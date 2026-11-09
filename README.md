@@ -1,6 +1,6 @@
 # Backtracking
 
-[繁體中文](#繁體中文) · [English](#english)
+[繁體中文](#繁體中文) · [English](#english) · [硬體使用量 / Hardware utilization](#硬體使用量--hardware-utilization)
 
 ## 繁體中文
 
@@ -55,6 +55,60 @@ The desktop apps restore preferences the next time you open them. For VST3 and C
 Choose a WAV sample rate of **44.1, 48, or 96 kHz** and **16-bit PCM, 24-bit PCM, or 32-bit IEEE float** encoding in the settings menu. The default is **48 kHz, 32-bit float**. Use **Select save folder** to choose the exact destination and **Go to save folder** to open it.
 
 [Full user guide](docs/USER_GUIDE.md#english) · [Desktop window controls](docs/USER_GUIDE.md#move-and-resize-the-desktop-window) · [Installation and build](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
+
+## 硬體使用量 / Hardware utilization
+
+測試於 2026-11-09 進行。程式版本為 `09f4ee8`，環境是 Linux 6.18.57 x86-64，CPU 顯示為 AMD EPYC 9V74，有 9 個邏輯 CPU 可用。量測範圍為 Linux CLAP 與共用 WAV 匯出核心。Windows、macOS、VST3 及實體 GPU 尚待量測。
+
+Measured on 2026-11-09 at revision `09f4ee8` in a Linux 6.18.57 x86-64 environment reporting an AMD EPYC 9V74 and 9 available logical CPUs. Measurements cover Linux CLAP and the shared WAV export core. Windows, macOS, VST3, and physical GPU measurements are pending.
+
+### 關閉插件介面 / Plug-in editor closed
+
+Release 版 CLAP 由小型測試宿主載入。輸入為 48 kHz 立體聲 float32，每 10 ms 送出 480 幀。各情境在暖機後各量測一次、每次 30 秒，持續錄音情境在量測前填滿緩衝區。CPU 以一個邏輯 CPU 的 100% 為基準，包含測試宿主及插件的執行緒。RSS 是量測結束時的程序常駐記憶體。
+
+A minimal host loaded the release CLAP. The input used 48 kHz stereo float32, with 480 frames per 10 ms. Each scenario was measured once for 30 seconds after warm-up. For continuous recording, the history was filled before measurement. CPU is relative to one logical CPU and includes the host and plug-in threads. RSS is the process resident memory at the end of the interval.
+
+| 情境 / Scenario | 保留時間 / History | CPU (%) | RSS (MiB) |
+| --- | ---: | ---: | ---: |
+| 測試宿主基準 / Host only | — | 0.18 | 1.26 |
+| 插件啟用、宿主未送音訊 / Active, no audio callbacks | 20 s | 0.53 | 15.57 |
+| 待命、輸入數位靜音 / Armed, digital silence | 20 s | 0.60 | 15.63 |
+| 持續錄音 / Continuous recording | 10 s | 0.66 | 15.46 |
+| 持續錄音 / Continuous recording | 20 s | 0.67 | 15.65 |
+| 持續錄音 / Continuous recording | 30 s | 0.71 | 15.65 |
+
+錄音環形緩衝區會依 30 秒容量預先配置，因此 10／20／30 秒設定的常駐記憶體接近。
+
+The recording ring allocates capacity for 30 seconds up front, which accounts for the similar RSS across history lengths.
+
+### 開啟插件介面 / Plug-in editor open
+
+使用 640 × 212 的 Release 版 CLAP 介面，在 Xvfb 以 llvmpipe 軟體 OpenGL 繪製。測試宿主與 Xvfb 限用兩個邏輯 CPU。音訊規格同上，保留時間設為 20 秒並預先填滿，自動續錄關閉。各情境量測兩次、每次 12 秒。表中的 CPU 是兩次量測的範圍，RSS 為每秒取樣的中位數，兩者均指測試宿主和插件所在的程序。Xvfb 另占 0.67–0.83% CPU、約 37–38 MiB RSS。
+
+The 640 × 212 release CLAP editor used llvmpipe software OpenGL under Xvfb. The host and Xvfb were pinned to two logical CPUs. The input format was unchanged, with a prefilled 20-second history and auto-resume set to Off. Each scenario ran twice for 12 seconds. CPU is the range across both runs. RSS is the median of one-second samples. Both describe the host process with the plug-in loaded. Xvfb separately used 0.67–0.83% CPU and about 37–38 MiB RSS.
+
+| 介面 / Editor | 狀態 / Capture state | CPU (%) | RSS (MiB) |
+| --- | --- | ---: | ---: |
+| 完整 / Full | 錄音中 / Recording | 9.41–10.16 | 94.8 |
+| 完整 / Full | 暫停 / Paused | 6.25–6.83 | 102.1 |
+| 僅波形 / Waveform only | 錄音中 / Recording | 9.50–9.58 | 85.5 |
+| 僅波形 / Waveform only | 暫停 / Paused | 6.00–6.50 | 92.8 |
+
+按下暫停時會建立凍結快照，供框選及拖曳使用。這組測試的暫停 RSS 約增加 7.3 MiB。
+
+Pausing creates a frozen snapshot for selection and dragging. In this test, paused RSS was about 7.3 MiB higher.
+
+### WAV 匯出成本 / WAV export cost
+
+使用 Release 版共用匯出核心，將 20 秒、48 kHz、立體聲 float32 合成音訊寫入 RAM 檔案系統。每個格式採 5 次測量的中位數。CPU 時間從呼叫匯出函式量到 WAV 寫完，包含取樣率轉換、編碼和寫入。峰值 RSS 包含測試程式、來源樣本和轉換用記憶體。
+
+The release export core wrote 20 seconds of synthetic 48 kHz stereo float32 audio to a RAM filesystem. Each result is the median of 5 runs. CPU time covers resampling, encoding, and writing the WAV. Peak RSS includes the harness, input samples, and resampling buffers.
+
+| 輸出取樣率 / Output rate | 16-bit PCM CPU (ms) | 24-bit PCM CPU (ms) | 32-bit float CPU (ms) | 峰值 RSS / Peak RSS (MiB) |
+| --- | ---: | ---: | ---: | ---: |
+| 44.1 kHz | 203.3 | 204.8 | 195.2 | 15.27 |
+| 48 kHz | 11.2 | 11.8 | 8.3 | 8.60 |
+| 96 kHz | 367.3 | 375.0 | 381.5 | 23.15–23.18 |
 
 ## 開發測試 / Development checks
 
