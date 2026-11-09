@@ -1,6 +1,6 @@
 # Backtracking
 
-給作曲與混音用的回溯錄音取樣器。桌面版擷取 macOS 系統混音，VST3／CLAP 擷取 DAW 送進插件的音訊。三個版本共用 Rust 錄音與匯出核心。
+給作曲與混音用的回溯錄音取樣器。Windows 和 macOS 桌面版擷取系統混音，VST3／CLAP 擷取 DAW 送進插件的音訊。各版本共用 Rust 錄音與匯出核心。
 
 ## 操作
 
@@ -13,7 +13,18 @@
 
 ## 建置
 
-需要近期的穩定版 Rust。macOS 桌面版另需 macOS 14.2 或更新版本和 Xcode Command Line Tools。
+需要近期的穩定版 Rust。Windows x64 桌面版及插件的本機建置需要 Visual Studio C++ Build Tools 和 Windows SDK。macOS 桌面版需要 macOS 14.2 或更新版本和 Xcode Command Line Tools。
+
+### Windows 桌面版
+
+在 Windows 10／11 x64 的 PowerShell，從專案根目錄執行下列指令。
+
+```powershell
+cargo build --manifest-path desktop/windows/Cargo.toml --release --locked
+.\desktop\windows\target\release\Backtracking.exe
+```
+
+桌面版用 WASAPI loopback 錄製預設播放裝置的共享混音。請將要取樣的程式輸出到該裝置。DAW 使用 ASIO 或其他直接輸出路徑時，可以在要擷取的軌道插入 VST3 或 CLAP。
 
 ### macOS 桌面版
 
@@ -44,7 +55,7 @@ $env:CARGO_TARGET_DIR = Join-Path (Get-Location) target
 cargo nice-plug bundle backtracking-plugin --release --locked --manifest-path plugins/backtracking-plugin/Cargo.toml
 ```
 
-輸出位於 `target/bundled/`。macOS 可把整個 VST3 bundle 放入 `~/Library/Audio/Plug-Ins/VST3/`，CLAP bundle 放入 `~/Library/Audio/Plug-Ins/CLAP/`，再從 REAPER 設定重新掃描。
+輸出位於 `target/bundled/`。Windows 可把整個 VST3 bundle 放入 `%CommonProgramFiles%\VST3`，CLAP 放入 `%CommonProgramFiles%\CLAP`，再從 FL Studio 或 REAPER 重新掃描。macOS 對應的路徑是 `~/Library/Audio/Plug-Ins/VST3/` 與 `~/Library/Audio/Plug-Ins/CLAP/`。
 
 ### 測試核心
 
@@ -60,7 +71,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 2. 播放音訊時點擊波形，確認暫停期間畫面和匯出內容固定。分別測試手動恢復及閒置自動恢復。
 3. 分別載入 VST3 和 CLAP。關閉編輯器再打開，確認 DAW 仍有提供音訊時會持續收錄。將素材從插件直接拖到同一個 DAW 的時間軸。
 4. 用 44.1 或 96 kHz 專案錄音。確認輸出 WAV 為 48 kHz float32，聲道及選取長度正確。驗證 CLAP 在宿主回報離線渲染時略過錄音。
-5. 在 Windows／FL Studio 驗證插件拖曳到 Playlist。Windows 桌面版的系統擷取後端仍待實作。
+5. 在 Windows 測試預設播放裝置擷取，再分別從桌面版和插件視窗拖 WAV 到 FL Studio Playlist。
 
 桌面版和 DAW 介面須在各自平台實機驗證。Linux 上的 Rust 測試涵蓋錄音環形緩衝區、靜音與暫停、佇列交接、選段與 WAV 匯出。
 
