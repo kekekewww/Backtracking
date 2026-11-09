@@ -1,6 +1,0 @@
-/target/
-**/target/
-**/.build/
-/desktop/macos/build/
-/output/
-.DS_Store

@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="zh-Hant-TW" data-lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="感謝你選擇 Backtracking。取得 Windows 版並開始取樣。">
+<title>感謝你選擇 Backtracking</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0a1210;
+    --panel: #10201b;
+    --line: #294439;
+    --text: #effbf5;
+    --muted: #a6c3b5;
+    --mint: #a2efc8;
+    --pink: #e38cbe;
+    font-family: "Noto Sans TC", "Noto Sans CJK TC", "PingFang TC", "Microsoft JhengHei", system-ui, sans-serif;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html { min-height: 100%; }
+  body {
+    margin: 0;
+    min-height: 100svh;
+    background: radial-gradient(ellipse at 72% 0%, #1b3a2e 0%, transparent 54%), var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+  }
+  [hidden] { display: none !important; }
+  html[data-lang="zh"] [data-copy="en"],
+  html[data-lang="en"] [data-copy="zh"] { display: none; }
+  a { color: inherit; }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--mint); outline-offset: 4px; }
+  .wrap { width: min(1040px, calc(100% - 48px)); margin: 0 auto; }
+  header {
+    min-height: 91px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 750; font-size: 1.12rem; text-decoration: none; }
+  .brand svg { width: 43px; height: 43px; flex: none; }
+  .languages { display: flex; padding: 3px; gap: 3px; border: 1px solid var(--line); border-radius: 10px; }
+  .languages button {
+    padding: 6px 10px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: .79rem;
+    font-weight: 650;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .languages button[aria-pressed="true"] { background: #244337; color: var(--text); }
+  .hero { display: grid; grid-template-columns: 1.06fr .94fr; gap: 36px; align-items: center; padding: 64px 0 52px; }
+  .status { display: flex; align-items: center; gap: 10px; margin: 0 0 17px; color: var(--mint); font-size: .8rem; font-weight: 750; letter-spacing: .06em; }
+  .status svg { width: 26px; height: 26px; padding: 4px; border-radius: 50%; background: #284a3a; }
+  h1 { margin: 0; font-size: clamp(2.2rem, 5.3vw, 4.3rem); font-weight: 780; letter-spacing: -.055em; line-height: 1.08; text-wrap: balance; }
+  h1 strong { color: var(--mint); font-weight: inherit; }
+  .intro { margin: 17px 0 23px; max-width: 36rem; color: var(--muted); font-size: 1rem; }
+  .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+  .button {
+    display: inline-flex; align-items: center; gap: 9px; justify-content: center;
+    min-height: 45px; padding: 9px 16px; border: 1px solid var(--line);
+    border-radius: 9px; text-decoration: none; font-weight: 710; font-size: .9rem;
+  }
+  .button svg { width: 17px; height: 17px; flex: none; }
+  .primary { background: var(--mint); color: #0b2518; border-color: transparent; }
+  .primary:hover { background: #c4f9de; }
+  .secondary:hover { background: #20392e; }
+  .signal {
+    margin: 0; position: relative; overflow: hidden; min-width: 0;
+    background: linear-gradient(155deg, #182f26, #0d1915 84%);
+    border: 1px solid #315547; border-radius: 20px;
+    box-shadow: 0 18px 46px #0004;
+  }
+  .signal svg { display: block; width: 100%; height: auto; }
+  .next {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 15px;
+    margin-bottom: 28px;
+  }
+  .next article { min-width: 0; padding: 20px 22px; }
+  .next article + article { border-left: 1px solid var(--line); }
+  .next h2 { margin: 0 0 5px; font-size: .98rem; font-weight: 750; }
+  .next p { margin: 0; color: var(--muted); font-size: .9rem; }
+  .number { color: var(--mint); font-size: .72rem; margin-right: 8px; letter-spacing: .06em; }
+  footer {
+    border-top: 1px solid var(--line); padding: 16px 0 26px;
+    display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; justify-content: space-between;
+    font-size: .81rem; color: var(--muted);
+  }
+  footer a { text-underline-offset: 3px; }
+  @media (max-width: 760px) {
+    .wrap { width: calc(100% - 32px); }
+    header { min-height: 73px; }
+    .hero { grid-template-columns: 1fr; gap: 27px; padding: 39px 0 26px; }
+    .signal { width: min(100%, 520px); }
+  }
+  @media (max-width: 460px) {
+    .next { grid-template-columns: 1fr; }
+    .next article { padding: 15px 16px; }
+    .next article + article { border-left: 0; border-top: 1px solid var(--line); }
+    .brand { gap: 7px; font-size: 1rem; }
+    .brand svg { width: 36px; height: 36px; }
+    .languages button { padding: 5px 7px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <a class="brand" href="https://github.com/kekekewww/Backtracking">
+      <svg aria-hidden="true" viewBox="0 0 512 512">
+        <defs>
+          <linearGradient id="logo-case" x2="1" y2="1">
+            <stop stop-color="#152b27"/><stop offset="1" stop-color="#081311"/>
+          </linearGradient>
+          <linearGradient id="logo-signal" x2="1" y2="1">
+            <stop stop-color="#b0fbd3"/><stop offset="1" stop-color="#55dca7"/>
+          </linearGradient>
+        </defs>
+        <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#logo-case)"/>
+        <rect x="20" y="20" width="472" height="472" rx="108" fill="none" stroke="#33564b" stroke-width="8"/>
+        <path d="M159 199 94 249a9 9 0 0 0 0 14l65 50a9 9 0 0 0 15-7V206a9 9 0 0 0-15-7Z" fill="url(#logo-signal)"/>
+        <path d="M215 213v86m53-130v174m53-145v116m53-78v40m49-32v24" fill="none" stroke="url(#logo-signal)" stroke-linecap="round" stroke-width="23"/>
+      </svg>
+      Backtracking
+    </a>
+    <div class="languages" role="group" aria-label="語言 Language">
+      <button type="button" lang="zh-Hant-TW" data-language="zh" aria-pressed="true">繁中</button>
+      <button type="button" lang="en" data-language="en" aria-pressed="false">English</button>
+    </div>
+  </header>
+  <main>
+    <section class="hero" aria-labelledby="title">
+      <div>
+        <p class="status">
+          <svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="m5 12 4 4 10-10" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span data-copy="zh">感謝你選擇 Backtracking</span>
+          <span data-copy="en" lang="en">THANKS FOR GETTING BACKTRACKING</span>
+        </p>
+        <h1 id="title">
+          <span data-copy="zh">把剛才那段聲音<br><strong>拖進 DAW</strong></span>
+          <span data-copy="en" lang="en">What you just heard<br><strong>Straight into your DAW</strong></span>
+        </h1>
+        <p class="intro">
+          <span data-copy="zh">Backtracking 會保留剛播過的有效音訊。想留下哪一段，就框選波形並拖成 WAV。</span>
+          <span data-copy="en" lang="en">Backtracking keeps the audio you just played. Select the part you want and drag it out as a WAV.</span>
+        </p>
+        <div class="actions">
+          <a class="button primary" id="guide" href="https://github.com/kekekewww/Backtracking/blob/main/docs/USER_GUIDE.md#繁體中文">
+            <span data-copy="zh">查看安裝與操作指南</span>
+            <span data-copy="en" lang="en">Open the setup guide</span>
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="M5 12h13m-6-6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </a>
+          <a class="button primary" id="download" hidden>
+            <span data-copy="zh">下載 Windows x64</span>
+            <span data-copy="en" lang="en">Download for Windows x64</span>
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="M12 4v11m-4-4 4 4 4-4M5 16v4h14v-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </a>
+          <a class="button secondary" href="https://github.com/kekekewww/Backtracking">GitHub</a>
+        </div>
+      </div>
+      <figure class="signal" aria-hidden="true">
+        <svg viewBox="0 0 456 242" fill="none">
+          <defs>
+            <pattern id="grid" x="24" y="32" width="34" height="34" patternUnits="userSpaceOnUse">
+              <path d="M0 0h34M0 0v34" stroke="#427360" stroke-opacity=".32"/>
+            </pattern>
+          </defs>
+          <path d="M24 29h408v177H24z" fill="url(#grid)"/>
+          <circle cx="29" cy="27" r="3.5" fill="#a2efc8"/>
+          <path d="M24 126h408" stroke="#416456" stroke-opacity=".7"/>
+          <rect x="170" y="63" width="116" height="126" rx="5" fill="#e38cbe" fill-opacity=".11" stroke="#e38cbe" stroke-opacity=".55"/>
+          <path d="M31 118v16m8-23v30m8-48v66m8-55v44m8-36v28m8-51v75m8-56v36m8-30v24m8-53v82m8-61v40m8-30v20m8-36v52m8-66v80m8-57v34m8-42v50m8-36v22m8-47v72m8-55v38
+          M293 109v34m8-53v72m8-47v22m8-35v48m8-35v22m8-40v58m8-66v74m8-54v34m8-27v20m8-41v62m8-48v34m8-26v18m8-40v62m8-46v30m8-25v20m8-32v44m8-28v12" stroke="#a2efc8" stroke-width="3" stroke-linecap="round"/>
+          <path d="M175 100v52m8-39v26m8-62v98m8-67v36m8-54v72m8-48v24m8-40v56m8-68v80m8-55v30m8-56v82m8-64v46m8-34v22m8-49v76m8-55v34" stroke="#e38cbe" stroke-width="3" stroke-linecap="round"/>
+          <path d="m276 148 4 27 7-7 5 9 5-3-5-9 10-2z" fill="#f3fff8" stroke="#0d1915" stroke-width="1.5"/>
+          <rect x="303" y="174" width="56" height="28" rx="7" fill="#a2efc8"/>
+          <text x="331" y="192.5" fill="#112b20" text-anchor="middle" font-family="monospace" font-size="12" font-weight="700">WAV</text>
+        </svg>
+      </figure>
+    </section>
+    <section class="next" aria-label="開始使用 Get started">
+      <article>
+        <h2><span class="number" aria-hidden="true">01</span><span data-copy="zh">取得 Windows x64 ZIP</span><span data-copy="en" lang="en">Get the Windows x64 ZIP</span></h2>
+        <p id="delivery-note">
+          <span data-copy="zh">從 Buy Me a Coffee 的商品交付頁下載。ZIP 內含桌面版、VST3 和 CLAP。</span>
+          <span data-copy="en" lang="en">Download it from the Buy Me a Coffee item delivery page. The ZIP includes standalone, VST3, and CLAP editions.</span>
+        </p>
+        <p id="direct-note" hidden>
+          <span data-copy="zh">ZIP 內含桌面版、VST3 和 CLAP。</span>
+          <span data-copy="en" lang="en">The ZIP includes standalone, VST3, and CLAP editions.</span>
+        </p>
+      </article>
+      <article>
+        <h2><span class="number" aria-hidden="true">02</span><span data-copy="zh">開始取樣</span><span data-copy="en" lang="en">Start sampling</span></h2>
+        <p>
+          <span data-copy="zh">解壓縮後開啟桌面版，或把插件放進 DAW。macOS 的建置步驟也在指南中。</span>
+          <span data-copy="en" lang="en">Unzip and run the desktop app, or add the plug-in to your DAW. The guide also covers building on macOS.</span>
+        </p>
+      </article>
+    </section>
+  </main>
+  <footer>
+    <span data-copy="zh">謝謝你支持 Backtracking 的開發。</span>
+    <span data-copy="en" lang="en">Thanks for supporting Backtracking.</span>
+    <a href="https://github.com/kekekewww/Backtracking/issues"><span data-copy="zh">回報問題</span><span data-copy="en" lang="en">Report an issue</span></a>
+  </footer>
+</div>
+<script>
+  // Optional public HTTPS link to the Windows x64 ZIP.
+  // Leave blank when the ZIP is attached to the Buy Me a Coffee Shop item.
+  const windowsDownloadUrl = "";
+  const root = document.documentElement;
+  const guide = document.getElementById("guide");
+  const download = document.getElementById("download");
+  const languageButtons = document.querySelectorAll("[data-language]");
+  const guideBase = "https://github.com/kekekewww/Backtracking/blob/main/docs/USER_GUIDE.md";
+  function selectLanguage(language) {
+    const english = language === "en";
+    root.dataset.lang = english ? "en" : "zh";
+    root.lang = english ? "en" : "zh-Hant-TW";
+    document.title = english ? "Thanks for getting Backtracking" : "感謝你選擇 Backtracking";
+    guide.href = guideBase + (english ? "#english" : "#繁體中文");
+    for (const button of languageButtons) {
+      button.setAttribute("aria-pressed", String(button.dataset.language === root.dataset.lang));
+    }
+  }
+  for (const button of languageButtons) {
+    button.addEventListener("click", () => selectLanguage(button.dataset.language));
+  }
+  const requestedLanguage = new URLSearchParams(location.search).get("lang");
+  selectLanguage(requestedLanguage ?? (navigator.language?.startsWith("zh") ? "zh" : "en"));
+  if (windowsDownloadUrl) {
+    try {
+      const destination = new URL(windowsDownloadUrl);
+      if (destination.protocol === "https:") {
+        download.href = destination.href;
+        download.hidden = false;
+        guide.classList.replace("primary", "secondary");
+        guide.before(download);
+        document.getElementById("delivery-note").hidden = true;
+        document.getElementById("direct-note").hidden = false;
+      }
+    } catch {
+      // An invalid URL leaves the guide and Shop delivery instructions available.
+    }
+  }
+</script>
+</body>
+</html>

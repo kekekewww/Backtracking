@@ -1,4 +1,0 @@
-[workspace]
-members = ["crates/backtracking-core"]
-exclude = ["plugins/backtracking-plugin", "desktop/windows"]
-resolver = "2"
