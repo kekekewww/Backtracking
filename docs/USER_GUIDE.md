@@ -24,7 +24,7 @@ macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`C
 
 ### 只顯示波形
 
-開啟 **只顯示波形／Show waveform only** 後，視窗只保留波形與 **Play／Pause**。要回到完整介面，在視窗內按右鍵開啟設定，再取消勾選。這個選項預設關閉，並跟著桌面偏好設定或 DAW 專案中的插件設定儲存。
+開啟 **只顯示波形／Show waveform only** 後，Backtracking 會隱藏自身的外框與深色底板，留下波形和其左上角的 **Play／Pause**。桌面版的背景會變透明。VST3／CLAP 內嵌在 DAW 時，仍可能看到宿主視窗的外框或不透明底色。要回到完整介面，在視窗內按右鍵開啟設定，再取消勾選。這個選項預設關閉，並跟著桌面偏好設定或 DAW 專案中的插件設定儲存。
 
 ### 移動與縮放桌面視窗
 
@@ -61,9 +61,9 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 ### 點擊、框選與拖曳
 
-未框選時，將游標移到波形上會預覽整段保留音訊。從波形任意位置點擊或開始拖曳，都會匯出這整段音訊。例如保留時間設為 20 秒，錄滿時匯出 20 秒，目前只收錄 7 秒時就匯出 7 秒。使用 `Ctrl` 或 `Option` 框選時，選取區以白色填滿，其中的綠色波形會顯示反相配色。預覽與匯出都會使用框選區間。
+在完整介面中，未框選時將游標移到波形上會預覽整段保留音訊。從波形任意位置點擊或開始拖曳，都會匯出這整段音訊。例如保留時間設為 20 秒，錄滿時匯出 20 秒，目前只收錄 7 秒時就匯出 7 秒。完整介面和只顯示波形模式都以波形線條的反相配色標示 `Ctrl` 或 `Option` 框選區間。匯出時使用該區間。
 
-波形的提示只在相關操作時出現。介面會依右、左、下、上的順序尋找可以放下提示的位置，並將提示留在視窗內。
+完整介面會在相關操作時顯示波形提示。介面會依右、左、下、上的順序尋找可以放下提示的位置，並將提示留在視窗內。
 
 | 動作 | Windows | macOS | 結果 |
 | --- | --- | --- | --- |
@@ -155,7 +155,7 @@ The settings menu offers five background transparency levels. Choose 0%, 25%, 50
 
 ### Show waveform only
 
-Turn on **Show waveform only** to keep just the waveform and **Play/Pause** visible. To restore the full interface, right-click inside the window and turn the option off. This setting defaults to Off and is saved with the desktop preferences or the plug-in's DAW project settings.
+Turn on **Show waveform only** to hide Backtracking's frame and dark panel background. The waveform remains visible with **Play/Pause** at its top left. The desktop window uses a transparent background. An embedded VST3 or CLAP editor may still show the DAW's window frame or opaque background. To restore the full interface, right-click inside the window and turn the option off. This setting defaults to Off and is saved with the desktop preferences or the plug-in's DAW project settings.
 
 ### Move and resize the desktop window
 
@@ -192,9 +192,9 @@ Loudness measurement references. [ITU-R BS.1770](https://www.itu.int/rec/R-REC-B
 
 ### Click, select, and drag
 
-With no selection, hover over the waveform to preview all retained audio. Clicking or starting a drag anywhere on the waveform exports that full range. For example, a full 20-second buffer exports 20 seconds. If only 7 seconds have been captured, the WAV is 7 seconds long. A `Ctrl` or `Option` selection has a white background with the green waveform's color inverted. The selected range is used for preview and export.
+In the full interface, hover over an unselected waveform to preview all retained audio. Clicking or starting a drag anywhere on the waveform exports that full range. For example, a full 20-second buffer exports 20 seconds. If only 7 seconds have been captured, the WAV is 7 seconds long. Both display modes mark a `Ctrl` or `Option` selection by inverting the waveform line color within that range. The selected range is used for export.
 
-Gesture hints appear as you interact. The tooltip tries the right, left, below, and above in that order and stays within the interface.
+Gesture hints appear as you interact in the full interface. The tooltip tries the right, left, below, and above in that order and stays within the interface.
 
 | Action | Windows | macOS | Result |
 | --- | --- | --- | --- |
@@ -353,8 +353,8 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 4. 修改一項偏好後重開桌面版，確認設定有還原。測試插件時，修改設定後先儲存 DAW 專案，再重開該專案確認。
 
    Change a preference and relaunch the desktop app to check that it is restored. For the plug-in, change a setting, save the DAW project, and reopen it to check the saved value.
-5. 開啟 **只顯示波形**，再按右鍵開啟設定並取消勾選，確認可回到完整介面。
+5. 開啟 **只顯示波形**，確認波形與左上角 **Play／Pause** 可操作，框選時可看到區間內的波形變色。再按右鍵開啟設定並取消勾選，確認可回到完整介面。
 
-   Turn on **Show waveform only**, then open Settings with a right-click and turn it off to restore the full interface.
+   Turn on **Show waveform only**. Check that the waveform and its top-left **Play/Pause** control work, and that selecting a range changes the waveform color in that range. Right-click to open Settings and turn the option off to restore the full interface.
 
 [回到專案首頁 / Back to the project README](../README.md)

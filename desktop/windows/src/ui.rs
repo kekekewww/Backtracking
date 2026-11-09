@@ -14,6 +14,13 @@ use eframe::egui::{
     self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection, Stroke, Vec2,
     ViewportCommand,
 };
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows::Win32::{
+    Foundation::HWND,
+    Graphics::Dwm::{
+        DWMWA_BORDER_COLOR, DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE, DwmSetWindowAttribute,
+    },
+};
 
 use crate::controller::Controller;
 use crate::preferences::{Key, MeterMode, Preferences, Settings, wav_sample_format_preference};
@@ -67,9 +74,35 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
         options,
         Box::new(|context| {
             configure_style(&context.egui_ctx);
+            if settings.waveform_only {
+                set_native_border(context, true);
+            }
             Ok(Box::new(Recorder::new(controller, preferences, settings)))
         }),
     )
+}
+
+fn set_native_border(window: &impl HasWindowHandle, hidden: bool) {
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+    let color = if hidden {
+        DWMWA_COLOR_NONE
+    } else {
+        DWMWA_COLOR_DEFAULT
+    };
+    // The borrowed handle is live for this call. Older Windows versions ignore this attribute.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            HWND(handle.hwnd.get() as *mut _),
+            DWMWA_BORDER_COLOR,
+            (&raw const color).cast(),
+            size_of::<u32>() as u32,
+        );
+    }
 }
 
 fn configure_style(ctx: &egui::Context) {
@@ -254,13 +287,9 @@ impl Recorder {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, menu_open: bool) -> bool {
-        if self.waveform_only {
-            ui.horizontal(|ui| self.transport_button(ui, menu_open));
-            return false;
-        }
         ui.horizontal(|ui| {
             ui.heading("Backtracking");
-            self.transport_button(ui, menu_open);
+            self.transport_button(ui, menu_open, None);
             self.recording_indicator(ui);
             self.clear_button(ui, menu_open);
             self.pin_button(ui, menu_open);
@@ -274,10 +303,19 @@ impl Recorder {
         .inner
     }
 
-    fn transport_button(&mut self, ui: &mut egui::Ui, menu_open: bool) {
+    fn transport_button(&mut self, ui: &mut egui::Ui, menu_open: bool, overlay: Option<Rect>) {
         let can_toggle = !menu_open && self.gesture.is_none();
-        let response = ui.add_enabled(can_toggle, icon_button());
-        if response.clicked() {
+        let response = if let Some(rect) = overlay {
+            let sense = if can_toggle {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            };
+            ui.interact(rect, ui.make_persistent_id("waveform-transport"), sense)
+        } else {
+            ui.add_enabled(can_toggle, icon_button())
+        };
+        if can_toggle && response.clicked() {
             if self.controller.is_paused() {
                 self.resume();
             } else {
@@ -293,7 +331,7 @@ impl Recorder {
             "Pause capture"
         };
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, can_toggle, label));
-        let response = if self.waveform_only {
+        let response = if overlay.is_some() {
             response
         } else {
             response.on_hover_text(label)
@@ -594,6 +632,7 @@ impl Recorder {
                 })
                 .inner;
             if waveform_only_changed {
+                set_native_border(frame, self.waveform_only);
                 self.save_preference(
                     Key::WaveformOnly,
                     if self.waveform_only { "1" } else { "0" },
@@ -798,6 +837,7 @@ impl Recorder {
         ui: &egui::Ui,
         frame: &eframe::Frame,
         response: &egui::Response,
+        transport: Option<Rect>,
     ) {
         let rect = response.rect;
         let (position, pressed, down, selecting) = ui.input(|input| {
@@ -812,6 +852,7 @@ impl Recorder {
         if pressed
             && response.contains_pointer()
             && let Some(position) = position
+            && transport.is_none_or(|rect| !rect.contains(position))
         {
             self.freeze();
             if selecting {
@@ -867,18 +908,18 @@ impl Recorder {
 
     fn draw_waveform(&self, ui: &egui::Ui, rect: Rect, preview_hover: bool) {
         let painter = ui.painter_at(rect);
-        // The panel already supplies the chosen alpha. Skip a second background
-        // layer when translucent so the waveform area uses the same opacity.
-        if self.transparency == 0 {
-            painter.rect_filled(rect, 6.0, Color32::from_rgb(22, 26, 29));
+        if !self.waveform_only {
+            // The panel already supplies the chosen alpha when translucent.
+            if self.transparency == 0 {
+                painter.rect_filled(rect, 6.0, Color32::from_rgb(22, 26, 29));
+            }
+            let inner = rect.shrink(8.0);
+            painter.hline(
+                inner.x_range(),
+                inner.center().y,
+                Stroke::new(1.0, Color32::from_rgb(47, 60, 64)),
+            );
         }
-        let inner = rect.shrink(8.0);
-        let middle = inner.center().y;
-        painter.hline(
-            inner.x_range(),
-            middle,
-            Stroke::new(1.0, Color32::from_rgb(47, 60, 64)),
-        );
         let audio = self.audio_rect(rect);
         if audio.width() <= 0.0 {
             if !self.waveform_only {
@@ -899,7 +940,8 @@ impl Recorder {
             }
             _ => self.selection.clone(),
         };
-        let full_preview = selection.is_none()
+        let full_preview = !self.waveform_only
+            && selection.is_none()
             && (matches!(self.gesture, Some(Gesture::Export { .. }))
                 || preview_hover
                     && ui.input(|input| {
@@ -912,49 +954,32 @@ impl Recorder {
             painter.rect_filled(audio, 2.0, Color32::from_rgb(31, 79, 64));
         }
 
-        self.paint_waveform(&painter, audio, MINT);
-        if let Some(range) = selection.as_ref().filter(|range| range.start < range.end) {
-            let selected = Rect::from_min_max(
-                Pos2::new(audio.left() + range.start * audio.width(), audio.top()),
-                Pos2::new(audio.left() + range.end * audio.width(), audio.bottom()),
-            );
-            painter.rect_filled(selected, 0.0, Color32::WHITE);
-            self.paint_waveform(&painter.with_clip_rect(selected), audio, SELECTED_WAVEFORM);
-        }
+        self.paint_waveform(&painter, audio, selection.as_ref());
 
-        if !self.waveform_only {
-            if let Some(range) = selection {
-                let text = painter.layout_no_wrap(
-                    format!("{:.2} s", (range.end - range.start) * self.seconds),
-                    egui::FontId::monospace(11.0),
-                    Color32::WHITE,
-                );
-                let padding = Vec2::new(4.0, 1.0);
-                let size = text.size() + padding * 2.0;
-                let bounds = Rect::from_min_size(audio.right_top() - Vec2::new(size.x, 0.0), size);
-                painter.rect_filled(bounds, 2.0, Color32::from_rgb(22, 26, 29));
-                painter.galley(bounds.min + padding, text, Color32::WHITE);
-            } else if full_preview {
-                painter.text(
-                    audio.right_top(),
-                    egui::Align2::RIGHT_TOP,
-                    format!("{:.2} s", self.seconds),
-                    egui::FontId::monospace(11.0),
-                    Color32::WHITE,
-                );
-            }
+        if !self.waveform_only
+            && let Some(range) = selection.or_else(|| full_preview.then_some(0.0..1.0))
+        {
+            painter.text(
+                audio.right_top(),
+                egui::Align2::RIGHT_TOP,
+                format!("{:.2} s", (range.end - range.start) * self.seconds),
+                egui::FontId::monospace(11.0),
+                Color32::WHITE,
+            );
         }
     }
 
-    fn paint_waveform(&self, painter: &egui::Painter, audio: Rect, color: Color32) {
+    fn paint_waveform(&self, painter: &egui::Painter, audio: Rect, selection: Option<&Range<f32>>) {
         let middle = audio.center().y;
         let extent = audio.height() * 0.47;
-        let clip = painter.clip_rect().expand(1.0);
         for (bin, (&low, &high)) in self.low.iter().zip(&self.high).enumerate() {
-            let position = audio.left() + ((bin as f32 + 0.5) / BINS as f32) * audio.width();
-            if position < clip.left() || position > clip.right() {
-                continue;
-            }
+            let fraction = (bin as f32 + 0.5) / BINS as f32;
+            let position = audio.left() + fraction * audio.width();
+            let color = if selection.is_some_and(|range| range.contains(&fraction)) {
+                SELECTED_WAVEFORM
+            } else {
+                MINT
+            };
             let top = middle - high.clamp(-1.0, 1.0) * extent;
             let bottom = middle - low.clamp(-1.0, 1.0) * extent;
             painter.line_segment(
@@ -1088,14 +1113,19 @@ impl eframe::App for Recorder {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        let fill = self.background_color(ui.visuals().panel_fill);
+        let fill = if self.waveform_only {
+            Color32::TRANSPARENT
+        } else {
+            self.background_color(ui.visuals().panel_fill)
+        };
         let frame_style = egui::Frame::central_panel(ui.style()).fill(fill);
         egui::CentralPanel::default()
             .frame(frame_style)
             .show(ui, |ui| {
                 let menu_open =
                     self.context_settings(ui, frame) || egui::Popup::is_any_open(ui.ctx());
-                let menu_open = self.controls(ui, frame, menu_open) || menu_open;
+                let menu_open =
+                    (!self.waveform_only && self.controls(ui, frame, menu_open)) || menu_open;
                 let window_cursor = if !menu_open && self.gesture.is_none() {
                     ui.input(|input| {
                         if input.viewport().fullscreen == Some(true) {
@@ -1119,10 +1149,16 @@ impl eframe::App for Recorder {
                     (ui.available_height() - status_height).max(46.0),
                 );
                 let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                let transport = self
+                    .waveform_only
+                    .then(|| Rect::from_min_size(rect.min, Vec2::splat(24.0)));
                 if !menu_open {
-                    self.interact_waveform(ui, frame, &response);
+                    self.interact_waveform(ui, frame, &response, transport);
                 }
                 self.draw_waveform(ui, rect, !menu_open && window_cursor.is_none());
+                if let Some(transport) = transport {
+                    self.transport_button(ui, menu_open, Some(transport));
+                }
                 let status = self.controller.error().unwrap_or(&self.message);
                 if !self.waveform_only && !status.is_empty() {
                     ui.add(egui::Label::new(status).truncate())

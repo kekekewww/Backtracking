@@ -14,8 +14,10 @@ backtracking-core = { path = "../../crates/backtracking-core" }
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
 rfd = "0.17"
 drag = "2.1.1"
+raw-window-handle = "0.6"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Media_Audio",
     "Win32_Media_KernelStreaming",
     "Win32_Media_Multimedia",

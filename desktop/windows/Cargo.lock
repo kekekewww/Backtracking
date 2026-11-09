@@ -106,6 +106,7 @@ dependencies = [
  "backtracking-core",
  "drag",
  "eframe",
+ "raw-window-handle",
  "rfd",
  "windows 0.62.2",
 ]

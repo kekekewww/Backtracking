@@ -22,6 +22,7 @@ use crate::session::Session;
 use crate::settings::{MeterMode, SessionSettings, TRANSPARENCY_LEVELS};
 
 const BINS: usize = 512;
+const TRANSPORT_SIZE: f32 = 25.0;
 const REFRESH: Duration = Duration::from_millis(80);
 const RECORDING_BLINK: Duration = Duration::from_millis(500);
 const DURATIONS: [DurationChoice; 3] = [
@@ -158,6 +159,12 @@ impl NiceEguiApp for CaptureUi {
         }
 
         let waveform_only = settings.show_waveform_only;
+        // An embedded host can still composite this against its own opaque backing.
+        frame.set_clear_color(if waveform_only {
+            egui::Rgba::TRANSPARENT
+        } else {
+            egui::Rgba::BLACK
+        });
         let can_toggle = self.gesture.is_none() && !self.native_dragging.load(Ordering::Acquire);
         let canvas = ui.max_rect().intersect(ui.clip_rect());
         let context_at = ui.input(|input| {
@@ -173,40 +180,32 @@ impl NiceEguiApp for CaptureUi {
         let controls_enabled = can_toggle
             && context_at.is_none()
             && !egui::Popup::is_id_open(ui.ctx(), egui::Id::unique(SETTINGS_POPUP_ID));
-        let gear = ui
-            .horizontal(|ui| {
-                if !waveform_only {
+        let gear = if waveform_only {
+            self.recording_since = None;
+            None
+        } else {
+            Some(
+                ui.horizontal(|ui| {
                     ui.heading("Backtracking");
                     ui.separator();
-                }
-                if capture_button(ui, paused, controls_enabled, !waveform_only).clicked() {
-                    if paused {
-                        self.session.resume();
-                        self.reset_frozen();
-                    } else {
-                        self.freeze_capture();
+                    if capture_button(ui, paused, controls_enabled, false).clicked() {
+                        self.toggle_capture(ui, paused);
+                        paused = self.session.is_paused();
                     }
-                    paused = self.session.is_paused();
-                    ui.ctx().request_repaint();
-                }
-                if waveform_only {
-                    self.recording_since = None;
-                    return None;
-                }
-                self.recording_indicator(ui, paused);
-                if clear_button(ui, controls_enabled && self.seconds > 0.0).clicked() {
-                    self.clear_capture();
-                }
-                Some(
+                    self.recording_indicator(ui, paused);
+                    if clear_button(ui, controls_enabled && self.seconds > 0.0).clicked() {
+                        self.clear_capture();
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let gear = settings_button(ui);
                         self.meter_readout(ui, settings.meter_mode);
                         gear
                     })
-                    .inner,
-                )
-            })
-            .inner;
+                    .inner
+                })
+                .inner,
+            )
+        };
 
         let dropped = self.session.dropped_frames();
         let status_is_visible = !waveform_only && (dropped != 0 || !self.message.is_empty());
@@ -220,6 +219,8 @@ impl NiceEguiApp for CaptureUi {
             (ui.available_height() - status_height).max(60.0),
         );
         let (rect, response) = ui.allocate_exact_size(wave_size, Sense::click_and_drag());
+        let transport =
+            waveform_only.then(|| Rect::from_min_size(rect.min, Vec2::splat(TRANSPORT_SIZE)));
         let settings_open = self.settings_menu(
             frame,
             &mut settings,
@@ -229,22 +230,36 @@ impl NiceEguiApp for CaptureUi {
             context_at,
         );
         let configured_seconds = settings.retention.seconds() as f32;
-        self.interact_waveform(ui, frame, rect, configured_seconds, !settings_open);
+        self.interact_waveform(
+            ui,
+            frame,
+            rect,
+            configured_seconds,
+            !settings_open,
+            transport,
+        );
         self.draw_waveform(
             ui,
             rect,
             configured_seconds,
             !settings_open,
             settings.panel_transparency,
+            waveform_only,
         );
         if !settings_open {
-            if !settings.show_waveform_only {
+            if !waveform_only {
                 self.draw_action_hint(ui, rect);
             }
             response.on_hover_cursor(CursorIcon::Grab);
         }
+        if let Some(transport) = transport {
+            let mut overlay = ui.new_child(egui::UiBuilder::new().max_rect(transport));
+            if capture_button(&mut overlay, paused, controls_enabled, true).clicked() {
+                self.toggle_capture(ui, paused);
+            }
+        }
 
-        if !settings.show_waveform_only && dropped != 0 {
+        if !waveform_only && dropped != 0 {
             let mut status = format!("Dropped {dropped} audio frames");
             if !self.message.is_empty() {
                 status.push_str(" · ");
@@ -252,7 +267,7 @@ impl NiceEguiApp for CaptureUi {
             }
             ui.add(egui::Label::new(&status).truncate())
                 .on_hover_text(status);
-        } else if !settings.show_waveform_only && status_is_visible {
+        } else if status_is_visible {
             ui.add(egui::Label::new(&self.message).truncate())
                 .on_hover_text(&self.message);
         }
@@ -552,6 +567,16 @@ impl CaptureUi {
         );
     }
 
+    fn toggle_capture(&mut self, ui: &egui::Ui, paused: bool) {
+        if paused {
+            self.session.resume();
+            self.reset_frozen();
+        } else {
+            self.freeze_capture();
+        }
+        ui.ctx().request_repaint();
+    }
+
     fn freeze_capture(&mut self) {
         self.session.pause();
         if self.frozen.is_none()
@@ -598,33 +623,39 @@ impl CaptureUi {
         seconds: f32,
         allow_hover: bool,
         panel_transparency: u8,
+        waveform_only: bool,
     ) {
         let painter = ui.painter_at(rect);
-        let opacity = ((100 - u16::from(panel_transparency)) * 255 / 100) as u8;
-        painter.rect_filled(
-            rect,
-            6.0,
-            Color32::from_rgba_unmultiplied(22, 26, 29, opacity),
-        );
         let inner = rect.shrink(8.0);
         let middle = inner.center().y;
         let extent = inner.height() * 0.47;
-        let baseline = Stroke::new(1.0, Color32::from_rgb(47, 60, 64));
-        painter.hline(inner.x_range(), middle, baseline);
+        if !waveform_only {
+            let opacity = ((100 - u16::from(panel_transparency)) * 255 / 100) as u8;
+            painter.rect_filled(
+                rect,
+                6.0,
+                Color32::from_rgba_unmultiplied(22, 26, 29, opacity),
+            );
+            painter.hline(
+                inner.x_range(),
+                middle,
+                Stroke::new(1.0, Color32::from_rgb(47, 60, 64)),
+            );
+        }
         let audio_rect = self.audio_rect(rect, seconds);
         let width = audio_rect.width();
         if width <= 0.0 {
             return;
         }
 
-        let at = |fraction: f32| audio_rect.left() + width * fraction;
         let explicit_range = match &self.gesture {
             Some(Gesture::Select { anchor, current }) => {
                 Some(anchor.min(*current)..anchor.max(*current))
             }
             _ => self.selection.clone(),
         };
-        let hover_preview = explicit_range.is_none()
+        let hover_preview = !waveform_only
+            && explicit_range.is_none()
             && match &self.gesture {
                 Some(Gesture::Select { .. }) => false,
                 Some(Gesture::Drag { .. }) => true,
@@ -642,30 +673,23 @@ impl CaptureUi {
             painter.rect_filled(audio_rect, 2.0, Color32::from_rgb(31, 79, 64));
         }
 
-        let draw_wave = |painter: &egui::Painter, color| {
-            let stroke = Stroke::new(1.0, color);
-            let clip = painter.clip_rect().expand(1.0);
-            for (bin, (&low, &high)) in self.minimum.iter().zip(&self.maximum).enumerate() {
-                let x = at((bin as f32 + 0.5) / BINS as f32);
-                if x < clip.left() || x > clip.right() {
-                    continue;
-                }
-                let top = middle - high.clamp(-1.0, 1.0) * extent;
-                let bottom = middle - low.clamp(-1.0, 1.0) * extent;
-                painter.line_segment(
-                    [Pos2::new(x, top), Pos2::new(x, bottom.max(top + 0.4))],
-                    stroke,
-                );
-            }
-        };
-        draw_wave(&painter, MINT);
-        if let Some(range) = explicit_range.filter(|range| range.end > range.start) {
-            let selection = Rect::from_min_max(
-                Pos2::new(at(range.start), inner.top()),
-                Pos2::new(at(range.end), inner.bottom()),
+        for (bin, (&low, &high)) in self.minimum.iter().zip(&self.maximum).enumerate() {
+            let fraction = (bin as f32 + 0.5) / BINS as f32;
+            let x = audio_rect.left() + width * fraction;
+            let top = middle - high.clamp(-1.0, 1.0) * extent;
+            let bottom = middle - low.clamp(-1.0, 1.0) * extent;
+            let color = if explicit_range
+                .as_ref()
+                .is_some_and(|range| range.contains(&fraction))
+            {
+                INVERTED_MINT
+            } else {
+                MINT
+            };
+            painter.line_segment(
+                [Pos2::new(x, top), Pos2::new(x, bottom.max(top + 0.4))],
+                Stroke::new(1.0, color),
             );
-            painter.rect_filled(selection, 0.0, Color32::WHITE);
-            draw_wave(&painter.with_clip_rect(selection), INVERTED_MINT);
         }
     }
 
@@ -741,6 +765,7 @@ impl CaptureUi {
         rect: Rect,
         seconds: f32,
         allow_new_gesture: bool,
+        transport: Option<Rect>,
     ) {
         let (position, pressed, down, selecting) = ui.input(|input| {
             (
@@ -756,7 +781,9 @@ impl CaptureUi {
 
         if allow_new_gesture
             && pressed
-            && let Some(position) = position.filter(|position| rect.contains(*position))
+            && let Some(position) = position.filter(|position| {
+                rect.contains(*position) && !transport.is_some_and(|rect| rect.contains(*position))
+            })
         {
             self.session.set_gesture_active(true);
             self.freeze_capture();
@@ -958,13 +985,11 @@ fn wav_format_controls(ui: &mut egui::Ui, profile: &mut WavExportProfile) {
     ui.end_row();
 }
 
-fn capture_button(
-    ui: &mut egui::Ui,
-    paused: bool,
-    enabled: bool,
-    show_hint: bool,
-) -> egui::Response {
-    let response = ui.add_enabled(enabled, egui::Button::new("").min_size(Vec2::splat(25.0)));
+fn capture_button(ui: &mut egui::Ui, paused: bool, enabled: bool, overlay: bool) -> egui::Response {
+    let button = egui::Button::new("")
+        .min_size(Vec2::splat(TRANSPORT_SIZE))
+        .frame(!overlay);
+    let response = ui.add_enabled(enabled, button);
     let label = if paused {
         "Start capture"
     } else {
@@ -992,10 +1017,10 @@ fn capture_button(
             );
         }
     }
-    if show_hint {
-        response.on_hover_text(label)
+    if overlay {
+        response.on_hover_cursor(CursorIcon::PointingHand)
     } else {
-        response
+        response.on_hover_text(label)
     }
 }
 

@@ -5,6 +5,7 @@ private let transparencyChoices: [UInt32] = [0, 25, 50, 75, 100]
 private let exportSampleRates: [UInt32] = [44_100, 48_000, 96_000]
 private let exportBitDepths: [UInt32] = [16, 24, 32]
 private let frameAutosaveName: NSWindow.FrameAutosaveName = "Backtracking.Panel"
+private let waveformMint = (red: CGFloat(0.32), green: CGFloat(0.89), blue: CGFloat(0.82))
 
 private func movesFromWaveform(_ modifiers: NSEvent.ModifierFlags) -> Bool {
     modifiers.contains([.command, .option]) && !modifiers.contains(.control)
@@ -29,6 +30,7 @@ private final class CapturePanel: NSPanel {
     var onClick: (() -> Void)?
     var onContextMenu: ((NSEvent) -> Void)?
     weak var waveform: WaveformView?
+    weak var waveformOverlayControl: NSView?
     private var moving = false
     private var resize: ResizeGesture?
     private var chromeCursorActive = false
@@ -152,6 +154,10 @@ private final class CapturePanel: NSPanel {
 
     private func waveformContains(_ location: NSPoint) -> Bool {
         guard let waveform else { return false }
+        if let waveformOverlayControl, !waveformOverlayControl.isHidden,
+           waveformOverlayControl.bounds.contains(waveformOverlayControl.convert(location, from: nil)) {
+            return false
+        }
         return waveform.bounds.contains(waveform.convert(location, from: nil))
     }
 
@@ -355,11 +361,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var waveform: WaveformView?
     private var timer: Timer?
     private let captureButton = NSButton(title: "", target: nil, action: nil)
+    private let overlayCaptureButton = NSButton(title: "", target: nil, action: nil)
     private let captureLamp = CaptureLamp(frame: .zero)
     private let clearButton = NSButton(title: "清除目前錄音", target: nil, action: nil)
     private let meterButton = NSButton(title: "— dBFS", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
-    private var extraControls: [NSView] = []
+    private var toolbar: NSStackView?
+    private var waveformTopBelowToolbar: NSLayoutConstraint?
+    private var waveformTopWithoutToolbar: NSLayoutConstraint?
     private var history: UInt32 = 20
     private var idleSeconds: UInt32 = 10
     private var transparency: UInt32 = 0
@@ -462,6 +471,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         captureButton.target = self
         captureButton.action = #selector(toggleCapture)
         captureButton.bezelStyle = .rounded
+        overlayCaptureButton.target = self
+        overlayCaptureButton.action = #selector(toggleCapture)
+        overlayCaptureButton.isBordered = false
+        window.waveformOverlayControl = overlayCaptureButton
+        overlayCaptureButton.contentTintColor = NSColor(
+            calibratedRed: waveformMint.red, green: waveformMint.green, blue: waveformMint.blue, alpha: 1
+        )
         captureLamp.setAccessibilityElement(true)
         captureLamp.setAccessibilityRole(.staticText)
         clearButton.target = self
@@ -481,7 +497,6 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let settingsButton = NSButton(title: "設定", target: self, action: #selector(showSettings(_:)))
         settingsButton.bezelStyle = .rounded
         setIcon("gearshape", label: "設定", on: settingsButton)
-        extraControls = [captureLamp, clearButton, pinButton, meterButton, settingsButton]
         let spacer = NSView(frame: .zero)
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let controls = NSStackView(views: [captureButton, captureLamp, clearButton, statusLabel, spacer, pinButton, meterButton, settingsButton])
@@ -493,28 +508,34 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         statusLabel.isHidden = true
-        let stack = NSStackView(views: [controls, waveform])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 6
         let content = CaptureBackground(frame: window.contentView?.bounds ?? .zero)
         content.waveform = waveform
         window.contentView = content
         background = content
         window.trackChrome(in: content)
-        content.addSubview(stack)
-        stack.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(waveform)
+        content.addSubview(controls)
+        content.addSubview(overlayCaptureButton)
+        waveform.translatesAutoresizingMaskIntoConstraints = false
+        controls.translatesAutoresizingMaskIntoConstraints = false
+        overlayCaptureButton.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
-            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
-            controls.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            waveform.widthAnchor.constraint(equalTo: stack.widthAnchor)
+            controls.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            controls.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
+            controls.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
+            waveform.leadingAnchor.constraint(equalTo: controls.leadingAnchor),
+            waveform.trailingAnchor.constraint(equalTo: controls.trailingAnchor),
+            waveform.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
+            overlayCaptureButton.leadingAnchor.constraint(equalTo: waveform.leadingAnchor, constant: 2),
+            overlayCaptureButton.topAnchor.constraint(equalTo: waveform.topAnchor, constant: 2),
+            overlayCaptureButton.widthAnchor.constraint(equalToConstant: 24),
+            overlayCaptureButton.heightAnchor.constraint(equalToConstant: 22)
         ])
+        toolbar = controls
+        waveformTopBelowToolbar = waveform.topAnchor.constraint(equalTo: controls.bottomAnchor, constant: 6)
+        waveformTopWithoutToolbar = waveform.topAnchor.constraint(equalTo: content.topAnchor, constant: 8)
         panel = window
         applyPin(to: pinButton)
-        updateBackground()
         applyWaveformOnly()
         let restoredFrame = window.setFrameUsingName(frameAutosaveName)
         _ = window.setFrameAutosaveName(frameAutosaveName)
@@ -660,12 +681,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func updateBackground() {
+        let effectiveTransparency = waveformOnly ? 100 : transparency
         panel?.isOpaque = false
         panel?.backgroundColor = .clear
         // An explicit setting gives the clear window the same input region as the opaque one.
         panel?.ignoresMouseEvents = false
-        panel?.hasShadow = transparency < 100
-        background?.backgroundOpacity = 1 - CGFloat(transparency) / 100
+        panel?.hasShadow = effectiveTransparency < 100
+        background?.backgroundOpacity = 1 - CGFloat(effectiveTransparency) / 100
     }
 
     @objc private func meterChanged(_ sender: NSMenuItem) {
@@ -731,8 +753,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func applyWaveformOnly() {
-        for control in extraControls { control.isHidden = waveformOnly }
+        toolbar?.isHidden = waveformOnly
+        overlayCaptureButton.isHidden = !waveformOnly
+        if waveformOnly {
+            waveformTopBelowToolbar?.isActive = false
+            waveformTopWithoutToolbar?.isActive = true
+        } else {
+            waveformTopWithoutToolbar?.isActive = false
+            waveformTopBelowToolbar?.isActive = true
+        }
         waveform?.showsOverlay = !waveformOnly
+        updateBackground()
         updateStatus()
     }
 
@@ -878,9 +909,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if captureButton.title != label {
             setIcon(paused ? "play.fill" : "pause.fill", label: label, on: captureButton)
         }
-        let captureHelp: String? = waveformOnly ? nil : label
-        if captureButton.toolTip != captureHelp { captureButton.toolTip = captureHelp }
+        if overlayCaptureButton.title != label {
+            setIcon(paused ? "play.fill" : "pause.fill", label: label, on: overlayCaptureButton)
+            overlayCaptureButton.toolTip = nil
+        }
         captureButton.isEnabled = !editing
+        overlayCaptureButton.isEnabled = !editing
         clearButton.isEnabled = tap?.core != nil && !editing
         updateMeter()
 
@@ -1209,13 +1243,15 @@ private final class WaveformView: NSView, NSDraggingSource {
         let height = bounds.height * 0.46
         let preview = selection != nil || pointer != nil || mouseDownEvent != nil || dragging ? exportRange : nil
         let selectedRect = selection.map { waveformRect(for: $0) }
-        if let preview, selectedRect == nil, frames != 0 {
+        if showsOverlay, let preview, selectedRect == nil, frames != 0 {
             NSColor.systemTeal.withAlphaComponent(0.23).setFill()
             NSBezierPath.fill(waveformRect(for: preview))
         }
 
-        NSColor.white.withAlphaComponent(0.17).setStroke()
-        NSBezierPath.strokeLine(from: NSPoint(x: 0, y: middle), to: NSPoint(x: bounds.width, y: middle))
+        if showsOverlay {
+            NSColor.white.withAlphaComponent(0.17).setStroke()
+            NSBezierPath.strokeLine(from: NSPoint(x: 0, y: middle), to: NSPoint(x: bounds.width, y: middle))
+        }
 
         if frames != 0 {
             let trace = NSBezierPath()
@@ -1227,23 +1263,29 @@ private final class WaveformView: NSView, NSDraggingSource {
                 trace.move(to: NSPoint(x: x, y: bottom))
                 trace.line(to: NSPoint(x: x, y: max(top, bottom + 0.7)))
             }
-            let mint = (red: CGFloat(0.32), green: CGFloat(0.89), blue: CGFloat(0.82))
+            let mint = waveformMint
             NSColor(calibratedRed: mint.red, green: mint.green, blue: mint.blue, alpha: 1).setStroke()
             trace.lineWidth = max(1, step * 0.75)
-            trace.stroke()
             if let selectedRect, !selectedRect.isEmpty {
+                let outside = NSBezierPath(rect: bounds)
+                outside.append(NSBezierPath(rect: selectedRect))
+                outside.windingRule = .evenOdd
+                NSGraphicsContext.saveGraphicsState()
+                outside.addClip()
+                trace.stroke()
+                NSGraphicsContext.restoreGraphicsState()
+
                 NSGraphicsContext.saveGraphicsState()
                 NSBezierPath(rect: selectedRect).addClip()
-                NSColor.white.setFill()
-                NSBezierPath.fill(selectedRect)
                 NSColor(calibratedRed: 1 - mint.red, green: 1 - mint.green, blue: 1 - mint.blue, alpha: 1).setStroke()
                 trace.stroke()
                 NSGraphicsContext.restoreGraphicsState()
+            } else {
+                trace.stroke()
             }
         }
-        if let pointer, anchor != nil || (selectionModifierDown && !movesFromWaveform(pointerModifiers)) {
-            let cursorColor = selectedRect?.contains(pointer) == true ? NSColor.black : .white
-            cursorColor.withAlphaComponent(0.4).setStroke()
+        if showsOverlay, let pointer, anchor != nil || (selectionModifierDown && !movesFromWaveform(pointerModifiers)) {
+            NSColor.white.withAlphaComponent(0.4).setStroke()
             NSBezierPath.strokeLine(
                 from: NSPoint(x: pointer.x, y: bounds.minY),
                 to: NSPoint(x: pointer.x, y: bounds.maxY)
@@ -1257,11 +1299,6 @@ private final class WaveformView: NSView, NSDraggingSource {
             ])
             let size = label.size()
             let origin = NSPoint(x: bounds.maxX - size.width - 7, y: bounds.maxY - size.height - 4)
-            let labelRect = NSRect(origin: origin, size: size)
-            if selectedRect?.intersects(labelRect) == true {
-                NSColor.black.withAlphaComponent(0.78).setFill()
-                NSBezierPath(roundedRect: labelRect.insetBy(dx: -3, dy: -1), xRadius: 3, yRadius: 3).fill()
-            }
             label.draw(at: origin)
         }
         drawActionHint()
