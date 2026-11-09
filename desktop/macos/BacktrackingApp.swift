@@ -1,6 +1,8 @@
 import AppKit
 
 private let timeChoices: [UInt32] = [10, 20, 30]
+private let autoResumeChoices: [UInt32] = [0, 5, 10]
+private let autoResumePreferenceKey = "autoResumeSeconds"
 private let transparencyChoices: [UInt32] = [0, 25, 50, 75, 100]
 private let exportSampleRates: [UInt32] = [44_100, 48_000, 96_000]
 private let exportBitDepths: [UInt32] = [16, 24, 32]
@@ -386,7 +388,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if let saved = unsignedSetting("history"), timeChoices.contains(saved) {
             history = saved
         }
-        if let seconds = unsignedSetting("idleSeconds"), seconds == 0 || timeChoices.contains(seconds) {
+        // The old idleSeconds key stored 0 for manual mode.
+        if let seconds = unsignedSetting(autoResumePreferenceKey), autoResumeChoices.contains(seconds) {
             idleSeconds = seconds
         }
         if let saved = unsignedSetting("backgroundTransparency"), transparencyChoices.contains(saved) {
@@ -564,9 +567,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             action: #selector(historyChanged(_:))
         ) { "\($0) 秒" })
         menu.addItem(choiceMenu(
-            title: "自動續錄", choices: [0] + timeChoices, selected: idleSeconds,
+            title: "自動續錄", choices: autoResumeChoices, selected: idleSeconds,
             action: #selector(idleChanged(_:))
-        ) { $0 == 0 ? "手動" : "\($0) 秒" })
+        ) { "\($0) 秒" })
         menu.addItem(choiceMenu(
             title: "背景透明度", choices: transparencyChoices, selected: transparency,
             action: #selector(transparencyChanged(_:))
@@ -660,9 +663,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     @objc private func idleChanged(_ sender: NSMenuItem) {
-        guard let selected = UInt32(exactly: sender.tag), selected == 0 || timeChoices.contains(selected) else { return }
+        guard let selected = UInt32(exactly: sender.tag), autoResumeChoices.contains(selected) else { return }
         idleSeconds = selected
-        defaults.set(Int(idleSeconds), forKey: "idleSeconds")
+        defaults.set(Int(idleSeconds), forKey: autoResumePreferenceKey)
         registerClick()
     }
 
@@ -781,6 +784,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     @objc private func chooseOutput() {
+        let wasPaused = paused
         beginEditing()
         let chooser = NSOpenPanel()
         chooser.title = "選擇 WAV 儲存資料夾"
@@ -797,7 +801,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 self.waveform?.discardPreparedFile()
                 self.setNotice("輸出位置 \(self.output)")
             }
-            self.endEditing()
+            self.endEditing(allowImmediateResume: !wasPaused)
         }
     }
 
@@ -832,10 +836,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         pauseCapture()
     }
 
-    func endEditing() {
+    var resumesImmediately: Bool { idleSeconds == 0 }
+
+    func endEditing(allowImmediateResume: Bool = true) {
+        guard editing else { return }
         editing = false
         registerClick()
-        updateStatus()
+        if allowImmediateResume && resumesImmediately && tap != nil {
+            resume(clearingSelection: false)
+        } else {
+            updateStatus()
+        }
     }
 
     private var captureActionLabel: String {
@@ -876,14 +887,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         updateStatus()
     }
 
-    private func resume() {
+    private func resume(clearingSelection: Bool = true) {
         guard paused, !editing else { return }
         do {
             if tap == nil {
                 tap = try SystemAudioTap(history: history)
             }
             try tap?.resume()
-            waveform?.clearSelection()
+            if clearingSelection { waveform?.clearSelection() }
             paused = false
             captureError = nil
             notice = nil
@@ -910,7 +921,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         updateStatus()
     }
 
-    private func refreshWaveform() {
+    func refreshWaveform() {
         guard let waveform, let tap, let core = tap.core else { return }
         waveform.refresh(core: core, sampleRate: tap.sampleRate)
     }
@@ -956,12 +967,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         updateStatus()
     }
 
-    func export(_ range: ClosedRange<Double>, completion: @escaping (URL?) -> Bool) {
-        guard paused, let core = tap?.core, let snapshot = bt_snapshot(core) else {
+    func frozenExport() -> WAVExport? {
+        guard paused, let core = tap?.core, let snapshot = bt_snapshot(core) else { return nil }
+        return WAVExport(snapshot)
+    }
+
+    func export(_ range: ClosedRange<Double>, snapshot: WAVExport?, completion: @escaping (URL?) -> Bool) {
+        guard let job = snapshot ?? frozenExport() else {
             if completion(nil) { setNotice("還沒有可匯出的錄音") }
             return
         }
-        let job = WAVExport(snapshot)
         let directory = output
         let sampleRate = exportSampleRate
         let bitsPerSample = exportBitsPerSample
@@ -989,6 +1004,7 @@ private final class WaveformView: NSView, NSDraggingSource {
     private var sampleRate = 0.0
     private var revision: UInt64?
     private var selection: ClosedRange<Double>?
+    private var selectedSnapshot: WAVExport?
     private var exportRange: ClosedRange<Double> { selection ?? 0...1 }
     private var anchor: Double?
     private var pointer: NSPoint?
@@ -1018,6 +1034,8 @@ private final class WaveformView: NSView, NSDraggingSource {
     }
 
     func refresh(core: OpaquePointer, sampleRate: Double) {
+        // Keep the selection preview aligned with the retained snapshot while capture continues.
+        guard selectedSnapshot == nil else { return }
         let currentRevision = bt_revision(core)
         guard currentRevision != revision || sampleRate != self.sampleRate else { return }
         revision = currentRevision
@@ -1033,6 +1051,7 @@ private final class WaveformView: NSView, NSDraggingSource {
 
     func clearSelection() {
         selection = nil
+        selectedSnapshot = nil
         discardPreparedFile()
         needsDisplay = true
     }
@@ -1086,9 +1105,11 @@ private final class WaveformView: NSView, NSDraggingSource {
     override func mouseDown(with event: NSEvent) {
         guard !dragging, let controller else { return }
         trackPointer(event)
+        let selecting = selectionModifierDown
+        if selecting { clearSelection() }
         controller.beginEditing()
-        if selectionModifierDown {
-            clearSelection()
+        if selecting {
+            controller.refreshWaveform()
             anchor = normalized(event)
             selection = anchor.map { $0...$0 }
             needsDisplay = true
@@ -1126,10 +1147,14 @@ private final class WaveformView: NSView, NSDraggingSource {
 
     override func mouseUp(with event: NSEvent) {
         trackPointer(event)
+        guard anchor != nil || mouseDownEvent != nil else { return }
+        var keepSelection = false
         if anchor != nil {
             mouseDragged(with: event)
             anchor = nil
             if let selection, selection.upperBound - selection.lowerBound > 0.001 {
+                if frames != 0 { selectedSnapshot = controller?.frozenExport() }
+                keepSelection = selectedSnapshot != nil
                 prepareExport(selection)
             } else {
                 clearSelection()
@@ -1137,7 +1162,7 @@ private final class WaveformView: NSView, NSDraggingSource {
         }
         mouseDownEvent = nil
         dragRequested = false
-        if !dragging { controller?.endEditing() }
+        if !dragging { endGesture(keepingSelection: keepSelection) }
     }
 
     override func rightMouseUp(with event: NSEvent) {
@@ -1153,7 +1178,7 @@ private final class WaveformView: NSView, NSDraggingSource {
         preparedRange = range
         preparingFile = true
         let version = exportVersion
-        controller?.export(range) { [weak self] url in
+        controller?.export(range, snapshot: selectedSnapshot) { [weak self] url in
             guard let self, self.exportVersion == version else { return false }
             self.preparingFile = false
             self.readyFile = url
@@ -1190,7 +1215,19 @@ private final class WaveformView: NSView, NSDraggingSource {
         dragRequested = false
         mouseDownEvent = nil
         trackDragPointer()
-        controller?.endEditing()
+        endGesture(keepingSelection: operation.isEmpty && selectedSnapshot != nil)
+    }
+
+    private func endGesture(keepingSelection: Bool = false) {
+        guard let controller else { return }
+        if controller.resumesImmediately && !keepingSelection {
+            selection = nil
+            selectedSnapshot = nil
+            // Allow the current WAV write to finish, but take a fresh snapshot on the next click.
+            preparedRange = nil
+            needsDisplay = true
+        }
+        controller.endEditing()
     }
 
     private func drawActionHint() {

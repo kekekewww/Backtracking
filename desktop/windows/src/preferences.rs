@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use backtracking_core::{DurationChoice, WavExportProfile, WavSampleFormat};
+use backtracking_core::{AutoResumeDelay, DurationChoice, WavExportProfile, WavSampleFormat};
 
 const MAX_VALUE_BYTES: u64 = 128 * 1024;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -42,7 +42,8 @@ impl Key {
     fn filename(self) -> &'static str {
         match self {
             Self::History => "history-seconds",
-            Self::IdleResume => "idle-resume-seconds",
+            // The old preference used 0 for Off.
+            Self::IdleResume => "idle-resume-delay-seconds",
             Self::Transparency => "transparency-percent",
             Self::Meter => "meter-unit",
             Self::WavSampleRate => "wav-sample-rate",
@@ -56,7 +57,7 @@ impl Key {
 
 pub(crate) struct Settings {
     pub(crate) history: DurationChoice,
-    pub(crate) idle_resume: Option<DurationChoice>,
+    pub(crate) idle_resume: AutoResumeDelay,
     pub(crate) transparency: u8,
     pub(crate) meter_mode: MeterMode,
     pub(crate) wav_profile: WavExportProfile,
@@ -72,7 +73,7 @@ impl Default for Settings {
             .unwrap_or_else(std::env::temp_dir);
         Self {
             history: DurationChoice::Seconds20,
-            idle_resume: Some(DurationChoice::Seconds10),
+            idle_resume: AutoResumeDelay::default(),
             transparency: 0,
             meter_mode: MeterMode::Dbfs,
             wav_profile: WavExportProfile::default(),
@@ -104,10 +105,11 @@ impl Preferences {
         if let Some(history) = self.read_number(Key::History).and_then(duration) {
             settings.history = history;
         }
-        match self.read_number(Key::IdleResume) {
-            Some(0) => settings.idle_resume = None,
-            Some(value) if duration(value).is_some() => settings.idle_resume = duration(value),
-            _ => {}
+        if let Some(delay) = self
+            .read_number(Key::IdleResume)
+            .and_then(AutoResumeDelay::from_seconds)
+        {
+            settings.idle_resume = delay;
         }
         if let Some(percent @ (0 | 25 | 50 | 75 | 100)) = self.read_number(Key::Transparency) {
             settings.transparency = percent;

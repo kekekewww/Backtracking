@@ -148,7 +148,7 @@ nice_export_clap!(Backtracking);
 mod tests {
     use std::collections::BTreeMap;
 
-    use backtracking_core::{DurationChoice, WavExportProfile, WavSampleFormat};
+    use backtracking_core::{AutoResumeDelay, DurationChoice, WavExportProfile, WavSampleFormat};
     use nice_plug::params::persist::serialize_field;
 
     use super::*;
@@ -158,7 +158,7 @@ mod tests {
     fn plugin_state_round_trips_instance_settings_without_audio_or_pause() {
         let original = Backtracking::default();
         original.session.set_retention(DurationChoice::Seconds30);
-        original.session.set_idle_resume(None);
+        original.session.set_idle_resume(AutoResumeDelay::Immediate);
         original.session.set_panel_transparency(75);
         original.session.set_meter_mode(MeterMode::Lufs);
         original.session.set_show_waveform_only(true);

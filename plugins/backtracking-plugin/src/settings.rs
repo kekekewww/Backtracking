@@ -3,10 +3,11 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use backtracking_core::{DurationChoice, WavExportProfile, WavSampleFormat};
+use backtracking_core::{AutoResumeDelay, DurationChoice, WavExportProfile, WavSampleFormat};
 use nice_plug::params::persist::{PersistentField, deserialize_field, serialize_field};
 
 pub(crate) const TRANSPARENCY_LEVELS: [u8; 5] = [0, 25, 50, 75, 100];
+const AUTO_RESUME_FIELD: &str = "auto_resume_delay_seconds";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MeterMode {
@@ -30,7 +31,7 @@ impl MeterMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionSettings {
     pub(crate) retention: DurationChoice,
-    pub(crate) idle_resume: Option<DurationChoice>,
+    pub(crate) idle_resume: AutoResumeDelay,
     pub(crate) panel_transparency: u8,
     pub(crate) meter_mode: MeterMode,
     pub(crate) wav_profile: WavExportProfile,
@@ -46,7 +47,7 @@ impl Default for SessionSettings {
             .unwrap_or_else(std::env::temp_dir);
         Self {
             retention: DurationChoice::Seconds20,
-            idle_resume: Some(DurationChoice::Seconds10),
+            idle_resume: AutoResumeDelay::default(),
             panel_transparency: 0,
             meter_mode: MeterMode::Dbfs,
             wav_profile: WavExportProfile::default(),
@@ -86,14 +87,12 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
             .filter(|path| path.is_absolute() && !path.as_os_str().as_encoded_bytes().contains(&0));
         let restored = SessionSettings {
             retention: read_duration("history_seconds").unwrap_or(defaults.retention),
-            idle_resume: if fields
-                .get("idle_resume_seconds")
-                .is_some_and(|value| value == "0")
-            {
-                None
-            } else {
-                read_duration("idle_resume_seconds").or(defaults.idle_resume)
-            },
+            // Older projects used idle_resume_seconds=0 for Off.
+            idle_resume: fields
+                .get(AUTO_RESUME_FIELD)
+                .and_then(|value| value.parse().ok())
+                .and_then(AutoResumeDelay::from_seconds)
+                .unwrap_or(defaults.idle_resume),
             panel_transparency: fields
                 .get("panel_transparency")
                 .and_then(|value| value.parse().ok())
@@ -138,11 +137,8 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                 settings.retention.seconds().to_string(),
             ),
             (
-                "idle_resume_seconds".into(),
-                settings
-                    .idle_resume
-                    .map_or(0, DurationChoice::seconds)
-                    .to_string(),
+                AUTO_RESUME_FIELD.into(),
+                settings.idle_resume.seconds().to_string(),
             ),
             (
                 "panel_transparency".into(),

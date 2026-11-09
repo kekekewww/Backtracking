@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -7,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{
-    DurationChoice, MeterReadings, Snapshot, WavExportProfile, WavSampleFormat,
+    AutoResumeDelay, DurationChoice, MeterReadings, Snapshot, WavExportProfile, WavSampleFormat,
     export_wav_with_profile, waveform,
 };
 use egui::{Color32, CursorIcon, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
@@ -51,9 +52,10 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
             context_menu_position: None,
             frozen: None,
             selection: None,
+            selection_ready_for_drag: false,
             gesture: None,
             export: None,
-            export_requested: false,
+            pending_exports: VecDeque::new(),
             exported: None,
             revision: 0,
             native_dragging: Arc::new(AtomicBool::new(false)),
@@ -73,9 +75,10 @@ pub struct CaptureUi {
     context_menu_position: Option<Pos2>,
     frozen: Option<Arc<Snapshot>>,
     selection: Option<Range<f32>>,
+    selection_ready_for_drag: bool,
     gesture: Option<Gesture>,
     export: Option<ExportJob>,
-    export_requested: bool,
+    pending_exports: VecDeque<ExportRequest>,
     exported: Option<ExportedWav>,
     revision: u64,
     native_dragging: Arc<AtomicBool>,
@@ -83,8 +86,15 @@ pub struct CaptureUi {
 }
 
 enum Gesture {
-    Select { anchor: f32, current: f32 },
-    Drag { origin: Pos2 },
+    Select {
+        anchor: f32,
+        current: f32,
+    },
+    Drag {
+        origin: Pos2,
+    },
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    SaveOnly,
 }
 
 enum FolderAction {
@@ -106,6 +116,32 @@ struct ExportJob {
     revision: u64,
     profile: WavExportProfile,
     worker: JoinHandle<io::Result<PathBuf>>,
+}
+
+struct ExportRequest {
+    revision: u64,
+    profile: WavExportProfile,
+    immediate: bool,
+    output: PathBuf,
+    snapshot: Arc<Snapshot>,
+    range: Range<usize>,
+}
+
+impl ExportRequest {
+    fn write(self) -> io::Result<PathBuf> {
+        let samples = self
+            .snapshot
+            .frames(self.range)
+            .ok_or_else(|| io::Error::other("invalid audio selection"))?;
+        export_wav_with_profile(
+            &self.output,
+            self.snapshot.sample_rate,
+            self.snapshot.channels,
+            samples,
+            self.profile,
+        )?
+        .canonicalize()
+    }
 }
 
 struct ExportedWav {
@@ -145,13 +181,13 @@ impl NiceEguiApp for CaptureUi {
             if retention_changed || output_changed || format_changed {
                 self.message.clear();
                 if self.gesture.take().is_some() {
-                    self.session.set_gesture_active(false);
+                    self.session.end_waveform_gesture();
                 }
             }
         }
         let mut paused = self.session.is_paused();
         self.collect_export();
-        self.refresh_waveform(paused);
+        self.refresh_waveform(paused, settings.idle_resume);
 
         if ui.input(|input| input.pointer.any_pressed()) {
             self.session.mark_interaction();
@@ -227,7 +263,14 @@ impl NiceEguiApp for CaptureUi {
             context_at,
         );
         let configured_seconds = settings.retention.seconds() as f32;
-        self.interact_waveform(ui, frame, rect, configured_seconds, !settings_open);
+        self.interact_waveform(
+            ui,
+            frame,
+            rect,
+            configured_seconds,
+            settings.idle_resume,
+            !settings_open,
+        );
         self.draw_waveform(
             ui,
             rect,
@@ -268,18 +311,20 @@ impl NiceEguiApp for CaptureUi {
         self.recording_since = None;
         self.context_menu_position = None;
         if !self.native_dragging.load(Ordering::Acquire) {
-            self.session.set_gesture_active(false);
+            self.session.end_waveform_gesture();
+        }
+        if self.pending_exports.iter().any(|request| request.immediate) {
+            self.finish_exports();
         }
     }
 }
 
 impl Drop for CaptureUi {
     fn drop(&mut self) {
-        if let Some(job) = self.export.take() {
-            // Do not leave plugin code running on a detached worker after library unload.
-            let _ = job.worker.join();
+        if !self.native_dragging.load(Ordering::Acquire) {
+            self.session.end_waveform_gesture();
         }
-        self.session.set_gesture_active(false);
+        self.finish_exports();
     }
 }
 
@@ -425,11 +470,10 @@ impl CaptureUi {
                             ui.end_row();
                             ui.label("Auto-resume");
                             ui.horizontal(|ui| {
-                                ui.selectable_value(&mut idle_resume, None, "Off");
-                                for duration in DURATIONS {
+                                for duration in AutoResumeDelay::ALL {
                                     ui.selectable_value(
                                         &mut idle_resume,
-                                        Some(duration),
+                                        duration,
                                         format!("{} s", duration.seconds()),
                                     );
                                 }
@@ -443,7 +487,7 @@ impl CaptureUi {
                 settings.retention = retention;
                 self.reset_frozen();
                 self.message.clear();
-                self.refresh_waveform(paused);
+                self.refresh_waveform(paused, settings.idle_resume);
             }
             if idle_resume != settings.idle_resume {
                 self.session.set_idle_resume(idle_resume);
@@ -535,12 +579,20 @@ impl CaptureUi {
         was_open || shown
     }
 
-    fn refresh_waveform(&mut self, paused: bool) {
-        if paused && self.frozen.is_some() {
-            return;
-        }
-        if !paused && self.frozen.is_some() {
-            self.reset_frozen();
+    fn refresh_waveform(&mut self, paused: bool, idle_resume: AutoResumeDelay) {
+        if self.frozen.is_some() {
+            if paused {
+                return;
+            }
+            if idle_resume == AutoResumeDelay::Immediate {
+                // The selected preview stays linked to its snapshot while capture continues.
+                if self.selection_ready_for_drag {
+                    return;
+                }
+                self.clear_frozen_preview();
+            } else {
+                self.reset_frozen();
+            }
         }
         if Instant::now() < self.next_refresh {
             return;
@@ -569,13 +621,13 @@ impl CaptureUi {
             self.session.resume();
             self.reset_frozen();
         } else {
-            self.freeze_capture();
+            self.session.pause();
+            self.cache_frozen_snapshot();
         }
         ui.ctx().request_repaint();
     }
 
-    fn freeze_capture(&mut self) {
-        self.session.pause();
+    fn cache_frozen_snapshot(&mut self) {
         if self.frozen.is_none()
             && let Some(snapshot) = self.session.snapshot()
         {
@@ -595,15 +647,24 @@ impl CaptureUi {
     }
 
     fn reset_frozen(&mut self) {
+        self.clear_frozen_preview();
+        self.invalidate_export();
+    }
+
+    fn clear_frozen_preview(&mut self) {
         self.frozen = None;
         self.selection = None;
-        self.invalidate_export();
+        self.selection_ready_for_drag = false;
         self.next_refresh = Instant::now();
     }
 
     fn invalidate_export(&mut self) {
+        self.next_export_revision();
+        self.pending_exports.retain(|request| request.immediate);
+    }
+
+    fn next_export_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
-        self.export_requested = false;
         self.exported = None;
     }
 
@@ -656,6 +717,8 @@ impl CaptureUi {
             && match &self.gesture {
                 Some(Gesture::Select { .. }) => false,
                 Some(Gesture::Drag { .. }) => true,
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                Some(Gesture::SaveOnly) => true,
                 None => {
                     allow_hover
                         && ui.input(|input| {
@@ -708,6 +771,8 @@ impl CaptureUi {
         let hint = match &self.gesture {
             Some(Gesture::Select { .. }) => "Drag to Select".into(),
             Some(Gesture::Drag { .. }) => "Drag and Drop".into(),
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            Some(Gesture::SaveOnly) => return,
             None if down => return,
             None if modifier => "Drag to Select".into(),
             None => {
@@ -761,6 +826,7 @@ impl CaptureUi {
         frame: &Frame,
         rect: Rect,
         seconds: f32,
+        idle_resume: AutoResumeDelay,
         allow_new_gesture: bool,
     ) {
         let (position, pressed, down, selecting) = ui.input(|input| {
@@ -779,8 +845,16 @@ impl CaptureUi {
             && pressed
             && let Some(position) = position.filter(|position| rect.contains(*position))
         {
-            self.session.set_gesture_active(true);
-            self.freeze_capture();
+            self.session.begin_waveform_gesture();
+            if idle_resume == AutoResumeDelay::Immediate {
+                if selecting && self.selection_ready_for_drag {
+                    self.clear_frozen_preview();
+                }
+                if self.frozen.is_none() {
+                    self.next_export_revision();
+                }
+            }
+            self.cache_frozen_snapshot();
             if selecting {
                 let anchor = position_in_audio(self.audio_rect(rect, seconds), position.x);
                 self.gesture = Some(Gesture::Select {
@@ -788,6 +862,7 @@ impl CaptureUi {
                     current: anchor,
                 });
             } else {
+                self.selection_ready_for_drag = false;
                 self.begin_export();
                 self.gesture = Some(Gesture::Drag { origin: position });
             }
@@ -815,10 +890,15 @@ impl CaptureUi {
             if let Gesture::Select { anchor, current } = gesture {
                 let range = anchor.min(current)..anchor.max(current);
                 self.selection = (range.end > range.start).then_some(range);
-                self.invalidate_export();
+                self.selection_ready_for_drag = self.selection.is_some();
+                if idle_resume == AutoResumeDelay::Immediate {
+                    self.next_export_revision();
+                } else {
+                    self.invalidate_export();
+                }
                 self.begin_export();
             }
-            self.session.set_gesture_active(false);
+            self.session.end_waveform_gesture();
         }
     }
 
@@ -829,14 +909,18 @@ impl CaptureUi {
             .exported
             .as_ref()
             .is_some_and(|file| file.profile == profile)
+            || self
+                .export
+                .as_ref()
+                .is_some_and(|job| job.revision == self.revision && job.profile == profile)
+            || self
+                .pending_exports
+                .iter()
+                .any(|request| request.revision == self.revision && request.profile == profile)
         {
             return;
         }
         self.exported = None;
-        if self.export.is_some() {
-            self.export_requested = true;
-            return;
-        }
         let Some(snapshot) = self
             .frozen
             .as_ref()
@@ -852,32 +936,45 @@ impl CaptureUi {
             let last = (range.end * frames as f32).ceil() as usize;
             first.min(frames - 1)..last.clamp(first.min(frames - 1) + 1, frames)
         });
-        let output = settings.output_dir;
+        let request = ExportRequest {
+            revision: self.revision,
+            profile,
+            immediate: settings.idle_resume == AutoResumeDelay::Immediate,
+            output: settings.output_dir,
+            snapshot,
+            range,
+        };
+        if self.export.is_some() || !self.pending_exports.is_empty() {
+            if !request.immediate {
+                self.pending_exports.retain(|request| request.immediate);
+            }
+            self.pending_exports.push_back(request);
+        } else {
+            self.spawn_export(request);
+        }
+    }
+
+    fn spawn_export(&mut self, request: ExportRequest) {
+        let revision = request.revision;
+        let profile = request.profile;
         let worker = thread::Builder::new()
             .name("backtracking-wav".into())
-            .spawn(move || {
-                let samples = snapshot
-                    .frames(range)
-                    .ok_or_else(|| io::Error::other("invalid audio selection"))?;
-                export_wav_with_profile(
-                    &output,
-                    snapshot.sample_rate,
-                    snapshot.channels,
-                    samples,
-                    profile,
-                )?
-                .canonicalize()
-            });
+            .spawn(move || request.write());
         match worker {
             Ok(worker) => {
                 self.export = Some(ExportJob {
-                    revision: self.revision,
+                    revision,
                     profile,
                     worker,
                 });
-                self.message = "Writing WAV…".into();
+                if revision == self.revision {
+                    self.message = "Writing WAV…".into();
+                }
             }
-            Err(error) => self.message = format!("Could not start export: {error}"),
+            Err(error) if revision == self.revision => {
+                self.message = format!("Could not start export: {error}");
+            }
+            Err(_) => {}
         }
     }
 
@@ -885,29 +982,42 @@ impl CaptureUi {
         if self
             .export
             .as_ref()
-            .is_none_or(|job| !job.worker.is_finished())
+            .is_some_and(|job| !job.worker.is_finished())
         {
             return;
         }
-        let Some(job) = self.export.take() else {
-            return;
-        };
-        let result = job.worker.join();
-        if job.revision == self.revision && job.profile == self.session.settings().wav_profile {
-            match result {
-                Ok(Ok(path)) => {
-                    self.message = format!("Saved {}", path.display());
-                    self.exported = Some(ExportedWav {
-                        profile: job.profile,
-                        path,
-                    });
+        if let Some(job) = self.export.take() {
+            let result = job.worker.join();
+            if job.revision == self.revision && job.profile == self.session.settings().wav_profile {
+                match result {
+                    Ok(Ok(path)) => {
+                        self.message = format!("Saved {}", path.display());
+                        self.exported = Some(ExportedWav {
+                            profile: job.profile,
+                            path,
+                        });
+                    }
+                    Ok(Err(error)) => self.message = format!("Could not save WAV: {error}"),
+                    Err(_) => self.message = "WAV export worker stopped unexpectedly.".into(),
                 }
-                Ok(Err(error)) => self.message = format!("Could not save WAV: {error}"),
-                Err(_) => self.message = "WAV export worker stopped unexpectedly.".into(),
             }
         }
-        if std::mem::take(&mut self.export_requested) {
-            self.begin_export();
+        if let Some(request) = self.pending_exports.pop_front() {
+            self.spawn_export(request);
+        }
+    }
+
+    fn finish_exports(&mut self) {
+        if let Some(job) = self.export.take() {
+            // Do not leave plugin code running on a detached worker after library unload.
+            let _ = job.worker.join();
+        }
+        for request in self
+            .pending_exports
+            .drain(..)
+            .filter(|request| request.immediate)
+        {
+            let _ = request.write();
         }
     }
 
@@ -933,21 +1043,21 @@ impl CaptureUi {
             drag::DragItem::Files(vec![path]),
             drag::Image::Raw(DRAG_ICON.to_vec()),
             move |_, _| {
-                session.set_gesture_active(false);
+                session.end_waveform_gesture();
                 dragging.store(false, Ordering::Release);
             },
             drag::Options::default(),
         );
         if let Err(error) = result {
             self.native_dragging.store(false, Ordering::Release);
-            self.session.set_gesture_active(false);
+            self.session.end_waveform_gesture();
             self.message = format!("Could not start file drag: {error}");
         }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn start_native_drag(&mut self, _frame: &Frame, path: PathBuf, _origin: Pos2) {
-        self.session.set_gesture_active(false);
+        self.gesture = Some(Gesture::SaveOnly);
         self.message = format!(
             "WAV saved. Drag the file from its folder: {}",
             path.display()
@@ -1105,7 +1215,7 @@ mod mac_drag {
 
     impl Drop for Completion {
         fn drop(&mut self) {
-            self.session.set_gesture_active(false);
+            self.session.end_waveform_gesture();
             self.dragging.store(false, Ordering::Release);
         }
     }

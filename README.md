@@ -19,7 +19,7 @@ Backtracking 是給作曲與混音用的回溯錄音取樣器。聽到想留下�
 3. 未框選時，在波形任意位置點擊可存下整段保留音訊，按住拖曳可把整段 WAV 送入 DAW。若只需其中一段，Windows 用 `Ctrl`、macOS 用 `Option` 加拖曳可框選起訖點，再點擊或拖出波形變色的區間。
 4. 在完整介面用工具列的 **Play／Pause** 啟用或暫停錄音。紅燈閃爍時正在收錄。操作波形也會暫停錄音，完成後可選 **Play** 或等待已設定的自動續錄。
 
-齒輪旁的即時音量表可顯示 **dBFS、VU 或瞬時 LUFS**。點齒輪或按右鍵可開啟相同的設定選單。**只顯示波形** 預設關閉，開啟後畫面只保留波形，可從右鍵選單啟用或暫停錄音，也可切回完整介面。桌面版可拖曳視窗內緣縮成細條。自動續錄的初始設定是 **10 秒**。清除錄音只會清空記憶體中的擷取內容。
+齒輪旁的即時音量表可顯示 **dBFS、VU 或瞬時 LUFS**。點齒輪或按右鍵可開啟相同的設定選單。**只顯示波形** 預設關閉，開啟後畫面只保留波形，可從右鍵選單啟用或暫停錄音，也可切回完整介面。桌面版可拖曳視窗內緣縮成細條。自動續錄可選 **0、5 或 10 秒**，預設 10 秒。選 0 秒會在波形操作完成後立刻恢復待命。清除錄音只會清空記憶體中的擷取內容。
 
 Windows 和 macOS 桌面版採用無邊框視窗，可直接在工具列切換置頂，或從設定選單結束程式。
 
@@ -46,7 +46,7 @@ Backtracking is a retrospective audio sampler for music production and mixing. W
 3. With no selection, click anywhere on the waveform to save all retained audio, or hold and drag to drop the full WAV into your DAW. For a shorter clip, hold `Ctrl` on Windows or `Option` on macOS while dragging to select a range, then click or drag out the section shown in a different waveform color.
 4. In the full interface, use the toolbar's **Play/Pause** control to arm or pause capture. A blinking red indicator means audio is being recorded. Working with the waveform also pauses capture. Choose **Play** when done or let the configured auto-resume timer re-arm capture.
 
-The live meter next to the gear can show **dBFS, VU, or momentary LUFS**. Click the gear or right-click to open the same settings menu. **Show waveform only** defaults to Off. When enabled, only the waveform is visible. Use the right-click menu to arm or pause capture, or to restore the full interface. On desktop, drag an inside edge to resize it into a thin strip. Auto-resume defaults to **10 seconds**. The clear action empties the audio held in memory.
+The live meter next to the gear can show **dBFS, VU, or momentary LUFS**. Click the gear or right-click to open the same settings menu. **Show waveform only** defaults to Off. When enabled, only the waveform is visible. Use the right-click menu to arm or pause capture, or to restore the full interface. On desktop, drag an inside edge to resize it into a thin strip. Auto-resume offers **0, 5, or 10 seconds**, with 10 seconds as the default. At 0 seconds, capture re-arms as soon as the waveform gesture ends. The clear action empties the audio held in memory.
 
 The Windows and macOS desktop apps use a frameless window. Use **Keep on top** in the toolbar or **Quit** in the settings menu.
 

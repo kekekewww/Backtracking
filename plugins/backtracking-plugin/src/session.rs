@@ -5,7 +5,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{
-    AudioQueue, Capture, CaptureState, DurationChoice, MeterReadings, Snapshot, WavExportProfile,
+    AudioQueue, AutoResumeDelay, Capture, CaptureState, DurationChoice, MeterReadings, Snapshot,
+    WavExportProfile,
 };
 
 use crate::settings::{MeterMode, SessionSettings, SettingsStore};
@@ -74,7 +75,7 @@ impl Consumer {
 
 struct State {
     retention: DurationChoice,
-    idle_resume: Option<DurationChoice>,
+    idle_resume: AutoResumeDelay,
     consumer: Option<Consumer>,
     paused: bool,
     gesture_active: bool,
@@ -146,7 +147,7 @@ impl Session {
         self.apply_capture_settings(&mut self.lock());
     }
 
-    pub(crate) fn set_idle_resume(&self, idle_resume: Option<DurationChoice>) {
+    pub(crate) fn set_idle_resume(&self, idle_resume: AutoResumeDelay) {
         self.settings.lock().idle_resume = idle_resume;
         self.apply_capture_settings(&mut self.lock());
     }
@@ -171,6 +172,10 @@ impl Session {
     pub(crate) fn pause(&self) {
         let mut state = self.lock();
         self.apply_capture_settings(&mut state);
+        self.pause_locked(&mut state);
+    }
+
+    fn pause_locked(&self, state: &mut State) {
         state.last_interaction = Instant::now();
         if state.paused {
             return;
@@ -221,6 +226,29 @@ impl Session {
         let mut state = self.lock();
         state.gesture_active = active;
         state.last_interaction = Instant::now();
+    }
+
+    pub(crate) fn begin_waveform_gesture(&self) {
+        let mut state = self.lock();
+        self.apply_capture_settings(&mut state);
+        state.gesture_active = true;
+        self.pause_locked(&mut state);
+    }
+
+    pub(crate) fn end_waveform_gesture(&self) {
+        let mut state = self.lock();
+        self.apply_capture_settings(&mut state);
+        if !state.gesture_active {
+            return;
+        }
+        state.gesture_active = false;
+        state.last_interaction = Instant::now();
+        if state.paused && state.idle_resume == AutoResumeDelay::Immediate {
+            Self::resume_locked(&mut state);
+            if let Some(consumer) = &mut state.consumer {
+                self.accept_input_when_safe(consumer);
+            }
+        }
     }
 
     pub(crate) fn snapshot(&self) -> Option<Snapshot> {
@@ -275,9 +303,9 @@ impl Session {
         self.apply_capture_settings(&mut state);
         if state.paused
             && !state.gesture_active
-            && state.idle_resume.is_some_and(|delay| {
-                state.last_interaction.elapsed() >= Duration::from_secs(u64::from(delay.seconds()))
-            })
+            && state.idle_resume != AutoResumeDelay::Immediate
+            && state.last_interaction.elapsed()
+                >= Duration::from_secs(u64::from(state.idle_resume.seconds()))
         {
             Self::resume_locked(&mut state);
         }
@@ -293,7 +321,13 @@ impl Session {
         } else {
             consumer.queue.discard_pending();
         }
-        if !accepting && !paused && !self.writer_active.load(Ordering::SeqCst) {
+        if !accepting && !paused {
+            self.accept_input_when_safe(consumer);
+        }
+    }
+
+    fn accept_input_when_safe(&self, consumer: &mut Consumer) {
+        if !self.writer_active.load(Ordering::SeqCst) {
             // A callback may have started just before Pause. Clear anything it published after
             // the frozen snapshot before accepting input again.
             consumer.queue.discard_pending();
@@ -432,7 +466,7 @@ mod tests {
             Session::new(SettingsStore::default())
                 .settings()
                 .idle_resume,
-            Some(DurationChoice::Seconds10)
+            AutoResumeDelay::Seconds10
         );
     }
 
@@ -450,13 +484,13 @@ mod tests {
 
         settings.set(BTreeMap::from([
             ("history_seconds".into(), "10".into()),
-            ("idle_resume_seconds".into(), "0".into()),
+            ("auto_resume_delay_seconds".into(), "5".into()),
         ]));
         session.consume();
 
         assert_eq!(session.snapshot().unwrap().frame_count(), 10_000);
         assert!(!session.is_paused());
-        assert_eq!(session.lock().idle_resume, None);
+        assert_eq!(session.lock().idle_resume, AutoResumeDelay::Seconds5);
     }
 
     #[test]
@@ -535,19 +569,62 @@ mod tests {
 
     #[test]
     fn idle_resume_waits_until_the_current_gesture_has_ended() {
-        let session = Session::new(SettingsStore::default());
-        session.pause();
-        session.set_idle_resume(Some(DurationChoice::Seconds10));
-        session.set_gesture_active(true);
-        session.lock().last_interaction = Instant::now() - Duration::from_secs(11);
-        session.consume();
-        assert!(session.is_paused());
+        for delay in [AutoResumeDelay::Seconds5, AutoResumeDelay::Seconds10] {
+            let session = Session::new(SettingsStore::default());
+            session.set_idle_resume(delay);
+            session.begin_waveform_gesture();
+            let after_delay = Instant::now() - Duration::from_secs(u64::from(delay.seconds()) + 1);
+            session.lock().last_interaction = after_delay;
+            session.consume();
+            assert!(session.is_paused());
 
-        session.set_gesture_active(false);
+            session.end_waveform_gesture();
+            session.consume();
+            assert!(session.is_paused());
+            session.lock().last_interaction = after_delay;
+            session.consume();
+            assert!(!session.is_paused());
+        }
+    }
+
+    #[test]
+    fn immediate_resume_follows_waveform_release_but_respects_manual_pause() {
+        let session = Arc::new(Session::new(SettingsStore::default()));
+        let mut worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
+        // Verify the first block after release without relying on the periodic worker.
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+        session.set_idle_resume(AutoResumeDelay::Immediate);
+        session.begin_waveform_gesture();
         session.consume();
         assert!(session.is_paused());
-        session.lock().last_interaction = Instant::now() - Duration::from_secs(11);
-        session.consume();
+        worker.push(&[&mut [0.25; 32]]);
+
+        session.end_waveform_gesture();
         assert!(!session.is_paused());
+        worker.push(&[&mut [0.5; 32]]);
+
+        session.pause();
+        assert_eq!(session.snapshot().unwrap().samples, vec![0.5; 32]);
+        session.consume();
+        assert!(session.is_paused());
+        session.end_waveform_gesture();
+        assert!(session.is_paused());
+        session.resume();
+        assert!(!session.is_paused());
+    }
+
+    #[test]
+    fn legacy_idle_resume_values_do_not_enable_immediate_resume() {
+        let settings = SettingsStore::default();
+        for value in ["0", "10", "20", "30"] {
+            settings.set(BTreeMap::from([(
+                "idle_resume_seconds".into(),
+                value.into(),
+            )]));
+            assert_eq!(settings.lock().idle_resume, AutoResumeDelay::Seconds10);
+        }
     }
 }

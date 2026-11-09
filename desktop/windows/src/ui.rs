@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -9,7 +10,7 @@ use std::time::{Duration, Instant};
 use crate::controller::Controller;
 use crate::preferences::{Key, MeterMode, Preferences, Settings, wav_sample_format_preference};
 use backtracking_core::{
-    DurationChoice, MeterReadings, Snapshot, WavExportProfile, WavSampleFormat,
+    AutoResumeDelay, DurationChoice, MeterReadings, Snapshot, WavExportProfile, WavSampleFormat,
     export_wav_with_profile, waveform,
 };
 use eframe::egui::{
@@ -49,6 +50,7 @@ const MIN_WIDTH: f32 = 510.0;
 const FULL_MIN_HEIGHT: f32 = 132.0;
 const WAVEFORM_MIN_HEIGHT: f32 = 48.0;
 const SETTINGS_MIN_HEIGHT: f32 = 112.0;
+const WRITING_WAV: &str = "Writing WAV…";
 
 pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
     let preferences = Preferences::for_current_user();
@@ -131,7 +133,7 @@ struct Recorder {
     pinned: bool,
     waveform_only: bool,
     settings_restore_height: Option<f32>,
-    idle_resume: Option<DurationChoice>,
+    idle_resume: AutoResumeDelay,
     transparency: u8,
     meter_mode: MeterMode,
     wav_profile: WavExportProfile,
@@ -147,7 +149,7 @@ struct Recorder {
     gesture: Option<Gesture>,
     window_command: Option<ViewportCommand>,
     export: Option<ExportJob>,
-    export_again: bool,
+    pending_exports: VecDeque<ExportClip>,
     clip_revision: u64,
     exported: Option<PathBuf>,
     message: String,
@@ -189,6 +191,31 @@ struct ExportJob {
     worker: JoinHandle<io::Result<PathBuf>>,
 }
 
+struct ExportClip {
+    revision: u64,
+    snapshot: Arc<Snapshot>,
+    frames: Range<usize>,
+    output: PathBuf,
+    profile: WavExportProfile,
+    immediate: bool,
+}
+
+impl ExportClip {
+    fn write(self) -> io::Result<PathBuf> {
+        let samples = self
+            .snapshot
+            .frames(self.frames)
+            .ok_or_else(|| io::Error::other("invalid audio selection"))?;
+        export_wav_with_profile(
+            &self.output,
+            self.snapshot.sample_rate,
+            self.snapshot.channels,
+            samples,
+            self.profile,
+        )
+    }
+}
+
 impl Recorder {
     fn new(mut controller: Controller, preferences: Preferences, settings: Settings) -> Self {
         controller.set_retention(settings.history);
@@ -215,7 +242,7 @@ impl Recorder {
             gesture: None,
             window_command: None,
             export: None,
-            export_again: false,
+            pending_exports: VecDeque::new(),
             clip_revision: 0,
             exported: None,
             message: String::new(),
@@ -242,6 +269,7 @@ impl Recorder {
         if self.snapshot.is_none()
             && let Some(snapshot) = self.controller.snapshot()
         {
+            self.advance_clip_revision();
             self.seconds = snapshot.frame_count() as f32 / snapshot.sample_rate.max(1) as f32;
             waveform::peaks(
                 &snapshot.samples,
@@ -254,11 +282,26 @@ impl Recorder {
     }
 
     fn clear_snapshot(&mut self) {
+        self.reset_snapshot();
+        self.invalidate_export();
+    }
+
+    fn reset_snapshot(&mut self) {
         self.snapshot = None;
         self.selection = None;
         self.live_revision = None;
         self.next_refresh = Instant::now();
-        self.invalidate_export();
+    }
+
+    fn finish_waveform_gesture(&mut self, keep_selection: bool) {
+        self.last_interaction = Instant::now();
+        if self.idle_resume == AutoResumeDelay::Immediate {
+            self.controller.resume();
+            if !self.controller.is_paused() && !keep_selection {
+                // Let the current WAV finish. A new snapshot will invalidate its cache.
+                self.reset_snapshot();
+            }
+        }
     }
 
     fn clear_capture(&mut self) {
@@ -274,9 +317,16 @@ impl Recorder {
     }
 
     fn invalidate_export(&mut self) {
+        self.advance_clip_revision();
+        self.pending_exports.retain(|clip| clip.immediate);
+    }
+
+    fn advance_clip_revision(&mut self) {
         self.clip_revision = self.clip_revision.wrapping_add(1);
         self.exported = None;
-        self.export_again = false;
+        if self.message == WRITING_WAV {
+            self.message.clear();
+        }
     }
 
     fn refresh_waveform(&mut self) {
@@ -642,17 +692,15 @@ impl Recorder {
                             ui.label("Auto-resume");
                             ui.horizontal(|ui| {
                                 let before = self.idle_resume;
-                                ui.selectable_value(&mut self.idle_resume, None, "Off");
-                                for value in DURATIONS {
+                                for value in AutoResumeDelay::ALL {
                                     ui.selectable_value(
                                         &mut self.idle_resume,
-                                        Some(value),
+                                        value,
                                         format!("{} s", value.seconds()),
                                     );
                                 }
                                 if self.idle_resume != before {
-                                    let seconds =
-                                        self.idle_resume.map_or(0, DurationChoice::seconds);
+                                    let seconds = self.idle_resume.seconds();
                                     self.save_preference(Key::IdleResume, seconds.to_string());
                                 }
                             });
@@ -748,6 +796,7 @@ impl Recorder {
     }
 
     fn select_save_folder(&mut self, frame: &eframe::Frame) {
+        let was_paused = self.controller.is_paused();
         self.controller.pause();
         if let Some(folder) = rfd::FileDialog::new()
             .set_title("Select save folder")
@@ -774,6 +823,9 @@ impl Recorder {
             };
         }
         self.last_interaction = Instant::now();
+        if !was_paused && self.idle_resume == AutoResumeDelay::Immediate {
+            self.controller.resume();
+        }
     }
 
     fn wav_settings(&mut self, ui: &mut egui::Ui) {
@@ -809,11 +861,17 @@ impl Recorder {
     }
 
     fn start_export(&mut self) {
-        if self.exported.is_some() {
-            return;
-        }
-        if let Some(job) = &self.export {
-            self.export_again = job.revision != self.clip_revision;
+        let revision = self.clip_revision;
+        if self.exported.is_some()
+            || self
+                .export
+                .as_ref()
+                .is_some_and(|job| job.revision == revision)
+            || self
+                .pending_exports
+                .iter()
+                .any(|clip| clip.revision == revision)
+        {
             return;
         }
         let Some(snapshot) = self
@@ -831,28 +889,35 @@ impl Recorder {
             let end = ((selection.end * frames as f32).ceil() as usize).clamp(start + 1, frames);
             start..end
         });
-        let output = self.output.clone();
-        let profile = self.wav_profile;
+        let clip = ExportClip {
+            revision,
+            snapshot,
+            frames: frames_to_export,
+            output: self.output.clone(),
+            profile: self.wav_profile,
+            immediate: self.idle_resume == AutoResumeDelay::Immediate,
+        };
+        if self.export.is_none() && self.pending_exports.is_empty() {
+            self.spawn_export(clip);
+        } else {
+            if !clip.immediate {
+                self.pending_exports.retain(|clip| clip.immediate);
+            }
+            self.pending_exports.push_back(clip);
+        }
+    }
+
+    fn spawn_export(&mut self, clip: ExportClip) {
+        let revision = clip.revision;
         match thread::Builder::new()
             .name("backtracking-wav".into())
-            .spawn(move || {
-                let samples = snapshot
-                    .frames(frames_to_export)
-                    .ok_or_else(|| io::Error::other("invalid audio selection"))?;
-                export_wav_with_profile(
-                    &output,
-                    snapshot.sample_rate,
-                    snapshot.channels,
-                    samples,
-                    profile,
-                )
-            }) {
+            .spawn(move || clip.write())
+        {
             Ok(worker) => {
-                self.export = Some(ExportJob {
-                    worker,
-                    revision: self.clip_revision,
-                });
-                self.message = "Writing WAV…".into();
+                self.export = Some(ExportJob { worker, revision });
+                if revision == self.clip_revision {
+                    self.message = WRITING_WAV.into();
+                }
             }
             Err(error) => self.message = format!("Could not start export: {error}"),
         }
@@ -862,26 +927,25 @@ impl Recorder {
         if self
             .export
             .as_ref()
-            .is_none_or(|job| !job.worker.is_finished())
+            .is_some_and(|job| !job.worker.is_finished())
         {
             return;
         }
-        let Some(job) = self.export.take() else {
-            return;
-        };
-        let result = job.worker.join();
-        if job.revision == self.clip_revision {
-            match result {
-                Ok(Ok(path)) => {
-                    self.message = format!("Saved {}", path.display());
-                    self.exported = Some(path);
+        if let Some(job) = self.export.take() {
+            let result = job.worker.join();
+            if job.revision == self.clip_revision {
+                match result {
+                    Ok(Ok(path)) => {
+                        self.message = format!("Saved {}", path.display());
+                        self.exported = Some(path);
+                    }
+                    Ok(Err(error)) => self.message = format!("Could not save WAV: {error}"),
+                    Err(_) => self.message = "WAV export worker stopped unexpectedly.".into(),
                 }
-                Ok(Err(error)) => self.message = format!("Could not save WAV: {error}"),
-                Err(_) => self.message = "WAV export worker stopped unexpectedly.".into(),
             }
         }
-        if std::mem::take(&mut self.export_again) {
-            self.start_export();
+        if let Some(clip) = self.pending_exports.pop_front() {
+            self.spawn_export(clip);
         }
     }
 
@@ -916,6 +980,9 @@ impl Recorder {
             && response.contains_pointer()
             && let Some(position) = position
         {
+            if selecting && !self.controller.is_paused() {
+                self.reset_snapshot();
+            }
             self.freeze();
             if selecting {
                 let start = fraction(self.audio_rect(rect), position.x);
@@ -942,7 +1009,6 @@ impl Recorder {
                 && position.distance(*origin) >= 4.0
             {
                 let file = file.clone();
-                self.gesture = None;
                 // OLE holds the UI thread until the mouse is released.
                 if let Err(error) = drag::start_drag(
                     frame,
@@ -952,19 +1018,25 @@ impl Recorder {
                     drag::Options::default(),
                 ) {
                     self.message = format!("Could not start file drag: {error}");
+                    self.gesture = Some(Gesture::Export { origin: position });
+                } else {
+                    self.gesture = None;
+                    self.finish_waveform_gesture(false);
                 }
-                self.last_interaction = Instant::now();
             }
         } else if let Some(gesture) = self.gesture.take() {
-            self.last_interaction = Instant::now();
-            if let Gesture::Select { anchor, cursor } = gesture {
+            let selecting = if let Gesture::Select { anchor, cursor } = gesture {
                 let range = anchor.min(cursor)..anchor.max(cursor);
                 if range.start < range.end {
                     self.selection = Some(range);
-                    self.invalidate_export();
+                    self.advance_clip_revision();
                     self.start_export();
                 }
-            }
+                self.selection.is_some()
+            } else {
+                false
+            };
+            self.finish_waveform_gesture(selecting);
         }
     }
 
@@ -1161,9 +1233,9 @@ impl eframe::App for Recorder {
         self.collect_export();
         if self.controller.is_paused()
             && self.gesture.is_none()
-            && self.idle_resume.is_some_and(|delay| {
-                self.last_interaction.elapsed() >= Duration::from_secs(u64::from(delay.seconds()))
-            })
+            && self.idle_resume != AutoResumeDelay::Immediate
+            && self.last_interaction.elapsed()
+                >= Duration::from_secs(u64::from(self.idle_resume.seconds()))
         {
             self.resume();
         }
@@ -1239,6 +1311,9 @@ impl Drop for Recorder {
     fn drop(&mut self) {
         if let Some(job) = self.export.take() {
             let _ = job.worker.join();
+        }
+        for clip in self.pending_exports.drain(..).filter(|clip| clip.immediate) {
+            let _ = clip.write();
         }
     }
 }

@@ -90,7 +90,9 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 選擇 **Play** 進入錄音待命，或選擇 **Pause** 手動暫停。完整介面使用工具列，只顯示波形時則使用右鍵選單。重新待命後，下一段收錄的音訊會接在原有歷史後方，受保留時間上限約束。
 
-**自動續錄／Auto-resume** 初始設定為 **10 秒**。可在齒輪選單改為 20、30 秒，或選擇 **手動／Off**，只用按鈕控制續錄。手動暫停或操作波形暫停後，會從取樣器視窗內最後一次點擊或手勢結束時開始計時。拖曳進行中會保持暫停。系統會依設定時間恢復待命，音量門檻仍決定何時實際收錄。
+**自動續錄／Auto-resume** 可在設定選單選擇 **0、5 或 10 秒**，預設 **10 秒**。選 **0 秒**時，點擊、框選或拖出 WAV 完成後會立刻恢復待命。框選的片段會保留，可在錄音接續時拖出。手動按 **Pause** 後會維持暫停，直到按 **Play** 或完成下一次波形操作。選 **5 秒**或 **10 秒**時，手動暫停或操作波形後會從取樣器視窗內最後一次點擊或手勢結束時開始計時。拖曳期間會保持暫停。恢復待命後，聲音超過靜音偵測門檻時才會收錄。
+
+舊版儲存的 **Off、20 秒、30 秒**會改用 **10 秒**。
 
 ### 清除目前錄音
 
@@ -142,7 +144,7 @@ Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續�
 | 能存檔，但拖不到 DAW | 等 WAV 完成後再拖，確認落點是可接受音訊檔的時間軸或 Playlist。也可從輸出資料夾將 WAV 拖入或手動匯入。 |
 | 無法寫入 WAV | 確認波形有可用的音訊，再選擇可寫入的存檔資料夾。 |
 
-**離線渲染**。CLAP 在宿主回報離線模式時會略過擷取。VST3 使用的 nice-plug 0.4.2 有時會回報前一次的處理模式，離線渲染仍可能進入回溯歷史。渲染前若要保留目前的素材，請先匯出。若要在渲染期間維持凍結，先關閉自動續錄，再按 **Pause**。
+**離線渲染**。CLAP 在宿主回報離線模式時會略過擷取。VST3 使用的 nice-plug 0.4.2 有時會回報前一次的處理模式，離線渲染仍可能進入回溯歷史。渲染前若要保留目前的素材，請先匯出。若要在渲染期間維持凍結，先將自動續錄設為 **0 秒**，再按 **Pause**。
 
 ## English
 
@@ -232,7 +234,9 @@ When you finish selecting a range, Backtracking prepares its WAV so you can drag
 
 Choose **Play** to arm capture or **Pause** to pause it manually. Use the toolbar in the full interface or the right-click menu in waveform-only mode. Once re-armed, the next sound is appended to the existing history within the selected limit.
 
-**Auto-resume** defaults to **10 seconds**. Open the gear menu to choose 20 or 30 seconds, or select **Off** for manual control. After a manual pause or waveform interaction, the timer starts after the last click in the sampler or the end of a gesture. Capture stays paused during a drag. The timer re-arms capture, and the incoming signal must still cross the silence threshold before audio is recorded.
+**Auto-resume** offers **0, 5, or 10 seconds** in Settings and defaults to **10 seconds**. At **0 seconds**, capture re-arms as soon as you finish clicking, selecting a range, or dragging out a WAV. A selected clip remains available to drag out while capture continues. After you manually press **Pause**, capture stays paused until you press **Play** or finish another waveform gesture. With **5 seconds** or **10 seconds**, the timer starts after the last click in the sampler or the end of a gesture. Capture stays paused during a drag. Once re-armed, capture waits for the incoming signal to cross the silence threshold.
+
+Existing **Off**, **20-second**, and **30-second** settings use the **10-second** default.
 
 ### Clear the current recording
 
@@ -284,7 +288,7 @@ For **VST3 and CLAP**, the DAW project stores each plug-in instance's history le
 | A WAV saves but the DAW refuses the drop | Wait for export to finish and drop on an audio timeline or Playlist. You can also drag the file from the output folder or import it manually. |
 | The WAV could not be written | Check that the waveform contains audio and choose a writable save folder. |
 
-**Offline rendering**. CLAP skips capture when the host reports offline mode. The nice-plug 0.4.2 VST3 wrapper can pass the previous processing mode to Backtracking, so an offline render may enter the capture history. Export important clips before rendering. To keep capture frozen during the render, turn off auto-resume and press **Pause** first.
+**Offline rendering**. CLAP skips capture when the host reports offline mode. The nice-plug 0.4.2 VST3 wrapper can pass the previous processing mode to Backtracking, so an offline render may enter the capture history. Export important clips before rendering. To keep capture frozen during the render, set auto-resume to **0 seconds** and press **Pause** first.
 
 ## 安裝與建置 / Installation and build
 
@@ -366,9 +370,9 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 1. 播放兩小段聲音，中間留一段長靜音。確認波形留下兩段有效音訊。
 
    Play two short sounds with a long pause between them and check that both remain in the waveform.
-2. 將自動續錄設為 **手動／Off**。播放有聲音時確認紅燈閃爍，再按 **Pause**，確認波形停止更新。按 **Play** 重新待命，播放聲音後確認接續收錄。
+2. 將自動續錄設為 **0 秒**。播放有聲音時確認紅燈閃爍，再按 **Pause**，確認波形停止更新。按 **Play** 重新待命，接著框選一段波形，確認放開滑鼠後恢復待命，而且仍能拖出剛選的片段。
 
-   Set auto-resume to **Off**. Play a sound and check that the red indicator blinks. Press **Pause** and check that the waveform freezes. Press **Play**, then play audio and check that capture continues.
+   Set auto-resume to **0 seconds**. Play a sound and check that the red indicator blinks. Press **Pause** and check that the waveform freezes. Press **Play**, then select a range and verify that capture re-arms on release and you can still drag out the selected clip.
 3. 選擇儲存資料夾，將 WAV 設為 44.1 kHz、24-bit PCM。框選一小段並拖進 DAW，再用 **前往儲存資料夾** 確認 WAV 直接存到指定位置，且規格正確。若使用插件，分別在 VST3 和 CLAP 實例操作一次。
 
    Choose a save folder and set the WAV format to 44.1 kHz, 24-bit PCM. Select a short clip and drag it into the DAW. Use **Go to save folder** to check that the WAV is in the selected folder and uses the chosen format. For plug-in use, try a VST3 instance and a CLAP instance.
