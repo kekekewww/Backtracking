@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use backtracking_core::DurationChoice;
+use backtracking_core::{DurationChoice, WavExportProfile, WavSampleFormat};
 
 const MAX_VALUE_BYTES: u64 = 128 * 1024;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -31,6 +31,8 @@ pub(crate) enum Key {
     IdleResume,
     Transparency,
     Meter,
+    WavSampleRate,
+    WavSampleFormat,
     Output,
     AlwaysOnTop,
 }
@@ -42,6 +44,8 @@ impl Key {
             Self::IdleResume => "idle-resume-seconds",
             Self::Transparency => "transparency-percent",
             Self::Meter => "meter-unit",
+            Self::WavSampleRate => "wav-sample-rate",
+            Self::WavSampleFormat => "wav-sample-format",
             Self::Output => "output-folder",
             Self::AlwaysOnTop => "always-on-top",
         }
@@ -53,6 +57,7 @@ pub(crate) struct Settings {
     pub(crate) idle_resume: Option<DurationChoice>,
     pub(crate) transparency: u8,
     pub(crate) meter_mode: MeterMode,
+    pub(crate) wav_profile: WavExportProfile,
     pub(crate) output: PathBuf,
     pub(crate) pinned: bool,
 }
@@ -67,6 +72,7 @@ impl Default for Settings {
             idle_resume: Some(DurationChoice::Seconds10),
             transparency: 0,
             meter_mode: MeterMode::Dbfs,
+            wav_profile: WavExportProfile::default(),
             output: home.join("Backtracking").join("output"),
             pinned: true,
         }
@@ -107,6 +113,15 @@ impl Preferences {
             Some("LUFS") => MeterMode::Lufs,
             _ => MeterMode::Dbfs,
         };
+        if let Some(rate @ (44_100 | 48_000 | 96_000)) = self.read_number(Key::WavSampleRate) {
+            settings.wav_profile.sample_rate = rate;
+        }
+        settings.wav_profile.sample_format =
+            match self.read(Key::WavSampleFormat).as_deref().map(str::trim) {
+                Some("pcm16") => WavSampleFormat::Pcm16,
+                Some("pcm24") => WavSampleFormat::Pcm24,
+                _ => WavSampleFormat::Float32,
+            };
         if let Some(path) = self.read(Key::Output)
             && !path.bytes().any(|byte| byte < 32)
         {
@@ -123,7 +138,7 @@ impl Preferences {
         settings
     }
 
-    fn read_number(&self, key: Key) -> Option<u8> {
+    fn read_number<T: std::str::FromStr>(&self, key: Key) -> Option<T> {
         self.read(key)?.trim().parse().ok()
     }
 
@@ -177,6 +192,14 @@ impl Preferences {
             let _ = fs::remove_file(&temporary);
         }
         result
+    }
+}
+
+pub(crate) fn wav_sample_format_preference(format: WavSampleFormat) -> &'static str {
+    match format {
+        WavSampleFormat::Pcm16 => "pcm16",
+        WavSampleFormat::Pcm24 => "pcm24",
+        WavSampleFormat::Float32 => "float32",
     }
 }
 

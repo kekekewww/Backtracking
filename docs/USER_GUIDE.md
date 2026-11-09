@@ -16,7 +16,7 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 ### 開啟設定
 
-點擊工具列的齒輪，開啟 **設定** 選單。可調整保留時間、自動續錄、背景透明度及專案資料夾。Windows 和 macOS 桌面版的 **置頂／Keep on top** 可直接在工具列切換。插件視窗的位置由 DAW 控制。
+點擊工具列的齒輪，開啟 **設定** 選單。可調整保留時間、自動續錄、背景透明度、WAV 匯出格式及專案資料夾。Windows 和 macOS 桌面版的 **置頂／Keep on top** 可直接在工具列切換。插件視窗的位置由 DAW 控制。
 
 齒輪選單的背景透明度可選 0%、25%、50%、75% 或 100%。0% 為不透明，100% 為透明。桌面版在 100% 時仍可透過齒輪選單調整透明度。VST3／CLAP 的 **Panel transparency** 調整插件內的波形面板背景，實際看到的底色取決於 DAW 的視窗背景。
 
@@ -89,16 +89,29 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 | Windows 桌面版 | `%USERPROFILE%\Backtracking\output\` |
 | VST3／CLAP | 使用者家目錄下的 `Backtracking/output/` |
 
-匯出格式固定為 **48 kHz、32-bit IEEE float WAV**。來源若是 44.1 或 96 kHz，會在匯出時轉成 48 kHz。WAV 保留擷取結果的 mono 或 stereo 聲道配置，Windows 桌面版會將多聲道輸出裝置的混音轉為 stereo。回溯歷史儲存在記憶體，關閉桌面程式或移除插件前，請先存下需要的片段。
+取樣率和編碼可在齒輪選單獨立調整。
+
+| 版本 | 取樣率選項的位置 | 編碼選項的位置 |
+| --- | --- | --- |
+| Windows 桌面版 | **WAV rate** | **WAV encoding** |
+| macOS 桌面版 | **WAV 匯出格式 → 取樣率** | **WAV 匯出格式 → 編碼** |
+| VST3／CLAP | **WAV sample rate** | **WAV sample format** |
+
+| WAV 設定 | 選項 | 預設 |
+| --- | --- | --- |
+| 取樣率 | 44.1 kHz、48 kHz、96 kHz | 48 kHz |
+| 編碼 | 16-bit PCM、24-bit PCM、32-bit IEEE float | 32-bit float |
+
+點擊存檔、框選後匯出及拖曳到 DAW 都使用目前選定的 WAV 規格。錄音與音量表以來源取樣率運作，取樣率轉換在匯出時進行。WAV 保留擷取結果的 mono 或 stereo 聲道配置，Windows 桌面版會將多聲道輸出裝置的混音轉為 stereo。回溯歷史儲存在記憶體，關閉桌面程式或移除插件前，請先存下需要的片段。
 
 ### 保存與還原設定
 
-Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續錄、背景透明度、音量表模式、輸出位置與置頂設定，下次開啟時還原。
+Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續錄、背景透明度、音量表模式、WAV 取樣率與編碼、輸出位置及置頂設定，下次開啟時還原。
 
 - **Windows**。設定儲存在 `%LOCALAPPDATA%\Backtracking\Settings`。若找不到 `LOCALAPPDATA`，則使用 `%APPDATA%\Backtracking\Settings`。程式會以預設視窗尺寸開啟，由系統安排位置。
 - **macOS**。設定儲存在系統的使用者偏好中，也會記住桌面視窗的位置與尺寸。
 
-**VST3／CLAP** 的保留時間、自動續錄、面板透明度、音量表模式和輸出位置由 DAW 專案保存，每個插件實例可獨立設定。修改後請手動儲存專案。重新開啟同一個專案時，DAW 會還原各實例的設定。
+**VST3／CLAP** 的保留時間、自動續錄、面板透明度、音量表模式、WAV 取樣率與編碼、輸出位置由 DAW 專案保存，每個插件實例可獨立設定。修改後請手動儲存專案。重新開啟同一個專案時，DAW 會還原各實例的設定。
 
 ### 排除問題
 
@@ -126,7 +139,7 @@ On Windows, route the source to the default playback device. If a DAW uses ASIO,
 
 ### Open settings
 
-Click the gear in the toolbar to open **Settings**. Use the menu to set the history length, auto-resume delay, background transparency, and project folder. In the Windows and macOS desktop apps, you can toggle **Keep on top** directly from the toolbar. The DAW controls the plug-in window.
+Click the gear in the toolbar to open **Settings**. Use the menu to set the history length, auto-resume delay, background transparency, WAV export format, and project folder. In the Windows and macOS desktop apps, you can toggle **Keep on top** directly from the toolbar. The DAW controls the plug-in window.
 
 The gear menu offers five background transparency levels. Choose 0%, 25%, 50%, 75%, or 100%, where 0% is opaque and 100% is clear. On the desktop apps, use the gear menu to adjust the setting even at 100%. In VST3 and CLAP, **Panel transparency** fades the waveform panel's fill. The DAW provides the background behind it.
 
@@ -199,16 +212,29 @@ In the gear menu, choose **Project folder** and select the project root. If you 
 | Windows desktop | `%USERPROFILE%\Backtracking\output\` |
 | VST3 / CLAP | `Backtracking/output/` in your home directory |
 
-Every export is a **48 kHz, 32-bit IEEE float WAV**. A 44.1 or 96 kHz source is resampled during export. The WAV preserves the captured mono or stereo layout. The Windows desktop app mixes multichannel playback to stereo. The rolling history lives in memory, so export any clips you need before closing the app or removing the plug-in.
+Choose the sample rate and encoding independently in the gear menu.
+
+| Edition | Sample rate menu | Encoding menu |
+| --- | --- | --- |
+| Windows desktop | **WAV rate** | **WAV encoding** |
+| macOS desktop | **WAV 匯出格式 → 取樣率** | **WAV 匯出格式 → 編碼** |
+| VST3 / CLAP | **WAV sample rate** | **WAV sample format** |
+
+| WAV setting | Options | Default |
+| --- | --- | --- |
+| Sample rate | 44.1 kHz, 48 kHz, 96 kHz | 48 kHz |
+| Encoding | 16-bit PCM, 24-bit PCM, 32-bit IEEE float | 32-bit float |
+
+Clicking to save, exporting a selection, and dragging into a DAW all use the current WAV format. Capture and metering run at the source sample rate. Any sample rate conversion happens during export. The WAV preserves the captured mono or stereo layout. The Windows desktop app mixes multichannel playback to stereo. The rolling history lives in memory, so export any clips you need before closing the app or removing the plug-in.
 
 ### Save and restore settings
 
-The Windows and macOS desktop apps save your history length, auto-resume delay, background transparency, meter mode, output folder, and keep-on-top setting as you change them. Those preferences are restored the next time you open the app.
+The Windows and macOS desktop apps save your history length, auto-resume delay, background transparency, meter mode, WAV sample rate and encoding, output folder, and keep-on-top setting as you change them. Those preferences are restored the next time you open the app.
 
 - **Windows**. Settings are stored in `%LOCALAPPDATA%\Backtracking\Settings`, with `%APPDATA%\Backtracking\Settings` as a fallback when `LOCALAPPDATA` is unavailable. The app opens at its default window size and Windows places the window.
 - **macOS**. Settings are stored in the macOS user preferences. The app also restores the desktop window's size and position.
 
-For **VST3 and CLAP**, the DAW project stores each plug-in instance's history length, auto-resume delay, panel transparency, meter mode, and output folder. Save the project manually after making changes. When you reopen that project, the DAW restores each instance's settings.
+For **VST3 and CLAP**, the DAW project stores each plug-in instance's history length, auto-resume delay, panel transparency, meter mode, WAV sample rate and encoding, and output folder. Save the project manually after making changes. When you reopen that project, the DAW restores each instance's settings.
 
 ### Troubleshooting
 
@@ -305,9 +331,9 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 2. 將自動續錄設為 **手動／Off**。播放有聲音時確認紅燈閃爍，再按 **Pause**，確認波形停止更新。按 **Play** 重新待命，播放聲音後確認接續收錄。
 
    Set auto-resume to **Off**. Play a sound and check that the red indicator blinks. Press **Pause** and check that the waveform freezes. Press **Play**, then play audio and check that capture continues.
-3. 框選一小段，拖進 DAW 並確認存檔位置及 WAV 規格。若使用插件，分別在 VST3 和 CLAP 實例操作一次。
+3. 將 WAV 設為 44.1 kHz、24-bit PCM，框選一小段並拖進 DAW。確認存檔位置與 WAV 規格。若使用插件，分別在 VST3 和 CLAP 實例操作一次。
 
-   Select a short clip, drag it into the DAW, and check the file location and WAV format. For plug-in use, try one instance of each format.
+   Set the WAV format to 44.1 kHz, 24-bit PCM. Select a short clip, drag it into the DAW, and check the file location and WAV format. For plug-in use, try a VST3 instance and a CLAP instance.
 4. 修改一項偏好後重開桌面版，確認設定有還原。測試插件時，修改設定後先儲存 DAW 專案，再重開該專案確認。
 
    Change a preference and relaunch the desktop app to check that it is restored. For the plug-in, change a setting, save the DAW project, and reopen it to check the saved value.

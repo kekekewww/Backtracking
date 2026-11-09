@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    export_wav, AudioQueue, Capture, CaptureState, DurationChoice, MeterReadings, Snapshot,
+    export_wav_with_profile, AudioQueue, Capture, CaptureState, DurationChoice, MeterReadings,
+    Snapshot, WavExportProfile, WavSampleFormat,
 };
 
 struct Reader {
@@ -244,6 +245,40 @@ unsafe extern "C" fn bt_snapshot_export(
     end: f64,
     directory: *const c_char,
 ) -> *mut c_char {
+    export_snapshot(snapshot, start, end, directory, WavExportProfile::default())
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_snapshot_export_with_profile(
+    snapshot: *const Snapshot,
+    start: f64,
+    end: f64,
+    directory: *const c_char,
+    sample_rate: u32,
+    bits_per_sample: u32,
+) -> *mut c_char {
+    let Some(sample_format) = WavSampleFormat::from_bits_per_sample(bits_per_sample) else {
+        return ptr::null_mut();
+    };
+    export_snapshot(
+        snapshot,
+        start,
+        end,
+        directory,
+        WavExportProfile {
+            sample_rate,
+            sample_format,
+        },
+    )
+}
+
+unsafe fn export_snapshot(
+    snapshot: *const Snapshot,
+    start: f64,
+    end: f64,
+    directory: *const c_char,
+    profile: WavExportProfile,
+) -> *mut c_char {
     let Some(snapshot) = snapshot.as_ref() else {
         return ptr::null_mut();
     };
@@ -269,11 +304,12 @@ unsafe extern "C" fn bt_snapshot_export(
     else {
         return ptr::null_mut();
     };
-    export_wav(
+    export_wav_with_profile(
         Path::new(directory),
         snapshot.sample_rate,
         snapshot.channels,
         samples,
+        profile,
     )
     .ok()
     .and_then(|path| path.to_str().and_then(|path| CString::new(path).ok()))
@@ -359,6 +395,25 @@ mod tests {
             assert_eq!(&bytes[62..66], &0.3f32.to_le_bytes());
             assert_eq!(bytes.len(), 66);
 
+            let pcm =
+                bt_snapshot_export_with_profile(frozen, 0.25, 0.75, directory.as_ptr(), 96_000, 24);
+            assert!(!pcm.is_null());
+            let bytes = fs::read(CStr::from_ptr(pcm).to_str().unwrap()).unwrap();
+            assert_eq!(&bytes[24..28], &96_000u32.to_le_bytes());
+            assert_eq!(&bytes[34..36], &24u16.to_le_bytes());
+            assert_eq!(&bytes[60..68], b"data\x0c\0\0\0");
+            assert_eq!(bytes.len(), 80);
+            assert!(bt_snapshot_export_with_profile(
+                frozen,
+                0.25,
+                0.75,
+                directory.as_ptr(),
+                96_000,
+                20
+            )
+            .is_null());
+
+            bt_string_free(pcm);
             bt_string_free(result);
             bt_snapshot_free(resumed);
             bt_snapshot_free(frozen);

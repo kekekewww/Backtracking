@@ -2,6 +2,8 @@ import AppKit
 
 private let timeChoices: [UInt32] = [10, 20, 30]
 private let transparencyChoices: [UInt32] = [0, 25, 50, 75, 100]
+private let exportSampleRates: [UInt32] = [44_100, 48_000, 96_000]
+private let exportBitDepths: [UInt32] = [16, 24, 32]
 private let frameAutosaveName: NSWindow.FrameAutosaveName = "Backtracking.Panel"
 
 private func movesFromWaveform(_ modifiers: NSEvent.ModifierFlags) -> Bool {
@@ -213,9 +215,11 @@ private final class WAVExport: @unchecked Sendable {
 
     deinit { bt_snapshot_free(snapshot) }
 
-    func write(range: ClosedRange<Double>, directory: String) -> URL? {
+    func write(range: ClosedRange<Double>, directory: String, sampleRate: UInt32, bitsPerSample: UInt32) -> URL? {
         directory.withCString { destination in
-            guard let path = bt_snapshot_export(snapshot, range.lowerBound, range.upperBound, destination) else {
+            guard let path = bt_snapshot_export_with_profile(
+                snapshot, range.lowerBound, range.upperBound, destination, sampleRate, bitsPerSample
+            ) else {
                 return nil
             }
             defer { bt_string_free(path) }
@@ -347,6 +351,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var idleSeconds: UInt32 = 10
     private var transparency: UInt32 = 0
     private var meterMode: MeterMode = .dbfs
+    private var exportSampleRate: UInt32 = 48_000
+    private var exportBitsPerSample: UInt32 = 32
     private var alwaysOnTop = true
     private var paused = true
     private var captureError: String?
@@ -367,6 +373,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         if let saved = unsignedSetting("meterMode"), let mode = MeterMode(rawValue: saved) {
             meterMode = mode
+        }
+        if let saved = unsignedSetting("exportSampleRate"), exportSampleRates.contains(saved) {
+            exportSampleRate = saved
+        }
+        if let saved = unsignedSetting("exportBitsPerSample"), exportBitDepths.contains(saved) {
+            exportBitsPerSample = saved
         }
         alwaysOnTop = defaults.object(forKey: "alwaysOnTop") as? Bool ?? true
         if let saved = defaults.string(forKey: "outputDirectory"), saved.hasPrefix("/"), !saved.utf8.contains(0) {
@@ -520,12 +532,28 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let meterItem = NSMenuItem(title: "電平顯示", action: nil, keyEquivalent: "")
         meterItem.submenu = meterMenu()
         menu.addItem(meterItem)
+        menu.addItem(exportFormatMenuItem())
         let outputItem = NSMenuItem(title: "專案資料夾…", action: #selector(chooseOutput), keyEquivalent: "")
         outputItem.target = self
         menu.addItem(outputItem)
         menu.addItem(.separator())
         menu.addItem(quitItem())
         showMenu(menu, below: sender)
+    }
+
+    private func exportFormatMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "WAV 匯出格式", action: nil, keyEquivalent: "")
+        let menu = NSMenu(title: item.title)
+        menu.addItem(choiceMenu(
+            title: "取樣率", choices: exportSampleRates, selected: exportSampleRate,
+            action: #selector(exportSampleRateChanged(_:))
+        ) { $0 == 44_100 ? "44.1 kHz" : "\($0 / 1_000) kHz" })
+        menu.addItem(choiceMenu(
+            title: "編碼", choices: exportBitDepths, selected: exportBitsPerSample,
+            action: #selector(exportEncodingChanged(_:))
+        ) { $0 == 32 ? "32-bit float" : "\($0)-bit PCM" })
+        item.submenu = menu
+        return item
     }
 
     @objc private func showMeterOptions(_ sender: NSButton) {
@@ -612,6 +640,26 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         defaults.set(Int(raw), forKey: "meterMode")
         registerClick()
         updateMeter()
+    }
+
+    @objc private func exportSampleRateChanged(_ sender: NSMenuItem) {
+        guard let rate = UInt32(exactly: sender.tag), exportSampleRates.contains(rate), rate != exportSampleRate else { return }
+        exportSampleRate = rate
+        defaults.set(Int(rate), forKey: "exportSampleRate")
+        invalidateExportFormat()
+    }
+
+    @objc private func exportEncodingChanged(_ sender: NSMenuItem) {
+        guard let bits = UInt32(exactly: sender.tag), exportBitDepths.contains(bits), bits != exportBitsPerSample else { return }
+        exportBitsPerSample = bits
+        defaults.set(Int(bits), forKey: "exportBitsPerSample")
+        invalidateExportFormat()
+    }
+
+    private func invalidateExportFormat() {
+        registerClick()
+        waveform?.discardPreparedFile()
+        setNotice(nil)
     }
 
     private func updateMeter() {
@@ -794,9 +842,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         let job = WAVExport(snapshot)
         let directory = output
+        let sampleRate = exportSampleRate
+        let bitsPerSample = exportBitsPerSample
         setNotice("正在寫入 WAV…")
         worker.async { [weak self] in
-            let url = job.write(range: range, directory: directory)
+            let url = job.write(range: range, directory: directory, sampleRate: sampleRate, bitsPerSample: bitsPerSample)
             DispatchQueue.main.async {
                 guard completion(url) else { return }
                 if let url {
@@ -870,6 +920,7 @@ private final class WaveformView: NSView, NSDraggingSource {
         preparingFile = false
         preparedRange = nil
         exportVersion &+= 1
+        needsDisplay = true
     }
 
     private func normalized(_ event: NSEvent) -> Double {

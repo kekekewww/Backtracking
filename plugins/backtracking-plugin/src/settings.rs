@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use backtracking_core::DurationChoice;
+use backtracking_core::{DurationChoice, WavExportProfile, WavSampleFormat};
 use nice_plug::params::persist::{PersistentField, deserialize_field, serialize_field};
 
 pub(crate) const TRANSPARENCY_LEVELS: [u8; 5] = [0, 25, 50, 75, 100];
@@ -33,6 +33,7 @@ pub(crate) struct SessionSettings {
     pub(crate) idle_resume: Option<DurationChoice>,
     pub(crate) panel_transparency: u8,
     pub(crate) meter_mode: MeterMode,
+    pub(crate) wav_profile: WavExportProfile,
     pub(crate) output_dir: PathBuf,
 }
 
@@ -47,6 +48,7 @@ impl Default for SessionSettings {
             idle_resume: Some(DurationChoice::Seconds10),
             panel_transparency: 0,
             meter_mode: MeterMode::Dbfs,
+            wav_profile: WavExportProfile::default(),
             output_dir: home.join("Backtracking").join("output"),
         }
     }
@@ -103,6 +105,18 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                         .find(|mode| mode.label() == value)
                 })
                 .unwrap_or(defaults.meter_mode),
+            wav_profile: WavExportProfile {
+                sample_rate: fields
+                    .get("wav_sample_rate")
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| WavExportProfile::SAMPLE_RATES.contains(value))
+                    .unwrap_or(defaults.wav_profile.sample_rate),
+                sample_format: fields
+                    .get("wav_bits_per_sample")
+                    .and_then(|value| value.parse().ok())
+                    .and_then(WavSampleFormat::from_bits_per_sample)
+                    .unwrap_or(defaults.wav_profile.sample_format),
+            },
             output_dir: output_dir.unwrap_or(defaults.output_dir),
         };
         *self.lock() = restored;
@@ -130,6 +144,18 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                 settings.panel_transparency.to_string(),
             ),
             ("meter_unit".into(), settings.meter_mode.label().into()),
+            (
+                "wav_sample_rate".into(),
+                settings.wav_profile.sample_rate.to_string(),
+            ),
+            (
+                "wav_bits_per_sample".into(),
+                settings
+                    .wav_profile
+                    .sample_format
+                    .bits_per_sample()
+                    .to_string(),
+            ),
         ]);
         // The framework's serde codec preserves native paths, including non-Unicode names.
         if let Ok(path) = serialize_field(settings.output_dir.as_os_str()) {

@@ -148,7 +148,7 @@ nice_export_clap!(Backtracking);
 mod tests {
     use std::collections::BTreeMap;
 
-    use backtracking_core::DurationChoice;
+    use backtracking_core::{DurationChoice, WavExportProfile, WavSampleFormat};
     use nice_plug::params::persist::serialize_field;
 
     use super::*;
@@ -161,6 +161,10 @@ mod tests {
         original.session.set_idle_resume(None);
         original.session.set_panel_transparency(75);
         original.session.set_meter_mode(MeterMode::Lufs);
+        original.session.set_wav_profile(WavExportProfile {
+            sample_rate: 96_000,
+            sample_format: WavSampleFormat::Pcm24,
+        });
         let output = std::env::temp_dir()
             .join("Backtracking 測試")
             .join("output");
@@ -187,7 +191,7 @@ mod tests {
         plugin.params().deserialize_fields(&BTreeMap::new());
         assert_eq!(plugin.session.settings(), defaults);
 
-        let input = BTreeMap::from([
+        let mut input = BTreeMap::from([
             ("history_seconds", "30".to_owned()),
             ("idle_resume_seconds", "unsupported".to_owned()),
             ("panel_transparency", "250".to_owned()),
@@ -207,7 +211,21 @@ mod tests {
             SessionSettings {
                 retention: DurationChoice::Seconds30,
                 meter_mode: MeterMode::Vu,
-                ..defaults
+                ..defaults.clone()
+            }
+        );
+
+        input.insert("wav_sample_rate", "192000".to_owned());
+        input.insert("wav_bits_per_sample", "16".to_owned());
+        plugin.params().deserialize_fields(&BTreeMap::from([(
+            "capture_settings_v1".to_owned(),
+            serialize_field(&input).unwrap(),
+        )]));
+        assert_eq!(
+            plugin.session.settings().wav_profile,
+            WavExportProfile {
+                sample_format: WavSampleFormat::Pcm16,
+                ..defaults.wav_profile
             }
         );
     }

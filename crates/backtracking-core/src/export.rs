@@ -6,11 +6,67 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const WAV_SAMPLE_RATE: u32 = 48_000;
-
-const WAV_HEADER_BYTES: u32 = 58;
 const PHASES: usize = 256;
 static NEXT_EXPORT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WavSampleFormat {
+    Pcm16,
+    Pcm24,
+    Float32,
+}
+
+impl WavSampleFormat {
+    pub const fn bits_per_sample(self) -> u16 {
+        match self {
+            Self::Pcm16 => 16,
+            Self::Pcm24 => 24,
+            Self::Float32 => 32,
+        }
+    }
+
+    /// The only 32-bit encoding supported by Backtracking is IEEE float.
+    pub const fn from_bits_per_sample(bits: u32) -> Option<Self> {
+        match bits {
+            16 => Some(Self::Pcm16),
+            24 => Some(Self::Pcm24),
+            32 => Some(Self::Float32),
+            _ => None,
+        }
+    }
+
+    fn format_chunk_size(self) -> u32 {
+        match self {
+            Self::Pcm16 => 16,
+            Self::Pcm24 => 40,   // WAVEFORMATEXTENSIBLE
+            Self::Float32 => 18, // WAVEFORMATEX
+        }
+    }
+
+    fn riff_overhead(self) -> u32 {
+        let fact_bytes = if self == Self::Float32 { 12 } else { 0 };
+        4 + 8 + self.format_chunk_size() + fact_bytes + 8
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WavExportProfile {
+    pub sample_rate: u32,
+    pub sample_format: WavSampleFormat,
+}
+
+impl WavExportProfile {
+    pub const SAMPLE_RATES: [u32; 3] = [44_100, 48_000, 96_000];
+}
+
+impl Default for WavExportProfile {
+    fn default() -> Self {
+        Self {
+            sample_rate: 48_000,
+            sample_format: WavSampleFormat::Float32,
+        }
+    }
+}
 
 /// Writes a new mono or stereo 48 kHz, IEEE float32 WAV. The caller can expose
 /// the path for dragging after this returns successfully.
@@ -20,33 +76,58 @@ pub fn write_wav(
     channels: usize,
     interleaved: &[f32],
 ) -> io::Result<()> {
+    write_wav_with_profile(
+        path,
+        source_sample_rate,
+        channels,
+        interleaved,
+        WavExportProfile::default(),
+    )
+}
+
+/// Writes a new mono or stereo WAV using the requested export profile.
+pub fn write_wav_with_profile(
+    path: &Path,
+    source_sample_rate: u32,
+    channels: usize,
+    interleaved: &[f32],
+    profile: WavExportProfile,
+) -> io::Result<()> {
     if source_sample_rate == 0 || !matches!(channels, 1 | 2) || interleaved.len() % channels != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "expected a nonzero sample rate and whole mono or stereo frames",
         ));
     }
+    if !WavExportProfile::SAMPLE_RATES.contains(&profile.sample_rate) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected an export rate of 44,100, 48,000 or 96,000 Hz",
+        ));
+    }
 
     let source_frames = interleaved.len() / channels;
     let rate = u128::from(source_sample_rate);
-    let rounded = (source_frames as u128 * u128::from(WAV_SAMPLE_RATE) + rate / 2) / rate;
+    let rounded = (source_frames as u128 * u128::from(profile.sample_rate) + rate / 2) / rate;
     let frames = rounded.max((source_frames != 0) as u128);
-    let frame_bytes = channels as u16 * 4;
+    let frame_bytes = channels as u16 * (profile.sample_format.bits_per_sample() / 8);
     let data_bytes = frames * u128::from(frame_bytes);
-    if data_bytes + u128::from(WAV_HEADER_BYTES - 8) > u128::from(u32::MAX) {
+    let riff_size = data_bytes + data_bytes % 2 + u128::from(profile.sample_format.riff_overhead());
+    if riff_size > u128::from(u32::MAX) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "selection exceeds the RIFF WAV size limit",
         ));
     }
 
-    let samples = if source_sample_rate == WAV_SAMPLE_RATE || source_frames == 0 {
+    let samples = if source_sample_rate == profile.sample_rate || source_frames == 0 {
         Cow::Borrowed(interleaved)
     } else {
         Cow::Owned(resample(
             interleaved,
             channels,
             source_sample_rate,
+            profile.sample_rate,
             frames as usize,
         ))
     };
@@ -56,7 +137,8 @@ pub fn write_wav(
         let mut writer = BufWriter::new(file);
         write_wave(
             &mut writer,
-            frame_bytes,
+            profile,
+            channels as u16,
             frames as u32,
             data_bytes as u32,
             &samples,
@@ -76,6 +158,23 @@ pub fn export_wav(
     channels: usize,
     interleaved: &[f32],
 ) -> io::Result<PathBuf> {
+    export_wav_with_profile(
+        output_dir,
+        source_sample_rate,
+        channels,
+        interleaved,
+        WavExportProfile::default(),
+    )
+}
+
+/// Saves a uniquely named clip using the requested WAV profile.
+pub fn export_wav_with_profile(
+    output_dir: &Path,
+    source_sample_rate: u32,
+    channels: usize,
+    interleaved: &[f32],
+    profile: WavExportProfile,
+) -> io::Result<PathBuf> {
     fs::create_dir_all(output_dir)?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -85,7 +184,7 @@ pub fn export_wav(
     loop {
         let serial = NEXT_EXPORT.fetch_add(1, Ordering::Relaxed);
         let path = output_dir.join(format!("Backtracking-{timestamp}-{process}-{serial}.wav"));
-        match write_wav(&path, source_sample_rate, channels, interleaved) {
+        match write_wav_with_profile(&path, source_sample_rate, channels, interleaved, profile) {
             Ok(()) => return Ok(path),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err),
@@ -95,39 +194,87 @@ pub fn export_wav(
 
 fn write_wave(
     output: &mut impl Write,
-    frame_bytes: u16,
+    profile: WavExportProfile,
+    channels: u16,
     frames: u32,
     data_bytes: u32,
     samples: &[f32],
 ) -> io::Result<()> {
+    let format = profile.sample_format;
+    let bits = format.bits_per_sample();
+    let sample_bytes = bits / 8;
+    let frame_bytes = channels * sample_bytes;
+    let padding = data_bytes % 2;
+    let format_tag = match format {
+        WavSampleFormat::Pcm16 => 1u16,   // WAVE_FORMAT_PCM
+        WavSampleFormat::Pcm24 => 0xfffe, // WAVE_FORMAT_EXTENSIBLE, PCM subformat
+        WavSampleFormat::Float32 => 3,    // WAVE_FORMAT_IEEE_FLOAT
+    };
     output.write_all(b"RIFF")?;
-    output.write_all(&(data_bytes + (WAV_HEADER_BYTES - 8)).to_le_bytes())?;
+    output.write_all(&(data_bytes + padding + format.riff_overhead()).to_le_bytes())?;
     output.write_all(b"WAVEfmt ")?;
-    output.write_all(&18u32.to_le_bytes())?;
-    output.write_all(&3u16.to_le_bytes())?; // WAVE_FORMAT_IEEE_FLOAT
-    output.write_all(&(frame_bytes / 4).to_le_bytes())?;
-    output.write_all(&WAV_SAMPLE_RATE.to_le_bytes())?;
-    output.write_all(&(WAV_SAMPLE_RATE * u32::from(frame_bytes)).to_le_bytes())?;
+    output.write_all(&format.format_chunk_size().to_le_bytes())?;
+    output.write_all(&format_tag.to_le_bytes())?;
+    output.write_all(&channels.to_le_bytes())?;
+    output.write_all(&profile.sample_rate.to_le_bytes())?;
+    output.write_all(&(profile.sample_rate * u32::from(frame_bytes)).to_le_bytes())?;
     output.write_all(&frame_bytes.to_le_bytes())?;
-    output.write_all(&32u16.to_le_bytes())?;
-    output.write_all(&0u16.to_le_bytes())?; // WAVEFORMATEX extension size
-    output.write_all(b"fact")?;
-    output.write_all(&4u32.to_le_bytes())?;
-    output.write_all(&frames.to_le_bytes())?;
+    output.write_all(&bits.to_le_bytes())?;
+    match format {
+        WavSampleFormat::Pcm16 => {}
+        WavSampleFormat::Pcm24 => {
+            const PCM_SUBFORMAT: [u8; 16] = [
+                0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38,
+                0x9b, 0x71,
+            ];
+            let channel_mask = if channels == 1 { 0x4u32 } else { 0x3u32 };
+            output.write_all(&22u16.to_le_bytes())?; // Extension size
+            output.write_all(&bits.to_le_bytes())?; // Valid bits
+            output.write_all(&channel_mask.to_le_bytes())?;
+            output.write_all(&PCM_SUBFORMAT)?;
+        }
+        WavSampleFormat::Float32 => {
+            output.write_all(&0u16.to_le_bytes())?; // Extension size
+            output.write_all(b"fact")?;
+            output.write_all(&4u32.to_le_bytes())?;
+            output.write_all(&frames.to_le_bytes())?;
+        }
+    }
     output.write_all(b"data")?;
     output.write_all(&data_bytes.to_le_bytes())?;
+    let sample_bytes = usize::from(sample_bytes);
     let mut bytes = [0; 4096];
-    for chunk in samples.chunks(bytes.len() / 4) {
-        for (slot, sample) in bytes.chunks_exact_mut(4).zip(chunk) {
-            slot.copy_from_slice(&sample.to_le_bytes());
+    for chunk in samples.chunks(bytes.len() / sample_bytes) {
+        for (slot, &sample) in bytes.chunks_exact_mut(sample_bytes).zip(chunk) {
+            let sample = match format {
+                WavSampleFormat::Pcm16 => quantize(sample, 1 << 15).to_le_bytes(),
+                WavSampleFormat::Pcm24 => quantize(sample, 1 << 23).to_le_bytes(),
+                WavSampleFormat::Float32 => sample.to_le_bytes(),
+            };
+            slot.copy_from_slice(&sample[..sample_bytes]);
         }
-        output.write_all(&bytes[..chunk.len() * 4])?;
+        output.write_all(&bytes[..chunk.len() * sample_bytes])?;
+    }
+    if padding != 0 {
+        output.write_all(&[0])?;
     }
     Ok(())
 }
 
-fn resample(samples: &[f32], channels: usize, source_rate: u32, frames: usize) -> Vec<f32> {
-    let step = f64::from(source_rate) / f64::from(WAV_SAMPLE_RATE);
+fn quantize(sample: f32, full_scale: i32) -> i32 {
+    // Rust's float-to-int cast maps NaN to 0 and saturates infinities.
+    let scaled = (f64::from(sample) * f64::from(full_scale)).round() as i32;
+    scaled.clamp(-full_scale, full_scale - 1)
+}
+
+fn resample(
+    samples: &[f32],
+    channels: usize,
+    source_rate: u32,
+    target_rate: u32,
+    frames: usize,
+) -> Vec<f32> {
+    let step = f64::from(source_rate) / f64::from(target_rate);
     let cutoff = if step > 1.0 { 0.95 / step } else { 1.0 };
     let radius = (24.0 / cutoff).ceil().min(192.0) as isize;
     let kernels = phase_kernels(cutoff, radius);
@@ -191,7 +338,7 @@ mod tests {
     fn wave_header_and_samples_are_ieee_float_stereo() {
         let samples = [1.25, -0.125, 0.5, 0.75];
         let mut wave = Vec::new();
-        write_wave(&mut wave, 8, 2, 16, &samples).unwrap();
+        write_wave(&mut wave, WavExportProfile::default(), 2, 2, 16, &samples).unwrap();
 
         assert_eq!(&wave[..4], b"RIFF");
         assert_eq!(
@@ -200,7 +347,7 @@ mod tests {
         );
         assert_eq!(&wave[8..16], b"WAVEfmt ");
         assert_eq!(&wave[20..24], &[3, 0, 2, 0]);
-        assert_eq!(&wave[24..28], &WAV_SAMPLE_RATE.to_le_bytes());
+        assert_eq!(&wave[24..28], &48_000u32.to_le_bytes());
         assert_eq!(&wave[38..42], b"fact");
         assert_eq!(&wave[46..50], &2u32.to_le_bytes());
         assert_eq!(&wave[50..54], b"data");
@@ -213,13 +360,60 @@ mod tests {
     }
 
     #[test]
+    fn pcm16_saturates_and_uses_a_standard_header() {
+        let samples = [-1.5, -0.5, 0.0, 0.5, 1.5];
+        let profile = WavExportProfile {
+            sample_rate: 44_100,
+            sample_format: WavSampleFormat::Pcm16,
+        };
+        let mut wave = Vec::new();
+        write_wave(&mut wave, profile, 1, 5, 10, &samples).unwrap();
+        assert_eq!(&wave[16..20], &16u32.to_le_bytes());
+        assert_eq!(&wave[20..24], &[1, 0, 1, 0]);
+        assert_eq!(&wave[24..28], &44_100u32.to_le_bytes());
+        assert_eq!(&wave[28..32], &88_200u32.to_le_bytes());
+        assert_eq!(&wave[32..36], &[2, 0, 16, 0]);
+        assert_eq!(&wave[36..40], b"data");
+        let payload: Vec<_> = wave[44..]
+            .chunks_exact(2)
+            .map(|bytes| i16::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(payload, [i16::MIN, -16_384, 0, 16_384, i16::MAX]);
+    }
+
+    #[test]
+    fn pcm24_is_packed_and_pads_an_odd_sized_mono_payload() {
+        let samples = [-1.5, -0.5, 0.0, 0.5, 1.5];
+        let profile = WavExportProfile {
+            sample_rate: 96_000,
+            sample_format: WavSampleFormat::Pcm24,
+        };
+        let mut wave = Vec::new();
+        write_wave(&mut wave, profile, 1, 5, 15, &samples).unwrap();
+        assert_eq!(&wave[4..8], &76u32.to_le_bytes());
+        assert_eq!(&wave[16..20], &40u32.to_le_bytes());
+        assert_eq!(&wave[20..24], &[0xfe, 0xff, 1, 0]);
+        assert_eq!(&wave[24..28], &96_000u32.to_le_bytes());
+        assert_eq!(&wave[32..40], &[3, 0, 24, 0, 22, 0, 24, 0]);
+        assert_eq!(&wave[40..48], &[4, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(&wave[60..68], b"data\x0f\0\0\0");
+        assert_eq!(
+            &wave[68..],
+            &[0, 0, 0x80, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0x40, 0xff, 0xff, 0x7f, 0]
+        );
+        assert_eq!(wave.len(), 84);
+    }
+
+    #[test]
     fn resampling_keeps_channel_order_and_level() {
         let input: Vec<_> = [0.5, -0.25].repeat(441);
-        let output = resample(&input, 2, 44_100, 480);
-        assert_eq!(output.len(), 960);
-        for frame in output.chunks_exact(2) {
-            assert!((frame[0] - 0.5).abs() < 1e-6);
-            assert!((frame[1] + 0.25).abs() < 1e-6);
+        for (rate, frames) in [(48_000, 480), (96_000, 960)] {
+            let output = resample(&input, 2, 44_100, rate, frames);
+            assert_eq!(output.len(), frames * 2);
+            for frame in output.chunks_exact(2) {
+                assert!((frame[0] - 0.5).abs() < 1e-6);
+                assert!((frame[1] + 0.25).abs() < 1e-6);
+            }
         }
     }
 
@@ -228,8 +422,12 @@ mod tests {
         let input: Vec<_> = (0..960)
             .map(|frame| (2.0 * PI * 34_000.0 * f64::from(frame) / 96_000.0).sin() as f32)
             .collect();
-        let output = resample(&input, 1, 96_000, 480);
-        assert!(output[48..432].iter().all(|sample| sample.abs() < 0.001));
+        for (rate, frames) in [(44_100, 441), (48_000, 480)] {
+            let output = resample(&input, 1, 96_000, rate, frames);
+            assert!(output[48..frames - 48]
+                .iter()
+                .all(|sample| sample.abs() < 0.001));
+        }
     }
 
     #[test]
@@ -246,6 +444,67 @@ mod tests {
         let err = write_wav(&first, 48_000, 1, &[0.0]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(first).unwrap(), bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn profiles_write_the_selected_rate_bit_depth_and_duration() {
+        let serial = NEXT_EXPORT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "backtracking-profiles-{}-{serial}",
+            std::process::id()
+        ));
+        let samples = [1.5, -1.5].repeat(480);
+        for rate in WavExportProfile::SAMPLE_RATES {
+            for (format, header_bytes) in [
+                (WavSampleFormat::Pcm16, 44),
+                (WavSampleFormat::Pcm24, 68),
+                (WavSampleFormat::Float32, 58),
+            ] {
+                let path = export_wav_with_profile(
+                    &dir,
+                    48_000,
+                    2,
+                    &samples,
+                    WavExportProfile {
+                        sample_rate: rate,
+                        sample_format: format,
+                    },
+                )
+                .unwrap();
+                let bytes = fs::read(path).unwrap();
+                let bits = format.bits_per_sample();
+                assert_eq!(&bytes[24..28], &rate.to_le_bytes());
+                assert_eq!(&bytes[34..36], &bits.to_le_bytes());
+                assert_eq!(
+                    bytes.len(),
+                    header_bytes + rate as usize / 100 * usize::from(bits / 8) * 2
+                );
+                if format == WavSampleFormat::Float32 {
+                    assert_eq!(
+                        &bytes[header_bytes..header_bytes + 8],
+                        &[0, 0, 0xc0, 0x3f, 0, 0, 0xc0, 0xbf]
+                    );
+                }
+            }
+        }
+        let invalid = dir.join("invalid.wav");
+        assert_eq!(
+            write_wav_with_profile(
+                &invalid,
+                48_000,
+                2,
+                &samples,
+                WavExportProfile {
+                    sample_rate: 0,
+                    sample_format: WavSampleFormat::Pcm24,
+                }
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(!invalid.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 }

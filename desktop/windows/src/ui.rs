@@ -5,14 +5,17 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use backtracking_core::{DurationChoice, MeterReadings, Snapshot, export_wav, waveform};
+use backtracking_core::{
+    DurationChoice, MeterReadings, Snapshot, WavExportProfile, WavSampleFormat,
+    export_wav_with_profile, waveform,
+};
 use eframe::egui::{
     self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection, Stroke, Vec2,
     ViewportCommand,
 };
 
 use crate::controller::Controller;
-use crate::preferences::{Key, MeterMode, Preferences, Settings};
+use crate::preferences::{Key, MeterMode, Preferences, Settings, wav_sample_format_preference};
 
 const BINS: usize = 384;
 const REFRESH: Duration = Duration::from_millis(80);
@@ -22,6 +25,13 @@ const DURATIONS: [DurationChoice; 3] = [
     DurationChoice::Seconds30,
 ];
 const TRANSPARENCIES: [u8; 5] = [0, 25, 50, 75, 100];
+const WAV_SAMPLE_RATES: [(u32, &str); 3] =
+    [(44_100, "44.1 kHz"), (48_000, "48 kHz"), (96_000, "96 kHz")];
+const WAV_SAMPLE_FORMATS: [(WavSampleFormat, &str); 3] = [
+    (WavSampleFormat::Pcm16, "16-bit PCM"),
+    (WavSampleFormat::Pcm24, "24-bit PCM"),
+    (WavSampleFormat::Float32, "32-bit float"),
+];
 const MINT: Color32 = Color32::from_rgb(103, 231, 181);
 const RECORDING_LIT: Color32 = Color32::from_rgb(249, 78, 88);
 const RECORDING_DIM: Color32 = Color32::from_rgb(103, 44, 48);
@@ -82,6 +92,7 @@ struct Recorder {
     idle_resume: Option<DurationChoice>,
     transparency: u8,
     meter_mode: MeterMode,
+    wav_profile: WavExportProfile,
     last_interaction: Instant,
     recording_started: Option<f64>,
     low: [f32; BINS],
@@ -141,6 +152,7 @@ impl Recorder {
             idle_resume: settings.idle_resume,
             transparency: settings.transparency,
             meter_mode: settings.meter_mode,
+            wav_profile: settings.wav_profile,
             last_interaction: Instant::now(),
             recording_started: None,
             low: [0.0; BINS],
@@ -450,10 +462,12 @@ impl Recorder {
         let was_open = popup.is_open();
         let settings_height = (ui.ctx().content_rect().height() - 59.0).max(48.0);
         let shown = popup.show(|ui| {
-            ui.set_width(292.0);
+            ui.set_width(340.0);
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
             egui::ScrollArea::vertical()
                 .id_salt("settings-options")
                 .max_height(settings_height)
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.spacing_mut().interact_size.y = 15.0;
                     ui.spacing_mut().button_padding.y = 0.5;
@@ -529,6 +543,7 @@ impl Recorder {
                                 }
                             });
                             ui.end_row();
+                            self.wav_settings(ui);
                         });
                 });
 
@@ -581,6 +596,38 @@ impl Recorder {
         was_open || shown.is_some()
     }
 
+    fn wav_settings(&mut self, ui: &mut egui::Ui) {
+        let previous = self.wav_profile;
+        ui.label("WAV rate");
+        ui.horizontal(|ui| {
+            for (rate, label) in WAV_SAMPLE_RATES {
+                ui.selectable_value(&mut self.wav_profile.sample_rate, rate, label);
+            }
+        });
+        ui.end_row();
+        ui.label("WAV encoding");
+        ui.horizontal(|ui| {
+            for (format, label) in WAV_SAMPLE_FORMATS {
+                ui.selectable_value(&mut self.wav_profile.sample_format, format, label);
+            }
+        });
+        ui.end_row();
+
+        if self.wav_profile != previous {
+            self.invalidate_export();
+            self.message.clear();
+            if self.wav_profile.sample_rate != previous.sample_rate {
+                self.save_preference(Key::WavSampleRate, self.wav_profile.sample_rate.to_string());
+            }
+            if self.wav_profile.sample_format != previous.sample_format {
+                self.save_preference(
+                    Key::WavSampleFormat,
+                    wav_sample_format_preference(self.wav_profile.sample_format),
+                );
+            }
+        }
+    }
+
     fn start_export(&mut self) {
         if self.exported.is_some() {
             return;
@@ -605,13 +652,20 @@ impl Recorder {
             start..end
         });
         let output = self.output.clone();
+        let profile = self.wav_profile;
         match thread::Builder::new()
             .name("backtracking-wav".into())
             .spawn(move || {
                 let samples = snapshot
                     .frames(frames_to_export)
                     .ok_or_else(|| io::Error::other("invalid audio selection"))?;
-                export_wav(&output, snapshot.sample_rate, snapshot.channels, samples)
+                export_wav_with_profile(
+                    &output,
+                    snapshot.sample_rate,
+                    snapshot.channels,
+                    samples,
+                    profile,
+                )
             }) {
             Ok(worker) => {
                 self.export = Some(ExportJob {

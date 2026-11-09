@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use backtracking_core::{DurationChoice, MeterReadings, Snapshot, export_wav, waveform};
+use backtracking_core::{
+    DurationChoice, MeterReadings, Snapshot, WavExportProfile, WavSampleFormat,
+    export_wav_with_profile, waveform,
+};
 use egui::{Color32, CursorIcon, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
 use nice_plug::context::gui::GuiContext;
 use nice_plug_egui::baseview::dpi::LogicalSize;
@@ -69,7 +72,7 @@ pub struct CaptureUi {
     gesture: Option<Gesture>,
     export: Option<ExportJob>,
     export_requested: bool,
-    exported: Option<PathBuf>,
+    exported: Option<ExportedWav>,
     revision: u64,
     native_dragging: Arc<AtomicBool>,
     message: String,
@@ -92,7 +95,13 @@ impl MeterMode {
 
 struct ExportJob {
     revision: u64,
+    profile: WavExportProfile,
     worker: JoinHandle<io::Result<PathBuf>>,
+}
+
+struct ExportedWav {
+    profile: WavExportProfile,
+    path: PathBuf,
 }
 
 impl NiceEguiApp for CaptureUi {
@@ -118,12 +127,13 @@ impl NiceEguiApp for CaptureUi {
         if let Some(previous) = &self.displayed_settings {
             let retention_changed = previous.retention != settings.retention;
             let output_changed = previous.output_dir != settings.output_dir;
+            let format_changed = previous.wav_profile != settings.wav_profile;
             if retention_changed {
                 self.reset_frozen();
-            } else if output_changed {
+            } else if output_changed || format_changed {
                 self.invalidate_export();
             }
-            if retention_changed || output_changed {
+            if retention_changed || output_changed || format_changed {
                 self.message.clear();
                 if self.gesture.take().is_some() {
                     self.session.set_gesture_active(false);
@@ -290,57 +300,64 @@ impl CaptureUi {
             .gap(4.0)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
         let was_open = popup.is_open();
+        let menu_content_height = (ui.ctx().viewport_rect().height() - 68.0).max(60.0);
         let menu = popup.show(|ui| {
             let mut retention = settings.retention;
             let mut idle_resume = settings.idle_resume;
             let mut panel_transparency = settings.panel_transparency;
             let mut meter_mode = settings.meter_mode;
-            egui::Grid::new("capture-settings")
-                .spacing([12.0, 6.0])
+            let mut wav_profile = settings.wav_profile;
+            egui::ScrollArea::vertical()
+                .max_height(menu_content_height)
                 .show(ui, |ui| {
-                    ui.label("History");
-                    ui.horizontal(|ui| {
-                        for duration in DURATIONS {
-                            ui.selectable_value(
-                                &mut retention,
-                                duration,
-                                format!("{} s", duration.seconds()),
+                    egui::Grid::new("capture-settings")
+                        .spacing([12.0, 3.0])
+                        .show(ui, |ui| {
+                            ui.label("History");
+                            ui.horizontal(|ui| {
+                                for duration in DURATIONS {
+                                    ui.selectable_value(
+                                        &mut retention,
+                                        duration,
+                                        format!("{} s", duration.seconds()),
+                                    );
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Panel transparency").on_hover_text(
+                                "Fades the panel fill. The DAW may keep the editor backing opaque.",
                             );
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("Panel transparency").on_hover_text(
-                        "Fades the plugin's panel fill. The DAW may keep the editor background opaque.",
-                    );
-                    ui.horizontal(|ui| {
-                        for percent in TRANSPARENCY_LEVELS {
-                            ui.selectable_value(
-                                &mut panel_transparency,
-                                percent,
-                                format!("{percent}%"),
-                            );
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("Meter");
-                    ui.horizontal(|ui| {
-                        for mode in MeterMode::ALL {
-                            ui.selectable_value(&mut meter_mode, mode, mode.label());
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("Auto-resume");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut idle_resume, None, "Off");
-                        for duration in DURATIONS {
-                            ui.selectable_value(
-                                &mut idle_resume,
-                                Some(duration),
-                                format!("{} s", duration.seconds()),
-                            );
-                        }
-                    });
-                    ui.end_row();
+                            ui.horizontal(|ui| {
+                                for percent in TRANSPARENCY_LEVELS {
+                                    ui.selectable_value(
+                                        &mut panel_transparency,
+                                        percent,
+                                        format!("{percent}%"),
+                                    );
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Meter");
+                            ui.horizontal(|ui| {
+                                for mode in MeterMode::ALL {
+                                    ui.selectable_value(&mut meter_mode, mode, mode.label());
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Auto-resume");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut idle_resume, None, "Off");
+                                for duration in DURATIONS {
+                                    ui.selectable_value(
+                                        &mut idle_resume,
+                                        Some(duration),
+                                        format!("{} s", duration.seconds()),
+                                    );
+                                }
+                            });
+                            ui.end_row();
+                            wav_format_controls(ui, &mut wav_profile);
+                        });
                 });
             if retention != settings.retention {
                 self.session.set_retention(retention);
@@ -360,6 +377,12 @@ impl CaptureUi {
             if meter_mode != settings.meter_mode {
                 self.session.set_meter_mode(meter_mode);
                 settings.meter_mode = meter_mode;
+            }
+            if wav_profile != settings.wav_profile {
+                self.session.set_wav_profile(wav_profile);
+                settings.wav_profile = wav_profile;
+                self.invalidate_export();
+                self.message.clear();
             }
             ui.separator();
             let choose_project = ui
@@ -628,11 +651,13 @@ impl CaptureUi {
         }
 
         if down {
-            if let (Some(Gesture::Drag { origin }), Some(position), Some(path)) =
-                (&self.gesture, position, self.exported.clone())
+            if let (Some(Gesture::Drag { origin }), Some(position), Some(file)) =
+                (&self.gesture, position, self.exported.as_ref())
                 && position.distance(*origin) >= 4.0
+                && file.profile == self.session.settings().wav_profile
             {
                 let origin = *origin;
+                let path = file.path.clone();
                 self.gesture = None;
                 self.start_native_drag(frame, path, origin);
             }
@@ -648,9 +673,16 @@ impl CaptureUi {
     }
 
     fn begin_export(&mut self) {
-        if self.exported.is_some() {
+        let settings = self.session.settings();
+        let profile = settings.wav_profile;
+        if self
+            .exported
+            .as_ref()
+            .is_some_and(|file| file.profile == profile)
+        {
             return;
         }
+        self.exported = None;
         if self.export.is_some() {
             self.export_requested = true;
             return;
@@ -670,20 +702,27 @@ impl CaptureUi {
             let last = (range.end * frames as f32).ceil() as usize;
             first.min(frames - 1)..last.clamp(first.min(frames - 1) + 1, frames)
         });
-        let output = self.session.settings().output_dir;
+        let output = settings.output_dir;
         let worker = thread::Builder::new()
             .name("backtracking-wav".into())
             .spawn(move || {
                 let samples = snapshot
                     .frames(range)
                     .ok_or_else(|| io::Error::other("invalid audio selection"))?;
-                export_wav(&output, snapshot.sample_rate, snapshot.channels, samples)?
-                    .canonicalize()
+                export_wav_with_profile(
+                    &output,
+                    snapshot.sample_rate,
+                    snapshot.channels,
+                    samples,
+                    profile,
+                )?
+                .canonicalize()
             });
         match worker {
             Ok(worker) => {
                 self.export = Some(ExportJob {
                     revision: self.revision,
+                    profile,
                     worker,
                 });
                 self.message = "Writing WAV…".into();
@@ -704,11 +743,14 @@ impl CaptureUi {
             return;
         };
         let result = job.worker.join();
-        if job.revision == self.revision {
+        if job.revision == self.revision && job.profile == self.session.settings().wav_profile {
             match result {
                 Ok(Ok(path)) => {
                     self.message = format!("Saved {}", path.display());
-                    self.exported = Some(path);
+                    self.exported = Some(ExportedWav {
+                        profile: job.profile,
+                        path,
+                    });
                 }
                 Ok(Err(error)) => self.message = format!("Could not save WAV: {error}"),
                 Err(_) => self.message = "WAV export worker stopped unexpectedly.".into(),
@@ -761,6 +803,30 @@ impl CaptureUi {
             path.display()
         );
     }
+}
+
+fn wav_format_controls(ui: &mut egui::Ui, profile: &mut WavExportProfile) {
+    ui.label("WAV sample rate");
+    ui.horizontal(|ui| {
+        for (rate, label) in WavExportProfile::SAMPLE_RATES
+            .into_iter()
+            .zip(["44.1 kHz", "48 kHz", "96 kHz"])
+        {
+            ui.selectable_value(&mut profile.sample_rate, rate, label);
+        }
+    });
+    ui.end_row();
+    ui.label("WAV sample format");
+    ui.horizontal(|ui| {
+        for (format, label) in [
+            (WavSampleFormat::Pcm16, "16-bit PCM"),
+            (WavSampleFormat::Pcm24, "24-bit PCM"),
+            (WavSampleFormat::Float32, "32-bit float"),
+        ] {
+            ui.selectable_value(&mut profile.sample_format, format, label);
+        }
+    });
+    ui.end_row();
 }
 
 fn capture_button(ui: &mut egui::Ui, paused: bool, enabled: bool) -> egui::Response {

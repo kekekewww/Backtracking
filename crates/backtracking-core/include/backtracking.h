@@ -38,6 +38,10 @@ void bt_snapshot_free(BtSnapshot *snapshot);
 // A frozen snapshot can be passed to a worker for export. The two endpoints
 // are fractions of its frame count. The returned UTF-8 path belongs to Rust.
 char *bt_snapshot_export(const BtSnapshot *snapshot, double start, double end, const char *directory);
+// Rates are 44100, 48000 or 96000. Sample sizes 16 and 24 are PCM, 32 is IEEE float.
+char *bt_snapshot_export_with_profile(const BtSnapshot *snapshot, double start, double end,
+                                      const char *directory, uint32_t sample_rate,
+                                      uint32_t bits_per_sample);
 void bt_string_free(char *string);
 
 #endif

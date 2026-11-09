@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{
-    AudioQueue, Capture, CaptureState, DurationChoice, MeterReadings, Snapshot,
+    AudioQueue, Capture, CaptureState, DurationChoice, MeterReadings, Snapshot, WavExportProfile,
 };
 
 use crate::settings::{MeterMode, SessionSettings, SettingsStore};
@@ -131,6 +131,10 @@ impl Session {
 
     pub(crate) fn set_meter_mode(&self, meter_mode: MeterMode) {
         self.settings.lock().meter_mode = meter_mode;
+    }
+
+    pub(crate) fn set_wav_profile(&self, profile: WavExportProfile) {
+        self.settings.lock().wav_profile = profile;
     }
 
     pub(crate) fn set_retention(&self, retention: DurationChoice) {

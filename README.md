@@ -25,7 +25,7 @@ Windows 和 macOS 桌面版採用無邊框視窗，可直接在工具列切換�
 
 桌面版會在下次開啟時還原偏好設定。VST3／CLAP 的設定跟著各自的插件實例存進 DAW 專案，修改後請儲存專案。要保留錄音素材，請先匯出 WAV。
 
-匯出為 **48 kHz、32-bit float WAV**。指定專案資料夾後，檔案會存到它的 `output/` 子目錄。
+在齒輪選單可選擇 WAV 取樣率 **44.1、48 或 96 kHz**，以及 **16-bit PCM、24-bit PCM 或 32-bit IEEE float** 編碼。預設為 **48 kHz、32-bit float**。指定專案資料夾後，檔案會存到它的 `output/` 子目錄。
 
 [完整操作手冊](docs/USER_GUIDE.md#繁體中文) · [桌面視窗操作](docs/USER_GUIDE.md#移動與縮放桌面視窗) · [安裝與建置](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
 
@@ -52,7 +52,7 @@ The Windows and macOS desktop apps use a frameless window. Use **Keep on top** i
 
 The desktop apps restore preferences the next time you open them. For VST3 and CLAP, save your DAW project after making changes to store each instance's settings. Export a WAV to keep captured audio.
 
-Exports are **48 kHz, 32-bit float WAV** files. After you choose a project folder, files go into its `output/` subfolder.
+Choose a WAV sample rate of **44.1, 48, or 96 kHz** and **16-bit PCM, 24-bit PCM, or 32-bit IEEE float** encoding in the gear menu. The default is **48 kHz, 32-bit float**. After you choose a project folder, files go into its `output/` subfolder.
 
 [Full user guide](docs/USER_GUIDE.md#english) · [Desktop window controls](docs/USER_GUIDE.md#move-and-resize-the-desktop-window) · [Installation and build](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
 
