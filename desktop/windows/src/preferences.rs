@@ -7,6 +7,7 @@ use backtracking_core::{AutoResumeDelay, DurationChoice, WavExportProfile, WavSa
 
 const MAX_VALUE_BYTES: u64 = 128 * 1024;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+pub(crate) const DEFAULT_ACCENT: [u8; 3] = [103, 231, 181];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MeterMode {
@@ -30,12 +31,14 @@ pub(crate) enum Key {
     History,
     IdleResume,
     Transparency,
+    Accent,
     Meter,
     WavSampleRate,
     WavSampleFormat,
     Output,
     AlwaysOnTop,
     WaveformOnly,
+    WindowPosition,
 }
 
 impl Key {
@@ -45,12 +48,14 @@ impl Key {
             // The old preference used 0 for Off.
             Self::IdleResume => "idle-resume-delay-seconds",
             Self::Transparency => "transparency-percent",
+            Self::Accent => "theme-color",
             Self::Meter => "meter-unit",
             Self::WavSampleRate => "wav-sample-rate",
             Self::WavSampleFormat => "wav-sample-format",
             Self::Output => "output-folder",
             Self::AlwaysOnTop => "always-on-top",
             Self::WaveformOnly => "waveform-only",
+            Self::WindowPosition => "window-position",
         }
     }
 }
@@ -59,11 +64,13 @@ pub(crate) struct Settings {
     pub(crate) history: DurationChoice,
     pub(crate) idle_resume: AutoResumeDelay,
     pub(crate) transparency: u8,
+    pub(crate) accent: [u8; 3],
     pub(crate) meter_mode: MeterMode,
     pub(crate) wav_profile: WavExportProfile,
     pub(crate) output: PathBuf,
     pub(crate) pinned: bool,
     pub(crate) waveform_only: bool,
+    pub(crate) window_position: Option<[i32; 2]>,
 }
 
 impl Default for Settings {
@@ -75,11 +82,13 @@ impl Default for Settings {
             history: DurationChoice::Seconds20,
             idle_resume: AutoResumeDelay::default(),
             transparency: 0,
+            accent: DEFAULT_ACCENT,
             meter_mode: MeterMode::Dbfs,
             wav_profile: WavExportProfile::default(),
             output: home.join("Backtracking").join("output"),
             pinned: true,
             waveform_only: false,
+            window_position: None,
         }
     }
 }
@@ -102,7 +111,10 @@ impl Preferences {
     pub(crate) fn load(&self) -> Settings {
         let mut settings = Settings::default();
 
-        if let Some(history) = self.read_number(Key::History).and_then(duration) {
+        if let Some(history) = self
+            .read_number(Key::History)
+            .and_then(DurationChoice::from_seconds)
+        {
             settings.history = history;
         }
         if let Some(delay) = self
@@ -113,6 +125,9 @@ impl Preferences {
         }
         if let Some(percent @ (0 | 25 | 50 | 75 | 100)) = self.read_number(Key::Transparency) {
             settings.transparency = percent;
+        }
+        if let Some(accent) = self.read(Key::Accent).as_deref().and_then(parse_accent) {
+            settings.accent = accent;
         }
         settings.meter_mode = match self.read(Key::Meter).as_deref().map(str::trim) {
             Some("VU") => MeterMode::Vu,
@@ -142,6 +157,12 @@ impl Preferences {
             _ => {}
         }
         settings.waveform_only = self.read_number::<u8>(Key::WaveformOnly) == Some(1);
+        settings.window_position = self.read(Key::WindowPosition).and_then(|value| {
+            let mut parts = value.split_whitespace();
+            let x = parts.next()?.parse().ok()?;
+            let y = parts.next()?.parse().ok()?;
+            parts.next().is_none().then_some([x, y])
+        });
         settings
     }
 
@@ -210,11 +231,11 @@ pub(crate) fn wav_sample_format_preference(format: WavSampleFormat) -> &'static 
     }
 }
 
-fn duration(value: u8) -> Option<DurationChoice> {
-    match value {
-        10 => Some(DurationChoice::Seconds10),
-        20 => Some(DurationChoice::Seconds20),
-        30 => Some(DurationChoice::Seconds30),
-        _ => None,
+fn parse_accent(value: &str) -> Option<[u8; 3]> {
+    let hex = value.trim().strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
     }
+    let [_, r, g, b] = u32::from_str_radix(hex, 16).ok()?.to_be_bytes();
+    Some([r, g, b])
 }

@@ -14,14 +14,33 @@ pub enum DurationChoice {
     Seconds10,
     Seconds20,
     Seconds30,
+    Seconds60,
 }
 
 impl DurationChoice {
+    pub const ALL: [Self; 4] = [
+        Self::Seconds10,
+        Self::Seconds20,
+        Self::Seconds30,
+        Self::Seconds60,
+    ];
+
+    pub const fn from_seconds(seconds: u32) -> Option<Self> {
+        match seconds {
+            10 => Some(Self::Seconds10),
+            20 => Some(Self::Seconds20),
+            30 => Some(Self::Seconds30),
+            60 => Some(Self::Seconds60),
+            _ => None,
+        }
+    }
+
     pub const fn seconds(self) -> u32 {
         match self {
             Self::Seconds10 => 10,
             Self::Seconds20 => 20,
             Self::Seconds30 => 30,
+            Self::Seconds60 => 60,
         }
     }
 }
@@ -105,7 +124,7 @@ impl Capture {
         }
 
         let capacity_frames = usize::try_from(
-            u64::from(sample_rate) * u64::from(DurationChoice::Seconds30.seconds()),
+            u64::from(sample_rate) * u64::from(DurationChoice::Seconds60.seconds()),
         )
         .map_err(|_| CaptureError::BufferTooLarge)?;
         let frames_for_ms = |ms| (u64::from(sample_rate) * u64::from(ms)).div_ceil(1_000) as usize;
@@ -407,28 +426,28 @@ mod tests {
     #[test]
     fn wrapped_stereo_history_keeps_frame_order_and_obeys_retention() {
         let mut capture = Capture::new(1, 2, DurationChoice::Seconds10).unwrap();
-        let input: Vec<f32> = (1..=35)
+        let input: Vec<f32> = (1..=65)
             .flat_map(|frame| [frame as f32, -(frame as f32)])
             .collect();
         capture.push_interleaved(&input).unwrap();
         let snapshot = capture.snapshot();
         assert_eq!(snapshot.frame_count(), 10);
-        assert_eq!(snapshot.samples, &input[50..]);
-        assert_eq!(snapshot.frames(3..7), Some(&input[56..64]));
+        assert_eq!(snapshot.samples, &input[110..]);
+        assert_eq!(snapshot.frames(3..7), Some(&input[116..124]));
         assert_eq!(snapshot.frames(0..11), None);
 
         let mut minimum = [0.0; 2];
         let mut maximum = [0.0; 2];
         assert_eq!(capture.waveform(&mut minimum, &mut maximum), 10);
-        assert_eq!(minimum, [-30.0, -35.0]);
-        assert_eq!(maximum, [30.0, 35.0]);
+        assert_eq!(minimum, [-60.0, -65.0]);
+        assert_eq!(maximum, [60.0, 65.0]);
 
-        capture.set_retention(DurationChoice::Seconds30);
+        capture.set_retention(DurationChoice::Seconds60);
         assert_eq!(capture.snapshot(), snapshot);
-        capture.push_interleaved(&[36.0, -36.0]).unwrap();
+        capture.push_interleaved(&[66.0, -66.0]).unwrap();
         assert_eq!(capture.snapshot().frame_count(), 11);
         capture.set_retention(DurationChoice::Seconds10);
-        assert_eq!(capture.snapshot().frames(0..1), Some(&[27.0, -27.0][..]));
+        assert_eq!(capture.snapshot().frames(0..1), Some(&[57.0, -57.0][..]));
     }
 
     #[test]

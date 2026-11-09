@@ -1,6 +1,7 @@
 import AppKit
+import ServiceManagement
 
-private let timeChoices: [UInt32] = [10, 20, 30]
+private let timeChoices: [UInt32] = [10, 20, 30, 60]
 private let autoResumeChoices: [UInt32] = [0, 5, 10]
 private let autoResumePreferenceKey = "autoResumeSeconds"
 private let transparencyChoices: [UInt32] = [0, 25, 50, 75, 100]
@@ -11,7 +12,16 @@ private let fullPanelMinimum = NSSize(width: 560, height: 100)
 private let waveformOnlyPanelMinimum = NSSize(width: 240, height: 48)
 private let panelVerticalInset: CGFloat = 8
 private let fullWaveformMinimumHeight: CGFloat = 51
-private let waveformMint = (red: CGFloat(0.32), green: CGFloat(0.89), blue: CGFloat(0.82))
+private let defaultAccentRGB: UInt32 = 0x52E3D1
+
+private func accentColor(_ rgb: UInt32) -> NSColor {
+    NSColor(
+        srgbRed: CGFloat((rgb >> 16) & 0xFF) / 255,
+        green: CGFloat((rgb >> 8) & 0xFF) / 255,
+        blue: CGFloat(rgb & 0xFF) / 255,
+        alpha: 1
+    )
+}
 
 private func movesFromWaveform(_ modifiers: NSEvent.ModifierFlags) -> Bool {
     modifiers.contains([.command, .option]) && !modifiers.contains(.control)
@@ -24,7 +34,7 @@ enum BacktrackingApp {
         let app = NSApplication.shared
         let delegate = BacktrackingController()
         app.delegate = delegate
-        app.setActivationPolicy(.regular)
+        app.setActivationPolicy(.accessory)
         app.run()
         withExtendedLifetime(delegate) {}
     }
@@ -80,6 +90,10 @@ private final class CapturePanel: NSPanel {
 
     override func sendEvent(_ event: NSEvent) {
         switch event.type {
+        case .keyDown:
+            // Hardware codes 51 and 53 are Backspace and Escape on macOS.
+            if !event.modifierFlags.contains(.command), event.keyCode == 51 || event.keyCode == 53,
+               waveform?.cancelSelection() == true { return }
         case .leftMouseDown:
             onClick?()
             move = nil
@@ -367,11 +381,12 @@ private enum MeterMode: UInt32, CaseIterable {
 }
 
 @MainActor
-private final class BacktrackingController: NSObject, NSApplicationDelegate, NSWindowDelegate {
+private final class BacktrackingController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private let defaults = UserDefaults.standard
     private let worker = DispatchQueue(label: "backtracking.wav-export", qos: .userInitiated)
     private var tap: SystemAudioTap?
     private var panel: CapturePanel?
+    private var statusItem: NSStatusItem?
     private var background: CaptureBackground?
     private var waveform: WaveformView?
     private var timer: Timer?
@@ -388,6 +403,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var history: UInt32 = 20
     private var idleSeconds: UInt32 = 10
     private var transparency: UInt32 = 0
+    private var accentRGB = defaultAccentRGB
     private var meterMode: MeterMode = .dbfs
     private var exportSampleRate: UInt32 = 48_000
     private var exportBitsPerSample: UInt32 = 32
@@ -411,6 +427,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if let saved = unsignedSetting("backgroundTransparency"), transparencyChoices.contains(saved) {
             transparency = saved
         }
+        if let saved = unsignedSetting("accentRGB"), saved <= 0xFFFFFF {
+            accentRGB = saved
+        }
         if let saved = unsignedSetting("meterMode"), let mode = MeterMode(rawValue: saved) {
             meterMode = mode
         }
@@ -431,6 +450,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
         configureMenu()
         configurePanel()
+        configureStatusItem()
         resume()
         let timer = Timer(timeInterval: 1.0 / 15.0, target: self, selector: #selector(tick(_:)), userInfo: nil, repeats: true)
         self.timer = timer
@@ -449,8 +469,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         tap = nil
     }
 
-    func windowWillClose(_ notification: Notification) {
-        NSApp.terminate(nil)
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        hidePanel(sender)
+        return false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if let panel, !panel.isVisible { showPanel(panel) }
+        return false
     }
 
     func applicationDidChangeScreenParameters(_ notification: Notification) {
@@ -465,6 +491,56 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         item.submenu = menu
         bar.addItem(item)
         NSApp.mainMenu = bar
+    }
+
+    private func configureStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Backtracking") {
+            image.isTemplate = true
+            item.button?.image = image
+        } else {
+            item.button?.title = "BT"
+        }
+        item.button?.toolTip = "Backtracking"
+        let menu = NSMenu(title: "Backtracking")
+        menu.delegate = self
+        item.menu = menu
+        statusItem = item
+        menuNeedsUpdate(menu)
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === statusItem?.menu else { return }
+        menu.removeAllItems()
+        let title = panel?.isVisible == true ? "隱藏波形" : "顯示波形"
+        let visibility = NSMenuItem(title: title, action: #selector(togglePanelVisibility), keyEquivalent: "")
+        visibility.target = self
+        menu.addItem(visibility)
+        menu.addItem(captureMenuItem())
+        menu.addItem(loginItem())
+        menu.addItem(.separator())
+        menu.addItem(quitItem())
+    }
+
+    @objc private func togglePanelVisibility() {
+        guard let panel else { return }
+        if panel.isVisible {
+            hidePanel(panel)
+        } else {
+            showPanel(panel)
+        }
+    }
+
+    private func hidePanel(_ panel: NSWindow) {
+        panel.saveFrame(usingName: frameAutosaveName)
+        panel.orderOut(nil)
+    }
+
+    private func showPanel(_ panel: NSWindow) {
+        keepPanelVisible(panel)
+        refreshWaveform()
+        updateStatus()
+        panel.orderFrontRegardless()
     }
 
     private func configurePanel() {
@@ -486,6 +562,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
         let waveform = WaveformView(frame: .zero)
         waveform.controller = self
+        waveform.accentRGB = accentRGB
         let minimumWaveformHeight = waveform.heightAnchor.constraint(greaterThanOrEqualToConstant: fullWaveformMinimumHeight)
         minimumWaveformHeight.isActive = true
         waveformMinimumHeight = minimumWaveformHeight
@@ -555,16 +632,18 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         _ = window.setFrameAutosaveName(frameAutosaveName)
         if restoredFrame {
             applyPanelMinimum()
-            keepPanelVisible(window)
         } else {
             window.center()
         }
-        window.orderFrontRegardless()
+        showPanel(window)
     }
 
     private func keepPanelVisible(_ window: NSWindow) {
         let screens = NSScreen.screens
-        if !screens.isEmpty && !screens.contains(where: { $0.visibleFrame.intersects(window.frame) }) {
+        if !screens.isEmpty && !screens.contains(where: {
+            let visible = $0.visibleFrame.intersection(window.frame)
+            return visible.width >= min(40, window.frame.width) && visible.height >= min(30, window.frame.height)
+        }) {
             window.center()
         }
     }
@@ -589,10 +668,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private func settingsMenu() -> NSMenu {
         let menu = NSMenu(title: "設定")
         if waveformOnly {
-            let transportItem = NSMenuItem(title: captureActionLabel, action: #selector(toggleCapture(_:)), keyEquivalent: "")
-            transportItem.target = self
-            transportItem.representedObject = paused
-            menu.addItem(transportItem)
+            menu.addItem(captureMenuItem())
             menu.addItem(.separator())
         }
         menu.addItem(choiceMenu(
@@ -607,6 +683,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             title: "背景透明度", choices: transparencyChoices, selected: transparency,
             action: #selector(transparencyChanged(_:))
         ) { "\($0)%" })
+        let accent = NSMenuItem(title: "主題色…", action: #selector(chooseAccentColor), keyEquivalent: "")
+        accent.target = self
+        menu.addItem(accent)
         let meterItem = NSMenuItem(title: "電平顯示", action: nil, keyEquivalent: "")
         meterItem.submenu = meterMenu()
         menu.addItem(meterItem)
@@ -621,6 +700,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let revealItem = NSMenuItem(title: "前往儲存資料夾", action: #selector(openOutputFolder), keyEquivalent: "")
         revealItem.target = self
         menu.addItem(revealItem)
+        menu.addItem(loginItem())
         menu.addItem(.separator())
         menu.addItem(quitItem())
         return menu
@@ -666,6 +746,67 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let item = NSMenuItem(title: "結束 Backtracking", action: #selector(NSApplication.terminate(_:)), keyEquivalent: shortcut)
         item.target = NSApp
         return item
+    }
+
+    private func captureMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: captureActionLabel, action: #selector(toggleCapture(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = paused
+        return item
+    }
+
+    private func loginItem() -> NSMenuItem {
+        let status = SMAppService.mainApp.status
+        let title = status == .requiresApproval ? "登入時啟動（待核准）" : "登入時啟動"
+        let item = NSMenuItem(title: title, action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        item.target = self
+        item.state = status == .enabled ? .on : (status == .requiresApproval ? .mixed : .off)
+        return item
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled || service.status == .requiresApproval {
+                try service.unregister()
+            } else {
+                try service.register()
+                if service.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
+            }
+        } catch {
+            if service.status == .requiresApproval {
+                SMAppService.openSystemSettingsLoginItems()
+            } else {
+                let alert = NSAlert(error: error)
+                alert.messageText = "無法更新登入啟動設定"
+                NSApp.activate()
+                _ = alert.runModal()
+            }
+        }
+    }
+
+    @objc private func chooseAccentColor() {
+        registerClick()
+        let picker = NSColorPanel.shared
+        picker.color = accentColor(accentRGB)
+        picker.showsAlpha = false
+        picker.isContinuous = true
+        picker.setTarget(self)
+        picker.setAction(#selector(accentColorChanged(_:)))
+        NSApp.activate()
+        picker.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func accentColorChanged(_ picker: NSColorPanel) {
+        guard let color = picker.color.usingColorSpace(.sRGB) else { return }
+        func channel(_ value: CGFloat) -> UInt32 {
+            UInt32((min(1, max(0, value)) * 255).rounded())
+        }
+        let rgb = (channel(color.redComponent) << 16) | (channel(color.greenComponent) << 8) | channel(color.blueComponent)
+        guard rgb != accentRGB else { return }
+        accentRGB = rgb
+        defaults.set(Int(rgb), forKey: "accentRGB")
+        waveform?.accentRGB = rgb
     }
 
     private func choiceMenu(title: String, choices: [UInt32], selected: UInt32, action: Selector, label: (UInt32) -> String) -> NSMenuItem {
@@ -895,6 +1036,18 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
+    func resumeAfterSelectionCancellation() {
+        editing = false
+        registerClick()
+        notice = nil
+        if paused && tap != nil {
+            resume()
+        } else {
+            refreshWaveform()
+            updateStatus()
+        }
+    }
+
     private var captureActionLabel: String {
         if tap == nil || captureError != nil { return "重新連線並開始錄音" }
         return paused ? "開始錄音" : "暫停錄音"
@@ -954,17 +1107,18 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     @objc private func tick(_: Timer) {
-        waveform?.refreshHintModifiers()
+        let panelVisible = panel?.isVisible == true
+        if panelVisible { waveform?.refreshHintModifiers() }
         if let core = tap?.core, !paused {
             bt_poll(core)
-            refreshWaveform()
+            if panelVisible { refreshWaveform() }
         }
         if paused && !editing && tap != nil && idleSeconds > 0 &&
             ProcessInfo.processInfo.systemUptime - lastClick >= Double(idleSeconds) {
             registerClick()
             resume()
         }
-        updateStatus()
+        if panelVisible { updateStatus() }
     }
 
     func refreshWaveform() {
@@ -1008,7 +1162,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if statusLabel.isHidden != hideStatus { statusLabel.isHidden = hideStatus }
     }
 
-    private func setNotice(_ message: String?) {
+    fileprivate func setNotice(_ message: String?) {
         notice = message
         updateStatus()
     }
@@ -1018,7 +1172,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         return WAVExport(snapshot)
     }
 
-    func export(_ range: ClosedRange<Double>, snapshot: WAVExport?, completion: @escaping (URL?) -> Bool) {
+    func export(
+        _ range: ClosedRange<Double>, snapshot: WAVExport?, provisional: Bool, completion: @escaping (URL?) -> Bool
+    ) {
         guard let job = snapshot ?? frozenExport() else {
             if completion(nil) { setNotice("還沒有可匯出的錄音") }
             return
@@ -1026,13 +1182,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let directory = output
         let sampleRate = exportSampleRate
         let bitsPerSample = exportBitsPerSample
-        setNotice("正在寫入 WAV…")
+        setNotice(provisional ? "正在準備拖放…" : "正在寫入 WAV…")
         worker.async { [weak self] in
             let url = job.write(range: range, directory: directory, sampleRate: sampleRate, bitsPerSample: bitsPerSample)
             DispatchQueue.main.async {
-                guard completion(url) else { return }
+                guard completion(url) else {
+                    if provisional, let url { try? FileManager.default.removeItem(at: url) }
+                    return
+                }
                 if let url {
-                    self?.setNotice("已存入 \(url.lastPathComponent)")
+                    self?.setNotice(provisional ? nil : "已存入 \(url.lastPathComponent)")
                 } else {
                     self?.setNotice("無法匯出 WAV，請確認有錄音及資料夾寫入權限")
                 }
@@ -1045,6 +1204,7 @@ private final class WaveformView: NSView, NSDraggingSource {
     weak var controller: BacktrackingController?
     var showsOverlay = true { didSet { needsDisplay = true } }
     var maximumTraceHeight: CGFloat? { didSet { needsDisplay = true } }
+    var accentRGB = defaultAccentRGB { didSet { needsDisplay = true } }
     private var low = [Float](repeating: 0, count: 256)
     private var high = [Float](repeating: 0, count: 256)
     private var frames: UInt64 = 0
@@ -1062,11 +1222,18 @@ private final class WaveformView: NSView, NSDraggingSource {
     private var dragRequested = false
     private var dragging = false
     private var readyFile: URL?
+    private var readyFileIsProvisional = false
     private var preparingFile = false
     private var preparedRange: ClosedRange<Double>?
     private var exportVersion: UInt64 = 0
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var acceptsFirstResponder: Bool { true }
+    override var needsPanelToBecomeKey: Bool {
+        let modifiers = NSEvent.modifierFlags
+        return selection != nil ||
+            (!movesFromWaveform(modifiers) && !modifiers.intersection([.option, .control]).isEmpty)
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -1103,8 +1270,22 @@ private final class WaveformView: NSView, NSDraggingSource {
         needsDisplay = true
     }
 
+    func cancelSelection() -> Bool {
+        guard !dragging, anchor != nil || selection != nil else { return false }
+        anchor = nil
+        mouseDownEvent = nil
+        dragRequested = false
+        clearSelection()
+        controller?.resumeAfterSelectionCancellation()
+        return true
+    }
+
     func discardPreparedFile() {
+        if readyFileIsProvisional, let readyFile {
+            try? FileManager.default.removeItem(at: readyFile)
+        }
         readyFile = nil
+        readyFileIsProvisional = false
         preparingFile = false
         preparedRange = nil
         exportVersion &+= 1
@@ -1156,6 +1337,8 @@ private final class WaveformView: NSView, NSDraggingSource {
         if selecting { clearSelection() }
         controller.beginEditing()
         if selecting {
+            window?.makeKey()
+            window?.makeFirstResponder(self)
             controller.refreshWaveform()
             anchor = normalized(event)
             selection = anchor.map { $0...$0 }
@@ -1165,7 +1348,7 @@ private final class WaveformView: NSView, NSDraggingSource {
 
         mouseDownEvent = event
         dragRequested = false
-        prepareExport(exportRange, reuse: true)
+        if selectedSnapshot == nil { prepareExport(exportRange) }
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -1181,8 +1364,9 @@ private final class WaveformView: NSView, NSDraggingSource {
         } else if let mouseDownEvent {
             let start = mouseDownEvent.locationInWindow
             let current = event.locationInWindow
-            if hypot(current.x - start.x, current.y - start.y) >= 4 {
+            if !dragRequested && hypot(current.x - start.x, current.y - start.y) >= 4 {
                 dragRequested = true
+                if selectedSnapshot != nil { prepareExport(exportRange, provisional: true) }
                 tryStartDrag()
             }
         }
@@ -1202,9 +1386,18 @@ private final class WaveformView: NSView, NSDraggingSource {
             if let selection, selection.upperBound - selection.lowerBound > 0.001 {
                 if frames != 0 { selectedSnapshot = controller?.frozenExport() }
                 keepSelection = selectedSnapshot != nil
-                prepareExport(selection)
+                if !keepSelection { clearSelection() }
             } else {
                 clearSelection()
+            }
+        } else if !dragging, selectedSnapshot != nil {
+            if !dragRequested {
+                prepareExport(exportRange)
+            } else {
+                // The button was released before the selected WAV could be dragged.
+                discardPreparedFile()
+                controller?.setNotice(nil)
+                keepSelection = true
             }
         }
         mouseDownEvent = nil
@@ -1216,8 +1409,8 @@ private final class WaveformView: NSView, NSDraggingSource {
         if anchor != nil { mouseUp(with: event) }
     }
 
-    private func prepareExport(_ range: ClosedRange<Double>, reuse: Bool = false) {
-        if reuse && preparedRange == range {
+    private func prepareExport(_ range: ClosedRange<Double>, provisional: Bool = false) {
+        if preparedRange == range {
             if preparingFile { return }
             if let readyFile, FileManager.default.fileExists(atPath: readyFile.path) { return }
         }
@@ -1225,10 +1418,11 @@ private final class WaveformView: NSView, NSDraggingSource {
         preparedRange = range
         preparingFile = true
         let version = exportVersion
-        controller?.export(range, snapshot: selectedSnapshot) { [weak self] url in
+        controller?.export(range, snapshot: selectedSnapshot, provisional: provisional) { [weak self] url in
             guard let self, self.exportVersion == version else { return false }
             self.preparingFile = false
             self.readyFile = url
+            self.readyFileIsProvisional = provisional && url != nil
             self.needsDisplay = true
             self.tryStartDrag()
             return true
@@ -1262,6 +1456,10 @@ private final class WaveformView: NSView, NSDraggingSource {
         dragRequested = false
         mouseDownEvent = nil
         trackDragPointer()
+        if readyFileIsProvisional {
+            if operation.isEmpty { discardPreparedFile() }
+            else { readyFileIsProvisional = false }
+        }
         endGesture(keepingSelection: operation.isEmpty && selectedSnapshot != nil)
     }
 
@@ -1287,7 +1485,9 @@ private final class WaveformView: NSView, NSDraggingSource {
             action = "Drag and Drop"
         } else if selectionModifierDown {
             action = "Drag to Select"
-        } else if selection != nil || readyFile != nil {
+        } else if selection != nil {
+            action = "Drag and Drop   Esc to Cancel"
+        } else if readyFile != nil {
             action = "Drag and Drop   Option + Click"
         } else {
             action = "Click   Option + Click"
@@ -1344,7 +1544,7 @@ private final class WaveformView: NSView, NSDraggingSource {
         let preview = selection != nil || pointer != nil || mouseDownEvent != nil || dragging ? exportRange : nil
         let selectedRect = selection.map { waveformRect(for: $0) }
         if showsOverlay, let preview, selectedRect == nil, frames != 0 {
-            NSColor.systemTeal.withAlphaComponent(0.23).setFill()
+            accentColor(accentRGB).withAlphaComponent(0.23).setFill()
             NSBezierPath.fill(waveformRect(for: preview))
         }
 
@@ -1363,8 +1563,7 @@ private final class WaveformView: NSView, NSDraggingSource {
                 trace.move(to: NSPoint(x: x, y: bottom))
                 trace.line(to: NSPoint(x: x, y: max(top, bottom + 0.7)))
             }
-            let mint = waveformMint
-            NSColor(calibratedRed: mint.red, green: mint.green, blue: mint.blue, alpha: 1).setStroke()
+            accentColor(accentRGB).setStroke()
             trace.lineWidth = max(1, step * 0.75)
             if let selectedRect, !selectedRect.isEmpty {
                 let outside = NSBezierPath(rect: bounds)
@@ -1377,7 +1576,7 @@ private final class WaveformView: NSView, NSDraggingSource {
 
                 NSGraphicsContext.saveGraphicsState()
                 NSBezierPath(rect: selectedRect).addClip()
-                NSColor(calibratedRed: 1 - mint.red, green: 1 - mint.green, blue: 1 - mint.blue, alpha: 1).setStroke()
+                accentColor(accentRGB ^ 0xFFFFFF).setStroke()
                 trace.stroke()
                 NSGraphicsContext.restoreGraphicsState()
             } else {

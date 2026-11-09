@@ -20,7 +20,7 @@ use nice_plug_egui::{
 };
 
 use crate::session::Session;
-use crate::settings::{MeterMode, SessionSettings, TRANSPARENCY_LEVELS};
+use crate::settings::{DEFAULT_ACCENT, MeterMode, SessionSettings, TRANSPARENCY_LEVELS};
 
 #[cfg(target_os = "windows")]
 mod win_drag;
@@ -28,13 +28,6 @@ mod win_drag;
 const BINS: usize = 512;
 const REFRESH: Duration = Duration::from_millis(80);
 const RECORDING_BLINK: Duration = Duration::from_millis(500);
-const DURATIONS: [DurationChoice; 3] = [
-    DurationChoice::Seconds10,
-    DurationChoice::Seconds20,
-    DurationChoice::Seconds30,
-];
-const MINT: Color32 = Color32::from_rgb(103, 231, 181);
-const INVERTED_MINT: Color32 = Color32::from_rgb(152, 24, 74);
 const SETTINGS_POPUP_ID: &str = "backtracking-settings-popup";
 const TOOLBAR_CONTROL_HEIGHT: f32 = 25.0;
 const MIN_WAVEFORM_HEIGHT: f32 = 60.0;
@@ -106,6 +99,7 @@ enum Gesture {
     },
     Drag {
         origin: Pos2,
+        export_started: bool,
     },
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     SaveOnly,
@@ -233,9 +227,30 @@ impl NiceEguiApp for CaptureUi {
                 }
             }
         }
-        let mut paused = self.session.is_paused();
         self.collect_export();
+        let popup_id = egui::Id::unique(SETTINGS_POPUP_ID);
+        let canceled_selection = !egui::Popup::is_id_open(ui.ctx(), popup_id)
+            && self.can_cancel_selection()
+            && ui.input_mut(|input| {
+                let event_count = input.events.len();
+                input.events.retain(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Escape | egui::Key::Backspace,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                });
+                input.events.len() != event_count
+            });
+        if canceled_selection {
+            self.cancel_selection();
+        }
+        let mut paused = self.session.is_paused();
         self.refresh_waveform(paused, settings.idle_resume);
+        ui.visuals_mut().selection.bg_fill = muted_accent(settings.accent);
 
         if ui.input(|input| input.pointer.any_pressed()) {
             self.session.mark_interaction();
@@ -260,9 +275,8 @@ impl NiceEguiApp for CaptureUi {
                 None
             }
         });
-        let controls_enabled = can_toggle
-            && context_at.is_none()
-            && !egui::Popup::is_id_open(ui.ctx(), egui::Id::unique(SETTINGS_POPUP_ID));
+        let controls_enabled =
+            can_toggle && context_at.is_none() && !egui::Popup::is_id_open(ui.ctx(), popup_id);
         let gear = if waveform_only {
             self.recording_since = None;
             None
@@ -319,14 +333,19 @@ impl NiceEguiApp for CaptureUi {
             context_at,
         );
         let configured_seconds = settings.retention.seconds() as f32;
-        self.interact_waveform(
-            ui,
-            frame,
-            rect,
-            configured_seconds,
-            settings.idle_resume,
-            !settings_open,
-        );
+        if !canceled_selection {
+            self.interact_waveform(
+                ui,
+                frame,
+                &response,
+                configured_seconds,
+                settings.idle_resume,
+                !settings_open,
+            );
+        }
+        if canceled_selection {
+            response.surrender_focus();
+        }
         // Keep the transparent overlay's entire gesture area and center only the drawing.
         let draw_rect = if waveform_only {
             let height = self.full_waveform_height.unwrap_or_else(|| {
@@ -344,14 +363,7 @@ impl NiceEguiApp for CaptureUi {
         } else {
             rect
         };
-        self.draw_waveform(
-            ui,
-            draw_rect,
-            configured_seconds,
-            !settings_open,
-            settings.panel_transparency,
-            waveform_only,
-        );
+        self.draw_waveform(ui, draw_rect, configured_seconds, !settings_open, &settings);
         if !settings_open {
             if !waveform_only {
                 self.draw_action_hint(ui, rect);
@@ -489,6 +501,7 @@ impl CaptureUi {
             let mut retention = settings.retention;
             let mut idle_resume = settings.idle_resume;
             let mut panel_transparency = settings.panel_transparency;
+            let mut accent = settings.accent;
             let mut meter_mode = settings.meter_mode;
             let mut wav_profile = settings.wav_profile;
             let mut waveform_only = settings.show_waveform_only;
@@ -512,7 +525,7 @@ impl CaptureUi {
                         .show(ui, |ui| {
                             ui.label("History");
                             ui.horizontal(|ui| {
-                                for duration in DURATIONS {
+                                for duration in DurationChoice::ALL {
                                     ui.selectable_value(
                                         &mut retention,
                                         duration,
@@ -554,6 +567,20 @@ impl CaptureUi {
                             ui.end_row();
                             wav_format_controls(ui, &mut wav_profile);
                         });
+                    ui.collapsing("Theme color", |ui| {
+                        ui.spacing_mut().slider_width = 120.0;
+                        let mut color = Color32::from_rgb(accent[0], accent[1], accent[2]);
+                        if egui::color_picker::color_picker_color32(
+                            ui,
+                            &mut color,
+                            egui::color_picker::Alpha::Opaque,
+                        ) {
+                            accent = [color.r(), color.g(), color.b()];
+                        }
+                        if ui.button("Reset color").clicked() {
+                            accent = DEFAULT_ACCENT;
+                        }
+                    });
                 });
             if retention != settings.retention {
                 self.session.set_retention(retention);
@@ -569,6 +596,10 @@ impl CaptureUi {
             if panel_transparency != settings.panel_transparency {
                 self.session.set_panel_transparency(panel_transparency);
                 settings.panel_transparency = panel_transparency;
+            }
+            if accent != settings.accent {
+                self.session.set_accent(accent);
+                settings.accent = accent;
             }
             if meter_mode != settings.meter_mode {
                 self.session.set_meter_mode(meter_mode);
@@ -731,6 +762,19 @@ impl CaptureUi {
         self.next_refresh = Instant::now();
     }
 
+    fn can_cancel_selection(&self) -> bool {
+        !self.native_dragging.load(Ordering::Acquire)
+            && (self.selection_ready_for_drag
+                || matches!(self.gesture, Some(Gesture::Select { .. })))
+    }
+
+    fn cancel_selection(&mut self) {
+        self.gesture = None;
+        self.reset_frozen();
+        self.message.clear();
+        self.session.cancel_waveform_selection();
+    }
+
     fn invalidate_export(&mut self) {
         self.next_export_revision();
         self.pending_exports.retain(|request| request.immediate);
@@ -753,15 +797,15 @@ impl CaptureUi {
         rect: Rect,
         seconds: f32,
         allow_hover: bool,
-        panel_transparency: u8,
-        waveform_only: bool,
+        settings: &SessionSettings,
     ) {
+        let waveform_only = settings.show_waveform_only;
         let painter = ui.painter_at(rect);
         let inner = rect.shrink(8.0);
         let middle = inner.center().y;
         let extent = inner.height().max(0.0) * 0.47;
         if !waveform_only {
-            let opacity = ((100 - u16::from(panel_transparency)) * 255 / 100) as u8;
+            let opacity = ((100 - u16::from(settings.panel_transparency)) * 255 / 100) as u8;
             painter.rect_filled(
                 rect,
                 6.0,
@@ -803,9 +847,22 @@ impl CaptureUi {
                 }
             };
         if hover_preview {
-            painter.rect_filled(audio_rect, 2.0, Color32::from_rgb(31, 79, 64));
+            painter.rect_filled(audio_rect, 2.0, muted_accent(settings.accent));
         }
 
+        let [r, g, b] = settings.accent;
+        let color = Color32::from_rgb(r, g, b);
+        let complement = [255 - r, 255 - g, 255 - b];
+        let selected_color = if settings
+            .accent
+            .into_iter()
+            .zip(complement)
+            .all(|(a, b)| a.abs_diff(b) < 64)
+        {
+            Color32::WHITE
+        } else {
+            Color32::from_rgb(complement[0], complement[1], complement[2])
+        };
         for (bin, (&low, &high)) in self.minimum.iter().zip(&self.maximum).enumerate() {
             let fraction = (bin as f32 + 0.5) / BINS as f32;
             let x = audio_rect.left() + width * fraction;
@@ -815,9 +872,9 @@ impl CaptureUi {
                 .as_ref()
                 .is_some_and(|range| range.contains(&fraction))
             {
-                INVERTED_MINT
+                selected_color
             } else {
-                MINT
+                color
             };
             painter.line_segment(
                 [Pos2::new(x, top), Pos2::new(x, bottom.max(top + 0.4))],
@@ -848,6 +905,9 @@ impl CaptureUi {
             Some(Gesture::SaveOnly) => return,
             None if down => return,
             None if modifier => "Drag to Select".into(),
+            None if self.selection_ready_for_drag => {
+                "Drag and Drop\nEsc / Backspace to cancel".into()
+            }
             None => {
                 let action = if self.exported.is_some() || self.selection.is_some() {
                     "Drag and Drop"
@@ -897,11 +957,12 @@ impl CaptureUi {
         &mut self,
         ui: &egui::Ui,
         frame: &Frame,
-        rect: Rect,
+        waveform: &egui::Response,
         seconds: f32,
         idle_resume: AutoResumeDelay,
         allow_new_gesture: bool,
     ) {
+        let rect = waveform.rect;
         let (position, pressed, down, selecting) = ui.input(|input| {
             (
                 input.pointer.interact_pos(),
@@ -929,15 +990,21 @@ impl CaptureUi {
             }
             self.cache_frozen_snapshot();
             if selecting {
+                waveform.request_focus();
                 let anchor = position_in_audio(self.audio_rect(rect, seconds), position.x);
                 self.gesture = Some(Gesture::Select {
                     anchor,
                     current: anchor,
                 });
             } else {
-                self.selection_ready_for_drag = false;
-                self.begin_export();
-                self.gesture = Some(Gesture::Drag { origin: position });
+                let export_started = !self.selection_ready_for_drag;
+                if export_started {
+                    self.begin_export();
+                }
+                self.gesture = Some(Gesture::Drag {
+                    origin: position,
+                    export_started,
+                });
             }
         }
 
@@ -949,27 +1016,49 @@ impl CaptureUi {
         }
 
         if down {
-            if let (Some(Gesture::Drag { origin }), Some(position), Some(file)) =
-                (&self.gesture, position, self.exported.as_ref())
+            if let (
+                Some(Gesture::Drag {
+                    origin,
+                    export_started,
+                }),
+                Some(position),
+            ) = (&mut self.gesture, position)
                 && position.distance(*origin) >= 4.0
-                && file.profile == self.session.settings().wav_profile
             {
                 let origin = *origin;
-                let path = file.path.clone();
-                self.gesture = None;
-                self.start_native_drag(frame, path, origin);
+                if !*export_started {
+                    *export_started = true;
+                    self.selection_ready_for_drag = false;
+                    self.begin_export();
+                }
+                if let Some(file) = &self.exported
+                    && file.profile == self.session.settings().wav_profile
+                {
+                    let path = file.path.clone();
+                    self.gesture = None;
+                    self.start_native_drag(frame, path, origin);
+                }
             }
         } else if let Some(gesture) = self.gesture.take() {
-            if let Gesture::Select { anchor, current } = gesture {
-                let range = anchor.min(current)..anchor.max(current);
-                self.selection = (range.end > range.start).then_some(range);
-                self.selection_ready_for_drag = self.selection.is_some();
-                if idle_resume == AutoResumeDelay::Immediate {
-                    self.next_export_revision();
-                } else {
-                    self.invalidate_export();
+            match gesture {
+                Gesture::Select { anchor, current } => {
+                    let range = anchor.min(current)..anchor.max(current);
+                    self.selection = (range.end > range.start).then_some(range);
+                    self.selection_ready_for_drag = self.selection.is_some();
+                    if idle_resume == AutoResumeDelay::Immediate {
+                        self.next_export_revision();
+                    } else {
+                        self.invalidate_export();
+                    }
                 }
-                self.begin_export();
+                Gesture::Drag {
+                    export_started: false,
+                    ..
+                } => {
+                    self.selection_ready_for_drag = false;
+                    self.begin_export();
+                }
+                _ => {}
             }
             self.session.end_waveform_gesture();
         }
@@ -1127,6 +1216,10 @@ impl CaptureUi {
             path.display()
         );
     }
+}
+
+fn muted_accent([r, g, b]: [u8; 3]) -> Color32 {
+    Color32::from_rgb(r / 3, g / 3, b / 3)
 }
 
 fn wav_format_controls(ui: &mut egui::Ui, profile: &mut WavExportProfile) {

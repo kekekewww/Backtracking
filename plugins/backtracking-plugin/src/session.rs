@@ -130,6 +130,10 @@ impl Session {
         self.settings.lock().panel_transparency = panel_transparency;
     }
 
+    pub(crate) fn set_accent(&self, accent: [u8; 3]) {
+        self.settings.lock().accent = accent;
+    }
+
     pub(crate) fn set_meter_mode(&self, meter_mode: MeterMode) {
         self.settings.lock().meter_mode = meter_mode;
     }
@@ -244,6 +248,17 @@ impl Session {
         state.gesture_active = false;
         state.last_interaction = Instant::now();
         if state.paused && state.idle_resume == AutoResumeDelay::Immediate {
+            Self::resume_locked(&mut state);
+            if let Some(consumer) = &mut state.consumer {
+                self.accept_input_when_safe(consumer);
+            }
+        }
+    }
+
+    pub(crate) fn cancel_waveform_selection(&self) {
+        let mut state = self.lock();
+        state.gesture_active = false;
+        if state.paused {
             Self::resume_locked(&mut state);
             if let Some(consumer) = &mut state.consumer {
                 self.accept_input_when_safe(consumer);

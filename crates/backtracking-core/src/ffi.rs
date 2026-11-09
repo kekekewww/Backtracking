@@ -38,18 +38,9 @@ impl BtCore {
     }
 }
 
-fn duration(seconds: u32) -> Option<DurationChoice> {
-    match seconds {
-        10 => Some(DurationChoice::Seconds10),
-        20 => Some(DurationChoice::Seconds20),
-        30 => Some(DurationChoice::Seconds30),
-        _ => None,
-    }
-}
-
 #[no_mangle]
 extern "C" fn bt_new(sample_rate: f64, channels: u32, history_secs: u32) -> *mut BtCore {
-    let Some(history) = duration(history_secs) else {
+    let Some(history) = DurationChoice::from_seconds(history_secs) else {
         return ptr::null_mut();
     };
     if !(1.0..=384_000.0).contains(&sample_rate) || !(1..=2).contains(&channels) {
@@ -170,7 +161,8 @@ unsafe extern "C" fn bt_meter_readings(core: *const BtCore) -> MeterReadings {
 
 #[no_mangle]
 unsafe extern "C" fn bt_set_history(core: *const BtCore, seconds: u32) -> i32 {
-    let (Some(core), Some(retention)) = (core.as_ref(), duration(seconds)) else {
+    let (Some(core), Some(retention)) = (core.as_ref(), DurationChoice::from_seconds(seconds))
+    else {
         return 0;
     };
     let Ok(mut reader) = core.reader.lock() else {
@@ -328,6 +320,33 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn sixty_second_history_retains_the_latest_frames() {
+        let core = bt_new(1.0, 1, 60);
+        assert!(!core.is_null());
+        unsafe {
+            for frame in 1..=63 {
+                let sample = frame as f32 / 64.0;
+                assert_eq!(bt_push_interleaved(core, &sample, 1), 1);
+                bt_poll(core);
+            }
+
+            let snapshot = bt_snapshot(core);
+            let expected: Vec<_> = (4..=63).map(|frame| frame as f32 / 64.0).collect();
+            assert_eq!((*snapshot).samples, expected);
+            bt_snapshot_free(snapshot);
+
+            assert_eq!(bt_set_history(core, 30), 1);
+            assert_eq!(bt_set_history(core, 60), 1);
+            assert_eq!(bt_push_interleaved(core, &1.0, 1), 1);
+            bt_poll(core);
+            let snapshot = bt_snapshot(core);
+            assert_eq!((*snapshot).frame_count(), 31);
+            bt_snapshot_free(snapshot);
+            bt_free(core);
+        }
+    }
 
     #[test]
     fn clear_discards_already_queued_audio_and_preserves_mode() {

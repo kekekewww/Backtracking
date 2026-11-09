@@ -27,7 +27,7 @@ xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library -O \
   -import-objc-header "$repo_dir/crates/backtracking-core/include/backtracking.h" \
   "$source_dir/BacktrackingApp.swift" "$source_dir/SystemAudioTap.swift" \
   "$target_dir/$rust_target/release/libbacktracking_core.a" \
-  -framework AppKit -framework CoreAudio -framework AudioToolbox \
+  -framework AppKit -framework CoreAudio -framework AudioToolbox -framework ServiceManagement \
   -o "$app_dir/Contents/MacOS/Backtracking"
 codesign --force --sign - "$app_dir"
 printf 'Built %s\n' "$app_dir"
