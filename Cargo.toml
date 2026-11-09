@@ -1,0 +1,4 @@
+[workspace]
+members = ["crates/backtracking-core"]
+exclude = ["plugins/backtracking-plugin"]
+resolver = "2"
