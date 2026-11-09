@@ -19,6 +19,7 @@ use crate::session::{Session, SessionSettings};
 
 const BINS: usize = 512;
 const REFRESH: Duration = Duration::from_millis(80);
+const RECORDING_BLINK: Duration = Duration::from_millis(500);
 const DURATIONS: [DurationChoice; 3] = [
     DurationChoice::Seconds10,
     DurationChoice::Seconds20,
@@ -39,6 +40,7 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
             maximum: [0.0; BINS],
             seconds: 0.0,
             next_refresh: Instant::now(),
+            recording_since: None,
             frozen: None,
             selection: None,
             gesture: None,
@@ -58,6 +60,7 @@ pub struct CaptureUi {
     maximum: [f32; BINS],
     seconds: f32,
     next_refresh: Instant,
+    recording_since: Option<Instant>,
     frozen: Option<Arc<Snapshot>>,
     selection: Option<Range<f32>>,
     gesture: Option<Gesture>,
@@ -99,7 +102,7 @@ impl NiceEguiApp for CaptureUi {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame) {
         let mut settings = self.session.settings();
-        let paused = self.session.is_paused();
+        let mut paused = self.session.is_paused();
         self.collect_export();
         self.refresh_waveform(paused);
 
@@ -111,21 +114,19 @@ impl NiceEguiApp for CaptureUi {
             .horizontal(|ui| {
                 ui.heading("Backtracking");
                 ui.separator();
-                let (status, color) = if paused {
-                    ("Paused", Color32::from_rgb(246, 196, 118))
-                } else if self.session.is_recording() {
-                    ("Recording", MINT)
-                } else {
-                    ("Waiting for audio", ui.visuals().weak_text_color())
-                };
-                ui.colored_label(color, status);
-                if ui
-                    .add_enabled(paused, egui::Button::new("Resume"))
-                    .clicked()
-                {
-                    self.reset_frozen();
-                    self.session.resume();
+                let can_toggle =
+                    self.gesture.is_none() && !self.native_dragging.load(Ordering::Acquire);
+                if capture_button(ui, paused, can_toggle).clicked() {
+                    if paused {
+                        self.session.resume();
+                        self.reset_frozen();
+                    } else {
+                        self.freeze_capture();
+                    }
+                    paused = self.session.is_paused();
+                    ui.ctx().request_repaint();
                 }
+                self.recording_indicator(ui, paused);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     self.settings_menu(ui, frame, &mut settings, paused)
                 })
@@ -175,6 +176,7 @@ impl NiceEguiApp for CaptureUi {
 
     fn editor_closed(&mut self) {
         self.gesture = None;
+        self.recording_since = None;
         if !self.native_dragging.load(Ordering::Acquire) {
             self.session.set_gesture_active(false);
         }
@@ -192,6 +194,30 @@ impl Drop for CaptureUi {
 }
 
 impl CaptureUi {
+    fn recording_indicator(&mut self, ui: &mut egui::Ui, paused: bool) {
+        let (status, color) = if !paused && self.session.is_recording() {
+            let started = self.recording_since.get_or_insert_with(Instant::now);
+            let phase = started.elapsed().as_millis() / RECORDING_BLINK.as_millis();
+            let color = if phase.is_multiple_of(2) {
+                Color32::from_rgb(249, 78, 88)
+            } else {
+                Color32::from_rgb(103, 44, 48)
+            };
+            ("Recording", color)
+        } else {
+            self.recording_since = None;
+            if paused {
+                ("Paused", Color32::from_rgb(51, 56, 61))
+            } else {
+                ("Waiting for sound", Color32::from_rgb(74, 81, 88))
+            }
+        };
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, color);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Status, true, status));
+        response.on_hover_text(status);
+    }
+
     fn settings_menu(
         &mut self,
         ui: &mut egui::Ui,
@@ -297,6 +323,16 @@ impl CaptureUi {
         );
     }
 
+    fn freeze_capture(&mut self) {
+        self.session.pause();
+        if self.frozen.is_none()
+            && let Some(snapshot) = self.session.snapshot()
+        {
+            self.update_peaks(&snapshot);
+            self.frozen = Some(Arc::new(snapshot));
+        }
+    }
+
     fn reset_frozen(&mut self) {
         self.frozen = None;
         self.selection = None;
@@ -327,13 +363,6 @@ impl CaptureUi {
         let audio_rect = self.audio_rect(rect, seconds);
         let width = audio_rect.width();
         if width <= 0.0 {
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "No captured audio",
-                egui::FontId::proportional(13.0),
-                Color32::GRAY,
-            );
             return;
         }
 
@@ -464,13 +493,7 @@ impl CaptureUi {
             && let Some(position) = position.filter(|position| rect.contains(*position))
         {
             self.session.set_gesture_active(true);
-            self.session.pause();
-            if self.frozen.is_none()
-                && let Some(snapshot) = self.session.snapshot()
-            {
-                self.update_peaks(&snapshot);
-                self.frozen = Some(Arc::new(snapshot));
-            }
+            self.freeze_capture();
             if selecting {
                 let anchor = position_in_audio(self.audio_rect(rect, seconds), position.x);
                 self.gesture = Some(Gesture::Select {
@@ -623,6 +646,38 @@ impl CaptureUi {
             path.display()
         );
     }
+}
+
+fn capture_button(ui: &mut egui::Ui, paused: bool, enabled: bool) -> egui::Response {
+    let response = ui.add_enabled(enabled, egui::Button::new("").min_size(Vec2::splat(25.0)));
+    let label = if paused {
+        "Start capture"
+    } else {
+        "Pause capture"
+    };
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
+    let center = response.rect.center();
+    let color = ui.style().interact(&response).fg_stroke.color;
+    if paused {
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![
+                center + Vec2::new(-4.0, -6.0),
+                center + Vec2::new(6.0, 0.0),
+                center + Vec2::new(-4.0, 6.0),
+            ],
+            color,
+            Stroke::NONE,
+        ));
+    } else {
+        for offset in [-2.7, 2.7] {
+            ui.painter().rect_filled(
+                Rect::from_center_size(center + Vec2::new(offset, 0.0), Vec2::new(2.6, 11.0)),
+                0.5,
+                color,
+            );
+        }
+    }
+    response.on_hover_text(label)
 }
 
 fn settings_button(ui: &mut egui::Ui) -> egui::Response {

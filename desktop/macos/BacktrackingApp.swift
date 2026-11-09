@@ -222,6 +222,54 @@ private final class WAVExport: @unchecked Sendable {
     }
 }
 
+private final class CaptureLamp: NSView {
+    enum State: Equatable {
+        case unavailable, paused, waiting, recording
+
+        var label: String {
+            switch self {
+            case .unavailable: "錄音裝置未連線"
+            case .paused: "已暫停"
+            case .waiting: "等待聲音"
+            case .recording: "錄音中"
+            }
+        }
+    }
+
+    private var state: State?
+    private var pulseStart: TimeInterval = 0
+    private var bright = true
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 14, height: 14) }
+
+    func update(_ state: State, now: TimeInterval, detail: String) {
+        if toolTip != detail {
+            toolTip = detail
+            setAccessibilityLabel(detail)
+        }
+        let changed = state != self.state
+        if changed { pulseStart = now }
+        let nextBright = state != .recording || Int((now - pulseStart) / 0.5).isMultiple(of: 2)
+        guard changed || bright != nextBright else { return }
+        self.state = state
+        bright = nextBright
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let state else { return }
+        let color: NSColor = switch state {
+        case .unavailable: .systemOrange
+        case .paused: .quaternaryLabelColor
+        case .waiting: .tertiaryLabelColor
+        case .recording: .systemRed.withAlphaComponent(bright ? 1 : 0.27)
+        }
+        color.setFill()
+        NSBezierPath(ovalIn: NSRect(x: bounds.midX - 4, y: bounds.midY - 4, width: 8, height: 8)).fill()
+    }
+}
+
 @MainActor
 private final class BacktrackingController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let defaults = UserDefaults.standard
@@ -230,11 +278,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var panel: CapturePanel?
     private var waveform: WaveformView?
     private var timer: Timer?
-    private let resumeButton = NSButton(title: "重新連線", target: nil, action: nil)
+    private let captureButton = NSButton(title: "", target: nil, action: nil)
+    private let captureLamp = CaptureLamp(frame: .zero)
     private let statusLabel = NSTextField(labelWithString: "")
     private var history: UInt32 = 20
     private var idleSeconds: UInt32 = 0
     private var paused = true
+    private var captureFailed = false
     private var editing = false
     private var lastClick = ProcessInfo.processInfo.systemUptime
     private var notice: String?
@@ -283,12 +333,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     private func configurePanel() {
         let window = CapturePanel(
-            contentRect: NSRect(x: 0, y: 0, width: 590, height: 132),
+            contentRect: NSRect(x: 0, y: 0, width: 590, height: 116),
             styleMask: [.borderless, .resizable, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
         window.title = "Backtracking"
-        window.contentMinSize = NSSize(width: 560, height: 120)
+        window.contentMinSize = NSSize(width: 560, height: 100)
         window.isMovable = true
         window.hasShadow = true
         window.delegate = self
@@ -307,21 +357,23 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         window.waveform = waveform
         self.waveform = waveform
 
-        resumeButton.target = self
-        resumeButton.action = #selector(resume)
-        resumeButton.bezelStyle = .rounded
-        let pinButton = NSButton(checkboxWithTitle: "置頂", target: self, action: #selector(pinChanged(_:)))
+        captureButton.target = self
+        captureButton.action = #selector(toggleCapture)
+        captureButton.bezelStyle = .rounded
+        captureLamp.setAccessibilityElement(true)
+        captureLamp.setAccessibilityRole(.staticText)
+
+        let pinButton = NSButton(title: "置頂", target: self, action: #selector(pinChanged(_:)))
+        pinButton.setButtonType(.pushOnPushOff)
+        pinButton.bezelStyle = .rounded
         pinButton.state = .on
+        setIcon("pin.fill", label: "取消置頂", on: pinButton)
         let settingsButton = NSButton(title: "設定", target: self, action: #selector(showSettings(_:)))
         settingsButton.bezelStyle = .rounded
-        settingsButton.toolTip = "設定"
-        if let gear = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "設定") {
-            settingsButton.image = gear
-            settingsButton.imagePosition = .imageOnly
-        }
+        setIcon("gearshape", label: "設定", on: settingsButton)
         let spacer = NSView(frame: .zero)
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let controls = NSStackView(views: [resumeButton, spacer, pinButton, settingsButton])
+        let controls = NSStackView(views: [captureButton, captureLamp, statusLabel, spacer, pinButton, settingsButton])
         controls.orientation = .horizontal
         controls.spacing = 6
         controls.alignment = .centerY
@@ -329,7 +381,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         statusLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let stack = NSStackView(views: [controls, waveform, statusLabel])
+        statusLabel.isHidden = true
+        let stack = NSStackView(views: [controls, waveform])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 6
@@ -343,14 +396,21 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
             controls.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            waveform.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            statusLabel.widthAnchor.constraint(equalTo: stack.widthAnchor)
+            waveform.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
         panel = window
         if !window.setFrameUsingName("Backtracking.Panel") {
             window.center()
         }
         window.orderFrontRegardless()
+    }
+
+    private func setIcon(_ symbol: String, label: String, on button: NSButton) {
+        button.title = label
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+        button.imagePosition = button.image == nil ? .noImage : .imageOnly
+        button.toolTip = label
+        button.setAccessibilityLabel(label)
     }
 
     @objc private func showSettings(_ sender: NSButton) {
@@ -417,6 +477,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         panel?.isFloatingPanel = pinned
         panel?.hidesOnDeactivate = false
         panel?.level = pinned ? .floating : .normal
+        setIcon(pinned ? "pin.fill" : "pin", label: pinned ? "取消置頂" : "置頂", on: sender)
     }
 
     @objc private func chooseOutput() {
@@ -447,23 +508,36 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     func beginEditing() {
         editing = true
         registerClick()
-        guard !paused else { return }
-        do {
-            try tap?.pause()
-        } catch {
-            setNotice(error.localizedDescription)
-        }
-        paused = true
-        refreshWaveform()
-        updateStatus()
+        pauseCapture()
     }
 
     func endEditing() {
         editing = false
         registerClick()
+        updateStatus()
     }
 
-    @objc private func resume() {
+    @objc private func toggleCapture() {
+        guard !editing else { return }
+        registerClick()
+        if paused { resume() } else { pauseCapture() }
+    }
+
+    private func pauseCapture() {
+        if !paused {
+            do {
+                try tap?.pause()
+            } catch {
+                captureFailed = true
+                notice = error.localizedDescription
+            }
+            paused = true
+            refreshWaveform()
+        }
+        updateStatus()
+    }
+
+    private func resume() {
         guard paused, !editing else { return }
         do {
             if tap == nil {
@@ -472,11 +546,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             try tap?.resume()
             waveform?.clearSelection()
             paused = false
-            setNotice(nil)
+            captureFailed = false
+            notice = nil
         } catch {
             // The callback gate is still closed after a failed start. Let the user retry.
             paused = true
-            setNotice(error.localizedDescription)
+            captureFailed = true
+            notice = error.localizedDescription
         }
         updateStatus()
     }
@@ -501,22 +577,35 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func updateStatus() {
-        resumeButton.title = tap == nil ? "重新連線" : "繼續錄音"
-        resumeButton.isEnabled = (paused || tap == nil) && !editing
-        let state: String
-        if paused {
-            state = tap == nil ? "未連線" : "已暫停"
+        let state: CaptureLamp.State
+        if tap == nil || captureFailed {
+            state = .unavailable
+        } else if paused {
+            state = .paused
         } else if let core = tap?.core, bt_state(core) == 1 {
-            state = "錄音中"
+            state = .recording
         } else {
-            state = "等待聲音"
+            state = .waiting
         }
+        let label = state == .unavailable ? "重新連線並開始錄音" : (paused ? "開始錄音" : "暫停錄音")
+        if captureButton.title != label {
+            setIcon(paused ? "play.fill" : "pause.fill", label: label, on: captureButton)
+        }
+        captureButton.isEnabled = !editing
+
+        let now = ProcessInfo.processInfo.systemUptime
+        var detail = state.label
         if paused && !editing && tap != nil && idleSeconds > 0 {
-            let elapsed = ProcessInfo.processInfo.systemUptime - lastClick
+            let elapsed = now - lastClick
             let remaining = max(0, Int(ceil(Double(idleSeconds) - elapsed)))
-            statusLabel.stringValue = "\(state) · \(remaining) 秒後續錄" + (notice.map { " · \($0)" } ?? "")
-        } else {
-            statusLabel.stringValue = state + (notice.map { " · \($0)" } ?? "")
+            detail += " · \(remaining) 秒後續錄"
+        }
+        captureLamp.update(state, now: now, detail: detail)
+        let message = notice ?? ""
+        if statusLabel.stringValue != message {
+            statusLabel.stringValue = message
+            statusLabel.toolTip = notice
+            statusLabel.isHidden = message.isEmpty
         }
     }
 

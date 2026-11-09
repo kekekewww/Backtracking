@@ -20,6 +20,8 @@ struct Consumer {
     sample_rate: u32,
     channels: usize,
     waveform: WaveformCache,
+    last_input: Option<Instant>,
+    input_timeout: Duration,
 }
 
 #[derive(Default)]
@@ -32,16 +34,21 @@ struct WaveformCache {
 
 impl Consumer {
     fn drain(&mut self, keep: bool, max_blocks: usize) {
+        let mut received_input = false;
         for _ in 0..max_blocks {
             let frames = self.queue.pop_interleaved(&mut self.scratch);
             if frames == 0 {
                 break;
             }
             if keep {
+                received_input = true;
                 let _ = self
                     .capture
                     .push_interleaved(&self.scratch[..frames * self.channels]);
             }
+        }
+        if received_input {
+            self.last_input = Some(Instant::now());
         }
     }
 
@@ -192,10 +199,12 @@ impl Session {
 
     pub(crate) fn is_recording(&self) -> bool {
         let state = self.lock();
-        state
-            .consumer
-            .as_ref()
-            .is_some_and(|consumer| matches!(consumer.capture.state(), CaptureState::Recording))
+        state.consumer.as_ref().is_some_and(|consumer| {
+            matches!(consumer.capture.state(), CaptureState::Recording)
+                && consumer
+                    .last_input
+                    .is_some_and(|last| last.elapsed() < consumer.input_timeout)
+        })
     }
 
     pub(crate) fn dropped_frames(&self) -> usize {
@@ -268,6 +277,11 @@ impl Worker {
                 sample_rate: rate,
                 channels,
                 waveform: WaveformCache::default(),
+                last_input: None,
+                // A stopped host may stop sending blocks before the gate receives silence.
+                input_timeout: Duration::from_secs_f64(
+                    (2.0 * f64::from(max_buffer) / f64::from(rate)).max(0.25),
+                ),
             });
             session.accepting.store(!state.paused, Ordering::SeqCst);
             (queue, capacity_frames)
@@ -360,6 +374,23 @@ mod tests {
         let recorded = session.snapshot().unwrap();
         assert_eq!(&recorded.samples[..32], &[0.25; 32]);
         assert_eq!(&recorded.samples[32..], &[0.75; 32]);
+    }
+
+    #[test]
+    fn recording_indicator_stops_when_host_stops_sending_audio() {
+        let session = Arc::new(Session::new());
+        let worker = Worker::new(session.clone(), 48_000, 1, 256).unwrap();
+
+        worker.push(&[&mut [0.25; 32]]);
+        session.consume();
+        assert!(session.is_recording());
+
+        let mut state = session.lock();
+        let consumer = state.consumer.as_mut().unwrap();
+        consumer.last_input = Some(Instant::now() - consumer.input_timeout);
+        drop(state);
+        assert!(!session.is_recording());
+        assert_eq!(session.snapshot().unwrap().samples, vec![0.25; 32]);
     }
 
     #[test]

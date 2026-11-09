@@ -21,7 +21,11 @@ const DURATIONS: [DurationChoice; 3] = [
     DurationChoice::Seconds30,
 ];
 const MINT: Color32 = Color32::from_rgb(103, 231, 181);
-const IDLE: Color32 = Color32::from_rgb(246, 196, 118);
+const RECORDING_LIT: Color32 = Color32::from_rgb(249, 78, 88);
+const RECORDING_DIM: Color32 = Color32::from_rgb(103, 44, 48);
+const WAITING_LED: Color32 = Color32::from_rgb(76, 86, 88);
+const PAUSED_LED: Color32 = Color32::from_rgb(54, 57, 60);
+const ERROR_LED: Color32 = Color32::from_rgb(246, 196, 118);
 const RESIZE_EDGE: f32 = 7.0;
 const RESIZE_CORNER: f32 = 14.0;
 
@@ -66,6 +70,7 @@ struct Recorder {
     pinned: bool,
     idle_resume: Option<DurationChoice>,
     last_interaction: Instant,
+    recording_started: Option<f64>,
     low: [f32; BINS],
     high: [f32; BINS],
     seconds: f32,
@@ -103,6 +108,7 @@ impl Recorder {
             pinned: true,
             idle_resume: None,
             last_interaction: Instant::now(),
+            recording_started: None,
             low: [0.0; BINS],
             high: [0.0; BINS],
             seconds: 0.0,
@@ -125,6 +131,23 @@ impl Recorder {
         self.last_interaction = Instant::now();
         if !self.controller.is_paused() {
             self.clear_snapshot();
+        }
+    }
+
+    fn freeze(&mut self) {
+        self.controller.pause();
+        self.last_interaction = Instant::now();
+        if self.snapshot.is_none()
+            && let Some(snapshot) = self.controller.snapshot()
+        {
+            self.seconds = snapshot.frame_count() as f32 / snapshot.sample_rate.max(1) as f32;
+            waveform::peaks(
+                &snapshot.samples,
+                snapshot.channels,
+                &mut self.low,
+                &mut self.high,
+            );
+            self.snapshot = Some(Arc::new(snapshot));
         }
     }
 
@@ -159,34 +182,9 @@ impl Recorder {
     fn controls(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) -> bool {
         ui.horizontal(|ui| {
             ui.heading("Backtracking");
-            let (status, color) = if self.controller.error().is_some() {
-                ("Capture unavailable", IDLE)
-            } else if self.controller.is_paused() {
-                ("Paused", IDLE)
-            } else if self.controller.is_recording() {
-                ("Recording", MINT)
-            } else {
-                ("Waiting for sound", ui.visuals().weak_text_color())
-            };
-            ui.colored_label(color, status);
-            if ui
-                .add_enabled(
-                    self.controller.is_paused() || self.controller.error().is_some(),
-                    egui::Button::new("Resume"),
-                )
-                .clicked()
-            {
-                self.resume();
-            }
-            if ui.checkbox(&mut self.pinned, "Keep on top").changed() {
-                let level = if self.pinned {
-                    egui::WindowLevel::AlwaysOnTop
-                } else {
-                    egui::WindowLevel::Normal
-                };
-                ui.ctx()
-                    .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-            }
+            self.transport_button(ui);
+            self.recording_indicator(ui);
+            self.pin_button(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.settings_button(ui, frame)
             })
@@ -195,10 +193,126 @@ impl Recorder {
         .inner
     }
 
+    fn transport_button(&mut self, ui: &mut egui::Ui) {
+        let can_toggle = self.gesture.is_none();
+        let response = ui.add_enabled(can_toggle, icon_button());
+        if response.clicked() {
+            if self.controller.is_paused() {
+                self.resume();
+            } else {
+                self.freeze();
+            }
+        }
+        let paused = self.controller.is_paused();
+        let label = if self.controller.error().is_some() {
+            "Retry capture"
+        } else if paused {
+            "Start capture"
+        } else {
+            "Pause capture"
+        };
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, can_toggle, label));
+        let response = response.on_hover_text(label);
+        let center = response.rect.center();
+        let color = ui.style().interact(&response).fg_stroke.color;
+        if paused {
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![
+                    center + Vec2::new(-3.5, -5.5),
+                    center + Vec2::new(5.0, 0.0),
+                    center + Vec2::new(-3.5, 5.5),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        } else {
+            for x in [-2.4, 2.4] {
+                ui.painter().rect_filled(
+                    Rect::from_center_size(center + Vec2::new(x, 0.0), Vec2::new(2.4, 10.0)),
+                    0.5,
+                    color,
+                );
+            }
+        }
+    }
+
+    fn recording_indicator(&mut self, ui: &mut egui::Ui) {
+        let (status, color) = if self.controller.error().is_some() {
+            ("Capture unavailable", ERROR_LED)
+        } else if self.controller.is_paused() {
+            ("Paused", PAUSED_LED)
+        } else if self.controller.is_recording() {
+            let time = ui.input(|input| input.time);
+            let started = *self.recording_started.get_or_insert(time);
+            let lit = (time - started).rem_euclid(1.0) < 0.5;
+            ("Recording", if lit { RECORDING_LIT } else { RECORDING_DIM })
+        } else {
+            ("Waiting for sound", WAITING_LED)
+        };
+        if !self.controller.is_recording() {
+            self.recording_started = None;
+        }
+
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(15.0, 24.0), egui::Sense::hover());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Status, true, status));
+        response.on_hover_text(status);
+        ui.painter().circle_filled(rect.center(), 4.5, color);
+    }
+
+    fn pin_button(&mut self, ui: &mut egui::Ui) {
+        let response = ui.add(icon_button());
+        if response.clicked() {
+            self.pinned = !self.pinned;
+            let level = if self.pinned {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            };
+            ui.ctx()
+                .send_viewport_cmd(ViewportCommand::WindowLevel(level));
+        }
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::Role::CheckBox, true, self.pinned, "Keep on top")
+        });
+        let response = response.on_hover_text(if self.pinned {
+            "Disable keep on top"
+        } else {
+            "Keep on top"
+        });
+        let center = response.rect.center();
+        let color = if self.pinned {
+            MINT
+        } else {
+            ui.style().interact(&response).fg_stroke.color
+        };
+        let stroke = Stroke::new(1.3, color);
+        let points = [
+            (-4.5, -7.0),
+            (4.5, -7.0),
+            (2.8, -5.2),
+            (2.8, -1.7),
+            (5.5, 1.0),
+            (5.5, 2.2),
+            (-5.5, 2.2),
+            (-5.5, 1.0),
+            (-2.8, -1.7),
+            (-2.8, -5.2),
+        ];
+        ui.painter().add(egui::Shape::closed_line(
+            points
+                .into_iter()
+                .map(|(x, y)| center + Vec2::new(x, y))
+                .collect(),
+            stroke,
+        ));
+        ui.painter().line_segment(
+            [center + Vec2::new(0.0, 2.2), center + Vec2::new(0.0, 7.0)],
+            stroke,
+        );
+    }
+
     fn settings_button(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) -> bool {
-        let response = ui
-            .add(egui::Button::new("").min_size(Vec2::splat(24.0)))
-            .on_hover_text("Settings");
+        let response = ui.add(icon_button()).on_hover_text("Settings");
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Settings"));
         let center = response.rect.center();
         let color = ui.style().interact(&response).fg_stroke.color;
@@ -261,11 +375,7 @@ impl Recorder {
                         .button("Project folder…")
                         .on_hover_text(self.output.display().to_string())
                         .clicked();
-                    let quit = ui
-                        .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.button("Quit").clicked()
-                        })
-                        .inner;
+                    let quit = ui.button("Quit").clicked();
                     (choose_project, quit)
                 })
                 .inner;
@@ -390,19 +500,7 @@ impl Recorder {
             && response.contains_pointer()
             && let Some(position) = position
         {
-            self.controller.pause();
-            if self.snapshot.is_none()
-                && let Some(snapshot) = self.controller.snapshot()
-            {
-                self.seconds = snapshot.frame_count() as f32 / snapshot.sample_rate.max(1) as f32;
-                waveform::peaks(
-                    &snapshot.samples,
-                    snapshot.channels,
-                    &mut self.low,
-                    &mut self.high,
-                );
-                self.snapshot = Some(Arc::new(snapshot));
-            }
+            self.freeze();
             if selecting {
                 let start = fraction(self.audio_rect(rect), position.x);
                 self.gesture = Some(Gesture::Select {
@@ -627,6 +725,9 @@ impl eframe::App for Recorder {
             ctx.send_viewport_cmd(command);
         }
         self.controller.poll();
+        if !self.controller.is_recording() {
+            self.recording_started = None;
+        }
         self.collect_export();
         if self.controller.is_paused()
             && self.gesture.is_none()
@@ -697,6 +798,10 @@ impl Drop for Recorder {
 
 fn fraction(rect: Rect, x: f32) -> f32 {
     ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0)
+}
+
+fn icon_button() -> egui::Button<'static> {
+    egui::Button::new("").min_size(Vec2::splat(24.0))
 }
 
 fn window_interaction(

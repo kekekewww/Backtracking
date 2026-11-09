@@ -30,9 +30,12 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 ### 讀懂波形與錄音狀態
 
+工具列的 **Play／Pause** 圖示顯示可執行的動作。將游標移到按鈕上，可看到 **開始錄音／Start capture** 或 **暫停錄音／Pause capture**。將游標移到狀態燈上，可查看目前狀態。
+
 - **等待聲音／Waiting for sound**。錄音已待命，聲音超過靜音偵測門檻時便開始收錄。
-- **錄音中／Recording**。右側是最新收錄的音訊。當錄音達到保留上限，新的音訊會逐步取代最舊的音訊。
-- **已暫停／Paused**。操作波形時會固定當前內容，以便選段和匯出。暫停期間的聲音會略過。
+- **錄音中／Recording**。紅色狀態燈閃爍。波形右側是最新收錄的音訊，達到保留上限後，新的音訊會逐步取代最舊的音訊。
+- **已暫停／Paused**。按下 **Pause** 或操作波形會暫停錄音，讓波形固定供選段和匯出。暫停期間的聲音會略過。
+- **未連線／Capture unavailable**。桌面版無法擷取時，可用 **Play** 重新連線。
 
 **保留／History／Buffer** 可選 10、20 或 30 秒，預設為 20 秒。這是記憶體中的音訊長度。假設兩段各 5 秒的聲音相隔一分鐘，兩段會接在一起，中間只保留靜音偵測需要的短緩衝。非常小聲的內容可能低於門檻。縮短保留時間會裁掉最早的部分，事後加長只會增加接下來可保留的長度。
 
@@ -52,9 +55,11 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 完成框選後，Backtracking 會先準備選取區的 WAV，以便接著拖出。第一次匯出或需要轉換取樣率時，檔案可能需要短暫準備。拖曳時可先維持按住，等檔案可拖出再放開。若 DAW 沒有接受拖放，可以從 `output/` 直接匯入已存好的 WAV。
 
-### 恢復錄音
+### 啟用、暫停與自動續錄
 
-按 **繼續錄音／Resume** 可回到錄音待命狀態。已保留的音訊會接續使用，後續收錄仍受保留上限約束。若只想手動控制，將 **自動續錄／Auto-resume** 設成 **手動／Off**。也可設定 10、20 或 30 秒，從取樣器視窗內最後一次點擊或手勢結束時開始計時。拖曳進行中會保持暫停，輸入聲音本身也不會觸發續錄。
+按 **Play** 進入錄音待命，按 **Pause** 手動暫停。重新待命後，下一段收錄的音訊會接在原有歷史後方，受保留時間上限約束。
+
+在齒輪選單將 **自動續錄／Auto-resume** 設成 **手動／Off**，即可由按鈕控制續錄。若選擇 10、20 或 30 秒，手動暫停或操作波形暫停後，都會從取樣器視窗內最後一次點擊或手勢結束時開始計時。拖曳進行中會保持暫停。系統會依設定時間恢復待命，音量門檻仍決定何時實際收錄。
 
 ### 輸出位置與檔案規格
 
@@ -72,13 +77,13 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 | 狀況 | 檢查方式 |
 | --- | --- |
-| 播放有聲音，但波形沒有更新 | 先看狀態是否暫停。Windows 確認來源使用預設播放裝置。macOS 確認系統音訊錄製權限，再按 **繼續錄音**。插件確認音軌正在播放或監聽，且 Backtracking 的插入點收得到訊號。 |
-| Windows 切換喇叭或耳機後無法擷取 | 確認新的裝置已是系統預設播放裝置，再用 **Resume** 重新連線。 |
+| 播放有聲音，但波形沒有更新 | 將游標移到狀態燈確認狀態。若已暫停，按 **Play**。Windows 確認來源使用預設播放裝置。macOS 確認系統音訊錄製權限。插件確認音軌正在播放或監聽，且 Backtracking 的插入點收得到訊號。 |
+| Windows 切換喇叭或耳機後無法擷取 | 確認新的裝置已是系統預設播放裝置，再按 **Play** 重新連線。 |
 | DAW 掃描不到插件 | 確認已複製完整 `.vst3` 或 `.clap`，架構與 DAW 相容，且檔案位於 DAW 會掃描的資料夾。依下方步驟重新掃描。 |
 | 能存檔，但拖不到 DAW | 等 WAV 完成後再拖，確認落點是可接受音訊檔的時間軸或 Playlist。也可從輸出資料夾將 WAV 拖入或手動匯入。 |
 | 無法寫入 WAV | 確認波形有可用的音訊，再選擇可寫入且仍然存在的專案資料夾。 |
 
-**離線渲染**。CLAP 在宿主回報離線模式時會略過擷取。VST3 使用的 nice-plug 0.4.2 有時會回報前一次的處理模式，離線渲染仍可能進入回溯歷史。渲染前若要保留目前的素材，請先匯出。若要在渲染期間維持凍結，先關閉自動續錄，再點擊波形暫停。
+**離線渲染**。CLAP 在宿主回報離線模式時會略過擷取。VST3 使用的 nice-plug 0.4.2 有時會回報前一次的處理模式，離線渲染仍可能進入回溯歷史。渲染前若要保留目前的素材，請先匯出。若要在渲染期間維持凍結，先關閉自動續錄，再按 **Pause**。
 
 ## English
 
@@ -108,9 +113,12 @@ The Windows and macOS desktop apps use a frameless window. Use the gestures belo
 
 ### Read the waveform and capture status
 
+The toolbar's **Play/Pause** icon shows the available action. Hover over the button to see **Start capture** or **Pause capture**, and hover over the indicator to see the capture state.
+
 - **Waiting for sound**. Capture is armed and starts when the incoming signal crosses the silence threshold.
-- **Recording**. The newest audio appears on the right. Once the buffer fills, new audio gradually replaces the oldest samples.
-- **Paused**. Working with the waveform freezes the current history for selection and export. Incoming audio is skipped during the pause.
+- **Recording**. The red indicator blinks. The newest audio appears on the right. Once the buffer fills, new audio gradually replaces the oldest samples.
+- **Paused**. Pressing **Pause** or working with the waveform freezes the current history for selection and export. Incoming audio is skipped during the pause.
+- **Capture unavailable**. If the desktop recorder loses its connection, press **Play** to retry.
 
 **History / Buffer** can hold 10, 20, or 30 seconds and defaults to 20 seconds. This is the amount of audio retained in memory. Two five-second sounds a minute apart are joined with only a little silence at the join. Very quiet material may fall below the capture threshold. Shortening the buffer trims the oldest audio. Lengthening it gives future audio more room.
 
@@ -130,9 +138,11 @@ Gesture hints appear as you interact. The tooltip tries the right, left, below, 
 
 When you finish selecting a range, Backtracking prepares its WAV so you can drag it next. The first export and clips that need resampling may take a moment to prepare. Keep the mouse button held until the file is ready to drag. If the DAW does not accept the drop, import the saved WAV from `output/`.
 
-### Resume capture
+### Arm, pause, and auto-resume capture
 
-Choose **Resume** to arm capture again. The existing audio stays in the rolling history, and new audio is appended within the selected limit. Leave **Auto-resume** set to **Off** for manual control, or choose 10, 20, or 30 seconds. The timer starts after the last click in the sampler or the end of a gesture. Capture stays paused during a drag, and incoming audio alone cannot resume it.
+Press **Play** to arm capture or **Pause** to pause it manually. Once re-armed, the next sound is appended to the existing history within the selected limit.
+
+In the gear menu, leave **Auto-resume** set to **Off** for manual control, or choose 10, 20, or 30 seconds. After a manual pause or waveform interaction, the timer starts after the last click in the sampler or the end of a gesture. Capture stays paused during a drag. The timer re-arms capture, and the incoming signal must still cross the silence threshold before audio is recorded.
 
 ### Output location and file format
 
@@ -150,13 +160,13 @@ Every export is a **48 kHz, 32-bit IEEE float WAV**. A 44.1 or 96 kHz source is 
 
 | Symptom | What to check |
 | --- | --- |
-| Audio plays but the waveform stays still | Check whether capture is paused. On Windows, verify the source uses the default playback device. On macOS, verify system audio recording permission, then select **Resume**. In a DAW, check playback or monitoring and the signal at the plug-in insert. |
-| Capture stops after switching Windows playback devices | Set the new device as the default playback device, then select **Resume** to reconnect. |
+| Audio plays but the waveform stays still | Hover over the indicator to check the capture state. If paused, press **Play**. On Windows, verify the source uses the default playback device. On macOS, verify system audio recording permission. In a DAW, check playback or monitoring and the signal at the plug-in insert. |
+| Capture stops after switching Windows playback devices | Set the new device as the default playback device, then press **Play** to reconnect. |
 | The plug-in does not appear in the DAW | Verify that the entire `.vst3` or `.clap` is in a scanned folder and that its architecture matches the DAW. Rescan using the steps below. |
 | A WAV saves but the DAW refuses the drop | Wait for export to finish and drop on an audio timeline or Playlist. You can also drag the file from the output folder or import it manually. |
 | The WAV could not be written | Check that the waveform contains audio and choose a project folder that exists and allows writing. |
 
-**Offline rendering**. CLAP skips capture when the host reports offline mode. The nice-plug 0.4.2 VST3 wrapper can pass the previous processing mode to Backtracking, so an offline render may enter the capture history. Export important clips before rendering. To keep capture frozen during the render, turn off auto-resume and click the waveform to pause first.
+**Offline rendering**. CLAP skips capture when the host reports offline mode. The nice-plug 0.4.2 VST3 wrapper can pass the previous processing mode to Backtracking, so an offline render may enter the capture history. Export important clips before rendering. To keep capture frozen during the render, turn off auto-resume and press **Pause** first.
 
 ## 安裝與建置 / Installation and build
 
@@ -238,9 +248,9 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 1. 播放兩小段聲音，中間留一段長靜音。確認波形留下兩段有效音訊。
 
    Play two short sounds with a long pause between them and check that both remain in the waveform.
-2. 點擊波形並繼續播放。確認波形保持固定，按 **繼續錄音／Resume** 後才接續收錄。
+2. 將自動續錄設為 **手動／Off**。播放有聲音時確認紅燈閃爍，再按 **Pause**，確認波形停止更新。按 **Play** 重新待命，播放聲音後確認接續收錄。
 
-   Click the waveform and continue playback. Check that the waveform stays frozen until you choose **Resume**.
+   Set auto-resume to **Off**. Play a sound and check that the red indicator blinks. Press **Pause** and check that the waveform freezes. Press **Play**, then play audio and check that capture continues.
 3. 框選一小段，拖進 DAW 並確認存檔位置及 WAV 規格。若使用插件，分別在 VST3 和 CLAP 實例操作一次。
 
    Select a short clip, drag it into the DAW, and check the file location and WAV format. For plug-in use, try one instance of each format.
