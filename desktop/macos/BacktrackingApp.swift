@@ -5,6 +5,9 @@ private let transparencyChoices: [UInt32] = [0, 25, 50, 75, 100]
 private let exportSampleRates: [UInt32] = [44_100, 48_000, 96_000]
 private let exportBitDepths: [UInt32] = [16, 24, 32]
 private let frameAutosaveName: NSWindow.FrameAutosaveName = "Backtracking.Panel"
+private let fullPanelMinimum = NSSize(width: 560, height: 100)
+private let waveformOnlyPanelMinimum = NSSize(width: 560, height: 48)
+private let panelVerticalInset: CGFloat = 8
 private let waveformMint = (red: CGFloat(0.32), green: CGFloat(0.89), blue: CGFloat(0.82))
 
 private func movesFromWaveform(_ modifiers: NSEvent.ModifierFlags) -> Bool {
@@ -30,7 +33,6 @@ private final class CapturePanel: NSPanel {
     var onClick: (() -> Void)?
     var onContextMenu: ((NSEvent) -> Void)?
     weak var waveform: WaveformView?
-    weak var waveformOverlayControl: NSView?
     private var moving = false
     private var resize: ResizeGesture?
     private var chromeCursorActive = false
@@ -154,10 +156,6 @@ private final class CapturePanel: NSPanel {
 
     private func waveformContains(_ location: NSPoint) -> Bool {
         guard let waveform else { return false }
-        if let waveformOverlayControl, !waveformOverlayControl.isHidden,
-           waveformOverlayControl.bounds.contains(waveformOverlayControl.convert(location, from: nil)) {
-            return false
-        }
         return waveform.bounds.contains(waveform.convert(location, from: nil))
     }
 
@@ -361,12 +359,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var waveform: WaveformView?
     private var timer: Timer?
     private let captureButton = NSButton(title: "", target: nil, action: nil)
-    private let overlayCaptureButton = NSButton(title: "", target: nil, action: nil)
     private let captureLamp = CaptureLamp(frame: .zero)
     private let clearButton = NSButton(title: "清除目前錄音", target: nil, action: nil)
     private let meterButton = NSButton(title: "— dBFS", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
     private var toolbar: NSStackView?
+    private var waveformMinimumHeight: NSLayoutConstraint?
     private var waveformTopBelowToolbar: NSLayoutConstraint?
     private var waveformTopWithoutToolbar: NSLayoutConstraint?
     private var history: UInt32 = 20
@@ -453,7 +451,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             backing: .buffered, defer: false
         )
         window.title = "Backtracking"
-        window.contentMinSize = NSSize(width: 560, height: 100)
+        window.contentMinSize = fullPanelMinimum
         window.isMovable = true
         window.delegate = self
         window.becomesKeyOnlyIfNeeded = true
@@ -464,20 +462,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
         let waveform = WaveformView(frame: .zero)
         waveform.controller = self
-        waveform.heightAnchor.constraint(greaterThanOrEqualToConstant: 51).isActive = true
+        let minimumWaveformHeight = waveform.heightAnchor.constraint(greaterThanOrEqualToConstant: 51)
+        minimumWaveformHeight.isActive = true
+        waveformMinimumHeight = minimumWaveformHeight
         window.waveform = waveform
         self.waveform = waveform
 
         captureButton.target = self
-        captureButton.action = #selector(toggleCapture)
+        captureButton.action = #selector(toggleCapture(_:))
         captureButton.bezelStyle = .rounded
-        overlayCaptureButton.target = self
-        overlayCaptureButton.action = #selector(toggleCapture)
-        overlayCaptureButton.isBordered = false
-        window.waveformOverlayControl = overlayCaptureButton
-        overlayCaptureButton.contentTintColor = NSColor(
-            calibratedRed: waveformMint.red, green: waveformMint.green, blue: waveformMint.blue, alpha: 1
-        )
         captureLamp.setAccessibilityElement(true)
         captureLamp.setAccessibilityRole(.staticText)
         clearButton.target = self
@@ -515,25 +508,19 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         window.trackChrome(in: content)
         content.addSubview(waveform)
         content.addSubview(controls)
-        content.addSubview(overlayCaptureButton)
         waveform.translatesAutoresizingMaskIntoConstraints = false
         controls.translatesAutoresizingMaskIntoConstraints = false
-        overlayCaptureButton.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             controls.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
             controls.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
-            controls.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
+            controls.topAnchor.constraint(equalTo: content.topAnchor, constant: panelVerticalInset),
             waveform.leadingAnchor.constraint(equalTo: controls.leadingAnchor),
             waveform.trailingAnchor.constraint(equalTo: controls.trailingAnchor),
-            waveform.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
-            overlayCaptureButton.leadingAnchor.constraint(equalTo: waveform.leadingAnchor, constant: 2),
-            overlayCaptureButton.topAnchor.constraint(equalTo: waveform.topAnchor, constant: 2),
-            overlayCaptureButton.widthAnchor.constraint(equalToConstant: 24),
-            overlayCaptureButton.heightAnchor.constraint(equalToConstant: 22)
+            waveform.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -panelVerticalInset)
         ])
         toolbar = controls
         waveformTopBelowToolbar = waveform.topAnchor.constraint(equalTo: controls.bottomAnchor, constant: 6)
-        waveformTopWithoutToolbar = waveform.topAnchor.constraint(equalTo: content.topAnchor, constant: 8)
+        waveformTopWithoutToolbar = waveform.topAnchor.constraint(equalTo: content.topAnchor, constant: panelVerticalInset)
         panel = window
         applyPin(to: pinButton)
         applyWaveformOnly()
@@ -565,6 +552,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     private func settingsMenu() -> NSMenu {
         let menu = NSMenu(title: "設定")
+        if waveformOnly {
+            let transportItem = NSMenuItem(title: captureActionLabel, action: #selector(toggleCapture(_:)), keyEquivalent: "")
+            transportItem.target = self
+            transportItem.representedObject = paused
+            menu.addItem(transportItem)
+            menu.addItem(.separator())
+        }
         menu.addItem(choiceMenu(
             title: "保留時間", choices: timeChoices, selected: history,
             action: #selector(historyChanged(_:))
@@ -753,18 +747,37 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func applyWaveformOnly() {
+        applyPanelMinimum()
         toolbar?.isHidden = waveformOnly
-        overlayCaptureButton.isHidden = !waveformOnly
         if waveformOnly {
             waveformTopBelowToolbar?.isActive = false
+            waveformMinimumHeight?.constant = waveformOnlyPanelMinimum.height - 2 * panelVerticalInset
             waveformTopWithoutToolbar?.isActive = true
         } else {
             waveformTopWithoutToolbar?.isActive = false
+            waveformMinimumHeight?.constant = 51
             waveformTopBelowToolbar?.isActive = true
         }
         waveform?.showsOverlay = !waveformOnly
         updateBackground()
         updateStatus()
+    }
+
+    private func applyPanelMinimum() {
+        guard let panel else { return }
+        let original = panel.frame
+        let minimum = waveformOnly ? waveformOnlyPanelMinimum : fullPanelMinimum
+        panel.contentMinSize = minimum
+        let frameMinimum = panel.frameRect(forContentRect: NSRect(origin: .zero, size: minimum)).size
+        let width = max(original.width, frameMinimum.width)
+        let height = max(original.height, frameMinimum.height)
+        guard width != original.width || height != original.height else { return }
+
+        var adjusted = NSRect(x: original.minX, y: original.maxY - height, width: width, height: height)
+        if let visible = panel.screen?.visibleFrame, height <= visible.height {
+            adjusted.origin.y = min(max(adjusted.minY, visible.minY), visible.maxY - height)
+        }
+        panel.setFrame(adjusted, display: true)
     }
 
     @objc private func chooseOutput() {
@@ -825,8 +838,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         updateStatus()
     }
 
-    @objc private func toggleCapture() {
+    private var captureActionLabel: String {
+        if tap == nil || captureError != nil { return "重新連線並開始錄音" }
+        return paused ? "開始錄音" : "暫停錄音"
+    }
+
+    @objc private func toggleCapture(_ sender: Any?) {
         guard !editing else { return }
+        // Auto-resume can satisfy a Start action while the contextual menu is open.
+        if let offeredWhilePaused = (sender as? NSMenuItem)?.representedObject as? Bool,
+           offeredWhilePaused != paused { return }
         registerClick()
         if paused { resume() } else { pauseCapture() }
     }
@@ -905,16 +926,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         } else {
             state = .waiting
         }
-        let label = state == .unavailable ? "重新連線並開始錄音" : (paused ? "開始錄音" : "暫停錄音")
+        let label = captureActionLabel
         if captureButton.title != label {
             setIcon(paused ? "play.fill" : "pause.fill", label: label, on: captureButton)
         }
-        if overlayCaptureButton.title != label {
-            setIcon(paused ? "play.fill" : "pause.fill", label: label, on: overlayCaptureButton)
-            overlayCaptureButton.toolTip = nil
-        }
         captureButton.isEnabled = !editing
-        overlayCaptureButton.isEnabled = !editing
         clearButton.isEnabled = tap?.core != nil && !editing
         updateMeter()
 

@@ -22,7 +22,6 @@ use crate::session::Session;
 use crate::settings::{MeterMode, SessionSettings, TRANSPARENCY_LEVELS};
 
 const BINS: usize = 512;
-const TRANSPORT_SIZE: f32 = 25.0;
 const REFRESH: Duration = Duration::from_millis(80);
 const RECORDING_BLINK: Duration = Duration::from_millis(500);
 const DURATIONS: [DurationChoice; 3] = [
@@ -165,7 +164,7 @@ impl NiceEguiApp for CaptureUi {
         } else {
             egui::Rgba::BLACK
         });
-        let can_toggle = self.gesture.is_none() && !self.native_dragging.load(Ordering::Acquire);
+        let can_toggle = self.can_toggle_capture();
         let canvas = ui.max_rect().intersect(ui.clip_rect());
         let context_at = ui.input(|input| {
             if can_toggle && input.pointer.secondary_clicked() {
@@ -188,7 +187,7 @@ impl NiceEguiApp for CaptureUi {
                 ui.horizontal(|ui| {
                     ui.heading("Backtracking");
                     ui.separator();
-                    if capture_button(ui, paused, controls_enabled, false).clicked() {
+                    if capture_button(ui, paused, controls_enabled).clicked() {
                         self.toggle_capture(ui, paused);
                         paused = self.session.is_paused();
                     }
@@ -219,8 +218,6 @@ impl NiceEguiApp for CaptureUi {
             (ui.available_height() - status_height).max(60.0),
         );
         let (rect, response) = ui.allocate_exact_size(wave_size, Sense::click_and_drag());
-        let transport =
-            waveform_only.then(|| Rect::from_min_size(rect.min, Vec2::splat(TRANSPORT_SIZE)));
         let settings_open = self.settings_menu(
             frame,
             &mut settings,
@@ -230,14 +227,7 @@ impl NiceEguiApp for CaptureUi {
             context_at,
         );
         let configured_seconds = settings.retention.seconds() as f32;
-        self.interact_waveform(
-            ui,
-            frame,
-            rect,
-            configured_seconds,
-            !settings_open,
-            transport,
-        );
+        self.interact_waveform(ui, frame, rect, configured_seconds, !settings_open);
         self.draw_waveform(
             ui,
             rect,
@@ -252,13 +242,6 @@ impl NiceEguiApp for CaptureUi {
             }
             response.on_hover_cursor(CursorIcon::Grab);
         }
-        if let Some(transport) = transport {
-            let mut overlay = ui.new_child(egui::UiBuilder::new().max_rect(transport));
-            if capture_button(&mut overlay, paused, controls_enabled, true).clicked() {
-                self.toggle_capture(ui, paused);
-            }
-        }
-
         if !waveform_only && dropped != 0 {
             let mut status = format!("Dropped {dropped} audio frames");
             if !self.message.is_empty() {
@@ -394,6 +377,16 @@ impl CaptureUi {
             egui::ScrollArea::vertical()
                 .max_height(menu_content_height)
                 .show(ui, |ui| {
+                    if waveform_only {
+                        let label = if paused { "Play" } else { "Pause" };
+                        if ui
+                            .add_enabled(self.can_toggle_capture(), egui::Button::new(label))
+                            .clicked()
+                        {
+                            self.toggle_capture(ui, paused);
+                            ui.close();
+                        }
+                    }
                     ui.checkbox(&mut waveform_only, "Show waveform only");
                     ui.separator();
                     egui::Grid::new("capture-settings")
@@ -565,6 +558,10 @@ impl CaptureUi {
             &mut self.minimum,
             &mut self.maximum,
         );
+    }
+
+    fn can_toggle_capture(&self) -> bool {
+        self.gesture.is_none() && !self.native_dragging.load(Ordering::Acquire)
     }
 
     fn toggle_capture(&mut self, ui: &egui::Ui, paused: bool) {
@@ -765,7 +762,6 @@ impl CaptureUi {
         rect: Rect,
         seconds: f32,
         allow_new_gesture: bool,
-        transport: Option<Rect>,
     ) {
         let (position, pressed, down, selecting) = ui.input(|input| {
             (
@@ -781,9 +777,7 @@ impl CaptureUi {
 
         if allow_new_gesture
             && pressed
-            && let Some(position) = position.filter(|position| {
-                rect.contains(*position) && !transport.is_some_and(|rect| rect.contains(*position))
-            })
+            && let Some(position) = position.filter(|position| rect.contains(*position))
         {
             self.session.set_gesture_active(true);
             self.freeze_capture();
@@ -985,10 +979,8 @@ fn wav_format_controls(ui: &mut egui::Ui, profile: &mut WavExportProfile) {
     ui.end_row();
 }
 
-fn capture_button(ui: &mut egui::Ui, paused: bool, enabled: bool, overlay: bool) -> egui::Response {
-    let button = egui::Button::new("")
-        .min_size(Vec2::splat(TRANSPORT_SIZE))
-        .frame(!overlay);
+fn capture_button(ui: &mut egui::Ui, paused: bool, enabled: bool) -> egui::Response {
+    let button = egui::Button::new("").min_size(Vec2::splat(25.0));
     let response = ui.add_enabled(enabled, button);
     let label = if paused {
         "Start capture"
@@ -1017,11 +1009,7 @@ fn capture_button(ui: &mut egui::Ui, paused: bool, enabled: bool, overlay: bool)
             );
         }
     }
-    if overlay {
-        response.on_hover_cursor(CursorIcon::PointingHand)
-    } else {
-        response.on_hover_text(label)
-    }
+    response.on_hover_text(label)
 }
 
 fn settings_button(ui: &mut egui::Ui) -> egui::Response {

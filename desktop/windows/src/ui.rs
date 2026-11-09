@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::controller::Controller;
+use crate::preferences::{Key, MeterMode, Preferences, Settings, wav_sample_format_preference};
 use backtracking_core::{
     DurationChoice, MeterReadings, Snapshot, WavExportProfile, WavSampleFormat,
     export_wav_with_profile, waveform,
@@ -14,16 +16,10 @@ use eframe::egui::{
     self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection, Stroke, Vec2,
     ViewportCommand,
 };
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows::Win32::{
-    Foundation::HWND,
-    Graphics::Dwm::{
-        DWMWA_BORDER_COLOR, DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE, DwmSetWindowAttribute,
-    },
+use winit::{
+    platform::windows::{Color, CornerPreference, WindowExtWindows},
+    window::Window,
 };
-
-use crate::controller::Controller;
-use crate::preferences::{Key, MeterMode, Preferences, Settings, wav_sample_format_preference};
 
 const BINS: usize = 384;
 const REFRESH: Duration = Duration::from_millis(80);
@@ -49,6 +45,10 @@ const PAUSED_LED: Color32 = Color32::from_rgb(54, 57, 60);
 const ERROR_LED: Color32 = Color32::from_rgb(246, 196, 118);
 const RESIZE_EDGE: f32 = 7.0;
 const RESIZE_CORNER: f32 = 14.0;
+const MIN_WIDTH: f32 = 510.0;
+const FULL_MIN_HEIGHT: f32 = 132.0;
+const WAVEFORM_MIN_HEIGHT: f32 = 48.0;
+const SETTINGS_MIN_HEIGHT: f32 = 112.0;
 
 pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
     let preferences = Preferences::for_current_user();
@@ -56,11 +56,10 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([610.0, 144.0])
-            .with_min_inner_size([510.0, 132.0])
+            .with_min_inner_size(min_window_size(settings.waveform_only))
             .with_decorations(false)
             .with_resizable(true)
             .with_transparent(true)
-            .with_has_shadow(false)
             .with_window_level(if settings.pinned {
                 egui::WindowLevel::AlwaysOnTop
             } else {
@@ -75,33 +74,39 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
         Box::new(|context| {
             configure_style(&context.egui_ctx);
             if settings.waveform_only {
-                set_native_border(context, true);
+                set_waveform_frame(context.winit_window(), true);
             }
             Ok(Box::new(Recorder::new(controller, preferences, settings)))
         }),
     )
 }
 
-fn set_native_border(window: &impl HasWindowHandle, hidden: bool) {
-    let Ok(handle) = window.window_handle() else {
-        return;
-    };
-    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-        return;
-    };
-    let color = if hidden {
-        DWMWA_COLOR_NONE
+fn set_waveform_frame(window: Option<&Arc<Window>>, waveform_only: bool) {
+    if let Some(window) = window {
+        // egui-winit enables the Windows shadow for undecorated windows at creation.
+        window.set_undecorated_shadow(!waveform_only && window.fullscreen().is_none());
+        window.set_border_color((!waveform_only).then_some(Color::SYSTEM_DEFAULT));
+        window.set_corner_preference(if waveform_only {
+            CornerPreference::DoNotRound
+        } else {
+            CornerPreference::Default
+        });
+    }
+}
+
+fn min_window_size(waveform_only: bool) -> Vec2 {
+    let height = if waveform_only {
+        WAVEFORM_MIN_HEIGHT
     } else {
-        DWMWA_COLOR_DEFAULT
+        FULL_MIN_HEIGHT
     };
-    // The borrowed handle is live for this call. Older Windows versions ignore this attribute.
-    unsafe {
-        let _ = DwmSetWindowAttribute(
-            HWND(handle.hwnd.get() as *mut _),
-            DWMWA_BORDER_COLOR,
-            (&raw const color).cast(),
-            size_of::<u32>() as u32,
-        );
+    Vec2::new(MIN_WIDTH, height)
+}
+
+fn expand_for_settings(ctx: &egui::Context) {
+    let size = ctx.viewport_rect().size();
+    if size.y < FULL_MIN_HEIGHT {
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size.max(min_window_size(false))));
     }
 }
 
@@ -125,6 +130,7 @@ struct Recorder {
     output: PathBuf,
     pinned: bool,
     waveform_only: bool,
+    settings_restore_height: Option<f32>,
     idle_resume: Option<DurationChoice>,
     transparency: u8,
     meter_mode: MeterMode,
@@ -192,6 +198,7 @@ impl Recorder {
             output: settings.output,
             pinned: settings.pinned,
             waveform_only: settings.waveform_only,
+            settings_restore_height: None,
             idle_resume: settings.idle_resume,
             transparency: settings.transparency,
             meter_mode: settings.meter_mode,
@@ -289,7 +296,7 @@ impl Recorder {
     fn controls(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, menu_open: bool) -> bool {
         ui.horizontal(|ui| {
             ui.heading("Backtracking");
-            self.transport_button(ui, menu_open, None);
+            self.transport_button(ui, menu_open);
             self.recording_indicator(ui);
             self.clear_button(ui, menu_open);
             self.pin_button(ui, menu_open);
@@ -303,24 +310,19 @@ impl Recorder {
         .inner
     }
 
-    fn transport_button(&mut self, ui: &mut egui::Ui, menu_open: bool, overlay: Option<Rect>) {
-        let can_toggle = !menu_open && self.gesture.is_none();
-        let response = if let Some(rect) = overlay {
-            let sense = if can_toggle {
-                egui::Sense::click()
-            } else {
-                egui::Sense::hover()
-            };
-            ui.interact(rect, ui.make_persistent_id("waveform-transport"), sense)
+    fn toggle_capture(&mut self) {
+        if self.controller.is_paused() {
+            self.resume();
         } else {
-            ui.add_enabled(can_toggle, icon_button())
-        };
-        if can_toggle && response.clicked() {
-            if self.controller.is_paused() {
-                self.resume();
-            } else {
-                self.freeze();
-            }
+            self.freeze();
+        }
+    }
+
+    fn transport_button(&mut self, ui: &mut egui::Ui, menu_open: bool) {
+        let can_toggle = !menu_open && self.gesture.is_none();
+        let response = ui.add_enabled(can_toggle, icon_button());
+        if response.clicked() {
+            self.toggle_capture();
         }
         let paused = self.controller.is_paused();
         let label = if self.controller.error().is_some() {
@@ -331,11 +333,7 @@ impl Recorder {
             "Pause capture"
         };
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, can_toggle, label));
-        let response = if overlay.is_some() {
-            response
-        } else {
-            response.on_hover_text(label)
-        };
+        let response = response.on_hover_text(label);
         let center = response.rect.center();
         let color = ui.style().interact(&response).fg_stroke.color;
         if paused {
@@ -524,10 +522,56 @@ impl Recorder {
                         .hover_pos()
                         .is_some_and(|position| input.content_rect().contains(position))
             });
+        if open && self.waveform_only && ui.ctx().content_rect().height() < SETTINGS_MIN_HEIGHT {
+            self.settings_restore_height = Some(ui.ctx().viewport_rect().height());
+            expand_for_settings(ui.ctx());
+        }
         let popup = egui::Popup::menu(&ui.response())
             .open_memory(open.then_some(true.into()))
             .at_pointer_fixed();
-        self.show_settings(popup, ui, frame)
+        let menu_open = self.show_settings(popup, ui, frame);
+        if !egui::Popup::is_any_open(ui.ctx())
+            && let Some(height) = self.settings_restore_height.take()
+            && self.waveform_only
+        {
+            let size = ui.ctx().viewport_rect().size();
+            if size.y != height {
+                ui.ctx()
+                    .send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(size.x, height)));
+            }
+        }
+        menu_open
+    }
+
+    fn apply_waveform_mode(&mut self, ui: &egui::Ui, frame: &eframe::Frame) {
+        set_waveform_frame(frame.winit_window(), self.waveform_only);
+        self.save_preference(
+            Key::WaveformOnly,
+            if self.waveform_only { "1" } else { "0" },
+        );
+        ui.ctx()
+            .send_viewport_cmd(ViewportCommand::MinInnerSize(min_window_size(
+                self.waveform_only,
+            )));
+        if !self.waveform_only {
+            expand_for_settings(ui.ctx());
+        }
+    }
+
+    fn waveform_mode_settings(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
+        let transport = if self.controller.is_paused() {
+            "Play"
+        } else {
+            "Pause"
+        };
+        let transport_clicked = self.waveform_only && ui.button(transport).clicked();
+        if transport_clicked {
+            self.toggle_capture();
+        }
+        let changed = ui
+            .checkbox(&mut self.waveform_only, "Show waveform only")
+            .changed();
+        (changed, transport_clicked)
     }
 
     fn show_settings(
@@ -540,20 +584,38 @@ impl Recorder {
             .accessible_name("Settings")
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
         let was_open = popup.is_open();
+        if self.waveform_only && ui.ctx().content_rect().height() < SETTINGS_MIN_HEIGHT {
+            let shown = popup.show(|ui| {
+                let (changed, transport_clicked, expand) = ui
+                    .horizontal(|ui| {
+                        let (changed, transport_clicked) = self.waveform_mode_settings(ui);
+                        let expand = ui.button("Expand settings").clicked();
+                        (changed, transport_clicked, expand)
+                    })
+                    .inner;
+                if changed {
+                    self.apply_waveform_mode(ui, frame);
+                }
+                if changed || transport_clicked {
+                    ui.close();
+                } else if expand {
+                    expand_for_settings(ui.ctx());
+                }
+            });
+            return was_open || shown.is_some();
+        }
         let settings_height = (ui.ctx().content_rect().height() - 59.0).max(48.0);
         let shown = popup.show(|ui| {
             ui.set_width(340.0);
             ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
-            let waveform_only_changed = egui::ScrollArea::vertical()
+            let (waveform_only_changed, transport_clicked) = egui::ScrollArea::vertical()
                 .id_salt("settings-options")
                 .max_height(settings_height)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.spacing_mut().interact_size.y = 15.0;
                     ui.spacing_mut().button_padding.y = 0.5;
-                    let changed = ui
-                        .checkbox(&mut self.waveform_only, "Show waveform only")
-                        .changed();
+                    let mode_actions = ui.horizontal(|ui| self.waveform_mode_settings(ui)).inner;
                     egui::Grid::new("recording-settings")
                         .spacing([9.0, 1.0])
                         .show(ui, |ui| {
@@ -628,15 +690,13 @@ impl Recorder {
                             ui.end_row();
                             self.wav_settings(ui);
                         });
-                    changed
+                    mode_actions
                 })
                 .inner;
             if waveform_only_changed {
-                set_native_border(frame, self.waveform_only);
-                self.save_preference(
-                    Key::WaveformOnly,
-                    if self.waveform_only { "1" } else { "0" },
-                );
+                self.apply_waveform_mode(ui, frame);
+            }
+            if waveform_only_changed || transport_clicked {
                 ui.close();
             }
 
@@ -826,7 +886,11 @@ impl Recorder {
     }
 
     fn audio_rect(&self, rect: Rect) -> Rect {
-        let inner = rect.shrink(8.0);
+        let inner = if self.waveform_only {
+            rect.shrink2(Vec2::new(8.0, 2.0))
+        } else {
+            rect.shrink(8.0)
+        };
         let width = inner.width()
             * (self.seconds / self.controller.retention().seconds() as f32).clamp(0.0, 1.0);
         Rect::from_min_max(Pos2::new(inner.right() - width, inner.top()), inner.max)
@@ -837,7 +901,6 @@ impl Recorder {
         ui: &egui::Ui,
         frame: &eframe::Frame,
         response: &egui::Response,
-        transport: Option<Rect>,
     ) {
         let rect = response.rect;
         let (position, pressed, down, selecting) = ui.input(|input| {
@@ -852,7 +915,6 @@ impl Recorder {
         if pressed
             && response.contains_pointer()
             && let Some(position) = position
-            && transport.is_none_or(|rect| !rect.contains(position))
         {
             self.freeze();
             if selecting {
@@ -1113,12 +1175,14 @@ impl eframe::App for Recorder {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        let fill = if self.waveform_only {
-            Color32::TRANSPARENT
+        let panel = egui::Frame::central_panel(ui.style());
+        let frame_style = if self.waveform_only {
+            panel
+                .fill(Color32::TRANSPARENT)
+                .inner_margin(egui::Margin::symmetric(8, 4))
         } else {
-            self.background_color(ui.visuals().panel_fill)
+            panel.fill(self.background_color(ui.visuals().panel_fill))
         };
-        let frame_style = egui::Frame::central_panel(ui.style()).fill(fill);
         egui::CentralPanel::default()
             .frame(frame_style)
             .show(ui, |ui| {
@@ -1143,22 +1207,17 @@ impl eframe::App for Recorder {
                     None
                 };
                 self.refresh_waveform();
-                let status_height = if self.waveform_only { 0.0 } else { 26.0 };
-                let size = Vec2::new(
-                    ui.available_width(),
-                    (ui.available_height() - status_height).max(46.0),
-                );
+                let height = if self.waveform_only {
+                    ui.available_height()
+                } else {
+                    (ui.available_height() - 26.0).max(46.0)
+                };
+                let size = Vec2::new(ui.available_width(), height);
                 let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-                let transport = self
-                    .waveform_only
-                    .then(|| Rect::from_min_size(rect.min, Vec2::splat(24.0)));
                 if !menu_open {
-                    self.interact_waveform(ui, frame, &response, transport);
+                    self.interact_waveform(ui, frame, &response);
                 }
                 self.draw_waveform(ui, rect, !menu_open && window_cursor.is_none());
-                if let Some(transport) = transport {
-                    self.transport_button(ui, menu_open, Some(transport));
-                }
                 let status = self.controller.error().unwrap_or(&self.message);
                 if !self.waveform_only && !status.is_empty() {
                     ui.add(egui::Label::new(status).truncate())

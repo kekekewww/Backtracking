@@ -24,7 +24,18 @@ macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`C
 
 ### 只顯示波形
 
-開啟 **只顯示波形／Show waveform only** 後，Backtracking 會隱藏自身的外框與深色底板，留下波形和其左上角的 **Play／Pause**。桌面版的背景會變透明。VST3／CLAP 內嵌在 DAW 時，仍可能看到宿主視窗的外框或不透明底色。要回到完整介面，在視窗內按右鍵開啟設定，再取消勾選。這個選項預設關閉，並跟著桌面偏好設定或 DAW 專案中的插件設定儲存。
+開啟 **只顯示波形／Show waveform only** 後，Backtracking 會隱藏自身的外框與深色底板，畫面只保留波形。桌面版的背景會變透明。VST3／CLAP 的視窗尺寸由 DAW 宿主決定，內嵌時可能看得到宿主視窗的外框或不透明底色。這個選項預設關閉，並跟著桌面偏好設定或 DAW 專案中的插件設定儲存。
+
+在波形上按右鍵。錄音已暫停時，選單提供 **開始錄音／Play**。錄音已待命或正在收錄時，選單提供 **暫停錄音／Pause**。
+
+開啟時會保留目前的視窗尺寸。可拖曳桌面視窗的上方或下方內緣，把波形縮成細條。取消勾選時，視窗若低於完整介面的最小高度，會自動拉高以容納工具列。
+
+| 桌面版 | 只顯示波形最小高度 | 完整介面最小高度 |
+| --- | --- | --- |
+| Windows | 48 邏輯像素 | 132 邏輯像素 |
+| macOS | 48 點 | 100 點 |
+
+要回到完整介面，在波形上按右鍵，再取消勾選 **只顯示波形／Show waveform only**。Windows 薄視窗開啟設定時會視需要暫時拉高，關閉選單後回到原高度。視窗調整期間也可用精簡選單的 **Expand settings** 再要求展開。只顯示波形時，Backtracking 會向 Windows 要求關閉原生陰影、邊框與圓角。
 
 ### 移動與縮放桌面視窗
 
@@ -38,7 +49,7 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 ### 讀懂波形與錄音狀態
 
-工具列的 **Play／Pause** 圖示顯示可執行的動作。將游標移到按鈕上，可看到 **開始錄音／Start capture** 或 **暫停錄音／Pause capture**。將游標移到狀態燈上，可查看目前狀態。
+在完整介面中，工具列的 **Play／Pause** 圖示顯示可執行的動作。將游標移到按鈕上，可看到 **開始錄音／Start capture** 或 **暫停錄音／Pause capture**。將游標移到狀態燈上，可查看目前狀態。
 
 - **等待聲音／Waiting for sound**。錄音已待命，聲音超過靜音偵測門檻時便開始收錄。
 - **錄音中／Recording**。紅色狀態燈閃爍。波形右側是最新收錄的音訊，達到保留上限後，新的音訊會逐步取代最舊的音訊。
@@ -77,7 +88,7 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 ### 啟用、暫停與自動續錄
 
-按 **Play** 進入錄音待命，按 **Pause** 手動暫停。重新待命後，下一段收錄的音訊會接在原有歷史後方，受保留時間上限約束。
+選擇 **Play** 進入錄音待命，或選擇 **Pause** 手動暫停。完整介面使用工具列，只顯示波形時則使用右鍵選單。重新待命後，下一段收錄的音訊會接在原有歷史後方，受保留時間上限約束。
 
 **自動續錄／Auto-resume** 初始設定為 **10 秒**。可在齒輪選單改為 20、30 秒，或選擇 **手動／Off**，只用按鈕控制續錄。手動暫停或操作波形暫停後，會從取樣器視窗內最後一次點擊或手勢結束時開始計時。拖曳進行中會保持暫停。系統會依設定時間恢復待命，音量門檻仍決定何時實際收錄。
 
@@ -155,7 +166,18 @@ The settings menu offers five background transparency levels. Choose 0%, 25%, 50
 
 ### Show waveform only
 
-Turn on **Show waveform only** to hide Backtracking's frame and dark panel background. The waveform remains visible with **Play/Pause** at its top left. The desktop window uses a transparent background. An embedded VST3 or CLAP editor may still show the DAW's window frame or opaque background. To restore the full interface, right-click inside the window and turn the option off. This setting defaults to Off and is saved with the desktop preferences or the plug-in's DAW project settings.
+Turn on **Show waveform only** to hide Backtracking's frame and dark panel background. Only the waveform is visible. The desktop window uses a transparent background. The DAW controls the VST3 or CLAP editor size and may supply its own window frame or opaque background. This setting defaults to Off and is saved with the desktop preferences or the plug-in's DAW project settings.
+
+Right-click the waveform. Choose **Play** (**開始錄音** in the macOS app) when capture is paused, or **Pause** (**暫停錄音**) when capture is armed or recording.
+
+The desktop window keeps its current size when you enable the mode. Drag the inside top or bottom edge to make the waveform a thin strip. When you turn the mode off, the window grows if needed to meet the full interface's minimum height.
+
+| Desktop app | Waveform-only minimum height | Full interface minimum height |
+| --- | --- | --- |
+| Windows | 48 logical pixels | 132 logical pixels |
+| macOS | 48 points | 100 points |
+
+To restore the full interface, right-click the waveform and turn off **Show waveform only**. A thin Windows window expands temporarily if needed to show Settings and returns to its previous height when the menu closes. While the window resizes, **Expand settings** in the compact menu can request expansion again. In waveform-only mode, Backtracking asks Windows to suppress the native shadow, border, and rounded corners.
 
 ### Move and resize the desktop window
 
@@ -169,7 +191,7 @@ The Windows and macOS desktop apps use a frameless window. Use the gestures belo
 
 ### Read the waveform and capture status
 
-The toolbar's **Play/Pause** icon shows the available action. Hover over the button to see **Start capture** or **Pause capture**, and hover over the indicator to see the capture state.
+In the full interface, the toolbar's **Play/Pause** icon shows the available action. Hover over the button to see **Start capture** or **Pause capture**, and hover over the indicator to see the capture state.
 
 - **Waiting for sound**. Capture is armed and starts when the incoming signal crosses the silence threshold.
 - **Recording**. The red indicator blinks. The newest audio appears on the right. Once the buffer fills, new audio gradually replaces the oldest samples.
@@ -208,7 +230,7 @@ When you finish selecting a range, Backtracking prepares its WAV so you can drag
 
 ### Arm, pause, and auto-resume capture
 
-Press **Play** to arm capture or **Pause** to pause it manually. Once re-armed, the next sound is appended to the existing history within the selected limit.
+Choose **Play** to arm capture or **Pause** to pause it manually. Use the toolbar in the full interface or the right-click menu in waveform-only mode. Once re-armed, the next sound is appended to the existing history within the selected limit.
 
 **Auto-resume** defaults to **10 seconds**. Open the gear menu to choose 20 or 30 seconds, or select **Off** for manual control. After a manual pause or waveform interaction, the timer starts after the last click in the sampler or the end of a gesture. Capture stays paused during a drag. The timer re-arms capture, and the incoming signal must still cross the silence threshold before audio is recorded.
 
@@ -353,8 +375,8 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 4. 修改一項偏好後重開桌面版，確認設定有還原。測試插件時，修改設定後先儲存 DAW 專案，再重開該專案確認。
 
    Change a preference and relaunch the desktop app to check that it is restored. For the plug-in, change a setting, save the DAW project, and reopen it to check the saved value.
-5. 開啟 **只顯示波形**，確認波形與左上角 **Play／Pause** 可操作，框選時可看到區間內的波形變色。再按右鍵開啟設定並取消勾選，確認可回到完整介面。
+5. 開啟 **只顯示波形**。按右鍵測試暫停和啟用錄音，再確認框選時區間內的波形會變色。桌面版可把視窗縮到最小高度，再按右鍵開啟設定並取消勾選，確認可回到完整介面。
 
-   Turn on **Show waveform only**. Check that the waveform and its top-left **Play/Pause** control work, and that selecting a range changes the waveform color in that range. Right-click to open Settings and turn the option off to restore the full interface.
+   Turn on **Show waveform only**. Use the right-click menu to pause and arm capture. Check that selecting a range changes the waveform color in that range. On desktop, resize to the minimum height, then right-click and turn the option off to restore the full interface.
 
 [回到專案首頁 / Back to the project README](../README.md)
