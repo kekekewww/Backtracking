@@ -15,7 +15,8 @@ use nice_plug_egui::{
     create_egui_editor,
 };
 
-use crate::session::{Session, SessionSettings};
+use crate::session::Session;
+use crate::settings::{MeterMode, SessionSettings, TRANSPARENCY_LEVELS};
 
 const BINS: usize = 512;
 const REFRESH: Duration = Duration::from_millis(80);
@@ -26,7 +27,6 @@ const DURATIONS: [DurationChoice; 3] = [
     DurationChoice::Seconds30,
 ];
 const MINT: Color32 = Color32::from_rgb(103, 231, 181);
-const TRANSPARENCY_LEVELS: [u8; 5] = [0, 25, 50, 75, 100];
 
 pub type CaptureEditor = EguiEditor<CaptureUi>;
 
@@ -42,8 +42,7 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
             seconds: 0.0,
             next_refresh: Instant::now(),
             recording_since: None,
-            panel_transparency: 0,
-            meter_mode: MeterMode::Dbfs,
+            displayed_settings: None,
             frozen: None,
             selection: None,
             gesture: None,
@@ -64,8 +63,7 @@ pub struct CaptureUi {
     seconds: f32,
     next_refresh: Instant,
     recording_since: Option<Instant>,
-    panel_transparency: u8,
-    meter_mode: MeterMode,
+    displayed_settings: Option<SessionSettings>,
     frozen: Option<Arc<Snapshot>>,
     selection: Option<Range<f32>>,
     gesture: Option<Gesture>,
@@ -82,24 +80,7 @@ enum Gesture {
     Drag { origin: Pos2 },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MeterMode {
-    Dbfs,
-    Vu,
-    Lufs,
-}
-
 impl MeterMode {
-    const ALL: [Self; 3] = [Self::Dbfs, Self::Vu, Self::Lufs];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Dbfs => "dBFS",
-            Self::Vu => "VU",
-            Self::Lufs => "LUFS",
-        }
-    }
-
     fn reading(self, readings: MeterReadings) -> f32 {
         match self {
             Self::Dbfs => readings.peak_dbfs,
@@ -134,6 +115,21 @@ impl NiceEguiApp for CaptureUi {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame) {
         let mut settings = self.session.settings();
+        if let Some(previous) = &self.displayed_settings {
+            let retention_changed = previous.retention != settings.retention;
+            let output_changed = previous.output_dir != settings.output_dir;
+            if retention_changed {
+                self.reset_frozen();
+            } else if output_changed {
+                self.invalidate_export();
+            }
+            if retention_changed || output_changed {
+                self.message.clear();
+                if self.gesture.take().is_some() {
+                    self.session.set_gesture_active(false);
+                }
+            }
+        }
         let mut paused = self.session.is_paused();
         self.collect_export();
         self.refresh_waveform(paused);
@@ -164,7 +160,7 @@ impl NiceEguiApp for CaptureUi {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let open = self.settings_menu(ui, frame, &mut settings, paused);
-                    self.meter_readout(ui);
+                    self.meter_readout(ui, settings.meter_mode);
                     open
                 })
                 .inner
@@ -185,7 +181,13 @@ impl NiceEguiApp for CaptureUi {
         let (rect, response) = ui.allocate_exact_size(wave_size, Sense::click_and_drag());
         let configured_seconds = settings.retention.seconds() as f32;
         self.interact_waveform(ui, frame, rect, configured_seconds, !settings_open);
-        self.draw_waveform(ui, rect, configured_seconds, !settings_open);
+        self.draw_waveform(
+            ui,
+            rect,
+            configured_seconds,
+            !settings_open,
+            settings.panel_transparency,
+        );
         if !settings_open {
             self.draw_action_hint(ui, rect);
             response.on_hover_cursor(CursorIcon::Grab);
@@ -203,6 +205,7 @@ impl NiceEguiApp for CaptureUi {
             ui.add(egui::Label::new(&self.message).truncate())
                 .on_hover_text(&self.message);
         }
+        self.displayed_settings = Some(settings);
         ui.ctx()
             .request_repaint_after(if self.gesture.is_some() || self.export.is_some() {
                 Duration::from_millis(16)
@@ -231,8 +234,7 @@ impl Drop for CaptureUi {
 }
 
 impl CaptureUi {
-    fn meter_readout(&self, ui: &mut egui::Ui) {
-        let mode = self.meter_mode;
+    fn meter_readout(&self, ui: &mut egui::Ui, mode: MeterMode) {
         let value = mode.reading(self.session.meter_readings());
         let text = if value.is_finite() {
             format!("{value:.1} {}", mode.label())
@@ -291,6 +293,8 @@ impl CaptureUi {
         let menu = popup.show(|ui| {
             let mut retention = settings.retention;
             let mut idle_resume = settings.idle_resume;
+            let mut panel_transparency = settings.panel_transparency;
+            let mut meter_mode = settings.meter_mode;
             egui::Grid::new("capture-settings")
                 .spacing([12.0, 6.0])
                 .show(ui, |ui| {
@@ -311,7 +315,7 @@ impl CaptureUi {
                     ui.horizontal(|ui| {
                         for percent in TRANSPARENCY_LEVELS {
                             ui.selectable_value(
-                                &mut self.panel_transparency,
+                                &mut panel_transparency,
                                 percent,
                                 format!("{percent}%"),
                             );
@@ -321,7 +325,7 @@ impl CaptureUi {
                     ui.label("Meter");
                     ui.horizontal(|ui| {
                         for mode in MeterMode::ALL {
-                            ui.selectable_value(&mut self.meter_mode, mode, mode.label());
+                            ui.selectable_value(&mut meter_mode, mode, mode.label());
                         }
                     });
                     ui.end_row();
@@ -342,10 +346,20 @@ impl CaptureUi {
                 self.session.set_retention(retention);
                 settings.retention = retention;
                 self.reset_frozen();
+                self.message.clear();
                 self.refresh_waveform(paused);
             }
             if idle_resume != settings.idle_resume {
                 self.session.set_idle_resume(idle_resume);
+                settings.idle_resume = idle_resume;
+            }
+            if panel_transparency != settings.panel_transparency {
+                self.session.set_panel_transparency(panel_transparency);
+                settings.panel_transparency = panel_transparency;
+            }
+            if meter_mode != settings.meter_mode {
+                self.session.set_meter_mode(meter_mode);
+                settings.meter_mode = meter_mode;
             }
             ui.separator();
             let choose_project = ui
@@ -367,6 +381,7 @@ impl CaptureUi {
             if let Some(folder) = selection {
                 let output = folder.join("output");
                 self.session.set_output_dir(output.clone());
+                settings.output_dir = output.clone();
                 self.invalidate_export();
                 self.message = format!("Output: {}", output.display());
             }
@@ -439,9 +454,16 @@ impl CaptureUi {
         Rect::from_min_max(Pos2::new(inner.right() - width, inner.top()), inner.max)
     }
 
-    fn draw_waveform(&self, ui: &egui::Ui, rect: Rect, seconds: f32, allow_hover: bool) {
+    fn draw_waveform(
+        &self,
+        ui: &egui::Ui,
+        rect: Rect,
+        seconds: f32,
+        allow_hover: bool,
+        panel_transparency: u8,
+    ) {
         let painter = ui.painter_at(rect);
-        let opacity = ((100 - u16::from(self.panel_transparency)) * 255 / 100) as u8;
+        let opacity = ((100 - u16::from(panel_transparency)) * 255 / 100) as u8;
         painter.rect_filled(
             rect,
             6.0,

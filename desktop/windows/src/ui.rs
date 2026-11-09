@@ -12,6 +12,7 @@ use eframe::egui::{
 };
 
 use crate::controller::Controller;
+use crate::preferences::{Key, MeterMode, Preferences, Settings};
 
 const BINS: usize = 384;
 const REFRESH: Duration = Duration::from_millis(80);
@@ -31,6 +32,8 @@ const RESIZE_EDGE: f32 = 7.0;
 const RESIZE_CORNER: f32 = 14.0;
 
 pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
+    let preferences = Preferences::for_current_user();
+    let settings = preferences.load();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([610.0, 144.0])
@@ -39,7 +42,11 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
             .with_resizable(true)
             .with_transparent(true)
             .with_has_shadow(false)
-            .with_always_on_top(),
+            .with_window_level(if settings.pinned {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            }),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -48,7 +55,7 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
         options,
         Box::new(|context| {
             configure_style(&context.egui_ctx);
-            Ok(Box::new(Recorder::new(controller)))
+            Ok(Box::new(Recorder::new(controller, preferences, settings)))
         }),
     )
 }
@@ -69,6 +76,7 @@ fn configure_style(ctx: &egui::Context) {
 
 struct Recorder {
     controller: Controller,
+    preferences: Preferences,
     output: PathBuf,
     pinned: bool,
     idle_resume: Option<DurationChoice>,
@@ -97,23 +105,8 @@ enum Gesture {
     Export { origin: Pos2 },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MeterMode {
-    Dbfs,
-    Vu,
-    Lufs,
-}
-
 impl MeterMode {
     const OPTIONS: [Self; 3] = [Self::Dbfs, Self::Vu, Self::Lufs];
-
-    fn unit(self) -> &'static str {
-        match self {
-            Self::Dbfs => "dBFS",
-            Self::Vu => "VU",
-            Self::Lufs => "LUFS",
-        }
-    }
 
     fn value(self, readings: MeterReadings) -> f32 {
         match self {
@@ -138,17 +131,16 @@ struct ExportJob {
 }
 
 impl Recorder {
-    fn new(controller: Controller) -> Self {
-        let home = std::env::var_os("USERPROFILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+    fn new(mut controller: Controller, preferences: Preferences, settings: Settings) -> Self {
+        controller.set_retention(settings.history);
         Self {
             controller,
-            output: home.join("Backtracking").join("output"),
-            pinned: true,
-            idle_resume: Some(DurationChoice::Seconds10),
-            transparency: 0,
-            meter_mode: MeterMode::Dbfs,
+            preferences,
+            output: settings.output,
+            pinned: settings.pinned,
+            idle_resume: settings.idle_resume,
+            transparency: settings.transparency,
+            meter_mode: settings.meter_mode,
             last_interaction: Instant::now(),
             recording_started: None,
             low: [0.0; BINS],
@@ -165,6 +157,12 @@ impl Recorder {
             clip_revision: 0,
             exported: None,
             message: String::new(),
+        }
+    }
+
+    fn save_preference(&mut self, key: Key, value: impl AsRef<str>) {
+        if let Err(error) = self.preferences.save(key, value.as_ref()) {
+            self.message = format!("Could not save settings: {error}");
         }
     }
 
@@ -379,6 +377,7 @@ impl Recorder {
         let response = ui.add(icon_button());
         if response.clicked() {
             self.pinned = !self.pinned;
+            self.save_preference(Key::AlwaysOnTop, if self.pinned { "1" } else { "0" });
             let level = if self.pinned {
                 egui::WindowLevel::AlwaysOnTop
             } else {
@@ -474,11 +473,16 @@ impl Recorder {
                                 if retention != self.controller.retention() {
                                     self.controller.set_retention(retention);
                                     self.clear_snapshot();
+                                    self.save_preference(
+                                        Key::History,
+                                        retention.seconds().to_string(),
+                                    );
                                 }
                             });
                             ui.end_row();
                             ui.label("Auto-resume");
                             ui.horizontal(|ui| {
+                                let before = self.idle_resume;
                                 ui.selectable_value(&mut self.idle_resume, None, "Off");
                                 for value in DURATIONS {
                                     ui.selectable_value(
@@ -487,11 +491,17 @@ impl Recorder {
                                         format!("{} s", value.seconds()),
                                     );
                                 }
+                                if self.idle_resume != before {
+                                    let seconds =
+                                        self.idle_resume.map_or(0, DurationChoice::seconds);
+                                    self.save_preference(Key::IdleResume, seconds.to_string());
+                                }
                             });
                             ui.end_row();
                             ui.label("Background")
                                 .on_hover_text("Background transparency");
                             ui.horizontal(|ui| {
+                                let before = self.transparency;
                                 for value in TRANSPARENCIES {
                                     ui.selectable_value(
                                         &mut self.transparency,
@@ -499,13 +509,23 @@ impl Recorder {
                                         format!("{value}%"),
                                     );
                                 }
+                                if self.transparency != before {
+                                    self.save_preference(
+                                        Key::Transparency,
+                                        self.transparency.to_string(),
+                                    );
+                                }
                             });
                             ui.end_row();
                             ui.label("Meter");
                             ui.horizontal(|ui| {
+                                let before = self.meter_mode;
                                 for mode in MeterMode::OPTIONS {
                                     ui.selectable_value(&mut self.meter_mode, mode, mode.unit())
                                         .on_hover_text(mode.description());
+                                }
+                                if self.meter_mode != before {
+                                    self.save_preference(Key::Meter, self.meter_mode.unit());
                                 }
                             });
                             ui.end_row();
@@ -541,7 +561,20 @@ impl Recorder {
             {
                 self.output = folder.join("output");
                 self.invalidate_export();
-                self.message = format!("Output: {}", self.output.display());
+                let saved = self
+                    .output
+                    .to_str()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "output path cannot be encoded as UTF-8",
+                        )
+                    })
+                    .and_then(|path| self.preferences.save(Key::Output, path));
+                self.message = match saved {
+                    Ok(()) => format!("Output: {}", self.output.display()),
+                    Err(error) => format!("Could not save settings: {error}"),
+                };
             }
             self.last_interaction = Instant::now();
         }

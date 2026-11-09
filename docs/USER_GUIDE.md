@@ -73,7 +73,7 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 按 **Play** 進入錄音待命，按 **Pause** 手動暫停。重新待命後，下一段收錄的音訊會接在原有歷史後方，受保留時間上限約束。
 
-**自動續錄／Auto-resume** 初始設定為 **10 秒**。可在齒輪選單改為 20、30 秒，或選擇 **手動／Off**，只用按鈕控制續錄。macOS 桌面版會讀取先前儲存的設定。手動暫停或操作波形暫停後，會從取樣器視窗內最後一次點擊或手勢結束時開始計時。拖曳進行中會保持暫停。系統會依設定時間恢復待命，音量門檻仍決定何時實際收錄。
+**自動續錄／Auto-resume** 初始設定為 **10 秒**。可在齒輪選單改為 20、30 秒，或選擇 **手動／Off**，只用按鈕控制續錄。手動暫停或操作波形暫停後，會從取樣器視窗內最後一次點擊或手勢結束時開始計時。拖曳進行中會保持暫停。系統會依設定時間恢復待命，音量門檻仍決定何時實際收錄。
 
 ### 清除目前錄音
 
@@ -83,13 +83,22 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 從齒輪選單選擇 **專案資料夾／Project folder**，指定專案根目錄。例如選擇 `My Song`，檔案會寫到 `My Song/output/`。程式會在需要時建立該子目錄。插件的資料夾由使用者選擇，與 DAW 的專案儲存位置各自設定。
 
-| 版本 | 未指定專案時的輸出位置 | 設定保存 |
-| --- | --- | --- |
-| macOS 桌面版 | `~/Backtracking/output/` | 記住保留時間、自動續錄、背景透明度、音量表模式與輸出位置。 |
-| Windows 桌面版 | `%USERPROFILE%\Backtracking\output\` | 設定適用於本次開啟的桌面程式。 |
-| VST3／CLAP | 使用者家目錄下的 `Backtracking/output/` | 每個插件實例各自設定，重新載入時使用預設值。 |
+| 版本 | 未指定專案時的輸出位置 |
+| --- | --- |
+| macOS 桌面版 | `~/Backtracking/output/` |
+| Windows 桌面版 | `%USERPROFILE%\Backtracking\output\` |
+| VST3／CLAP | 使用者家目錄下的 `Backtracking/output/` |
 
 匯出格式固定為 **48 kHz、32-bit IEEE float WAV**。來源若是 44.1 或 96 kHz，會在匯出時轉成 48 kHz。WAV 保留擷取結果的 mono 或 stereo 聲道配置，Windows 桌面版會將多聲道輸出裝置的混音轉為 stereo。回溯歷史儲存在記憶體，關閉桌面程式或移除插件前，請先存下需要的片段。
+
+### 保存與還原設定
+
+Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續錄、背景透明度、音量表模式、輸出位置與置頂設定，下次開啟時還原。
+
+- **Windows**。設定儲存在 `%LOCALAPPDATA%\Backtracking\Settings`。若找不到 `LOCALAPPDATA`，則使用 `%APPDATA%\Backtracking\Settings`。程式會以預設視窗尺寸開啟，由系統安排位置。
+- **macOS**。設定儲存在系統的使用者偏好中，也會記住桌面視窗的位置與尺寸。
+
+**VST3／CLAP** 的保留時間、自動續錄、面板透明度、音量表模式和輸出位置由 DAW 專案保存，每個插件實例可獨立設定。修改後請手動儲存專案。重新開啟同一個專案時，DAW 會還原各實例的設定。
 
 ### 排除問題
 
@@ -174,7 +183,7 @@ When you finish selecting a range, Backtracking prepares its WAV so you can drag
 
 Press **Play** to arm capture or **Pause** to pause it manually. Once re-armed, the next sound is appended to the existing history within the selected limit.
 
-**Auto-resume** defaults to **10 seconds**. Open the gear menu to choose 20 or 30 seconds, or select **Off** for manual control. The macOS desktop app loads its previously saved setting. After a manual pause or waveform interaction, the timer starts after the last click in the sampler or the end of a gesture. Capture stays paused during a drag. The timer re-arms capture, and the incoming signal must still cross the silence threshold before audio is recorded.
+**Auto-resume** defaults to **10 seconds**. Open the gear menu to choose 20 or 30 seconds, or select **Off** for manual control. After a manual pause or waveform interaction, the timer starts after the last click in the sampler or the end of a gesture. Capture stays paused during a drag. The timer re-arms capture, and the incoming signal must still cross the silence threshold before audio is recorded.
 
 ### Clear the current recording
 
@@ -184,13 +193,22 @@ Click the trash icon in the toolbar. It is labeled **Clear capture** on Windows 
 
 In the gear menu, choose **Project folder** and select the project root. If you select `My Song`, clips go to `My Song/output/`. The application creates the subfolder as needed. Set the plug-in output folder separately from your DAW's project save location.
 
-| Edition | Default output folder | Settings |
-| --- | --- | --- |
-| macOS desktop | `~/Backtracking/output/` | Remembers history, auto-resume, background transparency, meter mode, and the output folder. |
-| Windows desktop | `%USERPROFILE%\Backtracking\output\` | Applies to the current app session. |
-| VST3 / CLAP | `Backtracking/output/` in your home directory | Each instance has its own settings for the current session. |
+| Edition | Default output folder |
+| --- | --- |
+| macOS desktop | `~/Backtracking/output/` |
+| Windows desktop | `%USERPROFILE%\Backtracking\output\` |
+| VST3 / CLAP | `Backtracking/output/` in your home directory |
 
 Every export is a **48 kHz, 32-bit IEEE float WAV**. A 44.1 or 96 kHz source is resampled during export. The WAV preserves the captured mono or stereo layout. The Windows desktop app mixes multichannel playback to stereo. The rolling history lives in memory, so export any clips you need before closing the app or removing the plug-in.
+
+### Save and restore settings
+
+The Windows and macOS desktop apps save your history length, auto-resume delay, background transparency, meter mode, output folder, and keep-on-top setting as you change them. Those preferences are restored the next time you open the app.
+
+- **Windows**. Settings are stored in `%LOCALAPPDATA%\Backtracking\Settings`, with `%APPDATA%\Backtracking\Settings` as a fallback when `LOCALAPPDATA` is unavailable. The app opens at its default window size and Windows places the window.
+- **macOS**. Settings are stored in the macOS user preferences. The app also restores the desktop window's size and position.
+
+For **VST3 and CLAP**, the DAW project stores each plug-in instance's history length, auto-resume delay, panel transparency, meter mode, and output folder. Save the project manually after making changes. When you reopen that project, the DAW restores each instance's settings.
 
 ### Troubleshooting
 
@@ -290,5 +308,8 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 3. 框選一小段，拖進 DAW 並確認存檔位置及 WAV 規格。若使用插件，分別在 VST3 和 CLAP 實例操作一次。
 
    Select a short clip, drag it into the DAW, and check the file location and WAV format. For plug-in use, try one instance of each format.
+4. 修改一項偏好後重開桌面版，確認設定有還原。測試插件時，修改設定後先儲存 DAW 專案，再重開該專案確認。
+
+   Change a preference and relaunch the desktop app to check that it is restored. For the plug-in, change a setting, save the DAW project, and reopen it to check the saved value.
 
 [回到專案首頁 / Back to the project README](../README.md)

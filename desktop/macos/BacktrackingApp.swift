@@ -2,6 +2,7 @@ import AppKit
 
 private let timeChoices: [UInt32] = [10, 20, 30]
 private let transparencyChoices: [UInt32] = [0, 25, 50, 75, 100]
+private let frameAutosaveName: NSWindow.FrameAutosaveName = "Backtracking.Panel"
 
 private func movesFromWaveform(_ modifiers: NSEvent.ModifierFlags) -> Bool {
     modifiers.contains([.command, .option]) && !modifiers.contains(.control)
@@ -346,6 +347,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var idleSeconds: UInt32 = 10
     private var transparency: UInt32 = 0
     private var meterMode: MeterMode = .dbfs
+    private var alwaysOnTop = true
     private var paused = true
     private var captureError: String?
     private var editing = false
@@ -354,23 +356,25 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var output = ""
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let storedHistory = defaults.integer(forKey: "history")
-        if let matching = timeChoices.first(where: { Int($0) == storedHistory }) {
-            history = matching
+        if let saved = unsignedSetting("history"), timeChoices.contains(saved) {
+            history = saved
         }
-        if let storedIdle = defaults.object(forKey: "idleSeconds") as? NSNumber,
-           let seconds = UInt32(exactly: storedIdle.intValue), seconds == 0 || timeChoices.contains(seconds) {
+        if let seconds = unsignedSetting("idleSeconds"), seconds == 0 || timeChoices.contains(seconds) {
             idleSeconds = seconds
         }
-        if let saved = UInt32(exactly: defaults.integer(forKey: "backgroundTransparency")), transparencyChoices.contains(saved) {
+        if let saved = unsignedSetting("backgroundTransparency"), transparencyChoices.contains(saved) {
             transparency = saved
         }
-        if let saved = UInt32(exactly: defaults.integer(forKey: "meterMode")), let mode = MeterMode(rawValue: saved) {
+        if let saved = unsignedSetting("meterMode"), let mode = MeterMode(rawValue: saved) {
             meterMode = mode
         }
-        output = defaults.string(forKey: "outputDirectory") ??
-            FileManager.default.homeDirectoryForCurrentUser
+        alwaysOnTop = defaults.object(forKey: "alwaysOnTop") as? Bool ?? true
+        if let saved = defaults.string(forKey: "outputDirectory"), saved.hasPrefix("/"), !saved.utf8.contains(0) {
+            output = saved
+        } else {
+            output = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Backtracking/output", isDirectory: true).path
+        }
 
         configureMenu()
         configurePanel()
@@ -380,7 +384,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         RunLoop.main.add(timer, forMode: .common)
     }
 
+    private func unsignedSetting(_ key: String) -> UInt32? {
+        guard let number = defaults.object(forKey: key) as? NSNumber else { return nil }
+        return UInt32(exactly: number.doubleValue)
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        panel?.saveFrame(usingName: frameAutosaveName)
         timer?.invalidate()
         timer = nil
         tap = nil
@@ -411,13 +421,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         window.isMovable = true
         window.delegate = self
         window.becomesKeyOnlyIfNeeded = true
-        window.isFloatingPanel = true
-        window.hidesOnDeactivate = false
         window.acceptsMouseMovedEvents = true
-        window.level = .floating
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.onClick = { [weak self] in self?.registerClick() }
-        window.setFrameAutosaveName("Backtracking.Panel")
 
         let waveform = WaveformView(frame: .zero)
         waveform.controller = self
@@ -444,8 +450,6 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let pinButton = NSButton(title: "置頂", target: self, action: #selector(pinChanged(_:)))
         pinButton.setButtonType(.pushOnPushOff)
         pinButton.bezelStyle = .rounded
-        pinButton.state = .on
-        setIcon("pin.fill", label: "取消置頂", on: pinButton)
         let settingsButton = NSButton(title: "設定", target: self, action: #selector(showSettings(_:)))
         settingsButton.bezelStyle = .rounded
         setIcon("gearshape", label: "設定", on: settingsButton)
@@ -480,8 +484,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             waveform.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
         panel = window
+        applyPin(to: pinButton)
         updateBackground()
-        if !window.setFrameUsingName("Backtracking.Panel") {
+        let restoredFrame = window.setFrameUsingName(frameAutosaveName)
+        _ = window.setFrameAutosaveName(frameAutosaveName)
+        let screens = NSScreen.screens
+        if !restoredFrame || (!screens.isEmpty && !screens.contains(where: { $0.visibleFrame.intersects(window.frame) })) {
             window.center()
         }
         window.orderFrontRegardless()
@@ -620,11 +628,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     @objc private func pinChanged(_ sender: NSButton) {
-        let pinned = sender.state == .on
-        panel?.isFloatingPanel = pinned
+        alwaysOnTop = sender.state == .on
+        defaults.set(alwaysOnTop, forKey: "alwaysOnTop")
+        applyPin(to: sender)
+    }
+
+    private func applyPin(to button: NSButton) {
+        button.state = alwaysOnTop ? .on : .off
+        panel?.isFloatingPanel = alwaysOnTop
         panel?.hidesOnDeactivate = false
-        panel?.level = pinned ? .floating : .normal
-        setIcon(pinned ? "pin.fill" : "pin", label: pinned ? "取消置頂" : "置頂", on: sender)
+        panel?.level = alwaysOnTop ? .floating : .normal
+        setIcon(alwaysOnTop ? "pin.fill" : "pin", label: alwaysOnTop ? "取消置頂" : "置頂", on: button)
     }
 
     @objc private func chooseOutput() {

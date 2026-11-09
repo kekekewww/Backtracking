@@ -8,6 +8,8 @@ mod controller;
 #[cfg(target_os = "windows")]
 mod loopback;
 #[cfg(target_os = "windows")]
+mod preferences;
+#[cfg(target_os = "windows")]
 mod ui;
 
 #[cfg(target_os = "windows")]

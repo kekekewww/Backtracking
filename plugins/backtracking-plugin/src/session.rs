@@ -8,12 +8,7 @@ use backtracking_core::{
     AudioQueue, Capture, CaptureState, DurationChoice, MeterReadings, Snapshot,
 };
 
-#[derive(Clone)]
-pub(crate) struct SessionSettings {
-    pub(crate) retention: DurationChoice,
-    pub(crate) idle_resume: Option<DurationChoice>,
-    pub(crate) output_dir: PathBuf,
-}
+use crate::settings::{MeterMode, SessionSettings, SettingsStore};
 
 struct Consumer {
     queue: Arc<AudioQueue>,
@@ -78,7 +73,8 @@ impl Consumer {
 }
 
 struct State {
-    settings: SessionSettings,
+    retention: DurationChoice,
+    idle_resume: Option<DurationChoice>,
     consumer: Option<Consumer>,
     paused: bool,
     gesture_active: bool,
@@ -86,6 +82,7 @@ struct State {
 }
 
 pub(crate) struct Session {
+    settings: SettingsStore,
     state: Mutex<State>,
     accepting: AtomicBool,
     writer_active: AtomicBool,
@@ -93,17 +90,16 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub(crate) fn new() -> Self {
-        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+    pub(crate) fn new(settings: SettingsStore) -> Self {
+        let (retention, idle_resume) = {
+            let settings = settings.lock();
+            (settings.retention, settings.idle_resume)
+        };
         Self {
+            settings,
             state: Mutex::new(State {
-                settings: SessionSettings {
-                    retention: DurationChoice::Seconds20,
-                    idle_resume: Some(DurationChoice::Seconds10),
-                    output_dir: home.join("Backtracking").join("output"),
-                },
+                retention,
+                idle_resume,
                 consumer: None,
                 paused: false,
                 gesture_active: false,
@@ -122,29 +118,51 @@ impl Session {
     }
 
     pub(crate) fn settings(&self) -> SessionSettings {
-        self.lock().settings.clone()
+        self.settings.lock().clone()
     }
 
     pub(crate) fn set_output_dir(&self, output_dir: PathBuf) {
-        self.lock().settings.output_dir = output_dir;
+        self.settings.lock().output_dir = output_dir;
+    }
+
+    pub(crate) fn set_panel_transparency(&self, panel_transparency: u8) {
+        self.settings.lock().panel_transparency = panel_transparency;
+    }
+
+    pub(crate) fn set_meter_mode(&self, meter_mode: MeterMode) {
+        self.settings.lock().meter_mode = meter_mode;
     }
 
     pub(crate) fn set_retention(&self, retention: DurationChoice) {
-        let mut state = self.lock();
-        state.settings.retention = retention;
-        if let Some(consumer) = &mut state.consumer {
-            consumer.capture.set_retention(retention);
-        }
+        self.settings.lock().retention = retention;
+        self.apply_capture_settings(&mut self.lock());
     }
 
     pub(crate) fn set_idle_resume(&self, idle_resume: Option<DurationChoice>) {
-        let mut state = self.lock();
-        state.settings.idle_resume = idle_resume;
-        state.last_interaction = Instant::now();
+        self.settings.lock().idle_resume = idle_resume;
+        self.apply_capture_settings(&mut self.lock());
+    }
+
+    fn apply_capture_settings(&self, state: &mut State) {
+        let (retention, idle_resume) = {
+            let settings = self.settings.lock();
+            (settings.retention, settings.idle_resume)
+        };
+        if retention != state.retention {
+            state.retention = retention;
+            if let Some(consumer) = &mut state.consumer {
+                consumer.capture.set_retention(retention);
+            }
+        }
+        if idle_resume != state.idle_resume {
+            state.idle_resume = idle_resume;
+            state.last_interaction = Instant::now();
+        }
     }
 
     pub(crate) fn pause(&self) {
         let mut state = self.lock();
+        self.apply_capture_settings(&mut state);
         state.last_interaction = Instant::now();
         if state.paused {
             return;
@@ -198,7 +216,8 @@ impl Session {
     }
 
     pub(crate) fn snapshot(&self) -> Option<Snapshot> {
-        let state = self.lock();
+        let mut state = self.lock();
+        self.apply_capture_settings(&mut state);
         state
             .consumer
             .as_ref()
@@ -207,6 +226,7 @@ impl Session {
 
     pub(crate) fn waveform(&self, minimum: &mut [f32], maximum: &mut [f32]) -> (usize, u32) {
         let mut state = self.lock();
+        self.apply_capture_settings(&mut state);
         let Some(consumer) = &mut state.consumer else {
             minimum.fill(0.0);
             maximum.fill(0.0);
@@ -244,9 +264,10 @@ impl Session {
 
     fn consume(&self) {
         let mut state = self.lock();
+        self.apply_capture_settings(&mut state);
         if state.paused
             && !state.gesture_active
-            && state.settings.idle_resume.is_some_and(|delay| {
+            && state.idle_resume.is_some_and(|delay| {
                 state.last_interaction.elapsed() >= Duration::from_secs(u64::from(delay.seconds()))
             })
         {
@@ -295,7 +316,8 @@ impl Worker {
         }
         let (queue, capacity_frames) = {
             let mut state = session.lock();
-            let mut capture = Capture::new(rate, channels, state.settings.retention).ok()?;
+            session.apply_capture_settings(&mut state);
+            let mut capture = Capture::new(rate, channels, state.retention).ok()?;
             if state.paused {
                 capture.pause();
             }
@@ -390,19 +412,48 @@ impl Drop for Worker {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use nice_plug::params::persist::PersistentField;
+
     use super::*;
 
     #[test]
     fn fresh_instances_default_to_ten_second_idle_resume() {
         assert_eq!(
-            Session::new().settings().idle_resume,
+            Session::new(SettingsStore::default())
+                .settings()
+                .idle_resume,
             Some(DurationChoice::Seconds10)
         );
     }
 
     #[test]
+    fn host_settings_restore_updates_running_capture_without_reactivating() {
+        let settings = SettingsStore::default();
+        let session = Arc::new(Session::new(settings.clone()));
+        let worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
+        let mut input = [0.5; 3_000];
+        for _ in 0..5 {
+            worker.push(&[&mut input]);
+            session.consume();
+        }
+        assert_eq!(session.snapshot().unwrap().frame_count(), 15_000);
+
+        settings.set(BTreeMap::from([
+            ("history_seconds".into(), "10".into()),
+            ("idle_resume_seconds".into(), "0".into()),
+        ]));
+        session.consume();
+
+        assert_eq!(session.snapshot().unwrap().frame_count(), 10_000);
+        assert!(!session.is_paused());
+        assert_eq!(session.lock().idle_resume, None);
+    }
+
+    #[test]
     fn clear_discards_pending_and_retained_audio_without_changing_pause_state() {
-        let session = Arc::new(Session::new());
+        let session = Arc::new(Session::new(SettingsStore::default()));
         let worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
         worker.push(&[&mut [0.25; 32]]);
         session.consume();
@@ -424,7 +475,7 @@ mod tests {
 
     #[test]
     fn clear_followed_by_pause_cannot_restore_an_in_flight_block() {
-        let session = Arc::new(Session::new());
+        let session = Arc::new(Session::new(SettingsStore::default()));
         let worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
 
         session.writer_active.store(true, Ordering::SeqCst);
@@ -440,7 +491,7 @@ mod tests {
 
     #[test]
     fn pauses_without_recording_later_audio_and_appends_after_resuming() {
-        let session = Arc::new(Session::new());
+        let session = Arc::new(Session::new(SettingsStore::default()));
         let worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
 
         worker.push(&[&mut [0.25; 32]]);
@@ -459,7 +510,7 @@ mod tests {
 
     #[test]
     fn recording_indicator_stops_when_host_stops_sending_audio() {
-        let session = Arc::new(Session::new());
+        let session = Arc::new(Session::new(SettingsStore::default()));
         let worker = Worker::new(session.clone(), 48_000, 1, 256).unwrap();
 
         worker.push(&[&mut [0.25; 32]]);
@@ -476,7 +527,7 @@ mod tests {
 
     #[test]
     fn idle_resume_waits_until_the_current_gesture_has_ended() {
-        let session = Session::new();
+        let session = Session::new(SettingsStore::default());
         session.pause();
         session.set_idle_resume(Some(DurationChoice::Seconds10));
         session.set_gesture_active(true);

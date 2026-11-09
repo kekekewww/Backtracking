@@ -23,6 +23,8 @@ Backtracking 是給作曲與混音用的回溯錄音取樣器。聽到想留下�
 
 Windows 和 macOS 桌面版採用無邊框視窗，可直接在工具列切換置頂，或從齒輪選單結束程式。
 
+桌面版會在下次開啟時還原偏好設定。VST3／CLAP 的設定跟著各自的插件實例存進 DAW 專案，修改後請儲存專案。要保留錄音素材，請先匯出 WAV。
+
 匯出為 **48 kHz、32-bit float WAV**。指定專案資料夾後，檔案會存到它的 `output/` 子目錄。
 
 [完整操作手冊](docs/USER_GUIDE.md#繁體中文) · [桌面視窗操作](docs/USER_GUIDE.md#移動與縮放桌面視窗) · [安裝與建置](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
@@ -47,6 +49,8 @@ Backtracking is a retrospective audio sampler for music production and mixing. W
 The live meter next to the gear can show **dBFS, VU, or momentary LUFS**. Open the gear menu to set the history length, auto-resume delay, background transparency, meter unit, and project folder. Auto-resume defaults to **10 seconds**. The clear action empties the audio held in memory.
 
 The Windows and macOS desktop apps use a frameless window. Use **Keep on top** in the toolbar or **Quit** in the gear menu.
+
+The desktop apps restore preferences the next time you open them. For VST3 and CLAP, save your DAW project after making changes to store each instance's settings. Export a WAV to keep captured audio.
 
 Exports are **48 kHz, 32-bit float WAV** files. After you choose a project folder, files go into its `output/` subfolder.
 

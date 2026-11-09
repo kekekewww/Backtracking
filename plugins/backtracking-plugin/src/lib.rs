@@ -2,6 +2,7 @@
 mod editor;
 #[cfg_attr(not(feature = "editor"), allow(dead_code))]
 mod session;
+mod settings;
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use nice_plug::prelude::*;
 #[cfg(feature = "editor")]
 use crate::editor::CaptureEditor;
 use crate::session::{Session, Worker};
+use crate::settings::SettingsStore;
 
 struct Backtracking {
     params: Arc<PluginParams>,
@@ -20,14 +22,20 @@ struct Backtracking {
     capture_enabled: bool,
 }
 
-#[derive(Default, Params)]
-struct PluginParams {}
+#[derive(Params)]
+struct PluginParams {
+    #[persist = "capture_settings_v1"]
+    settings: SettingsStore,
+}
 
 impl Default for Backtracking {
     fn default() -> Self {
+        let settings = SettingsStore::default();
         Self {
-            params: Arc::new(PluginParams::default()),
-            session: Arc::new(Session::new()),
+            params: Arc::new(PluginParams {
+                settings: settings.clone(),
+            }),
+            session: Arc::new(Session::new(settings)),
             worker: None,
             capture_enabled: false,
         }
@@ -135,3 +143,72 @@ impl Vst3Plugin for Backtracking {
 
 nice_export_vst3!(Backtracking);
 nice_export_clap!(Backtracking);
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use backtracking_core::DurationChoice;
+    use nice_plug::params::persist::serialize_field;
+
+    use super::*;
+    use crate::settings::{MeterMode, SessionSettings};
+
+    #[test]
+    fn plugin_state_round_trips_instance_settings_without_audio_or_pause() {
+        let original = Backtracking::default();
+        original.session.set_retention(DurationChoice::Seconds30);
+        original.session.set_idle_resume(None);
+        original.session.set_panel_transparency(75);
+        original.session.set_meter_mode(MeterMode::Lufs);
+        let output = std::env::temp_dir()
+            .join("Backtracking 測試")
+            .join("output");
+        original.session.set_output_dir(output);
+        let worker = Worker::new(original.session.clone(), 1_000, 1, 256).unwrap();
+        worker.push(&[&mut [0.5; 32]]);
+        original.session.pause();
+        assert!(!original.session.snapshot().unwrap().samples.is_empty());
+
+        let fields = original.params().serialize_fields();
+        let restored = Backtracking::default();
+        restored.params().deserialize_fields(&fields);
+        let _worker = Worker::new(restored.session.clone(), 1_000, 1, 256).unwrap();
+
+        assert_eq!(restored.session.settings(), original.session.settings());
+        assert!(!restored.session.is_paused());
+        assert!(restored.session.snapshot().unwrap().samples.is_empty());
+    }
+
+    #[test]
+    fn legacy_and_invalid_fields_use_defaults_without_losing_valid_values() {
+        let plugin = Backtracking::default();
+        let defaults = SessionSettings::default();
+        plugin.params().deserialize_fields(&BTreeMap::new());
+        assert_eq!(plugin.session.settings(), defaults);
+
+        let input = BTreeMap::from([
+            ("history_seconds", "30".to_owned()),
+            ("idle_resume_seconds", "unsupported".to_owned()),
+            ("panel_transparency", "250".to_owned()),
+            ("meter_unit", "VU".to_owned()),
+            (
+                "output_dir",
+                serialize_field(std::ffi::OsStr::new("relative/output")).unwrap(),
+            ),
+        ]);
+        plugin.params().deserialize_fields(&BTreeMap::from([(
+            "capture_settings_v1".to_owned(),
+            serialize_field(&input).unwrap(),
+        )]));
+
+        assert_eq!(
+            plugin.session.settings(),
+            SessionSettings {
+                retention: DurationChoice::Seconds30,
+                meter_mode: MeterMode::Vu,
+                ..defaults
+            }
+        );
+    }
+}
