@@ -16,7 +16,9 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 ### 開啟設定
 
-點擊工具列的齒輪，開啟 **設定** 選單。選單內可以調整 **保留／History／Buffer**、**自動續錄／Auto-resume** 和 **專案資料夾／Project folder**。Windows 和 macOS 桌面版的 **置頂／Keep on top** 可直接在工具列切換。插件視窗的位置由 DAW 控制。
+點擊工具列的齒輪，開啟 **設定** 選單。可調整保留時間、自動續錄、背景透明度及專案資料夾。Windows 和 macOS 桌面版的 **置頂／Keep on top** 可直接在工具列切換。插件視窗的位置由 DAW 控制。
+
+齒輪選單的背景透明度可選 0%、25%、50%、75% 或 100%。0% 為不透明，100% 為透明。桌面版在 100% 時仍可透過齒輪選單調整透明度。VST3／CLAP 的 **Panel transparency** 調整插件內的波形面板背景，實際看到的底色取決於 DAW 的視窗背景。
 
 ### 移動與縮放桌面視窗
 
@@ -39,6 +41,18 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 **保留／History／Buffer** 可選 10、20 或 30 秒，預設為 20 秒。這是記憶體中的音訊長度。假設兩段各 5 秒的聲音相隔一分鐘，兩段會接在一起，中間只保留靜音偵測需要的短緩衝。非常小聲的內容可能低於門檻。縮短保留時間會裁掉最早的部分，事後加長只會增加接下來可保留的長度。
 
+### 即時音量表
+
+齒輪旁的音量表顯示目前輸入的音訊，預設模式是 dBFS。從齒輪選單的音量表設定切換單位。macOS 桌面版也可直接點擊讀值切換。暫停錄音或目前無可用讀值時，顯示 `—`。
+
+| 模式 | 讀值 |
+| --- | --- |
+| **dBFS** | 數位取樣峰值，0 dBFS 是數位滿刻度。 |
+| **VU** | 以 300 毫秒 RMS 估算平均電平。以 1 kHz、峰值 −18 dBFS 的正弦波校準為 0 VU。 |
+| **LUFS** | 瞬時響度。以 K 加權和 400 毫秒滑動視窗估算。 |
+
+響度量測參考文件。 [ITU-R BS.1770](https://www.itu.int/rec/R-REC-BS.1770-5-202311-I/en) · [EBU Tech 3341](https://tech.ebu.ch/publications/tech3341)
+
 ### 點擊、框選與拖曳
 
 未框選時，將游標移到波形上會預覽整段保留音訊。從波形任意位置點擊或開始拖曳，都會匯出這整段音訊。例如保留時間設為 20 秒，錄滿時匯出 20 秒，目前只收錄 7 秒時就匯出 7 秒。若已有框選，預覽與匯出都使用框選區間。
@@ -59,7 +73,11 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 按 **Play** 進入錄音待命，按 **Pause** 手動暫停。重新待命後，下一段收錄的音訊會接在原有歷史後方，受保留時間上限約束。
 
-在齒輪選單將 **自動續錄／Auto-resume** 設成 **手動／Off**，即可由按鈕控制續錄。若選擇 10、20 或 30 秒，手動暫停或操作波形暫停後，都會從取樣器視窗內最後一次點擊或手勢結束時開始計時。拖曳進行中會保持暫停。系統會依設定時間恢復待命，音量門檻仍決定何時實際收錄。
+**自動續錄／Auto-resume** 初始設定為 **10 秒**。可在齒輪選單改為 20、30 秒，或選擇 **手動／Off**，只用按鈕控制續錄。macOS 桌面版會讀取先前儲存的設定。手動暫停或操作波形暫停後，會從取樣器視窗內最後一次點擊或手勢結束時開始計時。拖曳進行中會保持暫停。系統會依設定時間恢復待命，音量門檻仍決定何時實際收錄。
+
+### 清除目前錄音
+
+點擊工具列的垃圾桶圖示。提示文字依版本為 **清除目前錄音**、**Clear capture** 或 **Clear captured audio**。這會清空目前的波形、選取區間與記憶體中的錄音。若錄音已待命，接下來收到的聲音會重新填入波形。已寫入 `output/` 的 WAV 可從資料夾取用。
 
 ### 輸出位置與檔案規格
 
@@ -67,7 +85,7 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 | 版本 | 未指定專案時的輸出位置 | 設定保存 |
 | --- | --- | --- |
-| macOS 桌面版 | `~/Backtracking/output/` | 記住保留時間、自動續錄與輸出位置。 |
+| macOS 桌面版 | `~/Backtracking/output/` | 記住保留時間、自動續錄、背景透明度、音量表模式與輸出位置。 |
 | Windows 桌面版 | `%USERPROFILE%\Backtracking\output\` | 設定適用於本次開啟的桌面程式。 |
 | VST3／CLAP | 使用者家目錄下的 `Backtracking/output/` | 每個插件實例各自設定，重新載入時使用預設值。 |
 
@@ -99,7 +117,9 @@ On Windows, route the source to the default playback device. If a DAW uses ASIO,
 
 ### Open settings
 
-Click the gear in the toolbar to open **Settings**. The menu contains **History / Buffer**, **Auto-resume**, and **Project folder**. In the Windows and macOS desktop apps, you can toggle **Keep on top** directly from the toolbar. The DAW controls the plug-in window.
+Click the gear in the toolbar to open **Settings**. Use the menu to set the history length, auto-resume delay, background transparency, and project folder. In the Windows and macOS desktop apps, you can toggle **Keep on top** directly from the toolbar. The DAW controls the plug-in window.
+
+The gear menu offers five background transparency levels. Choose 0%, 25%, 50%, 75%, or 100%, where 0% is opaque and 100% is clear. On the desktop apps, use the gear menu to adjust the setting even at 100%. In VST3 and CLAP, **Panel transparency** fades the waveform panel's fill. The DAW provides the background behind it.
 
 ### Move and resize the desktop window
 
@@ -122,6 +142,18 @@ The toolbar's **Play/Pause** icon shows the available action. Hover over the but
 
 **History / Buffer** can hold 10, 20, or 30 seconds and defaults to 20 seconds. This is the amount of audio retained in memory. Two five-second sounds a minute apart are joined with only a little silence at the join. Very quiet material may fall below the capture threshold. Shortening the buffer trims the oldest audio. Lengthening it gives future audio more room.
 
+### Live audio meter
+
+The meter next to the gear reads the incoming audio signal and defaults to dBFS. Choose the unit in the gear menu. In the macOS desktop app, you can also click the readout to switch units. The meter displays `—` while paused or when a reading is unavailable.
+
+| Mode | What it shows |
+| --- | --- |
+| **dBFS** | Digital sample peak level. 0 dBFS is digital full scale. |
+| **VU** | A 300-millisecond RMS estimate of average level. A 1 kHz sine wave with a −18 dBFS peak reads 0 VU. |
+| **LUFS** | Momentary loudness estimated with K-weighting and a 400-millisecond sliding window. |
+
+Loudness measurement references. [ITU-R BS.1770](https://www.itu.int/rec/R-REC-BS.1770-5-202311-I/en) · [EBU Tech 3341](https://tech.ebu.ch/publications/tech3341)
+
 ### Click, select, and drag
 
 With no selection, hover over the waveform to preview all retained audio. Clicking or starting a drag anywhere on the waveform exports that full range. For example, a full 20-second buffer exports 20 seconds. If only 7 seconds have been captured, the WAV is 7 seconds long. An explicit selection sets the range for both preview and export.
@@ -142,7 +174,11 @@ When you finish selecting a range, Backtracking prepares its WAV so you can drag
 
 Press **Play** to arm capture or **Pause** to pause it manually. Once re-armed, the next sound is appended to the existing history within the selected limit.
 
-In the gear menu, leave **Auto-resume** set to **Off** for manual control, or choose 10, 20, or 30 seconds. After a manual pause or waveform interaction, the timer starts after the last click in the sampler or the end of a gesture. Capture stays paused during a drag. The timer re-arms capture, and the incoming signal must still cross the silence threshold before audio is recorded.
+**Auto-resume** defaults to **10 seconds**. Open the gear menu to choose 20 or 30 seconds, or select **Off** for manual control. The macOS desktop app loads its previously saved setting. After a manual pause or waveform interaction, the timer starts after the last click in the sampler or the end of a gesture. Capture stays paused during a drag. The timer re-arms capture, and the incoming signal must still cross the silence threshold before audio is recorded.
+
+### Clear the current recording
+
+Click the trash icon in the toolbar. It is labeled **Clear capture** on Windows desktop and **Clear captured audio** in the plug-ins. This empties the waveform, selection, and audio held in memory. If capture is armed, incoming sound starts filling the waveform again. You can find WAV files already written to `output/` in that folder.
 
 ### Output location and file format
 
@@ -150,7 +186,7 @@ In the gear menu, choose **Project folder** and select the project root. If you 
 
 | Edition | Default output folder | Settings |
 | --- | --- | --- |
-| macOS desktop | `~/Backtracking/output/` | Remembers history, auto-resume, and the output folder. |
+| macOS desktop | `~/Backtracking/output/` | Remembers history, auto-resume, background transparency, meter mode, and the output folder. |
 | Windows desktop | `%USERPROFILE%\Backtracking\output\` | Applies to the current app session. |
 | VST3 / CLAP | `Backtracking/output/` in your home directory | Each instance has its own settings for the current session. |
 

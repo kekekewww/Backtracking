@@ -1,6 +1,7 @@
 import AppKit
 
 private let timeChoices: [UInt32] = [10, 20, 30]
+private let transparencyChoices: [UInt32] = [0, 25, 50, 75, 100]
 
 private func movesFromWaveform(_ modifiers: NSEvent.ModifierFlags) -> Bool {
     modifiers.contains([.command, .option]) && !modifiers.contains(.control)
@@ -270,21 +271,83 @@ private final class CaptureLamp: NSView {
     }
 }
 
+private final class CaptureBackground: NSView {
+    weak var waveform: NSView?
+    var backgroundOpacity: CGFloat = 1 { didSet { needsDisplay = true } }
+
+    override func layout() {
+        super.layout()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        NSColor.clear.setFill()
+        NSRectFillUsingOperation(dirtyRect, .copy)
+        guard backgroundOpacity > 0 else { return }
+        let fill = NSBezierPath(rect: bounds)
+        let waveShape = waveform.map { NSBezierPath(roundedRect: convert($0.bounds, from: $0), xRadius: 6, yRadius: 6) }
+        if let waveShape {
+            fill.append(waveShape)
+            fill.windingRule = .evenOdd
+        }
+        NSColor.windowBackgroundColor.withAlphaComponent(backgroundOpacity).setFill()
+        fill.fill()
+        if let waveShape {
+            NSColor(calibratedRed: 0.07, green: 0.09, blue: 0.12, alpha: backgroundOpacity).setFill()
+            waveShape.fill()
+        }
+    }
+}
+
+private enum MeterMode: UInt32, CaseIterable {
+    case dbfs, vu, lufs
+
+    var label: String {
+        switch self {
+        case .dbfs: "dBFS"
+        case .vu: "VU"
+        case .lufs: "LUFS"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .dbfs: "峰值電平"
+        case .vu: "VU 電平"
+        case .lufs: "瞬時響度"
+        }
+    }
+
+    func value(from readings: BtMeterReadings) -> Float {
+        switch self {
+        case .dbfs: readings.peak_dbfs
+        case .vu: readings.vu
+        case .lufs: readings.momentary_lufs
+        }
+    }
+}
+
 @MainActor
 private final class BacktrackingController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let defaults = UserDefaults.standard
     private let worker = DispatchQueue(label: "backtracking.wav-export", qos: .userInitiated)
     private var tap: SystemAudioTap?
     private var panel: CapturePanel?
+    private var background: CaptureBackground?
     private var waveform: WaveformView?
     private var timer: Timer?
     private let captureButton = NSButton(title: "", target: nil, action: nil)
     private let captureLamp = CaptureLamp(frame: .zero)
+    private let clearButton = NSButton(title: "清除目前錄音", target: nil, action: nil)
+    private let meterButton = NSButton(title: "— dBFS", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
     private var history: UInt32 = 20
-    private var idleSeconds: UInt32 = 0
+    private var idleSeconds: UInt32 = 10
+    private var transparency: UInt32 = 0
+    private var meterMode: MeterMode = .dbfs
     private var paused = true
-    private var captureFailed = false
+    private var captureError: String?
     private var editing = false
     private var lastClick = ProcessInfo.processInfo.systemUptime
     private var notice: String?
@@ -295,9 +358,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if let matching = timeChoices.first(where: { Int($0) == storedHistory }) {
             history = matching
         }
-        let storedIdle = defaults.integer(forKey: "idleSeconds")
-        if let matching = timeChoices.first(where: { Int($0) == storedIdle }) {
-            idleSeconds = matching
+        if let storedIdle = defaults.object(forKey: "idleSeconds") as? NSNumber,
+           let seconds = UInt32(exactly: storedIdle.intValue), seconds == 0 || timeChoices.contains(seconds) {
+            idleSeconds = seconds
+        }
+        if let saved = UInt32(exactly: defaults.integer(forKey: "backgroundTransparency")), transparencyChoices.contains(saved) {
+            transparency = saved
+        }
+        if let saved = UInt32(exactly: defaults.integer(forKey: "meterMode")), let mode = MeterMode(rawValue: saved) {
+            meterMode = mode
         }
         output = defaults.string(forKey: "outputDirectory") ??
             FileManager.default.homeDirectoryForCurrentUser
@@ -340,7 +409,6 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         window.title = "Backtracking"
         window.contentMinSize = NSSize(width: 560, height: 100)
         window.isMovable = true
-        window.hasShadow = true
         window.delegate = self
         window.becomesKeyOnlyIfNeeded = true
         window.isFloatingPanel = true
@@ -362,6 +430,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         captureButton.bezelStyle = .rounded
         captureLamp.setAccessibilityElement(true)
         captureLamp.setAccessibilityRole(.staticText)
+        clearButton.target = self
+        clearButton.action = #selector(clearCapture)
+        clearButton.bezelStyle = .rounded
+        setIcon("trash", label: "清除目前錄音", on: clearButton)
+        clearButton.toolTip = "清除目前錄音，保留已匯出的 WAV"
+        meterButton.target = self
+        meterButton.action = #selector(showMeterOptions(_:))
+        meterButton.bezelStyle = .rounded
+        meterButton.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        meterButton.widthAnchor.constraint(equalToConstant: 88).isActive = true
 
         let pinButton = NSButton(title: "置頂", target: self, action: #selector(pinChanged(_:)))
         pinButton.setButtonType(.pushOnPushOff)
@@ -373,7 +451,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         setIcon("gearshape", label: "設定", on: settingsButton)
         let spacer = NSView(frame: .zero)
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let controls = NSStackView(views: [captureButton, captureLamp, statusLabel, spacer, pinButton, settingsButton])
+        let controls = NSStackView(views: [captureButton, captureLamp, clearButton, statusLabel, spacer, pinButton, meterButton, settingsButton])
         controls.orientation = .horizontal
         controls.spacing = 6
         controls.alignment = .centerY
@@ -386,7 +464,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 6
-        guard let content = window.contentView else { return }
+        let content = CaptureBackground(frame: window.contentView?.bounds ?? .zero)
+        content.waveform = waveform
+        window.contentView = content
+        background = content
         window.trackChrome(in: content)
         content.addSubview(stack)
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -399,6 +480,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             waveform.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
         panel = window
+        updateBackground()
         if !window.setFrameUsingName("Backtracking.Panel") {
             window.center()
         }
@@ -415,19 +497,46 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     @objc private func showSettings(_ sender: NSButton) {
         let menu = NSMenu(title: "設定")
-        menu.addItem(timeMenu(
+        menu.addItem(choiceMenu(
             title: "保留時間", choices: timeChoices, selected: history,
             action: #selector(historyChanged(_:))
-        ))
-        menu.addItem(timeMenu(
+        ) { "\($0) 秒" })
+        menu.addItem(choiceMenu(
             title: "自動續錄", choices: [0] + timeChoices, selected: idleSeconds,
             action: #selector(idleChanged(_:))
-        ))
+        ) { $0 == 0 ? "手動" : "\($0) 秒" })
+        menu.addItem(choiceMenu(
+            title: "背景透明度", choices: transparencyChoices, selected: transparency,
+            action: #selector(transparencyChanged(_:))
+        ) { "\($0)%" })
+        let meterItem = NSMenuItem(title: "電平顯示", action: nil, keyEquivalent: "")
+        meterItem.submenu = meterMenu()
+        menu.addItem(meterItem)
         let outputItem = NSMenuItem(title: "專案資料夾…", action: #selector(chooseOutput), keyEquivalent: "")
         outputItem.target = self
         menu.addItem(outputItem)
         menu.addItem(.separator())
         menu.addItem(quitItem())
+        showMenu(menu, below: sender)
+    }
+
+    @objc private func showMeterOptions(_ sender: NSButton) {
+        showMenu(meterMenu(), below: sender)
+    }
+
+    private func meterMenu() -> NSMenu {
+        let menu = NSMenu(title: "電平顯示")
+        for mode in MeterMode.allCases {
+            let item = NSMenuItem(title: mode.label, action: #selector(meterChanged(_:)), keyEquivalent: "")
+            item.tag = Int(mode.rawValue)
+            item.target = self
+            item.state = mode == meterMode ? .on : .off
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    private func showMenu(_ menu: NSMenu, below sender: NSButton) {
         let below = sender.isFlipped ? sender.bounds.maxY + 3 : sender.bounds.minY - 3
         _ = menu.popUp(positioning: nil, at: NSPoint(x: sender.bounds.minX, y: below), in: sender)
     }
@@ -438,14 +547,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         return item
     }
 
-    private func timeMenu(title: String, choices: [UInt32], selected: UInt32, action: Selector) -> NSMenuItem {
+    private func choiceMenu(title: String, choices: [UInt32], selected: UInt32, action: Selector, label: (UInt32) -> String) -> NSMenuItem {
         let section = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         let submenu = NSMenu(title: title)
-        for seconds in choices {
-            let item = NSMenuItem(title: seconds == 0 ? "手動" : "\(seconds) 秒", action: action, keyEquivalent: "")
-            item.tag = Int(seconds)
+        for choice in choices {
+            let item = NSMenuItem(title: label(choice), action: action, keyEquivalent: "")
+            item.tag = Int(choice)
             item.target = self
-            item.state = seconds == selected ? .on : .off
+            item.state = choice == selected ? .on : .off
             submenu.addItem(item)
         }
         section.submenu = submenu
@@ -470,6 +579,44 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         idleSeconds = selected
         defaults.set(Int(idleSeconds), forKey: "idleSeconds")
         registerClick()
+    }
+
+    @objc private func transparencyChanged(_ sender: NSMenuItem) {
+        guard let selected = UInt32(exactly: sender.tag), transparencyChoices.contains(selected) else { return }
+        transparency = selected
+        defaults.set(Int(selected), forKey: "backgroundTransparency")
+        registerClick()
+        updateBackground()
+    }
+
+    private func updateBackground() {
+        panel?.isOpaque = false
+        panel?.backgroundColor = .clear
+        // An explicit setting gives the clear window the same input region as the opaque one.
+        panel?.ignoresMouseEvents = false
+        panel?.hasShadow = transparency < 100
+        background?.backgroundOpacity = 1 - CGFloat(transparency) / 100
+    }
+
+    @objc private func meterChanged(_ sender: NSMenuItem) {
+        guard let raw = UInt32(exactly: sender.tag), let mode = MeterMode(rawValue: raw) else { return }
+        meterMode = mode
+        defaults.set(Int(raw), forKey: "meterMode")
+        registerClick()
+        updateMeter()
+    }
+
+    private func updateMeter() {
+        let core = tap?.core
+        let reading = core.map { meterMode.value(from: bt_meter_readings($0)) } ?? -Float.infinity
+        let value = reading.isFinite ? String(format: "%.1f", Double(reading)) : "—"
+        let title = "\(value) \(meterMode.label)"
+        if meterButton.title != title || meterButton.toolTip == nil {
+            meterButton.title = title
+            meterButton.setAccessibilityLabel("\(title)，點擊切換單位")
+        }
+        let detail = "\(meterMode.detail) · 點擊切換單位"
+        if meterButton.toolTip != detail { meterButton.toolTip = detail }
     }
 
     @objc private func pinChanged(_ sender: NSButton) {
@@ -523,13 +670,23 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if paused { resume() } else { pauseCapture() }
     }
 
+    @objc private func clearCapture() {
+        guard !editing, let core = tap?.core else { return }
+        registerClick()
+        bt_clear(core)
+        waveform?.clearSelection()
+        refreshWaveform()
+        notice = nil
+        updateStatus()
+    }
+
     private func pauseCapture() {
         if !paused {
             do {
                 try tap?.pause()
             } catch {
-                captureFailed = true
-                notice = error.localizedDescription
+                captureError = error.localizedDescription
+                notice = nil
             }
             paused = true
             refreshWaveform()
@@ -546,13 +703,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             try tap?.resume()
             waveform?.clearSelection()
             paused = false
-            captureFailed = false
+            captureError = nil
             notice = nil
         } catch {
             // The callback gate is still closed after a failed start. Let the user retry.
             paused = true
-            captureFailed = true
-            notice = error.localizedDescription
+            captureError = error.localizedDescription
+            notice = nil
         }
         updateStatus()
     }
@@ -578,7 +735,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     private func updateStatus() {
         let state: CaptureLamp.State
-        if tap == nil || captureFailed {
+        if tap == nil || captureError != nil {
             state = .unavailable
         } else if paused {
             state = .paused
@@ -592,6 +749,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             setIcon(paused ? "play.fill" : "pause.fill", label: label, on: captureButton)
         }
         captureButton.isEnabled = !editing
+        clearButton.isEnabled = tap?.core != nil && !editing
+        updateMeter()
 
         let now = ProcessInfo.processInfo.systemUptime
         var detail = state.label
@@ -601,10 +760,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             detail += " · \(remaining) 秒後續錄"
         }
         captureLamp.update(state, now: now, detail: detail)
-        let message = notice ?? ""
+        let message = notice ?? captureError ?? ""
         if statusLabel.stringValue != message {
             statusLabel.stringValue = message
-            statusLabel.toolTip = notice
+            statusLabel.toolTip = message.isEmpty ? nil : message
             statusLabel.isHidden = message.isEmpty
         }
     }
@@ -614,10 +773,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         updateStatus()
     }
 
-    func export(_ range: ClosedRange<Double>, completion: @escaping (URL?) -> Void) {
+    func export(_ range: ClosedRange<Double>, completion: @escaping (URL?) -> Bool) {
         guard paused, let core = tap?.core, let snapshot = bt_snapshot(core) else {
-            setNotice("還沒有可匯出的錄音")
-            completion(nil)
+            if completion(nil) { setNotice("還沒有可匯出的錄音") }
             return
         }
         let job = WAVExport(snapshot)
@@ -626,12 +784,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         worker.async { [weak self] in
             let url = job.write(range: range, directory: directory)
             DispatchQueue.main.async {
+                guard completion(url) else { return }
                 if let url {
                     self?.setNotice("已存入 \(url.lastPathComponent)")
                 } else {
                     self?.setNotice("無法匯出 WAV，請確認有錄音及資料夾寫入權限")
                 }
-                completion(url)
             }
         }
     }
@@ -809,11 +967,12 @@ private final class WaveformView: NSView, NSDraggingSource {
         preparingFile = true
         let version = exportVersion
         controller?.export(range) { [weak self] url in
-            guard let self, self.exportVersion == version else { return }
+            guard let self, self.exportVersion == version else { return false }
             self.preparingFile = false
             self.readyFile = url
             self.needsDisplay = true
             self.tryStartDrag()
+            return true
         }
     }
 
@@ -900,8 +1059,6 @@ private final class WaveformView: NSView, NSDraggingSource {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         let panel = NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6)
-        NSColor(calibratedRed: 0.07, green: 0.09, blue: 0.12, alpha: 1).setFill()
-        panel.fill()
         NSGraphicsContext.saveGraphicsState()
         panel.addClip()
         let middle = bounds.midY

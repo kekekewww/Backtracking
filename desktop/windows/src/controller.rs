@@ -1,4 +1,4 @@
-use backtracking_core::{Capture, CaptureState, DurationChoice, Snapshot};
+use backtracking_core::{Capture, CaptureState, DurationChoice, MeterReadings, Snapshot};
 
 use crate::loopback::Loopback;
 
@@ -124,6 +124,20 @@ impl Controller {
 
     pub(crate) fn snapshot(&self) -> Option<Snapshot> {
         self.capture.as_ref().map(Capture::snapshot)
+    }
+
+    pub(crate) fn meter_readings(&self) -> Option<MeterReadings> {
+        self.capture.as_ref().map(Capture::meter_readings)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        if let Some(loopback) = &self.loopback {
+            loopback.queue.discard_pending();
+        }
+        if let Some(capture) = &mut self.capture {
+            capture.clear();
+            self.revision = self.revision.wrapping_add(1);
+        }
     }
 
     pub(crate) fn waveform(&self, minimum: &mut [f32], maximum: &mut [f32]) -> (usize, u32) {

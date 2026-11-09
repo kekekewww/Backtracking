@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use backtracking_core::{AudioQueue, Capture, CaptureState, DurationChoice, Snapshot};
+use backtracking_core::{
+    AudioQueue, Capture, CaptureState, DurationChoice, MeterReadings, Snapshot,
+};
 
 #[derive(Clone)]
 pub(crate) struct SessionSettings {
@@ -33,19 +35,22 @@ struct WaveformCache {
 }
 
 impl Consumer {
-    fn drain(&mut self, keep: bool, max_blocks: usize) {
+    fn has_fresh_input(&self) -> bool {
+        self.last_input
+            .is_some_and(|last| last.elapsed() < self.input_timeout)
+    }
+
+    fn drain(&mut self, max_blocks: usize) {
         let mut received_input = false;
         for _ in 0..max_blocks {
             let frames = self.queue.pop_interleaved(&mut self.scratch);
             if frames == 0 {
                 break;
             }
-            if keep {
-                received_input = true;
-                let _ = self
-                    .capture
-                    .push_interleaved(&self.scratch[..frames * self.channels]);
-            }
+            received_input = true;
+            let _ = self
+                .capture
+                .push_interleaved(&self.scratch[..frames * self.channels]);
         }
         if received_input {
             self.last_input = Some(Instant::now());
@@ -96,7 +101,7 @@ impl Session {
             state: Mutex::new(State {
                 settings: SessionSettings {
                     retention: DurationChoice::Seconds20,
-                    idle_resume: None,
+                    idle_resume: Some(DurationChoice::Seconds10),
                     output_dir: home.join("Backtracking").join("output"),
                 },
                 consumer: None,
@@ -144,10 +149,14 @@ impl Session {
         if state.paused {
             return;
         }
-        self.accepting.store(false, Ordering::SeqCst);
+        let was_accepting = self.accepting.swap(false, Ordering::SeqCst);
         if let Some(consumer) = &mut state.consumer {
-            // Bring the snapshot up to date with the audio already published by the producer.
-            consumer.drain(true, usize::MAX);
+            if was_accepting {
+                // Bring the snapshot up to date with audio already published by the producer.
+                consumer.drain(usize::MAX);
+            } else {
+                consumer.queue.discard_pending();
+            }
             consumer.capture.pause();
         }
         state.paused = true;
@@ -155,6 +164,19 @@ impl Session {
 
     pub(crate) fn resume(&self) {
         Self::resume_locked(&mut self.lock());
+    }
+
+    pub(crate) fn clear(&self) {
+        let mut state = self.lock();
+        state.last_interaction = Instant::now();
+        self.accepting.store(false, Ordering::SeqCst);
+        if let Some(consumer) = &mut state.consumer {
+            // Discard audio published before the clear. The worker re-arms only after any
+            // in-flight producer has also finished and its remaining frames are discarded.
+            consumer.queue.discard_pending();
+            consumer.capture.clear();
+            consumer.last_input = None;
+        }
     }
 
     fn resume_locked(state: &mut State) {
@@ -201,10 +223,19 @@ impl Session {
         let state = self.lock();
         state.consumer.as_ref().is_some_and(|consumer| {
             matches!(consumer.capture.state(), CaptureState::Recording)
-                && consumer
-                    .last_input
-                    .is_some_and(|last| last.elapsed() < consumer.input_timeout)
+                && consumer.has_fresh_input()
         })
+    }
+
+    pub(crate) fn meter_readings(&self) -> MeterReadings {
+        let state = self.lock();
+        state
+            .consumer
+            .as_ref()
+            .filter(|consumer| !state.paused && consumer.has_fresh_input())
+            .map_or_else(MeterReadings::default, |consumer| {
+                consumer.capture.meter_readings()
+            })
     }
 
     pub(crate) fn dropped_frames(&self) -> usize {
@@ -227,12 +258,16 @@ impl Session {
             return;
         };
         let accepting = self.accepting.load(Ordering::SeqCst);
-        // Yield the session lock regularly even when a DAW renders ahead faster than realtime.
-        consumer.drain(accepting && !paused, 8);
+        if accepting && !paused {
+            // Yield the session lock regularly even when a DAW renders ahead of realtime.
+            consumer.drain(8);
+        } else {
+            consumer.queue.discard_pending();
+        }
         if !accepting && !paused && !self.writer_active.load(Ordering::SeqCst) {
             // A callback may have started just before Pause. Clear anything it published after
             // the frozen snapshot before accepting input again.
-            consumer.drain(false, usize::MAX);
+            consumer.queue.discard_pending();
             self.accepting.store(true, Ordering::SeqCst);
         }
     }
@@ -356,6 +391,52 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_instances_default_to_ten_second_idle_resume() {
+        assert_eq!(
+            Session::new().settings().idle_resume,
+            Some(DurationChoice::Seconds10)
+        );
+    }
+
+    #[test]
+    fn clear_discards_pending_and_retained_audio_without_changing_pause_state() {
+        let session = Arc::new(Session::new());
+        let worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
+        worker.push(&[&mut [0.25; 32]]);
+        session.consume();
+        assert!(!session.snapshot().unwrap().samples.is_empty());
+
+        worker.push(&[&mut [0.5; 32]]);
+        session.clear();
+        session.consume();
+        assert!(!session.is_paused());
+        assert!(session.snapshot().unwrap().samples.is_empty());
+
+        worker.push(&[&mut [0.75; 32]]);
+        session.pause();
+        assert_eq!(session.snapshot().unwrap().samples, vec![0.75; 32]);
+        session.clear();
+        assert!(session.is_paused());
+        assert!(session.snapshot().unwrap().samples.is_empty());
+    }
+
+    #[test]
+    fn clear_followed_by_pause_cannot_restore_an_in_flight_block() {
+        let session = Arc::new(Session::new());
+        let worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
+
+        session.writer_active.store(true, Ordering::SeqCst);
+        session.clear();
+        // Model a callback that observed the old accepting flag but published after Clear.
+        assert_eq!(worker.queue.push_planar(&[0.5; 32], None), 32);
+        session.pause();
+        session.writer_active.store(false, Ordering::SeqCst);
+
+        assert!(session.is_paused());
+        assert!(session.snapshot().unwrap().samples.is_empty());
+    }
 
     #[test]
     fn pauses_without_recording_later_audio_and_appends_after_resuming() {

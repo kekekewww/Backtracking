@@ -6,6 +6,12 @@
 typedef struct BtCore BtCore;
 typedef struct BtSnapshot BtSnapshot;
 
+typedef struct BtMeterReadings {
+    float peak_dbfs;
+    float vu;
+    float momentary_lufs;
+} BtMeterReadings;
+
 // Call controls and bt_poll on one thread, and push from exactly one audio
 // producer. The input arrays must contain the requested number of frames.
 // Stop and join the producer before rearming after a pause, changing devices,
@@ -17,6 +23,10 @@ uint32_t bt_push_planar_stereo(const BtCore *core, const float *left, const floa
 void bt_poll(const BtCore *core);
 void bt_pause(const BtCore *core);
 void bt_resume(const BtCore *core);
+// Discard history, pre-roll and already published audio. Preserve armed/paused mode.
+void bt_clear(const BtCore *core);
+// Unavailable readings (including pause) are negative infinity.
+BtMeterReadings bt_meter_readings(const BtCore *core);
 int32_t bt_set_history(const BtCore *core, uint32_t seconds);
 uint32_t bt_state(const BtCore *core);
 uint64_t bt_revision(const BtCore *core);

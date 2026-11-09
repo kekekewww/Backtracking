@@ -19,7 +19,9 @@ Backtracking 是給作曲與混音用的回溯錄音取樣器。聽到想留下�
 3. 未框選時，在波形任意位置點擊可存下整段保留音訊，按住拖曳可把整段 WAV 送入 DAW。若只需其中一段，Windows 用 `Ctrl`、macOS 用 `Option` 加拖曳可框選起訖點，再點擊或拖出選取區。
 4. 用工具列的 **Play／Pause** 圖示手動啟用或暫停錄音。紅燈閃爍時正在收錄。操作波形也會暫停錄音，完成後可按 **Play** 或等待已設定的自動續錄。
 
-點擊工具列的齒輪，可調整保留時間、自動續錄與專案資料夾。Windows 和 macOS 桌面版採用無邊框視窗，可直接在工具列切換置頂，或從齒輪選單結束程式。
+齒輪旁的即時音量表可顯示 **dBFS、VU 或瞬時 LUFS**。齒輪選單可調整保留時間、自動續錄、背景透明度、音量表單位與專案資料夾。自動續錄的初始設定是 **10 秒**。清除錄音只會清空記憶體中的擷取內容。
+
+Windows 和 macOS 桌面版採用無邊框視窗，可直接在工具列切換置頂，或從齒輪選單結束程式。
 
 匯出為 **48 kHz、32-bit float WAV**。指定專案資料夾後，檔案會存到它的 `output/` 子目錄。
 
@@ -42,7 +44,9 @@ Backtracking is a retrospective audio sampler for music production and mixing. W
 3. With no selection, click anywhere on the waveform to save all retained audio, or hold and drag to drop the full WAV into your DAW. For a shorter clip, hold `Ctrl` on Windows or `Option` on macOS while dragging to select a range, then click or drag out that selection.
 4. Use the toolbar's **Play/Pause** control to arm or pause capture. A blinking red indicator means audio is being recorded. Working with the waveform also pauses capture. Press **Play** when done or let the configured auto-resume timer re-arm capture.
 
-Click the gear in the toolbar to set the history length, auto-resume delay, and project folder. The Windows and macOS desktop apps use a frameless window. Use **Keep on top** in the toolbar or **Quit** in the gear menu.
+The live meter next to the gear can show **dBFS, VU, or momentary LUFS**. Open the gear menu to set the history length, auto-resume delay, background transparency, meter unit, and project folder. Auto-resume defaults to **10 seconds**. The clear action empties the audio held in memory.
+
+The Windows and macOS desktop apps use a frameless window. Use **Keep on top** in the toolbar or **Quit** in the gear menu.
 
 Exports are **48 kHz, 32-bit float WAV** files. After you choose a project folder, files go into its `output/` subfolder.
 

@@ -1,4 +1,7 @@
+use std::time::Instant;
 use std::{error::Error, fmt, ops::Range};
+
+use crate::meter::{Meter, MeterReadings};
 
 const OPEN_LEVEL: f32 = 0.001;
 const CLOSE_LEVEL: f32 = 0.000_5;
@@ -85,6 +88,7 @@ pub struct Capture {
     quiet_frames: usize,
     state: CaptureState,
     revision: u64,
+    meter: Meter,
 }
 
 impl Capture {
@@ -116,6 +120,7 @@ impl Capture {
             quiet_frames: 0,
             state: CaptureState::Waiting,
             revision: 0,
+            meter: Meter::new(sample_rate, channels)?,
         })
     }
 
@@ -124,15 +129,14 @@ impl Capture {
         if !frames.remainder().is_empty() {
             return Err(CaptureError::IncompleteFrame);
         }
-        if self.state == CaptureState::Paused {
+        if self.state == CaptureState::Paused || samples.is_empty() {
             return Ok(());
         }
 
+        self.meter.begin_block(Instant::now());
         let mut changed = false;
         for frame in frames {
-            let peak = frame
-                .iter()
-                .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+            let peak = self.meter.push_frame(frame);
 
             if self.state == CaptureState::Waiting {
                 if peak < OPEN_LEVEL {
@@ -169,6 +173,7 @@ impl Capture {
         if changed {
             self.revision = self.revision.wrapping_add(1);
         }
+        self.meter.end_block(Instant::now());
         Ok(())
     }
 
@@ -176,6 +181,7 @@ impl Capture {
         self.state = CaptureState::Paused;
         self.quiet_frames = 0;
         self.pre_roll.clear();
+        self.meter.reset();
     }
 
     pub fn resume(&mut self) {
@@ -186,6 +192,10 @@ impl Capture {
 
     pub fn state(&self) -> CaptureState {
         self.state
+    }
+
+    pub fn meter_readings(&self) -> MeterReadings {
+        self.meter.readings(Instant::now())
     }
 
     /// Changes whenever the retained samples change.
@@ -253,6 +263,7 @@ impl Capture {
         self.history.truncate_to(self.retention_frames);
     }
 
+    /// Drops retained audio and pre-roll. An armed capture waits for fresh signal.
     pub fn clear(&mut self) {
         if self.history.len_frames != 0 {
             self.revision = self.revision.wrapping_add(1);
@@ -260,7 +271,8 @@ impl Capture {
         self.history.clear();
         self.pre_roll.clear();
         self.quiet_frames = 0;
-        if self.state != CaptureState::Paused {
+        self.meter.reset();
+        if self.state == CaptureState::Recording {
             self.state = CaptureState::Waiting;
         }
     }
@@ -438,5 +450,32 @@ mod tests {
         assert_eq!(capture.waveform(&mut minimum, &mut maximum), 0);
         assert_eq!(minimum, [0.0; 3]);
         assert_eq!(maximum, [0.0; 3]);
+    }
+
+    #[test]
+    fn clear_discards_pre_roll_and_waits_for_fresh_signal() {
+        let mut capture = Capture::new(1_000, 1, DurationChoice::Seconds10).unwrap();
+        capture.push_interleaved(&[0.000_25; 40]).unwrap();
+        assert!(capture.meter_readings().peak_dbfs.is_finite());
+        assert_eq!(capture.state(), CaptureState::Waiting);
+        capture.clear();
+        assert_eq!(capture.state(), CaptureState::Waiting);
+        capture.push_interleaved(&[0.5]).unwrap();
+        assert_eq!(capture.snapshot().samples, [0.5]);
+
+        let old_revision = capture.revision();
+        capture.clear();
+        assert_eq!(capture.state(), CaptureState::Waiting);
+        assert_eq!(capture.meter_readings(), MeterReadings::default());
+        assert_ne!(capture.revision(), old_revision);
+        assert_eq!(capture.snapshot().frame_count(), 0);
+        capture.push_interleaved(&[0.0; 150]).unwrap();
+        assert_eq!(capture.snapshot().frame_count(), 0);
+        capture.push_interleaved(&[0.25]).unwrap();
+        assert_eq!(capture.state(), CaptureState::Recording);
+        assert!(capture.meter_readings().peak_dbfs.is_finite());
+        capture.pause();
+        capture.push_interleaved(&[1.0; 200]).unwrap();
+        assert_eq!(capture.meter_readings(), MeterReadings::default());
     }
 }

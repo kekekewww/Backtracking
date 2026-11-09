@@ -88,6 +88,13 @@ impl AudioQueue {
         self.read.store(read.wrapping_add(count), Ordering::Release);
         count
     }
+
+    /// Drops all published frames without copying them. Call only from the
+    /// designated consumer. A producer block published later remains queued.
+    pub fn discard_pending(&self) {
+        let write = self.write.load(Ordering::Acquire);
+        self.read.store(write, Ordering::Release);
+    }
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use backtracking_core::{DurationChoice, Snapshot, export_wav, waveform};
+use backtracking_core::{DurationChoice, MeterReadings, Snapshot, export_wav, waveform};
 use egui::{Color32, CursorIcon, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
 use nice_plug::context::gui::GuiContext;
 use nice_plug_egui::baseview::dpi::LogicalSize;
@@ -26,6 +26,7 @@ const DURATIONS: [DurationChoice; 3] = [
     DurationChoice::Seconds30,
 ];
 const MINT: Color32 = Color32::from_rgb(103, 231, 181);
+const TRANSPARENCY_LEVELS: [u8; 5] = [0, 25, 50, 75, 100];
 
 pub type CaptureEditor = EguiEditor<CaptureUi>;
 
@@ -41,6 +42,8 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
             seconds: 0.0,
             next_refresh: Instant::now(),
             recording_since: None,
+            panel_transparency: 0,
+            meter_mode: MeterMode::Dbfs,
             frozen: None,
             selection: None,
             gesture: None,
@@ -61,6 +64,8 @@ pub struct CaptureUi {
     seconds: f32,
     next_refresh: Instant,
     recording_since: Option<Instant>,
+    panel_transparency: u8,
+    meter_mode: MeterMode,
     frozen: Option<Arc<Snapshot>>,
     selection: Option<Range<f32>>,
     gesture: Option<Gesture>,
@@ -75,6 +80,33 @@ pub struct CaptureUi {
 enum Gesture {
     Select { anchor: f32, current: f32 },
     Drag { origin: Pos2 },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MeterMode {
+    Dbfs,
+    Vu,
+    Lufs,
+}
+
+impl MeterMode {
+    const ALL: [Self; 3] = [Self::Dbfs, Self::Vu, Self::Lufs];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dbfs => "dBFS",
+            Self::Vu => "VU",
+            Self::Lufs => "LUFS",
+        }
+    }
+
+    fn reading(self, readings: MeterReadings) -> f32 {
+        match self {
+            Self::Dbfs => readings.peak_dbfs,
+            Self::Vu => readings.vu,
+            Self::Lufs => readings.momentary_lufs,
+        }
+    }
 }
 
 struct ExportJob {
@@ -127,8 +159,13 @@ impl NiceEguiApp for CaptureUi {
                     ui.ctx().request_repaint();
                 }
                 self.recording_indicator(ui, paused);
+                if clear_button(ui, can_toggle && self.seconds > 0.0).clicked() {
+                    self.clear_capture();
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.settings_menu(ui, frame, &mut settings, paused)
+                    let open = self.settings_menu(ui, frame, &mut settings, paused);
+                    self.meter_readout(ui);
+                    open
                 })
                 .inner
             })
@@ -194,6 +231,26 @@ impl Drop for CaptureUi {
 }
 
 impl CaptureUi {
+    fn meter_readout(&self, ui: &mut egui::Ui) {
+        let mode = self.meter_mode;
+        let value = mode.reading(self.session.meter_readings());
+        let text = if value.is_finite() {
+            format!("{value:.1} {}", mode.label())
+        } else {
+            format!("— {}", mode.label())
+        };
+        let description = match mode {
+            MeterMode::Dbfs => "Sample peak level",
+            MeterMode::Vu => "Volume units",
+            MeterMode::Lufs => "Momentary loudness (400 ms)",
+        };
+        ui.add_sized(
+            [90.0, 25.0],
+            egui::Label::new(egui::RichText::new(text).monospace()).truncate(),
+        )
+        .on_hover_text(description);
+    }
+
     fn recording_indicator(&mut self, ui: &mut egui::Ui, paused: bool) {
         let (status, color) = if !paused && self.session.is_recording() {
             let started = self.recording_since.get_or_insert_with(Instant::now);
@@ -245,6 +302,26 @@ impl CaptureUi {
                                 duration,
                                 format!("{} s", duration.seconds()),
                             );
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Panel transparency").on_hover_text(
+                        "Fades the plugin's panel fill. The DAW may keep the editor background opaque.",
+                    );
+                    ui.horizontal(|ui| {
+                        for percent in TRANSPARENCY_LEVELS {
+                            ui.selectable_value(
+                                &mut self.panel_transparency,
+                                percent,
+                                format!("{percent}%"),
+                            );
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Meter");
+                    ui.horizontal(|ui| {
+                        for mode in MeterMode::ALL {
+                            ui.selectable_value(&mut self.meter_mode, mode, mode.label());
                         }
                     });
                     ui.end_row();
@@ -333,6 +410,16 @@ impl CaptureUi {
         }
     }
 
+    fn clear_capture(&mut self) {
+        self.session.clear();
+        self.reset_frozen();
+        self.minimum.fill(0.0);
+        self.maximum.fill(0.0);
+        self.seconds = 0.0;
+        self.recording_since = None;
+        self.message.clear();
+    }
+
     fn reset_frozen(&mut self) {
         self.frozen = None;
         self.selection = None;
@@ -354,7 +441,12 @@ impl CaptureUi {
 
     fn draw_waveform(&self, ui: &egui::Ui, rect: Rect, seconds: f32, allow_hover: bool) {
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 6.0, Color32::from_rgb(22, 26, 29));
+        let opacity = ((100 - u16::from(self.panel_transparency)) * 255 / 100) as u8;
+        painter.rect_filled(
+            rect,
+            6.0,
+            Color32::from_rgba_unmultiplied(22, 26, 29, opacity),
+        );
         let inner = rect.shrink(8.0);
         let middle = inner.center().y;
         let extent = inner.height() * 0.47;
@@ -589,15 +681,16 @@ impl CaptureUi {
         let Some(job) = self.export.take() else {
             return;
         };
-        match job.worker.join() {
-            Ok(Ok(path)) => {
-                self.message = format!("Saved {}", path.display());
-                if job.revision == self.revision {
+        let result = job.worker.join();
+        if job.revision == self.revision {
+            match result {
+                Ok(Ok(path)) => {
+                    self.message = format!("Saved {}", path.display());
                     self.exported = Some(path);
                 }
+                Ok(Err(error)) => self.message = format!("Could not save WAV: {error}"),
+                Err(_) => self.message = "WAV export worker stopped unexpectedly.".into(),
             }
-            Ok(Err(error)) => self.message = format!("Could not save WAV: {error}"),
-            Err(_) => self.message = "WAV export worker stopped unexpectedly.".into(),
         }
         if std::mem::take(&mut self.export_requested) {
             self.begin_export();
@@ -695,6 +788,30 @@ fn settings_button(ui: &mut egui::Ui) -> egui::Response {
     ui.painter().add(egui::Shape::closed_line(outline, stroke));
     ui.painter().circle_stroke(center, 2.1, stroke);
     response.on_hover_text("Settings")
+}
+
+fn clear_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
+    let response = ui.add_enabled(enabled, egui::Button::new("").min_size(Vec2::splat(25.0)));
+    let label = "Clear captured audio";
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
+    let center = response.rect.center();
+    let stroke = ui.style().interact(&response).fg_stroke;
+    let painter = ui.painter();
+    painter.rect_stroke(
+        Rect::from_center_size(center + Vec2::new(0.0, 2.0), Vec2::new(9.0, 10.0)),
+        1.2,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    painter.hline(center.x - 6.0..=center.x + 6.0, center.y - 4.0, stroke);
+    painter.line_segment(
+        [
+            center + Vec2::new(-2.2, -6.2),
+            center + Vec2::new(2.2, -6.2),
+        ],
+        stroke,
+    );
+    response.on_hover_text(label)
 }
 
 fn position_in_audio(rect: Rect, x: f32) -> f32 {

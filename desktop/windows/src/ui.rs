@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use backtracking_core::{DurationChoice, Snapshot, export_wav, waveform};
+use backtracking_core::{DurationChoice, MeterReadings, Snapshot, export_wav, waveform};
 use eframe::egui::{
     self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection, Stroke, Vec2,
     ViewportCommand,
@@ -20,6 +20,7 @@ const DURATIONS: [DurationChoice; 3] = [
     DurationChoice::Seconds20,
     DurationChoice::Seconds30,
 ];
+const TRANSPARENCIES: [u8; 5] = [0, 25, 50, 75, 100];
 const MINT: Color32 = Color32::from_rgb(103, 231, 181);
 const RECORDING_LIT: Color32 = Color32::from_rgb(249, 78, 88);
 const RECORDING_DIM: Color32 = Color32::from_rgb(103, 44, 48);
@@ -36,6 +37,8 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
             .with_min_inner_size([510.0, 132.0])
             .with_decorations(false)
             .with_resizable(true)
+            .with_transparent(true)
+            .with_has_shadow(false)
             .with_always_on_top(),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
@@ -69,6 +72,8 @@ struct Recorder {
     output: PathBuf,
     pinned: bool,
     idle_resume: Option<DurationChoice>,
+    transparency: u8,
+    meter_mode: MeterMode,
     last_interaction: Instant,
     recording_started: Option<f64>,
     low: [f32; BINS],
@@ -92,6 +97,41 @@ enum Gesture {
     Export { origin: Pos2 },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MeterMode {
+    Dbfs,
+    Vu,
+    Lufs,
+}
+
+impl MeterMode {
+    const OPTIONS: [Self; 3] = [Self::Dbfs, Self::Vu, Self::Lufs];
+
+    fn unit(self) -> &'static str {
+        match self {
+            Self::Dbfs => "dBFS",
+            Self::Vu => "VU",
+            Self::Lufs => "LUFS",
+        }
+    }
+
+    fn value(self, readings: MeterReadings) -> f32 {
+        match self {
+            Self::Dbfs => readings.peak_dbfs,
+            Self::Vu => readings.vu,
+            Self::Lufs => readings.momentary_lufs,
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Dbfs => "Peak level",
+            Self::Vu => "VU level",
+            Self::Lufs => "Momentary loudness",
+        }
+    }
+}
+
 struct ExportJob {
     revision: u64,
     worker: JoinHandle<io::Result<PathBuf>>,
@@ -106,7 +146,9 @@ impl Recorder {
             controller,
             output: home.join("Backtracking").join("output"),
             pinned: true,
-            idle_resume: None,
+            idle_resume: Some(DurationChoice::Seconds10),
+            transparency: 0,
+            meter_mode: MeterMode::Dbfs,
             last_interaction: Instant::now(),
             recording_started: None,
             low: [0.0; BINS],
@@ -159,6 +201,18 @@ impl Recorder {
         self.invalidate_export();
     }
 
+    fn clear_capture(&mut self) {
+        self.controller.clear();
+        self.clear_snapshot();
+        self.message.clear();
+        self.last_interaction = Instant::now();
+    }
+
+    fn background_color(&self, color: Color32) -> Color32 {
+        let alpha = ((100 - u16::from(self.transparency)) * 255 + 50) / 100;
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha as u8)
+    }
+
     fn invalidate_export(&mut self) {
         self.clip_revision = self.clip_revision.wrapping_add(1);
         self.exported = None;
@@ -184,9 +238,12 @@ impl Recorder {
             ui.heading("Backtracking");
             self.transport_button(ui);
             self.recording_indicator(ui);
+            self.clear_button(ui);
             self.pin_button(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.settings_button(ui, frame)
+                let settings_open = self.settings_button(ui, frame);
+                self.meter_readout(ui);
+                settings_open
             })
             .inner
         })
@@ -257,6 +314,65 @@ impl Recorder {
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Status, true, status));
         response.on_hover_text(status);
         ui.painter().circle_filled(rect.center(), 4.5, color);
+    }
+
+    fn clear_button(&mut self, ui: &mut egui::Ui) {
+        let enabled = self.gesture.is_none();
+        let response = ui.add_enabled(enabled, icon_button());
+        if response.clicked() {
+            self.clear_capture();
+        }
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::Role::Button, enabled, "Clear capture")
+        });
+        let response = response.on_hover_text("Clear capture");
+        let center = response.rect.center();
+        let stroke = Stroke::new(1.3, ui.style().interact(&response).fg_stroke.color);
+        let point = |x, y| center + Vec2::new(x, y);
+        let painter = ui.painter();
+        painter.line_segment([point(-6.0, -4.0), point(6.0, -4.0)], stroke);
+        painter.line_segment([point(-2.0, -6.0), point(2.0, -6.0)], stroke);
+        painter.add(egui::Shape::line(
+            vec![
+                point(-4.4, -4.0),
+                point(-3.8, 6.0),
+                point(3.8, 6.0),
+                point(4.4, -4.0),
+            ],
+            stroke,
+        ));
+        for x in [-1.7, 1.7] {
+            painter.line_segment([point(x, -1.5), point(x, 3.7)], stroke);
+        }
+    }
+
+    fn meter_readout(&self, ui: &mut egui::Ui) {
+        let value = self
+            .controller
+            .meter_readings()
+            .map(|readings| self.meter_mode.value(readings));
+        let number = if let Some(value) = value.filter(|value| value.is_finite()) {
+            if self.meter_mode == MeterMode::Vu {
+                format!("{value:+.1}")
+            } else {
+                format!("{value:.1}")
+            }
+        } else {
+            "—".into()
+        };
+        let text = format!("{number} {}", self.meter_mode.unit());
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(102.0, 24.0), egui::Sense::hover());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Status, true, &text));
+        response.on_hover_text(self.meter_mode.description());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 5.0, ui.visuals().widgets.inactive.bg_fill);
+        painter.text(
+            rect.right_center() - Vec2::new(8.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
+            text,
+            egui::FontId::monospace(12.0),
+            ui.visuals().text_color(),
+        );
     }
 
     fn pin_button(&mut self, ui: &mut egui::Ui) {
@@ -333,39 +449,67 @@ impl Recorder {
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .gap(4.0);
         let was_open = popup.is_open();
+        let settings_height = (ui.ctx().content_rect().height() - 59.0).max(48.0);
         let shown = popup.show(|ui| {
-            ui.set_min_width(222.0);
-            egui::Grid::new("recording-settings")
-                .spacing([10.0, 3.0])
+            ui.set_width(292.0);
+            egui::ScrollArea::vertical()
+                .id_salt("settings-options")
+                .max_height(settings_height)
                 .show(ui, |ui| {
-                    ui.label("History");
-                    ui.horizontal(|ui| {
-                        let mut retention = self.controller.retention();
-                        for value in DURATIONS {
-                            ui.selectable_value(
-                                &mut retention,
-                                value,
-                                format!("{} s", value.seconds()),
-                            );
-                        }
-                        if retention != self.controller.retention() {
-                            self.controller.set_retention(retention);
-                            self.clear_snapshot();
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("Auto-resume");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.idle_resume, None, "Off");
-                        for value in DURATIONS {
-                            ui.selectable_value(
-                                &mut self.idle_resume,
-                                Some(value),
-                                format!("{} s", value.seconds()),
-                            );
-                        }
-                    });
-                    ui.end_row();
+                    ui.spacing_mut().interact_size.y = 15.0;
+                    ui.spacing_mut().button_padding.y = 0.5;
+                    egui::Grid::new("recording-settings")
+                        .spacing([9.0, 1.0])
+                        .show(ui, |ui| {
+                            ui.label("History");
+                            ui.horizontal(|ui| {
+                                let mut retention = self.controller.retention();
+                                for value in DURATIONS {
+                                    ui.selectable_value(
+                                        &mut retention,
+                                        value,
+                                        format!("{} s", value.seconds()),
+                                    );
+                                }
+                                if retention != self.controller.retention() {
+                                    self.controller.set_retention(retention);
+                                    self.clear_snapshot();
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Auto-resume");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut self.idle_resume, None, "Off");
+                                for value in DURATIONS {
+                                    ui.selectable_value(
+                                        &mut self.idle_resume,
+                                        Some(value),
+                                        format!("{} s", value.seconds()),
+                                    );
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Background")
+                                .on_hover_text("Background transparency");
+                            ui.horizontal(|ui| {
+                                for value in TRANSPARENCIES {
+                                    ui.selectable_value(
+                                        &mut self.transparency,
+                                        value,
+                                        format!("{value}%"),
+                                    );
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Meter");
+                            ui.horizontal(|ui| {
+                                for mode in MeterMode::OPTIONS {
+                                    ui.selectable_value(&mut self.meter_mode, mode, mode.unit())
+                                        .on_hover_text(mode.description());
+                                }
+                            });
+                            ui.end_row();
+                        });
                 });
 
             ui.separator();
@@ -458,15 +602,16 @@ impl Recorder {
         let Some(job) = self.export.take() else {
             return;
         };
-        match job.worker.join() {
-            Ok(Ok(path)) => {
-                self.message = format!("Saved {}", path.display());
-                if job.revision == self.clip_revision {
+        let result = job.worker.join();
+        if job.revision == self.clip_revision {
+            match result {
+                Ok(Ok(path)) => {
+                    self.message = format!("Saved {}", path.display());
                     self.exported = Some(path);
                 }
+                Ok(Err(error)) => self.message = format!("Could not save WAV: {error}"),
+                Err(_) => self.message = "WAV export worker stopped unexpectedly.".into(),
             }
-            Ok(Err(error)) => self.message = format!("Could not save WAV: {error}"),
-            Err(_) => self.message = "WAV export worker stopped unexpectedly.".into(),
         }
         if std::mem::take(&mut self.export_again) {
             self.start_export();
@@ -554,7 +699,11 @@ impl Recorder {
 
     fn draw_waveform(&self, ui: &egui::Ui, rect: Rect, preview_hover: bool) {
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 6.0, Color32::from_rgb(22, 26, 29));
+        // The panel already supplies the chosen alpha. Skip a second background
+        // layer when translucent so the waveform area uses the same opacity.
+        if self.transparency == 0 {
+            painter.rect_filled(rect, 6.0, Color32::from_rgb(22, 26, 29));
+        }
         let inner = rect.shrink(8.0);
         let middle = inner.center().y;
         painter.hline(
@@ -677,6 +826,10 @@ impl Recorder {
 }
 
 impl eframe::App for Recorder {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
+
     fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
         if input.viewport().minimized == Some(true) {
             return;
@@ -745,46 +898,50 @@ impl eframe::App for Recorder {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            let menu_open = self.controls(ui, frame);
-            let window_cursor = if !menu_open && self.gesture.is_none() {
-                ui.input(|input| {
-                    if input.viewport().fullscreen == Some(true) {
-                        return None;
-                    }
-                    window_interaction(
-                        input.viewport_rect(),
-                        input.pointer.hover_pos()?,
-                        input.modifiers.alt,
-                        input.viewport().maximized != Some(true),
-                    )
-                    .map(|(_, cursor)| cursor)
-                })
-            } else {
-                None
-            };
-            self.refresh_waveform();
-            let size = Vec2::new(
-                ui.available_width(),
-                (ui.available_height() - 26.0).max(46.0),
-            );
-            let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-            if !menu_open {
-                self.interact_waveform(ui, frame, &response);
-            }
-            self.draw_waveform(ui, rect, !menu_open && window_cursor.is_none());
-            let status = self.controller.error().unwrap_or(&self.message);
-            if !status.is_empty() {
-                ui.add(egui::Label::new(status).truncate())
-                    .on_hover_text(status);
-            }
-            if let Some(cursor) = window_cursor {
-                ui.ctx().set_cursor_icon(cursor);
-            } else if !menu_open {
-                self.draw_action_hint(ui, &response);
-                response.on_hover_cursor(CursorIcon::Grab);
-            }
-        });
+        let fill = self.background_color(ui.visuals().panel_fill);
+        let frame_style = egui::Frame::central_panel(ui.style()).fill(fill);
+        egui::CentralPanel::default()
+            .frame(frame_style)
+            .show(ui, |ui| {
+                let menu_open = self.controls(ui, frame);
+                let window_cursor = if !menu_open && self.gesture.is_none() {
+                    ui.input(|input| {
+                        if input.viewport().fullscreen == Some(true) {
+                            return None;
+                        }
+                        window_interaction(
+                            input.viewport_rect(),
+                            input.pointer.hover_pos()?,
+                            input.modifiers.alt,
+                            input.viewport().maximized != Some(true),
+                        )
+                        .map(|(_, cursor)| cursor)
+                    })
+                } else {
+                    None
+                };
+                self.refresh_waveform();
+                let size = Vec2::new(
+                    ui.available_width(),
+                    (ui.available_height() - 26.0).max(46.0),
+                );
+                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                if !menu_open {
+                    self.interact_waveform(ui, frame, &response);
+                }
+                self.draw_waveform(ui, rect, !menu_open && window_cursor.is_none());
+                let status = self.controller.error().unwrap_or(&self.message);
+                if !status.is_empty() {
+                    ui.add(egui::Label::new(status).truncate())
+                        .on_hover_text(status);
+                }
+                if let Some(cursor) = window_cursor {
+                    ui.ctx().set_cursor_icon(cursor);
+                } else if !menu_open {
+                    self.draw_action_hint(ui, &response);
+                    response.on_hover_cursor(CursorIcon::Grab);
+                }
+            });
     }
 }
 

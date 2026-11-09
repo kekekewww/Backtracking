@@ -5,7 +5,9 @@ use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::{export_wav, AudioQueue, Capture, CaptureState, DurationChoice, Snapshot};
+use crate::{
+    export_wav, AudioQueue, Capture, CaptureState, DurationChoice, MeterReadings, Snapshot,
+};
 
 struct Reader {
     capture: Capture,
@@ -145,6 +147,27 @@ unsafe extern "C" fn bt_resume(core: *const BtCore) {
 }
 
 #[no_mangle]
+unsafe extern "C" fn bt_clear(core: *const BtCore) {
+    if let Some(core) = core.as_ref() {
+        if let Ok(mut reader) = core.reader.lock() {
+            core.queue.discard_pending();
+            reader.capture.clear();
+        }
+    }
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_meter_readings(core: *const BtCore) -> MeterReadings {
+    let Some(core) = core.as_ref() else {
+        return MeterReadings::default();
+    };
+    core.reader.lock().map_or_else(
+        |_| MeterReadings::default(),
+        |reader| reader.capture.meter_readings(),
+    )
+}
+
+#[no_mangle]
 unsafe extern "C" fn bt_set_history(core: *const BtCore, seconds: u32) -> i32 {
     let (Some(core), Some(retention)) = (core.as_ref(), duration(seconds)) else {
         return 0;
@@ -269,6 +292,35 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn clear_discards_already_queued_audio_and_preserves_mode() {
+        let core = bt_new(48_000.0, 1, 10);
+        assert!(!core.is_null());
+        unsafe {
+            assert_eq!(bt_push_interleaved(core, [0.75].as_ptr(), 1), 1);
+            bt_clear(core);
+            bt_poll(core);
+            assert_eq!(bt_state(core), 0);
+            assert_eq!(bt_meter_readings(core), MeterReadings::default());
+            assert_eq!(bt_push_interleaved(core, [0.5].as_ptr(), 1), 1);
+            bt_poll(core);
+            assert_eq!(bt_state(core), 1);
+            assert!((bt_meter_readings(core).peak_dbfs + 6.0206).abs() < 0.0001);
+
+            bt_clear(core);
+            assert_eq!(bt_state(core), 0);
+            assert_eq!(bt_meter_readings(core), MeterReadings::default());
+            let empty = bt_snapshot(core);
+            assert_eq!((*empty).frame_count(), 0);
+            bt_snapshot_free(empty);
+            bt_pause(core);
+            bt_clear(core);
+            assert_eq!(bt_state(core), 2);
+            assert_eq!(bt_meter_readings(core), MeterReadings::default());
+            bt_free(core);
+        }
+    }
 
     #[test]
     fn pause_freezes_the_snapshot_and_export_uses_the_selected_frames() {
