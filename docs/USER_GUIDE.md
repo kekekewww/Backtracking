@@ -20,7 +20,7 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 ### 移動與縮放桌面視窗
 
-可拖曳原生標題列來移動視窗，或拖曳原生邊框調整大小。也可以直接從視窗內容區操作。
+Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調整大小。要關閉桌面程式，請開啟工具列的齒輪選單並選擇 **結束／Quit**。
 
 | 動作 | Windows 桌面版 | macOS 桌面版 |
 | --- | --- | --- |
@@ -98,7 +98,7 @@ Click the gear in the toolbar to open **Settings**. The menu contains **History 
 
 ### Move and resize the desktop window
 
-Drag the native title bar to move the window or drag its border to resize it. You can also use these gestures inside the content area.
+The Windows and macOS desktop apps use a frameless window. Use the gestures below to move or resize it. To close the desktop app, open the gear menu in the toolbar and choose **Quit**.
 
 | Action | Windows desktop | macOS desktop |
 | --- | --- | --- |

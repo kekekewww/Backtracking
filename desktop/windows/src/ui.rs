@@ -30,6 +30,8 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([610.0, 144.0])
             .with_min_inner_size([510.0, 132.0])
+            .with_decorations(false)
+            .with_resizable(true)
             .with_always_on_top(),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
@@ -253,14 +255,27 @@ impl Recorder {
                 });
 
             ui.separator();
-            let choose_project = ui
-                .button("Project folder…")
-                .on_hover_text(self.output.display().to_string())
-                .clicked();
-            if choose_project {
+            let (choose_project, quit) = ui
+                .horizontal(|ui| {
+                    let choose_project = ui
+                        .button("Project folder…")
+                        .on_hover_text(self.output.display().to_string())
+                        .clicked();
+                    let quit = ui
+                        .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.button("Quit").clicked()
+                        })
+                        .inner;
+                    (choose_project, quit)
+                })
+                .inner;
+            if quit {
+                ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+            }
+            if choose_project || quit {
                 ui.close();
             }
-            choose_project
+            choose_project && !quit
         });
 
         if shown.as_ref().is_some_and(|menu| menu.inner) {

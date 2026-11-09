@@ -20,6 +20,8 @@ enum BacktrackingApp {
 }
 
 private final class CapturePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+
     var onClick: (() -> Void)?
     weak var waveform: WaveformView?
     private var moving = false
@@ -273,7 +275,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let bar = NSMenu()
         let item = NSMenuItem()
         let menu = NSMenu()
-        menu.addItem(withTitle: "結束 Backtracking", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quitItem(shortcut: "q"))
         item.submenu = menu
         bar.addItem(item)
         NSApp.mainMenu = bar
@@ -282,11 +284,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private func configurePanel() {
         let window = CapturePanel(
             contentRect: NSRect(x: 0, y: 0, width: 590, height: 132),
-            styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
+            styleMask: [.borderless, .resizable, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
         window.title = "Backtracking"
         window.contentMinSize = NSSize(width: 560, height: 120)
+        window.isMovable = true
+        window.hasShadow = true
         window.delegate = self
         window.becomesKeyOnlyIfNeeded = true
         window.isFloatingPanel = true
@@ -362,8 +366,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let outputItem = NSMenuItem(title: "專案資料夾…", action: #selector(chooseOutput), keyEquivalent: "")
         outputItem.target = self
         menu.addItem(outputItem)
+        menu.addItem(.separator())
+        menu.addItem(quitItem())
         let below = sender.isFlipped ? sender.bounds.maxY + 3 : sender.bounds.minY - 3
         _ = menu.popUp(positioning: nil, at: NSPoint(x: sender.bounds.minX, y: below), in: sender)
+    }
+
+    private func quitItem(shortcut: String = "") -> NSMenuItem {
+        let item = NSMenuItem(title: "結束 Backtracking", action: #selector(NSApplication.terminate(_:)), keyEquivalent: shortcut)
+        item.target = NSApp
+        return item
     }
 
     private func timeMenu(title: String, choices: [UInt32], selected: UInt32, action: Selector) -> NSMenuItem {
