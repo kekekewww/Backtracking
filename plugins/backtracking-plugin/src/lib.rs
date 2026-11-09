@@ -161,6 +161,7 @@ mod tests {
         original.session.set_idle_resume(None);
         original.session.set_panel_transparency(75);
         original.session.set_meter_mode(MeterMode::Lufs);
+        original.session.set_show_waveform_only(true);
         original.session.set_wav_profile(WavExportProfile {
             sample_rate: 96_000,
             sample_format: WavSampleFormat::Pcm24,

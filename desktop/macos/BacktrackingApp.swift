@@ -27,6 +27,7 @@ private final class CapturePanel: NSPanel {
     override var canBecomeKey: Bool { true }
 
     var onClick: (() -> Void)?
+    var onContextMenu: ((NSEvent) -> Void)?
     weak var waveform: WaveformView?
     private var moving = false
     private var resize: ResizeGesture?
@@ -103,7 +104,14 @@ private final class CapturePanel: NSPanel {
                 }
                 return
             }
-        case .rightMouseDown, .otherMouseDown:
+        case .rightMouseDown:
+            onClick?()
+            let controlSelect = event.modifierFlags.contains(.control) && waveformContains(event.locationInWindow)
+            if !controlSelect, let onContextMenu {
+                onContextMenu(event)
+                return
+            }
+        case .otherMouseDown:
             onClick?()
         default: break
         }
@@ -139,8 +147,12 @@ private final class CapturePanel: NSPanel {
     private func canMove(at location: NSPoint, modifiers: NSEvent.ModifierFlags) -> Bool {
         guard isMovable, modifiers.contains(.option), !modifiers.contains(.control) else { return false }
         if movesFromWaveform(modifiers) { return true }
-        guard let waveform else { return true }
-        return !waveform.bounds.contains(waveform.convert(location, from: nil))
+        return !waveformContains(location)
+    }
+
+    private func waveformContains(_ location: NSPoint) -> Bool {
+        guard let waveform else { return false }
+        return waveform.bounds.contains(waveform.convert(location, from: nil))
     }
 
     private func resizeEdges(at location: NSPoint, in area: NSRect) -> Edges {
@@ -347,6 +359,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private let clearButton = NSButton(title: "清除目前錄音", target: nil, action: nil)
     private let meterButton = NSButton(title: "— dBFS", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
+    private var extraControls: [NSView] = []
     private var history: UInt32 = 20
     private var idleSeconds: UInt32 = 10
     private var transparency: UInt32 = 0
@@ -354,6 +367,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var exportSampleRate: UInt32 = 48_000
     private var exportBitsPerSample: UInt32 = 32
     private var alwaysOnTop = true
+    private var waveformOnly = false
     private var paused = true
     private var captureError: String?
     private var editing = false
@@ -381,6 +395,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             exportBitsPerSample = saved
         }
         alwaysOnTop = defaults.object(forKey: "alwaysOnTop") as? Bool ?? true
+        waveformOnly = defaults.object(forKey: "waveformOnly") as? Bool ?? false
         if let saved = defaults.string(forKey: "outputDirectory"), saved.hasPrefix("/"), !saved.utf8.contains(0) {
             output = saved
         } else {
@@ -436,6 +451,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         window.acceptsMouseMovedEvents = true
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.onClick = { [weak self] in self?.registerClick() }
+        window.onContextMenu = { [weak self] event in self?.showContextMenu(event) }
 
         let waveform = WaveformView(frame: .zero)
         waveform.controller = self
@@ -465,6 +481,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let settingsButton = NSButton(title: "設定", target: self, action: #selector(showSettings(_:)))
         settingsButton.bezelStyle = .rounded
         setIcon("gearshape", label: "設定", on: settingsButton)
+        extraControls = [captureLamp, clearButton, pinButton, meterButton, settingsButton]
         let spacer = NSView(frame: .zero)
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let controls = NSStackView(views: [captureButton, captureLamp, clearButton, statusLabel, spacer, pinButton, meterButton, settingsButton])
@@ -498,6 +515,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         panel = window
         applyPin(to: pinButton)
         updateBackground()
+        applyWaveformOnly()
         let restoredFrame = window.setFrameUsingName(frameAutosaveName)
         _ = window.setFrameAutosaveName(frameAutosaveName)
         let screens = NSScreen.screens
@@ -516,6 +534,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     @objc private func showSettings(_ sender: NSButton) {
+        showMenu(settingsMenu(), below: sender)
+    }
+
+    private func showContextMenu(_ event: NSEvent) {
+        guard !editing, let content = panel?.contentView else { return }
+        NSMenu.popUpContextMenu(settingsMenu(), with: event, for: content)
+    }
+
+    private func settingsMenu() -> NSMenu {
         let menu = NSMenu(title: "設定")
         menu.addItem(choiceMenu(
             title: "保留時間", choices: timeChoices, selected: history,
@@ -533,12 +560,19 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         meterItem.submenu = meterMenu()
         menu.addItem(meterItem)
         menu.addItem(exportFormatMenuItem())
-        let outputItem = NSMenuItem(title: "專案資料夾…", action: #selector(chooseOutput), keyEquivalent: "")
+        let waveformItem = NSMenuItem(title: "只顯示波形", action: #selector(toggleWaveformOnly), keyEquivalent: "")
+        waveformItem.target = self
+        waveformItem.state = waveformOnly ? .on : .off
+        menu.addItem(waveformItem)
+        let outputItem = NSMenuItem(title: "選擇儲存資料夾…", action: #selector(chooseOutput), keyEquivalent: "")
         outputItem.target = self
         menu.addItem(outputItem)
+        let revealItem = NSMenuItem(title: "前往儲存資料夾", action: #selector(openOutputFolder), keyEquivalent: "")
+        revealItem.target = self
+        menu.addItem(revealItem)
         menu.addItem(.separator())
         menu.addItem(quitItem())
-        showMenu(menu, below: sender)
+        return menu
     }
 
     private func exportFormatMenuItem() -> NSMenuItem {
@@ -689,25 +723,59 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         setIcon(alwaysOnTop ? "pin.fill" : "pin", label: alwaysOnTop ? "取消置頂" : "置頂", on: button)
     }
 
+    @objc private func toggleWaveformOnly() {
+        waveformOnly.toggle()
+        defaults.set(waveformOnly, forKey: "waveformOnly")
+        registerClick()
+        applyWaveformOnly()
+    }
+
+    private func applyWaveformOnly() {
+        for control in extraControls { control.isHidden = waveformOnly }
+        waveform?.showsOverlay = !waveformOnly
+        updateStatus()
+    }
+
     @objc private func chooseOutput() {
         beginEditing()
         let chooser = NSOpenPanel()
-        chooser.title = "選擇專案資料夾，WAV 會存到其中的 output"
+        chooser.title = "選擇 WAV 儲存資料夾"
         chooser.canChooseDirectories = true
         chooser.canChooseFiles = false
         chooser.canCreateDirectories = true
         chooser.allowsMultipleSelection = false
-        chooser.directoryURL = URL(fileURLWithPath: output, isDirectory: true).deletingLastPathComponent()
+        chooser.directoryURL = URL(fileURLWithPath: output, isDirectory: true)
         chooser.begin { [weak self] response in
             guard let self else { return }
             if response == .OK, let url = chooser.url {
-                self.output = url.appendingPathComponent("output", isDirectory: true).path
+                self.output = url.path
                 self.defaults.set(self.output, forKey: "outputDirectory")
                 self.waveform?.discardPreparedFile()
                 self.setNotice("輸出位置 \(self.output)")
             }
             self.endEditing()
         }
+    }
+
+    @objc private func openOutputFolder() {
+        registerClick()
+        let url = URL(fileURLWithPath: output, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        } catch {
+            reportFolderError(error.localizedDescription)
+            return
+        }
+        if !NSWorkspace.shared.open(url) { reportFolderError(url.path) }
+    }
+
+    private func reportFolderError(_ detail: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "無法開啟儲存資料夾"
+        alert.informativeText = detail
+        alert.addButton(withTitle: "好")
+        _ = alert.runModal()
     }
 
     func registerClick() {
@@ -810,6 +878,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if captureButton.title != label {
             setIcon(paused ? "play.fill" : "pause.fill", label: label, on: captureButton)
         }
+        let captureHelp: String? = waveformOnly ? nil : label
+        if captureButton.toolTip != captureHelp { captureButton.toolTip = captureHelp }
         captureButton.isEnabled = !editing
         clearButton.isEnabled = tap?.core != nil && !editing
         updateMeter()
@@ -826,8 +896,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if statusLabel.stringValue != message {
             statusLabel.stringValue = message
             statusLabel.toolTip = message.isEmpty ? nil : message
-            statusLabel.isHidden = message.isEmpty
         }
+        let hideStatus = waveformOnly || message.isEmpty
+        if statusLabel.isHidden != hideStatus { statusLabel.isHidden = hideStatus }
     }
 
     private func setNotice(_ message: String?) {
@@ -861,6 +932,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
 private final class WaveformView: NSView, NSDraggingSource {
     weak var controller: BacktrackingController?
+    var showsOverlay = true { didSet { needsDisplay = true } }
     private var low = [Float](repeating: 0, count: 256)
     private var high = [Float](repeating: 0, count: 256)
     private var frames: UInt64 = 0
@@ -1072,7 +1144,7 @@ private final class WaveformView: NSView, NSDraggingSource {
     }
 
     private func drawActionHint() {
-        guard frames != 0, let pointer, bounds.contains(pointer) else { return }
+        guard showsOverlay, frames != 0, let pointer, bounds.contains(pointer) else { return }
         if anchor == nil && mouseDownEvent == nil && !dragging && movesFromWaveform(pointerModifiers) { return }
         let action: String
         if anchor != nil {
@@ -1121,6 +1193,13 @@ private final class WaveformView: NSView, NSDraggingSource {
         label.draw(at: NSPoint(x: rect.minX + 7, y: rect.minY + 4))
     }
 
+    private func waveformRect(for range: ClosedRange<Double>) -> NSRect {
+        NSRect(
+            x: bounds.minX + bounds.width * CGFloat(range.lowerBound), y: bounds.minY,
+            width: bounds.width * CGFloat(range.upperBound - range.lowerBound), height: bounds.height
+        )
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         let panel = NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6)
@@ -1129,13 +1208,10 @@ private final class WaveformView: NSView, NSDraggingSource {
         let middle = bounds.midY
         let height = bounds.height * 0.46
         let preview = selection != nil || pointer != nil || mouseDownEvent != nil || dragging ? exportRange : nil
-        if let preview, frames != 0 {
+        let selectedRect = selection.map { waveformRect(for: $0) }
+        if let preview, selectedRect == nil, frames != 0 {
             NSColor.systemTeal.withAlphaComponent(0.23).setFill()
-            NSBezierPath.fill(NSRect(
-                x: bounds.width * CGFloat(preview.lowerBound), y: 0,
-                width: bounds.width * CGFloat(preview.upperBound - preview.lowerBound),
-                height: bounds.height
-            ))
+            NSBezierPath.fill(waveformRect(for: preview))
         }
 
         NSColor.white.withAlphaComponent(0.17).setStroke()
@@ -1151,25 +1227,42 @@ private final class WaveformView: NSView, NSDraggingSource {
                 trace.move(to: NSPoint(x: x, y: bottom))
                 trace.line(to: NSPoint(x: x, y: max(top, bottom + 0.7)))
             }
-            NSColor(calibratedRed: 0.32, green: 0.89, blue: 0.82, alpha: 1).setStroke()
+            let mint = (red: CGFloat(0.32), green: CGFloat(0.89), blue: CGFloat(0.82))
+            NSColor(calibratedRed: mint.red, green: mint.green, blue: mint.blue, alpha: 1).setStroke()
             trace.lineWidth = max(1, step * 0.75)
             trace.stroke()
+            if let selectedRect, !selectedRect.isEmpty {
+                NSGraphicsContext.saveGraphicsState()
+                NSBezierPath(rect: selectedRect).addClip()
+                NSColor.white.setFill()
+                NSBezierPath.fill(selectedRect)
+                NSColor(calibratedRed: 1 - mint.red, green: 1 - mint.green, blue: 1 - mint.blue, alpha: 1).setStroke()
+                trace.stroke()
+                NSGraphicsContext.restoreGraphicsState()
+            }
         }
         if let pointer, anchor != nil || (selectionModifierDown && !movesFromWaveform(pointerModifiers)) {
-            NSColor.white.withAlphaComponent(0.4).setStroke()
+            let cursorColor = selectedRect?.contains(pointer) == true ? NSColor.black : .white
+            cursorColor.withAlphaComponent(0.4).setStroke()
             NSBezierPath.strokeLine(
                 from: NSPoint(x: pointer.x, y: bounds.minY),
                 to: NSPoint(x: pointer.x, y: bounds.maxY)
             )
         }
-        if let preview, frames != 0, sampleRate > 0 {
+        if showsOverlay, let preview, frames != 0, sampleRate > 0 {
             let seconds = Double(frames) / sampleRate * (preview.upperBound - preview.lowerBound)
             let label = NSAttributedString(string: String(format: "%.2f 秒", seconds), attributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium),
                 .foregroundColor: NSColor.white
             ])
             let size = label.size()
-            label.draw(at: NSPoint(x: bounds.width - size.width - 7, y: bounds.height - size.height - 4))
+            let origin = NSPoint(x: bounds.maxX - size.width - 7, y: bounds.maxY - size.height - 4)
+            let labelRect = NSRect(origin: origin, size: size)
+            if selectedRect?.intersects(labelRect) == true {
+                NSColor.black.withAlphaComponent(0.78).setFill()
+                NSBezierPath(roundedRect: labelRect.insetBy(dx: -3, dy: -1), xRadius: 3, yRadius: 3).fill()
+            }
+            label.draw(at: origin)
         }
         drawActionHint()
         NSGraphicsContext.restoreGraphicsState()

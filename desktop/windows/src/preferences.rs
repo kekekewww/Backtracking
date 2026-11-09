@@ -35,6 +35,7 @@ pub(crate) enum Key {
     WavSampleFormat,
     Output,
     AlwaysOnTop,
+    WaveformOnly,
 }
 
 impl Key {
@@ -48,6 +49,7 @@ impl Key {
             Self::WavSampleFormat => "wav-sample-format",
             Self::Output => "output-folder",
             Self::AlwaysOnTop => "always-on-top",
+            Self::WaveformOnly => "waveform-only",
         }
     }
 }
@@ -60,6 +62,7 @@ pub(crate) struct Settings {
     pub(crate) wav_profile: WavExportProfile,
     pub(crate) output: PathBuf,
     pub(crate) pinned: bool,
+    pub(crate) waveform_only: bool,
 }
 
 impl Default for Settings {
@@ -75,6 +78,7 @@ impl Default for Settings {
             wav_profile: WavExportProfile::default(),
             output: home.join("Backtracking").join("output"),
             pinned: true,
+            waveform_only: false,
         }
     }
 }
@@ -135,6 +139,7 @@ impl Preferences {
             Some(1) => settings.pinned = true,
             _ => {}
         }
+        settings.waveform_only = self.read_number::<u8>(Key::WaveformOnly) == Some(1);
         settings
     }
 

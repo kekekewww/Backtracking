@@ -137,6 +137,10 @@ impl Session {
         self.settings.lock().wav_profile = profile;
     }
 
+    pub(crate) fn set_show_waveform_only(&self, show_waveform_only: bool) {
+        self.settings.lock().show_waveform_only = show_waveform_only;
+    }
+
     pub(crate) fn set_retention(&self, retention: DurationChoice) {
         self.settings.lock().retention = retention;
         self.apply_capture_settings(&mut self.lock());

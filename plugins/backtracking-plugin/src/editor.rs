@@ -30,6 +30,8 @@ const DURATIONS: [DurationChoice; 3] = [
     DurationChoice::Seconds30,
 ];
 const MINT: Color32 = Color32::from_rgb(103, 231, 181);
+const INVERTED_MINT: Color32 = Color32::from_rgb(152, 24, 74);
+const SETTINGS_POPUP_ID: &str = "backtracking-settings-popup";
 
 pub type CaptureEditor = EguiEditor<CaptureUi>;
 
@@ -46,6 +48,7 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
             next_refresh: Instant::now(),
             recording_since: None,
             displayed_settings: None,
+            context_menu_position: None,
             frozen: None,
             selection: None,
             gesture: None,
@@ -67,6 +70,7 @@ pub struct CaptureUi {
     next_refresh: Instant,
     recording_since: Option<Instant>,
     displayed_settings: Option<SessionSettings>,
+    context_menu_position: Option<Pos2>,
     frozen: Option<Arc<Snapshot>>,
     selection: Option<Range<f32>>,
     gesture: Option<Gesture>,
@@ -81,6 +85,11 @@ pub struct CaptureUi {
 enum Gesture {
     Select { anchor: f32, current: f32 },
     Drag { origin: Pos2 },
+}
+
+enum FolderAction {
+    Select,
+    Open,
 }
 
 impl MeterMode {
@@ -148,13 +157,29 @@ impl NiceEguiApp for CaptureUi {
             self.session.mark_interaction();
         }
 
-        let settings_open = ui
+        let waveform_only = settings.show_waveform_only;
+        let can_toggle = self.gesture.is_none() && !self.native_dragging.load(Ordering::Acquire);
+        let canvas = ui.max_rect().intersect(ui.clip_rect());
+        let context_at = ui.input(|input| {
+            if can_toggle && input.pointer.secondary_clicked() {
+                input
+                    .pointer
+                    .interact_pos()
+                    .filter(|position| canvas.contains(*position))
+            } else {
+                None
+            }
+        });
+        let controls_enabled = can_toggle
+            && context_at.is_none()
+            && !egui::Popup::is_id_open(ui.ctx(), egui::Id::unique(SETTINGS_POPUP_ID));
+        let gear = ui
             .horizontal(|ui| {
-                ui.heading("Backtracking");
-                ui.separator();
-                let can_toggle =
-                    self.gesture.is_none() && !self.native_dragging.load(Ordering::Acquire);
-                if capture_button(ui, paused, can_toggle).clicked() {
+                if !waveform_only {
+                    ui.heading("Backtracking");
+                    ui.separator();
+                }
+                if capture_button(ui, paused, controls_enabled, !waveform_only).clicked() {
                     if paused {
                         self.session.resume();
                         self.reset_frozen();
@@ -164,21 +189,27 @@ impl NiceEguiApp for CaptureUi {
                     paused = self.session.is_paused();
                     ui.ctx().request_repaint();
                 }
+                if waveform_only {
+                    self.recording_since = None;
+                    return None;
+                }
                 self.recording_indicator(ui, paused);
-                if clear_button(ui, can_toggle && self.seconds > 0.0).clicked() {
+                if clear_button(ui, controls_enabled && self.seconds > 0.0).clicked() {
                     self.clear_capture();
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let open = self.settings_menu(ui, frame, &mut settings, paused);
-                    self.meter_readout(ui, settings.meter_mode);
-                    open
-                })
-                .inner
+                Some(
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let gear = settings_button(ui);
+                        self.meter_readout(ui, settings.meter_mode);
+                        gear
+                    })
+                    .inner,
+                )
             })
             .inner;
 
         let dropped = self.session.dropped_frames();
-        let status_is_visible = dropped != 0 || !self.message.is_empty();
+        let status_is_visible = !waveform_only && (dropped != 0 || !self.message.is_empty());
         let status_height = if status_is_visible {
             ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y
         } else {
@@ -189,6 +220,14 @@ impl NiceEguiApp for CaptureUi {
             (ui.available_height() - status_height).max(60.0),
         );
         let (rect, response) = ui.allocate_exact_size(wave_size, Sense::click_and_drag());
+        let settings_open = self.settings_menu(
+            frame,
+            &mut settings,
+            paused,
+            gear.as_ref(),
+            &response,
+            context_at,
+        );
         let configured_seconds = settings.retention.seconds() as f32;
         self.interact_waveform(ui, frame, rect, configured_seconds, !settings_open);
         self.draw_waveform(
@@ -199,11 +238,13 @@ impl NiceEguiApp for CaptureUi {
             settings.panel_transparency,
         );
         if !settings_open {
-            self.draw_action_hint(ui, rect);
+            if !settings.show_waveform_only {
+                self.draw_action_hint(ui, rect);
+            }
             response.on_hover_cursor(CursorIcon::Grab);
         }
 
-        if dropped != 0 {
+        if !settings.show_waveform_only && dropped != 0 {
             let mut status = format!("Dropped {dropped} audio frames");
             if !self.message.is_empty() {
                 status.push_str(" · ");
@@ -211,7 +252,7 @@ impl NiceEguiApp for CaptureUi {
             }
             ui.add(egui::Label::new(&status).truncate())
                 .on_hover_text(status);
-        } else if status_is_visible {
+        } else if !settings.show_waveform_only && status_is_visible {
             ui.add(egui::Label::new(&self.message).truncate())
                 .on_hover_text(&self.message);
         }
@@ -227,6 +268,7 @@ impl NiceEguiApp for CaptureUi {
     fn editor_closed(&mut self) {
         self.gesture = None;
         self.recording_since = None;
+        self.context_menu_position = None;
         if !self.native_dragging.load(Ordering::Acquire) {
             self.session.set_gesture_active(false);
         }
@@ -289,27 +331,56 @@ impl CaptureUi {
 
     fn settings_menu(
         &mut self,
-        ui: &mut egui::Ui,
         frame: &mut Frame,
         settings: &mut SessionSettings,
         paused: bool,
+        gear: Option<&egui::Response>,
+        waveform: &egui::Response,
+        context_at: Option<Pos2>,
     ) -> bool {
-        let gear = settings_button(ui);
-        let popup = egui::Popup::menu(&gear)
-            .align(egui::RectAlign::BOTTOM_END)
-            .gap(4.0)
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
-        let was_open = popup.is_open();
-        let menu_content_height = (ui.ctx().viewport_rect().height() - 68.0).max(60.0);
-        let menu = popup.show(|ui| {
+        let ctx = &waveform.ctx;
+        let popup_id = egui::Id::unique(SETTINGS_POPUP_ID);
+        let was_open = egui::Popup::is_id_open(ctx, popup_id);
+        let open = if let Some(position) = context_at {
+            self.context_menu_position = Some(position);
+            Some(egui::SetOpenCommand::Bool(true))
+        } else if gear.is_some_and(egui::Response::clicked) {
+            let from_context = self.context_menu_position.take().is_some();
+            Some(egui::SetOpenCommand::Bool(!was_open || from_context))
+        } else {
+            None
+        };
+        let popup = egui::Popup::menu(gear.unwrap_or(waveform))
+            .id(popup_id)
+            .accessible_name("Settings")
+            .open_memory(open)
+            .gap(4.0);
+        let popup = if let Some(position) = self.context_menu_position {
+            popup.at_position(position)
+        } else if gear.is_some() {
+            popup.align(egui::RectAlign::BOTTOM_END)
+        } else {
+            egui::Popup::close_id(ctx, popup_id);
+            return was_open;
+        };
+        let close_behavior = if context_at.is_some() {
+            egui::PopupCloseBehavior::IgnoreClicks
+        } else {
+            egui::PopupCloseBehavior::CloseOnClickOutside
+        };
+        let menu_content_height = (ctx.viewport_rect().height() - 68.0).max(60.0);
+        let menu = popup.close_behavior(close_behavior).show(|ui| {
             let mut retention = settings.retention;
             let mut idle_resume = settings.idle_resume;
             let mut panel_transparency = settings.panel_transparency;
             let mut meter_mode = settings.meter_mode;
             let mut wav_profile = settings.wav_profile;
+            let mut waveform_only = settings.show_waveform_only;
             egui::ScrollArea::vertical()
                 .max_height(menu_content_height)
                 .show(ui, |ui| {
+                    ui.checkbox(&mut waveform_only, "Show waveform only");
+                    ui.separator();
                     egui::Grid::new("capture-settings")
                         .spacing([12.0, 3.0])
                         .show(ui, |ui| {
@@ -384,33 +455,76 @@ impl CaptureUi {
                 self.invalidate_export();
                 self.message.clear();
             }
+            if waveform_only != settings.show_waveform_only {
+                self.session.set_show_waveform_only(waveform_only);
+                settings.show_waveform_only = waveform_only;
+            }
             ui.separator();
-            let choose_project = ui
-                .button("Project folder…")
-                .on_hover_text(settings.output_dir.display().to_string())
-                .clicked();
-            if choose_project {
+            let action = ui
+                .horizontal(|ui| {
+                    let folder = settings.output_dir.display().to_string();
+                    let select = ui
+                        .button("Select save folder")
+                        .on_hover_text(&folder)
+                        .clicked();
+                    let open = ui
+                        .button("Go to save folder")
+                        .on_hover_text(folder)
+                        .clicked();
+                    if select {
+                        Some(FolderAction::Select)
+                    } else if open {
+                        Some(FolderAction::Open)
+                    } else {
+                        None
+                    }
+                })
+                .inner;
+            if action.is_some() {
                 ui.close();
             }
-            choose_project
+            action
         });
-        if menu.as_ref().is_some_and(|menu| menu.inner) {
-            self.session.set_gesture_active(true);
-            let selection = rfd::FileDialog::new()
-                .set_title("Choose a project folder for Backtracking WAVs")
-                .set_parent(frame.baseview_window())
-                .pick_folder();
-            self.session.set_gesture_active(false);
-            if let Some(folder) = selection {
-                let output = folder.join("output");
-                self.session.set_output_dir(output.clone());
-                settings.output_dir = output.clone();
-                self.invalidate_export();
-                self.message = format!("Output: {}", output.display());
+        if !egui::Popup::is_id_open(ctx, popup_id) {
+            self.context_menu_position = None;
+        }
+        let shown = menu.is_some();
+        match menu.and_then(|menu| menu.inner) {
+            Some(FolderAction::Select) => {
+                self.session.set_gesture_active(true);
+                let selection = rfd::FileDialog::new()
+                    .set_title("Select save folder")
+                    .set_parent(frame.baseview_window())
+                    .pick_folder();
+                self.session.set_gesture_active(false);
+                if let Some(folder) = selection {
+                    self.session.set_output_dir(folder.clone());
+                    self.invalidate_export();
+                    self.message = format!("Output: {}", folder.display());
+                    settings.output_dir = folder;
+                }
             }
+            Some(FolderAction::Open) => {
+                if let Err(error) = std::fs::create_dir_all(&settings.output_dir)
+                    .and_then(|()| open::that_detached(&settings.output_dir))
+                {
+                    self.message = format!("Could not open save folder: {error}");
+                    if settings.show_waveform_only {
+                        self.session.set_gesture_active(true);
+                        rfd::MessageDialog::new()
+                            .set_level(rfd::MessageLevel::Warning)
+                            .set_title("Backtracking")
+                            .set_description(&self.message)
+                            .set_parent(frame.baseview_window())
+                            .show();
+                        self.session.set_gesture_active(false);
+                    }
+                }
+            }
+            None => {}
         }
         // A waveform click that dismisses the popup must not also start an export.
-        was_open || menu.is_some()
+        was_open || shown
     }
 
     fn refresh_waveform(&mut self, paused: bool) {
@@ -504,39 +618,54 @@ impl CaptureUi {
         }
 
         let at = |fraction: f32| audio_rect.left() + width * fraction;
-        let selecting = match &self.gesture {
+        let explicit_range = match &self.gesture {
             Some(Gesture::Select { anchor, current }) => {
                 Some(anchor.min(*current)..anchor.max(*current))
             }
-            Some(Gesture::Drag { .. }) => Some(self.selection.clone().unwrap_or(0.0..1.0)),
-            None if allow_hover => self.selection.clone().or_else(|| {
-                ui.input(|input| {
-                    input
-                        .pointer
-                        .hover_pos()
-                        .is_some_and(|position| rect.contains(position))
-                })
-                .then_some(0.0..1.0)
-            }),
-            None => self.selection.clone(),
+            _ => self.selection.clone(),
         };
-        if let Some(range) = selecting {
+        let hover_preview = explicit_range.is_none()
+            && match &self.gesture {
+                Some(Gesture::Select { .. }) => false,
+                Some(Gesture::Drag { .. }) => true,
+                None => {
+                    allow_hover
+                        && ui.input(|input| {
+                            input
+                                .pointer
+                                .hover_pos()
+                                .is_some_and(|position| rect.contains(position))
+                        })
+                }
+            };
+        if hover_preview {
+            painter.rect_filled(audio_rect, 2.0, Color32::from_rgb(31, 79, 64));
+        }
+
+        let draw_wave = |painter: &egui::Painter, color| {
+            let stroke = Stroke::new(1.0, color);
+            let clip = painter.clip_rect().expand(1.0);
+            for (bin, (&low, &high)) in self.minimum.iter().zip(&self.maximum).enumerate() {
+                let x = at((bin as f32 + 0.5) / BINS as f32);
+                if x < clip.left() || x > clip.right() {
+                    continue;
+                }
+                let top = middle - high.clamp(-1.0, 1.0) * extent;
+                let bottom = middle - low.clamp(-1.0, 1.0) * extent;
+                painter.line_segment(
+                    [Pos2::new(x, top), Pos2::new(x, bottom.max(top + 0.4))],
+                    stroke,
+                );
+            }
+        };
+        draw_wave(&painter, MINT);
+        if let Some(range) = explicit_range.filter(|range| range.end > range.start) {
             let selection = Rect::from_min_max(
                 Pos2::new(at(range.start), inner.top()),
                 Pos2::new(at(range.end), inner.bottom()),
             );
-            painter.rect_filled(selection, 2.0, Color32::from_rgb(31, 79, 64));
-        }
-
-        let wave_stroke = Stroke::new(1.0, MINT);
-        for (bin, (&low, &high)) in self.minimum.iter().zip(&self.maximum).enumerate() {
-            let x = at((bin as f32 + 0.5) / BINS as f32);
-            let top = middle - high.clamp(-1.0, 1.0) * extent;
-            let bottom = middle - low.clamp(-1.0, 1.0) * extent;
-            painter.line_segment(
-                [Pos2::new(x, top), Pos2::new(x, bottom.max(top + 0.4))],
-                wave_stroke,
-            );
+            painter.rect_filled(selection, 0.0, Color32::WHITE);
+            draw_wave(&painter.with_clip_rect(selection), INVERTED_MINT);
         }
     }
 
@@ -829,7 +958,12 @@ fn wav_format_controls(ui: &mut egui::Ui, profile: &mut WavExportProfile) {
     ui.end_row();
 }
 
-fn capture_button(ui: &mut egui::Ui, paused: bool, enabled: bool) -> egui::Response {
+fn capture_button(
+    ui: &mut egui::Ui,
+    paused: bool,
+    enabled: bool,
+    show_hint: bool,
+) -> egui::Response {
     let response = ui.add_enabled(enabled, egui::Button::new("").min_size(Vec2::splat(25.0)));
     let label = if paused {
         "Start capture"
@@ -858,7 +992,11 @@ fn capture_button(ui: &mut egui::Ui, paused: bool, enabled: bool) -> egui::Respo
             );
         }
     }
-    response.on_hover_text(label)
+    if show_hint {
+        response.on_hover_text(label)
+    } else {
+        response
+    }
 }
 
 fn settings_button(ui: &mut egui::Ui) -> egui::Response {

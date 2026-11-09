@@ -34,6 +34,7 @@ pub(crate) struct SessionSettings {
     pub(crate) panel_transparency: u8,
     pub(crate) meter_mode: MeterMode,
     pub(crate) wav_profile: WavExportProfile,
+    pub(crate) show_waveform_only: bool,
     pub(crate) output_dir: PathBuf,
 }
 
@@ -49,6 +50,7 @@ impl Default for SessionSettings {
             panel_transparency: 0,
             meter_mode: MeterMode::Dbfs,
             wav_profile: WavExportProfile::default(),
+            show_waveform_only: false,
             output_dir: home.join("Backtracking").join("output"),
         }
     }
@@ -117,6 +119,9 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                     .and_then(WavSampleFormat::from_bits_per_sample)
                     .unwrap_or(defaults.wav_profile.sample_format),
             },
+            show_waveform_only: fields
+                .get("show_waveform_only")
+                .is_some_and(|value| value == "true"),
             output_dir: output_dir.unwrap_or(defaults.output_dir),
         };
         *self.lock() = restored;
@@ -144,6 +149,10 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                 settings.panel_transparency.to_string(),
             ),
             ("meter_unit".into(), settings.meter_mode.label().into()),
+            (
+                "show_waveform_only".into(),
+                settings.show_waveform_only.to_string(),
+            ),
             (
                 "wav_sample_rate".into(),
                 settings.wav_profile.sample_rate.to_string(),

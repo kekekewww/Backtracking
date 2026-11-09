@@ -16,13 +16,19 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 ### 開啟設定
 
-點擊工具列的齒輪，開啟 **設定** 選單。可調整保留時間、自動續錄、背景透明度、WAV 匯出格式及專案資料夾。Windows 和 macOS 桌面版的 **置頂／Keep on top** 可直接在工具列切換。插件視窗的位置由 DAW 控制。
+點擊工具列的齒輪，或在 Backtracking 視窗內按滑鼠右鍵，可開啟同一個 **設定** 選單。可調整保留時間、自動續錄、背景透明度、WAV 匯出格式及存檔資料夾。Windows 和 macOS 桌面版的 **置頂／Keep on top** 可直接在工具列切換。插件視窗的位置由 DAW 控制。
 
-齒輪選單的背景透明度可選 0%、25%、50%、75% 或 100%。0% 為不透明，100% 為透明。桌面版在 100% 時仍可透過齒輪選單調整透明度。VST3／CLAP 的 **Panel transparency** 調整插件內的波形面板背景，實際看到的底色取決於 DAW 的視窗背景。
+macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`Control` 搭配波形上的點擊與拖曳用於框選。
+
+設定選單的背景透明度可選 0%、25%、50%、75% 或 100%。0% 為不透明，100% 為透明。桌面版在 100% 時仍可開啟設定選單調整透明度。VST3／CLAP 的 **Panel transparency** 調整插件內的波形面板背景，實際看到的底色取決於 DAW 的視窗背景。
+
+### 只顯示波形
+
+開啟 **只顯示波形／Show waveform only** 後，視窗只保留波形與 **Play／Pause**。要回到完整介面，在視窗內按右鍵開啟設定，再取消勾選。這個選項預設關閉，並跟著桌面偏好設定或 DAW 專案中的插件設定儲存。
 
 ### 移動與縮放桌面視窗
 
-Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調整大小。要關閉桌面程式，請開啟工具列的齒輪選單並選擇 **結束／Quit**。
+Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調整大小。要關閉桌面程式，請從設定選單選擇 **結束／Quit**。
 
 | 動作 | Windows 桌面版 | macOS 桌面版 |
 | --- | --- | --- |
@@ -55,7 +61,7 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 ### 點擊、框選與拖曳
 
-未框選時，將游標移到波形上會預覽整段保留音訊。從波形任意位置點擊或開始拖曳，都會匯出這整段音訊。例如保留時間設為 20 秒，錄滿時匯出 20 秒，目前只收錄 7 秒時就匯出 7 秒。若已有框選，預覽與匯出都使用框選區間。
+未框選時，將游標移到波形上會預覽整段保留音訊。從波形任意位置點擊或開始拖曳，都會匯出這整段音訊。例如保留時間設為 20 秒，錄滿時匯出 20 秒，目前只收錄 7 秒時就匯出 7 秒。使用 `Ctrl` 或 `Option` 框選時，選取區以白色填滿，其中的綠色波形會顯示反相配色。預覽與匯出都會使用框選區間。
 
 波形的提示只在相關操作時出現。介面會依右、左、下、上的順序尋找可以放下提示的位置，並將提示留在視窗內。
 
@@ -67,7 +73,7 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 | 匯入 DAW | 在波形上按住滑鼠左鍵並拖出 | 在波形上按住滑鼠左鍵並拖出 | 按住時顯示 **Drag and Drop**。檔案就緒後，拖到 REAPER 時間軸、FL Studio Playlist 或其他接受 WAV 的位置。 |
 | 指定起訖點 | 按住 `Ctrl`，在波形上按住左鍵拖曳 | 按住 `Option`，在波形上按住左鍵拖曳 | 顯示 **Drag to Select**。放開後保留框選區間，再放開修飾鍵並點擊或拖出選取區。 |
 
-完成框選後，Backtracking 會先準備選取區的 WAV，以便接著拖出。第一次匯出或需要轉換取樣率時，檔案可能需要短暫準備。拖曳時可先維持按住，等檔案可拖出再放開。若 DAW 沒有接受拖放，可以從 `output/` 直接匯入已存好的 WAV。
+完成框選後，Backtracking 會先準備選取區的 WAV，以便接著拖出。第一次匯出或需要轉換取樣率時，檔案可能需要短暫準備。拖曳時可先維持按住，等檔案可拖出再放開。若 DAW 沒有接受拖放，可開啟存檔資料夾並直接匯入 WAV。
 
 ### 啟用、暫停與自動續錄
 
@@ -77,13 +83,15 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 ### 清除目前錄音
 
-點擊工具列的垃圾桶圖示。提示文字依版本為 **清除目前錄音**、**Clear capture** 或 **Clear captured audio**。這會清空目前的波形、選取區間與記憶體中的錄音。若錄音已待命，接下來收到的聲音會重新填入波形。已寫入 `output/` 的 WAV 可從資料夾取用。
+點擊工具列的垃圾桶圖示。提示文字依版本為 **清除目前錄音**、**Clear capture** 或 **Clear captured audio**。這會清空目前的波形、選取區間與記憶體中的錄音。若錄音已待命，接下來收到的聲音會重新填入波形。先前匯出的 WAV 可從存檔資料夾取用。
 
 ### 輸出位置與檔案規格
 
-從齒輪選單選擇 **專案資料夾／Project folder**，指定專案根目錄。例如選擇 `My Song`，檔案會寫到 `My Song/output/`。程式會在需要時建立該子目錄。插件的資料夾由使用者選擇，與 DAW 的專案儲存位置各自設定。
+從設定選單使用 **選擇儲存資料夾…／Select save folder**，指定 WAV 的實際目的地。例如選擇 `My Song/Samples`，檔案就會直接存入該資料夾。先前已儲存的目的地會繼續沿用。
 
-| 版本 | 未指定專案時的輸出位置 |
+選擇 **前往儲存資料夾／Go to save folder** 可用系統預設的檔案管理程式開啟目前的目的地。資料夾尚未存在時，Backtracking 會先建立再開啟。
+
+| 版本 | 預設儲存資料夾 |
 | --- | --- |
 | macOS 桌面版 | `~/Backtracking/output/` |
 | Windows 桌面版 | `%USERPROFILE%\Backtracking\output\` |
@@ -106,12 +114,12 @@ Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調�
 
 ### 保存與還原設定
 
-Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續錄、背景透明度、音量表模式、WAV 取樣率與編碼、輸出位置及置頂設定，下次開啟時還原。
+Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續錄、背景透明度、音量表模式、WAV 取樣率與編碼、存檔資料夾、置頂及只顯示波形的設定，下次開啟時還原。
 
 - **Windows**。設定儲存在 `%LOCALAPPDATA%\Backtracking\Settings`。若找不到 `LOCALAPPDATA`，則使用 `%APPDATA%\Backtracking\Settings`。程式會以預設視窗尺寸開啟，由系統安排位置。
 - **macOS**。設定儲存在系統的使用者偏好中，也會記住桌面視窗的位置與尺寸。
 
-**VST3／CLAP** 的保留時間、自動續錄、面板透明度、音量表模式、WAV 取樣率與編碼、輸出位置由 DAW 專案保存，每個插件實例可獨立設定。修改後請手動儲存專案。重新開啟同一個專案時，DAW 會還原各實例的設定。
+**VST3／CLAP** 的保留時間、自動續錄、面板透明度、音量表模式、WAV 取樣率與編碼、存檔資料夾及只顯示波形的設定由 DAW 專案保存，每個插件實例可獨立設定。修改後請手動儲存專案。重新開啟同一個專案時，DAW 會還原各實例的設定。
 
 ### 排除問題
 
@@ -121,7 +129,7 @@ Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續�
 | Windows 切換喇叭或耳機後無法擷取 | 確認新的裝置已是系統預設播放裝置，再按 **Play** 重新連線。 |
 | DAW 掃描不到插件 | 確認已複製完整 `.vst3` 或 `.clap`，架構與 DAW 相容，且檔案位於 DAW 會掃描的資料夾。依下方步驟重新掃描。 |
 | 能存檔，但拖不到 DAW | 等 WAV 完成後再拖，確認落點是可接受音訊檔的時間軸或 Playlist。也可從輸出資料夾將 WAV 拖入或手動匯入。 |
-| 無法寫入 WAV | 確認波形有可用的音訊，再選擇可寫入且仍然存在的專案資料夾。 |
+| 無法寫入 WAV | 確認波形有可用的音訊，再選擇可寫入的存檔資料夾。 |
 
 **離線渲染**。CLAP 在宿主回報離線模式時會略過擷取。VST3 使用的 nice-plug 0.4.2 有時會回報前一次的處理模式，離線渲染仍可能進入回溯歷史。渲染前若要保留目前的素材，請先匯出。若要在渲染期間維持凍結，先關閉自動續錄，再按 **Pause**。
 
@@ -139,13 +147,19 @@ On Windows, route the source to the default playback device. If a DAW uses ASIO,
 
 ### Open settings
 
-Click the gear in the toolbar to open **Settings**. Use the menu to set the history length, auto-resume delay, background transparency, WAV export format, and project folder. In the Windows and macOS desktop apps, you can toggle **Keep on top** directly from the toolbar. The DAW controls the plug-in window.
+Click the gear in the toolbar or right-click inside the Backtracking window to open the same **Settings** menu. Use the menu to set the history length, auto-resume delay, background transparency, WAV export format, and save folder. In the Windows and macOS desktop apps, you can toggle **Keep on top** directly from the toolbar. The DAW controls the plug-in window.
 
-The gear menu offers five background transparency levels. Choose 0%, 25%, 50%, 75%, or 100%, where 0% is opaque and 100% is clear. On the desktop apps, use the gear menu to adjust the setting even at 100%. In VST3 and CLAP, **Panel transparency** fades the waveform panel's fill. The DAW provides the background behind it.
+In the macOS desktop app, use a mouse right-click or the trackpad's secondary click to open the menu. Use `Control` with a click and drag over the waveform to select audio.
+
+The settings menu offers five background transparency levels. Choose 0%, 25%, 50%, 75%, or 100%, where 0% is opaque and 100% is clear. On the desktop apps, you can open Settings and adjust the value even at 100%. In VST3 and CLAP, **Panel transparency** fades the waveform panel's fill. The DAW provides the background behind it.
+
+### Show waveform only
+
+Turn on **Show waveform only** to keep just the waveform and **Play/Pause** visible. To restore the full interface, right-click inside the window and turn the option off. This setting defaults to Off and is saved with the desktop preferences or the plug-in's DAW project settings.
 
 ### Move and resize the desktop window
 
-The Windows and macOS desktop apps use a frameless window. Use the gestures below to move or resize it. To close the desktop app, open the gear menu in the toolbar and choose **Quit**.
+The Windows and macOS desktop apps use a frameless window. Use the gestures below to move or resize it. To close the desktop app, choose **Quit** from Settings.
 
 | Action | Windows desktop | macOS desktop |
 | --- | --- | --- |
@@ -178,7 +192,7 @@ Loudness measurement references. [ITU-R BS.1770](https://www.itu.int/rec/R-REC-B
 
 ### Click, select, and drag
 
-With no selection, hover over the waveform to preview all retained audio. Clicking or starting a drag anywhere on the waveform exports that full range. For example, a full 20-second buffer exports 20 seconds. If only 7 seconds have been captured, the WAV is 7 seconds long. An explicit selection sets the range for both preview and export.
+With no selection, hover over the waveform to preview all retained audio. Clicking or starting a drag anywhere on the waveform exports that full range. For example, a full 20-second buffer exports 20 seconds. If only 7 seconds have been captured, the WAV is 7 seconds long. A `Ctrl` or `Option` selection has a white background with the green waveform's color inverted. The selected range is used for preview and export.
 
 Gesture hints appear as you interact. The tooltip tries the right, left, below, and above in that order and stays within the interface.
 
@@ -190,7 +204,7 @@ Gesture hints appear as you interact. The tooltip tries the right, left, below, 
 | Drop a clip into a DAW | Hold the primary mouse button on the waveform and drag out | Hold the primary mouse button on the waveform and drag out | The hint shows **Drag and Drop**. Once ready, drop the WAV onto the REAPER timeline, FL Studio Playlist, or another WAV drop target. |
 | Choose both ends | Hold `Ctrl` and drag across the waveform | Hold `Option` and drag across the waveform | The hint shows **Drag to Select**. Release to keep the selection, then release the modifier and click or drag the highlighted range. |
 
-When you finish selecting a range, Backtracking prepares its WAV so you can drag it next. The first export and clips that need resampling may take a moment to prepare. Keep the mouse button held until the file is ready to drag. If the DAW does not accept the drop, import the saved WAV from `output/`.
+When you finish selecting a range, Backtracking prepares its WAV so you can drag it next. The first export and clips that need resampling may take a moment to prepare. Keep the mouse button held until the file is ready to drag. If the DAW does not accept the drop, open the save folder and import the WAV from there.
 
 ### Arm, pause, and auto-resume capture
 
@@ -200,13 +214,15 @@ Press **Play** to arm capture or **Pause** to pause it manually. Once re-armed, 
 
 ### Clear the current recording
 
-Click the trash icon in the toolbar. It is labeled **Clear capture** on Windows desktop and **Clear captured audio** in the plug-ins. This empties the waveform, selection, and audio held in memory. If capture is armed, incoming sound starts filling the waveform again. You can find WAV files already written to `output/` in that folder.
+Click the trash icon in the toolbar. It is labeled **Clear capture** on Windows desktop and **Clear captured audio** in the plug-ins. This empties the waveform, selection, and audio held in memory. If capture is armed, incoming sound starts filling the waveform again. You can find previously exported WAVs in the save folder.
 
 ### Output location and file format
 
-In the gear menu, choose **Project folder** and select the project root. If you select `My Song`, clips go to `My Song/output/`. The application creates the subfolder as needed. Set the plug-in output folder separately from your DAW's project save location.
+In Settings, choose **Select save folder** (**選擇儲存資料夾…** in the macOS app) and select the exact WAV destination. If you select `My Song/Samples`, WAVs go directly into that folder. Previously saved destinations are carried forward.
 
-| Edition | Default output folder |
+Choose **Go to save folder** (**前往儲存資料夾** in the macOS app) to open the current destination in your system's file manager. Backtracking creates the folder first if it does not exist yet.
+
+| Edition | Default save folder |
 | --- | --- |
 | macOS desktop | `~/Backtracking/output/` |
 | Windows desktop | `%USERPROFILE%\Backtracking\output\` |
@@ -229,12 +245,12 @@ Clicking to save, exporting a selection, and dragging into a DAW all use the cur
 
 ### Save and restore settings
 
-The Windows and macOS desktop apps save your history length, auto-resume delay, background transparency, meter mode, WAV sample rate and encoding, output folder, and keep-on-top setting as you change them. Those preferences are restored the next time you open the app.
+The Windows and macOS desktop apps save your history length, auto-resume delay, background transparency, meter mode, WAV sample rate and encoding, save folder, keep-on-top setting, and waveform-only mode as you change them. Those preferences are restored the next time you open the app.
 
 - **Windows**. Settings are stored in `%LOCALAPPDATA%\Backtracking\Settings`, with `%APPDATA%\Backtracking\Settings` as a fallback when `LOCALAPPDATA` is unavailable. The app opens at its default window size and Windows places the window.
 - **macOS**. Settings are stored in the macOS user preferences. The app also restores the desktop window's size and position.
 
-For **VST3 and CLAP**, the DAW project stores each plug-in instance's history length, auto-resume delay, panel transparency, meter mode, WAV sample rate and encoding, and output folder. Save the project manually after making changes. When you reopen that project, the DAW restores each instance's settings.
+For **VST3 and CLAP**, the DAW project stores each plug-in instance's history length, auto-resume delay, panel transparency, meter mode, WAV sample rate and encoding, save folder, and waveform-only mode. Save the project manually after making changes. When you reopen that project, the DAW restores each instance's settings.
 
 ### Troubleshooting
 
@@ -244,7 +260,7 @@ For **VST3 and CLAP**, the DAW project stores each plug-in instance's history le
 | Capture stops after switching Windows playback devices | Set the new device as the default playback device, then press **Play** to reconnect. |
 | The plug-in does not appear in the DAW | Verify that the entire `.vst3` or `.clap` is in a scanned folder and that its architecture matches the DAW. Rescan using the steps below. |
 | A WAV saves but the DAW refuses the drop | Wait for export to finish and drop on an audio timeline or Playlist. You can also drag the file from the output folder or import it manually. |
-| The WAV could not be written | Check that the waveform contains audio and choose a project folder that exists and allows writing. |
+| The WAV could not be written | Check that the waveform contains audio and choose a writable save folder. |
 
 **Offline rendering**. CLAP skips capture when the host reports offline mode. The nice-plug 0.4.2 VST3 wrapper can pass the previous processing mode to Backtracking, so an offline render may enter the capture history. Export important clips before rendering. To keep capture frozen during the render, turn off auto-resume and press **Pause** first.
 
@@ -331,11 +347,14 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 2. 將自動續錄設為 **手動／Off**。播放有聲音時確認紅燈閃爍，再按 **Pause**，確認波形停止更新。按 **Play** 重新待命，播放聲音後確認接續收錄。
 
    Set auto-resume to **Off**. Play a sound and check that the red indicator blinks. Press **Pause** and check that the waveform freezes. Press **Play**, then play audio and check that capture continues.
-3. 將 WAV 設為 44.1 kHz、24-bit PCM，框選一小段並拖進 DAW。確認存檔位置與 WAV 規格。若使用插件，分別在 VST3 和 CLAP 實例操作一次。
+3. 選擇儲存資料夾，將 WAV 設為 44.1 kHz、24-bit PCM。框選一小段並拖進 DAW，再用 **前往儲存資料夾** 確認 WAV 直接存到指定位置，且規格正確。若使用插件，分別在 VST3 和 CLAP 實例操作一次。
 
-   Set the WAV format to 44.1 kHz, 24-bit PCM. Select a short clip, drag it into the DAW, and check the file location and WAV format. For plug-in use, try a VST3 instance and a CLAP instance.
+   Choose a save folder and set the WAV format to 44.1 kHz, 24-bit PCM. Select a short clip and drag it into the DAW. Use **Go to save folder** to check that the WAV is in the selected folder and uses the chosen format. For plug-in use, try a VST3 instance and a CLAP instance.
 4. 修改一項偏好後重開桌面版，確認設定有還原。測試插件時，修改設定後先儲存 DAW 專案，再重開該專案確認。
 
    Change a preference and relaunch the desktop app to check that it is restored. For the plug-in, change a setting, save the DAW project, and reopen it to check the saved value.
+5. 開啟 **只顯示波形**，再按右鍵開啟設定並取消勾選，確認可回到完整介面。
+
+   Turn on **Show waveform only**, then open Settings with a right-click and turn it off to restore the full interface.
 
 [回到專案首頁 / Back to the project README](../README.md)

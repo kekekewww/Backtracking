@@ -165,6 +165,7 @@ dependencies = [
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "open",
  "raw-window-handle",
  "rfd",
 ]
@@ -2001,6 +2002,7 @@ version = "5.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d8c8b8e725ad26404d6896eb2f064294a0a7b4f1d9120210d85544684c4ca95"
 dependencies = [
+ "dunce",
  "is-wsl",
  "libc",
 ]
