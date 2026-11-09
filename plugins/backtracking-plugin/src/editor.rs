@@ -22,6 +22,9 @@ use nice_plug_egui::{
 use crate::session::Session;
 use crate::settings::{MeterMode, SessionSettings, TRANSPARENCY_LEVELS};
 
+#[cfg(target_os = "windows")]
+mod win_drag;
+
 const BINS: usize = 512;
 const REFRESH: Duration = Duration::from_millis(80);
 const RECORDING_BLINK: Duration = Duration::from_millis(500);
@@ -64,6 +67,8 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
             exported: None,
             revision: 0,
             native_dragging: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "windows")]
+            drag_errors: None,
             message: String::new(),
         },
     )
@@ -89,6 +94,8 @@ pub struct CaptureUi {
     exported: Option<ExportedWav>,
     revision: u64,
     native_dragging: Arc<AtomicBool>,
+    #[cfg(target_os = "windows")]
+    drag_errors: Option<std::sync::mpsc::Receiver<String>>,
     message: String,
 }
 
@@ -196,6 +203,19 @@ impl NiceEguiApp for CaptureUi {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame) {
+        #[cfg(target_os = "windows")]
+        if let Some(errors) = &self.drag_errors {
+            use std::sync::mpsc::TryRecvError;
+
+            match errors.try_recv() {
+                Ok(error) => {
+                    self.message = format!("WAV saved. Could not drag file: {error}");
+                    self.drag_errors = None;
+                }
+                Err(TryRecvError::Disconnected) => self.drag_errors = None,
+                Err(TryRecvError::Empty) => (),
+            }
+        }
         let mut settings = self.session.settings();
         if let Some(previous) = &self.displayed_settings {
             let retention_changed = previous.retention != settings.retention;
@@ -1088,23 +1108,14 @@ impl CaptureUi {
 
     #[cfg(target_os = "windows")]
     fn start_native_drag(&mut self, frame: &Frame, path: PathBuf, _origin: Pos2) {
-        let session = Arc::clone(&self.session);
-        let dragging = Arc::clone(&self.native_dragging);
-        dragging.store(true, Ordering::Release);
-        let result = drag::start_drag(
+        match win_drag::schedule(
             frame.baseview_window(),
-            drag::DragItem::Files(vec![path]),
-            drag::Image::Raw(DRAG_ICON.to_vec()),
-            move |_, _| {
-                session.end_waveform_gesture();
-                dragging.store(false, Ordering::Release);
-            },
-            drag::Options::default(),
-        );
-        if let Err(error) = result {
-            self.native_dragging.store(false, Ordering::Release);
-            self.session.end_waveform_gesture();
-            self.message = format!("Could not start file drag: {error}");
+            path,
+            Arc::clone(&self.session),
+            Arc::clone(&self.native_dragging),
+        ) {
+            Ok(errors) => self.drag_errors = Some(errors),
+            Err(error) => self.message = format!("WAV saved. Could not drag file: {error}"),
         }
     }
 
@@ -1222,7 +1233,7 @@ fn position_in_audio(rect: Rect, x: f32) -> f32 {
 }
 
 // A small RGBA PNG waveform preview for the native file-drag cursor.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
 const DRAG_ICON: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0x18, 0x08, 0x06, 0x00, 0x00, 0x00, 0xed, 0x69, 0x4d,
