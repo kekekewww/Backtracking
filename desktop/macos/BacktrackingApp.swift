@@ -109,12 +109,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     private func configurePanel() {
         let window = CapturePanel(
-            contentRect: NSRect(x: 0, y: 0, width: 590, height: 164),
+            contentRect: NSRect(x: 0, y: 0, width: 590, height: 132),
             styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
         window.title = "Backtracking"
-        window.contentMinSize = NSSize(width: 560, height: 150)
+        window.contentMinSize = NSSize(width: 560, height: 120)
         window.delegate = self
         window.becomesKeyOnlyIfNeeded = true
         window.isFloatingPanel = true
@@ -161,11 +161,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         statusLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let helpLabel = NSTextField(labelWithString: "點擊存到最新處　拖曳送入 DAW　⌥／⌃＋拖曳框選")
-        helpLabel.font = .systemFont(ofSize: 11)
-        helpLabel.textColor = .secondaryLabelColor
-
-        let stack = NSStackView(views: [controls, waveform, statusLabel, helpLabel])
+        let stack = NSStackView(views: [controls, waveform, statusLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 6
@@ -280,6 +276,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     @objc private func tick(_: Timer) {
+        waveform?.refreshHintModifiers()
         if let core = tap?.core, !paused {
             bt_poll(core)
             refreshWaveform()
@@ -355,6 +352,8 @@ private final class WaveformView: NSView, NSDraggingSource {
     private var selection: ClosedRange<Double>?
     private var anchor: Double?
     private var hover: Double?
+    private var pointer: NSPoint?
+    private var selectionModifierDown = false
     private var pointerArea: NSTrackingArea?
     private var mouseDownEvent: NSEvent?
     private var dragRequested = false
@@ -371,7 +370,7 @@ private final class WaveformView: NSView, NSDraggingSource {
         if let pointerArea { removeTrackingArea(pointerArea) }
         let area = NSTrackingArea(
             rect: .zero,
-            options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect, .enabledDuringMouseDrag],
             owner: self, userInfo: nil
         )
         addTrackingArea(area)
@@ -410,22 +409,50 @@ private final class WaveformView: NSView, NSDraggingSource {
         return Double(min(1, max(0, (position - bounds.minX) / max(1, bounds.width))))
     }
 
+    private func selectionModifier(_ flags: NSEvent.ModifierFlags) -> Bool {
+        flags.contains(.option) || flags.contains(.control)
+    }
+
+    func refreshHintModifiers() {
+        guard pointer != nil, anchor == nil, mouseDownEvent == nil, !dragging else { return }
+        let isDown = selectionModifier(NSEvent.modifierFlags)
+        guard isDown != selectionModifierDown else { return }
+        selectionModifierDown = isDown
+        needsDisplay = true
+    }
+
+    private func trackPointer(_ event: NSEvent) {
+        let position = convert(event.locationInWindow, from: nil)
+        pointer = bounds.contains(position) ? position : nil
+        selectionModifierDown = selectionModifier(event.modifierFlags)
+        needsDisplay = true
+    }
+
+    private func trackDragPointer() {
+        guard let window else { return }
+        let position = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        pointer = bounds.contains(position) ? position : nil
+        needsDisplay = true
+    }
+
     override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
 
     override func mouseMoved(with event: NSEvent) {
         hover = normalized(event)
-        needsDisplay = true
+        trackPointer(event)
     }
 
     override func mouseExited(with event: NSEvent) {
         hover = nil
+        pointer = nil
         needsDisplay = true
     }
 
     override func mouseDown(with event: NSEvent) {
         guard !dragging, let controller else { return }
+        trackPointer(event)
         controller.beginEditing()
-        if event.modifierFlags.contains(.option) || event.modifierFlags.contains(.control) {
+        if selectionModifierDown {
             clearSelection()
             anchor = normalized(event)
             selection = anchor.map { $0...$0 }
@@ -448,6 +475,7 @@ private final class WaveformView: NSView, NSDraggingSource {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        trackPointer(event)
         if let anchor {
             let position = normalized(event)
             selection = min(anchor, position)...max(anchor, position)
@@ -467,6 +495,7 @@ private final class WaveformView: NSView, NSDraggingSource {
     }
 
     override func mouseUp(with event: NSEvent) {
+        trackPointer(event)
         if anchor != nil {
             mouseDragged(with: event)
             anchor = nil
@@ -495,6 +524,7 @@ private final class WaveformView: NSView, NSDraggingSource {
             guard let self, self.exportVersion == version else { return }
             self.preparingFile = false
             self.readyFile = url
+            self.needsDisplay = true
             self.tryStartDrag()
         }
     }
@@ -517,11 +547,65 @@ private final class WaveformView: NSView, NSDraggingSource {
 
     func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { true }
 
+    func draggingSession(_ session: NSDraggingSession, movedTo screenPoint: NSPoint) {
+        trackDragPointer()
+    }
+
     func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
         dragging = false
         dragRequested = false
         mouseDownEvent = nil
+        trackDragPointer()
         controller?.endEditing()
+    }
+
+    private func drawActionHint() {
+        guard frames != 0, let pointer, bounds.contains(pointer) else { return }
+        let action: String
+        if anchor != nil {
+            action = "[Drag to Select]"
+        } else if mouseDownEvent != nil || dragging {
+            action = "[Drag and Drop]"
+        } else if selectionModifierDown {
+            action = "[Drag to Select]"
+        } else if selection != nil || readyFile != nil {
+            action = "[Drag and Drop]   [Option + Click]"
+        } else {
+            action = "[Click]   [Option + Click]"
+        }
+
+        let label = NSAttributedString(string: action, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .medium),
+            .foregroundColor: NSColor.white
+        ])
+        let textSize = label.size()
+        let width = ceil(textSize.width) + 14
+        let height = ceil(textSize.height) + 8
+        let area = bounds.insetBy(dx: 4, dy: 4)
+        guard area.width >= width, area.height >= height else { return }
+
+        let gap: CGFloat = 16
+        let centeredX = min(max(pointer.x - width / 2, area.minX), area.maxX - width)
+        let centeredY = min(max(pointer.y - height / 2, area.minY), area.maxY - height)
+        let candidates = [
+            NSRect(x: pointer.x + gap, y: centeredY, width: width, height: height),
+            NSRect(x: pointer.x - gap - width, y: centeredY, width: width, height: height),
+            NSRect(x: centeredX, y: pointer.y - gap - height, width: width, height: height),
+            NSRect(x: centeredX, y: pointer.y + gap, width: width, height: height)
+        ]
+        let rect = candidates.first { area.contains($0) } ?? NSRect(
+            x: min(max(pointer.x + gap, area.minX), area.maxX - width),
+            y: centeredY,
+            width: width,
+            height: height
+        )
+        let bubble = NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5)
+        NSColor(calibratedRed: 0.09, green: 0.13, blue: 0.17, alpha: 0.96).setFill()
+        bubble.fill()
+        NSColor.white.withAlphaComponent(0.20).setStroke()
+        bubble.lineWidth = 1
+        bubble.stroke()
+        label.draw(at: NSPoint(x: rect.minX + 7, y: rect.minY + 4))
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -574,6 +658,7 @@ private final class WaveformView: NSView, NSDraggingSource {
             let size = label.size()
             label.draw(at: NSPoint(x: bounds.width - size.width - 7, y: bounds.height - size.height - 4))
         }
+        drawActionHint()
         NSGraphicsContext.restoreGraphicsState()
     }
 }

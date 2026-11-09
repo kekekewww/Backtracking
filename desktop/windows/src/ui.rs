@@ -23,8 +23,8 @@ const IDLE: Color32 = Color32::from_rgb(246, 196, 118);
 pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([610.0, 190.0])
-            .with_min_inner_size([510.0, 172.0])
+            .with_inner_size([610.0, 166.0])
+            .with_min_inner_size([510.0, 152.0])
             .with_always_on_top(),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
@@ -95,7 +95,7 @@ impl Recorder {
             export_again: false,
             clip_revision: 0,
             exported: None,
-            message: "48 kHz / 32-bit float WAV".into(),
+            message: String::new(),
         }
     }
 
@@ -458,6 +458,54 @@ impl Recorder {
             );
         }
     }
+
+    fn draw_action_hint(&self, ui: &egui::Ui, response: &egui::Response) {
+        if self.seconds <= 0.0 || !response.contains_pointer() {
+            return;
+        }
+        let (position, modifier) = ui.input(|input| {
+            (
+                input.pointer.hover_pos(),
+                input.modifiers.ctrl || input.modifiers.alt,
+            )
+        });
+        let Some(position) = position.filter(|point| response.rect.contains(*point)) else {
+            return;
+        };
+        let hint = match self.gesture {
+            Some(Gesture::Select { .. }) => "[Drag to Select]",
+            Some(Gesture::Export { .. }) => "[Drag and Drop]",
+            None if modifier => "[Drag to Select]",
+            None if self.exported.is_some() || self.explicit_clip => {
+                "[Drag and Drop]   [Ctrl + Click]"
+            }
+            None => "[Click]   [Ctrl + Click]",
+        };
+        let bounds = ui.ctx().content_rect().shrink(5.0);
+        let painter = ui.painter().with_clip_rect(bounds);
+        let foreground = Color32::from_rgb(234, 243, 240);
+        let text = painter.layout_no_wrap(
+            hint.to_owned(),
+            egui::FontId::proportional(12.0),
+            foreground,
+        );
+        let padding = Vec2::new(9.0, 5.0);
+        let size = text.size() + padding * 2.0;
+        let [x, y] = waveform::hint_position(
+            [position.x, position.y],
+            [size.x, size.y],
+            [bounds.left(), bounds.top(), bounds.right(), bounds.bottom()],
+        );
+        let bubble = Rect::from_min_size(Pos2::new(x, y), size);
+        painter.rect(
+            bubble,
+            5.0,
+            Color32::from_rgb(36, 47, 47),
+            Stroke::new(1.0, Color32::from_rgb(67, 89, 83)),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(bubble.min + padding, text, foreground);
+    }
 }
 
 impl eframe::App for Recorder {
@@ -496,16 +544,18 @@ impl eframe::App for Recorder {
             self.refresh_waveform();
             let size = Vec2::new(
                 ui.available_width(),
-                (ui.available_height() - 39.0).max(46.0),
+                (ui.available_height() - 26.0).max(46.0),
             );
             let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
             self.interact_waveform(ui, frame, &response);
             self.draw_waveform(ui, rect);
-            response.on_hover_cursor(egui::CursorIcon::Grab);
-            ui.small("Click to save · Drag WAV out · Ctrl + drag to select");
             let status = self.controller.error().unwrap_or(&self.message);
-            ui.add(egui::Label::new(status).truncate())
-                .on_hover_text(status);
+            if !status.is_empty() {
+                ui.add(egui::Label::new(status).truncate())
+                    .on_hover_text(status);
+            }
+            self.draw_action_hint(ui, &response);
+            response.on_hover_cursor(egui::CursorIcon::Grab);
         });
     }
 }

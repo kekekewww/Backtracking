@@ -29,7 +29,7 @@ pub type CaptureEditor = EguiEditor<CaptureUi>;
 
 pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
     create_egui_editor(
-        EguiEditorState::from_size(LogicalSize::new(640.0, 232.0), 1.0),
+        EguiEditorState::from_size(LogicalSize::new(640.0, 212.0), 1.0),
         RepaintNotifier::new(),
         EguiNiceSettings::new().with_tile("Backtracking"),
         CaptureUi {
@@ -47,7 +47,7 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
             exported: None,
             revision: 0,
             native_dragging: Arc::new(AtomicBool::new(false)),
-            message: "Exports are saved as 48 kHz / 32-bit float WAV.".into(),
+            message: String::new(),
         },
     )
 }
@@ -171,29 +171,35 @@ impl NiceEguiApp for CaptureUi {
             }
         });
 
+        let dropped = self.session.dropped_frames();
+        let status_is_visible = dropped != 0 || !self.message.is_empty();
+        let status_height = if status_is_visible {
+            ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y
+        } else {
+            0.0
+        };
         let wave_size = Vec2::new(
             ui.available_width(),
-            (ui.available_height() - 44.0).max(60.0),
+            (ui.available_height() - status_height).max(60.0),
         );
         let (rect, response) = ui.allocate_exact_size(wave_size, Sense::click_and_drag());
         let configured_seconds = settings.retention.seconds() as f32;
         self.interact_waveform(ui, frame, rect, configured_seconds);
         self.draw_waveform(ui, rect, configured_seconds);
+        self.draw_action_hint(ui, rect);
         response.on_hover_cursor(CursorIcon::Grab);
 
-        ui.small(if cfg!(target_os = "macos") {
-            "Click to save · Drag WAV out · Option + drag to select a range"
-        } else {
-            "Click to save · Drag WAV out · Ctrl + drag to select a range"
-        });
-        let dropped = self.session.dropped_frames();
-        if dropped == 0 {
-            ui.add(egui::Label::new(&self.message).truncate())
-                .on_hover_text(&self.message);
-        } else {
-            let status = format!("Dropped {dropped} audio frames · {}", self.message);
+        if dropped != 0 {
+            let mut status = format!("Dropped {dropped} audio frames");
+            if !self.message.is_empty() {
+                status.push_str(" · ");
+                status.push_str(&self.message);
+            }
             ui.add(egui::Label::new(&status).truncate())
                 .on_hover_text(status);
+        } else if status_is_visible {
+            ui.add(egui::Label::new(&self.message).truncate())
+                .on_hover_text(&self.message);
         }
         ui.ctx()
             .request_repaint_after(if self.gesture.is_some() || self.export.is_some() {
@@ -321,6 +327,67 @@ impl CaptureUi {
                 wave_stroke,
             );
         }
+    }
+
+    fn draw_action_hint(&self, ui: &egui::Ui, rect: Rect) {
+        if self.seconds <= 0.0 || self.native_dragging.load(Ordering::Acquire) {
+            return;
+        }
+        let (cursor, down, modifier) = ui.input(|input| {
+            (
+                input.pointer.hover_pos(),
+                input.pointer.button_down(PointerButton::Primary),
+                input.modifiers.alt || input.modifiers.ctrl,
+            )
+        });
+        let visible_waveform = rect.intersect(ui.clip_rect());
+        let Some(cursor) = cursor.filter(|cursor| visible_waveform.contains(*cursor)) else {
+            return;
+        };
+        let hint = match &self.gesture {
+            Some(Gesture::Select { .. }) => "[Drag to Select]".into(),
+            Some(Gesture::Drag { .. }) => "[Drag and Drop]".into(),
+            None if down => return,
+            None if modifier => "[Drag to Select]".into(),
+            None => {
+                let action = if self.exported.is_some() || self.selection.is_some() {
+                    "[Drag and Drop]"
+                } else {
+                    "[Click]"
+                };
+                let selection = if cfg!(target_os = "macos") {
+                    "[Option + Click]"
+                } else {
+                    "[Ctrl + Click]"
+                };
+                format!("{action}\n{selection}")
+            }
+        };
+
+        let bounds = visible_waveform.shrink(2.0);
+        let painter = ui.painter_at(bounds);
+        let color = Color32::from_rgb(232, 242, 238);
+        let label = painter.layout_no_wrap(hint, egui::FontId::proportional(12.0), color);
+        let padding = Vec2::new(8.0, 5.0);
+        let size = label.size() + 2.0 * padding;
+        let [left, top] = waveform::hint_position(
+            [cursor.x, cursor.y],
+            [size.x, size.y],
+            [bounds.left(), bounds.top(), bounds.right(), bounds.bottom()],
+        );
+        let background = Rect::from_min_size(Pos2::new(left, top), size);
+        painter.rect_filled(
+            background,
+            5.0,
+            Color32::from_rgba_unmultiplied(33, 41, 46, 245),
+        );
+        painter.rect_stroke(
+            background,
+            5.0,
+            Stroke::new(1.0, Color32::from_rgb(65, 81, 82)),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(background.min + padding, label, color);
     }
 
     fn interact_waveform(&mut self, ui: &egui::Ui, frame: &Frame, rect: Rect, seconds: f32) {
