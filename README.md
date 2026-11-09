@@ -19,6 +19,8 @@ Backtracking 是給作曲與混音用的回溯錄音取樣器。聽到想留下�
 3. 將游標移到要取樣的起點。點擊可存檔，按住拖曳可把 WAV 送入 DAW。Windows 用 `Ctrl`、macOS 用 `Option` 加拖曳可框選起訖點。
 4. 操作波形時會暫停錄音。完成後按 **繼續錄音／Resume**，或使用 10、20、30 秒的閒置自動續錄。
 
+點擊工具列的齒輪，可調整保留時間、自動續錄與專案資料夾。Windows 和 macOS 桌面版可直接在工具列切換置頂。
+
 匯出為 **48 kHz、32-bit float WAV**。指定專案資料夾後，檔案會存到它的 `output/` 子目錄。
 
 [完整操作手冊](docs/USER_GUIDE.md#繁體中文) · [安裝與建置](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
@@ -39,6 +41,8 @@ Backtracking is a retrospective audio sampler for music production and mixing. W
 2. Play some audio. The waveform keeps the last 10, 20, or 30 seconds of captured sound and holds its position through long gaps.
 3. Point to the start of the clip. Click to save, or hold and drag the WAV into your DAW. To set both ends, hold `Ctrl` on Windows or `Option` on macOS while dragging across the waveform.
 4. Working with the waveform pauses capture. Choose **Resume** when finished or set it to resume after 10, 20, or 30 seconds of inactivity.
+
+Click the gear in the toolbar to set the history length, auto-resume delay, and project folder. On Windows and macOS, use **Keep on top** directly from the desktop toolbar.
 
 Exports are **48 kHz, 32-bit float WAV** files. After you choose a project folder, files go into its `output/` subfolder.
 

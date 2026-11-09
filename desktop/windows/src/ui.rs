@@ -23,8 +23,8 @@ const IDLE: Color32 = Color32::from_rgb(246, 196, 118);
 pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([610.0, 166.0])
-            .with_min_inner_size([510.0, 152.0])
+            .with_inner_size([610.0, 144.0])
+            .with_min_inner_size([510.0, 132.0])
             .with_always_on_top(),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
@@ -33,10 +33,24 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
         "Backtracking",
         options,
         Box::new(|context| {
-            context.egui_ctx.set_visuals(egui::Visuals::dark());
+            configure_style(&context.egui_ctx);
             Ok(Box::new(Recorder::new(controller)))
         }),
     )
+}
+
+fn configure_style(ctx: &egui::Context) {
+    ctx.set_visuals(egui::Visuals::dark());
+    let mut fonts = egui::FontDefinitions::default();
+    let name = waveform::HINT_BOLD_FAMILY;
+    fonts.font_data.insert(
+        name.to_owned(),
+        Arc::new(egui::FontData::from_static(waveform::HINT_BOLD_FONT)),
+    );
+    fonts
+        .families
+        .insert(egui::FontFamily::Name(name.into()), vec![name.to_owned()]);
+    ctx.set_fonts(fonts);
 }
 
 struct Recorder {
@@ -136,7 +150,7 @@ impl Recorder {
         }
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+    fn controls(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) -> bool {
         ui.horizontal(|ui| {
             ui.heading("Backtracking");
             let (status, color) = if self.controller.error().is_some() {
@@ -167,60 +181,98 @@ impl Recorder {
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
             }
-        });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.settings_button(ui, frame)
+            })
+            .inner
+        })
+        .inner
+    }
 
-        ui.horizontal(|ui| {
-            let mut retention = self.controller.retention();
-            egui::ComboBox::from_id_salt("retention")
-                .selected_text(format!("History: {} s", retention.seconds()))
-                .show_ui(ui, |ui| {
-                    for value in DURATIONS {
-                        ui.selectable_value(
-                            &mut retention,
-                            value,
-                            format!("{} s", value.seconds()),
-                        );
-                    }
-                });
-            if retention != self.controller.retention() {
-                self.controller.set_retention(retention);
-                self.clear_snapshot();
+    fn settings_button(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) -> bool {
+        let response = ui
+            .add(egui::Button::new("").min_size(Vec2::splat(24.0)))
+            .on_hover_text("Settings");
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Settings"));
+        let center = response.rect.center();
+        let color = ui.style().interact(&response).fg_stroke.color;
+        let mut teeth = Vec::with_capacity(32);
+        for tooth in 0..8 {
+            for (offset, radius) in [(-0.32, 6.0), (-0.20, 8.0), (0.20, 8.0), (0.32, 6.0)] {
+                let angle = (tooth as f32 + offset) * std::f32::consts::TAU / 8.0;
+                let (sin, cos) = angle.sin_cos();
+                teeth.push(center + Vec2::new(cos, sin) * radius);
             }
+        }
+        let stroke = Stroke::new(1.2, color);
+        ui.painter().add(egui::Shape::closed_line(teeth, stroke));
+        ui.painter().circle_stroke(center, 2.6, stroke);
 
-            egui::ComboBox::from_id_salt("idle")
-                .selected_text(match self.idle_resume {
-                    Some(duration) => format!("Auto-resume: {} s", duration.seconds()),
-                    None => "Auto-resume: off".into(),
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.idle_resume, None, "Off");
-                    for value in DURATIONS {
-                        ui.selectable_value(
-                            &mut self.idle_resume,
-                            Some(value),
-                            format!("{} s", value.seconds()),
-                        );
-                    }
+        let popup = egui::Popup::menu(&response)
+            .accessible_name("Settings")
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .gap(4.0);
+        let was_open = popup.is_open();
+        let shown = popup.show(|ui| {
+            ui.set_min_width(222.0);
+            egui::Grid::new("recording-settings")
+                .spacing([10.0, 3.0])
+                .show(ui, |ui| {
+                    ui.label("History");
+                    ui.horizontal(|ui| {
+                        let mut retention = self.controller.retention();
+                        for value in DURATIONS {
+                            ui.selectable_value(
+                                &mut retention,
+                                value,
+                                format!("{} s", value.seconds()),
+                            );
+                        }
+                        if retention != self.controller.retention() {
+                            self.controller.set_retention(retention);
+                            self.clear_snapshot();
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Auto-resume");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.idle_resume, None, "Off");
+                        for value in DURATIONS {
+                            ui.selectable_value(
+                                &mut self.idle_resume,
+                                Some(value),
+                                format!("{} s", value.seconds()),
+                            );
+                        }
+                    });
+                    ui.end_row();
                 });
 
-            if ui
+            ui.separator();
+            let choose_project = ui
                 .button("Project folder…")
                 .on_hover_text(self.output.display().to_string())
-                .clicked()
-            {
-                self.controller.pause();
-                if let Some(folder) = rfd::FileDialog::new()
-                    .set_title("Choose the Backtracking project folder")
-                    .set_parent(frame)
-                    .pick_folder()
-                {
-                    self.output = folder.join("output");
-                    self.invalidate_export();
-                    self.message = format!("Output: {}", self.output.display());
-                }
-                self.last_interaction = Instant::now();
+                .clicked();
+            if choose_project {
+                ui.close();
             }
+            choose_project
         });
+
+        if shown.as_ref().is_some_and(|menu| menu.inner) {
+            self.controller.pause();
+            if let Some(folder) = rfd::FileDialog::new()
+                .set_title("Choose the Backtracking project folder")
+                .set_parent(frame)
+                .pick_folder()
+            {
+                self.output = folder.join("output");
+                self.invalidate_export();
+                self.message = format!("Output: {}", self.output.display());
+            }
+            self.last_interaction = Instant::now();
+        }
+        was_open || shown.is_some()
     }
 
     fn start_export(&mut self) {
@@ -390,7 +442,7 @@ impl Recorder {
         }
     }
 
-    fn draw_waveform(&self, ui: &egui::Ui, rect: Rect) {
+    fn draw_waveform(&self, ui: &egui::Ui, rect: Rect, preview_hover: bool) {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 6.0, Color32::from_rgb(22, 26, 29));
         let inner = rect.shrink(8.0);
@@ -418,10 +470,11 @@ impl Recorder {
             }
             Some(Gesture::Export { .. }) => self.clip.clone(),
             None if self.explicit_clip => self.clip.clone(),
-            None => ui
+            None if preview_hover => ui
                 .input(|input| input.pointer.hover_pos())
                 .filter(|position| rect.contains(*position))
                 .map(|position| fraction(audio, position.x)..1.0),
+            None => None,
         };
         let x = |fraction: f32| audio.left() + fraction * audio.width();
         if let Some(range) = &highlight {
@@ -473,20 +526,23 @@ impl Recorder {
             return;
         };
         let hint = match self.gesture {
-            Some(Gesture::Select { .. }) => "[Drag to Select]",
-            Some(Gesture::Export { .. }) => "[Drag and Drop]",
-            None if modifier => "[Drag to Select]",
+            Some(Gesture::Select { .. }) => "Drag to Select",
+            Some(Gesture::Export { .. }) => "Drag and Drop",
+            None if modifier => "Drag to Select",
             None if self.exported.is_some() || self.explicit_clip => {
-                "[Drag and Drop]   [Ctrl + Click]"
+                "Drag and Drop   ·   Ctrl + Click"
             }
-            None => "[Click]   [Ctrl + Click]",
+            None => "Click   ·   Ctrl + Click",
         };
         let bounds = ui.ctx().content_rect().shrink(5.0);
         let painter = ui.painter().with_clip_rect(bounds);
         let foreground = Color32::from_rgb(234, 243, 240);
         let text = painter.layout_no_wrap(
             hint.to_owned(),
-            egui::FontId::proportional(12.0),
+            egui::FontId::new(
+                12.0,
+                egui::FontFamily::Name(waveform::HINT_BOLD_FAMILY.into()),
+            ),
             foreground,
         );
         let padding = Vec2::new(9.0, 5.0);
@@ -540,22 +596,26 @@ impl eframe::App for Recorder {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
-            self.controls(ui, frame);
+            let menu_open = self.controls(ui, frame);
             self.refresh_waveform();
             let size = Vec2::new(
                 ui.available_width(),
                 (ui.available_height() - 26.0).max(46.0),
             );
             let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-            self.interact_waveform(ui, frame, &response);
-            self.draw_waveform(ui, rect);
+            if !menu_open {
+                self.interact_waveform(ui, frame, &response);
+            }
+            self.draw_waveform(ui, rect, !menu_open);
             let status = self.controller.error().unwrap_or(&self.message);
             if !status.is_empty() {
                 ui.add(egui::Label::new(status).truncate())
                     .on_hover_text(status);
             }
-            self.draw_action_hint(ui, &response);
-            response.on_hover_cursor(egui::CursorIcon::Grab);
+            if !menu_open {
+                self.draw_action_hint(ui, &response);
+                response.on_hover_cursor(egui::CursorIcon::Grab);
+            }
         });
     }
 }

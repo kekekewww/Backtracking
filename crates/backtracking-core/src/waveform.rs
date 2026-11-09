@@ -26,6 +26,9 @@ pub fn peaks(interleaved: &[f32], channels: usize, minimum: &mut [f32], maximum:
     }
 }
 
+pub const HINT_BOLD_FAMILY: &str = "BacktrackingHintBold";
+pub const HINT_BOLD_FONT: &[u8] = include_bytes!("../assets/OpenSans-Bold-Latin.ttf");
+
 /// Place a cursor hint in right, left, below, above order within the client area.
 /// Coordinates increase downwards. The caller clips hints larger than the area.
 pub fn hint_position(cursor: [f32; 2], size: [f32; 2], bounds: [f32; 4]) -> [f32; 2] {

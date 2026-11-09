@@ -12,7 +12,11 @@
 | 某一軌、群組或主輸出的聲音 | 把 VST3 或 CLAP 插入對應的效果鏈。插件接收該位置的 mono 或 stereo 音訊，並將音訊原樣傳給下游。 |
 | 軟體樂器加效果後的聲音 | 把插件放在樂器及要納入取樣的效果後面。若需要乾聲，就放在那些效果前面。 |
 
-Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 ASIO、獨占模式或其他直接輸出路徑，使用音軌插件可直接取得該軌訊號。macOS 桌面版首次啟動時，請依系統提示允許錄製系統音訊。桌面版可用 **置頂／Keep on top** 將視窗留在前景，插件視窗的位置則由 DAW 控制。 [Windows WASAPI](https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording) · [Apple Core Audio](https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps)
+Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 ASIO、獨占模式或其他直接輸出路徑，使用音軌插件可直接取得該軌訊號。macOS 桌面版首次啟動時，請依系統提示允許錄製系統音訊。 [Windows WASAPI](https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording) · [Apple Core Audio](https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps)
+
+### 開啟設定
+
+點擊工具列的齒輪，開啟 **設定** 選單。選單內可以調整 **保留／History／Buffer**、**自動續錄／Auto-resume** 和 **專案資料夾／Project folder**。Windows 和 macOS 桌面版的 **置頂／Keep on top** 可直接在工具列切換。插件視窗的位置由 DAW 控制。
 
 ### 讀懂波形與錄音狀態
 
@@ -28,11 +32,11 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 | 動作 | Windows | macOS | 結果 |
 | --- | --- | --- | --- |
-| 查看可用操作 | 將游標移到波形 | 將游標移到波形 | 提示會列出 `[Click]` 及 `[Ctrl + Click]` 或 `[Option + Click]`。已有選取區或 WAV 可拖曳時，主要提示會顯示 `[Drag and Drop]`。 |
-| 進入框選模式 | 游標在波形上時按住 `Ctrl` | 游標在波形上時按住 `Option` | 提示切換為 `[Drag to Select]`。 |
+| 查看可用操作 | 將游標移到波形 | 將游標移到波形 | 提示會列出 **Click** 及 **Ctrl + Click** 或 **Option + Click**。已有選取區或 WAV 可拖曳時，主要提示會顯示 **Drag and Drop**。 |
+| 進入框選模式 | 游標在波形上時按住 `Ctrl` | 游標在波形上時按住 `Option` | 提示切換為 **Drag to Select**。 |
 | 直接存檔 | 點一下波形 | 點一下波形 | 固定波形並將目前區段存成 WAV。 |
-| 匯入 DAW | 在波形上按住滑鼠左鍵並拖出 | 在波形上按住滑鼠左鍵並拖出 | 按住時顯示 `[Drag and Drop]`。檔案就緒後，拖到 REAPER 時間軸、FL Studio Playlist 或其他接受 WAV 的位置。 |
-| 指定起訖點 | 按住 `Ctrl`，在波形上按住左鍵拖曳 | 按住 `Option`，在波形上按住左鍵拖曳 | 顯示 `[Drag to Select]`。放開後保留框選區間，再放開修飾鍵並點擊或拖出選取區。 |
+| 匯入 DAW | 在波形上按住滑鼠左鍵並拖出 | 在波形上按住滑鼠左鍵並拖出 | 按住時顯示 **Drag and Drop**。檔案就緒後，拖到 REAPER 時間軸、FL Studio Playlist 或其他接受 WAV 的位置。 |
+| 指定起訖點 | 按住 `Ctrl`，在波形上按住左鍵拖曳 | 按住 `Option`，在波形上按住左鍵拖曳 | 顯示 **Drag to Select**。放開後保留框選區間，再放開修飾鍵並點擊或拖出選取區。 |
 
 完成框選後，Backtracking 會先準備選取區的 WAV，以便接著拖出。第一次匯出或需要轉換取樣率時，檔案可能需要短暫準備。拖曳時可先維持按住，等檔案可拖出再放開。若 DAW 沒有接受拖放，可以從 `output/` 直接匯入已存好的 WAV。
 
@@ -42,7 +46,7 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 ### 輸出位置與檔案規格
 
-選擇 **專案資料夾／Project folder**，指定專案根目錄。例如選擇 `My Song`，檔案會寫到 `My Song/output/`。程式會在需要時建立該子目錄。插件的資料夾由使用者選擇，與 DAW 的專案儲存位置各自設定。
+從齒輪選單選擇 **專案資料夾／Project folder**，指定專案根目錄。例如選擇 `My Song`，檔案會寫到 `My Song/output/`。程式會在需要時建立該子目錄。插件的資料夾由使用者選擇，與 DAW 的專案儲存位置各自設定。
 
 | 版本 | 未指定專案時的輸出位置 | 設定保存 |
 | --- | --- | --- |
@@ -74,7 +78,11 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 | One DAW track, a bus, or the master output | Insert the VST3 or CLAP plug-in on the relevant effects chain. It captures mono or stereo audio at that point and passes the input through unchanged. |
 | A software instrument with effects | Insert Backtracking after the instrument and any effects you want in the sample. Move it ahead of those effects to capture the dry signal. |
 
-On Windows, route the source to the default playback device. If a DAW uses ASIO, exclusive mode, or another direct output path, use the plug-in to sample its track signal. On macOS, grant system audio recording permission when the desktop app first prompts you. Enable **Keep on top** to keep the desktop recorder visible over other apps. The DAW controls the plug-in window. [Windows WASAPI](https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording) · [Apple Core Audio](https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps)
+On Windows, route the source to the default playback device. If a DAW uses ASIO, exclusive mode, or another direct output path, use the plug-in to sample its track signal. On macOS, grant system audio recording permission when the desktop app first prompts you. [Windows WASAPI](https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording) · [Apple Core Audio](https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps)
+
+### Open settings
+
+Click the gear in the toolbar to open **Settings**. The menu contains **History / Buffer**, **Auto-resume**, and **Project folder**. In the Windows and macOS desktop apps, you can toggle **Keep on top** directly from the toolbar. The DAW controls the plug-in window.
 
 ### Read the waveform and capture status
 
@@ -90,11 +98,11 @@ Point at the waveform to preview a clip running from the pointer to the newest a
 
 | Action | Windows | macOS | Result |
 | --- | --- | --- | --- |
-| See the available actions | Hover over the waveform | Hover over the waveform | The hint shows `[Click]` alongside `[Ctrl + Click]` or `[Option + Click]`. If a selection or WAV is ready to drag, the main hint changes to `[Drag and Drop]`. |
-| Enter selection mode | Hold `Ctrl` over the waveform | Hold `Option` over the waveform | The hint changes to `[Drag to Select]`. |
+| See the available actions | Hover over the waveform | Hover over the waveform | The hint shows **Click** alongside **Ctrl + Click** or **Option + Click**. If a selection or WAV is ready to drag, the main hint changes to **Drag and Drop**. |
+| Enter selection mode | Hold `Ctrl` over the waveform | Hold `Option` over the waveform | The hint changes to **Drag to Select**. |
 | Save the clip | Click the waveform | Click the waveform | Capture pauses and the current clip is saved as a WAV. |
-| Drop a clip into a DAW | Hold the primary mouse button on the waveform and drag out | Hold the primary mouse button on the waveform and drag out | The hint shows `[Drag and Drop]`. Once ready, drop the WAV onto the REAPER timeline, FL Studio Playlist, or another WAV drop target. |
-| Choose both ends | Hold `Ctrl` and drag across the waveform | Hold `Option` and drag across the waveform | The hint shows `[Drag to Select]`. Release to keep the selection, then release the modifier and click or drag the highlighted range. |
+| Drop a clip into a DAW | Hold the primary mouse button on the waveform and drag out | Hold the primary mouse button on the waveform and drag out | The hint shows **Drag and Drop**. Once ready, drop the WAV onto the REAPER timeline, FL Studio Playlist, or another WAV drop target. |
+| Choose both ends | Hold `Ctrl` and drag across the waveform | Hold `Option` and drag across the waveform | The hint shows **Drag to Select**. Release to keep the selection, then release the modifier and click or drag the highlighted range. |
 
 When you finish selecting a range, Backtracking prepares its WAV so you can drag it next. The first export and clips that need resampling may take a moment to prepare. Keep the mouse button held until the file is ready to drag. If the DAW does not accept the drop, import the saved WAV from `output/`.
 
@@ -104,7 +112,7 @@ Choose **Resume** to arm capture again. The existing audio stays in the rolling 
 
 ### Output location and file format
 
-Choose **Project folder** and select the project root. If you select `My Song`, clips go to `My Song/output/`. The application creates the subfolder as needed. Set the plug-in output folder separately from your DAW's project save location.
+In the gear menu, choose **Project folder** and select the project root. If you select `My Song`, clips go to `My Song/output/`. The application creates the subfolder as needed. Set the plug-in output folder separately from your DAW's project save location.
 
 | Edition | Default output folder | Settings |
 | --- | --- | --- |

@@ -130,30 +130,21 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         waveform.heightAnchor.constraint(greaterThanOrEqualToConstant: 51).isActive = true
         self.waveform = waveform
 
-        let historyPicker = NSPopUpButton(frame: .zero, pullsDown: false)
-        historyPicker.addItems(withTitles: timeChoices.map { "\($0) 秒" })
-        historyPicker.selectItem(at: timeChoices.firstIndex(of: history) ?? 1)
-        historyPicker.target = self
-        historyPicker.action = #selector(historyChanged(_:))
-
-        let idlePicker = NSPopUpButton(frame: .zero, pullsDown: false)
-        idlePicker.addItems(withTitles: ["手動"] + timeChoices.map { "\($0) 秒" })
-        idlePicker.selectItem(at: ([0] + timeChoices).firstIndex(of: idleSeconds) ?? 0)
-        idlePicker.target = self
-        idlePicker.action = #selector(idleChanged(_:))
-
         resumeButton.target = self
         resumeButton.action = #selector(resume)
         resumeButton.bezelStyle = .rounded
-        let outputButton = NSButton(title: "專案資料夾", target: self, action: #selector(chooseOutput))
-        outputButton.bezelStyle = .rounded
         let pinButton = NSButton(checkboxWithTitle: "置頂", target: self, action: #selector(pinChanged(_:)))
         pinButton.state = .on
-
-        let controls = NSStackView(views: [
-            resumeButton, NSTextField(labelWithString: "保留"), historyPicker,
-            NSTextField(labelWithString: "自動續錄"), idlePicker, pinButton, outputButton
-        ])
+        let settingsButton = NSButton(title: "設定", target: self, action: #selector(showSettings(_:)))
+        settingsButton.bezelStyle = .rounded
+        settingsButton.toolTip = "設定"
+        if let gear = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "設定") {
+            settingsButton.image = gear
+            settingsButton.imagePosition = .imageOnly
+        }
+        let spacer = NSView(frame: .zero)
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let controls = NSStackView(views: [resumeButton, spacer, pinButton, settingsButton])
         controls.orientation = .horizontal
         controls.spacing = 6
         controls.alignment = .centerY
@@ -173,6 +164,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
+            controls.widthAnchor.constraint(equalTo: stack.widthAnchor),
             waveform.widthAnchor.constraint(equalTo: stack.widthAnchor),
             statusLabel.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
@@ -183,12 +175,41 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         window.orderFrontRegardless()
     }
 
-    @objc private func historyChanged(_ sender: NSPopUpButton) {
-        let index = sender.indexOfSelectedItem
-        guard timeChoices.indices.contains(index) else { return }
-        let selected = timeChoices[index]
+    @objc private func showSettings(_ sender: NSButton) {
+        let menu = NSMenu(title: "設定")
+        menu.addItem(timeMenu(
+            title: "保留時間", choices: timeChoices, selected: history,
+            action: #selector(historyChanged(_:))
+        ))
+        menu.addItem(timeMenu(
+            title: "自動續錄", choices: [0] + timeChoices, selected: idleSeconds,
+            action: #selector(idleChanged(_:))
+        ))
+        let outputItem = NSMenuItem(title: "專案資料夾…", action: #selector(chooseOutput), keyEquivalent: "")
+        outputItem.target = self
+        menu.addItem(outputItem)
+        let below = sender.isFlipped ? sender.bounds.maxY + 3 : sender.bounds.minY - 3
+        _ = menu.popUp(positioning: nil, at: NSPoint(x: sender.bounds.minX, y: below), in: sender)
+    }
+
+    private func timeMenu(title: String, choices: [UInt32], selected: UInt32, action: Selector) -> NSMenuItem {
+        let section = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: title)
+        for seconds in choices {
+            let item = NSMenuItem(title: seconds == 0 ? "手動" : "\(seconds) 秒", action: action, keyEquivalent: "")
+            item.tag = Int(seconds)
+            item.target = self
+            item.state = seconds == selected ? .on : .off
+            submenu.addItem(item)
+        }
+        section.submenu = submenu
+        return section
+    }
+
+    @objc private func historyChanged(_ sender: NSMenuItem) {
+        guard let selected = UInt32(exactly: sender.tag), timeChoices.contains(selected) else { return }
+        registerClick()
         if let core = tap?.core, bt_set_history(core, selected) != 1 {
-            sender.selectItem(at: timeChoices.firstIndex(of: history) ?? 1)
             setNotice("無法調整保留時間")
             return
         }
@@ -198,10 +219,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         refreshWaveform()
     }
 
-    @objc private func idleChanged(_ sender: NSPopUpButton) {
-        let choices: [UInt32] = [0] + timeChoices
-        guard choices.indices.contains(sender.indexOfSelectedItem) else { return }
-        idleSeconds = choices[sender.indexOfSelectedItem]
+    @objc private func idleChanged(_ sender: NSMenuItem) {
+        guard let selected = UInt32(exactly: sender.tag), selected == 0 || timeChoices.contains(selected) else { return }
+        idleSeconds = selected
         defaults.set(Int(idleSeconds), forKey: "idleSeconds")
         registerClick()
     }
@@ -563,19 +583,19 @@ private final class WaveformView: NSView, NSDraggingSource {
         guard frames != 0, let pointer, bounds.contains(pointer) else { return }
         let action: String
         if anchor != nil {
-            action = "[Drag to Select]"
+            action = "Drag to Select"
         } else if mouseDownEvent != nil || dragging {
-            action = "[Drag and Drop]"
+            action = "Drag and Drop"
         } else if selectionModifierDown {
-            action = "[Drag to Select]"
+            action = "Drag to Select"
         } else if selection != nil || readyFile != nil {
-            action = "[Drag and Drop]   [Option + Click]"
+            action = "Drag and Drop   Option + Click"
         } else {
-            action = "[Click]   [Option + Click]"
+            action = "Click   Option + Click"
         }
 
         let label = NSAttributedString(string: action, attributes: [
-            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .medium),
+            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .bold),
             .foregroundColor: NSColor.white
         ])
         let textSize = label.size()
