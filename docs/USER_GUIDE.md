@@ -38,13 +38,15 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 ### 點擊、框選與拖曳
 
-將游標放在波形上，介面會預覽從游標到最新音訊的區段。若已有框選，操作會使用框選區間。波形的提示只在相關操作時出現。介面會依右、左、下、上的順序尋找可以放下提示的位置，並將提示留在視窗內。
+未框選時，將游標移到波形上會預覽整段保留音訊。從波形任意位置點擊或開始拖曳，都會匯出這整段音訊。例如保留時間設為 20 秒，錄滿時匯出 20 秒，目前只收錄 7 秒時就匯出 7 秒。若已有框選，預覽與匯出都使用框選區間。
+
+波形的提示只在相關操作時出現。介面會依右、左、下、上的順序尋找可以放下提示的位置，並將提示留在視窗內。
 
 | 動作 | Windows | macOS | 結果 |
 | --- | --- | --- | --- |
 | 查看可用操作 | 將游標移到波形 | 將游標移到波形 | 提示會列出 **Click** 及 **Ctrl + Click** 或 **Option + Click**。已有選取區或 WAV 可拖曳時，主要提示會顯示 **Drag and Drop**。 |
 | 進入框選模式 | 游標在波形上時按住 `Ctrl` | 游標在波形上時按住 `Option` | 提示切換為 **Drag to Select**。 |
-| 直接存檔 | 點一下波形 | 點一下波形 | 固定波形並將目前區段存成 WAV。 |
+| 直接存檔 | 點一下波形 | 點一下波形 | 固定波形並存成 WAV。未框選時存下整段保留音訊。 |
 | 匯入 DAW | 在波形上按住滑鼠左鍵並拖出 | 在波形上按住滑鼠左鍵並拖出 | 按住時顯示 **Drag and Drop**。檔案就緒後，拖到 REAPER 時間軸、FL Studio Playlist 或其他接受 WAV 的位置。 |
 | 指定起訖點 | 按住 `Ctrl`，在波形上按住左鍵拖曳 | 按住 `Option`，在波形上按住左鍵拖曳 | 顯示 **Drag to Select**。放開後保留框選區間，再放開修飾鍵並點擊或拖出選取區。 |
 
@@ -114,13 +116,15 @@ Drag the native title bar to move the window or drag its border to resize it. Yo
 
 ### Click, select, and drag
 
-Point at the waveform to preview a clip running from the pointer to the newest audio. An explicit selection takes precedence. Gesture hints appear as you interact. The tooltip tries the right, left, below, and above in that order and stays within the interface.
+With no selection, hover over the waveform to preview all retained audio. Clicking or starting a drag anywhere on the waveform exports that full range. For example, a full 20-second buffer exports 20 seconds. If only 7 seconds have been captured, the WAV is 7 seconds long. An explicit selection sets the range for both preview and export.
+
+Gesture hints appear as you interact. The tooltip tries the right, left, below, and above in that order and stays within the interface.
 
 | Action | Windows | macOS | Result |
 | --- | --- | --- | --- |
 | See the available actions | Hover over the waveform | Hover over the waveform | The hint shows **Click** alongside **Ctrl + Click** or **Option + Click**. If a selection or WAV is ready to drag, the main hint changes to **Drag and Drop**. |
 | Enter selection mode | Hold `Ctrl` over the waveform | Hold `Option` over the waveform | The hint changes to **Drag to Select**. |
-| Save the clip | Click the waveform | Click the waveform | Capture pauses and the current clip is saved as a WAV. |
+| Save the clip | Click the waveform | Click the waveform | Capture pauses and saves a WAV. With no selection, the file contains all retained audio. |
 | Drop a clip into a DAW | Hold the primary mouse button on the waveform and drag out | Hold the primary mouse button on the waveform and drag out | The hint shows **Drag and Drop**. Once ready, drop the WAV onto the REAPER timeline, FL Studio Playlist, or another WAV drop target. |
 | Choose both ends | Hold `Ctrl` and drag across the waveform | Hold `Option` and drag across the waveform | The hint shows **Drag to Select**. Release to keep the selection, then release the modifier and click or drag the highlighted range. |
 

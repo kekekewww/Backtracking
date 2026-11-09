@@ -70,8 +70,7 @@ struct Recorder {
     live_revision: Option<u64>,
     next_refresh: Instant,
     snapshot: Option<Arc<Snapshot>>,
-    clip: Option<Range<f32>>,
-    explicit_clip: bool,
+    selection: Option<Range<f32>>,
     gesture: Option<Gesture>,
     window_command: Option<ViewportCommand>,
     export: Option<ExportJob>,
@@ -108,8 +107,7 @@ impl Recorder {
             live_revision: None,
             next_refresh: Instant::now(),
             snapshot: None,
-            clip: None,
-            explicit_clip: false,
+            selection: None,
             gesture: None,
             window_command: None,
             export: None,
@@ -130,8 +128,7 @@ impl Recorder {
 
     fn clear_snapshot(&mut self) {
         self.snapshot = None;
-        self.clip = None;
-        self.explicit_clip = false;
+        self.selection = None;
         self.live_revision = None;
         self.next_refresh = Instant::now();
         self.invalidate_export();
@@ -299,18 +296,18 @@ impl Recorder {
             self.message = "No audio captured yet.".into();
             return;
         };
-        let Some(clip) = self.clip.clone() else {
-            return;
-        };
         let frames = snapshot.frame_count();
-        let start = ((clip.start * frames as f32).floor() as usize).min(frames - 1);
-        let end = ((clip.end * frames as f32).ceil() as usize).clamp(start + 1, frames);
+        let frames_to_export = self.selection.as_ref().map_or(0..frames, |selection| {
+            let start = ((selection.start * frames as f32).floor() as usize).min(frames - 1);
+            let end = ((selection.end * frames as f32).ceil() as usize).clamp(start + 1, frames);
+            start..end
+        });
         let output = self.output.clone();
         match thread::Builder::new()
             .name("backtracking-wav".into())
             .spawn(move || {
                 let samples = snapshot
-                    .frames(start..end)
+                    .frames(frames_to_export)
                     .ok_or_else(|| io::Error::other("invalid audio selection"))?;
                 export_wav(&output, snapshot.sample_rate, snapshot.channels, samples)
             }) {
@@ -391,19 +388,13 @@ impl Recorder {
                 );
                 self.snapshot = Some(Arc::new(snapshot));
             }
-            let start = fraction(self.audio_rect(rect), position.x);
             if selecting {
+                let start = fraction(self.audio_rect(rect), position.x);
                 self.gesture = Some(Gesture::Select {
                     anchor: start,
                     cursor: start,
                 });
             } else {
-                if !self.explicit_clip
-                    && self.clip.as_ref().is_none_or(|range| range.start != start)
-                {
-                    self.clip = Some(start..1.0);
-                    self.invalidate_export();
-                }
                 self.start_export();
                 self.gesture = Some(Gesture::Export { origin: position });
             }
@@ -440,8 +431,7 @@ impl Recorder {
             if let Gesture::Select { anchor, cursor } = gesture {
                 let range = anchor.min(cursor)..anchor.max(cursor);
                 if range.start < range.end {
-                    self.clip = Some(range);
-                    self.explicit_clip = true;
+                    self.selection = Some(range);
                     self.invalidate_export();
                     self.start_export();
                 }
@@ -475,12 +465,18 @@ impl Recorder {
             Some(Gesture::Select { anchor, cursor }) => {
                 Some(anchor.min(cursor)..anchor.max(cursor))
             }
-            Some(Gesture::Export { .. }) => self.clip.clone(),
-            None if self.explicit_clip => self.clip.clone(),
-            None if preview_hover => ui
-                .input(|input| input.pointer.hover_pos())
-                .filter(|position| rect.contains(*position))
-                .map(|position| fraction(audio, position.x)..1.0),
+            Some(Gesture::Export { .. }) => Some(self.selection.clone().unwrap_or(0.0..1.0)),
+            None if self.selection.is_some() => self.selection.clone(),
+            None if preview_hover
+                && ui.input(|input| {
+                    input
+                        .pointer
+                        .hover_pos()
+                        .is_some_and(|pos| rect.contains(pos))
+                }) =>
+            {
+                Some(0.0..1.0)
+            }
             None => None,
         };
         let x = |fraction: f32| audio.left() + fraction * audio.width();
@@ -532,7 +528,7 @@ impl Recorder {
             Some(Gesture::Select { .. }) => "Drag to Select",
             Some(Gesture::Export { .. }) => "Drag and Drop",
             None if modifier => "Drag to Select",
-            None if self.exported.is_some() || self.explicit_clip => {
+            None if self.exported.is_some() || self.selection.is_some() => {
                 "Drag and Drop   ·   Ctrl + Click"
             }
             None => "Click   ·   Ctrl + Click",

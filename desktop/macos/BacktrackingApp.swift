@@ -544,8 +544,8 @@ private final class WaveformView: NSView, NSDraggingSource {
     private var sampleRate = 0.0
     private var revision: UInt64?
     private var selection: ClosedRange<Double>?
+    private var exportRange: ClosedRange<Double> { selection ?? 0...1 }
     private var anchor: Double?
-    private var hover: Double?
     private var pointer: NSPoint?
     private var pointerModifiers: NSEvent.ModifierFlags = []
     private var selectionModifierDown: Bool { !pointerModifiers.intersection([.option, .control]).isEmpty }
@@ -628,13 +628,9 @@ private final class WaveformView: NSView, NSDraggingSource {
 
     override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
 
-    override func mouseMoved(with event: NSEvent) {
-        hover = normalized(event)
-        trackPointer(event)
-    }
+    override func mouseMoved(with event: NSEvent) { trackPointer(event) }
 
     func clearPointerFeedback() {
-        hover = nil
         pointer = nil
         needsDisplay = true
     }
@@ -655,12 +651,7 @@ private final class WaveformView: NSView, NSDraggingSource {
 
         mouseDownEvent = event
         dragRequested = false
-        if let selection {
-            prepareExport(selection, reuse: true)
-        } else {
-            let lastFrame = 1 - 1 / Double(max(1, frames))
-            prepareExport(min(lastFrame, normalized(event))...1)
-        }
+        prepareExport(exportRange, reuse: true)
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -708,7 +699,10 @@ private final class WaveformView: NSView, NSDraggingSource {
     }
 
     private func prepareExport(_ range: ClosedRange<Double>, reuse: Bool = false) {
-        if reuse && preparedRange == range && (preparingFile || readyFile != nil) { return }
+        if reuse && preparedRange == range {
+            if preparingFile { return }
+            if let readyFile, FileManager.default.fileExists(atPath: readyFile.path) { return }
+        }
         discardPreparedFile()
         preparedRange = range
         preparingFile = true
@@ -811,7 +805,7 @@ private final class WaveformView: NSView, NSDraggingSource {
         panel.addClip()
         let middle = bounds.midY
         let height = bounds.height * 0.46
-        let preview = selection ?? hover.map { $0...1 }
+        let preview = selection != nil || pointer != nil || mouseDownEvent != nil || dragging ? exportRange : nil
         if let preview, frames != 0 {
             NSColor.systemTeal.withAlphaComponent(0.23).setFill()
             NSBezierPath.fill(NSRect(
@@ -838,10 +832,12 @@ private final class WaveformView: NSView, NSDraggingSource {
             trace.lineWidth = max(1, step * 0.75)
             trace.stroke()
         }
-        if let hover {
+        if let pointer, anchor != nil || (selectionModifierDown && !movesFromWaveform(pointerModifiers)) {
             NSColor.white.withAlphaComponent(0.4).setStroke()
-            let x = CGFloat(hover) * bounds.width
-            NSBezierPath.strokeLine(from: NSPoint(x: x, y: 0), to: NSPoint(x: x, y: bounds.height))
+            NSBezierPath.strokeLine(
+                from: NSPoint(x: pointer.x, y: bounds.minY),
+                to: NSPoint(x: pointer.x, y: bounds.maxY)
+            )
         }
         if let preview, frames != 0, sampleRate > 0 {
             let seconds = Double(frames) / sampleRate * (preview.upperBound - preview.lowerBound)

@@ -41,7 +41,6 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
             next_refresh: Instant::now(),
             frozen: None,
             selection: None,
-            implicit_start: None,
             gesture: None,
             export: None,
             export_requested: false,
@@ -61,7 +60,6 @@ pub struct CaptureUi {
     next_refresh: Instant,
     frozen: Option<Arc<Snapshot>>,
     selection: Option<Range<f32>>,
-    implicit_start: Option<f32>,
     gesture: Option<Gesture>,
     export: Option<ExportJob>,
     export_requested: bool,
@@ -302,7 +300,6 @@ impl CaptureUi {
     fn reset_frozen(&mut self) {
         self.frozen = None;
         self.selection = None;
-        self.implicit_start = None;
         self.invalidate_export();
         self.next_refresh = Instant::now();
     }
@@ -345,14 +342,15 @@ impl CaptureUi {
             Some(Gesture::Select { anchor, current }) => {
                 Some(anchor.min(*current)..anchor.max(*current))
             }
-            Some(Gesture::Drag { .. }) => self
-                .selection
-                .clone()
-                .or_else(|| self.implicit_start.map(|start| start..1.0)),
+            Some(Gesture::Drag { .. }) => Some(self.selection.clone().unwrap_or(0.0..1.0)),
             None if allow_hover => self.selection.clone().or_else(|| {
-                ui.input(|input| input.pointer.hover_pos())
-                    .filter(|position| rect.contains(*position))
-                    .map(|position| position_in_audio(audio_rect, position.x)..1.0)
+                ui.input(|input| {
+                    input
+                        .pointer
+                        .hover_pos()
+                        .is_some_and(|position| rect.contains(position))
+                })
+                .then_some(0.0..1.0)
             }),
             None => self.selection.clone(),
         };
@@ -480,18 +478,6 @@ impl CaptureUi {
                     current: anchor,
                 });
             } else {
-                if self.selection.is_none() {
-                    let audio_rect = self.audio_rect(rect, seconds);
-                    let start = position_in_audio(audio_rect, position.x);
-                    let pixel = 1.0 / audio_rect.width().max(1.0);
-                    if self
-                        .implicit_start
-                        .is_none_or(|old| (start - old).abs() > pixel)
-                    {
-                        self.implicit_start = Some(start);
-                        self.invalidate_export();
-                    }
-                }
                 self.begin_export();
                 self.gesture = Some(Gesture::Drag { origin: position });
             }
@@ -517,7 +503,6 @@ impl CaptureUi {
             if let Gesture::Select { anchor, current } = gesture {
                 let range = anchor.min(current)..anchor.max(current);
                 self.selection = (range.end > range.start).then_some(range);
-                self.implicit_start = Some(anchor);
                 self.invalidate_export();
                 self.begin_export();
             }
@@ -543,11 +528,7 @@ impl CaptureUi {
             return;
         };
         let frames = snapshot.frame_count();
-        let selection = self
-            .selection
-            .clone()
-            .or_else(|| self.implicit_start.map(|start| start..1.0));
-        let range = selection.map_or(0..frames, |range| {
+        let range = self.selection.as_ref().map_or(0..frames, |range| {
             let first = (range.start * frames as f32).floor() as usize;
             let last = (range.end * frames as f32).ceil() as usize;
             first.min(frames - 1)..last.clamp(first.min(frames - 1) + 1, frames)
