@@ -2,6 +2,10 @@ import AppKit
 
 private let timeChoices: [UInt32] = [10, 20, 30]
 
+private func movesFromWaveform(_ modifiers: NSEvent.ModifierFlags) -> Bool {
+    modifiers.contains([.command, .option]) && !modifiers.contains(.control)
+}
+
 @main
 enum BacktrackingApp {
     @MainActor
@@ -17,13 +21,181 @@ enum BacktrackingApp {
 
 private final class CapturePanel: NSPanel {
     var onClick: (() -> Void)?
+    weak var waveform: WaveformView?
+    private var moving = false
+    private var resize: ResizeGesture?
+    private var chromeCursorActive = false
+
+    private struct Edges: OptionSet {
+        let rawValue: UInt8
+        static let left = Self(rawValue: 1 << 0)
+        static let right = Self(rawValue: 1 << 1)
+        static let bottom = Self(rawValue: 1 << 2)
+        static let top = Self(rawValue: 1 << 3)
+
+        @MainActor var cursor: NSCursor {
+            let horizontal = contains(.left) || contains(.right)
+            let vertical = contains(.top) || contains(.bottom)
+            if horizontal && vertical {
+                return contains(.left) == contains(.top) ? Self.downDiagonal : Self.upDiagonal
+            }
+            return horizontal ? .resizeLeftRight : .resizeUpDown
+        }
+
+        @MainActor private static let downDiagonal = diagonal("arrow.up.left.and.arrow.down.right")
+        @MainActor private static let upDiagonal = diagonal("arrow.up.right.and.arrow.down.left")
+
+        @MainActor private static func diagonal(_ symbol: String) -> NSCursor {
+            guard let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "調整視窗大小") else {
+                return .resizeLeftRight
+            }
+            return NSCursor(image: image, hotSpot: NSPoint(x: image.size.width / 2, y: image.size.height / 2))
+        }
+    }
+
+    private struct ResizeGesture {
+        let edges: Edges
+        let startPointer: NSPoint
+        let startFrame: NSRect
+    }
 
     override func sendEvent(_ event: NSEvent) {
         switch event.type {
-        case .leftMouseDown, .rightMouseDown, .otherMouseDown: onClick?()
+        case .leftMouseDown:
+            onClick?()
+            moving = false
+            resize = nil
+            if let area = clientArea, area.contains(event.locationInWindow) {
+                if canMove(at: event.locationInWindow, modifiers: event.modifierFlags) {
+                    waveform?.clearPointerFeedback()
+                    moving = true
+                    setChromeCursor(.closedHand)
+                    performDrag(with: event)
+                    return
+                }
+                let edges = resizeEdges(at: event.locationInWindow, in: area)
+                if !edges.isEmpty {
+                    waveform?.clearPointerFeedback()
+                    resize = ResizeGesture(edges: edges, startPointer: convertPoint(toScreen: event.locationInWindow), startFrame: frame)
+                    setChromeCursor(edges.cursor)
+                    return
+                }
+            }
+        case .leftMouseDragged, .leftMouseUp:
+            if let resize {
+                applyResize(resize)
+                if event.type == .leftMouseUp {
+                    self.resize = nil
+                    updateChromeCursor()
+                }
+                return
+            }
+            if moving {
+                if event.type == .leftMouseUp {
+                    moving = false
+                    updateChromeCursor()
+                }
+                return
+            }
+        case .rightMouseDown, .otherMouseDown:
+            onClick?()
         default: break
         }
         super.sendEvent(event)
+        switch event.type {
+        case .mouseMoved, .mouseEntered, .cursorUpdate, .flagsChanged:
+            updateChromeCursor()
+        default: break
+        }
+    }
+
+    func trackChrome(in content: NSView) {
+        content.addTrackingArea(NSTrackingArea(
+            rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
+            owner: self, userInfo: nil
+        ))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if NSEvent.pressedMouseButtons & 1 == 0 {
+            moving = false
+            resize = nil
+            setChromeCursor(nil)
+        }
+        super.mouseExited(with: event)
+    }
+
+    private var clientArea: NSRect? {
+        guard !styleMask.contains(.fullScreen), let contentView else { return nil }
+        return contentView.convert(contentView.bounds, to: nil)
+    }
+
+    private func canMove(at location: NSPoint, modifiers: NSEvent.ModifierFlags) -> Bool {
+        guard isMovable, modifiers.contains(.option), !modifiers.contains(.control) else { return false }
+        if movesFromWaveform(modifiers) { return true }
+        guard let waveform else { return true }
+        return !waveform.bounds.contains(waveform.convert(location, from: nil))
+    }
+
+    private func resizeEdges(at location: NSPoint, in area: NSRect) -> Edges {
+        guard styleMask.contains(.resizable) else { return [] }
+        // The hit area sits inside the existing content gutters.
+        let gutter: CGFloat = 7
+        var edges: Edges = []
+        if location.x - area.minX < gutter { edges.insert(.left) }
+        if area.maxX - location.x < gutter { edges.insert(.right) }
+        if location.y - area.minY < gutter { edges.insert(.bottom) }
+        if area.maxY - location.y < gutter { edges.insert(.top) }
+        return edges
+    }
+
+    private func applyResize(_ gesture: ResizeGesture) {
+        let minimum = frameRect(forContentRect: NSRect(origin: .zero, size: contentMinSize)).size
+        let mouse = NSEvent.mouseLocation
+        let dx = mouse.x - gesture.startPointer.x
+        let dy = mouse.y - gesture.startPointer.y
+        let start = gesture.startFrame
+        let edges = gesture.edges
+        let left = edges.contains(.left) ? min(start.minX + dx, start.maxX - minimum.width) : start.minX
+        let right = edges.contains(.right) ? max(start.maxX + dx, start.minX + minimum.width) : start.maxX
+        let bottom = edges.contains(.bottom) ? min(start.minY + dy, start.maxY - minimum.height) : start.minY
+        let top = edges.contains(.top) ? max(start.maxY + dy, start.minY + minimum.height) : start.maxY
+        let proposed = NSRect(x: left, y: bottom, width: right - left, height: top - bottom)
+        if frame != proposed { setFrame(proposed, display: true) }
+    }
+
+    private func updateChromeCursor() {
+        if let resize {
+            if NSEvent.pressedMouseButtons & 1 != 0 {
+                setChromeCursor(resize.edges.cursor)
+                return
+            }
+            self.resize = nil
+        }
+        if moving && NSEvent.pressedMouseButtons & 1 == 0 { moving = false }
+        // A waveform gesture owns the pointer until release, even if it crosses a gutter.
+        guard NSEvent.pressedMouseButtons == 0 else { return }
+        let location = mouseLocationOutsideOfEventStream
+        guard !moving, let area = clientArea, area.contains(location) else {
+            if !moving { setChromeCursor(nil) }
+            return
+        }
+        if canMove(at: location, modifiers: NSEvent.modifierFlags) {
+            setChromeCursor(.openHand)
+        } else {
+            let edges = resizeEdges(at: location, in: area)
+            setChromeCursor(edges.isEmpty ? nil : edges.cursor)
+        }
+    }
+
+    private func setChromeCursor(_ cursor: NSCursor?) {
+        if let cursor {
+            cursor.set()
+            chromeCursorActive = true
+        } else if chromeCursorActive {
+            NSCursor.arrow.set()
+            chromeCursorActive = false
+        }
     }
 }
 
@@ -128,6 +300,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let waveform = WaveformView(frame: .zero)
         waveform.controller = self
         waveform.heightAnchor.constraint(greaterThanOrEqualToConstant: 51).isActive = true
+        window.waveform = waveform
         self.waveform = waveform
 
         resumeButton.target = self
@@ -157,6 +330,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         stack.alignment = .leading
         stack.spacing = 6
         guard let content = window.contentView else { return }
+        window.trackChrome(in: content)
         content.addSubview(stack)
         stack.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -373,7 +547,8 @@ private final class WaveformView: NSView, NSDraggingSource {
     private var anchor: Double?
     private var hover: Double?
     private var pointer: NSPoint?
-    private var selectionModifierDown = false
+    private var pointerModifiers: NSEvent.ModifierFlags = []
+    private var selectionModifierDown: Bool { !pointerModifiers.intersection([.option, .control]).isEmpty }
     private var pointerArea: NSTrackingArea?
     private var mouseDownEvent: NSEvent?
     private var dragRequested = false
@@ -429,22 +604,18 @@ private final class WaveformView: NSView, NSDraggingSource {
         return Double(min(1, max(0, (position - bounds.minX) / max(1, bounds.width))))
     }
 
-    private func selectionModifier(_ flags: NSEvent.ModifierFlags) -> Bool {
-        flags.contains(.option) || flags.contains(.control)
-    }
-
     func refreshHintModifiers() {
         guard pointer != nil, anchor == nil, mouseDownEvent == nil, !dragging else { return }
-        let isDown = selectionModifier(NSEvent.modifierFlags)
-        guard isDown != selectionModifierDown else { return }
-        selectionModifierDown = isDown
+        let current = NSEvent.modifierFlags.intersection([.option, .control, .command])
+        guard current != pointerModifiers else { return }
+        pointerModifiers = current
         needsDisplay = true
     }
 
     private func trackPointer(_ event: NSEvent) {
         let position = convert(event.locationInWindow, from: nil)
         pointer = bounds.contains(position) ? position : nil
-        selectionModifierDown = selectionModifier(event.modifierFlags)
+        pointerModifiers = event.modifierFlags.intersection([.option, .control, .command])
         needsDisplay = true
     }
 
@@ -462,11 +633,13 @@ private final class WaveformView: NSView, NSDraggingSource {
         trackPointer(event)
     }
 
-    override func mouseExited(with event: NSEvent) {
+    func clearPointerFeedback() {
         hover = nil
         pointer = nil
         needsDisplay = true
     }
+
+    override func mouseExited(with event: NSEvent) { clearPointerFeedback() }
 
     override func mouseDown(with event: NSEvent) {
         guard !dragging, let controller else { return }
@@ -581,6 +754,7 @@ private final class WaveformView: NSView, NSDraggingSource {
 
     private func drawActionHint() {
         guard frames != 0, let pointer, bounds.contains(pointer) else { return }
+        if anchor == nil && mouseDownEvent == nil && !dragging && movesFromWaveform(pointerModifiers) { return }
         let action: String
         if anchor != nil {
             action = "Drag to Select"

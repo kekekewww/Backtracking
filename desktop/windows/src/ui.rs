@@ -6,7 +6,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{DurationChoice, Snapshot, export_wav, waveform};
-use eframe::egui::{self, Color32, PointerButton, Pos2, Rect, Stroke, Vec2};
+use eframe::egui::{
+    self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection, Stroke, Vec2,
+    ViewportCommand,
+};
 
 use crate::controller::Controller;
 
@@ -19,6 +22,8 @@ const DURATIONS: [DurationChoice; 3] = [
 ];
 const MINT: Color32 = Color32::from_rgb(103, 231, 181);
 const IDLE: Color32 = Color32::from_rgb(246, 196, 118);
+const RESIZE_EDGE: f32 = 7.0;
+const RESIZE_CORNER: f32 = 14.0;
 
 pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -68,6 +73,7 @@ struct Recorder {
     clip: Option<Range<f32>>,
     explicit_clip: bool,
     gesture: Option<Gesture>,
+    window_command: Option<ViewportCommand>,
     export: Option<ExportJob>,
     export_again: bool,
     clip_revision: u64,
@@ -105,6 +111,7 @@ impl Recorder {
             clip: None,
             explicit_clip: false,
             gesture: None,
+            window_command: None,
             export: None,
             export_again: false,
             clip_revision: 0,
@@ -363,7 +370,7 @@ impl Recorder {
                 input.pointer.interact_pos(),
                 input.pointer.button_pressed(PointerButton::Primary),
                 input.pointer.button_down(PointerButton::Primary),
-                input.modifiers.ctrl || input.modifiers.alt,
+                input.modifiers.ctrl,
             )
         });
 
@@ -516,12 +523,8 @@ impl Recorder {
         if self.seconds <= 0.0 || !response.contains_pointer() {
             return;
         }
-        let (position, modifier) = ui.input(|input| {
-            (
-                input.pointer.hover_pos(),
-                input.modifiers.ctrl || input.modifiers.alt,
-            )
-        });
+        let (position, modifier) =
+            ui.input(|input| (input.pointer.hover_pos(), input.modifiers.ctrl));
         let Some(position) = position.filter(|point| response.rect.contains(*point)) else {
             return;
         };
@@ -565,18 +568,53 @@ impl Recorder {
 }
 
 impl eframe::App for Recorder {
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
-        if input.viewport().minimized != Some(true)
-            && input
-                .events
-                .iter()
-                .any(|event| matches!(event, egui::Event::PointerButton { pressed: true, .. }))
+    fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        if input.viewport().minimized == Some(true) {
+            return;
+        }
+        if input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::PointerButton { pressed: true, .. }))
         {
             self.last_interaction = Instant::now();
+        }
+        if self.gesture.is_some() || egui::Popup::is_any_open(ctx) {
+            return;
+        }
+        let bounds = input.screen_rect.unwrap_or_else(|| ctx.viewport_rect());
+        let viewport = input.viewport();
+        if viewport.fullscreen == Some(true) {
+            return;
+        }
+        let can_resize = viewport.maximized != Some(true);
+        for event in &mut input.events {
+            let egui::Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers,
+            } = *event
+            else {
+                continue;
+            };
+            // A queued release means the button was not held when the native command would run.
+            self.window_command = None;
+            if pressed
+                && let Some((command, _)) =
+                    window_interaction(bounds, pos, modifiers.alt, can_resize)
+            {
+                // Keep the position but prevent the reserved press from reaching any widget.
+                *event = egui::Event::PointerMoved(pos);
+                self.window_command = Some(command);
+            }
         }
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(command) = self.window_command.take() {
+            ctx.send_viewport_cmd(command);
+        }
         self.controller.poll();
         self.collect_export();
         if self.controller.is_paused()
@@ -597,6 +635,22 @@ impl eframe::App for Recorder {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
             let menu_open = self.controls(ui, frame);
+            let window_cursor = if !menu_open && self.gesture.is_none() {
+                ui.input(|input| {
+                    if input.viewport().fullscreen == Some(true) {
+                        return None;
+                    }
+                    window_interaction(
+                        input.viewport_rect(),
+                        input.pointer.hover_pos()?,
+                        input.modifiers.alt,
+                        input.viewport().maximized != Some(true),
+                    )
+                    .map(|(_, cursor)| cursor)
+                })
+            } else {
+                None
+            };
             self.refresh_waveform();
             let size = Vec2::new(
                 ui.available_width(),
@@ -606,15 +660,17 @@ impl eframe::App for Recorder {
             if !menu_open {
                 self.interact_waveform(ui, frame, &response);
             }
-            self.draw_waveform(ui, rect, !menu_open);
+            self.draw_waveform(ui, rect, !menu_open && window_cursor.is_none());
             let status = self.controller.error().unwrap_or(&self.message);
             if !status.is_empty() {
                 ui.add(egui::Label::new(status).truncate())
                     .on_hover_text(status);
             }
-            if !menu_open {
+            if let Some(cursor) = window_cursor {
+                ui.ctx().set_cursor_icon(cursor);
+            } else if !menu_open {
                 self.draw_action_hint(ui, &response);
-                response.on_hover_cursor(egui::CursorIcon::Grab);
+                response.on_hover_cursor(CursorIcon::Grab);
             }
         });
     }
@@ -631,6 +687,49 @@ impl Drop for Recorder {
 fn fraction(rect: Rect, x: f32) -> f32 {
     ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0)
 }
+
+fn window_interaction(
+    bounds: Rect,
+    pos: Pos2,
+    alt: bool,
+    can_resize: bool,
+) -> Option<(ViewportCommand, CursorIcon)> {
+    if !bounds.contains(pos) {
+        return None;
+    }
+    if alt {
+        return Some((ViewportCommand::StartDrag, CursorIcon::Move));
+    }
+    if !can_resize {
+        return None;
+    }
+
+    let left = pos.x - bounds.left();
+    let right = bounds.right() - pos.x;
+    let top = pos.y - bounds.top();
+    let bottom = bounds.bottom() - pos.y;
+    let (direction, cursor) = match () {
+        _ if left.min(top) <= RESIZE_EDGE && left.max(top) <= RESIZE_CORNER => {
+            (ResizeDirection::NorthWest, CursorIcon::ResizeNwSe)
+        }
+        _ if right.min(top) <= RESIZE_EDGE && right.max(top) <= RESIZE_CORNER => {
+            (ResizeDirection::NorthEast, CursorIcon::ResizeNeSw)
+        }
+        _ if left.min(bottom) <= RESIZE_EDGE && left.max(bottom) <= RESIZE_CORNER => {
+            (ResizeDirection::SouthWest, CursorIcon::ResizeNeSw)
+        }
+        _ if right.min(bottom) <= RESIZE_EDGE && right.max(bottom) <= RESIZE_CORNER => {
+            (ResizeDirection::SouthEast, CursorIcon::ResizeNwSe)
+        }
+        _ if left <= RESIZE_EDGE => (ResizeDirection::West, CursorIcon::ResizeHorizontal),
+        _ if right <= RESIZE_EDGE => (ResizeDirection::East, CursorIcon::ResizeHorizontal),
+        _ if top <= RESIZE_EDGE => (ResizeDirection::North, CursorIcon::ResizeVertical),
+        _ if bottom <= RESIZE_EDGE => (ResizeDirection::South, CursorIcon::ResizeVertical),
+        _ => return None,
+    };
+    Some((ViewportCommand::BeginResize(direction), cursor))
+}
+
 const DRAG_ICON: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0x18, 0x08, 0x06, 0x00, 0x00, 0x00, 0xed, 0x69, 0x4d,

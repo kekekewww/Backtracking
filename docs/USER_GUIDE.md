@@ -18,6 +18,16 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 點擊工具列的齒輪，開啟 **設定** 選單。選單內可以調整 **保留／History／Buffer**、**自動續錄／Auto-resume** 和 **專案資料夾／Project folder**。Windows 和 macOS 桌面版的 **置頂／Keep on top** 可直接在工具列切換。插件視窗的位置由 DAW 控制。
 
+### 移動與縮放桌面視窗
+
+可拖曳原生標題列來移動視窗，或拖曳原生邊框調整大小。也可以直接從視窗內容區操作。
+
+| 動作 | Windows 桌面版 | macOS 桌面版 |
+| --- | --- | --- |
+| 移動視窗 | 在內容區按住 `Alt`，用滑鼠左鍵拖曳。 | 在波形外的內容區按住 `Option`，用左鍵拖曳。在內容區任意位置可按住 `Command` + `Option` 再用左鍵拖曳。 |
+| 調整視窗大小 | 將游標移到視窗內容區的內緣或內角，按住左鍵拖曳。 | 將游標移到視窗內容區的內緣或內角，按住左鍵拖曳。 |
+| 框選音訊 | 在波形上按住 `Ctrl` 並用左鍵拖曳。 | 在波形上按住 `Option` 或 `Control` 並用左鍵拖曳。 |
+
 ### 讀懂波形與錄音狀態
 
 - **等待聲音／Waiting for sound**。錄音已待命，聲音超過靜音偵測門檻時便開始收錄。
@@ -83,6 +93,16 @@ On Windows, route the source to the default playback device. If a DAW uses ASIO,
 ### Open settings
 
 Click the gear in the toolbar to open **Settings**. The menu contains **History / Buffer**, **Auto-resume**, and **Project folder**. In the Windows and macOS desktop apps, you can toggle **Keep on top** directly from the toolbar. The DAW controls the plug-in window.
+
+### Move and resize the desktop window
+
+Drag the native title bar to move the window or drag its border to resize it. You can also use these gestures inside the content area.
+
+| Action | Windows desktop | macOS desktop |
+| --- | --- | --- |
+| Move the window | Hold `Alt` and left-drag inside the content area. | Hold `Option` and left-drag outside the waveform. Hold `Command` + `Option` and left-drag from anywhere in the content area. |
+| Resize the window | Move the pointer to an inside edge or corner, then left-drag. | Move the pointer to an inside edge or corner, then left-drag. |
+| Select audio | Hold `Ctrl` and left-drag over the waveform. | Hold `Option` or `Control` and left-drag over the waveform. |
 
 ### Read the waveform and capture status
 

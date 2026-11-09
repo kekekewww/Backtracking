@@ -23,7 +23,7 @@ Backtracking 是給作曲與混音用的回溯錄音取樣器。聽到想留下�
 
 匯出為 **48 kHz、32-bit float WAV**。指定專案資料夾後，檔案會存到它的 `output/` 子目錄。
 
-[完整操作手冊](docs/USER_GUIDE.md#繁體中文) · [安裝與建置](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
+[完整操作手冊](docs/USER_GUIDE.md#繁體中文) · [桌面視窗操作](docs/USER_GUIDE.md#移動與縮放桌面視窗) · [安裝與建置](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
 
 ## English
 
@@ -46,7 +46,7 @@ Click the gear in the toolbar to set the history length, auto-resume delay, and 
 
 Exports are **48 kHz, 32-bit float WAV** files. After you choose a project folder, files go into its `output/` subfolder.
 
-[Full user guide](docs/USER_GUIDE.md#english) · [Installation and build](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
+[Full user guide](docs/USER_GUIDE.md#english) · [Desktop window controls](docs/USER_GUIDE.md#move-and-resize-the-desktop-window) · [Installation and build](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
 
 ## 開發測試 / Development checks
 
