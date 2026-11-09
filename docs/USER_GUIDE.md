@@ -28,14 +28,14 @@ macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`C
 
 在波形上按右鍵。錄音已暫停時，選單提供 **開始錄音／Play**。錄音已待命或正在收錄時，選單提供 **暫停錄音／Pause**。
 
-切換時，波形會保持完整介面中的高度並垂直置中，視窗尺寸也會保留。可拖曳桌面視窗的上方或下方內緣，把波形縮成細條。可用空間不足時，波形會跟著縮小。取消勾選時，視窗若低於完整介面的最小高度，會自動拉高以容納工具列。
+切換時，波形會保持完整介面中的高度並垂直置中，視窗尺寸也會保留。拖曳桌面視窗的左右內緣可調整寬度，拖曳上下內緣可調整高度。視窗變窄時，同樣的錄音保留時間會顯示在更短的距離上，波形每秒移動的像素會減少。可用高度不足時，波形會跟著縮小。取消勾選時，視窗會視需要放大以容納完整介面。
 
-| 桌面版 | 只顯示波形最小高度 | 完整介面最小高度 |
+| 桌面版 | 只顯示波形最小尺寸 | 完整介面最小尺寸 |
 | --- | --- | --- |
-| Windows | 48 邏輯像素 | 132 邏輯像素 |
-| macOS | 48 點 | 100 點 |
+| Windows | 240 × 48 邏輯像素 | 510 × 132 邏輯像素 |
+| macOS | 240 × 48 點 | 560 × 100 點 |
 
-要回到完整介面，在波形上按右鍵，再取消勾選 **只顯示波形／Show waveform only**。Windows 薄視窗開啟設定時會視需要暫時拉高，關閉選單後回到原高度。視窗調整期間也可用精簡選單的 **Expand settings** 再要求展開。只顯示波形時，Backtracking 會向 Windows 要求關閉原生陰影、邊框與圓角。
+要回到完整介面，在波形上按右鍵，再取消勾選 **只顯示波形／Show waveform only**。Windows 小視窗會視需要暫時放大以顯示設定。若仍在只顯示波形模式，關閉選單後會回到原尺寸。視窗調整期間也可用精簡選單的 **Expand** 再要求展開。只顯示波形時，Backtracking 會向 Windows 要求關閉原生陰影、邊框與圓角。
 
 ### 移動與縮放桌面視窗
 
@@ -172,14 +172,14 @@ Turn on **Show waveform only** to hide Backtracking's frame and dark panel backg
 
 Right-click the waveform. Choose **Play** (**開始錄音** in the macOS app) when capture is paused, or **Pause** (**暫停錄音**) when capture is armed or recording.
 
-When you switch modes, the waveform keeps the height it had in the full interface and moves to the vertical center. The window keeps its size. Drag the inside top or bottom edge to make the desktop window a thin strip. The waveform shrinks if there is less room. When you turn the mode off, the window grows if needed to meet the full interface's minimum height.
+When you switch modes, the waveform keeps the height it had in the full interface and moves to the vertical center. The window keeps its size. Drag either inside side edge to adjust the desktop window's width or the top and bottom edges to adjust its height. A narrower window shows the same retained duration over a shorter distance, reducing the number of pixels the waveform scrolls per second. The waveform shrinks to fit a shorter window. When you turn the mode off, the window grows if needed to fit the full interface.
 
-| Desktop app | Waveform-only minimum height | Full interface minimum height |
+| Desktop app | Waveform-only minimum size | Full interface minimum size |
 | --- | --- | --- |
-| Windows | 48 logical pixels | 132 logical pixels |
-| macOS | 48 points | 100 points |
+| Windows | 240 × 48 logical pixels | 510 × 132 logical pixels |
+| macOS | 240 × 48 points | 560 × 100 points |
 
-To restore the full interface, right-click the waveform and turn off **Show waveform only**. A thin Windows window expands temporarily if needed to show Settings and returns to its previous height when the menu closes. While the window resizes, **Expand settings** in the compact menu can request expansion again. In waveform-only mode, Backtracking asks Windows to suppress the native shadow, border, and rounded corners.
+To restore the full interface, right-click the waveform and turn off **Show waveform only**. A small Windows window expands temporarily if needed to show Settings. It returns to its previous size when the menu closes in waveform-only mode. While the window resizes, **Expand** in the compact menu can request expansion again. In waveform-only mode, Backtracking asks Windows to suppress the native shadow, border, and rounded corners.
 
 ### Move and resize the desktop window
 
@@ -379,8 +379,8 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 4. 修改一項偏好後重開桌面版，確認設定有還原。測試插件時，修改設定後先儲存 DAW 專案，再重開該專案確認。
 
    Change a preference and relaunch the desktop app to check that it is restored. For the plug-in, change a setting, save the DAW project, and reopen it to check the saved value.
-5. 開啟 **只顯示波形**，確認波形高度維持原樣並垂直置中。按右鍵測試暫停和啟用錄音，再確認框選時區間內的波形會變色。桌面版可將視窗拖到螢幕邊緣附近，確認仍停在放開的位置，再將視窗縮到最小高度，並從右鍵選單切回完整介面。
+5. 開啟 **只顯示波形**，確認波形高度維持原樣並垂直置中。按右鍵測試暫停和啟用錄音，再確認框選時區間內的波形會變色。桌面版可將視窗拖到螢幕邊緣附近，確認仍停在放開的位置，再將視窗縮到最小尺寸，並從右鍵選單切回完整介面。
 
-   Turn on **Show waveform only** and check that the waveform keeps its height and moves to the vertical center. Use the right-click menu to pause and arm capture. Check that selecting a range changes its waveform color. On desktop, move the window near a screen edge and check that it stays where you release it, then resize it to the minimum height and restore the full interface from the right-click menu.
+   Turn on **Show waveform only** and check that the waveform keeps its height and moves to the vertical center. Use the right-click menu to pause and arm capture. Check that selecting a range changes its waveform color. On desktop, move the window near a screen edge and check that it stays where you release it, then resize it to the minimum size and restore the full interface from the right-click menu.
 
 [回到專案首頁 / Back to the project README](../README.md)

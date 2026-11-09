@@ -56,12 +56,15 @@ const PAUSED_LED: Color32 = Color32::from_rgb(54, 57, 60);
 const ERROR_LED: Color32 = Color32::from_rgb(246, 196, 118);
 const RESIZE_EDGE: f32 = 7.0;
 const RESIZE_CORNER: f32 = 14.0;
-const MIN_WIDTH: f32 = 510.0;
+const FULL_MIN_WIDTH: f32 = 510.0;
 const FULL_MIN_HEIGHT: f32 = 132.0;
+const WAVEFORM_MIN_WIDTH: f32 = 240.0;
 const WAVEFORM_MIN_HEIGHT: f32 = 48.0;
 // Plot height in the default full window, used when launching directly into waveform-only mode.
 const DEFAULT_WAVEFORM_HEIGHT: f32 = 59.0;
 const WAVEFORM_INSET: f32 = 8.0;
+const SETTINGS_WIDTH: f32 = 340.0;
+const SETTINGS_MIN_WIDTH: f32 = 380.0;
 const SETTINGS_MIN_HEIGHT: f32 = 112.0;
 const WRITING_WAV: &str = "Writing WAV…";
 
@@ -112,19 +115,49 @@ fn set_waveform_frame(window: Option<&Arc<Window>>, waveform_only: bool) {
 }
 
 fn min_window_size(waveform_only: bool) -> Vec2 {
-    let height = if waveform_only {
-        WAVEFORM_MIN_HEIGHT
+    if waveform_only {
+        Vec2::new(WAVEFORM_MIN_WIDTH, WAVEFORM_MIN_HEIGHT)
     } else {
-        FULL_MIN_HEIGHT
-    };
-    Vec2::new(MIN_WIDTH, height)
+        Vec2::new(FULL_MIN_WIDTH, FULL_MIN_HEIGHT)
+    }
 }
 
-fn expand_for_settings(ctx: &egui::Context) {
-    let size = ctx.viewport_rect().size();
-    if size.y < FULL_MIN_HEIGHT {
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size.max(min_window_size(false))));
+fn expanded_settings_size(ctx: &egui::Context) -> Option<Vec2> {
+    let content = ctx.content_rect().size();
+    let extra = Vec2::new(
+        (SETTINGS_MIN_WIDTH - content.x).max(0.0),
+        if content.y < SETTINGS_MIN_HEIGHT {
+            FULL_MIN_HEIGHT - content.y
+        } else {
+            0.0
+        },
+    );
+    (extra != Vec2::ZERO).then(|| ctx.viewport_rect().size() + extra)
+}
+
+fn fit_expanded_window(ctx: &egui::Context, frame: &eframe::Frame, size: Vec2) -> Option<Pos2> {
+    let window = frame.winit_window()?;
+    let monitor = window.current_monitor()?;
+    let origin = window.outer_position().ok()?;
+    let outer = window.outer_size();
+    let inner = window.inner_size();
+    let scale = ctx.pixels_per_point();
+    let outer_size = size * scale
+        + Vec2::new(
+            outer.width.saturating_sub(inner.width) as f32,
+            outer.height.saturating_sub(inner.height) as f32,
+        );
+    let monitor_origin = monitor.position();
+    let monitor_size = monitor.size();
+    let min = Pos2::new(monitor_origin.x as f32, monitor_origin.y as f32);
+    let max = min + Vec2::new(monitor_size.width as f32, monitor_size.height as f32);
+    let origin = Pos2::new(origin.x as f32, origin.y as f32);
+    let fitted = origin.clamp(min, (max - outer_size).max(min));
+    if fitted == origin {
+        return None;
     }
+    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(fitted / scale));
+    Some(origin / scale)
 }
 
 fn configure_style(ctx: &egui::Context) {
@@ -148,7 +181,7 @@ struct Recorder {
     pinned: bool,
     waveform_only: bool,
     full_waveform_height: f32,
-    settings_restore_height: Option<f32>,
+    settings_restore: Option<SettingsRestore>,
     idle_resume: AutoResumeDelay,
     transparency: u8,
     meter_mode: MeterMode,
@@ -169,6 +202,11 @@ struct Recorder {
     clip_revision: u64,
     exported: Option<PathBuf>,
     message: String,
+}
+
+struct SettingsRestore {
+    size: Vec2,
+    position: Option<Pos2>,
 }
 
 enum Gesture {
@@ -348,7 +386,7 @@ impl Recorder {
             pinned: settings.pinned,
             waveform_only: settings.waveform_only,
             full_waveform_height: DEFAULT_WAVEFORM_HEIGHT,
-            settings_restore_height: None,
+            settings_restore: None,
             idle_resume: settings.idle_resume,
             transparency: settings.transparency,
             meter_mode: settings.meter_mode,
@@ -695,22 +733,30 @@ impl Recorder {
                         .hover_pos()
                         .is_some_and(|position| input.content_rect().contains(position))
             });
-        if open && self.waveform_only && ui.ctx().content_rect().height() < SETTINGS_MIN_HEIGHT {
-            self.settings_restore_height = Some(ui.ctx().viewport_rect().height());
-            expand_for_settings(ui.ctx());
+        if open
+            && self.waveform_only
+            && let Some(expanded) = expanded_settings_size(ui.ctx())
+        {
+            self.settings_restore = Some(SettingsRestore {
+                size: ui.ctx().viewport_rect().size(),
+                position: fit_expanded_window(ui.ctx(), frame, expanded),
+            });
+            ui.ctx()
+                .send_viewport_cmd(ViewportCommand::InnerSize(expanded));
         }
         let popup = egui::Popup::menu(&ui.response())
             .open_memory(open.then_some(true.into()))
             .at_pointer_fixed();
         let menu_open = self.show_settings(popup, ui, frame);
         if !egui::Popup::is_any_open(ui.ctx())
-            && let Some(height) = self.settings_restore_height.take()
+            && let Some(restore) = self.settings_restore.take()
             && self.waveform_only
         {
-            let size = ui.ctx().viewport_rect().size();
-            if size.y != height {
+            ui.ctx()
+                .send_viewport_cmd(ViewportCommand::InnerSize(restore.size));
+            if let Some(position) = restore.position {
                 ui.ctx()
-                    .send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(size.x, height)));
+                    .send_viewport_cmd(ViewportCommand::OuterPosition(position));
             }
         }
         menu_open
@@ -722,16 +768,21 @@ impl Recorder {
             Key::WaveformOnly,
             if self.waveform_only { "1" } else { "0" },
         );
+        let minimum = min_window_size(self.waveform_only);
         ui.ctx()
-            .send_viewport_cmd(ViewportCommand::MinInnerSize(min_window_size(
-                self.waveform_only,
-            )));
+            .send_viewport_cmd(ViewportCommand::MinInnerSize(minimum));
         if !self.waveform_only {
-            expand_for_settings(ui.ctx());
+            let size = ui.ctx().viewport_rect().size();
+            let expanded = size.max(minimum);
+            if expanded != size {
+                fit_expanded_window(ui.ctx(), frame, expanded);
+                ui.ctx()
+                    .send_viewport_cmd(ViewportCommand::InnerSize(expanded));
+            }
         }
     }
 
-    fn waveform_mode_settings(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
+    fn waveform_mode_settings(&mut self, ui: &mut egui::Ui, label: &str) -> (bool, bool) {
         let transport = if self.controller.is_paused() {
             "Play"
         } else {
@@ -741,9 +792,7 @@ impl Recorder {
         if transport_clicked {
             self.toggle_capture();
         }
-        let changed = ui
-            .checkbox(&mut self.waveform_only, "Show waveform only")
-            .changed();
+        let changed = ui.checkbox(&mut self.waveform_only, label).changed();
         (changed, transport_clicked)
     }
 
@@ -757,12 +806,18 @@ impl Recorder {
             .accessible_name("Settings")
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
         let was_open = popup.is_open();
-        if self.waveform_only && ui.ctx().content_rect().height() < SETTINGS_MIN_HEIGHT {
+        if self.waveform_only
+            && let Some(expanded) = expanded_settings_size(ui.ctx())
+        {
             let shown = popup.show(|ui| {
                 let (changed, transport_clicked, expand) = ui
                     .horizontal(|ui| {
-                        let (changed, transport_clicked) = self.waveform_mode_settings(ui);
-                        let expand = ui.button("Expand settings").clicked();
+                        let (changed, transport_clicked) =
+                            self.waveform_mode_settings(ui, "Waveform only");
+                        let expand = ui
+                            .button("Expand")
+                            .on_hover_text("Expand settings")
+                            .clicked();
                         (changed, transport_clicked, expand)
                     })
                     .inner;
@@ -772,14 +827,19 @@ impl Recorder {
                 if changed || transport_clicked {
                     ui.close();
                 } else if expand {
-                    expand_for_settings(ui.ctx());
+                    let position = fit_expanded_window(ui.ctx(), frame, expanded);
+                    if let Some(restore) = &mut self.settings_restore {
+                        restore.position = restore.position.or(position);
+                    }
+                    ui.ctx()
+                        .send_viewport_cmd(ViewportCommand::InnerSize(expanded));
                 }
             });
             return was_open || shown.is_some();
         }
         let settings_height = (ui.ctx().content_rect().height() - 59.0).max(48.0);
         let shown = popup.show(|ui| {
-            ui.set_width(340.0);
+            ui.set_width(SETTINGS_WIDTH);
             ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
             let (waveform_only_changed, transport_clicked) = egui::ScrollArea::vertical()
                 .id_salt("settings-options")
@@ -788,7 +848,9 @@ impl Recorder {
                 .show(ui, |ui| {
                     ui.spacing_mut().interact_size.y = 15.0;
                     ui.spacing_mut().button_padding.y = 0.5;
-                    let mode_actions = ui.horizontal(|ui| self.waveform_mode_settings(ui)).inner;
+                    let mode_actions = ui
+                        .horizontal(|ui| self.waveform_mode_settings(ui, "Show waveform only"))
+                        .inner;
                     egui::Grid::new("recording-settings")
                         .spacing([9.0, 1.0])
                         .show(ui, |ui| {

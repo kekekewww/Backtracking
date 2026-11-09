@@ -8,7 +8,7 @@ private let exportSampleRates: [UInt32] = [44_100, 48_000, 96_000]
 private let exportBitDepths: [UInt32] = [16, 24, 32]
 private let frameAutosaveName: NSWindow.FrameAutosaveName = "Backtracking.Panel"
 private let fullPanelMinimum = NSSize(width: 560, height: 100)
-private let waveformOnlyPanelMinimum = NSSize(width: 560, height: 48)
+private let waveformOnlyPanelMinimum = NSSize(width: 240, height: 48)
 private let panelVerticalInset: CGFloat = 8
 private let fullWaveformMinimumHeight: CGFloat = 51
 private let waveformMint = (red: CGFloat(0.32), green: CGFloat(0.89), blue: CGFloat(0.82))
@@ -381,6 +381,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private let meterButton = NSButton(title: "— dBFS", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
     private var toolbar: NSStackView?
+    private var toolbarTrailing: NSLayoutConstraint?
     private var waveformMinimumHeight: NSLayoutConstraint?
     private var waveformTopBelowToolbar: NSLayoutConstraint?
     private var waveformTopWithoutToolbar: NSLayoutConstraint?
@@ -533,12 +534,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         content.addSubview(controls)
         waveform.translatesAutoresizingMaskIntoConstraints = false
         controls.translatesAutoresizingMaskIntoConstraints = false
+        let toolbarTrailing = controls.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10)
+        self.toolbarTrailing = toolbarTrailing
         NSLayoutConstraint.activate([
             controls.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
-            controls.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
+            toolbarTrailing,
             controls.topAnchor.constraint(equalTo: content.topAnchor, constant: panelVerticalInset),
-            waveform.leadingAnchor.constraint(equalTo: controls.leadingAnchor),
-            waveform.trailingAnchor.constraint(equalTo: controls.trailingAnchor),
+            waveform.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            waveform.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
             waveform.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -panelVerticalInset)
         ])
         toolbar = controls
@@ -551,6 +554,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let restoredFrame = window.setFrameUsingName(frameAutosaveName, force: true)
         _ = window.setFrameAutosaveName(frameAutosaveName)
         if restoredFrame {
+            applyPanelMinimum()
             keepPanelVisible(window)
         } else {
             window.center()
@@ -786,6 +790,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             waveform?.maximumTraceHeight = nil
         }
         applyPanelMinimum()
+        // Keep the hidden controls from imposing their width on the waveform.
+        toolbarTrailing?.isActive = !waveformOnly
         toolbar?.isHidden = waveformOnly
         if waveformOnly {
             waveformTopBelowToolbar?.isActive = false
@@ -812,8 +818,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard width != original.width || height != original.height else { return }
 
         var adjusted = NSRect(x: original.minX, y: original.maxY - height, width: width, height: height)
-        if let visible = panel.screen?.visibleFrame, height <= visible.height {
-            adjusted.origin.y = min(max(adjusted.minY, visible.minY), visible.maxY - height)
+        if let visible = panel.screen?.visibleFrame {
+            if width > original.width, width <= visible.width {
+                adjusted.origin.x = min(max(adjusted.minX, visible.minX), visible.maxX - width)
+            }
+            if height > original.height, height <= visible.height {
+                adjusted.origin.y = min(max(adjusted.minY, visible.minY), visible.maxY - height)
+            }
         }
         panel.setFrame(adjusted, display: true)
     }
