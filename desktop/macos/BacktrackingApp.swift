@@ -10,6 +10,7 @@ private let frameAutosaveName: NSWindow.FrameAutosaveName = "Backtracking.Panel"
 private let fullPanelMinimum = NSSize(width: 560, height: 100)
 private let waveformOnlyPanelMinimum = NSSize(width: 560, height: 48)
 private let panelVerticalInset: CGFloat = 8
+private let fullWaveformMinimumHeight: CGFloat = 51
 private let waveformMint = (red: CGFloat(0.32), green: CGFloat(0.89), blue: CGFloat(0.82))
 
 private func movesFromWaveform(_ modifiers: NSEvent.ModifierFlags) -> Bool {
@@ -35,7 +36,7 @@ private final class CapturePanel: NSPanel {
     var onClick: (() -> Void)?
     var onContextMenu: ((NSEvent) -> Void)?
     weak var waveform: WaveformView?
-    private var moving = false
+    private var move: MoveGesture?
     private var resize: ResizeGesture?
     private var chromeCursorActive = false
 
@@ -72,24 +73,29 @@ private final class CapturePanel: NSPanel {
         let startFrame: NSRect
     }
 
+    private struct MoveGesture {
+        let startPointer: NSPoint
+        let startOrigin: NSPoint
+    }
+
     override func sendEvent(_ event: NSEvent) {
         switch event.type {
         case .leftMouseDown:
             onClick?()
-            moving = false
+            move = nil
             resize = nil
             if let area = clientArea, area.contains(event.locationInWindow) {
+                let startPointer = convertPoint(toScreen: event.locationInWindow)
                 if canMove(at: event.locationInWindow, modifiers: event.modifierFlags) {
                     waveform?.clearPointerFeedback()
-                    moving = true
+                    move = MoveGesture(startPointer: startPointer, startOrigin: frame.origin)
                     setChromeCursor(.closedHand)
-                    performDrag(with: event)
                     return
                 }
                 let edges = resizeEdges(at: event.locationInWindow, in: area)
                 if !edges.isEmpty {
                     waveform?.clearPointerFeedback()
-                    resize = ResizeGesture(edges: edges, startPointer: convertPoint(toScreen: event.locationInWindow), startFrame: frame)
+                    resize = ResizeGesture(edges: edges, startPointer: startPointer, startFrame: frame)
                     setChromeCursor(edges.cursor)
                     return
                 }
@@ -103,9 +109,10 @@ private final class CapturePanel: NSPanel {
                 }
                 return
             }
-            if moving {
+            if let move {
+                applyMove(move)
                 if event.type == .leftMouseUp {
-                    moving = false
+                    self.move = nil
                     updateChromeCursor()
                 }
                 return
@@ -138,7 +145,7 @@ private final class CapturePanel: NSPanel {
 
     override func mouseExited(with event: NSEvent) {
         if NSEvent.pressedMouseButtons & 1 == 0 {
-            moving = false
+            move = nil
             resize = nil
             setChromeCursor(nil)
         }
@@ -151,7 +158,7 @@ private final class CapturePanel: NSPanel {
     }
 
     private func canMove(at location: NSPoint, modifiers: NSEvent.ModifierFlags) -> Bool {
-        guard isMovable, modifiers.contains(.option), !modifiers.contains(.control) else { return false }
+        guard modifiers.contains(.option), !modifiers.contains(.control) else { return false }
         if movesFromWaveform(modifiers) { return true }
         return !waveformContains(location)
     }
@@ -162,7 +169,6 @@ private final class CapturePanel: NSPanel {
     }
 
     private func resizeEdges(at location: NSPoint, in area: NSRect) -> Edges {
-        guard styleMask.contains(.resizable) else { return [] }
         // The hit area sits inside the existing content gutters.
         let gutter: CGFloat = 7
         var edges: Edges = []
@@ -171,6 +177,15 @@ private final class CapturePanel: NSPanel {
         if location.y - area.minY < gutter { edges.insert(.bottom) }
         if area.maxY - location.y < gutter { edges.insert(.top) }
         return edges
+    }
+
+    private func applyMove(_ gesture: MoveGesture) {
+        let mouse = NSEvent.mouseLocation
+        let origin = NSPoint(
+            x: gesture.startOrigin.x + mouse.x - gesture.startPointer.x,
+            y: gesture.startOrigin.y + mouse.y - gesture.startPointer.y
+        )
+        if frame.origin != origin { setFrameOrigin(origin) }
     }
 
     private func applyResize(_ gesture: ResizeGesture) {
@@ -196,12 +211,12 @@ private final class CapturePanel: NSPanel {
             }
             self.resize = nil
         }
-        if moving && NSEvent.pressedMouseButtons & 1 == 0 { moving = false }
+        if NSEvent.pressedMouseButtons & 1 == 0 { move = nil }
         // A waveform gesture owns the pointer until release, even if it crosses a gutter.
         guard NSEvent.pressedMouseButtons == 0 else { return }
         let location = mouseLocationOutsideOfEventStream
-        guard !moving, let area = clientArea, area.contains(location) else {
-            if !moving { setChromeCursor(nil) }
+        guard let area = clientArea, area.contains(location) else {
+            setChromeCursor(nil)
             return
         }
         if canMove(at: location, modifiers: NSEvent.modifierFlags) {
@@ -437,6 +452,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         NSApp.terminate(nil)
     }
 
+    func applicationDidChangeScreenParameters(_ notification: Notification) {
+        if let panel { keepPanelVisible(panel) }
+    }
+
     private func configureMenu() {
         let bar = NSMenu()
         let item = NSMenuItem()
@@ -450,22 +469,23 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private func configurePanel() {
         let window = CapturePanel(
             contentRect: NSRect(x: 0, y: 0, width: 590, height: 116),
-            styleMask: [.borderless, .resizable, .nonactivatingPanel],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
         window.title = "Backtracking"
         window.contentMinSize = fullPanelMinimum
-        window.isMovable = true
+        // CapturePanel handles dragging and resizing without AppKit's native window gestures.
+        window.isMovable = false
         window.delegate = self
         window.becomesKeyOnlyIfNeeded = true
         window.acceptsMouseMovedEvents = true
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .fullScreenDisallowsTiling]
         window.onClick = { [weak self] in self?.registerClick() }
         window.onContextMenu = { [weak self] event in self?.showContextMenu(event) }
 
         let waveform = WaveformView(frame: .zero)
         waveform.controller = self
-        let minimumWaveformHeight = waveform.heightAnchor.constraint(greaterThanOrEqualToConstant: 51)
+        let minimumWaveformHeight = waveform.heightAnchor.constraint(greaterThanOrEqualToConstant: fullWaveformMinimumHeight)
         minimumWaveformHeight.isActive = true
         waveformMinimumHeight = minimumWaveformHeight
         window.waveform = waveform
@@ -523,17 +543,26 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         ])
         toolbar = controls
         waveformTopBelowToolbar = waveform.topAnchor.constraint(equalTo: controls.bottomAnchor, constant: 6)
+        waveformTopBelowToolbar?.isActive = true
         waveformTopWithoutToolbar = waveform.topAnchor.constraint(equalTo: content.topAnchor, constant: panelVerticalInset)
         panel = window
         applyPin(to: pinButton)
         applyWaveformOnly()
-        let restoredFrame = window.setFrameUsingName(frameAutosaveName)
+        let restoredFrame = window.setFrameUsingName(frameAutosaveName, force: true)
         _ = window.setFrameAutosaveName(frameAutosaveName)
-        let screens = NSScreen.screens
-        if !restoredFrame || (!screens.isEmpty && !screens.contains(where: { $0.visibleFrame.intersects(window.frame) })) {
+        if restoredFrame {
+            keepPanelVisible(window)
+        } else {
             window.center()
         }
         window.orderFrontRegardless()
+    }
+
+    private func keepPanelVisible(_ window: NSWindow) {
+        let screens = NSScreen.screens
+        if !screens.isEmpty && !screens.contains(where: { $0.visibleFrame.intersects(window.frame) }) {
+            window.center()
+        }
     }
 
     private func setIcon(_ symbol: String, label: String, on button: NSButton) {
@@ -750,6 +779,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func applyWaveformOnly() {
+        if waveformOnly, let waveform {
+            panel?.contentView?.layoutSubtreeIfNeeded()
+            waveform.maximumTraceHeight = max(waveform.bounds.height, fullWaveformMinimumHeight)
+        } else {
+            waveform?.maximumTraceHeight = nil
+        }
         applyPanelMinimum()
         toolbar?.isHidden = waveformOnly
         if waveformOnly {
@@ -758,7 +793,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             waveformTopWithoutToolbar?.isActive = true
         } else {
             waveformTopWithoutToolbar?.isActive = false
-            waveformMinimumHeight?.constant = 51
+            waveformMinimumHeight?.constant = fullWaveformMinimumHeight
             waveformTopBelowToolbar?.isActive = true
         }
         waveform?.showsOverlay = !waveformOnly
@@ -998,6 +1033,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 private final class WaveformView: NSView, NSDraggingSource {
     weak var controller: BacktrackingController?
     var showsOverlay = true { didSet { needsDisplay = true } }
+    var maximumTraceHeight: CGFloat? { didSet { needsDisplay = true } }
     private var low = [Float](repeating: 0, count: 256)
     private var high = [Float](repeating: 0, count: 256)
     private var frames: UInt64 = 0
@@ -1293,7 +1329,7 @@ private final class WaveformView: NSView, NSDraggingSource {
         NSGraphicsContext.saveGraphicsState()
         panel.addClip()
         let middle = bounds.midY
-        let height = bounds.height * 0.46
+        let height = min(bounds.height, maximumTraceHeight ?? bounds.height) * 0.46
         let preview = selection != nil || pointer != nil || mouseDownEvent != nil || dragging ? exportRange : nil
         let selectedRect = selection.map { waveformRect(for: $0) }
         if showsOverlay, let preview, selectedRect == nil, frames != 0 {

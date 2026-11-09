@@ -33,6 +33,8 @@ const DURATIONS: [DurationChoice; 3] = [
 const MINT: Color32 = Color32::from_rgb(103, 231, 181);
 const INVERTED_MINT: Color32 = Color32::from_rgb(152, 24, 74);
 const SETTINGS_POPUP_ID: &str = "backtracking-settings-popup";
+const TOOLBAR_CONTROL_HEIGHT: f32 = 25.0;
+const MIN_WAVEFORM_HEIGHT: f32 = 60.0;
 
 pub type CaptureEditor = EguiEditor<CaptureUi>;
 
@@ -50,6 +52,7 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
             recording_since: None,
             displayed_settings: None,
             context_menu_position: None,
+            full_waveform_height: None,
             frozen: None,
             selection: None,
             selection_ready_for_drag: false,
@@ -73,6 +76,7 @@ pub struct CaptureUi {
     recording_since: Option<Instant>,
     displayed_settings: Option<SessionSettings>,
     context_menu_position: Option<Pos2>,
+    full_waveform_height: Option<f32>,
     frozen: Option<Arc<Snapshot>>,
     selection: Option<Range<f32>>,
     selection_ready_for_drag: bool,
@@ -249,10 +253,15 @@ impl NiceEguiApp for CaptureUi {
         } else {
             0.0
         };
-        let wave_size = Vec2::new(
-            ui.available_width(),
-            (ui.available_height() - status_height).max(60.0),
-        );
+        let available_height = ui.available_height();
+        let wave_height = if waveform_only {
+            available_height
+        } else {
+            let height = (available_height - status_height).max(MIN_WAVEFORM_HEIGHT);
+            self.full_waveform_height = Some(height);
+            height
+        };
+        let wave_size = Vec2::new(ui.available_width(), wave_height);
         let (rect, response) = ui.allocate_exact_size(wave_size, Sense::click_and_drag());
         let settings_open = self.settings_menu(
             frame,
@@ -271,9 +280,26 @@ impl NiceEguiApp for CaptureUi {
             settings.idle_resume,
             !settings_open,
         );
+        // Keep the transparent overlay's entire gesture area and center only the drawing.
+        let draw_rect = if waveform_only {
+            let height = self.full_waveform_height.unwrap_or_else(|| {
+                let spacing = ui.spacing();
+                let toolbar_height = TOOLBAR_CONTROL_HEIGHT
+                    .max(spacing.interact_size.y)
+                    .max(ui.text_style_height(&egui::TextStyle::Heading));
+                (available_height - toolbar_height - spacing.item_spacing.y)
+                    .max(MIN_WAVEFORM_HEIGHT)
+            });
+            Rect::from_center_size(
+                rect.center(),
+                Vec2::new(rect.width(), height.min(rect.height())),
+            )
+        } else {
+            rect
+        };
         self.draw_waveform(
             ui,
-            rect,
+            draw_rect,
             configured_seconds,
             !settings_open,
             settings.panel_transparency,
@@ -342,7 +368,7 @@ impl CaptureUi {
             MeterMode::Lufs => "Momentary loudness (400 ms)",
         };
         ui.add_sized(
-            [90.0, 25.0],
+            [90.0, TOOLBAR_CONTROL_HEIGHT],
             egui::Label::new(egui::RichText::new(text).monospace()).truncate(),
         )
         .on_hover_text(description);
@@ -686,7 +712,7 @@ impl CaptureUi {
         let painter = ui.painter_at(rect);
         let inner = rect.shrink(8.0);
         let middle = inner.center().y;
-        let extent = inner.height() * 0.47;
+        let extent = inner.height().max(0.0) * 0.47;
         if !waveform_only {
             let opacity = ((100 - u16::from(panel_transparency)) * 255 / 100) as u8;
             painter.rect_filled(
@@ -1090,7 +1116,7 @@ fn wav_format_controls(ui: &mut egui::Ui, profile: &mut WavExportProfile) {
 }
 
 fn capture_button(ui: &mut egui::Ui, paused: bool, enabled: bool) -> egui::Response {
-    let button = egui::Button::new("").min_size(Vec2::splat(25.0));
+    let button = egui::Button::new("").min_size(Vec2::splat(TOOLBAR_CONTROL_HEIGHT));
     let response = ui.add_enabled(enabled, button);
     let label = if paused {
         "Start capture"
@@ -1123,7 +1149,7 @@ fn capture_button(ui: &mut egui::Ui, paused: bool, enabled: bool) -> egui::Respo
 }
 
 fn settings_button(ui: &mut egui::Ui) -> egui::Response {
-    let response = ui.add(egui::Button::new("").min_size(Vec2::splat(25.0)));
+    let response = ui.add(egui::Button::new("").min_size(Vec2::splat(TOOLBAR_CONTROL_HEIGHT)));
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Settings"));
     let center = response.rect.center();
     let stroke = ui.style().interact(&response).fg_stroke;
@@ -1140,7 +1166,8 @@ fn settings_button(ui: &mut egui::Ui) -> egui::Response {
 }
 
 fn clear_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
-    let response = ui.add_enabled(enabled, egui::Button::new("").min_size(Vec2::splat(25.0)));
+    let button = egui::Button::new("").min_size(Vec2::splat(TOOLBAR_CONTROL_HEIGHT));
+    let response = ui.add_enabled(enabled, button);
     let label = "Clear captured audio";
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
     let center = response.rect.center();

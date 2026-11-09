@@ -28,7 +28,7 @@ macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`C
 
 在波形上按右鍵。錄音已暫停時，選單提供 **開始錄音／Play**。錄音已待命或正在收錄時，選單提供 **暫停錄音／Pause**。
 
-開啟時會保留目前的視窗尺寸。可拖曳桌面視窗的上方或下方內緣，把波形縮成細條。取消勾選時，視窗若低於完整介面的最小高度，會自動拉高以容納工具列。
+切換時，波形會保持完整介面中的高度並垂直置中，視窗尺寸也會保留。可拖曳桌面視窗的上方或下方內緣，把波形縮成細條。可用空間不足時，波形會跟著縮小。取消勾選時，視窗若低於完整介面的最小高度，會自動拉高以容納工具列。
 
 | 桌面版 | 只顯示波形最小高度 | 完整介面最小高度 |
 | --- | --- | --- |
@@ -39,7 +39,7 @@ macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`C
 
 ### 移動與縮放桌面視窗
 
-Windows 和 macOS 桌面版採用無邊框視窗。用下列手勢移動或調整大小。要關閉桌面程式，請從設定選單選擇 **結束／Quit**。
+Windows 和 macOS 桌面版採用無邊框視窗。以下手勢可自由移動或調整大小，靠近螢幕邊緣時不會自動貼齊。VST3／CLAP 的外層視窗由 DAW 管理。要關閉桌面程式，請從設定選單選擇 **結束／Quit**。
 
 | 動作 | Windows 桌面版 | macOS 桌面版 |
 | --- | --- | --- |
@@ -172,7 +172,7 @@ Turn on **Show waveform only** to hide Backtracking's frame and dark panel backg
 
 Right-click the waveform. Choose **Play** (**開始錄音** in the macOS app) when capture is paused, or **Pause** (**暫停錄音**) when capture is armed or recording.
 
-The desktop window keeps its current size when you enable the mode. Drag the inside top or bottom edge to make the waveform a thin strip. When you turn the mode off, the window grows if needed to meet the full interface's minimum height.
+When you switch modes, the waveform keeps the height it had in the full interface and moves to the vertical center. The window keeps its size. Drag the inside top or bottom edge to make the desktop window a thin strip. The waveform shrinks if there is less room. When you turn the mode off, the window grows if needed to meet the full interface's minimum height.
 
 | Desktop app | Waveform-only minimum height | Full interface minimum height |
 | --- | --- | --- |
@@ -183,7 +183,7 @@ To restore the full interface, right-click the waveform and turn off **Show wave
 
 ### Move and resize the desktop window
 
-The Windows and macOS desktop apps use a frameless window. Use the gestures below to move or resize it. To close the desktop app, choose **Quit** from Settings.
+The Windows and macOS desktop apps use a frameless window. The gestures below move and resize it without automatic snapping near screen edges. The DAW manages the outer window for VST3 and CLAP. To close the desktop app, choose **Quit** from Settings.
 
 | Action | Windows desktop | macOS desktop |
 | --- | --- | --- |
@@ -379,8 +379,8 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 4. 修改一項偏好後重開桌面版，確認設定有還原。測試插件時，修改設定後先儲存 DAW 專案，再重開該專案確認。
 
    Change a preference and relaunch the desktop app to check that it is restored. For the plug-in, change a setting, save the DAW project, and reopen it to check the saved value.
-5. 開啟 **只顯示波形**。按右鍵測試暫停和啟用錄音，再確認框選時區間內的波形會變色。桌面版可把視窗縮到最小高度，再按右鍵開啟設定並取消勾選，確認可回到完整介面。
+5. 開啟 **只顯示波形**，確認波形高度維持原樣並垂直置中。按右鍵測試暫停和啟用錄音，再確認框選時區間內的波形會變色。桌面版可將視窗拖到螢幕邊緣附近，確認仍停在放開的位置，再將視窗縮到最小高度，並從右鍵選單切回完整介面。
 
-   Turn on **Show waveform only**. Use the right-click menu to pause and arm capture. Check that selecting a range changes the waveform color in that range. On desktop, resize to the minimum height, then right-click and turn the option off to restore the full interface.
+   Turn on **Show waveform only** and check that the waveform keeps its height and moves to the vertical center. Use the right-click menu to pause and arm capture. Check that selecting a range changes its waveform color. On desktop, move the window near a screen edge and check that it stays where you release it, then resize it to the minimum height and restore the full interface from the right-click menu.
 
 [回到專案首頁 / Back to the project README](../README.md)

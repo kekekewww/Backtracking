@@ -17,8 +17,18 @@ use eframe::egui::{
     self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection, Stroke, Vec2,
     ViewportCommand,
 };
+use windows::Win32::{
+    Foundation::{HWND, POINT, RECT},
+    UI::{
+        Input::KeyboardAndMouse::GetCapture,
+        WindowsAndMessaging::{
+            GetCursorPos, GetWindowRect, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+        },
+    },
+};
 use winit::{
     platform::windows::{Color, CornerPreference, WindowExtWindows},
+    raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::Window,
 };
 
@@ -49,6 +59,9 @@ const RESIZE_CORNER: f32 = 14.0;
 const MIN_WIDTH: f32 = 510.0;
 const FULL_MIN_HEIGHT: f32 = 132.0;
 const WAVEFORM_MIN_HEIGHT: f32 = 48.0;
+// Plot height in the default full window, used when launching directly into waveform-only mode.
+const DEFAULT_WAVEFORM_HEIGHT: f32 = 59.0;
+const WAVEFORM_INSET: f32 = 8.0;
 const SETTINGS_MIN_HEIGHT: f32 = 112.0;
 const WRITING_WAV: &str = "Writing WAV…";
 
@@ -60,7 +73,9 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
             .with_inner_size([610.0, 144.0])
             .with_min_inner_size(min_window_size(settings.waveform_only))
             .with_decorations(false)
-            .with_resizable(true)
+            // The app handles resizing and moving without entering the shell's drag/snap loop.
+            .with_resizable(false)
+            .with_maximize_button(false)
             .with_transparent(true)
             .with_window_level(if settings.pinned {
                 egui::WindowLevel::AlwaysOnTop
@@ -132,6 +147,7 @@ struct Recorder {
     output: PathBuf,
     pinned: bool,
     waveform_only: bool,
+    full_waveform_height: f32,
     settings_restore_height: Option<f32>,
     idle_resume: AutoResumeDelay,
     transparency: u8,
@@ -147,7 +163,7 @@ struct Recorder {
     snapshot: Option<Arc<Snapshot>>,
     selection: Option<Range<f32>>,
     gesture: Option<Gesture>,
-    window_command: Option<ViewportCommand>,
+    window_drag: Option<WindowDrag>,
     export: Option<ExportJob>,
     pending_exports: VecDeque<ExportClip>,
     clip_revision: u64,
@@ -158,6 +174,112 @@ struct Recorder {
 enum Gesture {
     Select { anchor: f32, cursor: f32 },
     Export { origin: Pos2 },
+}
+
+#[derive(Clone, Copy)]
+enum WindowInteraction {
+    Move,
+    Resize(ResizeDirection),
+}
+
+impl WindowInteraction {
+    fn cursor(self) -> CursorIcon {
+        match self {
+            Self::Move => CursorIcon::Move,
+            Self::Resize(ResizeDirection::NorthWest | ResizeDirection::SouthEast) => {
+                CursorIcon::ResizeNwSe
+            }
+            Self::Resize(ResizeDirection::NorthEast | ResizeDirection::SouthWest) => {
+                CursorIcon::ResizeNeSw
+            }
+            Self::Resize(ResizeDirection::West | ResizeDirection::East) => {
+                CursorIcon::ResizeHorizontal
+            }
+            Self::Resize(ResizeDirection::North | ResizeDirection::South) => {
+                CursorIcon::ResizeVertical
+            }
+        }
+    }
+}
+
+struct WindowDrag {
+    interaction: WindowInteraction,
+    press_position: Pos2,
+    origin: Option<(POINT, RECT)>,
+    released: bool,
+}
+
+impl WindowDrag {
+    fn update(&mut self, window: &Window, pixels_per_point: f32, minimum: Vec2) -> Option<()> {
+        let handle = window.window_handle().ok()?;
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return None;
+        };
+        let hwnd = HWND(handle.hwnd.get() as *mut _);
+        if !self.released && unsafe { GetCapture() } != hwnd {
+            return None;
+        }
+
+        let mut cursor = POINT::default();
+        let mut current = RECT::default();
+        // The window and mouse are on the event-loop thread. Screen coordinates preserve
+        // the drag anchor as the client origin changes and can be negative across monitors.
+        unsafe {
+            GetCursorPos(&mut cursor).ok()?;
+            GetWindowRect(hwnd, &mut current).ok()?;
+        }
+        let (start, bounds) = if let Some(origin) = self.origin {
+            origin
+        } else {
+            if self.released {
+                return None;
+            }
+            let inner = window.inner_position().ok()?;
+            let start = POINT {
+                x: inner.x + (self.press_position.x * pixels_per_point).round() as i32,
+                y: inner.y + (self.press_position.y * pixels_per_point).round() as i32,
+            };
+            self.origin = Some((start, current));
+            (start, current)
+        };
+
+        let mut flags = SWP_NOACTIVATE | SWP_NOZORDER;
+        let inner = window.inner_size();
+        let min_width = (minimum.x * pixels_per_point).ceil() as i32
+            + (current.right - current.left - inner.width as i32).max(0);
+        let min_height = (minimum.y * pixels_per_point).ceil() as i32
+            + (current.bottom - current.top - inner.height as i32).max(0);
+        let target = drag_bounds(
+            self.interaction,
+            bounds,
+            start,
+            cursor,
+            min_width,
+            min_height,
+        );
+        let changed = match self.interaction {
+            WindowInteraction::Move => {
+                flags |= SWP_NOSIZE;
+                target.left != current.left || target.top != current.top
+            }
+            WindowInteraction::Resize(_) => target != current,
+        };
+        if changed {
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    target.left,
+                    target.top,
+                    target.right - target.left,
+                    target.bottom - target.top,
+                    flags,
+                )
+                .ok()?;
+            }
+        }
+        (!self.released).then_some(())
+    }
 }
 
 enum SettingsAction {
@@ -225,6 +347,7 @@ impl Recorder {
             output: settings.output,
             pinned: settings.pinned,
             waveform_only: settings.waveform_only,
+            full_waveform_height: DEFAULT_WAVEFORM_HEIGHT,
             settings_restore_height: None,
             idle_resume: settings.idle_resume,
             transparency: settings.transparency,
@@ -240,7 +363,7 @@ impl Recorder {
             snapshot: None,
             selection: None,
             gesture: None,
-            window_command: None,
+            window_drag: None,
             export: None,
             pending_exports: VecDeque::new(),
             clip_revision: 0,
@@ -951,9 +1074,13 @@ impl Recorder {
 
     fn audio_rect(&self, rect: Rect) -> Rect {
         let inner = if self.waveform_only {
-            rect.shrink2(Vec2::new(8.0, 2.0))
+            let inner = rect.shrink2(Vec2::new(WAVEFORM_INSET, 2.0));
+            Rect::from_center_size(
+                inner.center(),
+                Vec2::new(inner.width(), self.full_waveform_height.min(inner.height())),
+            )
         } else {
-            rect.shrink(8.0)
+            rect.shrink(WAVEFORM_INSET)
         };
         let width = inner.width()
             * (self.seconds / self.controller.retention().seconds() as f32).clamp(0.0, 1.0);
@@ -1047,7 +1174,7 @@ impl Recorder {
             if self.transparency == 0 {
                 painter.rect_filled(rect, 6.0, Color32::from_rgb(22, 26, 29));
             }
-            let inner = rect.shrink(8.0);
+            let inner = rect.shrink(WAVEFORM_INSET);
             painter.hline(
                 inner.x_range(),
                 inner.center().y,
@@ -1180,7 +1307,9 @@ impl eframe::App for Recorder {
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
-        if input.viewport().minimized == Some(true) {
+        let viewport = input.viewport();
+        if viewport.minimized == Some(true) || viewport.fullscreen == Some(true) || !input.focused {
+            self.window_drag = None;
             return;
         }
         if input
@@ -1194,10 +1323,6 @@ impl eframe::App for Recorder {
             return;
         }
         let bounds = input.screen_rect.unwrap_or_else(|| ctx.viewport_rect());
-        let viewport = input.viewport();
-        if viewport.fullscreen == Some(true) {
-            return;
-        }
         let can_resize = viewport.maximized != Some(true);
         for event in &mut input.events {
             let egui::Event::PointerButton {
@@ -1209,22 +1334,39 @@ impl eframe::App for Recorder {
             else {
                 continue;
             };
-            // A queued release means the button was not held when the native command would run.
-            self.window_command = None;
-            if pressed
-                && let Some((command, _)) =
-                    window_interaction(bounds, pos, modifiers.alt, can_resize)
-            {
+            if pressed {
+                self.window_drag =
+                    window_interaction(bounds, pos, modifiers.alt, can_resize).map(|interaction| {
+                        WindowDrag {
+                            interaction,
+                            press_position: pos,
+                            origin: None,
+                            released: false,
+                        }
+                    });
+            }
+            if let Some(drag) = &mut self.window_drag {
+                drag.released = !pressed;
                 // Keep the position but prevent the reserved press from reaching any widget.
                 *event = egui::Event::PointerMoved(pos);
-                self.window_command = Some(command);
             }
         }
     }
 
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(command) = self.window_command.take() {
-            ctx.send_viewport_cmd(command);
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(drag) = &mut self.window_drag
+            && frame
+                .winit_window()
+                .and_then(|window| {
+                    drag.update(
+                        window,
+                        ctx.pixels_per_point(),
+                        min_window_size(self.waveform_only),
+                    )
+                })
+                .is_none()
+        {
+            self.window_drag = None;
         }
         self.controller.poll();
         if !self.controller.is_recording() {
@@ -1239,11 +1381,13 @@ impl eframe::App for Recorder {
         {
             self.resume();
         }
-        ctx.request_repaint_after(if self.gesture.is_some() || self.export.is_some() {
-            Duration::from_millis(16)
-        } else {
-            REFRESH
-        });
+        ctx.request_repaint_after(
+            if self.window_drag.is_some() || self.gesture.is_some() || self.export.is_some() {
+                Duration::from_millis(16)
+            } else {
+                REFRESH
+            },
+        );
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -1258,11 +1402,15 @@ impl eframe::App for Recorder {
         egui::CentralPanel::default()
             .frame(frame_style)
             .show(ui, |ui| {
-                let menu_open =
-                    self.context_settings(ui, frame) || egui::Popup::is_any_open(ui.ctx());
+                let window_drag = self.window_drag.as_ref().map(|drag| drag.interaction);
+                let menu_open = window_drag.is_some()
+                    || self.context_settings(ui, frame)
+                    || egui::Popup::is_any_open(ui.ctx());
                 let menu_open =
                     (!self.waveform_only && self.controls(ui, frame, menu_open)) || menu_open;
-                let window_cursor = if !menu_open && self.gesture.is_none() {
+                let window_cursor = if let Some(interaction) = window_drag {
+                    Some(interaction.cursor())
+                } else if !menu_open && self.gesture.is_none() {
                     ui.input(|input| {
                         if input.viewport().fullscreen == Some(true) {
                             return None;
@@ -1273,7 +1421,7 @@ impl eframe::App for Recorder {
                             input.modifiers.alt,
                             input.viewport().maximized != Some(true),
                         )
-                        .map(|(_, cursor)| cursor)
+                        .map(WindowInteraction::cursor)
                     })
                 } else {
                     None
@@ -1286,6 +1434,9 @@ impl eframe::App for Recorder {
                 };
                 let size = Vec2::new(ui.available_width(), height);
                 let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                if !self.waveform_only {
+                    self.full_waveform_height = rect.height() - 2.0 * WAVEFORM_INSET;
+                }
                 if !menu_open {
                     self.interact_waveform(ui, frame, &response);
                 }
@@ -1331,12 +1482,12 @@ fn window_interaction(
     pos: Pos2,
     alt: bool,
     can_resize: bool,
-) -> Option<(ViewportCommand, CursorIcon)> {
+) -> Option<WindowInteraction> {
     if !bounds.contains(pos) {
         return None;
     }
     if alt {
-        return Some((ViewportCommand::StartDrag, CursorIcon::Move));
+        return Some(WindowInteraction::Move);
     }
     if !can_resize {
         return None;
@@ -1346,26 +1497,59 @@ fn window_interaction(
     let right = bounds.right() - pos.x;
     let top = pos.y - bounds.top();
     let bottom = bounds.bottom() - pos.y;
-    let (direction, cursor) = match () {
+    let direction = match () {
         _ if left.min(top) <= RESIZE_EDGE && left.max(top) <= RESIZE_CORNER => {
-            (ResizeDirection::NorthWest, CursorIcon::ResizeNwSe)
+            ResizeDirection::NorthWest
         }
         _ if right.min(top) <= RESIZE_EDGE && right.max(top) <= RESIZE_CORNER => {
-            (ResizeDirection::NorthEast, CursorIcon::ResizeNeSw)
+            ResizeDirection::NorthEast
         }
         _ if left.min(bottom) <= RESIZE_EDGE && left.max(bottom) <= RESIZE_CORNER => {
-            (ResizeDirection::SouthWest, CursorIcon::ResizeNeSw)
+            ResizeDirection::SouthWest
         }
         _ if right.min(bottom) <= RESIZE_EDGE && right.max(bottom) <= RESIZE_CORNER => {
-            (ResizeDirection::SouthEast, CursorIcon::ResizeNwSe)
+            ResizeDirection::SouthEast
         }
-        _ if left <= RESIZE_EDGE => (ResizeDirection::West, CursorIcon::ResizeHorizontal),
-        _ if right <= RESIZE_EDGE => (ResizeDirection::East, CursorIcon::ResizeHorizontal),
-        _ if top <= RESIZE_EDGE => (ResizeDirection::North, CursorIcon::ResizeVertical),
-        _ if bottom <= RESIZE_EDGE => (ResizeDirection::South, CursorIcon::ResizeVertical),
+        _ if left <= RESIZE_EDGE => ResizeDirection::West,
+        _ if right <= RESIZE_EDGE => ResizeDirection::East,
+        _ if top <= RESIZE_EDGE => ResizeDirection::North,
+        _ if bottom <= RESIZE_EDGE => ResizeDirection::South,
         _ => return None,
     };
-    Some((ViewportCommand::BeginResize(direction), cursor))
+    Some(WindowInteraction::Resize(direction))
+}
+
+fn drag_bounds(
+    interaction: WindowInteraction,
+    mut bounds: RECT,
+    start: POINT,
+    cursor: POINT,
+    min_width: i32,
+    min_height: i32,
+) -> RECT {
+    use ResizeDirection::{East, North, NorthEast, NorthWest, South, SouthEast, SouthWest, West};
+
+    let dx = cursor.x - start.x;
+    let dy = cursor.y - start.y;
+    let WindowInteraction::Resize(direction) = interaction else {
+        bounds.left += dx;
+        bounds.right += dx;
+        bounds.top += dy;
+        bounds.bottom += dy;
+        return bounds;
+    };
+
+    if matches!(direction, West | NorthWest | SouthWest) {
+        bounds.left = (bounds.left + dx).min(bounds.right - min_width);
+    } else if matches!(direction, East | NorthEast | SouthEast) {
+        bounds.right = (bounds.right + dx).max(bounds.left + min_width);
+    }
+    if matches!(direction, North | NorthWest | NorthEast) {
+        bounds.top = (bounds.top + dy).min(bounds.bottom - min_height);
+    } else if matches!(direction, South | SouthWest | SouthEast) {
+        bounds.bottom = (bounds.bottom + dy).max(bounds.top + min_height);
+    }
+    bounds
 }
 
 const DRAG_ICON: &[u8] = &[

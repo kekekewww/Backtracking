@@ -21,7 +21,7 @@ Backtracking 是給作曲與混音用的回溯錄音取樣器。聽到想留下�
 
 齒輪旁的即時音量表可顯示 **dBFS、VU 或瞬時 LUFS**。點齒輪或按右鍵可開啟相同的設定選單。**只顯示波形** 預設關閉，開啟後畫面只保留波形，可從右鍵選單啟用或暫停錄音，也可切回完整介面。桌面版可拖曳視窗內緣縮成細條。自動續錄可選 **0、5 或 10 秒**，預設 10 秒。選 0 秒會在波形操作完成後立刻恢復待命。清除錄音只會清空記憶體中的擷取內容。
 
-Windows 和 macOS 桌面版採用無邊框視窗，可直接在工具列切換置頂，或從設定選單結束程式。
+切換至 **只顯示波形** 時，波形會以原本的高度垂直置中。視窗縮到空間不足時，波形才會跟著縮小。Windows 和 macOS 桌面版的無邊框視窗可自由拖曳及調整大小，靠近螢幕邊緣時不會自動貼齊。可在工具列切換置頂，或從設定選單結束程式。
 
 桌面版會在下次開啟時還原偏好設定。VST3／CLAP 的設定跟著各自的插件實例存進 DAW 專案，修改後請儲存專案。要保留錄音素材，請先匯出 WAV。
 
@@ -48,7 +48,7 @@ Backtracking is a retrospective audio sampler for music production and mixing. W
 
 The live meter next to the gear can show **dBFS, VU, or momentary LUFS**. Click the gear or right-click to open the same settings menu. **Show waveform only** defaults to Off. When enabled, only the waveform is visible. Use the right-click menu to arm or pause capture, or to restore the full interface. On desktop, drag an inside edge to resize it into a thin strip. Auto-resume offers **0, 5, or 10 seconds**, with 10 seconds as the default. At 0 seconds, capture re-arms as soon as the waveform gesture ends. The clear action empties the audio held in memory.
 
-The Windows and macOS desktop apps use a frameless window. Use **Keep on top** in the toolbar or **Quit** in the settings menu.
+The waveform keeps its previous height and moves to the vertical center when you switch to **Show waveform only**. It shrinks to fit a shorter window. The frameless Windows and macOS desktop windows can be moved and resized without snapping to screen edges. Use **Keep on top** in the toolbar or **Quit** in the settings menu.
 
 The desktop apps restore preferences the next time you open them. For VST3 and CLAP, save your DAW project after making changes to store each instance's settings. Export a WAV to keep captured audio.
 
