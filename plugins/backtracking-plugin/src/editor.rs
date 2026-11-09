@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::io;
+use std::io::{self, Cursor};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use backtracking_core::{
     AutoResumeDelay, DurationChoice, MeterReadings, Snapshot, WavExportProfile, WavSampleFormat,
     export_wav_with_profile, waveform,
 };
-use egui::{Color32, CursorIcon, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
+use egui::{Color32, CursorIcon, PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use nice_plug::context::gui::GuiContext;
 use nice_plug_egui::baseview::dpi::LogicalSize;
 use nice_plug_egui::{
@@ -35,6 +35,7 @@ const INVERTED_MINT: Color32 = Color32::from_rgb(152, 24, 74);
 const SETTINGS_POPUP_ID: &str = "backtracking-settings-popup";
 const TOOLBAR_CONTROL_HEIGHT: f32 = 25.0;
 const MIN_WAVEFORM_HEIGHT: f32 = 60.0;
+const PRODUCT_ICON: &[u8] = include_bytes!("../../../assets/backtracking-icon.png");
 
 pub type CaptureEditor = EguiEditor<CaptureUi>;
 
@@ -45,6 +46,7 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
         EguiNiceSettings::new().with_tile("Backtracking"),
         CaptureUi {
             session,
+            product_icon: None,
             minimum: [0.0; BINS],
             maximum: [0.0; BINS],
             seconds: 0.0,
@@ -69,6 +71,7 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
 
 pub struct CaptureUi {
     session: Arc<Session>,
+    product_icon: Option<TextureHandle>,
     minimum: [f32; BINS],
     maximum: [f32; BINS],
     seconds: f32,
@@ -153,6 +156,26 @@ struct ExportedWav {
     path: PathBuf,
 }
 
+fn product_icon(context: &egui::Context) -> Option<TextureHandle> {
+    let mut decoder = png::Decoder::new(Cursor::new(PRODUCT_ICON));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().ok()?;
+    let mut pixels = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut pixels).ok()?;
+    let size = [info.width as usize, info.height as usize];
+    let pixels = &pixels[..info.buffer_size()];
+    let image = match info.color_type {
+        png::ColorType::Rgba => egui::ColorImage::from_rgba_unmultiplied(size, pixels),
+        png::ColorType::Rgb => egui::ColorImage::from_rgb(size, pixels),
+        _ => return None,
+    };
+    Some(context.load_texture(
+        "backtracking-icon",
+        image,
+        egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear)),
+    ))
+}
+
 impl NiceEguiApp for CaptureUi {
     fn build(
         &mut self,
@@ -160,6 +183,7 @@ impl NiceEguiApp for CaptureUi {
         _: GuiContext,
         _: &mut Frame,
     ) -> Result<(), nice_plug_egui::baseview::HandlerError> {
+        self.product_icon = product_icon(&context);
         context.add_font(egui::FontInsert {
             name: waveform::HINT_BOLD_FAMILY.to_owned(),
             data: egui::FontData::from_static(waveform::HINT_BOLD_FONT),
@@ -225,6 +249,9 @@ impl NiceEguiApp for CaptureUi {
         } else {
             Some(
                 ui.horizontal(|ui| {
+                    if let Some(icon) = &self.product_icon {
+                        ui.image((icon.id(), Vec2::splat(TOOLBAR_CONTROL_HEIGHT)));
+                    }
                     ui.heading("Backtracking");
                     ui.separator();
                     if capture_button(ui, paused, controls_enabled).clicked() {

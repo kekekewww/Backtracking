@@ -1,4 +1,4 @@
-# Backtracking
+# <img src="assets/backtracking-icon.svg" width="42" height="42" alt=""> Backtracking
 
 [繁體中文](#繁體中文) · [English](#english) · [硬體使用量 / Hardware utilization](#硬體使用量--hardware-utilization)
 

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::controller::Controller;
 use crate::preferences::{Key, MeterMode, Preferences, Settings, wav_sample_format_preference};
+use crate::window_order;
 use backtracking_core::{
     AutoResumeDelay, DurationChoice, MeterReadings, Snapshot, WavExportProfile, WavSampleFormat,
     export_wav_with_profile, waveform,
@@ -27,13 +28,14 @@ use windows::Win32::{
     },
 };
 use winit::{
-    platform::windows::{Color, CornerPreference, WindowExtWindows},
+    platform::windows::{Color, CornerPreference, IconExtWindows, WindowExtWindows},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
-    window::Window,
+    window::{Icon, Window},
 };
 
 const BINS: usize = 384;
 const REFRESH: Duration = Duration::from_millis(80);
+const PIN_RETRY: Duration = Duration::from_millis(320);
 const DURATIONS: [DurationChoice; 3] = [
     DurationChoice::Seconds10,
     DurationChoice::Seconds20,
@@ -71,10 +73,14 @@ const WRITING_WAV: &str = "Writing WAV…";
 pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
     let preferences = Preferences::for_current_user();
     let settings = preferences.load();
+    let icon =
+        eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/backtracking-icon.png"))
+            .expect("decode the Backtracking icon");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([610.0, 144.0])
             .with_min_inner_size(min_window_size(settings.waveform_only))
+            .with_icon(icon)
             .with_decorations(false)
             // The app handles resizing and moving without entering the shell's drag/snap loop.
             .with_resizable(false)
@@ -93,6 +99,9 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
         options,
         Box::new(|context| {
             configure_style(&context.egui_ctx);
+            if let Some(window) = context.winit_window() {
+                window.set_taskbar_icon(Icon::from_resource(1, None).ok());
+            }
             if settings.waveform_only {
                 set_waveform_frame(context.winit_window(), true);
             }
@@ -179,6 +188,7 @@ struct Recorder {
     preferences: Preferences,
     output: PathBuf,
     pinned: bool,
+    next_pin_check: Instant,
     waveform_only: bool,
     full_waveform_height: f32,
     settings_restore: Option<SettingsRestore>,
@@ -384,6 +394,7 @@ impl Recorder {
             preferences,
             output: settings.output,
             pinned: settings.pinned,
+            next_pin_check: Instant::now(),
             waveform_only: settings.waveform_only,
             full_waveform_height: DEFAULT_WAVEFORM_HEIGHT,
             settings_restore: None,
@@ -654,6 +665,7 @@ impl Recorder {
         let response = ui.add_enabled(!menu_open, icon_button());
         if response.clicked() {
             self.pinned = !self.pinned;
+            self.next_pin_check = Instant::now();
             self.save_preference(Key::AlwaysOnTop, if self.pinned { "1" } else { "0" });
             let level = if self.pinned {
                 egui::WindowLevel::AlwaysOnTop
@@ -1416,6 +1428,13 @@ impl eframe::App for Recorder {
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let now = Instant::now();
+        if self.pinned && now >= self.next_pin_check {
+            let attempted = frame
+                .winit_window()
+                .is_some_and(|window| window_order::raise_if_covered(window));
+            self.next_pin_check = now + if attempted { PIN_RETRY } else { REFRESH };
+        }
         if let Some(drag) = &mut self.window_drag
             && frame
                 .winit_window()

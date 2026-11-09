@@ -19,8 +19,9 @@ esac
 target_dir="${CARGO_TARGET_DIR:-$repo_dir/target}"
 CARGO_TARGET_DIR="$target_dir" cargo build --release --target "$rust_target" -p backtracking-core
 app_dir="$target_dir/bundled/Backtracking.app"
-mkdir -p "$app_dir/Contents/MacOS"
+mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
 cp "$source_dir/Info.plist" "$app_dir/Contents/Info.plist"
+cp "$repo_dir/assets/Backtracking.icns" "$app_dir/Contents/Resources/Backtracking.icns"
 xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library -O \
   -target "$swift_target" -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
   -import-objc-header "$repo_dir/crates/backtracking-core/include/backtracking.h" \

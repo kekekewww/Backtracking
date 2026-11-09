@@ -41,6 +41,8 @@ macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`C
 
 Windows 和 macOS 桌面版採用無邊框視窗。以下手勢可自由移動或調整大小，靠近螢幕邊緣時不會自動貼齊。VST3／CLAP 的外層視窗由 DAW 管理。要關閉桌面程式，請從設定選單選擇 **結束／Quit**。
 
+Windows 桌面版啟用 **置頂／Keep on top** 時，若工作列等同一桌面的視窗蓋住 Backtracking，程式會重新提升自身層級，並保留目前的輸入焦點。安全桌面與受保護的系統畫面由 Windows 管理。
+
 | 動作 | Windows 桌面版 | macOS 桌面版 |
 | --- | --- | --- |
 | 移動視窗 | 在內容區按住 `Alt`，用滑鼠左鍵拖曳。 | 在波形外的內容區按住 `Option`，用左鍵拖曳。在內容區任意位置可按住 `Command` + `Option` 再用左鍵拖曳。 |
@@ -184,6 +186,8 @@ To restore the full interface, right-click the waveform and turn off **Show wave
 ### Move and resize the desktop window
 
 The Windows and macOS desktop apps use a frameless window. The gestures below move and resize it without automatic snapping near screen edges. The DAW manages the outer window for VST3 and CLAP. To close the desktop app, choose **Quit** from Settings.
+
+With **Keep on top** enabled on Windows, Backtracking reasserts its position when the taskbar or another window on the same desktop covers it, while leaving input focus where it is. Windows manages the secure desktop and protected system surfaces.
 
 | Action | Windows desktop | macOS desktop |
 | --- | --- | --- |
@@ -341,8 +345,7 @@ cargo nice-plug bundle backtracking-plugin --release --locked --manifest-path pl
 
 ```sh
 cargo install cargo-nice-plug --locked
-CARGO_TARGET_DIR="$PWD/target" cargo nice-plug bundle backtracking-plugin --release --locked \
-  --manifest-path plugins/backtracking-plugin/Cargo.toml
+bash plugins/backtracking-plugin/bundle-macos.sh
 ```
 
 將 `target/bundled/` 產出的整個 `.vst3` 或 `.clap` 複製到 DAW 掃描的資料夾。

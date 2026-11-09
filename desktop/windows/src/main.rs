@@ -11,6 +11,8 @@ mod loopback;
 mod preferences;
 #[cfg(target_os = "windows")]
 mod ui;
+#[cfg(target_os = "windows")]
+mod window_order;
 
 #[cfg(target_os = "windows")]
 fn main() {
