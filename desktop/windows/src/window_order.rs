@@ -8,9 +8,31 @@ use windows::Win32::{
     },
 };
 use winit::{
+    dpi::PhysicalPosition,
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::Window,
 };
+
+/// Restore a physical desktop coordinate only when a usable portion of the window is visible.
+/// Otherwise, keep the OS placement, for example when a display has been unplugged.
+pub(crate) fn restore_position(window: &Window, [x, y]: [i32; 2]) {
+    let size = window.outer_size();
+    let (x64, y64) = (i64::from(x), i64::from(y));
+    let width = i64::from(size.width);
+    let height = i64::from(size.height);
+    let visible = window.available_monitors().any(|monitor| {
+        let origin = monitor.position();
+        let size = monitor.size();
+        let (left, top) = (i64::from(origin.x), i64::from(origin.y));
+        let right = left + i64::from(size.width);
+        let bottom = top + i64::from(size.height);
+        (right.min(x64 + width) - left.max(x64)) >= width.min(96)
+            && (bottom.min(y64 + height) - top.max(y64)) >= height.min(28)
+    });
+    if visible {
+        window.set_outer_position(PhysicalPosition::new(x, y));
+    }
+}
 
 /// Reassert the app's topmost order when another visible window covers it.
 /// Returns whether a raise was attempted, so callers can throttle retries.

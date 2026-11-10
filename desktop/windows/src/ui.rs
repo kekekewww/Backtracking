@@ -4,11 +4,16 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::controller::Controller;
-use crate::preferences::{Key, MeterMode, Preferences, Settings, wav_sample_format_preference};
+use crate::preferences::{
+    DEFAULT_ACCENT, Key, MeterMode, Preferences, Settings, wav_sample_format_preference,
+};
+use crate::startup;
+use crate::tray::{self, Tray};
 use crate::window_order;
 use backtracking_core::{
     AutoResumeDelay, DurationChoice, MeterReadings, Snapshot, WavExportProfile, WavSampleFormat,
@@ -28,19 +33,15 @@ use windows::Win32::{
     },
 };
 use winit::{
-    platform::windows::{Color, CornerPreference, IconExtWindows, WindowExtWindows},
+    platform::windows::{Color, CornerPreference, WindowExtWindows},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
-    window::{Icon, Window},
+    window::Window,
 };
 
 const BINS: usize = 384;
 const REFRESH: Duration = Duration::from_millis(80);
 const PIN_RETRY: Duration = Duration::from_millis(320);
-const DURATIONS: [DurationChoice; 3] = [
-    DurationChoice::Seconds10,
-    DurationChoice::Seconds20,
-    DurationChoice::Seconds30,
-];
+const WINDOW_POSITION_SAVE_DELAY: Duration = Duration::from_millis(250);
 const TRANSPARENCIES: [u8; 5] = [0, 25, 50, 75, 100];
 const WAV_SAMPLE_RATES: [(u32, &str); 3] =
     [(44_100, "44.1 kHz"), (48_000, "48 kHz"), (96_000, "96 kHz")];
@@ -49,8 +50,6 @@ const WAV_SAMPLE_FORMATS: [(WavSampleFormat, &str); 3] = [
     (WavSampleFormat::Pcm24, "24-bit PCM"),
     (WavSampleFormat::Float32, "32-bit float"),
 ];
-const MINT: Color32 = Color32::from_rgb(103, 231, 181);
-const SELECTED_WAVEFORM: Color32 = Color32::from_rgb(152, 24, 74);
 const RECORDING_LIT: Color32 = Color32::from_rgb(249, 78, 88);
 const RECORDING_DIM: Color32 = Color32::from_rgb(103, 44, 48);
 const WAITING_LED: Color32 = Color32::from_rgb(76, 86, 88);
@@ -81,6 +80,7 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
             .with_inner_size([610.0, 144.0])
             .with_min_inner_size(min_window_size(settings.waveform_only))
             .with_icon(icon)
+            .with_taskbar(false)
             .with_decorations(false)
             // The app handles resizing and moving without entering the shell's drag/snap loop.
             .with_resizable(false)
@@ -98,14 +98,24 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
         "Backtracking",
         options,
         Box::new(|context| {
-            configure_style(&context.egui_ctx);
-            if let Some(window) = context.winit_window() {
-                window.set_taskbar_icon(Icon::from_resource(1, None).ok());
-            }
+            configure_style(&context.egui_ctx, accent_color(settings.accent));
             if settings.waveform_only {
                 set_waveform_frame(context.winit_window(), true);
             }
-            Ok(Box::new(Recorder::new(controller, preferences, settings)))
+            if let (Some(window), Some(position)) =
+                (context.winit_window(), settings.window_position)
+            {
+                window_order::restore_position(window, position);
+            }
+            let mut recorder = Recorder::new(controller, preferences, settings);
+            if let Some(window) = context.winit_window() {
+                recorder.attach_tray(window, &context.egui_ctx);
+            }
+            match startup::enabled() {
+                Ok(enabled) => recorder.launch_at_login = enabled,
+                Err(error) => recorder.message = format!("Could not read startup setting: {error}"),
+            }
+            Ok(Box::new(recorder))
         }),
     )
 }
@@ -169,8 +179,9 @@ fn fit_expanded_window(ctx: &egui::Context, frame: &eframe::Frame, size: Vec2) -
     Some(origin / scale)
 }
 
-fn configure_style(ctx: &egui::Context) {
+fn configure_style(ctx: &egui::Context, accent: Color32) {
     ctx.set_visuals(egui::Visuals::dark());
+    apply_accent(ctx, accent);
     let mut fonts = egui::FontDefinitions::default();
     let name = waveform::HINT_BOLD_FAMILY;
     fonts.font_data.insert(
@@ -183,17 +194,43 @@ fn configure_style(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+fn accent_color([r, g, b]: [u8; 3]) -> Color32 {
+    Color32::from_rgb(r, g, b)
+}
+
+fn muted_accent(color: Color32) -> Color32 {
+    Color32::from_rgb(color.r() / 3, color.g() / 3, color.b() / 3)
+}
+
+fn apply_accent(ctx: &egui::Context, accent: Color32) {
+    ctx.global_style_mut(|style| {
+        style.visuals.selection.bg_fill = muted_accent(accent);
+        style.visuals.selection.stroke.color = Color32::WHITE;
+        style.visuals.widgets.active.bg_stroke.color = accent;
+        style.visuals.hyperlink_color = accent;
+    });
+}
+
 struct Recorder {
     controller: Controller,
     preferences: Preferences,
+    tray: Option<Tray>,
+    tray_available: bool,
+    next_tray_attach: Instant,
+    launch_at_login: bool,
+    quitting: bool,
     output: PathBuf,
     pinned: bool,
     next_pin_check: Instant,
     waveform_only: bool,
     full_waveform_height: f32,
     settings_restore: Option<SettingsRestore>,
+    window_position: Option<[i32; 2]>,
+    window_position_changed: Option<Instant>,
     idle_resume: AutoResumeDelay,
     transparency: u8,
+    accent: Color32,
+    saved_accent: Color32,
     meter_mode: MeterMode,
     wav_profile: WavExportProfile,
     last_interaction: Instant,
@@ -210,7 +247,7 @@ struct Recorder {
     export: Option<ExportJob>,
     pending_exports: VecDeque<ExportClip>,
     clip_revision: u64,
-    exported: Option<PathBuf>,
+    exported: Option<ExportedWav>,
     message: String,
 }
 
@@ -221,7 +258,7 @@ struct SettingsRestore {
 
 enum Gesture {
     Select { anchor: f32, cursor: f32 },
-    Export { origin: Pos2 },
+    Export { origin: Pos2, drag_requested: bool },
 }
 
 #[derive(Clone, Copy)]
@@ -333,6 +370,7 @@ impl WindowDrag {
 enum SettingsAction {
     SelectSaveFolder,
     GoToSaveFolder,
+    Hide,
     Quit,
 }
 
@@ -358,7 +396,7 @@ impl MeterMode {
 
 struct ExportJob {
     revision: u64,
-    worker: JoinHandle<io::Result<PathBuf>>,
+    worker: JoinHandle<io::Result<ExportedWav>>,
 }
 
 struct ExportClip {
@@ -368,21 +406,40 @@ struct ExportClip {
     output: PathBuf,
     profile: WavExportProfile,
     immediate: bool,
+    provisional: bool,
 }
 
 impl ExportClip {
-    fn write(self) -> io::Result<PathBuf> {
+    fn write(self) -> io::Result<ExportedWav> {
         let samples = self
             .snapshot
             .frames(self.frames)
             .ok_or_else(|| io::Error::other("invalid audio selection"))?;
-        export_wav_with_profile(
+        let path = export_wav_with_profile(
             &self.output,
             self.snapshot.sample_rate,
             self.snapshot.channels,
             samples,
             self.profile,
-        )
+        )?;
+        Ok(ExportedWav {
+            path,
+            provisional: self.provisional,
+        })
+    }
+}
+
+struct ExportedWav {
+    path: PathBuf,
+    provisional: bool,
+}
+
+impl Drop for ExportedWav {
+    fn drop(&mut self) {
+        // A selected drag needs a real file path before OLE starts. Keep it only after a drop.
+        if self.provisional {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -392,14 +449,23 @@ impl Recorder {
         Self {
             controller,
             preferences,
+            tray: None,
+            tray_available: false,
+            next_tray_attach: Instant::now(),
+            launch_at_login: false,
+            quitting: false,
             output: settings.output,
             pinned: settings.pinned,
             next_pin_check: Instant::now(),
             waveform_only: settings.waveform_only,
             full_waveform_height: DEFAULT_WAVEFORM_HEIGHT,
             settings_restore: None,
+            window_position: settings.window_position,
+            window_position_changed: None,
             idle_resume: settings.idle_resume,
             transparency: settings.transparency,
+            accent: accent_color(settings.accent),
+            saved_accent: accent_color(settings.accent),
             meter_mode: settings.meter_mode,
             wav_profile: settings.wav_profile,
             last_interaction: Instant::now(),
@@ -424,6 +490,143 @@ impl Recorder {
     fn save_preference(&mut self, key: Key, value: impl AsRef<str>) {
         if let Err(error) = self.preferences.save(key, value.as_ref()) {
             self.message = format!("Could not save settings: {error}");
+        }
+    }
+
+    fn set_launch_at_login(&mut self, enabled: bool, frame: &eframe::Frame) {
+        match startup::set_enabled(enabled) {
+            Ok(()) => self.launch_at_login = enabled,
+            Err(error) => {
+                self.message = format!("Could not update startup setting: {error}");
+                if self.waveform_only
+                    || frame.winit_window().and_then(|window| window.is_visible()) == Some(false)
+                {
+                    rfd::MessageDialog::new()
+                        .set_title("Backtracking")
+                        .set_description(&self.message)
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_parent(frame)
+                        .show();
+                }
+            }
+        }
+    }
+
+    fn hide(&mut self, ctx: &egui::Context) {
+        self.window_drag = None;
+        if self.gesture.take().is_some() {
+            self.resume();
+        }
+        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+    }
+
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        ctx.send_viewport_cmd(ViewportCommand::Close);
+    }
+
+    fn attach_tray(&mut self, window: &Window, ctx: &egui::Context) {
+        self.next_tray_attach = Instant::now() + Duration::from_secs(2);
+        match Tray::attach(window, ctx) {
+            Ok(tray) => {
+                self.tray_available = tray.is_active();
+                self.tray = Some(tray);
+            }
+            Err(error) => self.message = format!("System tray unavailable: {error}"),
+        }
+        tray::suppress_taskbar(window);
+    }
+
+    fn update_tray(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if self.tray.is_none()
+            && Instant::now() >= self.next_tray_attach
+            && let Some(window) = frame.winit_window()
+        {
+            self.attach_tray(window, ctx);
+        }
+        let Some(tray) = &self.tray else { return };
+        tray.refresh();
+        let available = tray.is_active();
+        let action = tray.take_action();
+        if tray.take_taskbar_recheck()
+            && let Some(window) = frame.winit_window()
+        {
+            tray::suppress_taskbar(window);
+        }
+        if available != self.tray_available {
+            self.tray_available = available;
+            if !available
+                && frame
+                    .winit_window()
+                    .is_some_and(|window| window.is_visible() == Some(false))
+            {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            }
+        }
+        match action {
+            Some(tray::Action::Show) => {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+            Some(tray::Action::Hide) => self.hide(ctx),
+            Some(tray::Action::ToggleStartup) => {
+                let enabled = startup::enabled().unwrap_or(self.launch_at_login);
+                self.set_launch_at_login(!enabled, frame);
+            }
+            Some(tray::Action::Quit) => self.quit(ctx),
+            None => {}
+        }
+        if self.tray_available
+            && !self.quitting
+            && ctx.input(|input| input.viewport().close_requested())
+        {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.hide(ctx);
+        }
+    }
+
+    fn save_accent(&mut self) {
+        if self.accent != self.saved_accent {
+            let [r, g, b, _] = self.accent.to_array();
+            self.save_preference(Key::Accent, format!("#{r:02X}{g:02X}{b:02X}"));
+            self.saved_accent = self.accent;
+        }
+    }
+
+    fn observe_window_position(&mut self, window: &Window, now: Instant) {
+        if window.is_visible() == Some(false) {
+            self.save_window_position();
+            return;
+        }
+        // A small waveform window can temporarily move when the settings menu is expanded.
+        if self.settings_restore.is_some()
+            || window.is_minimized() == Some(true)
+            || window.is_maximized()
+            || window.fullscreen().is_some()
+        {
+            return;
+        }
+        if let Ok(position) = window.outer_position() {
+            let position = [position.x, position.y];
+            if self.window_position != Some(position) {
+                self.window_position = Some(position);
+                self.window_position_changed = Some(now);
+            }
+        }
+        if self
+            .window_position_changed
+            .is_some_and(|changed| now.duration_since(changed) >= WINDOW_POSITION_SAVE_DELAY)
+        {
+            self.save_window_position();
+        }
+    }
+
+    fn save_window_position(&mut self) {
+        if self.window_position_changed.take().is_some()
+            && let Some([x, y]) = self.window_position
+        {
+            self.save_preference(Key::WindowPosition, format!("{x} {y}"));
         }
     }
 
@@ -483,6 +686,14 @@ impl Recorder {
         self.last_interaction = Instant::now();
     }
 
+    fn cancel_selection(&mut self) {
+        self.gesture = None;
+        self.clear_snapshot();
+        self.message.clear();
+        self.controller.resume();
+        self.last_interaction = Instant::now();
+    }
+
     fn background_color(&self, color: Color32) -> Color32 {
         let alpha = ((100 - u16::from(self.transparency)) * 255 + 50) / 100;
         Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha as u8)
@@ -490,7 +701,8 @@ impl Recorder {
 
     fn invalidate_export(&mut self) {
         self.advance_clip_revision();
-        self.pending_exports.retain(|clip| clip.immediate);
+        self.pending_exports
+            .retain(|clip| clip.immediate && !clip.provisional);
     }
 
     fn advance_clip_revision(&mut self) {
@@ -685,7 +897,7 @@ impl Recorder {
         });
         let center = response.rect.center();
         let color = if self.pinned {
-            MINT
+            self.accent
         } else {
             ui.style().interact(&response).fg_stroke.color
         };
@@ -860,16 +1072,28 @@ impl Recorder {
                 .show(ui, |ui| {
                     ui.spacing_mut().interact_size.y = 15.0;
                     ui.spacing_mut().button_padding.y = 0.5;
+                    let mut enabled = self.launch_at_login;
+                    if ui
+                        .checkbox(&mut enabled, "Start with Windows")
+                        .on_hover_text(
+                            "Launch Backtracking from its current location when you sign in",
+                        )
+                        .changed()
+                    {
+                        self.set_launch_at_login(enabled, frame);
+                    }
+                    self.accent_settings(ui);
                     let mode_actions = ui
                         .horizontal(|ui| self.waveform_mode_settings(ui, "Show waveform only"))
                         .inner;
+                    ui.separator();
                     egui::Grid::new("recording-settings")
                         .spacing([9.0, 1.0])
                         .show(ui, |ui| {
                             ui.label("History");
                             ui.horizontal(|ui| {
                                 let mut retention = self.controller.retention();
-                                for value in DURATIONS {
+                                for value in DurationChoice::ALL {
                                     ui.selectable_value(
                                         &mut retention,
                                         value,
@@ -953,11 +1177,14 @@ impl Recorder {
                         .button("Go to save folder")
                         .on_hover_text(self.output.display().to_string())
                         .clicked();
+                    let hide = self.tray_available && ui.button("Hide").clicked();
                     let quit = ui.button("Quit").clicked();
                     if choose {
                         Some(SettingsAction::SelectSaveFolder)
                     } else if open {
                         Some(SettingsAction::GoToSaveFolder)
+                    } else if hide {
+                        Some(SettingsAction::Hide)
                     } else {
                         quit.then_some(SettingsAction::Quit)
                     }
@@ -986,7 +1213,8 @@ impl Recorder {
                     }
                 }
             }
-            Some(SettingsAction::Quit) => ui.ctx().send_viewport_cmd(ViewportCommand::Close),
+            Some(SettingsAction::Hide) => self.hide(ui.ctx()),
+            Some(SettingsAction::Quit) => self.quit(ui.ctx()),
             None => {}
         }
         was_open || shown.is_some()
@@ -1057,7 +1285,28 @@ impl Recorder {
         }
     }
 
-    fn start_export(&mut self) {
+    fn accent_settings(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing("Theme color", |ui| {
+            ui.spacing_mut().slider_width = 112.0;
+            let mut accent = self.accent;
+            let changed = egui::color_picker::color_picker_color32(
+                ui,
+                &mut accent,
+                egui::color_picker::Alpha::Opaque,
+            );
+            if ui.button("Reset color").clicked() {
+                accent = accent_color(DEFAULT_ACCENT);
+            } else if !changed {
+                return;
+            }
+            if accent != self.accent {
+                self.accent = accent;
+                apply_accent(ui.ctx(), accent);
+            }
+        });
+    }
+
+    fn start_export(&mut self, provisional: bool) {
         let revision = self.clip_revision;
         if self.exported.is_some()
             || self
@@ -1093,6 +1342,7 @@ impl Recorder {
             output: self.output.clone(),
             profile: self.wav_profile,
             immediate: self.idle_resume == AutoResumeDelay::Immediate,
+            provisional,
         };
         if self.export.is_none() && self.pending_exports.is_empty() {
             self.spawn_export(clip);
@@ -1132,9 +1382,13 @@ impl Recorder {
             let result = job.worker.join();
             if job.revision == self.clip_revision {
                 match result {
-                    Ok(Ok(path)) => {
-                        self.message = format!("Saved {}", path.display());
-                        self.exported = Some(path);
+                    Ok(Ok(file)) => {
+                        if file.provisional {
+                            self.message.clear();
+                        } else {
+                            self.message = format!("Saved {}", file.path.display());
+                        }
+                        self.exported = Some(file);
                     }
                     Ok(Err(error)) => self.message = format!("Could not save WAV: {error}"),
                     Err(_) => self.message = "WAV export worker stopped unexpectedly.".into(),
@@ -1192,8 +1446,13 @@ impl Recorder {
                     cursor: start,
                 });
             } else {
-                self.start_export();
-                self.gesture = Some(Gesture::Export { origin: position });
+                if self.selection.is_none() {
+                    self.start_export(false);
+                }
+                self.gesture = Some(Gesture::Export {
+                    origin: position,
+                    drag_requested: false,
+                });
             }
         }
 
@@ -1205,39 +1464,84 @@ impl Recorder {
         }
 
         if down {
-            if let (Some(Gesture::Export { origin }), Some(position), Some(file)) =
-                (&self.gesture, position, self.exported.as_ref())
+            if let (
+                Some(Gesture::Export {
+                    origin,
+                    drag_requested,
+                }),
+                Some(position),
+            ) = (&mut self.gesture, position)
+                && !*drag_requested
                 && position.distance(*origin) >= 4.0
             {
-                let file = file.clone();
+                *drag_requested = true;
+                if self.selection.is_some() {
+                    self.start_export(true);
+                }
+            }
+            if matches!(
+                self.gesture,
+                Some(Gesture::Export {
+                    drag_requested: true,
+                    ..
+                })
+            ) && let Some(file) = &mut self.exported
+            {
+                let dropped = Arc::new(AtomicBool::new(false));
+                let drop_outcome = Arc::clone(&dropped);
                 // OLE holds the UI thread until the mouse is released.
-                if let Err(error) = drag::start_drag(
+                let result = drag::start_drag(
                     frame,
-                    drag::DragItem::Files(vec![file]),
+                    drag::DragItem::Files(vec![file.path.clone()]),
                     drag::Image::Raw(DRAG_ICON.to_vec()),
-                    |_, _| {},
+                    move |result, _| {
+                        drop_outcome.store(
+                            matches!(result, drag::DragResult::Dropped),
+                            Ordering::Relaxed,
+                        );
+                    },
                     drag::Options::default(),
-                ) {
+                );
+                self.gesture = None;
+                if let Err(error) = result {
+                    let keep_selection = self.selection.is_some();
+                    if keep_selection {
+                        self.invalidate_export();
+                    }
+                    self.finish_waveform_gesture(keep_selection);
                     self.message = format!("Could not start file drag: {error}");
-                    self.gesture = Some(Gesture::Export { origin: position });
+                } else if dropped.load(Ordering::Relaxed) {
+                    file.provisional = false;
+                    self.message = format!("Saved {}", file.path.display());
+                    self.finish_waveform_gesture(false);
+                } else if self.selection.is_some() {
+                    self.cancel_selection();
                 } else {
-                    self.gesture = None;
                     self.finish_waveform_gesture(false);
                 }
             }
         } else if let Some(gesture) = self.gesture.take() {
-            let selecting = if let Gesture::Select { anchor, cursor } = gesture {
-                let range = anchor.min(cursor)..anchor.max(cursor);
-                if range.start < range.end {
-                    self.selection = Some(range);
-                    self.advance_clip_revision();
-                    self.start_export();
+            let keep_selection = match gesture {
+                Gesture::Select { anchor, cursor } => {
+                    let range = anchor.min(cursor)..anchor.max(cursor);
+                    if range.start < range.end {
+                        self.selection = Some(range);
+                        self.invalidate_export();
+                    }
+                    self.selection.is_some()
                 }
-                self.selection.is_some()
-            } else {
-                false
+                Gesture::Export { drag_requested, .. } if self.selection.is_some() => {
+                    if drag_requested {
+                        // The button was released before the WAV was ready to drag.
+                        self.invalidate_export();
+                    } else {
+                        self.start_export(false);
+                    }
+                    drag_requested
+                }
+                Gesture::Export { .. } => false,
             };
-            self.finish_waveform_gesture(selecting);
+            self.finish_waveform_gesture(keep_selection);
         }
     }
 
@@ -1286,7 +1590,7 @@ impl Recorder {
                             .is_some_and(|pos| rect.contains(pos))
                     }));
         if full_preview {
-            painter.rect_filled(audio, 2.0, Color32::from_rgb(31, 79, 64));
+            painter.rect_filled(audio, 2.0, muted_accent(self.accent));
         }
 
         self.paint_waveform(&painter, audio, selection.as_ref());
@@ -1307,13 +1611,22 @@ impl Recorder {
     fn paint_waveform(&self, painter: &egui::Painter, audio: Rect, selection: Option<&Range<f32>>) {
         let middle = audio.center().y;
         let extent = audio.height() * 0.47;
+        let [r, g, b, _] = self.accent.to_array();
+        let selected = if [r, g, b]
+            .into_iter()
+            .any(|channel| channel.abs_diff(255 - channel) >= 80)
+        {
+            Color32::from_rgb(255 - r, 255 - g, 255 - b)
+        } else {
+            Color32::WHITE
+        };
         for (bin, (&low, &high)) in self.low.iter().zip(&self.high).enumerate() {
             let fraction = (bin as f32 + 0.5) / BINS as f32;
             let position = audio.left() + fraction * audio.width();
             let color = if selection.is_some_and(|range| range.contains(&fraction)) {
-                SELECTED_WAVEFORM
+                selected
             } else {
-                MINT
+                self.accent
             };
             let top = middle - high.clamp(-1.0, 1.0) * extent;
             let bottom = middle - low.clamp(-1.0, 1.0) * extent;
@@ -1367,8 +1680,8 @@ impl Recorder {
         painter.rect(
             bubble,
             5.0,
-            Color32::from_rgb(36, 47, 47),
-            Stroke::new(1.0, Color32::from_rgb(67, 89, 83)),
+            Color32::from_rgb(37, 43, 46),
+            Stroke::new(1.0, muted_accent(self.accent)),
             egui::StrokeKind::Inside,
         );
         painter.galley(bubble.min + padding, text, foreground);
@@ -1386,6 +1699,27 @@ impl eframe::App for Recorder {
             self.window_drag = None;
             return;
         }
+        let can_resize = viewport.maximized != Some(true);
+        let menu_open = egui::Popup::is_any_open(ctx);
+        if !menu_open
+            && (self.selection.is_some() || matches!(self.gesture, Some(Gesture::Select { .. })))
+        {
+            let cancel_key = |event: &egui::Event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Escape | egui::Key::Backspace,
+                        pressed: true,
+                        ..
+                    }
+                )
+            };
+            if input.events.iter().any(cancel_key) {
+                input.events.retain(|event| !cancel_key(event));
+                self.cancel_selection();
+                return;
+            }
+        }
         if input
             .events
             .iter()
@@ -1393,11 +1727,10 @@ impl eframe::App for Recorder {
         {
             self.last_interaction = Instant::now();
         }
-        if self.gesture.is_some() || egui::Popup::is_any_open(ctx) {
+        if self.gesture.is_some() || menu_open {
             return;
         }
         let bounds = input.screen_rect.unwrap_or_else(|| ctx.viewport_rect());
-        let can_resize = viewport.maximized != Some(true);
         for event in &mut input.events {
             let egui::Event::PointerButton {
                 pos,
@@ -1428,6 +1761,7 @@ impl eframe::App for Recorder {
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.update_tray(ctx, frame);
         let now = Instant::now();
         if self.pinned && now >= self.next_pin_check {
             let attempted = frame
@@ -1448,6 +1782,12 @@ impl eframe::App for Recorder {
                 .is_none()
         {
             self.window_drag = None;
+        }
+        if let Some(window) = frame.winit_window() {
+            self.observe_window_position(window, now);
+        }
+        if !ctx.input(|input| input.pointer.any_down()) {
+            self.save_accent();
         }
         self.controller.poll();
         if !self.controller.is_recording() {
@@ -1541,10 +1881,16 @@ impl eframe::App for Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
+        self.save_accent();
+        self.save_window_position();
         if let Some(job) = self.export.take() {
             let _ = job.worker.join();
         }
-        for clip in self.pending_exports.drain(..).filter(|clip| clip.immediate) {
+        for clip in self
+            .pending_exports
+            .drain(..)
+            .filter(|clip| clip.immediate && !clip.provisional)
+        {
             let _ = clip.write();
         }
     }

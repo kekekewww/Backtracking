@@ -157,9 +157,10 @@ mod tests {
     #[test]
     fn plugin_state_round_trips_instance_settings_without_audio_or_pause() {
         let original = Backtracking::default();
-        original.session.set_retention(DurationChoice::Seconds30);
+        original.session.set_retention(DurationChoice::Seconds60);
         original.session.set_idle_resume(AutoResumeDelay::Immediate);
         original.session.set_panel_transparency(75);
+        original.session.set_accent([224, 90, 155]);
         original.session.set_meter_mode(MeterMode::Lufs);
         original.session.set_show_waveform_only(true);
         original.session.set_wav_profile(WavExportProfile {
@@ -196,6 +197,7 @@ mod tests {
             ("history_seconds", "30".to_owned()),
             ("idle_resume_seconds", "unsupported".to_owned()),
             ("panel_transparency", "250".to_owned()),
+            ("accent_rgb", "[0, 256, 0]".to_owned()),
             ("meter_unit", "VU".to_owned()),
             (
                 "output_dir",

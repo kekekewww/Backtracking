@@ -16,7 +16,7 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 ### 開啟設定
 
-點擊工具列的齒輪，或在 Backtracking 視窗內按滑鼠右鍵，可開啟同一個 **設定** 選單。可調整保留時間、自動續錄、背景透明度、WAV 匯出格式及存檔資料夾。Windows 和 macOS 桌面版的 **置頂／Keep on top** 可直接在工具列切換。插件視窗的位置由 DAW 控制。
+點擊工具列的齒輪，或在 Backtracking 視窗內按滑鼠右鍵，可開啟同一個 **設定** 選單。可用調色盤變更主題色，也可調整保留時間、自動續錄、背景透明度、WAV 匯出格式及存檔資料夾。Windows 和 macOS 桌面版的 **置頂／Keep on top** 可直接在工具列切換。插件視窗的位置由 DAW 控制。
 
 macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`Control` 搭配波形上的點擊與拖曳用於框選。
 
@@ -43,6 +43,10 @@ Windows 和 macOS 桌面版採用無邊框視窗。以下手勢可自由移動�
 
 Windows 桌面版啟用 **置頂／Keep on top** 時，若工作列等同一桌面的視窗蓋住 Backtracking，程式會重新提升自身層級，並保留目前的輸入焦點。安全桌面與受保護的系統畫面由 Windows 管理。
 
+Windows 桌面版可從工作列右側的系統匣顯示或隱藏視窗。隱藏視窗後，錄音仍可在背景繼續。要停止程式，可從系統匣或設定選擇 **Quit**。先將 `Backtracking.exe` 放在固定位置，再開啟 **Start with Windows**。Backtracking 會在登入 Windows 時開啟並還原上次的視窗位置。
+
+macOS 桌面版可從選單列顯示、隱藏或結束 Backtracking，也可啟用登入時開啟。系統要求核准時，請在 macOS 系統設定允許 Backtracking 的登入項目。
+
 | 動作 | Windows 桌面版 | macOS 桌面版 |
 | --- | --- | --- |
 | 移動視窗 | 在內容區按住 `Alt`，用滑鼠左鍵拖曳。 | 在波形外的內容區按住 `Option`，用左鍵拖曳。在內容區任意位置可按住 `Command` + `Option` 再用左鍵拖曳。 |
@@ -58,7 +62,7 @@ Windows 桌面版啟用 **置頂／Keep on top** 時，若工作列等同一桌�
 - **已暫停／Paused**。按下 **Pause** 或操作波形會暫停錄音，讓波形固定供選段和匯出。暫停期間的聲音會略過。
 - **未連線／Capture unavailable**。桌面版無法擷取時，可用 **Play** 重新連線。
 
-**保留／History／Buffer** 可選 10、20 或 30 秒，預設為 20 秒。這是記憶體中的音訊長度。假設兩段各 5 秒的聲音相隔一分鐘，兩段會接在一起，中間只保留靜音偵測需要的短緩衝。非常小聲的內容可能低於門檻。縮短保留時間會裁掉最早的部分，事後加長只會增加接下來可保留的長度。
+**保留／History／Buffer** 可選 10、20、30 或 60 秒，預設為 20 秒。這是記憶體中的音訊長度。假設兩段各 5 秒的聲音相隔一分鐘，兩段會接在一起，中間只保留靜音偵測需要的短緩衝。非常小聲的內容可能低於門檻。縮短保留時間會裁掉最早的部分，事後加長只會增加接下來可保留的長度。
 
 ### 即時音量表
 
@@ -86,7 +90,7 @@ Windows 桌面版啟用 **置頂／Keep on top** 時，若工作列等同一桌�
 | 匯入 DAW | 在波形上按住滑鼠左鍵並拖出 | 在波形上按住滑鼠左鍵並拖出 | 按住時顯示 **Drag and Drop**。檔案就緒後，拖到 REAPER 時間軸、FL Studio Playlist 或其他接受 WAV 的位置。 |
 | 指定起訖點 | 按住 `Ctrl`，在波形上按住左鍵拖曳 | 按住 `Option`，在波形上按住左鍵拖曳 | 顯示 **Drag to Select**。放開後保留框選區間，再放開修飾鍵並點擊或拖出選取區。 |
 
-完成框選後，Backtracking 會先準備選取區的 WAV，以便接著拖出。第一次匯出或需要轉換取樣率時，檔案可能需要短暫準備。拖曳時可先維持按住，等檔案可拖出再放開。若 DAW 沒有接受拖放，可開啟存檔資料夾並直接匯入 WAV。
+完成框選後，片段先保留在記憶體，直到你點擊或拖曳才會匯出。在 Backtracking 視窗有焦點時，按 `Esc` 或 `Backspace` 可取消選取並立刻恢復待命，這次框選不會產生 WAV。第一次匯出或需要轉換取樣率時，可維持按住滑鼠，等檔案就緒再放開。若 DAW 沒有接受拖放，可開啟存檔資料夾並直接匯入已匯出的 WAV。
 
 ### 啟用、暫停與自動續錄
 
@@ -129,12 +133,12 @@ Windows 桌面版啟用 **置頂／Keep on top** 時，若工作列等同一桌�
 
 ### 保存與還原設定
 
-Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續錄、背景透明度、音量表模式、WAV 取樣率與編碼、存檔資料夾、置頂及只顯示波形的設定，下次開啟時還原。
+Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續錄、主題色、背景透明度、音量表模式、WAV 取樣率與編碼、存檔資料夾、置頂及只顯示波形的設定，下次開啟時還原。
 
-- **Windows**。設定儲存在 `%LOCALAPPDATA%\Backtracking\Settings`。若找不到 `LOCALAPPDATA`，則使用 `%APPDATA%\Backtracking\Settings`。程式會以預設視窗尺寸開啟，由系統安排位置。
+- **Windows**。設定儲存在 `%LOCALAPPDATA%\Backtracking\Settings`。若找不到 `LOCALAPPDATA`，則使用 `%APPDATA%\Backtracking\Settings`。程式會還原上次的視窗位置。
 - **macOS**。設定儲存在系統的使用者偏好中，也會記住桌面視窗的位置與尺寸。
 
-**VST3／CLAP** 的保留時間、自動續錄、面板透明度、音量表模式、WAV 取樣率與編碼、存檔資料夾及只顯示波形的設定由 DAW 專案保存，每個插件實例可獨立設定。修改後請手動儲存專案。重新開啟同一個專案時，DAW 會還原各實例的設定。
+**VST3／CLAP** 的保留時間、自動續錄、主題色、面板透明度、音量表模式、WAV 取樣率與編碼、存檔資料夾及只顯示波形的設定由 DAW 專案保存，每個插件實例可獨立設定。修改後請手動儲存專案。重新開啟同一個專案時，DAW 會還原各實例的設定。
 
 ### 排除問題
 
@@ -162,7 +166,7 @@ On Windows, route the source to the default playback device. If a DAW uses ASIO,
 
 ### Open settings
 
-Click the gear in the toolbar or right-click inside the Backtracking window to open the same **Settings** menu. Use the menu to set the history length, auto-resume delay, background transparency, WAV export format, and save folder. In the Windows and macOS desktop apps, you can toggle **Keep on top** directly from the toolbar. The DAW controls the plug-in window.
+Click the gear in the toolbar or right-click inside the Backtracking window to open the same **Settings** menu. Use the color picker to change the theme accent. You can also set the history length, auto-resume delay, background transparency, WAV export format, and save folder. In the Windows and macOS desktop apps, you can toggle **Keep on top** directly from the toolbar. The DAW controls the plug-in window.
 
 In the macOS desktop app, use a mouse right-click or the trackpad's secondary click to open the menu. Use `Control` with a click and drag over the waveform to select audio.
 
@@ -189,6 +193,10 @@ The Windows and macOS desktop apps use a frameless window. The gestures below mo
 
 With **Keep on top** enabled on Windows, Backtracking reasserts its position when the taskbar or another window on the same desktop covers it, while leaving input focus where it is. Windows manages the secure desktop and protected system surfaces.
 
+Use the Windows system tray icon to show or hide the window. Capture can continue while the window is hidden. Choose **Quit** from the tray or Settings to exit. Place `Backtracking.exe` in a permanent location and enable **Start with Windows** to open Backtracking at its last window position when you sign in.
+
+On macOS, use the menu bar item to show, hide, or quit Backtracking, or enable launch at login. If macOS asks for approval, allow the Backtracking login item in System Settings.
+
 | Action | Windows desktop | macOS desktop |
 | --- | --- | --- |
 | Move the window | Hold `Alt` and left-drag inside the content area. | Hold `Option` and left-drag outside the waveform. Hold `Command` + `Option` and left-drag from anywhere in the content area. |
@@ -204,7 +212,7 @@ In the full interface, the toolbar's **Play/Pause** icon shows the available act
 - **Paused**. Pressing **Pause** or working with the waveform freezes the current history for selection and export. Incoming audio is skipped during the pause.
 - **Capture unavailable**. If the desktop recorder loses its connection, press **Play** to retry.
 
-**History / Buffer** can hold 10, 20, or 30 seconds and defaults to 20 seconds. This is the amount of audio retained in memory. Two five-second sounds a minute apart are joined with only a little silence at the join. Very quiet material may fall below the capture threshold. Shortening the buffer trims the oldest audio. Lengthening it gives future audio more room.
+**History / Buffer** can hold 10, 20, 30, or 60 seconds and defaults to 20 seconds. This is the amount of audio retained in memory. Two five-second sounds a minute apart are joined with only a little silence at the join. Very quiet material may fall below the capture threshold. Shortening the buffer trims the oldest audio. Lengthening it gives future audio more room.
 
 ### Live audio meter
 
@@ -232,7 +240,7 @@ Gesture hints appear as you interact in the full interface. The tooltip tries th
 | Drop a clip into a DAW | Hold the primary mouse button on the waveform and drag out | Hold the primary mouse button on the waveform and drag out | The hint shows **Drag and Drop**. Once ready, drop the WAV onto the REAPER timeline, FL Studio Playlist, or another WAV drop target. |
 | Choose both ends | Hold `Ctrl` and drag across the waveform | Hold `Option` and drag across the waveform | The hint shows **Drag to Select**. Release to keep the selection, then release the modifier and click or drag the highlighted range. |
 
-When you finish selecting a range, Backtracking prepares its WAV so you can drag it next. The first export and clips that need resampling may take a moment to prepare. Keep the mouse button held until the file is ready to drag. If the DAW does not accept the drop, open the save folder and import the WAV from there.
+When you finish selecting a range, Backtracking keeps it in memory until you click or drag to export it. With the Backtracking window focused, press `Esc` or `Backspace` to clear the selection and re-arm capture immediately without writing a WAV for that selection. Keep the mouse button held while an export finishes preparing. If the DAW does not accept the drop, open the save folder and import the exported WAV from there.
 
 ### Arm, pause, and auto-resume capture
 
@@ -275,12 +283,12 @@ Clicking to save, exporting a selection, and dragging into a DAW all use the cur
 
 ### Save and restore settings
 
-The Windows and macOS desktop apps save your history length, auto-resume delay, background transparency, meter mode, WAV sample rate and encoding, save folder, keep-on-top setting, and waveform-only mode as you change them. Those preferences are restored the next time you open the app.
+The Windows and macOS desktop apps save your history length, auto-resume delay, theme accent, background transparency, meter mode, WAV sample rate and encoding, save folder, keep-on-top setting, and waveform-only mode as you change them. Those preferences are restored the next time you open the app.
 
-- **Windows**. Settings are stored in `%LOCALAPPDATA%\Backtracking\Settings`, with `%APPDATA%\Backtracking\Settings` as a fallback when `LOCALAPPDATA` is unavailable. The app opens at its default window size and Windows places the window.
+- **Windows**. Settings are stored in `%LOCALAPPDATA%\Backtracking\Settings`, with `%APPDATA%\Backtracking\Settings` as a fallback when `LOCALAPPDATA` is unavailable. The app restores its previous window position.
 - **macOS**. Settings are stored in the macOS user preferences. The app also restores the desktop window's size and position.
 
-For **VST3 and CLAP**, the DAW project stores each plug-in instance's history length, auto-resume delay, panel transparency, meter mode, WAV sample rate and encoding, save folder, and waveform-only mode. Save the project manually after making changes. When you reopen that project, the DAW restores each instance's settings.
+For **VST3 and CLAP**, the DAW project stores each plug-in instance's history length, auto-resume delay, theme accent, panel transparency, meter mode, WAV sample rate and encoding, save folder, and waveform-only mode. Save the project manually after making changes. When you reopen that project, the DAW restores each instance's settings.
 
 ### Troubleshooting
 
@@ -385,5 +393,11 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 5. 開啟 **只顯示波形**，確認波形高度維持原樣並垂直置中。按右鍵測試暫停和啟用錄音，再確認框選時區間內的波形會變色。桌面版可將視窗拖到螢幕邊緣附近，確認仍停在放開的位置，再將視窗縮到最小尺寸，並從右鍵選單切回完整介面。
 
    Turn on **Show waveform only** and check that the waveform keeps its height and moves to the vertical center. Use the right-click menu to pause and arm capture. Check that selecting a range changes its waveform color. On desktop, move the window near a screen edge and check that it stays where you release it, then resize it to the minimum size and restore the full interface from the right-click menu.
+6. 將保留時間切到 **60 秒**，並用調色盤改色。切到 **10 秒**自動續錄，框選後按 `Esc`，再用 `Backspace` 重試。每次都應立刻恢復待命，且存檔資料夾不應新增 WAV。
+
+   Set history to **60 seconds** and change the theme color. Set auto-resume to **10 seconds**, select a range, and press `Esc`. Repeat with `Backspace`. Capture should re-arm immediately each time and the save folder should have no new WAV.
+7. 移動桌面視窗，用系統匣或選單列隱藏視窗，播放音訊，再顯示並檢查波形。結束並重新開啟後，確認視窗位置有還原。若開啟了登入時自動啟動，可登出再登入確認。
+
+   Move the desktop window, hide it from the tray or menu bar, play audio, then show it and check the waveform. Quit and reopen the app to check that the position is restored. If you enabled launch at login, sign out and back in to verify it.
 
 [回到專案首頁 / Back to the project README](../README.md)

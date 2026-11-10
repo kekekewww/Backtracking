@@ -10,6 +10,10 @@ mod loopback;
 #[cfg(target_os = "windows")]
 mod preferences;
 #[cfg(target_os = "windows")]
+mod startup;
+#[cfg(target_os = "windows")]
+mod tray;
+#[cfg(target_os = "windows")]
 mod ui;
 #[cfg(target_os = "windows")]
 mod window_order;
@@ -19,7 +23,14 @@ fn main() {
     use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
     use windows::core::{HSTRING, PCWSTR, w};
 
-    if let Err(error) = ui::run(controller::Controller::new()) {
+    let result = (|| {
+        let Some(_instance) = startup::Instance::acquire()? else {
+            return Ok(());
+        };
+        ui::run(controller::Controller::new())?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })();
+    if let Err(error) = result {
         let message = HSTRING::from(format!("無法開啟 Backtracking。\n\n{error}"));
         unsafe {
             MessageBoxW(

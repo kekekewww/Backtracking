@@ -16,6 +16,7 @@ typedef struct BtMeterReadings {
 // producer. The input arrays must contain the requested number of frames.
 // Stop and join the producer before rearming after a pause, changing devices,
 // or freeing the handle.
+// History durations are 10, 20, 30, or 60 seconds.
 BtCore *bt_new(double sample_rate, uint32_t channels, uint32_t history_secs);
 void bt_free(BtCore *core);
 uint32_t bt_push_interleaved(const BtCore *core, const float *data, uint32_t frames);

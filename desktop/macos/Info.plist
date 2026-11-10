@@ -20,6 +20,8 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.2</string>
+    <key>LSUIElement</key>
+    <true/>
     <key>NSAudioCaptureUsageDescription</key>
     <string>Backtracking captures recent system audio so you can export samples as WAV files.</string>
 </dict>

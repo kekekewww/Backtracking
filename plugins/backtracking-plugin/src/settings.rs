@@ -7,6 +7,7 @@ use backtracking_core::{AutoResumeDelay, DurationChoice, WavExportProfile, WavSa
 use nice_plug::params::persist::{PersistentField, deserialize_field, serialize_field};
 
 pub(crate) const TRANSPARENCY_LEVELS: [u8; 5] = [0, 25, 50, 75, 100];
+pub(crate) const DEFAULT_ACCENT: [u8; 3] = [103, 231, 181];
 const AUTO_RESUME_FIELD: &str = "auto_resume_delay_seconds";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +34,7 @@ pub(crate) struct SessionSettings {
     pub(crate) retention: DurationChoice,
     pub(crate) idle_resume: AutoResumeDelay,
     pub(crate) panel_transparency: u8,
+    pub(crate) accent: [u8; 3],
     pub(crate) meter_mode: MeterMode,
     pub(crate) wav_profile: WavExportProfile,
     pub(crate) show_waveform_only: bool,
@@ -49,6 +51,7 @@ impl Default for SessionSettings {
             retention: DurationChoice::Seconds20,
             idle_resume: AutoResumeDelay::default(),
             panel_transparency: 0,
+            accent: DEFAULT_ACCENT,
             meter_mode: MeterMode::Dbfs,
             wav_profile: WavExportProfile::default(),
             show_waveform_only: false,
@@ -74,19 +77,17 @@ impl SettingsStore {
 impl PersistentField<'_, PersistedFields> for SettingsStore {
     fn set(&self, fields: PersistedFields) {
         let defaults = SessionSettings::default();
-        let read_duration = |key: &str| match fields.get(key).map(String::as_str) {
-            Some("10") => Some(DurationChoice::Seconds10),
-            Some("20") => Some(DurationChoice::Seconds20),
-            Some("30") => Some(DurationChoice::Seconds30),
-            _ => None,
-        };
         let output_dir = fields
             .get("output_dir")
             .and_then(|value| deserialize_field::<OsString>(value).ok())
             .map(PathBuf::from)
             .filter(|path| path.is_absolute() && !path.as_os_str().as_encoded_bytes().contains(&0));
         let restored = SessionSettings {
-            retention: read_duration("history_seconds").unwrap_or(defaults.retention),
+            retention: fields
+                .get("history_seconds")
+                .and_then(|value| value.parse().ok())
+                .and_then(DurationChoice::from_seconds)
+                .unwrap_or(defaults.retention),
             // Older projects used idle_resume_seconds=0 for Off.
             idle_resume: fields
                 .get(AUTO_RESUME_FIELD)
@@ -98,6 +99,10 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                 .and_then(|value| value.parse().ok())
                 .filter(|value| TRANSPARENCY_LEVELS.contains(value))
                 .unwrap_or(defaults.panel_transparency),
+            accent: fields
+                .get("accent_rgb")
+                .and_then(|value| deserialize_field(value).ok())
+                .unwrap_or(defaults.accent),
             meter_mode: fields
                 .get("meter_unit")
                 .and_then(|value| {
@@ -165,6 +170,9 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
         // The framework's serde codec preserves native paths, including non-Unicode names.
         if let Ok(path) = serialize_field(settings.output_dir.as_os_str()) {
             fields.insert("output_dir".into(), path);
+        }
+        if let Ok(accent) = serialize_field(&settings.accent) {
+            fields.insert("accent_rgb".into(), accent);
         }
         f(&fields)
     }
