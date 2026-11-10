@@ -15,13 +15,14 @@ use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GWL_EXSTYLE, GetCursorPos,
-    GetSystemMetrics, GetWindowLongPtrW, HICON, HMENU, IMAGE_ICON, IsIconic, IsWindowVisible,
-    LR_DEFAULTCOLOR, LoadImageW, MF_CHECKED, MF_SEPARATOR, MF_STRING, PostMessageW,
-    RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, STYLESTRUCT, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP,
-    WM_CONTEXTMENU, WM_LBUTTONUP, WM_NCDESTROY, WM_NULL, WM_RBUTTONUP, WM_STYLECHANGING,
+    AppendMenuW, CopyIcon, CreatePopupMenu, DestroyIcon, DestroyMenu, GWL_EXSTYLE, GetCursorPos,
+    GetSystemMetrics, GetWindowLongPtrW, HICON, HMENU, IDI_APPLICATION, IMAGE_ICON, IsIconic,
+    IsWindowVisible, LR_DEFAULTCOLOR, LoadIconW, LoadImageW, MF_CHECKED, MF_SEPARATOR, MF_STRING,
+    PostMessageW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, STYLESTRUCT, SW_HIDE,
+    SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_CONTEXTMENU,
+    WM_LBUTTONUP, WM_NCDESTROY, WM_NULL, WM_RBUTTONUP, WM_SHOWWINDOW, WM_STYLECHANGING,
     WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 use winit::platform::windows::WindowExtWindows;
@@ -57,8 +58,9 @@ struct TrayState {
     version_four: Cell<bool>,
     next_registration: Cell<Instant>,
     taskbar_created: u32,
+    taskbar_button_created: u32,
+    recheck_taskbar: Cell<bool>,
     show_existing: u32,
-    initial_taskbar_style: u32,
 }
 
 impl Tray {
@@ -83,6 +85,11 @@ impl Tray {
                 GetSystemMetrics(SM_CYSMICON),
                 LR_DEFAULTCOLOR,
             );
+            let icon = if icon.is_null() {
+                CopyIcon(LoadIconW(null_mut(), IDI_APPLICATION))
+            } else {
+                icon
+            };
             if icon.is_null() {
                 return Err(io::Error::last_os_error());
             }
@@ -97,9 +104,11 @@ impl Tray {
             version_four: Cell::new(false),
             next_registration: Cell::new(Instant::now()),
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated").as_ptr()) },
+            taskbar_button_created: unsafe {
+                RegisterWindowMessageW(w!("TaskbarButtonCreated").as_ptr())
+            },
+            recheck_taskbar: Cell::new(false),
             show_existing: startup::show_message(),
-            initial_taskbar_style: unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 }
-                & (WS_EX_APPWINDOW | WS_EX_TOOLWINDOW),
         });
         // The subclass owns a strong reference until it is removed or the HWND is destroyed.
         let data = Rc::into_raw(Rc::clone(&state));
@@ -139,20 +148,34 @@ impl Tray {
         self.state.registered.get()
     }
 
-    pub(crate) fn apply_taskbar_mode(&self, window: &Window) {
-        let active = self.is_active();
+    pub(crate) fn take_taskbar_recheck(&self) -> bool {
+        self.state.recheck_taskbar.replace(false)
+    }
+
+    pub(crate) fn take_action(&self) -> Option<Action> {
+        self.state.action.take()
+    }
+}
+
+pub(crate) fn suppress_taskbar(window: &Window) {
+    if let Ok(handle) = window.window_handle()
+        && let RawWindowHandle::Win32(handle) = handle.as_raw()
+    {
+        let hwnd = handle.hwnd.get() as HWND;
         unsafe {
-            let current = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32;
-            let taskbar_style = if active {
-                WS_EX_TOOLWINDOW
-            } else {
-                self.state.initial_taskbar_style
-            };
-            let next = (current & !(WS_EX_APPWINDOW | WS_EX_TOOLWINDOW)) | taskbar_style;
+            let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            let next = tool_window_style(current);
             if current != next {
-                SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, next as isize);
+                let visible = IsWindowVisible(hwnd) != 0;
+                let minimized = IsIconic(hwnd) != 0;
+                // Explorer can keep an existing taskbar button if the window stays visible
+                // while its taskbar eligibility changes.
+                if visible {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
                 SetWindowPos(
-                    self.hwnd,
+                    hwnd,
                     null_mut(),
                     0,
                     0,
@@ -160,14 +183,22 @@ impl Tray {
                     0,
                     SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
                 );
+                if visible {
+                    let show = if minimized {
+                        SW_SHOWMINNOACTIVE
+                    } else {
+                        SW_SHOWNOACTIVATE
+                    };
+                    ShowWindow(hwnd, show);
+                }
             }
         }
-        window.set_skip_taskbar(active);
     }
+    window.set_skip_taskbar(true);
+}
 
-    pub(crate) fn take_action(&self) -> Option<Action> {
-        self.state.action.take()
-    }
+fn tool_window_style(style: u32) -> u32 {
+    (style & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
 }
 
 impl Drop for Tray {
@@ -228,14 +259,10 @@ unsafe extern "system" fn tray_message(
         state.detach(hwnd);
         let _ = unsafe { RemoveWindowSubclass(hwnd, Some(tray_message), id) };
         drop(unsafe { Rc::from_raw(data) });
-    } else if message == WM_STYLECHANGING
-        && wparam as i32 == GWL_EXSTYLE
-        && state.registered.get()
-        && lparam != 0
-    {
+    } else if message == WM_STYLECHANGING && wparam as i32 == GWL_EXSTYLE && lparam != 0 {
         // Winit rebuilds extended styles on state changes, including when showing the window.
         let style = unsafe { &mut *(lparam as *mut STYLESTRUCT) };
-        style.styleNew = (style.styleNew & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW;
+        style.styleNew = tool_window_style(style.styleNew);
     } else if message == CALLBACK {
         const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
         let notification = (lparam as u32) & 0xffff;
@@ -253,6 +280,12 @@ unsafe extern "system" fn tray_message(
         // so its taskbar visibility is restored too.
         state.registered.set(false);
         state.next_registration.set(Instant::now());
+        state.recheck_taskbar.set(true);
+        state.ctx.request_repaint();
+    } else if (message == WM_SHOWWINDOW && wparam != 0)
+        || (message != 0 && message == state.taskbar_button_created)
+    {
+        state.recheck_taskbar.set(true);
         state.ctx.request_repaint();
     } else if message != 0 && message == state.show_existing {
         state.dispatch(Action::Show);

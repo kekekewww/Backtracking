@@ -33,9 +33,9 @@ use windows::Win32::{
     },
 };
 use winit::{
-    platform::windows::{Color, CornerPreference, IconExtWindows, WindowExtWindows},
+    platform::windows::{Color, CornerPreference, WindowExtWindows},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
-    window::{Icon, Window},
+    window::Window,
 };
 
 const BINS: usize = 384;
@@ -99,9 +99,6 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
         options,
         Box::new(|context| {
             configure_style(&context.egui_ctx, accent_color(settings.accent));
-            if let Some(window) = context.winit_window() {
-                window.set_taskbar_icon(Icon::from_resource(1, None).ok());
-            }
             if settings.waveform_only {
                 set_waveform_frame(context.winit_window(), true);
             }
@@ -112,17 +109,7 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
             }
             let mut recorder = Recorder::new(controller, preferences, settings);
             if let Some(window) = context.winit_window() {
-                match Tray::attach(window, &context.egui_ctx) {
-                    Ok(tray) => {
-                        tray.apply_taskbar_mode(window);
-                        recorder.tray_available = tray.is_active();
-                        recorder.tray = Some(tray);
-                    }
-                    Err(error) => {
-                        window.set_skip_taskbar(false);
-                        recorder.message = format!("System tray unavailable: {error}");
-                    }
-                }
+                recorder.attach_tray(window, &context.egui_ctx);
             }
             match startup::enabled() {
                 Ok(enabled) => recorder.launch_at_login = enabled,
@@ -229,6 +216,7 @@ struct Recorder {
     preferences: Preferences,
     tray: Option<Tray>,
     tray_available: bool,
+    next_tray_attach: Instant,
     launch_at_login: bool,
     quitting: bool,
     output: PathBuf,
@@ -463,6 +451,7 @@ impl Recorder {
             preferences,
             tray: None,
             tray_available: false,
+            next_tray_attach: Instant::now(),
             launch_at_login: false,
             quitting: false,
             output: settings.output,
@@ -536,18 +525,42 @@ impl Recorder {
         ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 
+    fn attach_tray(&mut self, window: &Window, ctx: &egui::Context) {
+        self.next_tray_attach = Instant::now() + Duration::from_secs(2);
+        match Tray::attach(window, ctx) {
+            Ok(tray) => {
+                self.tray_available = tray.is_active();
+                self.tray = Some(tray);
+            }
+            Err(error) => self.message = format!("System tray unavailable: {error}"),
+        }
+        tray::suppress_taskbar(window);
+    }
+
     fn update_tray(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if self.tray.is_none()
+            && Instant::now() >= self.next_tray_attach
+            && let Some(window) = frame.winit_window()
+        {
+            self.attach_tray(window, ctx);
+        }
         let Some(tray) = &self.tray else { return };
         tray.refresh();
         let available = tray.is_active();
         let action = tray.take_action();
+        if tray.take_taskbar_recheck()
+            && let Some(window) = frame.winit_window()
+        {
+            tray::suppress_taskbar(window);
+        }
         if available != self.tray_available {
             self.tray_available = available;
-            if let Some(window) = frame.winit_window() {
-                tray.apply_taskbar_mode(window);
-                if !available && window.is_visible() == Some(false) {
-                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                }
+            if !available
+                && frame
+                    .winit_window()
+                    .is_some_and(|window| window.is_visible() == Some(false))
+            {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             }
         }
         match action {
@@ -1059,9 +1072,21 @@ impl Recorder {
                 .show(ui, |ui| {
                     ui.spacing_mut().interact_size.y = 15.0;
                     ui.spacing_mut().button_padding.y = 0.5;
+                    let mut enabled = self.launch_at_login;
+                    if ui
+                        .checkbox(&mut enabled, "Start with Windows")
+                        .on_hover_text(
+                            "Launch Backtracking from its current location when you sign in",
+                        )
+                        .changed()
+                    {
+                        self.set_launch_at_login(enabled, frame);
+                    }
+                    self.accent_settings(ui);
                     let mode_actions = ui
                         .horizontal(|ui| self.waveform_mode_settings(ui, "Show waveform only"))
                         .inner;
+                    ui.separator();
                     egui::Grid::new("recording-settings")
                         .spacing([9.0, 1.0])
                         .show(ui, |ui| {
@@ -1133,18 +1158,7 @@ impl Recorder {
                             });
                             ui.end_row();
                             self.wav_settings(ui);
-                            ui.label("Startup");
-                            let mut enabled = self.launch_at_login;
-                            if ui
-                                .checkbox(&mut enabled, "Start with Windows")
-                                .on_hover_text("Launch Backtracking from its current location when you sign in")
-                                .changed()
-                            {
-                                self.set_launch_at_login(enabled, frame);
-                            }
-                            ui.end_row();
                         });
-                    self.accent_settings(ui);
                     mode_actions
                 })
                 .inner;
