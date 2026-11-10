@@ -1,5 +1,7 @@
 # <img src="assets/backtracking-icon.svg" width="42" height="42" alt=""> Backtracking
 
+> **[贊助 Backtracking / Support Backtracking on Buy Me a Coffee](https://buymeacoffee.com/kamelkyp/e/596694)**
+
 [繁體中文](#繁體中文) · [English](#english) · [硬體使用量 / Hardware utilization](#硬體使用量--hardware-utilization)
 
 ## 繁體中文
