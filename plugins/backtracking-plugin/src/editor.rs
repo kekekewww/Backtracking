@@ -1005,12 +1005,20 @@ impl CaptureUi {
         allow_new_gesture: bool,
     ) {
         let rect = waveform.rect;
-        let (position, pressed, down, selecting) = ui.input(|input| {
+        let (position, press, down) = ui.input(|input| {
+            let press = input.events.iter().rev().find_map(|event| match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                } => Some((*pos, modifiers.alt || modifiers.ctrl)),
+                _ => None,
+            });
             (
                 input.pointer.interact_pos(),
-                input.pointer.button_pressed(PointerButton::Primary),
+                press,
                 input.pointer.button_down(PointerButton::Primary),
-                input.modifiers.alt || input.modifiers.ctrl,
             )
         });
         if self.native_dragging.load(Ordering::Acquire) {
@@ -1018,8 +1026,8 @@ impl CaptureUi {
         }
 
         if allow_new_gesture
-            && pressed
-            && let Some(position) = position.filter(|position| rect.contains(*position))
+            && let Some((position, selecting)) =
+                press.filter(|(position, _)| rect.contains(*position))
         {
             self.discard_drag_preparation();
             self.session.begin_waveform_gesture();
