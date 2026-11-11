@@ -6,9 +6,9 @@ use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::export::export_track_refs;
+use crate::export::export_routed_track_refs;
 use crate::{
-    DurationChoice, MeterReadings, Snapshot, SynchronizedCapture, TimedAudioQueue,
+    ChannelRoute, DurationChoice, MeterReadings, Snapshot, SynchronizedCapture, TimedAudioQueue,
     WavExportProfile, WavSampleFormat, WaveformView,
 };
 
@@ -343,15 +343,47 @@ unsafe extern "C" fn bt_snapshot_export_frames_with_profile(
     sample_rate: u32,
     bits_per_sample: u32,
 ) -> *mut c_char {
+    bt_snapshot_export_routed_frames_with_profile(
+        snapshot,
+        first_frame,
+        end_frame,
+        directory,
+        sample_rate,
+        bits_per_sample,
+        ChannelRoute::Merged as u32,
+        0,
+    )
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_snapshot_export_routed_frames_with_profile(
+    snapshot: *const Snapshot,
+    first_frame: u64,
+    end_frame: u64,
+    directory: *const c_char,
+    sample_rate: u32,
+    bits_per_sample: u32,
+    route: u32,
+    force_mono: u32,
+) -> *mut c_char {
     let Some(snapshot) = snapshot.as_ref() else {
         return ptr::null_mut();
     };
     let Some(frames) = relative_frames(snapshot, first_frame, end_frame) else {
         return ptr::null_mut();
     };
-    let Some(mut paths) =
-        export_snapshots(&[snapshot], frames, directory, sample_rate, bits_per_sample)
-    else {
+    let Some(route) = ChannelRoute::from_code(route) else {
+        return ptr::null_mut();
+    };
+    let Some(mut paths) = export_snapshots(
+        &[snapshot],
+        frames,
+        directory,
+        sample_rate,
+        bits_per_sample,
+        &[route],
+        force_mono != 0,
+    ) else {
         return ptr::null_mut();
     };
     paths.remove(0).into_raw()
@@ -369,19 +401,56 @@ unsafe extern "C" fn bt_snapshots_export_pair_frames_with_profile(
     path_a: *mut *mut c_char,
     path_b: *mut *mut c_char,
 ) -> i32 {
+    bt_snapshots_export_pair_routed_frames_with_profile(
+        snapshot_a,
+        snapshot_b,
+        first_frame,
+        end_frame,
+        directory,
+        sample_rate,
+        bits_per_sample,
+        ChannelRoute::Merged as u32,
+        ChannelRoute::Merged as u32,
+        0,
+        path_a,
+        path_b,
+    )
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_snapshots_export_pair_routed_frames_with_profile(
+    snapshot_a: *const Snapshot,
+    snapshot_b: *const Snapshot,
+    first_frame: u64,
+    end_frame: u64,
+    directory: *const c_char,
+    sample_rate: u32,
+    bits_per_sample: u32,
+    route_a: u32,
+    route_b: u32,
+    force_mono: u32,
+    path_a: *mut *mut c_char,
+    path_b: *mut *mut c_char,
+) -> i32 {
     let Some(frames) = snapshot_a
         .as_ref()
         .and_then(|snapshot| relative_frames(snapshot, first_frame, end_frame))
     else {
         return 0;
     };
+    let (Some(route_a), Some(route_b)) = (
+        ChannelRoute::from_code(route_a),
+        ChannelRoute::from_code(route_b),
+    ) else {
+        return 0;
+    };
     export_pair(
-        snapshot_a,
-        snapshot_b,
+        [snapshot_a, snapshot_b],
         frames,
         directory,
-        sample_rate,
-        bits_per_sample,
+        [sample_rate, bits_per_sample],
+        [route_a, route_b],
+        force_mono != 0,
         [path_a, path_b],
     )
 }
@@ -407,12 +476,12 @@ unsafe extern "C" fn bt_snapshots_export_pair_with_profile(
     let count = snapshot.frame_count() as f64;
     let frames = (start * count).floor() as usize..(end * count).ceil() as usize;
     export_pair(
-        snapshot_a,
-        snapshot_b,
+        [snapshot_a, snapshot_b],
         frames,
         directory,
-        sample_rate,
-        bits_per_sample,
+        [sample_rate, bits_per_sample],
+        [ChannelRoute::Merged; 2],
+        false,
         [path_a, path_b],
     )
 }
@@ -425,12 +494,12 @@ fn relative_frames(snapshot: &Snapshot, first: u64, end: u64) -> Option<Range<us
 }
 
 unsafe fn export_pair(
-    snapshot_a: *const Snapshot,
-    snapshot_b: *const Snapshot,
+    [snapshot_a, snapshot_b]: [*const Snapshot; 2],
     frames: Range<usize>,
     directory: *const c_char,
-    sample_rate: u32,
-    bits_per_sample: u32,
+    [sample_rate, bits_per_sample]: [u32; 2],
+    routes: [ChannelRoute; 2],
+    force_mono: bool,
     [path_a, path_b]: [*mut *mut c_char; 2],
 ) -> i32 {
     if path_a.is_null() || path_b.is_null() || path_a == path_b {
@@ -441,9 +510,15 @@ unsafe fn export_pair(
     let (Some(a), Some(b)) = (snapshot_a.as_ref(), snapshot_b.as_ref()) else {
         return 0;
     };
-    let Some(mut paths) =
-        export_snapshots(&[a, b], frames, directory, sample_rate, bits_per_sample)
-    else {
+    let Some(mut paths) = export_snapshots(
+        &[a, b],
+        frames,
+        directory,
+        sample_rate,
+        bits_per_sample,
+        &routes,
+        force_mono,
+    ) else {
         return 0;
     };
     *path_a = paths.remove(0).into_raw();
@@ -457,6 +532,8 @@ unsafe fn export_snapshots(
     directory: *const c_char,
     sample_rate: u32,
     bits_per_sample: u32,
+    routes: &[ChannelRoute],
+    force_mono: bool,
 ) -> Option<Vec<CString>> {
     if directory.is_null() {
         return None;
@@ -470,7 +547,15 @@ unsafe fn export_snapshots(
         sample_rate,
         sample_format,
     };
-    let paths = export_track_refs(Path::new(directory), snapshots, frames, profile).ok()?;
+    let paths = export_routed_track_refs(
+        Path::new(directory),
+        snapshots,
+        frames,
+        profile,
+        routes,
+        force_mono,
+    )
+    .ok()?;
     let result: Option<Vec<CString>> = paths
         .iter()
         .map(|path| CString::new(path.to_str()?).ok())

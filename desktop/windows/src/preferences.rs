@@ -42,6 +42,7 @@ pub(crate) enum Key {
     CaptureSources,
     WavSampleRate,
     WavSampleFormat,
+    WavForceMono,
     Output,
     SavedSnapshots,
     AlwaysOnTop,
@@ -63,6 +64,7 @@ impl Key {
             Self::CaptureSources => "capture-sources",
             Self::WavSampleRate => "wav-sample-rate",
             Self::WavSampleFormat => "wav-sample-format",
+            Self::WavForceMono => "wav-force-mono",
             Self::Output => "output-folder",
             Self::SavedSnapshots => "saved-snapshots-folder",
             Self::AlwaysOnTop => "always-on-top",
@@ -82,6 +84,7 @@ pub(crate) struct Settings {
     pub(crate) split_waveform: bool,
     pub(crate) sources: [Option<SourceSettings>; 2],
     pub(crate) wav_profile: WavExportProfile,
+    pub(crate) wav_force_mono: bool,
     pub(crate) output: PathBuf,
     pub(crate) saved_output: PathBuf,
     pub(crate) pinned: bool,
@@ -111,6 +114,7 @@ impl Default for Settings {
                 None,
             ],
             wav_profile: WavExportProfile::default(),
+            wav_force_mono: false,
             output: directory.join("output"),
             saved_output: directory.join("saved"),
             pinned: true,
@@ -175,6 +179,7 @@ impl Preferences {
                 Some("pcm24") => WavSampleFormat::Pcm24,
                 _ => WavSampleFormat::Float32,
             };
+        settings.wav_force_mono = self.read_number::<u8>(Key::WavForceMono) == Some(1);
         if let Some(path) = self.read_absolute_path(Key::Output) {
             settings.output = path;
         }
@@ -371,6 +376,27 @@ fn parse_accent(value: &str) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mono_wav_export_defaults_off_and_persists_changes() {
+        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "Backtracking-mono-preference-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let preferences = Preferences {
+            directory: Some(directory.clone()),
+        };
+
+        assert!(!preferences.load().wav_force_mono);
+        preferences.save(Key::WavForceMono, "1").unwrap();
+        assert!(preferences.load().wav_force_mono);
+        preferences.save(Key::WavForceMono, "0").unwrap();
+        assert!(!preferences.load().wav_force_mono);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn persisted_lanes_keep_unicode_source_identity_and_independent_routes() {

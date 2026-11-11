@@ -56,6 +56,7 @@ pub(crate) struct SessionSettings {
     pub(crate) accent: [u8; 3],
     pub(crate) meter_mode: MeterMode,
     pub(crate) wav_profile: WavExportProfile,
+    pub(crate) force_mono: bool,
     pub(crate) show_waveform_only: bool,
     pub(crate) waveform_layout: WaveformLayout,
     pub(crate) output_dir: PathBuf,
@@ -76,6 +77,7 @@ impl Default for SessionSettings {
             accent: DEFAULT_ACCENT,
             meter_mode: MeterMode::Dbfs,
             wav_profile: WavExportProfile::default(),
+            force_mono: false,
             show_waveform_only: false,
             waveform_layout: WaveformLayout::default(),
             output_dir: backtracking.join("output"),
@@ -151,6 +153,9 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                     .and_then(WavSampleFormat::from_bits_per_sample)
                     .unwrap_or(defaults.wav_profile.sample_format),
             },
+            force_mono: fields
+                .get("wav_force_mono")
+                .is_some_and(|value| value == "true"),
             show_waveform_only: fields
                 .get("show_waveform_only")
                 .is_some_and(|value| value == "true"),
@@ -211,6 +216,7 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                     .bits_per_sample()
                     .to_string(),
             ),
+            ("wav_force_mono".into(), settings.force_mono.to_string()),
         ]);
         // The framework's serde codec preserves native paths, including non-Unicode names.
         if let Ok(path) = serialize_field(settings.output_dir.as_os_str()) {

@@ -147,16 +147,18 @@ Backtracking 視窗有焦點時，按 `Esc` 或 `Backspace` 可取消框選並�
 | 取樣率 | 44.1 kHz、48 kHz、96 kHz | 48 kHz |
 | 編碼 | 16-bit PCM、24-bit PCM、32-bit IEEE float | 32-bit float |
 
-快照保存及拖放匯出都使用目前選定的 WAV 規格。錄音與音量表以來源取樣率運作，取樣率轉換在匯出時進行。WAV 保留擷取結果的 mono 或 stereo 聲道配置，Windows 桌面版會將多聲道輸出裝置的混音轉為 stereo。回溯歷史儲存在記憶體，關閉桌面程式或移除插件前，請先存下需要的片段。
+快照保存及拖放匯出都使用目前選定的 WAV 規格，取樣率轉換在匯出時進行。桌面版的 **Left** 和 **Right** 匯出為單側有聲的立體聲，**Side** 以左側原相、右側反相匯出為立體聲，**Mid** 和 **Center** 匯出為單聲道。**Merged** 和插件沿用擷取結果的聲道數。
+
+在 WAV 設定勾選 **全部轉成單聲道／Export every file as mono**，每個檔案都會單獨轉成單聲道。立體聲 Merged 與插件的左右聲道會取平均，Side 則輸出擷取到的 Side 訊號。A／B 仍各自匯出，選項預設關閉。回溯歷史儲存在記憶體，關閉桌面程式或移除插件前，請先存下需要的片段。
 
 ### 保存與還原設定
 
-Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續錄、主題色、背景透明度、音量表模式、WAV 取樣率與編碼、兩個資料夾、置頂及只顯示波形的設定，下次開啟時還原。
+Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續錄、主題色、背景透明度、音量表模式、WAV 匯出設定、兩個資料夾、置頂及只顯示波形的設定，下次開啟時還原。
 
 - **Windows**。設定儲存在 `%LOCALAPPDATA%\Backtracking\Settings`。若找不到 `LOCALAPPDATA`，則使用 `%APPDATA%\Backtracking\Settings`。程式會還原上次的視窗位置。
 - **macOS**。設定儲存在系統的使用者偏好中，也會記住桌面視窗的位置與尺寸。
 
-**VST3／CLAP** 的保留時間、自動續錄、主題色、面板透明度、音量表模式、WAV 取樣率與編碼、兩個資料夾及只顯示波形的設定由 DAW 專案保存，每個插件實例可獨立設定。修改後請手動儲存專案。重新開啟同一個專案時，DAW 會還原各實例的設定。
+**VST3／CLAP** 的保留時間、自動續錄、主題色、面板透明度、音量表模式、WAV 匯出設定、兩個資料夾及只顯示波形的設定由 DAW 專案保存，每個插件實例可獨立設定。修改後請手動儲存專案。重新開啟同一個專案時，DAW 會還原各實例的設定。
 
 ### 排除問題
 
@@ -315,16 +317,18 @@ Choose the sample rate and encoding independently in the gear menu.
 | Sample rate | 44.1 kHz, 48 kHz, 96 kHz | 48 kHz |
 | Encoding | 16-bit PCM, 24-bit PCM, 32-bit IEEE float | 32-bit float |
 
-Saving a snapshot and exporting by drag and drop both use the current WAV format. Capture and metering run at the source sample rate. Any sample rate conversion happens during export. The WAV preserves the captured mono or stereo layout. The Windows desktop app mixes multichannel playback to stereo. The rolling history lives in memory, so export any clips you need before closing the app or removing the plug-in.
+Snapshot saves and drag-and-drop exports use the current WAV settings. Any sample rate conversion happens during export. On desktop, **Left** and **Right** export as stereo with audio on the corresponding side, **Side** exports as stereo with an inverted right channel, and **Mid** and **Center** export as mono. **Merged** and the plug-ins use the captured channel count.
+
+Enable **Export every file as mono** to export each WAV in mono. Stereo Merged and stereo plug-in captures average the left and right channels. Side exports the captured Side signal. A and B still export as individual files. The option defaults to Off. The rolling history lives in memory, so export any clips you need before closing the app or removing the plug-in.
 
 ### Save and restore settings
 
-The Windows and macOS desktop apps save your history length, auto-resume delay, theme accent, background transparency, meter mode, WAV sample rate and encoding, both folders, keep-on-top setting, and waveform-only mode as you change them. Those preferences are restored the next time you open the app.
+The Windows and macOS desktop apps save your history length, auto-resume delay, theme accent, background transparency, meter mode, WAV export settings, both folders, keep-on-top setting, and waveform-only mode as you change them. Those preferences are restored the next time you open the app.
 
 - **Windows**. Settings are stored in `%LOCALAPPDATA%\Backtracking\Settings`, with `%APPDATA%\Backtracking\Settings` as a fallback when `LOCALAPPDATA` is unavailable. The app restores its previous window position.
 - **macOS**. Settings are stored in the macOS user preferences. The app also restores the desktop window's size and position.
 
-For **VST3 and CLAP**, the DAW project stores each plug-in instance's history length, auto-resume delay, theme accent, panel transparency, meter mode, WAV sample rate and encoding, both folders, and waveform-only mode. Save the project manually after making changes. When you reopen that project, the DAW restores each instance's settings.
+For **VST3 and CLAP**, the DAW project stores each plug-in instance's history length, auto-resume delay, theme accent, panel transparency, meter mode, WAV export settings, both folders, and waveform-only mode. Save the project manually after making changes. When you reopen that project, the DAW restores each instance's settings.
 
 ### Troubleshooting
 

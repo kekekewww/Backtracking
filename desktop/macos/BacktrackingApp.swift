@@ -272,9 +272,11 @@ private final class CapturePanel: SnapshotShortcutPanel {
 // A frozen, shared interval. The worker owns all export access to its samples.
 private final class WAVExport: @unchecked Sendable {
     private let snapshots: [OpaquePointer]
+    private let routes: [UInt32]
     let span: Range<UInt64>
 
-    init?(core: OpaquePointer, laneCount: Int) {
+    init?(core: OpaquePointer, routes: [CaptureRoute]) {
+        guard (1...2).contains(routes.count) else { return nil }
         guard let first = bt_tracks_snapshot(core, 0) else { return nil }
         let count = bt_snapshot_frame_count(first)
         guard count > 0 else {
@@ -283,7 +285,8 @@ private final class WAVExport: @unchecked Sendable {
         }
         let start = bt_snapshot_first_frame(first)
         span = start..<(start + count)
-        if laneCount == 2 {
+        self.routes = routes.map(\.wavRouteCode)
+        if routes.count == 2 {
             guard let second = bt_tracks_snapshot(core, 1) else {
                 bt_snapshot_free(first)
                 return nil
@@ -298,14 +301,17 @@ private final class WAVExport: @unchecked Sendable {
         for snapshot in snapshots { bt_snapshot_free(snapshot) }
     }
 
-    func write(range: Range<UInt64>, directory: String, sampleRate: UInt32, bitsPerSample: UInt32) -> [URL] {
-        directory.withCString { destination -> [URL] in
+    func write(
+        range: Range<UInt64>, directory: String, sampleRate: UInt32, bitsPerSample: UInt32, forceMono: Bool
+    ) -> [URL] {
+        let mono: UInt32 = forceMono ? 1 : 0
+        return directory.withCString { destination -> [URL] in
             if snapshots.count == 2 {
                 var a: UnsafeMutablePointer<CChar>?
                 var b: UnsafeMutablePointer<CChar>?
-                guard bt_snapshots_export_pair_frames_with_profile(
+                guard bt_snapshots_export_pair_routed_frames_with_profile(
                     snapshots[0], snapshots[1], range.lowerBound, range.upperBound, destination,
-                    sampleRate, bitsPerSample, &a, &b
+                    sampleRate, bitsPerSample, routes[0], routes[1], mono, &a, &b
                 ) == 1, let pathA = a, let pathB = b else { return [] }
                 defer {
                     bt_string_free(pathA)
@@ -316,8 +322,9 @@ private final class WAVExport: @unchecked Sendable {
                     URL(fileURLWithPath: String(cString: pathB))
                 ]
             }
-            guard let path = bt_snapshot_export_frames_with_profile(
-                snapshots[0], range.lowerBound, range.upperBound, destination, sampleRate, bitsPerSample
+            guard let path = bt_snapshot_export_routed_frames_with_profile(
+                snapshots[0], range.lowerBound, range.upperBound, destination,
+                sampleRate, bitsPerSample, routes[0], mono
             ) else { return [] }
             defer { bt_string_free(path) }
             return [URL(fileURLWithPath: String(cString: path))]
@@ -501,6 +508,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var captureLanes: [CaptureLane] { dualSource ? [laneA, laneB] : [laneA] }
     private var exportSampleRate: UInt32 = 48_000
     private var exportBitsPerSample: UInt32 = 32
+    private var forceMonoExport = false
     private var alwaysOnTop = true
     private var waveformOnly = false
     private var paused = true
@@ -532,6 +540,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if let saved = unsignedSetting("exportBitsPerSample"), exportBitDepths.contains(saved) {
             exportBitsPerSample = saved
         }
+        forceMonoExport = defaults.bool(forKey: "forceMonoExport")
         alwaysOnTop = defaults.object(forKey: "alwaysOnTop") as? Bool ?? true
         waveformOnly = defaults.object(forKey: "waveformOnly") as? Bool ?? false
         startupUpdater.checkAtLaunch { [weak self] in self?.beginCaptureAfterUpdate() }
@@ -869,7 +878,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func makeCaptureTab() -> NSTabViewItem {
-        optionsTab("錄音與 WAV", rows: [
+        let mono = NSButton(
+            checkboxWithTitle: "全部轉成單聲道", target: self, action: #selector(exportMonoChanged(_:))
+        )
+        mono.state = forceMonoExport ? .on : .off
+        return optionsTab("錄音與 WAV", rows: [
             optionChoice(
                 "保留時間", choices: timeChoices, selected: history, action: #selector(historyChanged(_:))
             ) { "\($0) 秒" },
@@ -883,7 +896,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             optionChoice(
                 "WAV 編碼", choices: exportBitDepths, selected: exportBitsPerSample,
                 action: #selector(exportEncodingChanged(_:))
-            ) { $0 == 32 ? "32-bit float" : "\($0)-bit PCM" }
+            ) { $0 == 32 ? "32-bit float" : "\($0)-bit PCM" },
+            mono
         ])
     }
 
@@ -1306,6 +1320,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         invalidateExportFormat()
     }
 
+    @objc private func exportMonoChanged(_ sender: NSButton) {
+        let enabled = sender.state == .on
+        guard enabled != forceMonoExport else { return }
+        forceMonoExport = enabled
+        defaults.set(enabled, forKey: "forceMonoExport")
+        invalidateExportFormat()
+    }
+
     private func invalidateExportFormat() {
         registerClick()
         waveform?.discardPreparedFile()
@@ -1643,7 +1665,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private func captureSnapshot() -> WAVExport? {
         guard let tap else { return nil }
         if !paused { bt_tracks_poll(tap.core) }
-        return WAVExport(core: tap.core, laneCount: tap.laneCount)
+        return WAVExport(core: tap.core, routes: tap.captureRoutes)
     }
 
     @objc private func saveCurrentSnapshot() {
@@ -1680,9 +1702,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     ) -> DispatchWorkItem {
         let sampleRate = exportSampleRate
         let bitsPerSample = exportBitsPerSample
+        let forceMono = forceMonoExport
         setNotice(provisional ? "正在準備拖放…" : "正在寫入 WAV…")
         let write = DispatchWorkItem { @Sendable [weak self, worker, pendingProvisionalWAVs] in
-            let urls = job.write(range: range, directory: directory, sampleRate: sampleRate, bitsPerSample: bitsPerSample)
+            let urls = job.write(
+                range: range, directory: directory, sampleRate: sampleRate, bitsPerSample: bitsPerSample,
+                forceMono: forceMono
+            )
             if provisional { pendingProvisionalWAVs.urls.formUnion(urls) }
             DispatchQueue.main.async {
                 if provisional {

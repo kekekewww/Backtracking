@@ -66,6 +66,18 @@ enum CaptureSource: Hashable {
 enum CaptureRoute: UInt32, CaseIterable {
     case merged, left, right, center, mid, side
 
+    // UserDefaults stores the Swift raw values. WAV export uses the core route codes.
+    var wavRouteCode: UInt32 {
+        switch self {
+        case .left: 0
+        case .right: 1
+        case .center: 2
+        case .mid: 3
+        case .side: 4
+        case .merged: 5
+        }
+    }
+
     var label: String {
         switch self {
         case .merged: "Merged"
@@ -656,6 +668,7 @@ final class SystemAudioTap {
     private var running = false
     var core: OpaquePointer { timeline.core }
     var laneCount: Int { lanes.count }
+    var captureRoutes: [CaptureRoute] { lanes.map(\.route) }
     var privatePlaybackDevices: Set<AudioObjectID> {
         Set(slots.compactMap { ($0.input as? PlaybackTap)?.aggregateID })
     }
@@ -844,7 +857,8 @@ func verifyMacCaptureRouting() throws {
     defer { try? FileManager.default.removeItem(at: directory) }
 
     func check(
-        samples: [Float], labels: [AudioChannelLabel], routes: [CaptureRoute], expected: [[Float]]
+        samples: [Float], labels: [AudioChannelLabel], routes: [CaptureRoute],
+        captured: [[Float]], routed: [[Float]], mono: [[Float]]
     ) throws {
         let frameCount = 4_096
         let channels = UInt32(samples.count)
@@ -856,9 +870,9 @@ func verifyMacCaptureRouting() throws {
         )
         let format = try InputFormat(stream, labels: labels)
         if channels == 2, format.supports(.center) { throw CaptureError("Stereo falsely reported native Center") }
-        let timeline = try TimelineHandle(history: 10, a: UInt32(expected[0].count), b: UInt32(expected[1].count))
+        let timeline = try TimelineHandle(history: 10, a: UInt32(captured[0].count), b: UInt32(captured[1].count))
         let producers = routes.enumerated().map { index, route in
-            LaneProducer(timeline: timeline, lane: UInt32(index), route: route, outputChannels: UInt32(expected[index].count))
+            LaneProducer(timeline: timeline, lane: UInt32(index), route: route, outputChannels: UInt32(captured[index].count))
         }
         var signal = (0..<frameCount).flatMap { _ in samples }
         signal.withUnsafeMutableBytes { data in
@@ -887,56 +901,96 @@ func verifyMacCaptureRouting() throws {
         }
         let start = first + 37
         let end = first + 173
-        var a: UnsafeMutablePointer<CChar>?
-        var b: UnsafeMutablePointer<CChar>?
-        let written = directory.path.withCString {
-            bt_snapshots_export_pair_frames_with_profile(snapshotA, snapshotB, start, end, $0, 48_000, 32, &a, &b)
-        }
-        guard written == 1, let pathA = a, let pathB = b else {
-            throw CaptureError("Could not export the A/B take")
-        }
-        defer {
-            bt_string_free(pathA)
-            bt_string_free(pathB)
-        }
-        let urls: [URL] = [
-            URL(fileURLWithPath: String(cString: pathA)),
-            URL(fileURLWithPath: String(cString: pathB))
-        ]
-        let prefixA = urls[0].lastPathComponent.dropLast(6)
-        let prefixB = urls[1].lastPathComponent.dropLast(6)
-        guard urls[0].lastPathComponent.hasSuffix("-A.wav"), urls[1].lastPathComponent.hasSuffix("-B.wav"),
-              prefixA == prefixB else { throw CaptureError("A/B files do not share a take name") }
 
-        for (lane, url) in urls.enumerated() {
+        func verifyFile(_ url: URL, expected: [Float]) throws {
             let file = try AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: false)
             let count = AVAudioFrameCount(end - start)
-            guard file.processingFormat.channelCount == UInt32(expected[lane].count),
+            guard file.processingFormat.channelCount == UInt32(expected.count),
                   file.processingFormat.sampleRate == 48_000, file.length == Int64(count),
                   let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: count) else {
-                throw CaptureError("A/B WAV format or selected frame range is incorrect")
+                throw CaptureError("WAV format or selected frame range is incorrect")
             }
             try file.read(into: buffer)
             guard buffer.frameLength == count, let data = buffer.floatChannelData else {
-                throw CaptureError("A/B WAV has unreadable sample data")
+                throw CaptureError("WAV has unreadable sample data")
             }
-            for (channel, value) in expected[lane].enumerated() {
+            for (channel, value) in expected.enumerated() {
                 for frame in 0..<Int(count) where abs(data[channel][frame] - value) > 0.00001 {
-                    throw CaptureError("Unexpected sample in A/B lane \(lane), channel \(channel), frame \(frame)")
+                    throw CaptureError("Unexpected sample in \(url.lastPathComponent), channel \(channel), frame \(frame)")
                 }
+            }
+        }
+
+        func verifyPair(_ expected: [[Float]], routed: Bool, forceMono: UInt32 = 0) throws {
+            var a: UnsafeMutablePointer<CChar>?
+            var b: UnsafeMutablePointer<CChar>?
+            let written = directory.path.withCString { path in
+                if routed {
+                    return bt_snapshots_export_pair_routed_frames_with_profile(
+                        snapshotA, snapshotB, start, end, path, 48_000, 32,
+                        routes[0].wavRouteCode, routes[1].wavRouteCode, forceMono, &a, &b
+                    )
+                }
+                return bt_snapshots_export_pair_frames_with_profile(
+                    snapshotA, snapshotB, start, end, path, 48_000, 32, &a, &b
+                )
+            }
+            guard written == 1, let pathA = a, let pathB = b else {
+                throw CaptureError("Could not export the A/B take")
+            }
+            defer {
+                bt_string_free(pathA)
+                bt_string_free(pathB)
+            }
+            let urlA = URL(fileURLWithPath: String(cString: pathA))
+            let urlB = URL(fileURLWithPath: String(cString: pathB))
+            guard urlA.lastPathComponent.hasSuffix("-A.wav"), urlB.lastPathComponent.hasSuffix("-B.wav"),
+                  urlA.lastPathComponent.dropLast(6) == urlB.lastPathComponent.dropLast(6) else {
+                throw CaptureError("A/B files do not share a take name")
+            }
+            try verifyFile(urlA, expected: expected[0])
+            try verifyFile(urlB, expected: expected[1])
+        }
+
+        try verifyPair(captured, routed: false)
+        try verifyPair(routed, routed: true)
+        try verifyPair(mono, routed: true, forceMono: 1)
+
+        if routes[1] == .side {
+            let layouts: [(UInt32, [Float])] = [(0, routed[1]), (1, mono[1])]
+            for (forceMono, expected) in layouts {
+                let exported = directory.path.withCString {
+                    bt_snapshot_export_routed_frames_with_profile(
+                        snapshotB, start, end, $0, 48_000, 32, routes[1].wavRouteCode, forceMono
+                    )
+                }
+                guard let exported else { throw CaptureError("Could not export the single Side take") }
+                defer { bt_string_free(exported) }
+                try verifyFile(URL(fileURLWithPath: String(cString: exported)), expected: expected)
             }
         }
     }
 
     let stereo = [kAudioChannelLabel_Left, kAudioChannelLabel_Right]
-    try check(samples: [0.25, -0.5], labels: stereo, routes: [.left, .right], expected: [[0.25], [-0.5]])
-    try check(samples: [0.25, -0.5], labels: stereo, routes: [.mid, .side], expected: [[-0.125], [0.375]])
-    try check(samples: [0.25, -0.5], labels: stereo, routes: [.merged, .left], expected: [[0.25, -0.5], [0.25]])
+    try check(
+        samples: [0.25, -0.5], labels: stereo, routes: [.left, .right],
+        captured: [[0.25], [-0.5]], routed: [[0.25, 0], [0, -0.5]], mono: [[0.25], [-0.5]]
+    )
+    try check(
+        samples: [0.25, -0.5], labels: stereo, routes: [.mid, .side],
+        captured: [[-0.125], [0.375]], routed: [[-0.125], [0.375, -0.375]], mono: [[-0.125], [0.375]]
+    )
+    try check(
+        samples: [0.25, -0.5], labels: stereo, routes: [.merged, .left],
+        captured: [[0.25, -0.5], [0.25]], routed: [[0.25, -0.5], [0.25, 0]], mono: [[-0.125], [0.25]]
+    )
     let center: Float = 0.4
     let attenuation: Float = 0.70710677
+    let left = 0.25 + center * attenuation
+    let right = -0.5 + center * attenuation
     try check(
         samples: [0.25, -0.5, center], labels: stereo + [kAudioChannelLabel_Center], routes: [.center, .merged],
-        expected: [[center], [0.25 + center * attenuation, -0.5 + center * attenuation]]
+        captured: [[center], [left, right]], routed: [[center], [left, right]], mono: [[center], [(left + right) * 0.5]]
     )
 }
 #endif
