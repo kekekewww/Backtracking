@@ -996,6 +996,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             do { tap = try SystemAudioTap(history: history, lanes: captureLanes) }
             catch { captureError = error.localizedDescription }
         }
+        refreshWaveform()
         refreshSourceOptions()
         updateStatus()
     }

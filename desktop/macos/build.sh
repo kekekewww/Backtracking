@@ -17,7 +17,7 @@ case "$(uname -m)" in
 esac
 
 target_dir="${CARGO_TARGET_DIR:-$repo_dir/target}"
-CARGO_TARGET_DIR="$target_dir" cargo build --release --target "$rust_target" -p backtracking-core
+CARGO_TARGET_DIR="$target_dir" cargo build --locked --release --target "$rust_target" -p backtracking-core
 app_dir="$target_dir/bundled/Backtracking.app"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
 cp "$source_dir/Info.plist" "$app_dir/Contents/Info.plist"

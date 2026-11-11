@@ -124,7 +124,7 @@ private func audioObjects(_ selector: AudioObjectPropertySelector) -> [AudioObje
     let status = values.withUnsafeMutableBytes {
         AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, $0.baseAddress!)
     }
-    return status == noErr ? values : []
+    return status == noErr ? Array(values.prefix(Int(size) / MemoryLayout<AudioObjectID>.stride)) : []
 }
 
 private func audioString(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
@@ -161,8 +161,9 @@ private func layoutLabels(_ layout: UnsafePointer<AudioChannelLayout>) -> [Audio
     switch value.mChannelLayoutTag {
     case kAudioChannelLayoutTag_UseChannelDescriptions:
         let count = Int(value.mNumberChannelDescriptions)
-        guard count > 0, count <= 64,
-              let offset = MemoryLayout<AudioChannelLayout>.offset(of: \.mChannelDescriptions) else { return [] }
+        guard count > 0, count <= 64 else { return [] }
+        // The C ABI places its variable array after three UInt32 header fields.
+        let offset = 3 * MemoryLayout<UInt32>.stride
         let descriptions = UnsafeRawPointer(layout).advanced(by: offset).assumingMemoryBound(to: AudioChannelDescription.self)
         return (0..<count).map { descriptions[$0].mChannelLabel }
     default:
@@ -283,7 +284,7 @@ private struct InputFormat {
               (stream.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
               (stream.mFormatFlags & kAudioFormatFlagIsBigEndian) == 0,
               stream.mBitsPerChannel == 32, (1...64).contains(count),
-              stream.mSampleRate.isFinite, stream.mSampleRate > 0,
+              (1...384_000).contains(stream.mSampleRate),
               stream.mBytesPerFrame == sampleBytes * (separate ? 1 : stream.mChannelsPerFrame) else {
             throw CaptureError("此來源的音訊格式不受支援")
         }
