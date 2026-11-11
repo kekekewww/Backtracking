@@ -167,8 +167,8 @@ private func layoutLabels(_ layout: UnsafePointer<AudioChannelLayout>) -> [Audio
         let descriptions = UnsafeRawPointer(layout).advanced(by: offset).assumingMemoryBound(to: AudioChannelDescription.self)
         return (0..<count).map { descriptions[$0].mChannelLabel }
     default:
-        var specifier = value.mChannelLayoutTag == kAudioChannelLayoutTag_UseChannelBitmap
-            ? value.mChannelBitmap : value.mChannelLayoutTag
+        var specifier: UInt32 = value.mChannelLayoutTag == kAudioChannelLayoutTag_UseChannelBitmap
+            ? value.mChannelBitmap.rawValue : value.mChannelLayoutTag
         let selector = value.mChannelLayoutTag == kAudioChannelLayoutTag_UseChannelBitmap
             ? kAudioFormatProperty_ChannelLayoutForBitmap : kAudioFormatProperty_ChannelLayoutForTag
         let specifierSize = UInt32(MemoryLayout.size(ofValue: specifier))
@@ -218,7 +218,9 @@ private func parentProcess(_ pid: pid_t) -> pid_t? {
 
 @MainActor
 private func processObjects(for identifier: String) -> [AudioObjectID] {
-    let roots = Set(NSRunningApplication.runningApplications(withBundleIdentifier: identifier).map(.processIdentifier))
+    let roots = Set<pid_t>(NSRunningApplication.runningApplications(withBundleIdentifier: identifier).map {
+        $0.processIdentifier
+    })
     return audioObjects(kAudioHardwarePropertyProcessObjectList).filter { object in
         let bundle = audioString(object, kAudioProcessPropertyBundleID)
         if bundle == identifier { return true }
@@ -615,9 +617,7 @@ final class SystemAudioTap {
         var slots: [Slot] = []
         for (index, lane) in lanes.enumerated() {
             let current = identity(for: lane.source)
-            if let existing = slots.firstIndex(where: {
-                $0.source == lane.source || (current != nil && $0.identity == current)
-            }) {
+            if let existing = slots.firstIndex(where: { $0.source == lane.source }) {
                 let old = slots[existing]
                 slots[existing] = Slot(source: old.source, indexes: old.indexes + [index], identity: current)
             } else {
@@ -843,12 +843,17 @@ func verifyMacCaptureRouting() throws {
         let written = directory.path.withCString {
             bt_snapshots_export_pair_frames_with_profile(snapshotA, snapshotB, start, end, $0, 48_000, 32, &a, &b)
         }
-        guard written == 1, let a, let b else { throw CaptureError("Could not export the A/B take") }
-        defer {
-            bt_string_free(a)
-            bt_string_free(b)
+        guard written == 1, let pathA = a, let pathB = b else {
+            throw CaptureError("Could not export the A/B take")
         }
-        let urls = [a, b].map { URL(fileURLWithPath: String(cString: $0)) }
+        defer {
+            bt_string_free(pathA)
+            bt_string_free(pathB)
+        }
+        let urls: [URL] = [
+            URL(fileURLWithPath: String(cString: pathA)),
+            URL(fileURLWithPath: String(cString: pathB))
+        ]
         let prefixA = urls[0].lastPathComponent.dropLast(6)
         let prefixB = urls[1].lastPathComponent.dropLast(6)
         guard urls[0].lastPathComponent.hasSuffix("-A.wav"), urls[1].lastPathComponent.hasSuffix("-B.wav"),
