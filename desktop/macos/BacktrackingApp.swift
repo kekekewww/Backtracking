@@ -629,6 +629,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        if let source = sourcePopups.first(where: { $0.menu === menu }) {
+            refreshSourcePopup(source, choices: availableCaptureSources(excluding: tap?.privatePlaybackDevices ?? []))
+            return
+        }
         guard menu === statusItem?.menu else { return }
         menu.removeAllItems()
         let title = panel?.isVisible == true ? "隱藏波形" : "顯示波形"
@@ -893,6 +897,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             source.target = self
             source.tag = index
             source.action = #selector(captureSourceChanged(_:))
+            source.autoenablesItems = false
+            source.menu?.delegate = self
             source.widthAnchor.constraint(lessThanOrEqualToConstant: 300).isActive = true
             sourcePopups.append(source)
             let route = choiceControl(
@@ -915,24 +921,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     private func refreshSourceOptions() {
         guard sourcePopups.count == 2, routePopups.count == 2 else { return }
-        let choices = availableCaptureSources()
+        let choices = availableCaptureSources(excluding: tap?.privatePlaybackDevices ?? [])
         for (index, lane) in [laneA, laneB].enumerated() {
             let source = sourcePopups[index]
-            source.removeAllItems()
-            var selectedIndex: Int?
-            var usedTitles = Set<String>()
-            for choice in choices {
-                let title = usedTitles.insert(choice.title).inserted ? choice.title : "\(choice.title) · \(choice.source.key)"
-                source.addItem(withTitle: title)
-                source.lastItem?.representedObject = choice.source.key
-                if lane.source == choice.source { selectedIndex = source.numberOfItems - 1 }
-            }
-            if selectedIndex == nil {
-                source.addItem(withTitle: "\(lane.source.label)（目前未連線）")
-                source.lastItem?.representedObject = lane.source.key
-                selectedIndex = source.numberOfItems - 1
-            }
-            if let selectedIndex { source.selectItem(at: selectedIndex) }
+            refreshSourcePopup(source, choices: choices)
             source.isEnabled = index == 0 || dualSource
             let route = routePopups[index]
             route.isEnabled = source.isEnabled
@@ -946,6 +938,24 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         dualSourceButton?.state = dualSource ? .on : .off
         waveformModePopup?.isEnabled = !dualSource
         optionsMeterBPopup?.isEnabled = dualSource
+    }
+
+    private func refreshSourcePopup(_ popup: NSPopUpButton, choices: [(source: CaptureSource, title: String)]) {
+        let configured = popup.tag == 0 ? laneA.source : laneB.source
+        popup.removeAllItems()
+        var selectedIndex: Int?
+        var usedTitles = Set<String>()
+        for choice in choices {
+            let title = usedTitles.insert(choice.title).inserted ? choice.title : "\(choice.title) · \(choice.source.key)"
+            popup.addItem(withTitle: title)
+            popup.lastItem?.representedObject = choice.source.key
+            if configured == choice.source { selectedIndex = popup.numberOfItems - 1 }
+        }
+        if selectedIndex == nil {
+            popup.addItem(withTitle: "\(configured.label)（目前不可用）")
+            popup.lastItem?.isEnabled = false
+        }
+        popup.selectItem(at: selectedIndex ?? popup.numberOfItems - 1)
     }
 
     @objc private func dualSourceChanged(_ sender: NSButton) {

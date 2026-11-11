@@ -2,10 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::path::Path;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, PROPERTYKEY, WAIT_TIMEOUT};
-use windows::Win32::Media::Audio::{DEVICE_STATE_ACTIVE, IMMDevice, eCapture};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, PROPERTYKEY, S_FALSE, WAIT_TIMEOUT};
+use windows::Win32::Media::Audio::{
+    AudioSessionStateActive, AudioSessionStateInactive, DEVICE_STATE_ACTIVE, EDataFlow,
+    IAudioSessionControl, IAudioSessionControl2, IAudioSessionManager2, IMMDevice,
+    IMMDeviceEnumerator, eCapture, eRender,
+};
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
-use windows::Win32::System::Com::{CoTaskMemFree, STGM_READ};
+use windows::Win32::System::Com::{CLSCTX_ALL, CoTaskMemFree, STGM_READ};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -13,7 +17,7 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     QueryFullProcessImageNameW, WaitForSingleObject,
 };
-use windows::core::{GUID, PWSTR};
+use windows::core::{GUID, Interface, PWSTR};
 
 use super::{Apartment, audio_error, endpoint_enumerator, endpoint_id};
 
@@ -108,51 +112,77 @@ pub(super) fn target_process(executable: &str) -> Result<RunningProcess, String>
 
 pub(super) fn available_sources() -> Vec<CaptureSource> {
     let mut sources = vec![CaptureSource::System, CaptureSource::DefaultMicrophone];
-    sources.extend(microphones());
+    let Ok(_apartment) = Apartment::initialize() else {
+        return sources;
+    };
+    let Ok(enumerator) = endpoint_enumerator() else {
+        return sources;
+    };
+    sources.extend(
+        active_endpoints(&enumerator, eCapture).filter_map(|device| {
+            let id = endpoint_id(&device).ok()?;
+            let name = endpoint_name(&device).unwrap_or_else(|| id.clone());
+            Some(CaptureSource::Microphone { id, name })
+        }),
+    );
     if CaptureSource::supports_app_capture() {
-        let mut seen = HashSet::new();
-        let mut applications = Vec::new();
-        for process in processes().unwrap_or_default() {
-            if process.id == std::process::id() {
-                continue;
-            }
-            if let Some((path, _)) = process_path(process.id, false)
-                && seen.insert(path.to_lowercase())
-            {
-                applications.push(CaptureSource::Application {
-                    path,
-                    name: process.executable,
-                });
-            }
-        }
-        applications.sort_by_cached_key(|source| source.label().to_lowercase());
-        sources.extend(applications);
+        sources.extend(playback_applications(&enumerator));
     }
     sources
 }
 
-fn microphones() -> Vec<CaptureSource> {
-    let Ok(_apartment) = Apartment::initialize() else {
-        return Vec::new();
-    };
-    let Ok(enumerator) = endpoint_enumerator() else {
-        return Vec::new();
-    };
-    let Ok(collection) = (unsafe { enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) })
-    else {
-        return Vec::new();
-    };
-    let Ok(count) = (unsafe { collection.GetCount() }) else {
-        return Vec::new();
-    };
-    (0..count)
-        .filter_map(|index| {
-            let device = unsafe { collection.Item(index) }.ok()?;
-            let id = endpoint_id(&device).ok()?;
-            let name = endpoint_name(&device).unwrap_or_else(|| id.clone());
-            Some(CaptureSource::Microphone { id, name })
+fn active_endpoints(
+    enumerator: &IMMDeviceEnumerator,
+    flow: EDataFlow,
+) -> impl Iterator<Item = IMMDevice> + use<> {
+    let collection = unsafe { enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) }.ok();
+    let count = collection
+        .as_ref()
+        .and_then(|devices| unsafe { devices.GetCount() }.ok())
+        .unwrap_or_default();
+    (0..count).filter_map(move |index| unsafe { collection.as_ref()?.Item(index) }.ok())
+}
+
+fn playback_applications(enumerator: &IMMDeviceEnumerator) -> Vec<CaptureSource> {
+    let mut seen_processes = HashSet::new();
+    let mut seen_paths = HashSet::new();
+    let mut applications: Vec<_> = active_endpoints(enumerator, eRender)
+        .flat_map(|device| playback_sessions(&device).into_iter().flatten())
+        .filter_map(playback_process_id)
+        .filter(|&pid| seen_processes.insert(pid))
+        .filter_map(|pid| {
+            let (path, _) = process_path(pid, false)?;
+            let name = Path::new(&path).file_name()?.to_string_lossy().into_owned();
+            seen_paths
+                .insert(path.to_lowercase())
+                .then_some(CaptureSource::Application { path, name })
         })
-        .collect()
+        .collect();
+    applications.sort_by_cached_key(|source| source.label().to_lowercase());
+    applications
+}
+
+fn playback_sessions(
+    device: &IMMDevice,
+) -> windows::core::Result<impl Iterator<Item = IAudioSessionControl> + use<>> {
+    let manager: IAudioSessionManager2 = unsafe { device.Activate(CLSCTX_ALL, None) }?;
+    let sessions = unsafe { manager.GetSessionEnumerator() }?;
+    let count = unsafe { sessions.GetCount() }?;
+    Ok((0..count).filter_map(move |index| unsafe { sessions.GetSession(index) }.ok()))
+}
+
+fn playback_process_id(session: IAudioSessionControl) -> Option<u32> {
+    // The Windows mixer keeps an inactive session while it still owns an audio stream.
+    let state = unsafe { session.GetState() }.ok()?;
+    if state != AudioSessionStateActive && state != AudioSessionStateInactive {
+        return None;
+    }
+    let session: IAudioSessionControl2 = session.cast().ok()?;
+    if unsafe { session.IsSystemSoundsSession() } != S_FALSE {
+        return None;
+    }
+    let pid = unsafe { session.GetProcessId() }.ok()?;
+    (pid != 0 && pid != std::process::id()).then_some(pid)
 }
 
 fn endpoint_name(device: &IMMDevice) -> Option<String> {
