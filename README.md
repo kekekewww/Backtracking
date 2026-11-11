@@ -18,7 +18,7 @@ Backtracking 是給作曲與混音用的回溯錄音取樣器。聽到想留下�
 
 1. 開啟桌面版，或把 **Backtracking** 插入 DAW 音軌的效果鏈。
 2. 播放聲音。波形可保留最近 10、20、30 或 60 秒的有效音訊，長靜音期間會停在原處。
-3. 未框選時，在波形任意位置點擊可存下整段保留音訊，按住拖曳可把整段 WAV 送入 DAW。若只需其中一段，Windows 用 `Ctrl`、macOS 用 `Option` 加拖曳可框選起訖點，再點擊或拖出波形變色的區間。
+3. 按住波形拖出 Backtracking 視窗，放到接受 WAV 的位置，即可匯出整段保留音訊。只需其中一段時，Windows 用 `Ctrl`、macOS 用 `Option` 加拖曳框選，再拖出波形變色的區間。
 4. 在完整介面用工具列的 **Play／Pause** 啟用或暫停錄音。紅燈閃爍時正在收錄。操作波形也會暫停錄音，完成後可選 **Play** 或等待已設定的自動續錄。
 
 齒輪旁的即時音量表可顯示 **dBFS、VU 或瞬時 LUFS**。桌面版可點齒輪或按右鍵開啟獨立的 **Options** 視窗。**只顯示波形** 預設關閉，開啟後畫面只保留波形，可從 Options 啟用或暫停錄音，也可切回完整介面。桌面版可拖曳視窗內緣縮成細條。自動續錄可選 **0、5 或 10 秒**，預設 10 秒。選 0 秒會在波形操作完成後立刻恢復待命。清除錄音只會清空記憶體中的擷取內容。
@@ -29,7 +29,7 @@ Backtracking 是給作曲與混音用的回溯錄音取樣器。聽到想留下�
 
 桌面版會還原上次的視窗位置。Windows 從系統匣控制顯示、隱藏與結束，macOS 從選單列控制。可在設定啟用登入時自動啟動。VST3／CLAP 的設定跟著各自的插件實例存進 DAW 專案，修改後請儲存專案。要保留錄音素材，請先匯出 WAV。
 
-在 Backtracking 有焦點時，按 `Ctrl+S` 可把當下快照保存到保存資料夾。已框選時只保存該段，並立即恢復錄音待命。錄音中未框選時，保存整段保留的音訊，錄音會持續進行。波形點擊與拖曳使用預設輸出資料夾，兩個資料夾都可在 Options 自訂。
+在 Backtracking 有焦點時，按 `Ctrl+S` 可把當下快照保存到保存資料夾。已框選時只保存該段，並立即恢復錄音待命。錄音中未框選時，保存整段保留的音訊，錄音會持續進行。成功拖放使用預設輸出資料夾。單擊、框選及留在視窗內的拖曳不會寫檔。兩個資料夾都可在 Options 自訂。
 
 在 Options 可選擇 WAV 取樣率 **44.1、48 或 96 kHz**，以及 **16-bit PCM、24-bit PCM 或 32-bit IEEE float** 編碼。預設為 **48 kHz、32-bit float**。
 
@@ -49,7 +49,7 @@ Backtracking is a retrospective audio sampler for music production and mixing. W
 
 1. Open the desktop app or insert **Backtracking** in a DAW track's effects chain.
 2. Play some audio. The waveform can keep the last 10, 20, 30, or 60 seconds of captured sound and holds its position through long gaps.
-3. With no selection, click anywhere on the waveform to save all retained audio, or hold and drag to drop the full WAV into your DAW. For a shorter clip, hold `Ctrl` on Windows or `Option` on macOS while dragging to select a range, then click or drag out the section shown in a different waveform color.
+3. Drag the waveform outside the Backtracking window and drop it on a target that accepts WAV files to export all retained audio. For a shorter clip, hold `Ctrl` on Windows or `Option` on macOS while dragging to select a range, then drag out the highlighted range.
 4. In the full interface, use the toolbar's **Play/Pause** control to arm or pause capture. A blinking red indicator means audio is being recorded. Working with the waveform also pauses capture. Choose **Play** when done or let the configured auto-resume timer re-arm capture.
 
 The live meter next to the gear can show **dBFS, VU, or momentary LUFS**. On desktop, click the gear or right-click to open the separate **Options** window. **Show waveform only** defaults to Off. When enabled, only the waveform is visible. Open Options to arm or pause capture, or to restore the full interface. On desktop, drag an inside edge to resize it into a thin strip. Auto-resume offers **0, 5, or 10 seconds**, with 10 seconds as the default. At 0 seconds, capture re-arms as soon as the waveform gesture ends. The clear action empties the audio held in memory.
@@ -60,7 +60,7 @@ Use the color picker in the gear or right-click menu to change the theme accent.
 
 The desktop app restores its last window position. On Windows, use the system tray to show, hide, or quit the app. On macOS, use the menu bar. You can enable launch at sign-in in Settings. For VST3 and CLAP, save your DAW project after making changes to store each instance's settings. Export a WAV to keep captured audio.
 
-With Backtracking focused, press `Ctrl+S` to save the current snapshot to the saved snapshots folder. If a range is selected, it saves that range and immediately re-arms capture. With no selection, it saves all retained audio while active capture continues. Waveform clicks and drags use the default export folder. Both folders can be set in Options.
+With Backtracking focused, press `Ctrl+S` to save the current snapshot to the saved snapshots folder. If a range is selected, it saves that range and immediately re-arms capture. With no selection, it saves all retained audio while active capture continues. Successful drops use the default export folder. Clicking, selecting, and dragging within the window do not write files. Both folders can be set in Options.
 
 Choose a WAV sample rate of **44.1, 48, or 96 kHz** and **16-bit PCM, 24-bit PCM, or 32-bit IEEE float** encoding in Options. The default is **48 kHz, 32-bit float**.
 

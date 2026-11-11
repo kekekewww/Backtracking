@@ -1,10 +1,9 @@
-use std::collections::VecDeque;
 use std::io::{self, Cursor};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -36,12 +35,14 @@ const PRODUCT_ICON: &[u8] = include_bytes!("../../../assets/backtracking-icon.pn
 pub type CaptureEditor = EguiEditor<CaptureUi>;
 
 pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
+    let editor_state = EguiEditorState::from_size(LogicalSize::new(640.0, 212.0), 1.0);
     create_egui_editor(
-        EguiEditorState::from_size(LogicalSize::new(640.0, 212.0), 1.0),
+        editor_state.clone(),
         RepaintNotifier::new(),
         EguiNiceSettings::new().with_tile("Backtracking"),
         CaptureUi {
             session,
+            editor_state,
             product_icon: None,
             minimum: [0.0; BINS],
             maximum: [0.0; BINS],
@@ -56,14 +57,10 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
             selection: None,
             selection_ready_for_drag: false,
             gesture: None,
-            export: None,
-            pending_exports: VecDeque::new(),
+            drag_preparation: None,
             snapshot_writer: None,
-            exported: None,
-            revision: 0,
             native_dragging: Arc::new(AtomicBool::new(false)),
-            #[cfg(target_os = "windows")]
-            drag_errors: None,
+            drag_results: None,
             message: String::new(),
         },
     )
@@ -71,6 +68,7 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
 
 pub struct CaptureUi {
     session: Arc<Session>,
+    editor_state: Arc<EguiEditorState>,
     product_icon: Option<TextureHandle>,
     minimum: [f32; BINS],
     maximum: [f32; BINS],
@@ -85,14 +83,10 @@ pub struct CaptureUi {
     selection: Option<Range<f32>>,
     selection_ready_for_drag: bool,
     gesture: Option<Gesture>,
-    export: Option<ExportJob>,
-    pending_exports: VecDeque<ExportRequest>,
+    drag_preparation: Option<DragPreparation>,
     snapshot_writer: Option<SnapshotWriter>,
-    exported: Option<ExportedWav>,
-    revision: u64,
     native_dragging: Arc<AtomicBool>,
-    #[cfg(target_os = "windows")]
-    drag_errors: Option<std::sync::mpsc::Receiver<String>>,
+    drag_results: Option<Receiver<Result<PathBuf, String>>>,
     message: String,
 }
 
@@ -103,10 +97,8 @@ enum Gesture {
     },
     Drag {
         origin: Pos2,
-        export_started: bool,
+        preparation_started: bool,
     },
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    SaveOnly,
 }
 
 enum FolderAction {
@@ -154,16 +146,47 @@ impl MeterMode {
     }
 }
 
-struct ExportJob {
-    revision: u64,
-    profile: WavExportProfile,
-    worker: JoinHandle<io::Result<PathBuf>>,
+struct DragPreparation {
+    result: Arc<Mutex<Option<io::Result<PreparedDrag>>>>,
+    cancel: Option<Sender<()>>,
+    worker: JoinHandle<()>,
 }
 
-struct ExportRequest {
-    revision: u64,
-    immediate: bool,
-    clip: WavClip,
+struct PreparedDrag {
+    path: PathBuf,
+    accepted: bool,
+}
+
+impl Drop for PreparedDrag {
+    fn drop(&mut self) {
+        if !self.accepted {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+struct ActiveDrag {
+    file: PreparedDrag,
+    session: Arc<Session>,
+    active: Arc<AtomicBool>,
+    results: Sender<Result<PathBuf, String>>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+impl ActiveDrag {
+    fn accept(&mut self) {
+        self.file.accepted = true;
+        let _ = self.results.send(Ok(self.file.path.clone()));
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+impl Drop for ActiveDrag {
+    fn drop(&mut self) {
+        self.session.end_waveform_gesture();
+        self.active.store(false, Ordering::Release);
+    }
 }
 
 struct WavClip {
@@ -179,14 +202,14 @@ impl WavClip {
             .snapshot
             .frames(self.range)
             .ok_or_else(|| io::Error::other("invalid audio selection"))?;
-        export_wav_with_profile(
+        let path = export_wav_with_profile(
             &self.output,
             self.snapshot.sample_rate,
             self.snapshot.channels,
             samples,
             self.profile,
-        )?
-        .canonicalize()
+        )?;
+        Ok(path.canonicalize().unwrap_or(path))
     }
 }
 
@@ -220,11 +243,6 @@ impl SnapshotWriter {
     }
 }
 
-struct ExportedWav {
-    profile: WavExportProfile,
-    path: PathBuf,
-}
-
 fn product_icon(context: &egui::Context) -> Option<TextureHandle> {
     let mut decoder = png::Decoder::new(Cursor::new(PRODUCT_ICON));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
@@ -252,8 +270,8 @@ impl NiceEguiApp for CaptureUi {
         _: GuiContext,
         _frame: &mut Frame,
     ) -> Result<(), nice_plug_egui::baseview::HandlerError> {
+        self.editor_closed();
         self.product_icon = product_icon(&context);
-        self.options_open = false;
         // Baseview still sends ignored keys to egui. Let AppKit forward Cmd+S to the DAW.
         #[cfg(target_os = "macos")]
         _frame.set_key_capture(nice_plug_egui::KeyCapture::IgnoreKeys(vec![
@@ -272,16 +290,20 @@ impl NiceEguiApp for CaptureUi {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame) {
-        #[cfg(target_os = "windows")]
-        if let Some(errors) = &self.drag_errors {
+        if let Some(results) = &self.drag_results {
             use std::sync::mpsc::TryRecvError;
 
-            match errors.try_recv() {
-                Ok(error) => {
-                    self.message = format!("WAV saved. Could not drag file: {error}");
-                    self.drag_errors = None;
+            match results.try_recv() {
+                Ok(Ok(path)) => {
+                    self.selection_ready_for_drag = false;
+                    self.message = format!("Saved {}", path.display());
+                    self.drag_results = None;
                 }
-                Err(TryRecvError::Disconnected) => self.drag_errors = None,
+                Ok(Err(error)) => {
+                    self.message = format!("Could not drag file: {error}");
+                    self.drag_results = None;
+                }
+                Err(TryRecvError::Disconnected) => self.drag_results = None,
                 Err(TryRecvError::Empty) => (),
             }
         }
@@ -293,7 +315,7 @@ impl NiceEguiApp for CaptureUi {
             if retention_changed {
                 self.reset_frozen();
             } else if output_changed || format_changed {
-                self.invalidate_export();
+                self.discard_drag_preparation();
             }
             if retention_changed || output_changed || format_changed {
                 self.message.clear();
@@ -302,7 +324,7 @@ impl NiceEguiApp for CaptureUi {
                 }
             }
         }
-        self.collect_export();
+        self.reap_drag_preparation();
         self.collect_saved_snapshots();
         let save_shortcut = take_save_shortcut(ui) && frame.baseview_window().has_focus();
         let save_after_gesture = save_shortcut && !self.can_toggle_capture();
@@ -465,23 +487,22 @@ impl NiceEguiApp for CaptureUi {
                 .on_hover_text(&self.message);
         }
         self.displayed_settings = Some(settings);
-        ui.ctx()
-            .request_repaint_after(if self.gesture.is_some() || self.export.is_some() {
+        ui.ctx().request_repaint_after(
+            if self.gesture.is_some() || self.drag_preparation.is_some() {
                 Duration::from_millis(16)
             } else {
                 REFRESH
-            });
+            },
+        );
     }
 
     fn editor_closed(&mut self) {
         self.gesture = None;
         self.recording_since = None;
         self.options_open = false;
+        self.discard_drag_preparation();
         if !self.native_dragging.load(Ordering::Acquire) {
             self.session.end_waveform_gesture();
-        }
-        if self.pending_exports.iter().any(|request| request.immediate) {
-            self.finish_exports();
         }
     }
 }
@@ -494,7 +515,11 @@ impl Drop for CaptureUi {
         if let Some(writer) = self.snapshot_writer.take() {
             writer.finish();
         }
-        self.finish_exports();
+        if let Some(job) = self.drag_preparation.take() {
+            // Close the worker's cancellation channel before waiting for it.
+            drop(job.cancel);
+            let _ = job.worker.join();
+        }
     }
 }
 
@@ -653,7 +678,7 @@ impl CaptureUi {
         }
         if edited.wav_profile != settings.wav_profile {
             self.session.set_wav_profile(edited.wav_profile);
-            self.invalidate_export();
+            self.discard_drag_preparation();
             self.message.clear();
         }
         if edited.show_waveform_only != settings.show_waveform_only {
@@ -686,7 +711,7 @@ impl CaptureUi {
                         FolderKind::Export => {
                             self.session.set_output_dir(folder.clone());
                             settings.output_dir = folder;
-                            self.invalidate_export();
+                            self.discard_drag_preparation();
                         }
                         FolderKind::Saved => {
                             self.session.set_saved_dir(folder.clone());
@@ -775,7 +800,7 @@ impl CaptureUi {
 
     fn reset_frozen(&mut self) {
         self.clear_frozen_preview();
-        self.invalidate_export();
+        self.discard_drag_preparation();
     }
 
     fn clear_frozen_preview(&mut self) {
@@ -798,14 +823,10 @@ impl CaptureUi {
         self.session.cancel_waveform_selection();
     }
 
-    fn invalidate_export(&mut self) {
-        self.next_export_revision();
-        self.pending_exports.retain(|request| request.immediate);
-    }
-
-    fn next_export_revision(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
-        self.exported = None;
+    fn discard_drag_preparation(&mut self) {
+        if let Some(preparation) = &mut self.drag_preparation {
+            preparation.cancel = None;
+        }
     }
 
     fn audio_rect(&self, rect: Rect, seconds: f32) -> Rect {
@@ -857,8 +878,6 @@ impl CaptureUi {
             && match &self.gesture {
                 Some(Gesture::Select { .. }) => false,
                 Some(Gesture::Drag { .. }) => true,
-                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                Some(Gesture::SaveOnly) => true,
                 None => {
                     allow_hover
                         && ui.input(|input| {
@@ -924,23 +943,23 @@ impl CaptureUi {
         let hint = match &self.gesture {
             Some(Gesture::Select { .. }) => "Drag to Select".into(),
             Some(Gesture::Drag { .. }) => "Drag and Drop".into(),
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            Some(Gesture::SaveOnly) => return,
             None if down => return,
             None if modifier => "Drag to Select".into(),
-            None if self.selection_ready_for_drag => {
+            None if self.selection_ready_for_drag
+                && cfg!(any(target_os = "macos", target_os = "windows")) =>
+            {
                 "Drag and Drop\nEsc / Backspace to cancel".into()
             }
             None => {
-                let action = if self.exported.is_some() || self.selection.is_some() {
+                let action = if cfg!(any(target_os = "macos", target_os = "windows")) {
                     "Drag and Drop"
                 } else {
-                    "Click"
+                    "Ctrl + S"
                 };
                 let selection = if cfg!(target_os = "macos") {
-                    "Option + Click"
+                    "Option + Drag"
                 } else {
-                    "Ctrl + Click"
+                    "Ctrl + Drag"
                 };
                 format!("{action}\n{selection}")
             }
@@ -1002,14 +1021,13 @@ impl CaptureUi {
             && pressed
             && let Some(position) = position.filter(|position| rect.contains(*position))
         {
+            self.discard_drag_preparation();
             self.session.begin_waveform_gesture();
-            if idle_resume == AutoResumeDelay::Immediate {
-                if selecting && self.selection_ready_for_drag {
-                    self.clear_frozen_preview();
-                }
-                if self.frozen.is_none() {
-                    self.next_export_revision();
-                }
+            if idle_resume == AutoResumeDelay::Immediate
+                && selecting
+                && self.selection_ready_for_drag
+            {
+                self.clear_frozen_preview();
             }
             self.cache_frozen_snapshot();
             if selecting {
@@ -1020,13 +1038,9 @@ impl CaptureUi {
                     current: anchor,
                 });
             } else {
-                let export_started = !self.selection_ready_for_drag;
-                if export_started {
-                    self.begin_export();
-                }
                 self.gesture = Some(Gesture::Drag {
                     origin: position,
-                    export_started,
+                    preparation_started: false,
                 });
             }
         }
@@ -1038,74 +1052,47 @@ impl CaptureUi {
             *current = position_in_audio(audio_rect, position.x);
         }
 
-        if down {
-            if let (
-                Some(Gesture::Drag {
-                    origin,
-                    export_started,
-                }),
-                Some(position),
-            ) = (&mut self.gesture, position)
-                && position.distance(*origin) >= 4.0
+        let dragging = matches!(self.gesture, Some(Gesture::Drag { .. }));
+        let drag_canceled = dragging && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        let down = if dragging && cfg!(any(target_os = "macos", target_os = "windows")) {
+            primary_button_pressed()
+        } else {
+            down
+        };
+        if down && !drag_canceled {
+            if let Some(Gesture::Drag {
+                origin,
+                preparation_started,
+            }) = self.gesture
+                && pointer_outside_editor(frame)
             {
-                let origin = *origin;
-                if !*export_started {
-                    *export_started = true;
-                    self.selection_ready_for_drag = false;
-                    self.begin_export();
-                }
-                if let Some(file) = &self.exported
-                    && file.profile == self.session.settings().wav_profile
-                {
-                    let path = file.path.clone();
+                if !preparation_started {
+                    if self.drag_preparation.is_none() {
+                        self.gesture = Some(Gesture::Drag {
+                            origin,
+                            preparation_started: true,
+                        });
+                        self.begin_drag_preparation();
+                    }
+                } else if let Some(file) = self.take_prepared_drag() {
                     self.gesture = None;
-                    self.start_native_drag(frame, path, origin);
+                    self.message.clear();
+                    self.start_native_drag(frame, file, origin);
                 }
             }
         } else if let Some(gesture) = self.gesture.take() {
-            match gesture {
-                Gesture::Select { anchor, current } => {
-                    let range = anchor.min(current)..anchor.max(current);
-                    self.selection = (range.end > range.start).then_some(range);
-                    self.selection_ready_for_drag = self.selection.is_some();
-                    if idle_resume == AutoResumeDelay::Immediate {
-                        self.next_export_revision();
-                    } else {
-                        self.invalidate_export();
-                    }
-                }
-                Gesture::Drag {
-                    export_started: false,
-                    ..
-                } => {
-                    self.selection_ready_for_drag = false;
-                    self.begin_export();
-                }
-                _ => {}
+            if let Gesture::Select { anchor, current } = gesture {
+                let range = anchor.min(current)..anchor.max(current);
+                self.selection = (range.end > range.start).then_some(range);
+                self.selection_ready_for_drag = self.selection.is_some();
             }
+            self.discard_drag_preparation();
             self.session.end_waveform_gesture();
         }
     }
 
-    fn begin_export(&mut self) {
+    fn begin_drag_preparation(&mut self) {
         let settings = self.session.settings();
-        let profile = settings.wav_profile;
-        if self
-            .exported
-            .as_ref()
-            .is_some_and(|file| file.profile == profile)
-            || self
-                .export
-                .as_ref()
-                .is_some_and(|job| job.revision == self.revision && job.profile == profile)
-            || self
-                .pending_exports
-                .iter()
-                .any(|request| request.revision == self.revision && request.clip.profile == profile)
-        {
-            return;
-        }
-        self.exported = None;
         let Some(snapshot) = self
             .frozen
             .as_ref()
@@ -1115,16 +1102,75 @@ impl CaptureUi {
             self.message = "No captured audio to save yet.".into();
             return;
         };
-        self.queue_export(ExportRequest {
-            revision: self.revision,
-            immediate: settings.idle_resume == AutoResumeDelay::Immediate,
-            clip: WavClip {
-                profile,
-                output: settings.output_dir,
-                range: export_frame_range(snapshot.frame_count(), self.selection.as_ref()),
-                snapshot,
-            },
-        });
+        let clip = WavClip {
+            profile: settings.wav_profile,
+            output: settings.output_dir,
+            range: export_frame_range(snapshot.frame_count(), self.selection.as_ref()),
+            snapshot,
+        };
+        let (cancel, canceled) = mpsc::channel();
+        let result = Arc::new(Mutex::new(None));
+        let pending = result.clone();
+        let editor_state = self.editor_state.clone();
+        let worker = thread::Builder::new()
+            .name("backtracking-drag".into())
+            .spawn(move || {
+                use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+
+                let can_drag = || editor_state.is_open() && primary_button_pressed();
+                if !can_drag() || !matches!(canceled.try_recv(), Err(TryRecvError::Empty)) {
+                    return;
+                }
+                let file = clip.write().map(|path| PreparedDrag {
+                    path,
+                    accepted: false,
+                });
+                *pending.lock().unwrap() = Some(file);
+                // The editor can disappear between frames while the DAW remains open.
+                // Keep custody here until the editor claims the WAV or the gesture ends.
+                while can_drag()
+                    && matches!(
+                        canceled.recv_timeout(Duration::from_millis(16)),
+                        Err(RecvTimeoutError::Timeout)
+                    )
+                {}
+                pending.lock().unwrap().take();
+            });
+        match worker {
+            Ok(worker) => {
+                self.drag_preparation = Some(DragPreparation {
+                    result,
+                    cancel: Some(cancel),
+                    worker,
+                });
+            }
+            Err(error) => self.message = format!("Could not prepare file drag: {error}"),
+        }
+    }
+
+    fn reap_drag_preparation(&mut self) {
+        if self
+            .drag_preparation
+            .as_ref()
+            .is_some_and(|job| job.worker.is_finished())
+            && let Some(job) = self.drag_preparation.take()
+        {
+            let _ = job.worker.join();
+        }
+    }
+
+    fn take_prepared_drag(&mut self) -> Option<PreparedDrag> {
+        let preparation = self.drag_preparation.as_mut()?;
+        preparation.cancel.as_ref()?;
+        let result = preparation.result.lock().unwrap().take()?;
+        preparation.cancel = None;
+        match result {
+            Ok(file) => Some(file),
+            Err(error) => {
+                self.message = format!("Could not prepare file drag: {error}");
+                None
+            }
+        }
     }
 
     fn save_snapshot(&mut self, settings: &SessionSettings) {
@@ -1176,117 +1222,48 @@ impl CaptureUi {
         }
     }
 
-    fn queue_export(&mut self, request: ExportRequest) {
-        if self.export.is_some() || !self.pending_exports.is_empty() {
-            if !request.immediate {
-                self.pending_exports.retain(|request| request.immediate);
-            }
-            self.pending_exports.push_back(request);
-        } else {
-            self.spawn_export(request);
-        }
-    }
-
-    fn spawn_export(&mut self, request: ExportRequest) {
-        let revision = request.revision;
-        let profile = request.clip.profile;
-        let worker = thread::Builder::new()
-            .name("backtracking-wav".into())
-            .spawn(move || request.clip.write());
-        match worker {
-            Ok(worker) => {
-                self.export = Some(ExportJob {
-                    revision,
-                    profile,
-                    worker,
-                });
-                if revision == self.revision {
-                    self.message = "Writing WAV…".into();
-                }
-            }
-            Err(error) if revision == self.revision => {
-                self.message = format!("Could not start export: {error}");
-            }
-            Err(_) => {}
-        }
-    }
-
-    fn collect_export(&mut self) {
-        if self
-            .export
-            .as_ref()
-            .is_some_and(|job| !job.worker.is_finished())
-        {
-            return;
-        }
-        if let Some(job) = self.export.take() {
-            let result = job.worker.join();
-            if job.revision == self.revision && job.profile == self.session.settings().wav_profile {
-                match result {
-                    Ok(Ok(path)) => {
-                        self.message = format!("Saved {}", path.display());
-                        self.exported = Some(ExportedWav {
-                            profile: job.profile,
-                            path,
-                        });
-                    }
-                    Ok(Err(error)) => self.message = format!("Could not save WAV: {error}"),
-                    Err(_) => self.message = "WAV export worker stopped unexpectedly.".into(),
-                }
-            }
-        }
-        if let Some(request) = self.pending_exports.pop_front() {
-            self.spawn_export(request);
-        }
-    }
-
-    fn finish_exports(&mut self) {
-        if let Some(job) = self.export.take() {
-            // Do not leave plugin code running on a detached worker after library unload.
-            let _ = job.worker.join();
-        }
-        for request in self
-            .pending_exports
-            .drain(..)
-            .filter(|request| request.immediate)
-        {
-            let _ = request.clip.write();
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn start_native_drag(&mut self, frame: &Frame, path: PathBuf, origin: Pos2) {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn start_native_drag(&mut self, frame: &Frame, file: PreparedDrag, _origin: Pos2) {
+        let (results, receiver) = mpsc::channel();
         self.native_dragging.store(true, Ordering::Release);
-        let completion = mac_drag::Completion {
+        let drag = ActiveDrag {
+            file,
             session: Arc::clone(&self.session),
-            dragging: Arc::clone(&self.native_dragging),
+            active: Arc::clone(&self.native_dragging),
+            results,
         };
-        if let Err(error) = mac_drag::start(frame, &path, origin, completion) {
-            self.message = format!("Could not start file drag: {error}");
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    fn start_native_drag(&mut self, frame: &Frame, path: PathBuf, _origin: Pos2) {
-        match win_drag::schedule(
-            frame.baseview_window(),
-            path,
-            Arc::clone(&self.session),
-            Arc::clone(&self.native_dragging),
-        ) {
-            Ok(errors) => self.drag_errors = Some(errors),
-            Err(error) => self.message = format!("WAV saved. Could not drag file: {error}"),
+        #[cfg(target_os = "windows")]
+        let started = win_drag::schedule(frame.baseview_window(), drag);
+        #[cfg(target_os = "macos")]
+        let started = mac_drag::start(frame, _origin, drag);
+        match started {
+            Ok(()) => self.drag_results = Some(receiver),
+            Err(error) => self.message = format!("Could not start file drag: {error}"),
         }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    fn start_native_drag(&mut self, _frame: &Frame, path: PathBuf, _origin: Pos2) {
-        self.gesture = Some(Gesture::SaveOnly);
-        self.message = format!(
-            "WAV saved. Drag the file from its folder: {}",
-            path.display()
-        );
+    fn start_native_drag(&mut self, _frame: &Frame, _file: PreparedDrag, _origin: Pos2) {
+        self.session.end_waveform_gesture();
     }
+}
+
+fn pointer_outside_editor(_frame: &Frame) -> bool {
+    #[cfg(target_os = "windows")]
+    return win_drag::pointer_outside_editor(_frame.baseview_window());
+    #[cfg(target_os = "macos")]
+    return mac_drag::pointer_outside_editor(_frame);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    false
+}
+
+fn primary_button_pressed() -> bool {
+    #[cfg(target_os = "windows")]
+    return win_drag::primary_button_pressed();
+    #[cfg(target_os = "macos")]
+    return mac_drag::primary_button_pressed();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    false
 }
 
 fn muted_accent([r, g, b]: [u8; 3]) -> Color32 {
@@ -1507,6 +1484,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_accepted_drag_files_are_retained() {
+        let output = std::env::temp_dir().join(format!(
+            "backtracking-plugin-drag-test-{}",
+            std::process::id()
+        ));
+        let snapshot = Arc::new(Snapshot {
+            sample_rate: 48_000,
+            channels: 1,
+            samples: vec![0.25; 32],
+        });
+        let prepare_file = || {
+            WavClip {
+                profile: WavExportProfile::default(),
+                output: output.clone(),
+                snapshot: snapshot.clone(),
+                range: 0..32,
+            }
+            .write()
+            .unwrap()
+        };
+        let canceled = prepare_file();
+        let accepted = prepare_file();
+        drop(PreparedDrag {
+            path: canceled.clone(),
+            accepted: false,
+        });
+        drop(PreparedDrag {
+            path: accepted.clone(),
+            accepted: true,
+        });
+        assert!(!canceled.exists());
+        assert!(accepted.exists());
+        std::fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
     fn saved_snapshots_finish_without_editor_frames() {
         let output = std::env::temp_dir().join(format!(
             "backtracking-plugin-snapshot-test-{}",
@@ -1568,12 +1581,10 @@ const DRAG_ICON: &[u8] = &[
 mod mac_drag {
     use std::ffi::{CString, c_void};
     use std::os::unix::ffi::OsStrExt;
-    use std::path::Path;
     use std::ptr::{NonNull, null_mut};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use objc2::rc::Retained;
+    use objc2::rc::{Retained, Weak};
     use objc2::runtime::{
         AnyClass, AnyObject, AnyProtocol, ClassBuilder, NSObject, ProtocolObject, Sel,
     };
@@ -1582,33 +1593,46 @@ mod mac_drag {
         NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession, NSEvent,
         NSEventModifierFlags, NSEventType, NSImage, NSView,
     };
-    use objc2_foundation::{NSArray, NSData, NSPoint, NSRect, NSURL};
+    use objc2_foundation::{NSArray, NSData, NSPoint, NSPointInRect, NSRect, NSURL};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    use super::{DRAG_ICON, Frame, Pos2, Session};
+    use super::{ActiveDrag, DRAG_ICON, Frame, Pos2};
 
     static NEXT_CLASS: AtomicUsize = AtomicUsize::new(0);
     const COMPLETION: &std::ffi::CStr = c"backtrackingCompletion";
 
-    pub(super) struct Completion {
-        pub(super) session: Arc<Session>,
-        pub(super) dragging: Arc<AtomicBool>,
+    struct Completion {
+        drag: ActiveDrag,
+        editor: Weak<NSView>,
+        initial_bounds: NSRect,
     }
 
-    impl Drop for Completion {
-        fn drop(&mut self) {
-            self.session.end_waveform_gesture();
-            self.dragging.store(false, Ordering::Release);
-        }
+    fn editor_bounds(view: &NSView) -> Option<NSRect> {
+        let window = view.window()?;
+        Some(window.convertRectToScreen(view.convertRect_toView(view.bounds(), None)))
     }
 
-    pub(super) fn start(
-        frame: &Frame,
-        path: &Path,
-        origin: Pos2,
-        completion: Completion,
-    ) -> Result<(), &'static str> {
+    pub(super) fn primary_button_pressed() -> bool {
+        NSEvent::pressedMouseButtons() & 1 != 0
+    }
+
+    pub(super) fn pointer_outside_editor(frame: &Frame) -> bool {
+        let Ok(window) = frame.baseview_window().window_handle() else {
+            return false;
+        };
+        let RawWindowHandle::AppKit(handle) = window.as_raw() else {
+            return false;
+        };
+        // The WindowHandle borrow keeps the view valid during this geometry check.
+        let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+        editor_bounds(view).is_some_and(|bounds| !NSPointInRect(NSEvent::mouseLocation(), bounds))
+    }
+
+    pub(super) fn start(frame: &Frame, origin: Pos2, drag: ActiveDrag) -> Result<(), &'static str> {
         let _main = MainThreadMarker::new().ok_or("AppKit file drag requires the main thread")?;
+        if !primary_button_pressed() || !pointer_outside_editor(frame) {
+            return Ok(());
+        }
         let handle = frame
             .baseview_window()
             .window_handle()
@@ -1619,6 +1643,7 @@ mod mac_drag {
         // The WindowHandle borrow keeps the native view valid for the duration of this call.
         let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
         let window = view.window().ok_or("editor window detached")?;
+        let initial_bounds = editor_bounds(view).ok_or("editor bounds unavailable")?;
         let location = window.mouseLocationOutsideOfEventStream();
         let timestamp = window.currentEvent().map_or(0.0, |event| event.timestamp());
         let press =
@@ -1629,7 +1654,7 @@ mod mac_drag {
         ).ok_or("could not create the drag event")?;
 
         let native_path =
-            CString::new(path.as_os_str().as_bytes()).map_err(|_| "invalid WAV path")?;
+            CString::new(drag.file.path.as_os_str().as_bytes()).map_err(|_| "invalid WAV path")?;
         let path_ptr = NonNull::new(native_path.as_ptr().cast_mut()).ok_or("invalid WAV path")?;
         // AppKit reads the NUL-terminated native path before returning the NSURL.
         let url = unsafe {
@@ -1652,7 +1677,11 @@ mod mac_drag {
         // The preview contents are an NSImage, as required by AppKit.
         unsafe { item.setDraggingFrame_contents(NSRect::new(origin, size), Some(&*image)) };
         let items = NSArray::from_retained_slice(&[item]);
-        let source = make_source(completion)?;
+        let source = make_source(Completion {
+            drag,
+            editor: Weak::new(view),
+            initial_bounds,
+        })?;
 
         // Accept a nil result as an error. AppKit retains the source during a started session.
         let drag: Option<Retained<NSDraggingSession>> = unsafe {
@@ -1718,15 +1747,25 @@ mod mac_drag {
         source: &AnyObject,
         _selector: Sel,
         _session: &NSDraggingSession,
-        _location: NSPoint,
-        _operation: NSDragOperation,
+        location: NSPoint,
+        operation: NSDragOperation,
     ) {
-        release_completion(source, source.class());
+        if let Some(mut completion) = take_completion(source, source.class()) {
+            let bounds = completion
+                .editor
+                .load()
+                .as_deref()
+                .and_then(editor_bounds)
+                .unwrap_or(completion.initial_bounds);
+            if !operation.is_empty() && !NSPointInRect(location, bounds) {
+                completion.drag.accept();
+            }
+        }
     }
 
     extern "C-unwind" fn dealloc(source: &mut AnyObject, _selector: Sel) {
         let class = source.class();
-        release_completion(source, class);
+        drop(take_completion(source, class));
         // This dynamically registered class has exactly one instance and is never subclassed.
         unsafe {
             let _: () = msg_send![super(source, NSObject::class()), dealloc];
@@ -1734,15 +1773,12 @@ mod mac_drag {
         }
     }
 
-    fn release_completion(source: &AnyObject, class: &AnyClass) {
-        if let Some(ivar) = class.instance_variable(COMPLETION) {
-            // The callback and dealloc both run on the main thread. Taking the pointer makes
-            // completion idempotent for normal drops, cancellation, and failed drag starts.
-            let pointer = unsafe { ivar.load_ptr::<*mut c_void>(source).replace(null_mut()) };
-            if !pointer.is_null() {
-                drop(unsafe { Box::from_raw(pointer.cast::<Completion>()) });
-            }
-        }
+    fn take_completion(source: &AnyObject, class: &AnyClass) -> Option<Box<Completion>> {
+        let ivar = class.instance_variable(COMPLETION)?;
+        // The callback and dealloc both run on the main thread. Take ownership at most once.
+        let pointer = unsafe { ivar.load_ptr::<*mut c_void>(source).replace(null_mut()) };
+        NonNull::new(pointer.cast::<Completion>())
+            .map(|pointer| unsafe { Box::from_raw(pointer.as_ptr()) })
     }
 
     unsafe fn dispose(class: &AnyClass) {

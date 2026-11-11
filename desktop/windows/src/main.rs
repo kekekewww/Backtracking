@@ -6,6 +6,8 @@
 #[cfg(target_os = "windows")]
 mod controller;
 #[cfg(target_os = "windows")]
+mod file_drag;
+#[cfg(target_os = "windows")]
 mod loopback;
 #[cfg(target_os = "windows")]
 mod preferences;

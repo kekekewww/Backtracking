@@ -1,13 +1,11 @@
 use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{
-    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, HWND, LPARAM, LRESULT, S_OK,
-    WPARAM,
+    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, HWND, LPARAM, LRESULT, POINT,
+    RECT, S_OK, WPARAM,
 };
 use windows::Win32::System::Com::IDataObject;
 use windows::Win32::System::Ole::{
@@ -23,40 +21,61 @@ use windows::Win32::UI::Shell::{
     SHCreateItemFromParsingName, SHCreateShellItemArrayFromShellItem, SetWindowSubclass,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, PostMessageW, SM_SWAPBUTTON, SendMessageW, WM_APP, WM_LBUTTONUP, WM_NCDESTROY,
+    GetCursorPos, GetSystemMetrics, GetWindowRect, PostMessageW, SM_SWAPBUTTON, SendMessageW,
+    WM_APP, WM_LBUTTONUP, WM_NCDESTROY,
 };
 use windows::core::{BOOL, HRESULT, PCWSTR, implement};
 
-use crate::session::Session;
+use super::ActiveDrag;
 
 const START_DRAG: u32 = WM_APP + 0x425;
 static NEXT_DRAG_ID: AtomicUsize = AtomicUsize::new(1);
 
-pub(super) fn schedule(
-    window: &impl HasWindowHandle,
-    path: PathBuf,
-    session: Arc<Session>,
-    active: Arc<AtomicBool>,
-) -> Result<Receiver<String>, String> {
-    let (errors, receiver) = mpsc::channel();
-    active.store(true, Ordering::Release);
-    let drag = Box::new(PendingDrag {
-        path,
-        session,
-        active,
-        errors,
-    });
+fn editor_hwnd(window: &impl HasWindowHandle) -> Result<HWND, String> {
     let RawWindowHandle::Win32(handle) =
         window.window_handle().map_err(|e| e.to_string())?.as_raw()
     else {
         return Err("editor window is unavailable".into());
     };
-    let hwnd = HWND(handle.hwnd.get() as _);
+    Ok(HWND(handle.hwnd.get() as _))
+}
+
+pub(super) fn pointer_outside_editor(window: &impl HasWindowHandle) -> bool {
+    editor_hwnd(window).is_ok_and(pointer_outside)
+}
+
+fn pointer_outside(hwnd: HWND) -> bool {
+    let mut cursor = POINT::default();
+    let mut bounds = RECT::default();
+    unsafe {
+        if GetCursorPos(&mut cursor).is_err() || GetWindowRect(hwnd, &mut bounds).is_err() {
+            return false;
+        }
+    }
+    cursor.x < bounds.left
+        || cursor.x >= bounds.right
+        || cursor.y < bounds.top
+        || cursor.y >= bounds.bottom
+}
+
+pub(super) fn primary_button_pressed() -> bool {
+    let button = unsafe {
+        if GetSystemMetrics(SM_SWAPBUTTON) == 0 {
+            VK_LBUTTON
+        } else {
+            VK_RBUTTON
+        }
+    };
+    unsafe { GetAsyncKeyState(i32::from(button.0)) < 0 }
+}
+
+pub(super) fn schedule(window: &impl HasWindowHandle, drag: ActiveDrag) -> Result<(), String> {
+    let hwnd = editor_hwnd(window)?;
     let id = NEXT_DRAG_ID.fetch_add(1, Ordering::Relaxed);
 
     // OLE dispatches window messages, including drag-enter events to this editor. Post the
     // operation so the editor's current egui draw and its mutable borrows can finish first.
-    let data = Box::into_raw(drag);
+    let data = Box::into_raw(Box::new(drag));
     unsafe {
         if !SetWindowSubclass(hwnd, Some(drag_message), id, data as usize).as_bool() {
             drop(Box::from_raw(data));
@@ -69,21 +88,7 @@ pub(super) fn schedule(
             return Err(error.to_string());
         }
     }
-    Ok(receiver)
-}
-
-struct PendingDrag {
-    path: PathBuf,
-    session: Arc<Session>,
-    active: Arc<AtomicBool>,
-    errors: Sender<String>,
-}
-
-impl Drop for PendingDrag {
-    fn drop(&mut self) {
-        self.session.end_waveform_gesture();
-        self.active.store(false, Ordering::Release);
-    }
+    Ok(())
 }
 
 unsafe extern "system" fn drag_message(
@@ -98,9 +103,13 @@ unsafe extern "system" fn drag_message(
         // Detach before entering OLE's nested message loop. The drag owns its state even if
         // the host closes the editor while it is running.
         if unsafe { RemoveWindowSubclass(hwnd, Some(drag_message), id) }.as_bool() {
-            let drag = unsafe { Box::from_raw(data as *mut PendingDrag) };
-            if let Err(error) = drag_file(hwnd, &drag.path) {
-                let _ = drag.errors.send(error.to_string());
+            let mut drag = unsafe { Box::from_raw(data as *mut ActiveDrag) };
+            match drag_file(hwnd, &drag.file.path) {
+                Ok(true) => drag.accept(),
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = drag.results.send(Err(error.to_string()));
+                }
             }
         }
         return LRESULT(0);
@@ -108,7 +117,7 @@ unsafe extern "system" fn drag_message(
     if message == WM_NCDESTROY {
         unsafe {
             let _ = RemoveWindowSubclass(hwnd, Some(drag_message), id);
-            drop(Box::from_raw(data as *mut PendingDrag));
+            drop(Box::from_raw(data as *mut ActiveDrag));
         }
     }
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
@@ -122,8 +131,11 @@ impl Drop for OleApartment {
     }
 }
 
-fn drag_file(hwnd: HWND, path: &Path) -> windows::core::Result<()> {
+fn drag_file(hwnd: HWND, path: &Path) -> windows::core::Result<bool> {
     unsafe {
+        if !primary_button_pressed() || !pointer_outside(hwnd) {
+            return Ok(false);
+        }
         OleInitialize(None)?;
         let _ole = OleApartment;
         let wide_path: Vec<_> = dunce::simplified(path)
@@ -134,27 +146,29 @@ fn drag_file(hwnd: HWND, path: &Path) -> windows::core::Result<()> {
         let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide_path.as_ptr()), None)?;
         let items: IShellItemArray = SHCreateShellItemArrayFromShellItem(&item)?;
         let data: IDataObject = items.BindToHandler(None, &BHID_DataObject)?;
-        let primary_button = if GetSystemMetrics(SM_SWAPBUTTON) == 0 {
-            VK_LBUTTON
-        } else {
-            VK_RBUTTON
-        };
-        if GetAsyncKeyState(i32::from(primary_button.0)) >= 0 {
-            return Ok(());
+        if !primary_button_pressed() || !pointer_outside(hwnd) {
+            return Ok(false);
         }
         if GetCapture() == hwnd {
             // Finish the editor's local mouse gesture and release its capture before OLE
             // takes over. OLE reads the physical button state independently of this message.
             SendMessageW(hwnd, WM_LBUTTONUP, Some(WPARAM(0)), Some(LPARAM(0)));
         }
-        let source: IDropSource = DropSource.into();
+        let source: IDropSource = DropSource {
+            hwnd: hwnd.0 as usize,
+        }
+        .into();
         let mut effect = DROPEFFECT::default();
-        DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect).ok()
+        let result = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
+        result.ok()?;
+        Ok(result == DRAGDROP_S_DROP && effect.contains(DROPEFFECT_COPY))
     }
 }
 
 #[implement(IDropSource)]
-struct DropSource;
+struct DropSource {
+    hwnd: usize,
+}
 
 #[allow(non_snake_case)]
 impl IDropSource_Impl for DropSource_Impl {
@@ -162,7 +176,11 @@ impl IDropSource_Impl for DropSource_Impl {
         if escape.as_bool() {
             DRAGDROP_S_CANCEL
         } else if !keys.contains(MK_LBUTTON) {
-            DRAGDROP_S_DROP
+            if pointer_outside(HWND(self.hwnd as _)) {
+                DRAGDROP_S_DROP
+            } else {
+                DRAGDROP_S_CANCEL
+            }
         } else {
             S_OK
         }
