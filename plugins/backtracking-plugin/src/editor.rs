@@ -8,8 +8,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{
-    AutoResumeDelay, DurationChoice, MeterReadings, Snapshot, WavExportProfile, WavSampleFormat,
-    export_wav_with_profile, waveform,
+    AutoResumeDelay, ChannelRoute, DurationChoice, MeterReadings, Snapshot, WavExportProfile,
+    WavSampleFormat, export_routed_wav_with_profile, waveform,
 };
 use egui::{Color32, CursorIcon, PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use nice_plug::context::gui::GuiContext;
@@ -243,6 +243,7 @@ impl Drop for ActiveDrag {
 
 struct WavClip {
     profile: WavExportProfile,
+    force_mono: bool,
     output: PathBuf,
     snapshot: Arc<Snapshot>,
     range: Range<usize>,
@@ -261,12 +262,14 @@ impl WavClip {
             .snapshot
             .frames(self.range)
             .ok_or_else(|| io::Error::other("invalid audio selection"))?;
-        let path = export_wav_with_profile(
+        let path = export_routed_wav_with_profile(
             &self.output,
             self.snapshot.sample_rate,
             self.snapshot.channels,
             samples,
             self.profile,
+            ChannelRoute::Merged,
+            self.force_mono,
         )?;
         Ok(SavedWav {
             path: path.canonicalize().unwrap_or(path),
@@ -376,7 +379,8 @@ impl NiceEguiApp for CaptureUi {
         if let Some(previous) = &self.displayed_settings {
             let retention_changed = previous.retention != settings.retention;
             let output_changed = previous.output_dir != settings.output_dir;
-            let format_changed = previous.wav_profile != settings.wav_profile;
+            let format_changed = previous.wav_profile != settings.wav_profile
+                || previous.force_mono != settings.force_mono;
             if retention_changed {
                 self.reset_frozen();
             } else if output_changed || format_changed {
@@ -734,8 +738,9 @@ impl CaptureUi {
         if edited.meter_mode != settings.meter_mode {
             self.session.set_meter_mode(edited.meter_mode);
         }
-        if edited.wav_profile != settings.wav_profile {
-            self.session.set_wav_profile(edited.wav_profile);
+        if edited.wav_profile != settings.wav_profile || edited.force_mono != settings.force_mono {
+            self.session
+                .set_wav_export(edited.wav_profile, edited.force_mono);
             self.discard_drag_preparation();
             self.message.clear();
         }
@@ -1258,7 +1263,12 @@ impl CaptureUi {
             self.message = "No captured audio to save yet.".into();
             return;
         };
-        let Some(clip) = self.wav_clip(snapshot, settings.output_dir, settings.wav_profile) else {
+        let Some(clip) = self.wav_clip(
+            snapshot,
+            settings.output_dir,
+            settings.wav_profile,
+            settings.force_mono,
+        ) else {
             self.message = "The selected audio is no longer available.".into();
             return;
         };
@@ -1344,8 +1354,12 @@ impl CaptureUi {
             return;
         };
         self.sync_timeline(epoch);
-        let Some(clip) = self.wav_clip(snapshot, settings.saved_dir.clone(), settings.wav_profile)
-        else {
+        let Some(clip) = self.wav_clip(
+            snapshot,
+            settings.saved_dir.clone(),
+            settings.wav_profile,
+            settings.force_mono,
+        ) else {
             self.message = "The selected audio is no longer available.".into();
             return;
         };
@@ -1364,6 +1378,7 @@ impl CaptureUi {
         snapshot: Arc<Snapshot>,
         output: PathBuf,
         profile: WavExportProfile,
+        force_mono: bool,
     ) -> Option<WavClip> {
         let selected = self
             .selection
@@ -1372,6 +1387,7 @@ impl CaptureUi {
         let range = export_frame_range(&snapshot, &selected)?;
         Some(WavClip {
             profile,
+            force_mono,
             output,
             snapshot,
             range,
@@ -1504,6 +1520,9 @@ fn capture_options(ui: &mut egui::Ui, settings: &mut SessionSettings) {
         });
         ui.end_row();
         wav_format_controls(ui, &mut settings.wav_profile);
+        ui.label("WAV channels");
+        ui.checkbox(&mut settings.force_mono, "Export every file as mono");
+        ui.end_row();
     });
 }
 
@@ -1720,6 +1739,7 @@ mod tests {
         let prepare_file = || {
             WavClip {
                 profile: WavExportProfile::default(),
+                force_mono: false,
                 output: output.clone(),
                 snapshot: snapshot.clone(),
                 range: 0..32,
@@ -1754,14 +1774,15 @@ mod tests {
         let snapshot = Arc::new(Snapshot {
             first_frame: 0,
             sample_rate: 48_000,
-            channels: 1,
-            samples: vec![0.25; 32],
+            channels: 2,
+            samples: [0.75, -0.25].repeat(32),
         });
-        for range in [0..16, 0..32] {
+        for (range, force_mono) in [(0..16, true), (0..32, false)] {
             writer
                 .requests
                 .send(WavClip {
                     profile: WavExportProfile::default(),
+                    force_mono,
                     output: output.clone(),
                     snapshot: snapshot.clone(),
                     marker: markers.issue(range.start as u64..range.end as u64),
@@ -1783,10 +1804,22 @@ mod tests {
         assert_eq!(first.marker.range, 0..16);
         assert_eq!(second.marker.range, 0..32);
         assert_ne!(first.path, second.path);
-        assert_eq!(
-            second.path.metadata().unwrap().len() - first.path.metadata().unwrap().len(),
-            64
-        );
+        for (saved, channels, expected) in [
+            (first, 1, vec![0.25; 16]),
+            (second, 2, [0.75, -0.25].repeat(32)),
+        ] {
+            let wav = std::fs::read(saved.path).unwrap();
+            assert_eq!(
+                u16::from_le_bytes(wav[22..24].try_into().unwrap()),
+                channels
+            );
+            let data = wav.windows(4).position(|chunk| chunk == b"data").unwrap() + 8;
+            let samples: Vec<_> = wav[data..]
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect();
+            assert_eq!(samples, expected);
+        }
         std::fs::remove_dir_all(output).unwrap();
     }
 

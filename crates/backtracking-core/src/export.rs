@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::Snapshot;
+use crate::{ChannelRoute, Snapshot};
 
 const PHASES: usize = 256;
 static NEXT_EXPORT: AtomicU64 = AtomicU64::new(0);
@@ -71,6 +71,50 @@ impl Default for WavExportProfile {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WavChannelMap {
+    Unchanged,
+    Left,
+    Right,
+    Side,
+    Downmix,
+}
+
+impl WavChannelMap {
+    fn from_route(route: ChannelRoute, channels: usize, force_mono: bool) -> io::Result<Self> {
+        match (route, channels, force_mono) {
+            (ChannelRoute::Merged, 2, true) => Ok(Self::Downmix),
+            (ChannelRoute::Merged, 1 | 2, _) => Ok(Self::Unchanged),
+            (ChannelRoute::Left, 1, false) => Ok(Self::Left),
+            (ChannelRoute::Right, 1, false) => Ok(Self::Right),
+            (ChannelRoute::Side, 1, false) => Ok(Self::Side),
+            (_, 1, _) => Ok(Self::Unchanged),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "channel route does not match the captured audio",
+            )),
+        }
+    }
+
+    fn output_channels(self, source_channels: usize) -> usize {
+        match self {
+            Self::Unchanged => source_channels,
+            Self::Downmix => 1,
+            Self::Left | Self::Right | Self::Side => 2,
+        }
+    }
+
+    fn map_frame(self, frame: &[f32]) -> [f32; 2] {
+        match self {
+            Self::Left => [frame[0], 0.0],
+            Self::Right => [0.0, frame[0]],
+            Self::Side => [frame[0], -frame[0]],
+            Self::Downmix => [frame[0] * 0.5 + frame[1] * 0.5, 0.0],
+            Self::Unchanged => unreachable!(),
+        }
+    }
+}
+
 /// Writes a new mono or stereo 48 kHz, IEEE float32 WAV. The caller can expose
 /// the path for dragging after this returns successfully.
 pub fn write_wav(
@@ -96,6 +140,24 @@ pub fn write_wav_with_profile(
     interleaved: &[f32],
     profile: WavExportProfile,
 ) -> io::Result<()> {
+    write_wav_mapped(
+        path,
+        source_sample_rate,
+        channels,
+        interleaved,
+        profile,
+        WavChannelMap::Unchanged,
+    )
+}
+
+fn write_wav_mapped(
+    path: &Path,
+    source_sample_rate: u32,
+    channels: usize,
+    interleaved: &[f32],
+    profile: WavExportProfile,
+    channel_map: WavChannelMap,
+) -> io::Result<()> {
     if source_sample_rate == 0 || !matches!(channels, 1 | 2) || interleaved.len() % channels != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -113,7 +175,8 @@ pub fn write_wav_with_profile(
     let rate = u128::from(source_sample_rate);
     let rounded = (source_frames as u128 * u128::from(profile.sample_rate) + rate / 2) / rate;
     let frames = rounded.max((source_frames != 0) as u128);
-    let frame_bytes = channels as u16 * (profile.sample_format.bits_per_sample() / 8);
+    let output_channels = channel_map.output_channels(channels) as u16;
+    let frame_bytes = output_channels * (profile.sample_format.bits_per_sample() / 8);
     let data_bytes = frames * u128::from(frame_bytes);
     let riff_size = data_bytes + data_bytes % 2 + u128::from(profile.sample_format.riff_overhead());
     if riff_size > u128::from(u32::MAX) {
@@ -141,10 +204,11 @@ pub fn write_wav_with_profile(
         write_wave(
             &mut writer,
             profile,
-            channels as u16,
+            output_channels,
             frames as u32,
             data_bytes as u32,
             &samples,
+            channel_map,
         )
         .and_then(|()| writer.flush())
     };
@@ -178,11 +242,41 @@ pub fn export_wav_with_profile(
     interleaved: &[f32],
     profile: WavExportProfile,
 ) -> io::Result<PathBuf> {
+    export_routed_wav_with_profile(
+        output_dir,
+        source_sample_rate,
+        channels,
+        interleaved,
+        profile,
+        ChannelRoute::Merged,
+        false,
+    )
+}
+
+/// Exports already-routed capture samples with their intended speaker placement.
+/// Forcing mono keeps a routed lane's samples intact and averages a stereo merged lane.
+pub fn export_routed_wav_with_profile(
+    output_dir: &Path,
+    source_sample_rate: u32,
+    channels: usize,
+    interleaved: &[f32],
+    profile: WavExportProfile,
+    route: ChannelRoute,
+    force_mono: bool,
+) -> io::Result<PathBuf> {
+    let channel_map = WavChannelMap::from_route(route, channels, force_mono)?;
     fs::create_dir_all(output_dir)?;
     loop {
         let prefix = take_name();
         let path = output_dir.join(format!("{prefix}.wav"));
-        match write_wav_with_profile(&path, source_sample_rate, channels, interleaved, profile) {
+        match write_wav_mapped(
+            &path,
+            source_sample_rate,
+            channels,
+            interleaved,
+            profile,
+            channel_map,
+        ) {
             Ok(()) => return Ok(path),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err),
@@ -208,47 +302,85 @@ pub fn export_tracks_with_profile(
     frames: Range<usize>,
     profile: WavExportProfile,
 ) -> io::Result<Vec<PathBuf>> {
+    export_routed_tracks_with_profile(
+        output_dir,
+        snapshots,
+        frames,
+        profile,
+        &[ChannelRoute::Merged; 2][..snapshots.len().min(2)],
+        false,
+    )
+}
+
+/// Exports each selected lane to its own WAV using its capture route and output setting.
+pub fn export_routed_tracks_with_profile(
+    output_dir: &Path,
+    snapshots: &[Snapshot],
+    frames: Range<usize>,
+    profile: WavExportProfile,
+    routes: &[ChannelRoute],
+    force_mono: bool,
+) -> io::Result<Vec<PathBuf>> {
     match snapshots {
-        [one] => export_track_refs(output_dir, &[one], frames, profile),
-        [a, b] => export_track_refs(output_dir, &[a, b], frames, profile),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "expected one or two audio lanes",
-        )),
+        [one] => export_routed_track_refs(output_dir, &[one], frames, profile, routes, force_mono),
+        [a, b] => {
+            export_routed_track_refs(output_dir, &[a, b], frames, profile, routes, force_mono)
+        }
+        _ => Err(invalid_tracks()),
     }
 }
 
-pub(crate) fn export_track_refs(
+pub(crate) fn export_routed_track_refs(
     output_dir: &Path,
     snapshots: &[&Snapshot],
     frames: Range<usize>,
     profile: WavExportProfile,
+    routes: &[ChannelRoute],
+    force_mono: bool,
 ) -> io::Result<Vec<PathBuf>> {
-    match snapshots {
-        [snapshot] => export_wav_with_profile(
+    match (snapshots, routes) {
+        ([snapshot], [route]) => export_routed_wav_with_profile(
             output_dir,
             snapshot.sample_rate,
             snapshot.channels,
             track_clip(snapshot, frames)?,
             profile,
+            *route,
+            force_mono,
         )
         .map(|path| vec![path]),
-        [a, b] if a.sample_rate == b.sample_rate && a.frame_range() == b.frame_range() => {
+        ([a, b], [route_a, route_b])
+            if a.sample_rate == b.sample_rate && a.frame_range() == b.frame_range() =>
+        {
             let a_samples = track_clip(a, frames.clone())?;
             let b_samples = track_clip(b, frames)?;
+            let a_map = WavChannelMap::from_route(*route_a, a.channels, force_mono)?;
+            let b_map = WavChannelMap::from_route(*route_b, b.channels, force_mono)?;
             fs::create_dir_all(output_dir)?;
             loop {
                 let prefix = take_name();
                 let a_path = output_dir.join(format!("{prefix}-A.wav"));
                 let b_path = output_dir.join(format!("{prefix}-B.wav"));
-                match write_wav_with_profile(&a_path, a.sample_rate, a.channels, a_samples, profile)
-                {
+                match write_wav_mapped(
+                    &a_path,
+                    a.sample_rate,
+                    a.channels,
+                    a_samples,
+                    profile,
+                    a_map,
+                ) {
                     Ok(()) => {}
                     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
                     Err(err) => return Err(err),
                 }
-                match write_wav_with_profile(&b_path, b.sample_rate, b.channels, b_samples, profile)
-                {
+                match write_wav_mapped(
+                    &b_path,
+                    b.sample_rate,
+                    b.channels,
+                    b_samples,
+                    profile,
+                    b_map,
+                ) {
                     Ok(()) => return Ok(vec![a_path, b_path]),
                     Err(err) => {
                         fs::remove_file(a_path)?;
@@ -284,6 +416,7 @@ fn write_wave(
     frames: u32,
     data_bytes: u32,
     samples: &[f32],
+    channel_map: WavChannelMap,
 ) -> io::Result<()> {
     let format = profile.sample_format;
     let bits = format.bits_per_sample();
@@ -327,18 +460,21 @@ fn write_wave(
     }
     output.write_all(b"data")?;
     output.write_all(&data_bytes.to_le_bytes())?;
-    let sample_bytes = usize::from(sample_bytes);
-    let mut bytes = [0; 4096];
-    for chunk in samples.chunks(bytes.len() / sample_bytes) {
-        for (slot, &sample) in bytes.chunks_exact_mut(sample_bytes).zip(chunk) {
-            let sample = match format {
-                WavSampleFormat::Pcm16 => quantize(sample, 1 << 15).to_le_bytes(),
-                WavSampleFormat::Pcm24 => quantize(sample, 1 << 23).to_le_bytes(),
-                WavSampleFormat::Float32 => sample.to_le_bytes(),
-            };
-            slot.copy_from_slice(&sample[..sample_bytes]);
-        }
-        output.write_all(&bytes[..chunk.len() * sample_bytes])?;
+    if channel_map == WavChannelMap::Unchanged {
+        write_samples(output, format, samples.iter().copied(), false)?;
+    } else {
+        let source_channels = if channel_map == WavChannelMap::Downmix {
+            2
+        } else {
+            1
+        };
+        let routed = samples.chunks_exact(source_channels).flat_map(|frame| {
+            channel_map
+                .map_frame(frame)
+                .into_iter()
+                .take(usize::from(channels))
+        });
+        write_samples(output, format, routed, channel_map == WavChannelMap::Side)?;
     }
     if padding != 0 {
         output.write_all(&[0])?;
@@ -346,10 +482,37 @@ fn write_wave(
     Ok(())
 }
 
-fn quantize(sample: f32, full_scale: i32) -> i32 {
+fn write_samples(
+    output: &mut impl Write,
+    format: WavSampleFormat,
+    samples: impl Iterator<Item = f32>,
+    symmetric_pcm: bool,
+) -> io::Result<()> {
+    let sample_bytes = usize::from(format.bits_per_sample() / 8);
+    let mut bytes = [0; 4096];
+    let capacity = bytes.len() / sample_bytes * sample_bytes;
+    let mut used = 0;
+    for sample in samples {
+        let encoded = match format {
+            WavSampleFormat::Pcm16 => quantize(sample, 1 << 15, symmetric_pcm).to_le_bytes(),
+            WavSampleFormat::Pcm24 => quantize(sample, 1 << 23, symmetric_pcm).to_le_bytes(),
+            WavSampleFormat::Float32 => sample.to_le_bytes(),
+        };
+        bytes[used..used + sample_bytes].copy_from_slice(&encoded[..sample_bytes]);
+        used += sample_bytes;
+        if used == capacity {
+            output.write_all(&bytes[..used])?;
+            used = 0;
+        }
+    }
+    output.write_all(&bytes[..used])
+}
+
+fn quantize(sample: f32, full_scale: i32, symmetric: bool) -> i32 {
     // Rust's float-to-int cast maps NaN to 0 and saturates infinities.
     let scaled = (f64::from(sample) * f64::from(full_scale)).round() as i32;
-    scaled.clamp(-full_scale, full_scale - 1)
+    // A clipped Side frame still needs an exactly inverted right sample.
+    scaled.clamp(-full_scale + i32::from(symmetric), full_scale - 1)
 }
 
 fn resample(
@@ -480,10 +643,184 @@ mod tests {
     }
 
     #[test]
+    fn routed_wavs_keep_speaker_placement_and_can_export_each_file_as_mono() {
+        let dir = std::env::temp_dir().join(take_name());
+        let profile = WavExportProfile::default();
+        let mono = [0.25, -0.5];
+        let stereo = [0.25, 0.75, -0.5, 0.25];
+        for (route, input_channels, input, output_channels, expected) in [
+            (
+                ChannelRoute::Left,
+                1,
+                &mono[..],
+                2,
+                &[0.25, 0.0, -0.5, 0.0][..],
+            ),
+            (
+                ChannelRoute::Right,
+                1,
+                &mono[..],
+                2,
+                &[0.0, 0.25, 0.0, -0.5][..],
+            ),
+            (ChannelRoute::Mid, 1, &mono[..], 1, &mono[..]),
+            (ChannelRoute::Center, 1, &mono[..], 1, &mono[..]),
+            (
+                ChannelRoute::Side,
+                1,
+                &mono[..],
+                2,
+                &[0.25, -0.25, -0.5, 0.5][..],
+            ),
+            (ChannelRoute::Merged, 1, &mono[..], 1, &mono[..]),
+            (ChannelRoute::Merged, 2, &stereo[..], 2, &stereo[..]),
+        ] {
+            let path = export_routed_wav_with_profile(
+                &dir,
+                48_000,
+                input_channels,
+                input,
+                profile,
+                route,
+                false,
+            )
+            .unwrap();
+            let bytes = fs::read(path).unwrap();
+            assert_eq!(
+                u16::from_le_bytes(bytes[22..24].try_into().unwrap()),
+                output_channels
+            );
+            assert_eq!(u32::from_le_bytes(bytes[46..50].try_into().unwrap()), 2);
+            assert_eq!(float_samples(&bytes), expected);
+
+            let mono_path = export_routed_wav_with_profile(
+                &dir,
+                48_000,
+                input_channels,
+                input,
+                profile,
+                route,
+                true,
+            )
+            .unwrap();
+            let bytes = fs::read(mono_path).unwrap();
+            assert_eq!(&bytes[22..24], &1u16.to_le_bytes());
+            assert_eq!(
+                float_samples(&bytes),
+                if input_channels == 1 {
+                    mono
+                } else {
+                    [0.5, -0.125]
+                }
+            );
+        }
+
+        let a = Snapshot {
+            sample_rate: 44_100,
+            channels: 1,
+            samples: vec![0.0; 442],
+            first_frame: 42,
+        };
+        let mut b = a.clone();
+        b.samples[1..].fill(-0.25);
+        let mut a = a;
+        a.samples[1..].fill(0.5);
+        let routes = [ChannelRoute::Side, ChannelRoute::Mid];
+        for force_mono in [false, true] {
+            let paths = export_routed_tracks_with_profile(
+                &dir,
+                &[a.clone(), b.clone()],
+                1..442,
+                profile,
+                &routes,
+                force_mono,
+            )
+            .unwrap();
+            let [path_a, path_b] = paths.as_slice() else {
+                panic!("expected A/B files")
+            };
+            let a_name = path_a.file_name().unwrap().to_str().unwrap();
+            let b_name = path_b.file_name().unwrap().to_str().unwrap();
+            assert_eq!(a_name.strip_suffix("-A.wav"), b_name.strip_suffix("-B.wav"));
+            let a_wave = fs::read(path_a).unwrap();
+            let b_wave = fs::read(path_b).unwrap();
+            for bytes in [&a_wave, &b_wave] {
+                assert_eq!(&bytes[46..50], &480u32.to_le_bytes());
+            }
+            assert_eq!(
+                float_samples(&a_wave),
+                if force_mono {
+                    vec![0.5; 480]
+                } else {
+                    [0.5, -0.5].repeat(480)
+                }
+            );
+            assert_eq!(float_samples(&b_wave), vec![-0.25; 480]);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn float_samples(wav: &[u8]) -> Vec<f32> {
+        wav[58..]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn clipped_pcm_side_channels_remain_exact_inverses() {
+        let dir = std::env::temp_dir().join(take_name());
+        for (format, bytes_per_sample, data_offset, peak) in [
+            (WavSampleFormat::Pcm16, 2, 44, 32_767),
+            (WavSampleFormat::Pcm24, 3, 68, 8_388_607),
+        ] {
+            let path = export_routed_wav_with_profile(
+                &dir,
+                48_000,
+                1,
+                &[1.5, -1.5, 0.5],
+                WavExportProfile {
+                    sample_rate: 48_000,
+                    sample_format: format,
+                },
+                ChannelRoute::Side,
+                false,
+            )
+            .unwrap();
+            let bytes = fs::read(path).unwrap();
+            assert_eq!(&bytes[22..24], &2u16.to_le_bytes());
+            let samples: Vec<_> = bytes[data_offset..]
+                .chunks_exact(bytes_per_sample)
+                .map(|bytes| {
+                    let mut sample = [if bytes[bytes.len() - 1] & 0x80 == 0 {
+                        0
+                    } else {
+                        0xff
+                    }; 4];
+                    sample[..bytes.len()].copy_from_slice(bytes);
+                    i32::from_le_bytes(sample)
+                })
+                .collect();
+            assert_eq!(&samples[..4], &[peak, -peak, -peak, peak]);
+            assert!(samples.chunks_exact(2).all(|frame| frame[0] == -frame[1]));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn wave_header_and_samples_are_ieee_float_stereo() {
         let samples = [1.25, -0.125, 0.5, 0.75];
         let mut wave = Vec::new();
-        write_wave(&mut wave, WavExportProfile::default(), 2, 2, 16, &samples).unwrap();
+        write_wave(
+            &mut wave,
+            WavExportProfile::default(),
+            2,
+            2,
+            16,
+            &samples,
+            WavChannelMap::Unchanged,
+        )
+        .unwrap();
 
         assert_eq!(&wave[..4], b"RIFF");
         assert_eq!(
@@ -512,7 +849,16 @@ mod tests {
             sample_format: WavSampleFormat::Pcm16,
         };
         let mut wave = Vec::new();
-        write_wave(&mut wave, profile, 1, 5, 10, &samples).unwrap();
+        write_wave(
+            &mut wave,
+            profile,
+            1,
+            5,
+            10,
+            &samples,
+            WavChannelMap::Unchanged,
+        )
+        .unwrap();
         assert_eq!(&wave[16..20], &16u32.to_le_bytes());
         assert_eq!(&wave[20..24], &[1, 0, 1, 0]);
         assert_eq!(&wave[24..28], &44_100u32.to_le_bytes());
@@ -534,7 +880,16 @@ mod tests {
             sample_format: WavSampleFormat::Pcm24,
         };
         let mut wave = Vec::new();
-        write_wave(&mut wave, profile, 1, 5, 15, &samples).unwrap();
+        write_wave(
+            &mut wave,
+            profile,
+            1,
+            5,
+            15,
+            &samples,
+            WavChannelMap::Unchanged,
+        )
+        .unwrap();
         assert_eq!(&wave[4..8], &76u32.to_le_bytes());
         assert_eq!(&wave[16..20], &40u32.to_le_bytes());
         assert_eq!(&wave[20..24], &[0xfe, 0xff, 1, 0]);

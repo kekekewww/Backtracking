@@ -164,10 +164,13 @@ mod tests {
         original.session.set_meter_mode(MeterMode::Lufs);
         original.session.set_show_waveform_only(true);
         original.session.set_waveform_layout(WaveformLayout::Stereo);
-        original.session.set_wav_profile(WavExportProfile {
-            sample_rate: 96_000,
-            sample_format: WavSampleFormat::Pcm24,
-        });
+        original.session.set_wav_export(
+            WavExportProfile {
+                sample_rate: 96_000,
+                sample_format: WavSampleFormat::Pcm24,
+            },
+            true,
+        );
         let output = std::env::temp_dir()
             .join("Backtracking 測試")
             .join("output");
@@ -194,6 +197,7 @@ mod tests {
     fn legacy_and_invalid_fields_use_defaults_without_losing_valid_values() {
         let plugin = Backtracking::default();
         let defaults = SessionSettings::default();
+        assert!(!defaults.force_mono);
         plugin.params().deserialize_fields(&BTreeMap::new());
         assert_eq!(plugin.session.settings(), defaults);
 

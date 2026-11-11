@@ -183,8 +183,10 @@ impl Session {
         self.settings.lock().meter_mode = meter_mode;
     }
 
-    pub(crate) fn set_wav_profile(&self, profile: WavExportProfile) {
-        self.settings.lock().wav_profile = profile;
+    pub(crate) fn set_wav_export(&self, profile: WavExportProfile, force_mono: bool) {
+        let mut settings = self.settings.lock();
+        settings.wav_profile = profile;
+        settings.force_mono = force_mono;
     }
 
     pub(crate) fn set_show_waveform_only(&self, show_waveform_only: bool) {

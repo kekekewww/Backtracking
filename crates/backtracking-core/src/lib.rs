@@ -9,8 +9,9 @@ pub mod waveform;
 
 pub use capture::{Capture, CaptureError, CaptureState, DurationChoice, Snapshot};
 pub use export::{
-    export_tracks_with_profile, export_wav, export_wav_with_profile, write_wav,
-    write_wav_with_profile, WavExportProfile, WavSampleFormat,
+    export_routed_tracks_with_profile, export_routed_wav_with_profile, export_tracks_with_profile,
+    export_wav, export_wav_with_profile, write_wav, write_wav_with_profile, WavExportProfile,
+    WavSampleFormat,
 };
 pub use meter::MeterReadings;
 pub use queue::{AudioQueue, TimedAudioQueue, TimedPacket};

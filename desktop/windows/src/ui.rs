@@ -19,7 +19,7 @@ use crate::updater::UpdateOptions;
 use crate::window_order;
 use backtracking_core::{
     AutoResumeDelay, ChannelRoute, DurationChoice, MeterReadings, Snapshot, WavExportProfile,
-    WavSampleFormat, WaveformView, export_tracks_with_profile, waveform,
+    WavSampleFormat, WaveformView, export_routed_tracks_with_profile, waveform,
 };
 use eframe::egui::{
     self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection, Stroke, Vec2,
@@ -237,6 +237,7 @@ struct Recorder {
     meter_modes: [MeterMode; 2],
     split_waveform: bool,
     wav_profile: WavExportProfile,
+    wav_force_mono: bool,
     last_interaction: Instant,
     recording_started: Option<f64>,
     peaks: [WaveformPeaks; 2],
@@ -431,6 +432,8 @@ struct WavClip {
     frames: Range<usize>,
     output: PathBuf,
     profile: WavExportProfile,
+    routes: [ChannelRoute; 2],
+    force_mono: bool,
     flags: Option<FlagUpdate>,
 }
 
@@ -440,8 +443,13 @@ impl WavClip {
         selection: Option<&Range<u64>>,
         output: PathBuf,
         profile: WavExportProfile,
+        routes: [ChannelRoute; 2],
+        force_mono: bool,
         flags: Option<FlagUpdate>,
     ) -> Option<Self> {
+        if snapshots.len() > routes.len() {
+            return None;
+        }
         let visible = snapshots.first()?.frame_range();
         let selected = selection.cloned().unwrap_or_else(|| visible.clone());
         if selected.is_empty() || selected.start < visible.start || selected.end > visible.end {
@@ -454,13 +462,21 @@ impl WavClip {
             frames: start..end,
             output,
             profile,
+            routes,
+            force_mono,
             flags,
         })
     }
 
     fn write(self, keep: bool) -> io::Result<ExportedWav> {
-        let paths =
-            export_tracks_with_profile(&self.output, &self.snapshots, self.frames, self.profile)?;
+        let paths = export_routed_tracks_with_profile(
+            &self.output,
+            &self.snapshots,
+            self.frames,
+            self.profile,
+            &self.routes[..self.snapshots.len()],
+            self.force_mono,
+        )?;
         let mut result = ExportedWav {
             paths,
             keep,
@@ -541,6 +557,7 @@ impl Recorder {
             meter_modes: [settings.meter_mode, settings.meter_b_mode],
             split_waveform: settings.split_waveform,
             wav_profile: settings.wav_profile,
+            wav_force_mono: settings.wav_force_mono,
             last_interaction: Instant::now(),
             recording_started: None,
             peaks: [WaveformPeaks::EMPTY; 2],
@@ -1670,10 +1687,21 @@ impl Recorder {
             }
         });
         ui.end_row();
+        ui.label("WAV channels");
+        let mono_changed = ui
+            .checkbox(&mut self.wav_force_mono, "Export every file as mono")
+            .changed();
+        ui.end_row();
 
-        if self.wav_profile != previous {
+        if self.wav_profile != previous || mono_changed {
             self.invalidate_export();
             self.message.clear();
+            if mono_changed {
+                self.save_preference(
+                    Key::WavForceMono,
+                    if self.wav_force_mono { "1" } else { "0" },
+                );
+            }
             if self.wav_profile.sample_rate != previous.sample_rate {
                 self.save_preference(Key::WavSampleRate, self.wav_profile.sample_rate.to_string());
             }
@@ -1757,11 +1785,18 @@ impl Recorder {
         } else {
             None
         };
+        let routes = self.controller.sources().each_ref().map(|settings| {
+            settings
+                .as_ref()
+                .map_or(ChannelRoute::Merged, |settings| settings.route)
+        });
         WavClip::new(
             snapshots,
             self.selection.as_ref(),
             output,
             self.wav_profile,
+            routes,
+            self.wav_force_mono,
             flags,
         )
     }
@@ -2537,7 +2572,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dual_drag_retains_exact_selected_samples_and_cancels_both_files() {
+    fn dual_drag_exports_selected_routes_and_cleans_up_canceled_files() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2561,30 +2596,42 @@ mod tests {
             },
         ]
         .into();
-        let prepare = || {
+        let prepare = |force_mono| {
             WavClip::new(
                 snapshots.clone(),
                 Some(&(11..12)),
                 folder.clone(),
                 WavExportProfile::default(),
+                [ChannelRoute::Left, ChannelRoute::Side],
+                force_mono,
                 None,
             )
             .unwrap()
             .write(false)
             .unwrap()
         };
+        let assert_samples = |paths: &[PathBuf], expected: [&[f32]; 2]| {
+            assert_eq!(paths.len(), 2);
+            for (path, samples) in paths.iter().zip(expected) {
+                let wav = std::fs::read(path).unwrap();
+                let channels = u16::from_le_bytes(wav[22..24].try_into().unwrap());
+                assert_eq!(usize::from(channels), samples.len());
+                let expected: Vec<_> = samples
+                    .iter()
+                    .flat_map(|sample| sample.to_le_bytes())
+                    .collect();
+                assert_eq!(&wav[wav.len() - expected.len()..], expected);
+            }
+        };
 
-        let rejected = prepare();
-        assert_eq!(rejected.paths.len(), 2);
-        for (path, expected) in rejected.paths.iter().zip([0.5_f32, -0.5]) {
-            let wav = std::fs::read(path).unwrap();
-            assert_eq!(&wav[wav.len() - 4..], &expected.to_le_bytes());
-        }
+        let rejected = prepare(false);
+        assert_samples(&rejected.paths, [&[0.5, 0.0], &[-0.5, 0.5]]);
         let rejected_paths = rejected.paths.clone();
         drop(rejected);
         assert!(rejected_paths.iter().all(|path| !path.exists()));
 
-        let mut accepted = prepare();
+        let mut accepted = prepare(true);
+        assert_samples(&accepted.paths, [&[0.5], &[-0.5]]);
         let accepted_paths = accepted.paths.clone();
         accepted.keep = true;
         drop(accepted);

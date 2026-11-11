@@ -62,6 +62,19 @@ int32_t bt_snapshots_export_pair_frames_with_profile(const BtSnapshot *snapshot_
                                                      uint64_t first_frame, uint64_t end_frame,
                                                      const char *directory, uint32_t sample_rate,
                                                      uint32_t bits_per_sample, char **path_a, char **path_b);
+// Routes describe already-extracted samples: 0 = Left, 1 = Right, 2 = Center,
+// 3 = Mid, 4 = Side, 5 = Merged. Nonzero force_mono applies to each WAV separately.
+char *bt_snapshot_export_routed_frames_with_profile(const BtSnapshot *snapshot, uint64_t first_frame,
+                                                    uint64_t end_frame, const char *directory,
+                                                    uint32_t sample_rate, uint32_t bits_per_sample,
+                                                    uint32_t route, uint32_t force_mono);
+int32_t bt_snapshots_export_pair_routed_frames_with_profile(const BtSnapshot *snapshot_a,
+                                                            const BtSnapshot *snapshot_b,
+                                                            uint64_t first_frame, uint64_t end_frame,
+                                                            const char *directory, uint32_t sample_rate,
+                                                            uint32_t bits_per_sample, uint32_t route_a,
+                                                            uint32_t route_b, uint32_t force_mono,
+                                                            char **path_a, char **path_b);
 int32_t bt_snapshots_export_pair_with_profile(const BtSnapshot *snapshot_a,
                                               const BtSnapshot *snapshot_b,
                                               double start, double end,
