@@ -8,6 +8,7 @@ use eframe::egui::Context;
 use windows::core::w;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
     NIM_SETFOCUS, NIM_SETVERSION, NIN_SELECT, NINF_KEY, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
@@ -15,15 +16,15 @@ use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CopyIcon, CreatePopupMenu, DestroyIcon, DestroyMenu, GWL_EXSTYLE, GetCursorPos,
-    GetSystemMetrics, GetWindowLongPtrW, HICON, HMENU, IDI_APPLICATION, IMAGE_ICON, IsIconic,
-    IsWindowVisible, LR_DEFAULTCOLOR, LoadIconW, LoadImageW, MF_CHECKED, MF_SEPARATOR, MF_STRING,
-    PostMessageW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, STYLESTRUCT, SW_HIDE,
-    SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_CONTEXTMENU,
-    WM_LBUTTONUP, WM_NCDESTROY, WM_NULL, WM_RBUTTONUP, WM_SHOWWINDOW, WM_STYLECHANGING,
-    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    AppendMenuW, CopyIcon, CreatePopupMenu, DestroyIcon, DestroyMenu, FindWindowW, GWL_EXSTYLE,
+    GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowThreadProcessId, HICON, HMENU,
+    IDI_APPLICATION, IMAGE_ICON, IsIconic, IsWindowVisible, LR_DEFAULTCOLOR, LoadIconW, LoadImageW,
+    MF_CHECKED, MF_SEPARATOR, MF_STRING, PostMessageW, RegisterWindowMessageW, SM_CXSMICON,
+    SM_CYSMICON, STYLESTRUCT, SW_HIDE, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP,
+    WM_CONTEXTMENU, WM_LBUTTONUP, WM_NCDESTROY, WM_NULL, WM_RBUTTONUP, WM_SHOWWINDOW,
+    WM_STYLECHANGING, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 use winit::platform::windows::WindowExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -35,11 +36,13 @@ const CALLBACK: u32 = WM_APP + 0x42a;
 const ICON_ID: u32 = 1;
 const SUBCLASS_ID: usize = 1;
 const RETRY: Duration = Duration::from_secs(2);
+pub(crate) const OPTIONS_TITLE: &str = "Backtracking Options";
 
 #[derive(Clone, Copy)]
 pub(crate) enum Action {
     Show,
     Hide,
+    Options,
     ToggleStartup,
     Quit,
 }
@@ -79,7 +82,8 @@ impl Tray {
             }
             let icon = LoadImageW(
                 module,
-                1usize as *const u16,
+                // Win32 encodes the resource identifier in the low word of this argument.
+                std::ptr::without_provenance(1),
                 IMAGE_ICON,
                 GetSystemMetrics(SM_CXSMICON),
                 GetSystemMetrics(SM_CYSMICON),
@@ -161,44 +165,83 @@ pub(crate) fn suppress_taskbar(window: &Window) {
     if let Ok(handle) = window.window_handle()
         && let RawWindowHandle::Win32(handle) = handle.as_raw()
     {
-        let hwnd = handle.hwnd.get() as HWND;
-        unsafe {
-            let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-            let next = tool_window_style(current);
-            if current != next {
-                let visible = IsWindowVisible(hwnd) != 0;
-                let minimized = IsIconic(hwnd) != 0;
-                // Explorer can keep an existing taskbar button if the window stays visible
-                // while its taskbar eligibility changes.
-                if visible {
-                    ShowWindow(hwnd, SW_HIDE);
-                }
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
-                );
-                if visible {
-                    let show = if minimized {
-                        SW_SHOWMINNOACTIVE
-                    } else {
-                        SW_SHOWNOACTIVATE
-                    };
-                    ShowWindow(hwnd, show);
-                }
-            }
-        }
+        set_tool_window(handle.hwnd.get() as HWND);
     }
     window.set_skip_taskbar(true);
 }
 
+pub(crate) fn prepare_options_window() {
+    let title: Vec<u16> = OPTIONS_TITLE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // eframe exposes the root Window only. The immediate viewport's native window has
+    // already been created, but it is still hidden until its first render finishes.
+    let hwnd = unsafe { FindWindowW(null(), title.as_ptr()) };
+    if hwnd.is_null()
+        || unsafe { GetWindowThreadProcessId(hwnd, null_mut()) != GetCurrentThreadId() }
+    {
+        return;
+    }
+    // This callback keeps the style when winit subsequently updates the visible window.
+    let _ = unsafe { SetWindowSubclass(hwnd, Some(options_window_message), SUBCLASS_ID, 0) };
+    set_tool_window(hwnd);
+}
+
+fn set_tool_window(hwnd: HWND) {
+    unsafe {
+        let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let next = tool_window_style(current);
+        if current == next {
+            return;
+        }
+        let visible = IsWindowVisible(hwnd) != 0;
+        let minimized = IsIconic(hwnd) != 0;
+        // Explorer can keep an existing taskbar button if the window stays visible
+        // while its taskbar eligibility changes.
+        if visible {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+        );
+        if visible {
+            let show = if minimized {
+                SW_SHOWMINNOACTIVE
+            } else {
+                SW_SHOWNOACTIVATE
+            };
+            ShowWindow(hwnd, show);
+        }
+    }
+}
+
 fn tool_window_style(style: u32) -> u32 {
     (style & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
+}
+
+unsafe extern "system" fn options_window_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    _: usize,
+) -> LRESULT {
+    if message == WM_NCDESTROY {
+        let _ = unsafe { RemoveWindowSubclass(hwnd, Some(options_window_message), id) };
+    } else if message == WM_STYLECHANGING && wparam as i32 == GWL_EXSTYLE && lparam != 0 {
+        let style = unsafe { &mut *(lparam as *mut STYLESTRUCT) };
+        style.styleNew = tool_window_style(style.styleNew);
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
 impl Drop for Tray {
@@ -328,6 +371,7 @@ fn tray_menu(hwnd: HWND, state: &TrayState) -> Option<Action> {
             MF_STRING
         };
         if AppendMenuW(menu.0, MF_STRING, 1, visibility.as_ptr()) == 0
+            || AppendMenuW(menu.0, MF_STRING, 4, w!("Options").as_ptr()) == 0
             || AppendMenuW(menu.0, startup_flags, 2, w!("Start with Windows").as_ptr()) == 0
             || AppendMenuW(menu.0, MF_SEPARATOR, 0, null()) == 0
             || AppendMenuW(menu.0, MF_STRING, 3, w!("Quit").as_ptr()) == 0
@@ -355,6 +399,7 @@ fn tray_menu(hwnd: HWND, state: &TrayState) -> Option<Action> {
             1 => Some(Action::Show),
             2 => Some(Action::ToggleStartup),
             3 => Some(Action::Quit),
+            4 => Some(Action::Options),
             _ => None,
         }
     }

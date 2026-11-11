@@ -69,6 +69,12 @@ impl AudioQueue {
         count
     }
 
+    /// The number of already published frames. Call only from the designated consumer.
+    pub fn pending_frames(&self) -> usize {
+        let read = self.read.load(Ordering::Relaxed);
+        self.write.load(Ordering::Acquire).wrapping_sub(read)
+    }
+
     pub fn pop_interleaved(&self, destination: &mut [f32]) -> usize {
         let read = self.read.load(Ordering::Relaxed);
         let write = self.write.load(Ordering::Acquire);
@@ -105,15 +111,18 @@ mod tests {
     fn planar_and_interleaved_keep_frame_order_across_wrap() {
         let queue = AudioQueue::new(2, 2);
         assert_eq!(queue.push_planar(&[1., 2.], Some(&[11., 12.])), 2);
+        assert_eq!(queue.pending_frames(), 2);
         assert_eq!(queue.push_interleaved(&[3., 13.]), 0);
         let mut one = [0.; 2];
         assert_eq!(queue.pop_interleaved(&mut one), 1);
         assert_eq!(one, [1., 11.]);
+        assert_eq!(queue.pending_frames(), 1);
         assert_eq!(queue.push_interleaved(&[3., 13., 4., 14.]), 1);
         let mut two = [0.; 4];
         assert_eq!(queue.pop_interleaved(&mut two), 2);
         assert_eq!(two, [2., 12., 3., 13.]);
         assert_eq!(queue.pop_interleaved(&mut two), 0);
+        assert_eq!(queue.pending_frames(), 0);
     }
 
     #[test]

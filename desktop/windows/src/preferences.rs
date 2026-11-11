@@ -36,6 +36,7 @@ pub(crate) enum Key {
     WavSampleRate,
     WavSampleFormat,
     Output,
+    SavedSnapshots,
     AlwaysOnTop,
     WaveformOnly,
     WindowPosition,
@@ -53,6 +54,7 @@ impl Key {
             Self::WavSampleRate => "wav-sample-rate",
             Self::WavSampleFormat => "wav-sample-format",
             Self::Output => "output-folder",
+            Self::SavedSnapshots => "saved-snapshots-folder",
             Self::AlwaysOnTop => "always-on-top",
             Self::WaveformOnly => "waveform-only",
             Self::WindowPosition => "window-position",
@@ -68,6 +70,7 @@ pub(crate) struct Settings {
     pub(crate) meter_mode: MeterMode,
     pub(crate) wav_profile: WavExportProfile,
     pub(crate) output: PathBuf,
+    pub(crate) saved_output: PathBuf,
     pub(crate) pinned: bool,
     pub(crate) waveform_only: bool,
     pub(crate) window_position: Option<[i32; 2]>,
@@ -75,9 +78,10 @@ pub(crate) struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        let home = std::env::var_os("USERPROFILE")
+        let directory = std::env::var_os("USERPROFILE")
             .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Backtracking");
         Self {
             history: DurationChoice::Seconds20,
             idle_resume: AutoResumeDelay::default(),
@@ -85,7 +89,8 @@ impl Default for Settings {
             accent: DEFAULT_ACCENT,
             meter_mode: MeterMode::Dbfs,
             wav_profile: WavExportProfile::default(),
-            output: home.join("Backtracking").join("output"),
+            output: directory.join("output"),
+            saved_output: directory.join("saved"),
             pinned: true,
             waveform_only: false,
             window_position: None,
@@ -143,13 +148,11 @@ impl Preferences {
                 Some("pcm24") => WavSampleFormat::Pcm24,
                 _ => WavSampleFormat::Float32,
             };
-        if let Some(path) = self.read(Key::Output)
-            && !path.bytes().any(|byte| byte < 32)
-        {
-            let path = PathBuf::from(path);
-            if path.is_absolute() {
-                settings.output = path;
-            }
+        if let Some(path) = self.read_absolute_path(Key::Output) {
+            settings.output = path;
+        }
+        if let Some(path) = self.read_absolute_path(Key::SavedSnapshots) {
+            settings.saved_output = path;
         }
         match self.read_number(Key::AlwaysOnTop) {
             Some(0) => settings.pinned = false,
@@ -168,6 +171,15 @@ impl Preferences {
 
     fn read_number<T: std::str::FromStr>(&self, key: Key) -> Option<T> {
         self.read(key)?.trim().parse().ok()
+    }
+
+    fn read_absolute_path(&self, key: Key) -> Option<PathBuf> {
+        let path = self.read(key)?;
+        if path.bytes().any(|byte| byte < 32) {
+            return None;
+        }
+        let path = PathBuf::from(path);
+        path.is_absolute().then_some(path)
     }
 
     fn read(&self, key: Key) -> Option<String> {

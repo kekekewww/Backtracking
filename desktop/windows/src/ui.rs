@@ -64,9 +64,6 @@ const WAVEFORM_MIN_HEIGHT: f32 = 48.0;
 // Plot height in the default full window, used when launching directly into waveform-only mode.
 const DEFAULT_WAVEFORM_HEIGHT: f32 = 59.0;
 const WAVEFORM_INSET: f32 = 8.0;
-const SETTINGS_WIDTH: f32 = 340.0;
-const SETTINGS_MIN_WIDTH: f32 = 380.0;
-const SETTINGS_MIN_HEIGHT: f32 = 112.0;
 const WRITING_WAV: &str = "Writing WAV…";
 
 pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
@@ -141,17 +138,12 @@ fn min_window_size(waveform_only: bool) -> Vec2 {
     }
 }
 
-fn expanded_settings_size(ctx: &egui::Context) -> Option<Vec2> {
-    let content = ctx.content_rect().size();
-    let extra = Vec2::new(
-        (SETTINGS_MIN_WIDTH - content.x).max(0.0),
-        if content.y < SETTINGS_MIN_HEIGHT {
-            FULL_MIN_HEIGHT - content.y
-        } else {
-            0.0
-        },
-    );
-    (extra != Vec2::ZERO).then(|| ctx.viewport_rect().size() + extra)
+fn options_viewport() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("backtracking-options")
+}
+
+fn window_is_hidden(window: &Window) -> bool {
+    window.is_visible() == Some(false) || window.is_minimized() == Some(true)
 }
 
 fn fit_expanded_window(ctx: &egui::Context, frame: &eframe::Frame, size: Vec2) -> Option<Pos2> {
@@ -220,11 +212,13 @@ struct Recorder {
     launch_at_login: bool,
     quitting: bool,
     output: PathBuf,
+    saved_output: PathBuf,
     pinned: bool,
     next_pin_check: Instant,
     waveform_only: bool,
     full_waveform_height: f32,
-    settings_restore: Option<SettingsRestore>,
+    options_open: bool,
+    options_focus_requested: bool,
     window_position: Option<[i32; 2]>,
     window_position_changed: Option<Instant>,
     idle_resume: AutoResumeDelay,
@@ -246,14 +240,11 @@ struct Recorder {
     window_drag: Option<WindowDrag>,
     export: Option<ExportJob>,
     pending_exports: VecDeque<ExportClip>,
+    snapshot_save: Option<JoinHandle<io::Result<PathBuf>>>,
+    pending_snapshot_saves: VecDeque<WavClip>,
     clip_revision: u64,
     exported: Option<ExportedWav>,
     message: String,
-}
-
-struct SettingsRestore {
-    size: Vec2,
-    position: Option<Pos2>,
 }
 
 enum Gesture {
@@ -367,11 +358,15 @@ impl WindowDrag {
     }
 }
 
-enum SettingsAction {
+enum OptionsAction {
     SelectSaveFolder,
     GoToSaveFolder,
+    SelectSnapshotFolder,
+    OpenSnapshotFolder,
     Hide,
+    Show,
     Quit,
+    Close,
 }
 
 impl MeterMode {
@@ -401,31 +396,63 @@ struct ExportJob {
 
 struct ExportClip {
     revision: u64,
-    snapshot: Arc<Snapshot>,
-    frames: Range<usize>,
-    output: PathBuf,
-    profile: WavExportProfile,
+    wav: WavClip,
     immediate: bool,
     provisional: bool,
 }
 
 impl ExportClip {
     fn write(self) -> io::Result<ExportedWav> {
+        Ok(ExportedWav {
+            path: self.wav.write()?,
+            provisional: self.provisional,
+        })
+    }
+}
+
+struct WavClip {
+    snapshot: Arc<Snapshot>,
+    frames: Range<usize>,
+    output: PathBuf,
+    profile: WavExportProfile,
+}
+
+impl WavClip {
+    fn new(
+        snapshot: Arc<Snapshot>,
+        selection: Option<&Range<f32>>,
+        output: PathBuf,
+        profile: WavExportProfile,
+    ) -> Option<Self> {
+        let frames = snapshot.frame_count();
+        if frames == 0 {
+            return None;
+        }
+        let frames = selection.map_or(0..frames, |selection| {
+            let start = ((selection.start * frames as f32).floor() as usize).min(frames - 1);
+            let end = ((selection.end * frames as f32).ceil() as usize).clamp(start + 1, frames);
+            start..end
+        });
+        Some(Self {
+            snapshot,
+            frames,
+            output,
+            profile,
+        })
+    }
+
+    fn write(self) -> io::Result<PathBuf> {
         let samples = self
             .snapshot
             .frames(self.frames)
             .ok_or_else(|| io::Error::other("invalid audio selection"))?;
-        let path = export_wav_with_profile(
+        export_wav_with_profile(
             &self.output,
             self.snapshot.sample_rate,
             self.snapshot.channels,
             samples,
             self.profile,
-        )?;
-        Ok(ExportedWav {
-            path,
-            provisional: self.provisional,
-        })
+        )
     }
 }
 
@@ -455,11 +482,13 @@ impl Recorder {
             launch_at_login: false,
             quitting: false,
             output: settings.output,
+            saved_output: settings.saved_output,
             pinned: settings.pinned,
             next_pin_check: Instant::now(),
             waveform_only: settings.waveform_only,
             full_waveform_height: DEFAULT_WAVEFORM_HEIGHT,
-            settings_restore: None,
+            options_open: false,
+            options_focus_requested: false,
             window_position: settings.window_position,
             window_position_changed: None,
             idle_resume: settings.idle_resume,
@@ -481,6 +510,8 @@ impl Recorder {
             window_drag: None,
             export: None,
             pending_exports: VecDeque::new(),
+            snapshot_save: None,
+            pending_snapshot_saves: VecDeque::new(),
             clip_revision: 0,
             exported: None,
             message: String::new(),
@@ -513,6 +544,7 @@ impl Recorder {
     }
 
     fn hide(&mut self, ctx: &egui::Context) {
+        self.options_open = false;
         self.window_drag = None;
         if self.gesture.take().is_some() {
             self.resume();
@@ -564,12 +596,17 @@ impl Recorder {
             }
         }
         match action {
-            Some(tray::Action::Show) => {
-                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(ViewportCommand::Focus);
-            }
+            Some(tray::Action::Show) => self.show(ctx),
             Some(tray::Action::Hide) => self.hide(ctx),
+            Some(tray::Action::Options) => {
+                if frame
+                    .winit_window()
+                    .is_some_and(|window| window_is_hidden(window))
+                {
+                    self.show(ctx);
+                }
+                self.open_options(ctx);
+            }
             Some(tray::Action::ToggleStartup) => {
                 let enabled = startup::enabled().unwrap_or(self.launch_at_login);
                 self.set_launch_at_login(!enabled, frame);
@@ -599,9 +636,7 @@ impl Recorder {
             self.save_window_position();
             return;
         }
-        // A small waveform window can temporarily move when the settings menu is expanded.
-        if self.settings_restore.is_some()
-            || window.is_minimized() == Some(true)
+        if window.is_minimized() == Some(true)
             || window.is_maximized()
             || window.fullscreen().is_some()
         {
@@ -727,21 +762,18 @@ impl Recorder {
         }
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, menu_open: bool) -> bool {
+    fn controls(&mut self, ui: &mut egui::Ui, interaction_blocked: bool) {
         ui.horizontal(|ui| {
             ui.heading("Backtracking");
-            self.transport_button(ui, menu_open);
+            self.transport_button(ui, interaction_blocked);
             self.recording_indicator(ui);
-            self.clear_button(ui, menu_open);
-            self.pin_button(ui, menu_open);
+            self.clear_button(ui, interaction_blocked);
+            self.pin_button(ui, interaction_blocked);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let settings_open = self.settings_button(ui, frame);
+                self.options_button(ui, !interaction_blocked && self.gesture.is_none());
                 self.meter_readout(ui);
-                settings_open
-            })
-            .inner
-        })
-        .inner
+            });
+        });
     }
 
     fn toggle_capture(&mut self) {
@@ -877,15 +909,7 @@ impl Recorder {
         let response = ui.add_enabled(!menu_open, icon_button());
         if response.clicked() {
             self.pinned = !self.pinned;
-            self.next_pin_check = Instant::now();
-            self.save_preference(Key::AlwaysOnTop, if self.pinned { "1" } else { "0" });
-            let level = if self.pinned {
-                egui::WindowLevel::AlwaysOnTop
-            } else {
-                egui::WindowLevel::Normal
-            };
-            ui.ctx()
-                .send_viewport_cmd(ViewportCommand::WindowLevel(level));
+            self.apply_pinned(ui.ctx());
         }
         response.widget_info(|| {
             egui::WidgetInfo::selected(egui::Role::CheckBox, !menu_open, self.pinned, "Keep on top")
@@ -927,9 +951,22 @@ impl Recorder {
         );
     }
 
-    fn settings_button(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) -> bool {
-        let response = ui.add(icon_button()).on_hover_text("Settings");
-        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Settings"));
+    fn apply_pinned(&mut self, ctx: &egui::Context) {
+        self.next_pin_check = Instant::now();
+        self.save_preference(Key::AlwaysOnTop, if self.pinned { "1" } else { "0" });
+        let level = if self.pinned {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(level));
+    }
+
+    fn options_button(&mut self, ui: &mut egui::Ui, enabled: bool) {
+        let response = ui
+            .add_enabled(enabled, icon_button())
+            .on_hover_text("Options");
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, "Options"));
         let center = response.rect.center();
         let color = ui.style().interact(&response).fg_stroke.color;
         let mut teeth = Vec::with_capacity(32);
@@ -943,281 +980,318 @@ impl Recorder {
         let stroke = Stroke::new(1.2, color);
         ui.painter().add(egui::Shape::closed_line(teeth, stroke));
         ui.painter().circle_stroke(center, 2.6, stroke);
-
-        self.show_settings(egui::Popup::menu(&response).gap(4.0), ui, frame)
+        if response.clicked() {
+            self.open_options(ui.ctx());
+        }
     }
 
-    fn context_settings(&mut self, ui: &egui::Ui, frame: &eframe::Frame) -> bool {
-        let open = self.gesture.is_none()
-            && !egui::Popup::is_any_open(ui.ctx())
-            && ui.input(|input| {
-                input.pointer.button_clicked(PointerButton::Secondary)
-                    && input
-                        .pointer
-                        .hover_pos()
-                        .is_some_and(|position| input.content_rect().contains(position))
-            });
-        if open
-            && self.waveform_only
-            && let Some(expanded) = expanded_settings_size(ui.ctx())
-        {
-            self.settings_restore = Some(SettingsRestore {
-                size: ui.ctx().viewport_rect().size(),
-                position: fit_expanded_window(ui.ctx(), frame, expanded),
-            });
-            ui.ctx()
-                .send_viewport_cmd(ViewportCommand::InnerSize(expanded));
-        }
-        let popup = egui::Popup::menu(&ui.response())
-            .open_memory(open.then_some(true.into()))
-            .at_pointer_fixed();
-        let menu_open = self.show_settings(popup, ui, frame);
-        if !egui::Popup::is_any_open(ui.ctx())
-            && let Some(restore) = self.settings_restore.take()
-            && self.waveform_only
-        {
-            ui.ctx()
-                .send_viewport_cmd(ViewportCommand::InnerSize(restore.size));
-            if let Some(position) = restore.position {
-                ui.ctx()
-                    .send_viewport_cmd(ViewportCommand::OuterPosition(position));
-            }
-        }
-        menu_open
+    fn open_options(&mut self, ctx: &egui::Context) {
+        self.options_open = true;
+        self.options_focus_requested = true;
+        ctx.send_viewport_cmd(ViewportCommand::RequestPaintWhileHidden);
+        ctx.request_repaint();
     }
 
-    fn apply_waveform_mode(&mut self, ui: &egui::Ui, frame: &eframe::Frame) {
+    fn show(&self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+    }
+
+    fn apply_waveform_mode(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         set_waveform_frame(frame.winit_window(), self.waveform_only);
         self.save_preference(
             Key::WaveformOnly,
             if self.waveform_only { "1" } else { "0" },
         );
         let minimum = min_window_size(self.waveform_only);
-        ui.ctx()
-            .send_viewport_cmd(ViewportCommand::MinInnerSize(minimum));
+        ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(minimum));
         if !self.waveform_only {
-            let size = ui.ctx().viewport_rect().size();
+            let size = ctx.viewport_rect().size();
             let expanded = size.max(minimum);
             if expanded != size {
-                fit_expanded_window(ui.ctx(), frame, expanded);
-                ui.ctx()
-                    .send_viewport_cmd(ViewportCommand::InnerSize(expanded));
+                fit_expanded_window(ctx, frame, expanded);
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(expanded));
             }
         }
     }
 
-    fn waveform_mode_settings(&mut self, ui: &mut egui::Ui, label: &str) -> (bool, bool) {
-        let transport = if self.controller.is_paused() {
-            "Play"
-        } else {
-            "Pause"
-        };
-        let transport_clicked = self.waveform_only && ui.button(transport).clicked();
-        if transport_clicked {
-            self.toggle_capture();
+    fn draw_options_window(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if !self.options_open {
+            return;
         }
-        let changed = ui.checkbox(&mut self.waveform_only, label).changed();
-        (changed, transport_clicked)
-    }
-
-    fn show_settings(
-        &mut self,
-        popup: egui::Popup<'_>,
-        ui: &egui::Ui,
-        frame: &eframe::Frame,
-    ) -> bool {
-        let popup = popup
-            .accessible_name("Settings")
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
-        let was_open = popup.is_open();
-        if self.waveform_only
-            && let Some(expanded) = expanded_settings_size(ui.ctx())
+        // A direct repaint of a hidden window can run without the event loop context
+        // eframe needs to create an immediate viewport.
+        if frame
+            .winit_window()
+            .is_some_and(|window| window_is_hidden(window))
         {
-            let shown = popup.show(|ui| {
-                let (changed, transport_clicked, expand) = ui
-                    .horizontal(|ui| {
-                        let (changed, transport_clicked) =
-                            self.waveform_mode_settings(ui, "Waveform only");
-                        let expand = ui
-                            .button("Expand")
-                            .on_hover_text("Expand settings")
-                            .clicked();
-                        (changed, transport_clicked, expand)
-                    })
-                    .inner;
-                if changed {
-                    self.apply_waveform_mode(ui, frame);
-                }
-                if changed || transport_clicked {
-                    ui.close();
-                } else if expand {
-                    let position = fit_expanded_window(ui.ctx(), frame, expanded);
-                    if let Some(restore) = &mut self.settings_restore {
-                        restore.position = restore.position.or(position);
-                    }
-                    ui.ctx()
-                        .send_viewport_cmd(ViewportCommand::InnerSize(expanded));
-                }
-            });
-            return was_open || shown.is_some();
+            self.options_focus_requested = true;
+            return;
         }
-        let settings_height = (ui.ctx().content_rect().height() - 59.0).max(48.0);
-        let shown = popup.show(|ui| {
-            ui.set_width(SETTINGS_WIDTH);
-            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
-            let (waveform_only_changed, transport_clicked) = egui::ScrollArea::vertical()
-                .id_salt("settings-options")
-                .max_height(settings_height)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.spacing_mut().interact_size.y = 15.0;
-                    ui.spacing_mut().button_padding.y = 0.5;
-                    let mut enabled = self.launch_at_login;
-                    if ui
-                        .checkbox(&mut enabled, "Start with Windows")
-                        .on_hover_text(
-                            "Launch Backtracking from its current location when you sign in",
-                        )
-                        .changed()
-                    {
-                        self.set_launch_at_login(enabled, frame);
-                    }
-                    self.accent_settings(ui);
-                    let mode_actions = ui
-                        .horizontal(|ui| self.waveform_mode_settings(ui, "Show waveform only"))
-                        .inner;
-                    ui.separator();
-                    egui::Grid::new("recording-settings")
-                        .spacing([9.0, 1.0])
-                        .show(ui, |ui| {
-                            ui.label("History");
-                            ui.horizontal(|ui| {
-                                let mut retention = self.controller.retention();
-                                for value in DurationChoice::ALL {
-                                    ui.selectable_value(
-                                        &mut retention,
-                                        value,
-                                        format!("{} s", value.seconds()),
-                                    );
-                                }
-                                if retention != self.controller.retention() {
-                                    self.controller.set_retention(retention);
-                                    self.clear_snapshot();
-                                    self.save_preference(
-                                        Key::History,
-                                        retention.seconds().to_string(),
-                                    );
-                                }
-                            });
-                            ui.end_row();
-                            ui.label("Auto-resume");
-                            ui.horizontal(|ui| {
-                                let before = self.idle_resume;
-                                for value in AutoResumeDelay::ALL {
-                                    ui.selectable_value(
-                                        &mut self.idle_resume,
-                                        value,
-                                        format!("{} s", value.seconds()),
-                                    );
-                                }
-                                if self.idle_resume != before {
-                                    let seconds = self.idle_resume.seconds();
-                                    self.save_preference(Key::IdleResume, seconds.to_string());
-                                }
-                            });
-                            ui.end_row();
-                            ui.label("Background")
-                                .on_hover_text("Background transparency");
-                            ui.horizontal(|ui| {
-                                let before = self.transparency;
-                                for value in TRANSPARENCIES {
-                                    ui.selectable_value(
-                                        &mut self.transparency,
-                                        value,
-                                        format!("{value}%"),
-                                    );
-                                }
-                                if self.transparency != before {
-                                    self.save_preference(
-                                        Key::Transparency,
-                                        self.transparency.to_string(),
-                                    );
-                                }
-                            });
-                            ui.end_row();
-                            ui.label("Meter");
-                            ui.horizontal(|ui| {
-                                let before = self.meter_mode;
-                                for mode in MeterMode::OPTIONS {
-                                    ui.selectable_value(&mut self.meter_mode, mode, mode.unit())
-                                        .on_hover_text(mode.description());
-                                }
-                                if self.meter_mode != before {
-                                    self.save_preference(Key::Meter, self.meter_mode.unit());
-                                }
-                            });
-                            ui.end_row();
-                            self.wav_settings(ui);
-                        });
-                    mode_actions
-                })
-                .inner;
-            if waveform_only_changed {
-                self.apply_waveform_mode(ui, frame);
+        let pinned = self.pinned;
+        let waveform_only = self.waveform_only;
+        let builder = egui::ViewportBuilder::default()
+            .with_title(tray::OPTIONS_TITLE)
+            .with_inner_size([465.0, 540.0])
+            .with_min_inner_size([375.0, 300.0])
+            .with_maximize_button(false)
+            .with_taskbar(false)
+            .with_visible(false)
+            .with_window_level(if self.pinned {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            });
+        let action = ctx.show_viewport_immediate(options_viewport(), builder, |ui, class| {
+            if ui.input(|input| input.viewport().close_requested()) {
+                return Some(OptionsAction::Close);
             }
-            if waveform_only_changed || transport_clicked {
-                ui.close();
+            if std::mem::take(&mut self.options_focus_requested)
+                && class == egui::ViewportClass::Immediate
+            {
+                tray::prepare_options_window();
+                ui.ctx().send_viewport_cmd(ViewportCommand::Visible(true));
+                ui.ctx()
+                    .send_viewport_cmd(ViewportCommand::Minimized(false));
+                ui.ctx().send_viewport_cmd(ViewportCommand::Focus);
             }
-
-            ui.separator();
-            let action = ui
-                .horizontal(|ui| {
-                    let choose = ui.button("Select save folder").clicked();
-                    let open = ui
-                        .button("Go to save folder")
-                        .on_hover_text(self.output.display().to_string())
-                        .clicked();
-                    let hide = self.tray_available && ui.button("Hide").clicked();
-                    let quit = ui.button("Quit").clicked();
-                    if choose {
-                        Some(SettingsAction::SelectSaveFolder)
-                    } else if open {
-                        Some(SettingsAction::GoToSaveFolder)
-                    } else if hide {
-                        Some(SettingsAction::Hide)
-                    } else {
-                        quit.then_some(SettingsAction::Quit)
-                    }
-                })
-                .inner;
-            if action.is_some() {
-                ui.close();
+            self.handle_snapshot_shortcut(ui.ctx());
+            if ui.input(|input| input.pointer.any_pressed()) {
+                self.last_interaction = Instant::now();
             }
-            action
+            self.options_contents(ui, frame)
         });
-
-        match shown.as_ref().and_then(|menu| menu.inner.as_ref()) {
-            Some(SettingsAction::SelectSaveFolder) => self.select_save_folder(frame),
-            Some(SettingsAction::GoToSaveFolder) => {
+        if self.waveform_only != waveform_only {
+            self.apply_waveform_mode(ctx, frame);
+        }
+        if self.pinned != pinned {
+            self.apply_pinned(ctx);
+        }
+        match action {
+            Some(OptionsAction::SelectSaveFolder) => self.select_save_folder(frame),
+            Some(OptionsAction::GoToSaveFolder) => {
                 let result = std::fs::create_dir_all(&self.output)
                     .and_then(|()| Command::new("explorer.exe").arg(&self.output).spawn());
                 if let Err(error) = result {
                     self.message = format!("Could not open save folder: {error}");
-                    if self.waveform_only {
-                        rfd::MessageDialog::new()
-                            .set_title("Could not open save folder")
-                            .set_description(error.to_string())
-                            .set_level(rfd::MessageLevel::Error)
-                            .set_parent(frame)
-                            .show();
-                    }
                 }
             }
-            Some(SettingsAction::Hide) => self.hide(ui.ctx()),
-            Some(SettingsAction::Quit) => self.quit(ui.ctx()),
+            Some(OptionsAction::SelectSnapshotFolder) => self.select_saved_snapshot_folder(frame),
+            Some(OptionsAction::OpenSnapshotFolder) => self.open_saved_snapshot_folder(frame),
+            Some(OptionsAction::Hide) => self.hide(ctx),
+            Some(OptionsAction::Show) => self.show(ctx),
+            Some(OptionsAction::Quit) => self.quit(ctx),
+            Some(OptionsAction::Close) => self.options_open = false,
             None => {}
         }
-        was_open || shown.is_some()
+    }
+
+    fn options_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: &eframe::Frame,
+    ) -> Option<OptionsAction> {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(16))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::CollapsingHeader::new("Capture")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                self.capture_options(ui);
+                            });
+                        egui::CollapsingHeader::new("Appearance")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                self.appearance_options(ui);
+                            });
+                        egui::CollapsingHeader::new("WAV export")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                egui::Grid::new("wav-options").show(ui, |ui| self.wav_settings(ui));
+                                if ui.button("Save snapshot (Ctrl+S)").clicked() {
+                                    self.save_snapshot();
+                                }
+                            });
+                        let folders = egui::CollapsingHeader::new("Save folders")
+                            .default_open(true)
+                            .show(ui, |ui| self.folder_options(ui))
+                            .body_returned
+                            .flatten();
+                        let app = egui::CollapsingHeader::new("App")
+                            .default_open(true)
+                            .show(ui, |ui| self.app_options(ui, frame))
+                            .body_returned
+                            .flatten();
+                        if !self.message.is_empty() {
+                            ui.label(&self.message);
+                        }
+                        folders.or(app)
+                    })
+                    .inner
+            })
+            .inner
+    }
+
+    fn capture_options(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let can_toggle = self.gesture.is_none();
+            let transport = if self.controller.error().is_some() {
+                "Retry capture"
+            } else if self.controller.is_paused() {
+                "Play"
+            } else {
+                "Pause"
+            };
+            if ui
+                .add_enabled(can_toggle, egui::Button::new(transport))
+                .clicked()
+            {
+                self.toggle_capture();
+            }
+            if ui
+                .add_enabled(can_toggle, egui::Button::new("Clear capture"))
+                .clicked()
+            {
+                self.clear_capture();
+            }
+            if ui
+                .add_enabled(
+                    self.selection.is_some(),
+                    egui::Button::new("Cancel selection"),
+                )
+                .clicked()
+            {
+                self.cancel_selection();
+            }
+        });
+        egui::Grid::new("capture-options").show(ui, |ui| {
+            ui.label("History");
+            ui.horizontal(|ui| {
+                let mut retention = self.controller.retention();
+                for value in DurationChoice::ALL {
+                    ui.selectable_value(&mut retention, value, format!("{} s", value.seconds()));
+                }
+                if retention != self.controller.retention() {
+                    self.controller.set_retention(retention);
+                    self.clear_snapshot();
+                    self.save_preference(Key::History, retention.seconds().to_string());
+                }
+            });
+            ui.end_row();
+            ui.label("Auto-resume");
+            ui.horizontal(|ui| {
+                let before = self.idle_resume;
+                for value in AutoResumeDelay::ALL {
+                    ui.selectable_value(
+                        &mut self.idle_resume,
+                        value,
+                        format!("{} s", value.seconds()),
+                    );
+                }
+                if self.idle_resume != before {
+                    self.save_preference(Key::IdleResume, self.idle_resume.seconds().to_string());
+                }
+            });
+            ui.end_row();
+        });
+    }
+
+    fn appearance_options(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.waveform_only, "Show waveform only");
+        ui.checkbox(&mut self.pinned, "Keep on top");
+        egui::Grid::new("appearance-options").show(ui, |ui| {
+            ui.label("Background transparency");
+            ui.horizontal(|ui| {
+                let before = self.transparency;
+                for value in TRANSPARENCIES {
+                    ui.selectable_value(&mut self.transparency, value, format!("{value}%"));
+                }
+                if self.transparency != before {
+                    self.save_preference(Key::Transparency, self.transparency.to_string());
+                }
+            });
+            ui.end_row();
+            ui.label("Meter");
+            ui.horizontal(|ui| {
+                let before = self.meter_mode;
+                for mode in MeterMode::OPTIONS {
+                    ui.selectable_value(&mut self.meter_mode, mode, mode.unit())
+                        .on_hover_text(mode.description());
+                }
+                if self.meter_mode != before {
+                    self.save_preference(Key::Meter, self.meter_mode.unit());
+                }
+            });
+            ui.end_row();
+        });
+        self.accent_settings(ui);
+    }
+
+    fn folder_options(&self, ui: &mut egui::Ui) -> Option<OptionsAction> {
+        let waveform = ui
+            .horizontal(|ui| {
+                let select = ui.button("Select save folder").clicked();
+                let open = ui
+                    .button("Go to save folder")
+                    .on_hover_text(self.output.display().to_string())
+                    .clicked();
+                if select {
+                    Some(OptionsAction::SelectSaveFolder)
+                } else {
+                    open.then_some(OptionsAction::GoToSaveFolder)
+                }
+            })
+            .inner;
+        let snapshot = ui
+            .horizontal(|ui| {
+                let select = ui.button("Select snapshot folder").clicked();
+                let open = ui
+                    .button("Go to snapshot folder")
+                    .on_hover_text(self.saved_output.display().to_string())
+                    .clicked();
+                if select {
+                    Some(OptionsAction::SelectSnapshotFolder)
+                } else {
+                    open.then_some(OptionsAction::OpenSnapshotFolder)
+                }
+            })
+            .inner;
+        waveform.or(snapshot)
+    }
+
+    fn app_options(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) -> Option<OptionsAction> {
+        let mut enabled = self.launch_at_login;
+        if ui
+            .checkbox(&mut enabled, "Start with Windows")
+            .on_hover_text("Launch Backtracking from its current location when you sign in")
+            .changed()
+        {
+            self.set_launch_at_login(enabled, frame);
+        }
+        let visible = frame
+            .winit_window()
+            .is_none_or(|window| !window_is_hidden(window));
+        ui.horizontal(|ui| {
+            let visibility = if visible {
+                ui.add_enabled(self.tray_available, egui::Button::new("Hide waveform"))
+                    .clicked()
+                    .then_some(OptionsAction::Hide)
+            } else {
+                ui.button("Show waveform")
+                    .clicked()
+                    .then_some(OptionsAction::Show)
+            };
+            let quit = ui.button("Quit Backtracking").clicked();
+            let close = ui.button("Close Options").clicked();
+            visibility
+                .or_else(|| quit.then_some(OptionsAction::Quit))
+                .or_else(|| close.then_some(OptionsAction::Close))
+        })
+        .inner
     }
 
     fn select_save_folder(&mut self, frame: &eframe::Frame) {
@@ -1250,6 +1324,40 @@ impl Recorder {
         self.last_interaction = Instant::now();
         if !was_paused && self.idle_resume == AutoResumeDelay::Immediate {
             self.controller.resume();
+        }
+    }
+
+    fn select_saved_snapshot_folder(&mut self, frame: &eframe::Frame) {
+        let Some(folder) = rfd::FileDialog::new()
+            .set_title("Select snapshot folder")
+            .set_directory(&self.saved_output)
+            .set_parent(frame)
+            .pick_folder()
+        else {
+            return;
+        };
+        let saved = folder
+            .to_str()
+            .ok_or_else(|| io::Error::other("snapshot folder path is not valid UTF-8"))
+            .and_then(|path| self.preferences.save(Key::SavedSnapshots, path));
+        self.saved_output = folder;
+        self.message = match saved {
+            Ok(()) => format!("Snapshot folder: {}", self.saved_output.display()),
+            Err(error) => format!("Could not save settings: {error}"),
+        };
+    }
+
+    fn open_saved_snapshot_folder(&mut self, frame: &eframe::Frame) {
+        let result = std::fs::create_dir_all(&self.saved_output)
+            .and_then(|()| Command::new("explorer.exe").arg(&self.saved_output).spawn());
+        if let Err(error) = result {
+            self.message = format!("Could not open snapshot folder: {error}");
+            rfd::MessageDialog::new()
+                .set_title("Could not open snapshot folder")
+                .set_description(error.to_string())
+                .set_level(rfd::MessageLevel::Error)
+                .set_parent(frame)
+                .show();
         }
     }
 
@@ -1306,6 +1414,84 @@ impl Recorder {
         });
     }
 
+    fn handle_snapshot_shortcut(&mut self, ctx: &egui::Context) {
+        let requests = ctx.input_mut(|input| {
+            if !input.focused {
+                return 0;
+            }
+            let mut requests = 0;
+            input.events.retain(|event| {
+                if !snapshot_save_key(event) {
+                    return true;
+                }
+                requests += usize::from(matches!(event, egui::Event::Key { repeat: false, .. }));
+                false
+            });
+            requests
+        });
+        for _ in 0..requests {
+            self.save_snapshot();
+        }
+    }
+
+    fn save_snapshot(&mut self) {
+        if self.gesture.is_some() {
+            return;
+        }
+        let selection = self.selection.as_ref();
+        let snapshot = if selection.is_some() {
+            self.snapshot.clone()
+        } else {
+            self.controller.poll();
+            self.controller.snapshot().map(Arc::new)
+        };
+        let Some(clip) = snapshot.and_then(|snapshot| {
+            WavClip::new(
+                snapshot,
+                selection,
+                self.saved_output.clone(),
+                self.wav_profile,
+            )
+        }) else {
+            self.message = "No audio captured yet.".into();
+            return;
+        };
+        self.pending_snapshot_saves.push_back(clip);
+        if selection.is_some() || self.controller.is_paused() {
+            self.resume();
+        }
+        self.collect_snapshot_saves();
+    }
+
+    fn collect_snapshot_saves(&mut self) {
+        if self
+            .snapshot_save
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            return;
+        }
+        if let Some(worker) = self.snapshot_save.take() {
+            self.message = match worker.join() {
+                Ok(Ok(path)) => format!("Saved snapshot {}", path.display()),
+                Ok(Err(error)) => format!("Could not save snapshot: {error}"),
+                Err(_) => "Snapshot worker stopped unexpectedly.".into(),
+            };
+        }
+        if let Some(clip) = self.pending_snapshot_saves.pop_front() {
+            match thread::Builder::new()
+                .name("backtracking-snapshot".into())
+                .spawn(move || clip.write())
+            {
+                Ok(worker) => {
+                    self.snapshot_save = Some(worker);
+                    self.message = "Saving snapshot…".into();
+                }
+                Err(error) => self.message = format!("Could not start snapshot save: {error}"),
+            }
+        }
+    }
+
     fn start_export(&mut self, provisional: bool) {
         let revision = self.clip_revision;
         if self.exported.is_some()
@@ -1320,27 +1506,20 @@ impl Recorder {
         {
             return;
         }
-        let Some(snapshot) = self
-            .snapshot
-            .as_ref()
-            .filter(|s| s.frame_count() > 0)
-            .cloned()
-        else {
+        let Some(wav) = self.snapshot.clone().and_then(|snapshot| {
+            WavClip::new(
+                snapshot,
+                self.selection.as_ref(),
+                self.output.clone(),
+                self.wav_profile,
+            )
+        }) else {
             self.message = "No audio captured yet.".into();
             return;
         };
-        let frames = snapshot.frame_count();
-        let frames_to_export = self.selection.as_ref().map_or(0..frames, |selection| {
-            let start = ((selection.start * frames as f32).floor() as usize).min(frames - 1);
-            let end = ((selection.end * frames as f32).ceil() as usize).clamp(start + 1, frames);
-            start..end
-        });
         let clip = ExportClip {
             revision,
-            snapshot,
-            frames: frames_to_export,
-            output: self.output.clone(),
-            profile: self.wav_profile,
+            wav,
             immediate: self.idle_resume == AutoResumeDelay::Immediate,
             provisional,
         };
@@ -1694,6 +1873,12 @@ impl eframe::App for Recorder {
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        if input.focused && self.selection.is_some() && input.events.iter().any(snapshot_save_key) {
+            self.last_interaction = Instant::now();
+        }
+        if input.viewport_id != egui::ViewportId::ROOT {
+            return;
+        }
         let viewport = input.viewport();
         if viewport.minimized == Some(true) || viewport.fullscreen == Some(true) || !input.focused {
             self.window_drag = None;
@@ -1794,6 +1979,7 @@ impl eframe::App for Recorder {
             self.recording_started = None;
         }
         self.collect_export();
+        self.collect_snapshot_saves();
         if self.controller.is_paused()
             && self.gesture.is_none()
             && self.idle_resume != AutoResumeDelay::Immediate
@@ -1803,7 +1989,11 @@ impl eframe::App for Recorder {
             self.resume();
         }
         ctx.request_repaint_after(
-            if self.window_drag.is_some() || self.gesture.is_some() || self.export.is_some() {
+            if self.window_drag.is_some()
+                || self.gesture.is_some()
+                || self.export.is_some()
+                || self.snapshot_save.is_some()
+            {
                 Duration::from_millis(16)
             } else {
                 REFRESH
@@ -1824,14 +2014,19 @@ impl eframe::App for Recorder {
             .frame(frame_style)
             .show(ui, |ui| {
                 let window_drag = self.window_drag.as_ref().map(|drag| drag.interaction);
-                let menu_open = window_drag.is_some()
-                    || self.context_settings(ui, frame)
-                    || egui::Popup::is_any_open(ui.ctx());
-                let menu_open =
-                    (!self.waveform_only && self.controls(ui, frame, menu_open)) || menu_open;
+                let interaction_blocked = window_drag.is_some();
+                if !interaction_blocked
+                    && self.gesture.is_none()
+                    && ui.input(|input| input.pointer.button_clicked(PointerButton::Secondary))
+                {
+                    self.open_options(ui.ctx());
+                }
+                if !self.waveform_only {
+                    self.controls(ui, interaction_blocked);
+                }
                 let window_cursor = if let Some(interaction) = window_drag {
                     Some(interaction.cursor())
-                } else if !menu_open && self.gesture.is_none() {
+                } else if !interaction_blocked && self.gesture.is_none() {
                     ui.input(|input| {
                         if input.viewport().fullscreen == Some(true) {
                             return None;
@@ -1858,10 +2053,11 @@ impl eframe::App for Recorder {
                 if !self.waveform_only {
                     self.full_waveform_height = rect.height() - 2.0 * WAVEFORM_INSET;
                 }
-                if !menu_open {
+                if !interaction_blocked {
                     self.interact_waveform(ui, frame, &response);
                 }
-                self.draw_waveform(ui, rect, !menu_open && window_cursor.is_none());
+                self.handle_snapshot_shortcut(ui.ctx());
+                self.draw_waveform(ui, rect, !interaction_blocked && window_cursor.is_none());
                 let status = self.controller.error().unwrap_or(&self.message);
                 if !self.waveform_only && !status.is_empty() {
                     ui.add(egui::Label::new(status).truncate())
@@ -1869,13 +2065,14 @@ impl eframe::App for Recorder {
                 }
                 if let Some(cursor) = window_cursor {
                     ui.ctx().set_cursor_icon(cursor);
-                } else if !menu_open {
+                } else if !interaction_blocked {
                     if !self.waveform_only {
                         self.draw_action_hint(ui, &response);
                     }
                     response.on_hover_cursor(CursorIcon::Grab);
                 }
             });
+        self.draw_options_window(ui.ctx(), frame);
     }
 }
 
@@ -1893,7 +2090,25 @@ impl Drop for Recorder {
         {
             let _ = clip.write();
         }
+        if let Some(worker) = self.snapshot_save.take() {
+            let _ = worker.join();
+        }
+        for clip in self.pending_snapshot_saves.drain(..) {
+            let _ = clip.write();
+        }
     }
+}
+
+fn snapshot_save_key(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key {
+            key: egui::Key::S,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.ctrl && !modifiers.alt && !modifiers.shift && !modifiers.mac_cmd
+    )
 }
 
 fn fraction(rect: Rect, x: f32) -> f32 {
