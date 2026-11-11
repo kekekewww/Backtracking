@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Bounded, nonblocking audio transfer between exactly one producer and one consumer.
@@ -113,12 +113,15 @@ pub struct TimedPacket {
     pub timestamp_ns: u64,
     pub sample_rate: u32,
     pub frames: usize,
+    /// The producer confirmed a break in the audio before this packet.
+    pub discontinuity: bool,
 }
 
 struct PacketSlot {
     timestamp_ns: AtomicU64,
     sample_rate: AtomicU32,
     frames: AtomicUsize,
+    discontinuity: AtomicBool,
 }
 
 /// Bounded timestamped transfer between one audio producer and one consumer.
@@ -141,6 +144,7 @@ impl TimedAudioQueue {
                     timestamp_ns: AtomicU64::new(0),
                     sample_rate: AtomicU32::new(0),
                     frames: AtomicUsize::new(0),
+                    discontinuity: AtomicBool::new(false),
                 })
                 .collect(),
             channels,
@@ -154,7 +158,17 @@ impl TimedAudioQueue {
     }
 
     pub fn push_interleaved(&self, timestamp_ns: u64, sample_rate: u32, samples: &[f32]) -> usize {
-        self.push(timestamp_ns, sample_rate, || {
+        self.push_interleaved_with_discontinuity(timestamp_ns, sample_rate, samples, false)
+    }
+
+    pub fn push_interleaved_with_discontinuity(
+        &self,
+        timestamp_ns: u64,
+        sample_rate: u32,
+        samples: &[f32],
+        discontinuity: bool,
+    ) -> usize {
+        self.push(timestamp_ns, sample_rate, discontinuity, || {
             self.audio.push_interleaved(samples)
         })
     }
@@ -166,7 +180,7 @@ impl TimedAudioQueue {
         left: &[f32],
         right: Option<&[f32]>,
     ) -> usize {
-        self.push(timestamp_ns, sample_rate, || {
+        self.push(timestamp_ns, sample_rate, false, || {
             self.audio.push_planar(left, right)
         })
     }
@@ -175,6 +189,7 @@ impl TimedAudioQueue {
         &self,
         timestamp_ns: u64,
         sample_rate: u32,
+        discontinuity: bool,
         write_audio: impl FnOnce() -> usize,
     ) -> usize {
         let write = self.write.load(Ordering::Relaxed);
@@ -190,6 +205,7 @@ impl TimedAudioQueue {
         slot.timestamp_ns.store(timestamp_ns, Ordering::Relaxed);
         slot.sample_rate.store(sample_rate, Ordering::Relaxed);
         slot.frames.store(frames, Ordering::Relaxed);
+        slot.discontinuity.store(discontinuity, Ordering::Relaxed);
         self.write.store(write.wrapping_add(1), Ordering::Release);
         frames
     }
@@ -204,6 +220,7 @@ impl TimedAudioQueue {
         let timestamp_ns = slot.timestamp_ns.load(Ordering::Relaxed);
         let sample_rate = slot.sample_rate.load(Ordering::Relaxed);
         let frames = slot.frames.load(Ordering::Relaxed);
+        let discontinuity = slot.discontinuity.load(Ordering::Relaxed);
         scratch.resize(frames * self.channels, 0.);
         let copied = self.audio.pop_interleaved(scratch);
         debug_assert_eq!(copied, frames);
@@ -212,6 +229,7 @@ impl TimedAudioQueue {
             timestamp_ns,
             sample_rate,
             frames,
+            discontinuity,
         })
     }
 
@@ -240,7 +258,8 @@ mod tests {
             Some(TimedPacket {
                 timestamp_ns: 90,
                 sample_rate: 48_000,
-                frames: 2
+                frames: 2,
+                discontinuity: false,
             })
         );
         assert_eq!(samples, first);
@@ -252,11 +271,27 @@ mod tests {
             Some(TimedPacket {
                 timestamp_ns: 170,
                 sample_rate: 44_100,
-                frames: 3
+                frames: 3,
+                discontinuity: false,
             })
         );
         assert_eq!(samples, [4.; 9]);
         assert!(queue.pop(&mut samples).is_none());
+    }
+
+    #[test]
+    fn discontinuity_flag_follows_its_packet_when_a_slot_is_reused() {
+        let queue = TimedAudioQueue::new(4, 1, 1);
+        let mut samples = Vec::new();
+        assert_eq!(
+            queue.push_interleaved_with_discontinuity(90, 48_000, &[0.5], true),
+            1
+        );
+        assert!(queue.pop(&mut samples).unwrap().discontinuity);
+        assert_eq!(samples, [0.5]);
+        assert_eq!(queue.push_planar(120, 48_000, &[0.25], None), 1);
+        assert!(!queue.pop(&mut samples).unwrap().discontinuity);
+        assert_eq!(samples, [0.25]);
     }
 
     #[test]
