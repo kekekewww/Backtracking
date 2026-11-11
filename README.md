@@ -10,8 +10,8 @@ Backtracking 是給作曲與混音用的回溯錄音取樣器。聽到想留下�
 
 | 版本 | 擷取來源 |
 | --- | --- |
-| Windows 桌面版 | 預設播放裝置的共享混音 |
-| macOS 桌面版 | Core Audio 系統音訊 |
+| Windows 桌面版 | 系統播放、麥克風、指定 App，可選 A／B 兩路 |
+| macOS 桌面版 | 系統播放、麥克風、指定 App，可選 A／B 兩路 |
 | VST3／CLAP | DAW 在效果鏈插入點送進插件的音訊 |
 
 ### 快速開始
@@ -33,6 +33,8 @@ Backtracking 是給作曲與混音用的回溯錄音取樣器。聽到想留下�
 
 在 Options 可選擇 WAV 取樣率 **44.1、48 或 96 kHz**，以及 **16-bit PCM、24-bit PCM 或 32-bit IEEE float** 編碼。預設為 **48 kHz、32-bit float**。
 
+上次選段的兩端以旗標標記。框選時按住 `Shift`，游標靠近旗標即可吸附。Options 可切換合併或 L／R 波形。桌面版可為 A／B 各指定來源及聲道路由，同次 `Ctrl+S` 或拖放會匯出同起訖的兩個 WAV。**更新**設定提供啟動時自動安裝與手動檢查。 [擷取與波形](docs/USER_GUIDE.md#來源波形與旗標) · [啟動更新](docs/UPDATES.md)
+
 [完整操作手冊](docs/USER_GUIDE.md#繁體中文) · [桌面視窗操作](docs/USER_GUIDE.md#移動與縮放桌面視窗) · [安裝與建置](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
 
 ## English
@@ -41,8 +43,8 @@ Backtracking is a retrospective audio sampler for music production and mixing. W
 
 | Edition | Capture source |
 | --- | --- |
-| Windows desktop | Shared mix on the default playback device |
-| macOS desktop | System audio through Core Audio |
+| Windows desktop | System playback, microphone, or a selected app on up to two tracks |
+| macOS desktop | System playback, microphone, or a selected app on up to two tracks |
 | VST3 / CLAP | Audio the DAW sends to the plug-in at its insert point |
 
 ### Quick start
@@ -63,6 +65,8 @@ The desktop app restores its last window position. On Windows, use the system tr
 With Backtracking focused, press `Ctrl+S` to save the current snapshot to the saved snapshots folder. If a range is selected, it saves that range and immediately re-arms capture. With no selection, it saves all retained audio while active capture continues. Successful drops use the default export folder. Clicking, selecting, and dragging within the window do not write files. Both folders can be set in Options.
 
 Choose a WAV sample rate of **44.1, 48, or 96 kHz** and **16-bit PCM, 24-bit PCM, or 32-bit IEEE float** encoding in Options. The default is **48 kHz, 32-bit float**.
+
+Flags mark the previous range. Hold `Shift` near either flag while selecting to snap to it. Choose a merged or L/R waveform in Options. The desktop app can capture independent A/B sources and channel routes, then save or drag out two aligned WAVs. The update settings support installation at launch and manual checks. [Capture and waveform](docs/USER_GUIDE.md#sources-waveforms-and-flags) · [Startup updates](docs/UPDATES.md)
 
 [Full user guide](docs/USER_GUIDE.md#english) · [Desktop window controls](docs/USER_GUIDE.md#move-and-resize-the-desktop-window) · [Installation and build](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
 

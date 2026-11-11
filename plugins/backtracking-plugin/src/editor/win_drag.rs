@@ -104,7 +104,7 @@ unsafe extern "system" fn drag_message(
         // the host closes the editor while it is running.
         if unsafe { RemoveWindowSubclass(hwnd, Some(drag_message), id) }.as_bool() {
             let mut drag = unsafe { Box::from_raw(data as *mut ActiveDrag) };
-            match drag_file(hwnd, &drag.file.path) {
+            match drag_file(hwnd, &drag.file.wav.path) {
                 Ok(true) => drag.accept(),
                 Ok(false) => {}
                 Err(error) => {

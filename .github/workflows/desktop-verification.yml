@@ -1,0 +1,55 @@
+name: Native desktop verification
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/desktop-verification.yml'
+      - 'Cargo.*'
+      - 'crates/**'
+      - 'desktop/**'
+      - 'plugins/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.99.1 --profile minimal
+      - name: Test capture core
+        run: cargo +1.99.1 test --workspace --locked
+      - name: Test native desktop
+        run: cargo +1.99.1 test --locked --manifest-path desktop/windows/Cargo.toml
+      - name: Test native plug-in
+        run: cargo +1.99.1 test --locked --manifest-path plugins/backtracking-plugin/Cargo.toml
+      - name: Build Windows releases
+        run: |
+          cargo +1.99.1 build --locked --release --manifest-path desktop/windows/Cargo.toml
+          cargo +1.99.1 build --locked --release --manifest-path plugins/backtracking-plugin/Cargo.toml
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.99.1 --profile minimal
+      - name: Test capture core and plug-in
+        run: |
+          cargo +1.99.1 test --workspace --locked
+          cargo +1.99.1 test --locked --manifest-path plugins/backtracking-plugin/Cargo.toml
+      - name: Test signed update and rollback on macOS
+        run: |
+          xcrun swiftc -swift-version 5 -parse-as-library -D BACKTRACKING_UPDATER_TESTS \
+            desktop/macos/StartupUpdater.swift desktop/macos/tests/StartupUpdaterTests.swift \
+            -framework AppKit -o "$RUNNER_TEMP/backtracking-updater-tests"
+          "$RUNNER_TEMP/backtracking-updater-tests"
+      - name: Build and verify macOS app
+        run: |
+          RUSTUP_TOOLCHAIN=1.99.1 bash desktop/macos/build.sh
+          codesign --verify --strict --deep target/bundled/Backtracking.app
+      - name: Verify Swift capture routes and paired WAV export
+        run: RUSTUP_TOOLCHAIN=1.99.1 bash desktop/macos/verify-capture.sh

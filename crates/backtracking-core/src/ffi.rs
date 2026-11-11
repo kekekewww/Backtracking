@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     export_wav_with_profile, AudioQueue, Capture, CaptureState, DurationChoice, MeterReadings,
-    Snapshot, WavExportProfile, WavSampleFormat,
+    Snapshot, WavExportProfile, WavSampleFormat, WaveformView,
 };
 
 struct Reader {
@@ -210,6 +210,42 @@ unsafe extern "C" fn bt_waveform(
     let minimum = slice::from_raw_parts_mut(minimum, bins as usize);
     let maximum = slice::from_raw_parts_mut(maximum, bins as usize);
     reader.capture.waveform(minimum, maximum) as u64
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_waveform_view(
+    core: *const BtCore,
+    view: u32,
+    minimum: *mut f32,
+    maximum: *mut f32,
+    bins: u32,
+) -> u64 {
+    let (Some(core), Some(view)) = (core.as_ref(), WaveformView::from_code(view)) else {
+        return 0;
+    };
+    if minimum.is_null() || maximum.is_null() {
+        return 0;
+    }
+    let Ok(reader) = core.reader.lock() else {
+        return 0;
+    };
+    let minimum = slice::from_raw_parts_mut(minimum, bins as usize);
+    let maximum = slice::from_raw_parts_mut(maximum, bins as usize);
+    reader.capture.track_waveform(0, view, minimum, maximum) as u64
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_first_frame(core: *const BtCore) -> u64 {
+    core.as_ref()
+        .and_then(|core| core.reader.lock().ok())
+        .map_or(0, |reader| reader.capture.frame_range().start)
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_end_frame(core: *const BtCore) -> u64 {
+    core.as_ref()
+        .and_then(|core| core.reader.lock().ok())
+        .map_or(0, |reader| reader.capture.frame_range().end)
 }
 
 #[no_mangle]

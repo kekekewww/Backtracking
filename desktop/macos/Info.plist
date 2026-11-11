@@ -15,13 +15,15 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.1.5</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>5</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.2</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Backtracking captures a selected microphone when you enable that source.</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>Backtracking captures recent system audio so you can export samples as WAV files.</string>
 </dict>

@@ -7,9 +7,38 @@ use std::process::Command;
 const ICON: &str = "../../assets/backtracking.ico";
 const RT_ICON: u16 = 3;
 const RT_GROUP_ICON: u16 = 14;
+const RT_MANIFEST: u16 = 24;
+const APPLICATION_MANIFEST: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity name="Backtracking.Desktop" version="1.0.0.0" type="win32"/>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0"
+        processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>
+"#;
 
 fn main() {
     println!("cargo:rerun-if-changed={ICON}");
+    println!("cargo:rerun-if-env-changed=BACKTRACKING_UPDATE_PUBLIC_KEY");
+    if let Ok(key) = env::var("BACKTRACKING_UPDATE_PUBLIC_KEY") {
+        assert!(
+            key.len() == 64
+                && key
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+            "BACKTRACKING_UPDATE_PUBLIC_KEY must be a 32-byte lowercase hexadecimal Ed25519 public key"
+        );
+    }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -33,6 +62,7 @@ fn main() {
         assert!(status.success(), "{tool:?} could not compile the icon");
         object
     } else {
+        println!("cargo:rustc-link-arg-bin=Backtracking=/MANIFEST:NO");
         resource
     };
     println!("cargo:rustc-link-arg-bin=Backtracking={}", object.display());
@@ -94,6 +124,7 @@ fn icon_resource(icon: &[u8]) -> Vec<u8> {
         group.extend_from_slice(&id.to_le_bytes());
     }
     append_resource(&mut resource, RT_GROUP_ICON, 1, 0x0409, &group);
+    append_resource(&mut resource, RT_MANIFEST, 1, 0, APPLICATION_MANIFEST);
     resource
 }
 

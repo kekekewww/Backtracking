@@ -7,17 +7,19 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::controller::Controller;
+use crate::controller::{CaptureSource, Controller, SourceSettings};
 use crate::file_drag;
 use crate::preferences::{
-    DEFAULT_ACCENT, Key, MeterMode, Preferences, Settings, wav_sample_format_preference,
+    DEFAULT_ACCENT, Key, MeterMode, Preferences, Settings, serialize_sources,
+    wav_sample_format_preference,
 };
 use crate::startup;
 use crate::tray::{self, Tray};
+use crate::updater::UpdateOptions;
 use crate::window_order;
 use backtracking_core::{
-    AutoResumeDelay, DurationChoice, MeterReadings, Snapshot, WavExportProfile, WavSampleFormat,
-    export_wav_with_profile, waveform,
+    AutoResumeDelay, ChannelRoute, DurationChoice, MeterReadings, Snapshot, WavExportProfile,
+    WavSampleFormat, WaveformView, export_tracks_with_profile, waveform,
 };
 use eframe::egui::{
     self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection, Stroke, Vec2,
@@ -64,6 +66,8 @@ const WAVEFORM_MIN_HEIGHT: f32 = 48.0;
 // Plot height in the default full window, used when launching directly into waveform-only mode.
 const DEFAULT_WAVEFORM_HEIGHT: f32 = 59.0;
 const WAVEFORM_INSET: f32 = 8.0;
+const FLAG_SNAP_DISTANCE: f64 = 8.0;
+const FLAG_COLOR: Color32 = Color32::from_rgb(255, 201, 109);
 const PREPARING_WAV: &str = "Preparing WAV…";
 
 pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
@@ -112,6 +116,7 @@ pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
                 Ok(enabled) => recorder.launch_at_login = enabled,
                 Err(error) => recorder.message = format!("Could not read startup setting: {error}"),
             }
+            crate::updater::app_ready();
             Ok(Box::new(recorder))
         }),
     )
@@ -219,27 +224,35 @@ struct Recorder {
     full_waveform_height: f32,
     options_open: bool,
     options_focus_requested: bool,
+    available_sources: Vec<CaptureSource>,
+    source_list_worker: Option<JoinHandle<Vec<CaptureSource>>>,
+    updates: UpdateOptions,
     window_position: Option<[i32; 2]>,
     window_position_changed: Option<Instant>,
     idle_resume: AutoResumeDelay,
     transparency: u8,
     accent: Color32,
     saved_accent: Color32,
-    meter_mode: MeterMode,
+    meter_modes: [MeterMode; 2],
+    split_waveform: bool,
     wav_profile: WavExportProfile,
     last_interaction: Instant,
     recording_started: Option<f64>,
-    low: [f32; BINS],
-    high: [f32; BINS],
+    peaks: [WaveformPeaks; 2],
     seconds: f32,
+    sample_rate: u32,
+    visible_frames: Range<u64>,
     live_revision: Option<u64>,
     next_refresh: Instant,
-    snapshot: Option<Arc<Snapshot>>,
-    selection: Option<Range<f32>>,
+    generation: u64,
+    snapshot: Option<Arc<[Snapshot]>>,
+    selection: Option<Range<u64>>,
+    flags: Option<FlagUpdate>,
+    flag_order: u64,
     gesture: Option<Gesture>,
     window_drag: Option<WindowDrag>,
     export: Option<ExportJob>,
-    snapshot_save: Option<JoinHandle<io::Result<PathBuf>>>,
+    snapshot_save: Option<JoinHandle<io::Result<ExportedWav>>>,
     pending_snapshot_saves: VecDeque<WavClip>,
     clip_revision: u64,
     exported: Option<ExportedWav>,
@@ -247,8 +260,27 @@ struct Recorder {
 }
 
 enum Gesture {
-    Select { anchor: f32, cursor: f32 },
+    Select { anchor: u64, cursor: u64 },
     Export { preparing: bool },
+}
+
+#[derive(Clone, Copy)]
+struct WaveformPeaks {
+    low: [f32; BINS],
+    high: [f32; BINS],
+}
+
+impl WaveformPeaks {
+    const EMPTY: Self = Self {
+        low: [0.0; BINS],
+        high: [0.0; BINS],
+    };
+}
+
+struct FlagUpdate {
+    generation: u64,
+    order: u64,
+    frames: Range<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -394,61 +426,81 @@ struct ExportJob {
 }
 
 struct WavClip {
-    snapshot: Arc<Snapshot>,
+    snapshots: Arc<[Snapshot]>,
     frames: Range<usize>,
     output: PathBuf,
     profile: WavExportProfile,
+    flags: Option<FlagUpdate>,
 }
 
 impl WavClip {
     fn new(
-        snapshot: Arc<Snapshot>,
-        selection: Option<&Range<f32>>,
+        snapshots: Arc<[Snapshot]>,
+        selection: Option<&Range<u64>>,
         output: PathBuf,
         profile: WavExportProfile,
+        flags: Option<FlagUpdate>,
     ) -> Option<Self> {
-        let frames = snapshot.frame_count();
-        if frames == 0 {
+        let visible = snapshots.first()?.frame_range();
+        let selected = selection.cloned().unwrap_or_else(|| visible.clone());
+        if selected.is_empty() || selected.start < visible.start || selected.end > visible.end {
             return None;
         }
-        let frames = selection.map_or(0..frames, |selection| {
-            let start = ((selection.start * frames as f32).floor() as usize).min(frames - 1);
-            let end = ((selection.end * frames as f32).ceil() as usize).clamp(start + 1, frames);
-            start..end
-        });
+        let start = usize::try_from(selected.start - visible.start).ok()?;
+        let end = usize::try_from(selected.end - visible.start).ok()?;
         Some(Self {
-            snapshot,
-            frames,
+            snapshots,
+            frames: start..end,
             output,
             profile,
+            flags,
         })
     }
 
-    fn write(self) -> io::Result<PathBuf> {
-        let samples = self
-            .snapshot
-            .frames(self.frames)
-            .ok_or_else(|| io::Error::other("invalid audio selection"))?;
-        export_wav_with_profile(
-            &self.output,
-            self.snapshot.sample_rate,
-            self.snapshot.channels,
-            samples,
-            self.profile,
-        )
+    fn write(self, keep: bool) -> io::Result<ExportedWav> {
+        let paths =
+            export_tracks_with_profile(&self.output, &self.snapshots, self.frames, self.profile)?;
+        let mut result = ExportedWav {
+            paths,
+            keep,
+            flags: self.flags,
+        };
+        if !keep {
+            for path in &mut result.paths {
+                *path = dunce::canonicalize(&path)?;
+            }
+        }
+        Ok(result)
     }
 }
 
 struct ExportedWav {
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     keep: bool,
+    flags: Option<FlagUpdate>,
+}
+
+impl ExportedWav {
+    fn description(&self) -> String {
+        match self.paths.as_slice() {
+            [file] => file.display().to_string(),
+            [first, ..] => format!(
+                "{} WAV files in {}",
+                self.paths.len(),
+                first.parent().unwrap_or(first).display(),
+            ),
+            [] => String::new(),
+        }
+    }
 }
 
 impl Drop for ExportedWav {
     fn drop(&mut self) {
         // Native file drags need a readable path, which must remain stable after acceptance.
         if !self.keep {
-            let _ = std::fs::remove_file(&self.path);
+            for path in &self.paths {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }
@@ -456,6 +508,9 @@ impl Drop for ExportedWav {
 impl Recorder {
     fn new(mut controller: Controller, preferences: Preferences, settings: Settings) -> Self {
         controller.set_retention(settings.history);
+        controller.set_sources(settings.sources);
+        controller.resume();
+        let generation = controller.generation();
         Self {
             controller,
             preferences,
@@ -472,23 +527,31 @@ impl Recorder {
             full_waveform_height: DEFAULT_WAVEFORM_HEIGHT,
             options_open: false,
             options_focus_requested: false,
+            available_sources: vec![CaptureSource::System, CaptureSource::DefaultMicrophone],
+            source_list_worker: None,
+            updates: UpdateOptions::default(),
             window_position: settings.window_position,
             window_position_changed: None,
             idle_resume: settings.idle_resume,
             transparency: settings.transparency,
             accent: accent_color(settings.accent),
             saved_accent: accent_color(settings.accent),
-            meter_mode: settings.meter_mode,
+            meter_modes: [settings.meter_mode, settings.meter_b_mode],
+            split_waveform: settings.split_waveform,
             wav_profile: settings.wav_profile,
             last_interaction: Instant::now(),
             recording_started: None,
-            low: [0.0; BINS],
-            high: [0.0; BINS],
+            peaks: [WaveformPeaks::EMPTY; 2],
             seconds: 0.0,
+            sample_rate: 48_000,
+            visible_frames: 0..0,
             live_revision: None,
             next_refresh: Instant::now(),
+            generation,
             snapshot: None,
             selection: None,
+            flags: None,
+            flag_order: 0,
             gesture: None,
             window_drag: None,
             export: None,
@@ -650,6 +713,7 @@ impl Recorder {
 
     fn resume(&mut self) {
         self.controller.resume();
+        self.sync_generation();
         self.last_interaction = Instant::now();
         if !self.controller.is_paused() {
             self.clear_snapshot();
@@ -658,18 +722,54 @@ impl Recorder {
 
     fn freeze(&mut self) {
         self.controller.pause();
+        self.sync_generation();
         self.last_interaction = Instant::now();
-        if self.snapshot.is_none()
-            && let Some(snapshot) = self.controller.snapshot()
+        if self.snapshot.is_none() {
+            self.snapshot = self.current_snapshots();
+        }
+        self.live_revision = None;
+        self.next_refresh = Instant::now();
+        self.refresh_waveform();
+    }
+
+    fn dual_source(&self) -> bool {
+        self.controller.sources()[1].is_some()
+    }
+
+    fn current_snapshots(&self) -> Option<Arc<[Snapshot]>> {
+        let snapshots = (0..(if self.dual_source() { 2 } else { 1 }))
+            .map(|lane| self.controller.track_snapshot(lane))
+            .collect::<Option<Vec<_>>>()?;
+        Some(snapshots.into())
+    }
+
+    fn sync_generation(&mut self) {
+        let generation = self.controller.generation();
+        if generation != self.generation {
+            self.generation = generation;
+            self.flags = None;
+            self.gesture = None;
+            self.clear_snapshot();
+        }
+    }
+
+    fn flag_update(&mut self, frames: Range<u64>) -> FlagUpdate {
+        self.flag_order += 1;
+        FlagUpdate {
+            generation: self.generation,
+            order: self.flag_order,
+            frames,
+        }
+    }
+
+    fn apply_flags(&mut self, flags: FlagUpdate) {
+        if flags.generation == self.generation
+            && self
+                .flags
+                .as_ref()
+                .is_none_or(|current| current.order < flags.order)
         {
-            self.seconds = snapshot.frame_count() as f32 / snapshot.sample_rate.max(1) as f32;
-            waveform::peaks(
-                &snapshot.samples,
-                snapshot.channels,
-                &mut self.low,
-                &mut self.high,
-            );
-            self.snapshot = Some(Arc::new(snapshot));
+            self.flags = Some(flags);
         }
     }
 
@@ -689,14 +789,19 @@ impl Recorder {
         self.last_interaction = Instant::now();
         if self.idle_resume == AutoResumeDelay::Immediate {
             self.controller.resume();
+            self.sync_generation();
             if !self.controller.is_paused() && !keep_selection {
                 self.reset_snapshot();
             }
+            self.live_revision = None;
+            self.next_refresh = Instant::now();
         }
     }
 
     fn clear_capture(&mut self) {
         self.controller.clear();
+        self.sync_generation();
+        self.flags = None;
         self.clear_snapshot();
         self.message.clear();
         self.last_interaction = Instant::now();
@@ -707,6 +812,7 @@ impl Recorder {
         self.clear_snapshot();
         self.message.clear();
         self.controller.resume();
+        self.sync_generation();
         self.last_interaction = Instant::now();
     }
 
@@ -726,14 +832,48 @@ impl Recorder {
     fn refresh_waveform(&mut self) {
         let revision = self.controller.revision();
         let now = Instant::now();
-        if self.snapshot.is_none()
-            && self.live_revision != Some(revision)
-            && now >= self.next_refresh
-        {
-            let (frames, sample_rate) = self.controller.waveform(&mut self.low, &mut self.high);
-            self.seconds = frames as f32 / sample_rate.max(1) as f32;
-            self.live_revision = Some(revision);
-            self.next_refresh = now + REFRESH;
+        if self.live_revision == Some(revision) || now < self.next_refresh {
+            return;
+        }
+
+        let (views, rows) = self.waveform_layout();
+        let frozen = self
+            .snapshot
+            .as_deref()
+            .filter(|_| self.controller.is_paused());
+        self.visible_frames = frozen
+            .and_then(|snapshots| snapshots.first())
+            .map_or_else(|| self.controller.frame_range(), Snapshot::frame_range);
+        for ((lane, view), peaks) in views.into_iter().zip(&mut self.peaks).take(rows) {
+            if let Some(snapshot) = frozen.and_then(|snapshots| snapshots.get(lane)) {
+                waveform::view_peaks(
+                    &snapshot.samples,
+                    snapshot.channels,
+                    view,
+                    &mut peaks.low,
+                    &mut peaks.high,
+                );
+                self.sample_rate = snapshot.sample_rate;
+            } else {
+                let (_, sample_rate) =
+                    self.controller
+                        .track_waveform(lane, view, &mut peaks.low, &mut peaks.high);
+                self.sample_rate = sample_rate;
+            }
+        }
+        self.seconds = (self.visible_frames.end - self.visible_frames.start) as f32
+            / self.sample_rate.max(1) as f32;
+        self.live_revision = Some(revision);
+        self.next_refresh = now + REFRESH;
+    }
+
+    fn waveform_layout(&self) -> ([(usize, WaveformView); 2], usize) {
+        if self.dual_source() {
+            ([(0, WaveformView::Merged), (1, WaveformView::Merged)], 2)
+        } else if self.split_waveform && self.controller.track_channels(0) == Some(2) {
+            ([(0, WaveformView::Left), (0, WaveformView::Right)], 2)
+        } else {
+            ([(0, WaveformView::Merged); 2], 1)
         }
     }
 
@@ -746,7 +886,10 @@ impl Recorder {
             self.pin_button(ui, interaction_blocked);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.options_button(ui, !interaction_blocked && self.gesture.is_none());
-                self.meter_readout(ui);
+                if self.dual_source() {
+                    self.meter_readout(ui, 1);
+                }
+                self.meter_readout(ui, 0);
             });
         });
     }
@@ -851,13 +994,14 @@ impl Recorder {
         }
     }
 
-    fn meter_readout(&self, ui: &mut egui::Ui) {
+    fn meter_readout(&self, ui: &mut egui::Ui, lane: usize) {
+        let mode = self.meter_modes[lane];
         let value = self
             .controller
-            .meter_readings()
-            .map(|readings| self.meter_mode.value(readings));
+            .track_meter_readings(lane)
+            .map(|readings| mode.value(readings));
         let number = if let Some(value) = value.filter(|value| value.is_finite()) {
-            if self.meter_mode == MeterMode::Vu {
+            if mode == MeterMode::Vu {
                 format!("{value:+.1}")
             } else {
                 format!("{value:.1}")
@@ -865,17 +1009,22 @@ impl Recorder {
         } else {
             "—".into()
         };
-        let text = format!("{number} {}", self.meter_mode.unit());
-        let (rect, response) = ui.allocate_exact_size(Vec2::new(102.0, 24.0), egui::Sense::hover());
+        let text = if self.dual_source() {
+            format!("{} {number} {}", lane_name(lane), mode.unit())
+        } else {
+            format!("{number} {}", mode.unit())
+        };
+        let width = if self.dual_source() { 91.0 } else { 102.0 };
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 24.0), egui::Sense::hover());
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Status, true, &text));
-        response.on_hover_text(self.meter_mode.description());
+        response.on_hover_text(mode.description());
         let painter = ui.painter();
         painter.rect_filled(rect, 5.0, ui.visuals().widgets.inactive.bg_fill);
         painter.text(
             rect.right_center() - Vec2::new(8.0, 0.0),
             egui::Align2::RIGHT_CENTER,
             text,
-            egui::FontId::monospace(12.0),
+            egui::FontId::monospace(if self.dual_source() { 10.0 } else { 12.0 }),
             ui.visuals().text_color(),
         );
     }
@@ -961,6 +1110,9 @@ impl Recorder {
     }
 
     fn open_options(&mut self, ctx: &egui::Context) {
+        if !self.options_open {
+            self.refresh_source_list();
+        }
         self.options_open = true;
         self.options_focus_requested = true;
         ctx.send_viewport_cmd(ViewportCommand::RequestPaintWhileHidden);
@@ -1078,6 +1230,9 @@ impl Recorder {
                             .show(ui, |ui| {
                                 self.capture_options(ui);
                             });
+                        egui::CollapsingHeader::new("Audio sources")
+                            .default_open(true)
+                            .show(ui, |ui| self.source_options(ui));
                         egui::CollapsingHeader::new("Appearance")
                             .default_open(true)
                             .show(ui, |ui| {
@@ -1101,10 +1256,15 @@ impl Recorder {
                             .show(ui, |ui| self.app_options(ui, frame))
                             .body_returned
                             .flatten();
+                        let update = egui::CollapsingHeader::new("Updates")
+                            .show(ui, |ui| self.updates.show(ui))
+                            .body_returned
+                            .unwrap_or(false)
+                            .then_some(OptionsAction::Quit);
                         if !self.message.is_empty() {
                             ui.label(&self.message);
                         }
-                        folders.or(app)
+                        update.or(folders).or(app)
                     })
                     .inner
             })
@@ -1190,20 +1350,159 @@ impl Recorder {
                 }
             });
             ui.end_row();
-            ui.label("Meter");
-            ui.horizontal(|ui| {
-                let before = self.meter_mode;
-                for mode in MeterMode::OPTIONS {
-                    ui.selectable_value(&mut self.meter_mode, mode, mode.unit())
-                        .on_hover_text(mode.description());
-                }
-                if self.meter_mode != before {
-                    self.save_preference(Key::Meter, self.meter_mode.unit());
-                }
-            });
+            ui.label("Waveform display");
+            ui.add_enabled_ui(!self.dual_source(), |ui| {
+                ui.horizontal(|ui| {
+                    let before = self.split_waveform;
+                    ui.selectable_value(&mut self.split_waveform, false, "Merged");
+                    ui.selectable_value(&mut self.split_waveform, true, "Left / Right");
+                    if self.split_waveform != before {
+                        self.save_preference(
+                            Key::SplitWaveform,
+                            if self.split_waveform { "1" } else { "0" },
+                        );
+                        self.live_revision = None;
+                        self.next_refresh = Instant::now();
+                    }
+                });
+            })
+            .response
+            .on_disabled_hover_text("Dual source uses two rows, A and B");
             ui.end_row();
+            let dual = self.dual_source();
+            for lane in 0..if dual { 2 } else { 1 } {
+                if dual {
+                    ui.label(format!("Meter {}", lane_name(lane)));
+                } else {
+                    ui.label("Meter");
+                }
+                ui.horizontal(|ui| {
+                    let before = self.meter_modes[lane];
+                    for mode in MeterMode::OPTIONS {
+                        ui.selectable_value(&mut self.meter_modes[lane], mode, mode.unit())
+                            .on_hover_text(mode.description());
+                    }
+                    let mode = self.meter_modes[lane];
+                    if mode != before {
+                        self.save_preference(
+                            if lane == 0 { Key::Meter } else { Key::MeterB },
+                            mode.unit(),
+                        );
+                    }
+                });
+                ui.end_row();
+            }
         });
         self.accent_settings(ui);
+    }
+
+    fn source_options(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .add_enabled(
+                self.source_list_worker.is_none(),
+                egui::Button::new("Refresh source list").small(),
+            )
+            .clicked()
+        {
+            self.refresh_source_list();
+        }
+        let choices = self.available_sources.as_slice();
+        let mut sources = self.controller.sources().clone();
+        ui.add_enabled_ui(self.gesture.is_none(), |ui| {
+            for (lane, settings) in sources.iter_mut().enumerate() {
+                ui.push_id(lane, |ui| {
+                    let configured = settings.clone();
+                    let mut source = configured.as_ref().map(|settings| settings.source.clone());
+                    ui.horizontal(|ui| {
+                        ui.strong(lane_name(lane));
+                        egui::ComboBox::from_id_salt("source")
+                            .selected_text(source.as_ref().map_or("Off", CaptureSource::label))
+                            .width(196.0)
+                            .height(280.0)
+                            .truncate()
+                            .show_ui(ui, |ui| {
+                                if lane == 1 {
+                                    ui.selectable_value(&mut source, None, "Off");
+                                }
+                                for choice in choices {
+                                    let row = ui.selectable_value(
+                                        &mut source,
+                                        Some(choice.clone()),
+                                        choice.label(),
+                                    );
+                                    if let CaptureSource::Application { path, .. } = choice {
+                                        row.on_hover_text(path);
+                                    }
+                                }
+                            });
+                        let same_source = source.as_ref().zip(configured.as_ref()).is_some_and(
+                            |(source, configured)| source.same_source(&configured.source),
+                        );
+                        *settings = source.map(|source| SourceSettings {
+                            source,
+                            route: configured
+                                .filter(|_| same_source)
+                                .map_or(ChannelRoute::Merged, |settings| settings.route),
+                        });
+                        if let Some(settings) = settings {
+                            egui::ComboBox::from_id_salt("route")
+                                .selected_text(settings.route.label())
+                                .show_ui(ui, |ui| {
+                                    for route in ChannelRoute::ALL {
+                                        let enabled = same_source
+                                            && self.controller.route_available(lane, route);
+                                        ui.add_enabled_ui(enabled, |ui| {
+                                            ui.selectable_value(
+                                                &mut settings.route,
+                                                route,
+                                                route.label(),
+                                            );
+                                        });
+                                    }
+                                });
+                        }
+                    });
+                    if let Some(status) = self.controller.source_status(lane) {
+                        ui.small(status);
+                    }
+                });
+            }
+        });
+        if !CaptureSource::supports_app_capture() {
+            ui.small("Individual app capture requires Windows build 20348 or newer.");
+        }
+        if sources != *self.controller.sources() {
+            self.save_preference(Key::CaptureSources, serialize_sources(&sources));
+            self.controller.set_sources(sources);
+            self.sync_generation();
+        }
+    }
+
+    fn refresh_source_list(&mut self) {
+        if self.source_list_worker.is_some() {
+            return;
+        }
+        match thread::Builder::new()
+            .name("backtracking-sources".into())
+            .spawn(Controller::available_sources)
+        {
+            Ok(worker) => self.source_list_worker = Some(worker),
+            Err(error) => self.message = format!("Could not list audio sources: {error}"),
+        }
+    }
+
+    fn collect_source_list(&mut self) {
+        if self
+            .source_list_worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+            && let Some(worker) = self.source_list_worker.take()
+        {
+            match worker.join() {
+                Ok(sources) => self.available_sources = sources,
+                Err(_) => self.message = "Source list worker stopped unexpectedly.".into(),
+            }
+        }
     }
 
     fn folder_options(&self, ui: &mut egui::Ui) -> Option<OptionsAction> {
@@ -1413,29 +1712,39 @@ impl Recorder {
         if self.gesture.is_some() {
             return;
         }
-        let selection = self.selection.as_ref();
-        let snapshot = if selection.is_some() {
+        let has_selection = self.selection.is_some();
+        let snapshot = if has_selection {
             self.snapshot.clone()
         } else {
             self.controller.poll();
-            self.controller.snapshot().map(Arc::new)
+            self.sync_generation();
+            self.current_snapshots()
         };
-        let Some(clip) = snapshot.and_then(|snapshot| {
-            WavClip::new(
-                snapshot,
-                selection,
-                self.saved_output.clone(),
-                self.wav_profile,
-            )
-        }) else {
+        let output = self.saved_output.clone();
+        let Some(clip) = snapshot.and_then(|snapshot| self.wav_clip(snapshot, output)) else {
             self.message = "No audio captured yet.".into();
             return;
         };
         self.pending_snapshot_saves.push_back(clip);
-        if selection.is_some() || self.controller.is_paused() {
+        if has_selection || self.controller.is_paused() {
             self.resume();
         }
         self.collect_snapshot_saves();
+    }
+
+    fn wav_clip(&mut self, snapshots: Arc<[Snapshot]>, output: PathBuf) -> Option<WavClip> {
+        let flags = if self.selection.is_none() {
+            Some(self.flag_update(snapshots.first()?.frame_range()))
+        } else {
+            None
+        };
+        WavClip::new(
+            snapshots,
+            self.selection.as_ref(),
+            output,
+            self.wav_profile,
+            flags,
+        )
     }
 
     fn collect_snapshot_saves(&mut self) {
@@ -1448,7 +1757,12 @@ impl Recorder {
         }
         if let Some(worker) = self.snapshot_save.take() {
             self.message = match worker.join() {
-                Ok(Ok(path)) => format!("Saved snapshot {}", path.display()),
+                Ok(Ok(mut file)) => {
+                    if let Some(flags) = file.flags.take() {
+                        self.apply_flags(flags);
+                    }
+                    format!("Saved snapshot {}", file.description())
+                }
                 Ok(Err(error)) => format!("Could not save snapshot: {error}"),
                 Err(_) => "Snapshot worker stopped unexpectedly.".into(),
             };
@@ -1456,7 +1770,7 @@ impl Recorder {
         if let Some(clip) = self.pending_snapshot_saves.pop_front() {
             match thread::Builder::new()
                 .name("backtracking-snapshot".into())
-                .spawn(move || clip.write())
+                .spawn(move || clip.write(true))
             {
                 Ok(worker) => {
                     self.snapshot_save = Some(worker);
@@ -1468,27 +1782,19 @@ impl Recorder {
     }
 
     fn start_export(&mut self) {
-        let Some(wav) = self.snapshot.clone().and_then(|snapshot| {
-            WavClip::new(
-                snapshot,
-                self.selection.as_ref(),
-                self.output.clone(),
-                self.wav_profile,
-            )
-        }) else {
+        let output = self.output.clone();
+        let Some(wav) = self
+            .snapshot
+            .clone()
+            .and_then(|snapshot| self.wav_clip(snapshot, output))
+        else {
             self.message = "No audio captured yet.".into();
             return;
         };
         match thread::Builder::new()
             .name("backtracking-wav".into())
-            .spawn(move || {
-                let mut file = ExportedWav {
-                    path: wav.write()?,
-                    keep: false,
-                };
-                file.path = dunce::canonicalize(&file.path)?;
-                Ok(file)
-            }) {
+            .spawn(move || wav.write(false))
+        {
             Ok(worker) => {
                 self.export = Some(ExportJob {
                     worker,
@@ -1536,30 +1842,33 @@ impl Recorder {
     }
 
     fn interact_waveform(&mut self, ui: &egui::Ui, frame: &eframe::Frame, rect: Rect) {
-        let (position, press, down) = ui.input(|input| {
+        let (position, press, down, snap) = ui.input(|input| {
             let press = input.events.iter().rev().find_map(|event| match event {
                 egui::Event::PointerButton {
                     pos,
                     button: PointerButton::Primary,
                     pressed: true,
                     modifiers,
-                } => Some((*pos, modifiers.ctrl)),
+                } => Some((*pos, modifiers.ctrl, modifiers.shift)),
                 _ => None,
             });
             (
                 input.pointer.interact_pos(),
                 press,
                 input.pointer.button_down(PointerButton::Primary),
+                input.modifiers.shift,
             )
         });
 
-        if let Some((position, selecting)) = press.filter(|(point, _)| rect.contains(*point)) {
+        if let Some((position, selecting, snap_on_press)) =
+            press.filter(|(point, _, _)| rect.contains(*point))
+        {
             if selecting && !self.controller.is_paused() {
                 self.reset_snapshot();
             }
             self.freeze();
             if selecting {
-                let start = fraction(self.audio_rect(rect), position.x);
+                let start = self.frame_at(self.audio_rect(rect), position.x, snap_on_press);
                 self.gesture = Some(Gesture::Select {
                     anchor: start,
                     cursor: start,
@@ -1570,10 +1879,13 @@ impl Recorder {
         }
 
         let audio_rect = self.audio_rect(rect);
-        if let Some(Gesture::Select { cursor, .. }) = &mut self.gesture
-            && let Some(position) = position
+        if let Some(position) = position
+            && matches!(self.gesture, Some(Gesture::Select { .. }))
         {
-            *cursor = fraction(audio_rect, position.x);
+            let endpoint = self.frame_at(audio_rect, position.x, snap);
+            if let Some(Gesture::Select { cursor, .. }) = &mut self.gesture {
+                *cursor = endpoint;
+            }
         }
 
         // egui may lose its local pointer position when the cursor exits the viewport.
@@ -1585,7 +1897,9 @@ impl Recorder {
             let keep_selection = match gesture {
                 Gesture::Select { anchor, cursor } => {
                     let range = anchor.min(cursor)..anchor.max(cursor);
-                    if range.start < range.end {
+                    if !range.is_empty() {
+                        let flags = self.flag_update(range.clone());
+                        self.apply_flags(flags);
                         self.selection = Some(range);
                         self.invalidate_export();
                     }
@@ -1615,12 +1929,16 @@ impl Recorder {
         }
         if let Some(mut file) = self.exported.take() {
             self.gesture = None;
-            let result = file_drag::drag_file(hwnd, &file.path);
+            let result = file_drag::drag_files(hwnd, &file.paths);
             self.invalidate_export();
             match result {
                 Ok(true) => {
                     file.keep = true;
-                    self.message = format!("Saved {}", file.path.display());
+                    self.selection = None;
+                    if let Some(flags) = file.flags.take() {
+                        self.apply_flags(flags);
+                    }
+                    self.message = format!("Saved {}", file.description());
                     self.finish_waveform_gesture(false);
                 }
                 Ok(false) => self.finish_waveform_gesture(self.selection.is_some()),
@@ -1635,6 +1953,22 @@ impl Recorder {
         }
     }
 
+    fn frame_at(&self, audio: Rect, x: f32, snap: bool) -> u64 {
+        let visible = self.visible_frames.clone();
+        let mut fraction = f64::from(x - audio.left()) / f64::from(audio.width().max(1.0));
+        if snap {
+            fraction = waveform::snap_to_flags(
+                fraction,
+                visible.clone(),
+                self.flags.as_ref().map(|flags| &flags.frames),
+                FLAG_SNAP_DISTANCE / f64::from(audio.width().max(1.0)),
+            );
+        }
+        let length = visible.end - visible.start;
+        let fraction = fraction.clamp(0.0, 1.0);
+        visible.start + ((length as f64 * fraction).round() as u64).min(length)
+    }
+
     fn draw_waveform(&self, ui: &egui::Ui, rect: Rect, preview_hover: bool) {
         let painter = ui.painter_at(rect);
         if !self.waveform_only {
@@ -1642,12 +1976,6 @@ impl Recorder {
             if self.transparency == 0 {
                 painter.rect_filled(rect, 6.0, Color32::from_rgb(22, 26, 29));
             }
-            let inner = rect.shrink(WAVEFORM_INSET);
-            painter.hline(
-                inner.x_range(),
-                inner.center().y,
-                Stroke::new(1.0, Color32::from_rgb(47, 60, 64)),
-            );
         }
         let audio = self.audio_rect(rect);
         if audio.width() <= 0.0 {
@@ -1667,10 +1995,12 @@ impl Recorder {
             Some(Gesture::Select { anchor, cursor }) => {
                 Some(anchor.min(cursor)..anchor.max(cursor))
             }
-            _ => self.selection.clone(),
+            _ if self.controller.is_paused() => self.selection.clone(),
+            _ => None,
         };
         let full_preview = !self.waveform_only
             && selection.is_none()
+            && self.selection.is_none()
             && (matches!(self.gesture, Some(Gesture::Export { .. }))
                 || preview_hover
                     && ui.input(|input| {
@@ -1683,22 +2013,99 @@ impl Recorder {
             painter.rect_filled(audio, 2.0, muted_accent(self.accent));
         }
 
-        self.paint_waveform(&painter, audio, selection.as_ref());
+        let visible = self.visible_frames.clone();
+        let highlight = selection.as_ref().and_then(|range| {
+            let start = waveform::flag_fraction(range.start.max(visible.start), visible.clone())?;
+            let end = waveform::flag_fraction(range.end.min(visible.end), visible.clone())?;
+            Some(start as f32..end as f32)
+        });
+        let (_, rows) = self.waveform_layout();
+        let row_height = audio.height() / rows as f32;
+        for (index, peaks) in self.peaks.iter().take(rows).enumerate() {
+            let top = audio.top() + index as f32 * row_height;
+            let row = Rect::from_min_size(
+                Pos2::new(audio.left(), top),
+                Vec2::new(audio.width(), row_height),
+            );
+            if !self.waveform_only {
+                painter.hline(
+                    row.x_range(),
+                    row.center().y,
+                    Stroke::new(1.0, Color32::from_rgb(47, 60, 64)),
+                );
+                if rows == 2 {
+                    let label = if self.dual_source() {
+                        lane_name(index)
+                    } else if index == 0 {
+                        "L"
+                    } else {
+                        "R"
+                    };
+                    painter.text(
+                        Pos2::new(rect.left() + 1.0, row.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        egui::FontId::monospace(8.0),
+                        Color32::from_gray(180),
+                    );
+                }
+            }
+            self.paint_waveform(&painter, row, peaks, highlight.as_ref());
+        }
+        self.paint_flags(&painter, audio);
 
         if !self.waveform_only
-            && let Some(range) = selection.or_else(|| full_preview.then_some(0.0..1.0))
+            && let Some(range) = selection.or_else(|| full_preview.then_some(visible))
         {
             painter.text(
-                audio.right_top(),
+                audio.right_top() - Vec2::new(8.0, 0.0),
                 egui::Align2::RIGHT_TOP,
-                format!("{:.2} s", (range.end - range.start) * self.seconds),
+                format!(
+                    "{:.2} s",
+                    (range.end - range.start) as f64 / f64::from(self.sample_rate.max(1)),
+                ),
                 egui::FontId::monospace(11.0),
                 Color32::WHITE,
             );
         }
     }
 
-    fn paint_waveform(&self, painter: &egui::Painter, audio: Rect, selection: Option<&Range<f32>>) {
+    fn paint_flags(&self, painter: &egui::Painter, audio: Rect) {
+        let Some(flags) = &self.flags else { return };
+        let painter = painter.with_clip_rect(audio);
+        let visible = self.visible_frames.clone();
+        let flag_height = audio.height().min(11.0);
+        for (position, direction) in [(flags.frames.start, 1.0), (flags.frames.end, -1.0)] {
+            let Some(fraction) = waveform::flag_fraction(position, visible.clone()) else {
+                continue;
+            };
+            let x = audio.left() + fraction as f32 * audio.width();
+            let inset = (audio.width() * 0.25).min(0.25);
+            let x = x.clamp(audio.left() + inset, audio.right() - inset);
+            let y = audio.top();
+            painter.line_segment(
+                [Pos2::new(x, y), Pos2::new(x, y + flag_height)],
+                Stroke::new(1.0, FLAG_COLOR),
+            );
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(x, y),
+                    Pos2::new(x + direction * 6.0, y + flag_height * 0.28),
+                    Pos2::new(x, y + flag_height * 0.56),
+                ],
+                FLAG_COLOR,
+                Stroke::NONE,
+            ));
+        }
+    }
+
+    fn paint_waveform(
+        &self,
+        painter: &egui::Painter,
+        audio: Rect,
+        peaks: &WaveformPeaks,
+        selection: Option<&Range<f32>>,
+    ) {
         let middle = audio.center().y;
         let extent = audio.height() * 0.47;
         let [r, g, b, _] = self.accent.to_array();
@@ -1710,7 +2117,7 @@ impl Recorder {
         } else {
             Color32::WHITE
         };
-        for (bin, (&low, &high)) in self.low.iter().zip(&self.high).enumerate() {
+        for (bin, (&low, &high)) in peaks.low.iter().zip(&peaks.high).enumerate() {
             let fraction = (bin as f32 + 0.5) / BINS as f32;
             let position = audio.left() + fraction * audio.width();
             let color = if selection.is_some_and(|range| range.contains(&fraction)) {
@@ -1857,7 +2264,12 @@ impl eframe::App for Recorder {
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if self.updates.poll() {
+            self.quit(ctx);
+            return;
+        }
         self.update_tray(ctx, frame);
+        self.collect_source_list();
         let now = Instant::now();
         if self.pinned && now >= self.next_pin_check {
             let attempted = frame
@@ -1886,6 +2298,7 @@ impl eframe::App for Recorder {
             self.save_accent();
         }
         self.controller.poll();
+        self.sync_generation();
         if !self.controller.is_recording() {
             self.recording_started = None;
         }
@@ -1998,7 +2411,7 @@ impl Drop for Recorder {
             let _ = worker.join();
         }
         for clip in self.pending_snapshot_saves.drain(..) {
-            let _ = clip.write();
+            let _ = clip.write(true);
         }
     }
 }
@@ -2015,8 +2428,8 @@ fn snapshot_save_key(event: &egui::Event) -> bool {
     )
 }
 
-fn fraction(rect: Rect, x: f32) -> f32 {
-    ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0)
+fn lane_name(lane: usize) -> &'static str {
+    if lane == 0 { "A" } else { "B" }
 }
 
 fn icon_button() -> egui::Button<'static> {
@@ -2096,4 +2509,67 @@ fn drag_bounds(
         bounds.bottom = (bounds.bottom + dy).max(bounds.top + min_height);
     }
     bounds
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn dual_drag_retains_exact_selected_samples_and_cancels_both_files() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let folder = std::env::temp_dir().join(format!(
+            "Backtracking-dual-drag-{}-{nonce}",
+            std::process::id()
+        ));
+        let snapshots: Arc<[Snapshot]> = vec![
+            Snapshot {
+                first_frame: 10,
+                sample_rate: 48_000,
+                channels: 1,
+                samples: vec![0.0, 0.5, 1.0],
+            },
+            Snapshot {
+                first_frame: 10,
+                sample_rate: 48_000,
+                channels: 1,
+                samples: vec![0.0, -0.5, -1.0],
+            },
+        ]
+        .into();
+        let prepare = || {
+            WavClip::new(
+                snapshots.clone(),
+                Some(&(11..12)),
+                folder.clone(),
+                WavExportProfile::default(),
+                None,
+            )
+            .unwrap()
+            .write(false)
+            .unwrap()
+        };
+
+        let rejected = prepare();
+        assert_eq!(rejected.paths.len(), 2);
+        for (path, expected) in rejected.paths.iter().zip([0.5_f32, -0.5]) {
+            let wav = std::fs::read(path).unwrap();
+            assert_eq!(&wav[wav.len() - 4..], &expected.to_le_bytes());
+        }
+        let rejected_paths = rejected.paths.clone();
+        drop(rejected);
+        assert!(rejected_paths.iter().all(|path| !path.exists()));
+
+        let mut accepted = prepare();
+        let accepted_paths = accepted.paths.clone();
+        accepted.keep = true;
+        drop(accepted);
+        assert!(accepted_paths.iter().all(|path| path.is_file()));
+        std::fs::remove_dir_all(folder).unwrap();
+    }
 }

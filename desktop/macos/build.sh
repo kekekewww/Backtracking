@@ -22,12 +22,25 @@ app_dir="$target_dir/bundled/Backtracking.app"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
 cp "$source_dir/Info.plist" "$app_dir/Contents/Info.plist"
 cp "$repo_dir/assets/Backtracking.icns" "$app_dir/Contents/Resources/Backtracking.icns"
+if [[ -n "${BACKTRACKING_UPDATE_PUBLIC_KEY:-}" ]]; then
+  if [[ ! "$BACKTRACKING_UPDATE_PUBLIC_KEY" =~ ^[a-f0-9]{64}$ ]]; then
+    printf '%s\n' 'BACKTRACKING_UPDATE_PUBLIC_KEY must be 64 lowercase hexadecimal characters.' >&2
+    exit 1
+  fi
+  /usr/libexec/PlistBuddy -c "Add :BacktrackingUpdatePublicKey string $BACKTRACKING_UPDATE_PUBLIC_KEY" "$app_dir/Contents/Info.plist"
+fi
 xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library -O \
   -target "$swift_target" -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
   -import-objc-header "$repo_dir/crates/backtracking-core/include/backtracking.h" \
-  "$source_dir/BacktrackingApp.swift" "$source_dir/SystemAudioTap.swift" \
+  "$source_dir/BacktrackingApp.swift" "$source_dir/SystemAudioTap.swift" "$source_dir/StartupUpdater.swift" \
   "$target_dir/$rust_target/release/libbacktracking_core.a" \
-  -framework AppKit -framework CoreAudio -framework AudioToolbox -framework ServiceManagement \
+  -framework AppKit -framework CoreAudio -framework AudioToolbox -framework AVFoundation -framework ServiceManagement \
   -o "$app_dir/Contents/MacOS/Backtracking"
-codesign --force --sign - "$app_dir"
+identity="${BACKTRACKING_MAC_CODESIGN_IDENTITY:--}"
+if [[ "$identity" == - ]]; then
+  codesign --force --sign - "$app_dir"
+else
+  codesign --force --options runtime --timestamp --sign "$identity" \
+    --entitlements "$source_dir/Backtracking.entitlements" "$app_dir"
+fi
 printf 'Built %s\n' "$app_dir"

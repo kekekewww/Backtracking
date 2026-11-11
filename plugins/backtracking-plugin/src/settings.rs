@@ -29,6 +29,25 @@ impl MeterMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WaveformLayout {
+    #[default]
+    Merged,
+    Stereo,
+}
+
+#[cfg(feature = "editor")]
+impl WaveformLayout {
+    pub(crate) const ALL: [Self; 2] = [Self::Merged, Self::Stereo];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Merged => "Merged",
+            Self::Stereo => "Left / Right",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionSettings {
     pub(crate) retention: DurationChoice,
@@ -38,6 +57,7 @@ pub(crate) struct SessionSettings {
     pub(crate) meter_mode: MeterMode,
     pub(crate) wav_profile: WavExportProfile,
     pub(crate) show_waveform_only: bool,
+    pub(crate) waveform_layout: WaveformLayout,
     pub(crate) output_dir: PathBuf,
     pub(crate) saved_dir: PathBuf,
 }
@@ -57,6 +77,7 @@ impl Default for SessionSettings {
             meter_mode: MeterMode::Dbfs,
             wav_profile: WavExportProfile::default(),
             show_waveform_only: false,
+            waveform_layout: WaveformLayout::default(),
             output_dir: backtracking.join("output"),
             saved_dir: backtracking.join("saved"),
         }
@@ -133,6 +154,14 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
             show_waveform_only: fields
                 .get("show_waveform_only")
                 .is_some_and(|value| value == "true"),
+            waveform_layout: if fields
+                .get("waveform_layout")
+                .is_some_and(|value| value == "stereo")
+            {
+                WaveformLayout::Stereo
+            } else {
+                defaults.waveform_layout
+            },
             output_dir: read_dir("output_dir").unwrap_or(defaults.output_dir),
             saved_dir: read_dir("saved_dir").unwrap_or(defaults.saved_dir),
         };
@@ -161,6 +190,14 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
             (
                 "show_waveform_only".into(),
                 settings.show_waveform_only.to_string(),
+            ),
+            (
+                "waveform_layout".into(),
+                match settings.waveform_layout {
+                    WaveformLayout::Merged => "merged",
+                    WaveformLayout::Stereo => "stereo",
+                }
+                .into(),
             ),
             (
                 "wav_sample_rate".into(),
