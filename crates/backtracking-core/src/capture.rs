@@ -8,6 +8,7 @@ const OPEN_LEVEL: f32 = 0.001;
 const CLOSE_LEVEL: f32 = 0.000_5;
 const PRE_ROLL_MS: u32 = 40;
 const TAIL_MS: u32 = 150;
+const JOIN_FADE_MS: u32 = 2;
 const MAX_BUFFER_SAMPLES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,10 +114,58 @@ pub struct Capture {
     pre_roll: FrameRing,
     tail_frames: usize,
     quiet_frames: usize,
+    join_fade_frames: usize,
+    join_fade: JoinFade,
     state: CaptureState,
     revision: u64,
     meter: Meter,
     meter_b: Option<Meter>,
+}
+
+enum JoinFade {
+    None,
+    Pending {
+        fade_tail: bool,
+        wait_for_signal: bool,
+    },
+    FadeIn(usize),
+}
+
+impl JoinFade {
+    fn push(&mut self, history: &mut FrameRing, frame: &[f32], fade_frames: usize) {
+        let remaining = match *self {
+            Self::None => {
+                history.push(frame);
+                return;
+            }
+            Self::Pending {
+                fade_tail,
+                wait_for_signal,
+            } => {
+                if fade_tail {
+                    history.fade_out_tail(fade_frames);
+                }
+                if wait_for_signal && frame.iter().all(|&sample| sample == 0.0) {
+                    // A gap's synthetic pre-roll must not use up the fade-in.
+                    history.push(frame);
+                    *self = Self::Pending {
+                        fade_tail: false,
+                        wait_for_signal: true,
+                    };
+                    return;
+                }
+                fade_frames
+            }
+            Self::FadeIn(remaining) => remaining,
+        };
+        let gain = (fade_frames - remaining) as f32 / fade_frames.saturating_sub(1).max(1) as f32;
+        history.push_with_gain(frame, gain);
+        *self = if remaining > 1 {
+            Self::FadeIn(remaining - 1)
+        } else {
+            Self::None
+        };
+    }
 }
 
 impl Capture {
@@ -172,6 +221,8 @@ impl Capture {
             pre_roll: FrameRing::new(frames_for_ms(PRE_ROLL_MS), channels)?,
             tail_frames: frames_for_ms(TAIL_MS),
             quiet_frames: 0,
+            join_fade_frames: frames_for_ms(JOIN_FADE_MS),
+            join_fade: JoinFade::None,
             state: CaptureState::Waiting,
             revision: 0,
             meter: Meter::new(sample_rate, a_channels)?,
@@ -215,13 +266,15 @@ impl Capture {
                     .chunks_exact(self.channels)
                     .chain(second.chunks_exact(self.channels))
                 {
-                    self.history.push(pending_frame);
+                    self.join_fade
+                        .push(&mut self.history, pending_frame, self.join_fade_frames);
                 }
                 self.pre_roll.clear();
                 self.state = CaptureState::Recording;
             }
 
-            self.history.push(frame);
+            self.join_fade
+                .push(&mut self.history, frame, self.join_fade_frames);
             self.history.truncate_to(self.retention_frames);
             changed = true;
 
@@ -249,6 +302,7 @@ impl Capture {
     pub fn pause(&mut self) {
         self.state = CaptureState::Paused;
         self.quiet_frames = 0;
+        self.join_fade = JoinFade::None;
         self.pre_roll.clear();
         self.meter.reset();
         if let Some(meter) = &mut self.meter_b {
@@ -260,6 +314,30 @@ impl Capture {
         if self.state == CaptureState::Paused {
             self.state = CaptureState::Waiting;
         }
+    }
+
+    /// Ramps down the retained tail and ramps up the resumed audio when it is appended.
+    /// The retained history is unchanged until the next frame is kept by the gate.
+    pub fn smooth_next_join(&mut self) {
+        if self.history.len_frames != 0 {
+            self.join_fade = JoinFade::Pending {
+                fade_tail: true,
+                wait_for_signal: false,
+            };
+        }
+    }
+
+    pub(crate) fn smooth_next_start(&mut self) {
+        self.join_fade = JoinFade::Pending {
+            fade_tail: matches!(
+                self.join_fade,
+                JoinFade::Pending {
+                    fade_tail: true,
+                    ..
+                }
+            ),
+            wait_for_signal: true,
+        };
     }
 
     pub fn state(&self) -> CaptureState {
@@ -376,6 +454,12 @@ impl Capture {
         let (first, second) = self.history.as_slices();
         let first_frames = first.len() / self.channels;
         let frame_for_bin = |bin| (bin as u128 * frame_count as u128 / bin_count as u128) as usize;
+        let channel = match view {
+            Some(WaveformView::Left) => Some(track.start),
+            Some(WaveformView::Right) => Some(track.start + usize::from(track.len() > 1)),
+            Some(WaveformView::Merged) if track.len() == 1 => Some(track.start),
+            _ => None,
+        };
 
         for bin in 0..bin_count {
             let start = frame_for_bin(bin);
@@ -385,13 +469,21 @@ impl Capture {
             let first_end = end.min(first_frames) * self.channels;
             let second_start = start.saturating_sub(first_frames) * self.channels;
             let second_end = end.saturating_sub(first_frames) * self.channels;
-            let frames = first[first_start..first_end]
-                .chunks_exact(self.channels)
-                .chain(second[second_start..second_end].chunks_exact(self.channels))
-                .map(|frame| &frame[track.clone()]);
-            let (low, high) = match view {
-                Some(view) => crate::waveform::extrema(frames.map(|frame| view.sample(frame))),
-                None => crate::waveform::extrema(frames.flatten().copied()),
+            let first = &first[first_start..first_end];
+            let second = &second[second_start..second_end];
+            let (low, high) = if let Some(channel) = channel {
+                let first = first.iter().skip(channel).step_by(self.channels);
+                let second = second.iter().skip(channel).step_by(self.channels);
+                crate::waveform::extrema(first.chain(second).copied())
+            } else if view.is_some() {
+                let frames = first
+                    .chunks_exact(self.channels)
+                    .chain(second.chunks_exact(self.channels));
+                crate::waveform::extrema(
+                    frames.map(|frame| WaveformView::Merged.sample(&frame[track.clone()])),
+                )
+            } else {
+                crate::waveform::extrema(first.iter().chain(second).copied())
             };
             minimum[bin] = low;
             maximum[bin] = high;
@@ -415,6 +507,7 @@ impl Capture {
         self.history.clear();
         self.pre_roll.clear();
         self.quiet_frames = 0;
+        self.join_fade = JoinFade::None;
         self.meter.reset();
         if let Some(meter) = &mut self.meter_b {
             meter.reset();
@@ -456,14 +549,42 @@ impl FrameRing {
     }
 
     fn push(&mut self, frame: &[f32]) {
+        self.push_with_gain(frame, 1.0);
+    }
+
+    fn push_with_gain(&mut self, frame: &[f32], gain: f32) {
         let offset = self.next_frame * self.channels;
-        self.samples[offset..offset + self.channels].copy_from_slice(frame);
+        let destination = &mut self.samples[offset..offset + self.channels];
+        if gain == 1.0 {
+            destination.copy_from_slice(frame);
+        } else {
+            for (out, sample) in destination.iter_mut().zip(frame) {
+                *out = sample * gain;
+            }
+        }
         self.next_frame += 1;
         if self.next_frame == self.capacity_frames {
             self.next_frame = 0;
         }
         self.len_frames = (self.len_frames + 1).min(self.capacity_frames);
         self.total_frames = self.total_frames.saturating_add(1);
+    }
+
+    fn fade_out_tail(&mut self, frames: usize) {
+        let count = frames.min(self.len_frames);
+        let denominator = count.saturating_sub(1).max(1) as f32;
+        let mut end = self.next_frame;
+        for distance in 0..count {
+            if end == 0 {
+                end = self.capacity_frames;
+            }
+            end -= 1;
+            let offset = end * self.channels;
+            let gain = distance as f32 / denominator;
+            for sample in &mut self.samples[offset..offset + self.channels] {
+                *sample *= gain;
+            }
+        }
     }
 
     fn truncate_to(&mut self, capacity_frames: usize) {
@@ -492,6 +613,150 @@ impl FrameRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_fades_both_lanes_across_fragmented_blocks_without_retiming() {
+        let mut capture =
+            Capture::new_tracks(48_000, 1, Some(2), DurationChoice::Seconds10).unwrap();
+        let old = [0.75, -0.5, 0.25];
+        let new = [-0.75, 0.5, -0.25];
+        let clip_frames = 120;
+        capture.push_interleaved(&old.repeat(clip_frames)).unwrap();
+        capture.pause();
+        let frozen = capture.snapshot();
+        capture.smooth_next_join();
+        capture.resume();
+        assert_eq!(capture.snapshot(), frozen);
+
+        for frames in [1, 7, 64, 48] {
+            capture.push_interleaved(&new.repeat(frames)).unwrap();
+        }
+        let snapshot = capture.snapshot();
+        let unchanged = clip_frames - 96;
+        assert_eq!(snapshot.frame_range(), 0..240);
+        assert_eq!(
+            snapshot.frames(0..unchanged).unwrap(),
+            old.repeat(unchanged)
+        );
+        assert_eq!(
+            snapshot.frames(240 - unchanged..240).unwrap(),
+            new.repeat(unchanged)
+        );
+        assert_eq!(snapshot.frames(119..121).unwrap(), [0.0; 6]);
+        for (a, b) in snapshot
+            .samples
+            .chunks_exact(3)
+            .zip(snapshot.samples[3..].chunks_exact(3))
+        {
+            assert!(a.iter().zip(b).all(|(a, b)| (a - b).abs() < 0.008));
+        }
+        for lane in 0..2 {
+            let lane = capture.track_snapshot(lane).unwrap();
+            assert_eq!(lane.frame_range(), snapshot.frame_range());
+        }
+    }
+
+    #[test]
+    fn deferred_join_covers_retained_pre_roll_and_a_wrapped_tail() {
+        let mut capture = Capture::new(1_000, 1, DurationChoice::Seconds10).unwrap();
+        capture.push_interleaved(&[0.5; 60_001]).unwrap();
+        capture.pause();
+        capture.smooth_next_join();
+        capture.resume();
+        capture.push_interleaved(&[0.00025]).unwrap();
+        let waiting = capture.snapshot();
+        assert_eq!(waiting.frame_range(), 50_001..60_001);
+        assert_eq!(waiting.samples.last(), Some(&0.5));
+
+        capture.push_interleaved(&[-0.5]).unwrap();
+        let resumed = capture.snapshot();
+        assert_eq!(resumed.frame_range(), 50_003..60_003);
+        assert_eq!(resumed.frames(9_996..10_000).unwrap(), [0.5, 0., 0., -0.5]);
+
+        capture.smooth_next_join();
+        capture.clear();
+        capture.push_interleaved(&[0.5]).unwrap();
+        assert_eq!(capture.snapshot().samples, [0.5]);
+    }
+
+    #[test]
+    fn gap_fade_in_starts_after_silent_pre_roll() {
+        let mut capture = Capture::new(1_000, 1, DurationChoice::Seconds10).unwrap();
+        capture.push_interleaved(&[0.5; 16]).unwrap();
+        capture.smooth_next_join();
+        capture.push_interleaved(&[0.0; 250]).unwrap();
+        assert_eq!(capture.state(), CaptureState::Waiting);
+
+        capture.smooth_next_start();
+        capture.push_interleaved(&[-0.5]).unwrap();
+        capture.push_interleaved(&[-0.5, -0.5]).unwrap();
+        let snapshot = capture.snapshot();
+        assert_eq!(snapshot.frame_count(), 16 + 150 + 40 + 3);
+        assert_eq!(&snapshot.samples[14..17], &[0.5, 0., 0.]);
+        assert_eq!(&snapshot.samples[206..], &[0., -0.5, -0.5]);
+    }
+
+    #[test]
+    fn waveform_routes_match_snapshot_reference_across_ring_wrap() {
+        let mut capture =
+            Capture::new_tracks(1_000, 1, Some(2), DurationChoice::Seconds10).unwrap();
+        let mut samples: Vec<_> = (0..65_013)
+            .flat_map(|frame| {
+                [
+                    (frame % 61 - 30) as f32 / 64.,
+                    (frame % 67 - 33) as f32 / 64.,
+                    (frame % 71 - 35) as f32 / 64.,
+                ]
+            })
+            .collect();
+        samples[59_999 * 3] = -4.;
+        samples[60_000 * 3 + 1] = f32::NAN;
+        samples[60_000 * 3 + 2] = 4.;
+        samples[60_001 * 3 + 2] = f32::INFINITY;
+        capture.push_interleaved(&samples).unwrap();
+        assert!(!capture.history.as_slices().1.is_empty());
+
+        for bins in [7, 17, 280] {
+            let mut low = vec![0.; bins];
+            let mut high = vec![0.; bins + 1];
+            let mut expected_low = low.clone();
+            let mut expected_high = high.clone();
+            for lane in 0..2 {
+                let snapshot = capture.track_snapshot(lane).unwrap();
+                for view in [
+                    WaveformView::Merged,
+                    WaveformView::Left,
+                    WaveformView::Right,
+                ] {
+                    crate::waveform::view_peaks(
+                        &snapshot.samples,
+                        snapshot.channels,
+                        view,
+                        &mut expected_low,
+                        &mut expected_high,
+                    );
+                    assert_eq!(
+                        capture.track_waveform(lane, view, &mut low, &mut high),
+                        10_000
+                    );
+                    assert_eq!(low, expected_low);
+                    assert_eq!(high, expected_high);
+                }
+            }
+
+            let snapshot = capture.snapshot();
+            assert_eq!(capture.waveform(&mut low, &mut high), 10_000);
+            for bin in 0..bins {
+                let first = bin * 10_000 / bins;
+                let end = (bin + 1) * 10_000 / bins;
+                assert_eq!(
+                    (low[bin], high[bin]),
+                    crate::waveform::extrema(snapshot.frames(first..end).unwrap().iter().copied())
+                );
+            }
+            assert_eq!(high[bins], 0.0);
+        }
+    }
 
     #[test]
     fn absolute_retained_frame_range_survives_wrap_and_clear() {

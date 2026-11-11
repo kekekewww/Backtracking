@@ -384,6 +384,10 @@ impl ResamplingKernel {
         }
     }
 
+    pub(crate) fn radius(&self) -> usize {
+        self.radius as usize
+    }
+
     pub(crate) fn at(&self, samples: &[f32], channels: usize, position: f64) -> [f32; 2] {
         let last_frame = (samples.len() / channels - 1) as isize;
         let first = position.floor() as isize - self.radius;

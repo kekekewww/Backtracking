@@ -4,16 +4,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use backtracking_core::{
-    CaptureState, ChannelRoute, DurationChoice, MeterReadings, Snapshot, SynchronizedCapture,
-    WaveformView,
+    CaptureError, CaptureState, ChannelRoute, DurationChoice, MeterReadings, Snapshot,
+    SynchronizedCapture, WaveformView,
 };
 
 pub(crate) use crate::loopback::CaptureSource;
-use crate::loopback::{Format, Loopback, now_ns};
+use crate::loopback::{Format, Loopback, PACKET_QUEUE_CAPACITY, now_ns};
 
 const COMMON_RATE: u32 = 48_000;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
-const MAX_PACKETS_PER_POLL: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SourceSettings {
@@ -186,6 +185,7 @@ impl Controller {
             capture.drain(true);
             capture.reset_input();
             capture.capture_mut().pause();
+            capture.capture_mut().smooth_next_join();
             capture.capture_mut().resume();
             self.revision = self.revision.wrapping_add(1);
         }
@@ -309,18 +309,31 @@ impl Controller {
                     }),
             )
         };
-        let sample_rate = if self.sources[1].is_some() {
-            COMMON_RATE
-        } else {
+        let sample_rate = if self.shared_source_routes().is_some() {
             self.formats[0]
                 .as_ref()
                 .map_or(COMMON_RATE, |format| format.sample_rate)
+        } else {
+            COMMON_RATE
         };
-        let shape = (sample_rate, channels(0).unwrap_or(2), channels(1));
+        let mut shape = (sample_rate, channels(0).unwrap_or(2), channels(1));
         if self.shape == Some(shape) {
             return;
         }
-        match SynchronizedCapture::new(shape.0, shape.1, shape.2, self.retention) {
+        let mut capture = SynchronizedCapture::new(shape.0, shape.1, shape.2, self.retention);
+        if matches!(
+            capture,
+            Err(CaptureError::BufferTooLarge | CaptureError::AllocationFailed)
+        ) && shape.0 != COMMON_RATE
+        {
+            // Very high native rates can exceed the maximum history allocation.
+            shape.0 = COMMON_RATE;
+            if self.shape == Some(shape) {
+                return;
+            }
+            capture = SynchronizedCapture::new(shape.0, shape.1, shape.2, self.retention);
+        }
+        match capture {
             Ok(mut capture) => {
                 if self.paused {
                     capture.capture_mut().pause();
@@ -344,14 +357,25 @@ impl Controller {
         self.revision = self.revision.wrapping_add(1);
     }
 
+    fn shared_source_routes(&self) -> Option<([ChannelRoute; 2], usize)> {
+        let a = self.sources[0].as_ref()?;
+        match &self.sources[1] {
+            None => Some(([a.route, a.route], 1)),
+            Some(b) if a.source.same_source(&b.source) => Some(([a.route, b.route], 2)),
+            Some(_) => None,
+        }
+    }
+
     fn drain(&mut self, flush: bool) {
+        let shared_routes = self.shared_source_routes();
+        let capture_rate = self.shape.map_or(COMMON_RATE, |shape| shape.0);
         let Some(capture) = &mut self.capture else {
             return;
         };
         let before = capture.capture().revision();
         // Drain one packet from each input per round, so a burst from one device
         // cannot commit silence over queued data from the other device.
-        for _ in 0..MAX_PACKETS_PER_POLL {
+        for _ in 0..PACKET_QUEUE_CAPACITY {
             let mut found = false;
             for input in &self.inputs {
                 let Some(packet) = input.stream.packet(&mut self.native) else {
@@ -369,6 +393,23 @@ impl Controller {
                 let timestamp_ns = packet.timestamp_ns.saturating_add(
                     (skip as u128 * 1_000_000_000 / u128::from(packet.sample_rate)) as u64,
                 );
+                if let Some((routes, count)) = shared_routes
+                    && packet.sample_rate == capture_rate
+                {
+                    // Both routes came from the same hardware frame and can stay on
+                    // its native clock. WAV export converts the complete selection once.
+                    format.route_tracks(&routes[..count], samples, &mut self.scratch);
+                    if let Err(error) = capture.push_native_interleaved(
+                        timestamp_ns,
+                        &self.scratch,
+                        packet.discontinuity,
+                    ) {
+                        for status in &mut self.statuses[..count] {
+                            *status = Some(error.to_string());
+                        }
+                    }
+                    continue;
+                }
                 for (lane, source) in self.sources.iter().enumerate() {
                     let Some(source) = source
                         .as_ref()
@@ -378,8 +419,13 @@ impl Controller {
                     };
                     format.route(source.route, samples, &mut self.scratch);
                     if !self.scratch.is_empty()
-                        && let Err(error) =
-                            capture.push(lane, timestamp_ns, packet.sample_rate, &self.scratch)
+                        && let Err(error) = capture.push_with_discontinuity(
+                            lane,
+                            timestamp_ns,
+                            packet.sample_rate,
+                            &self.scratch,
+                            packet.discontinuity,
+                        )
                     {
                         self.statuses[lane] = Some(error.to_string());
                     }
@@ -444,6 +490,7 @@ impl Controller {
         }
         if let Some(capture) = &mut self.capture {
             capture.reset_input();
+            capture.capture_mut().smooth_next_join();
             capture.capture_mut().resume();
         }
         self.request_missing();

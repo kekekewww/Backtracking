@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use backtracking_core::{ChannelRoute, TimedAudioQueue, TimedPacket};
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::Audio::{
-    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
     AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
     AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
@@ -31,13 +32,16 @@ use windows::Win32::System::Variant::VT_BLOB;
 use windows::core::{Error, GUID, HRESULT, HSTRING, Interface, PCWSTR, Ref, implement};
 
 mod sources;
+mod timing;
 pub(crate) use sources::CaptureSource;
 use sources::{OwnedHandle, RunningProcess, target_process};
+use timing::PacketClock;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(4);
 const IDLE_PACKET_GAP: Duration = Duration::from_millis(200);
 const ENDPOINT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const PACKET_QUEUE_CAPACITY: usize = 1024;
 const WAVE_FORMAT_PCM: u16 = 1;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xfffe;
@@ -277,7 +281,8 @@ struct WasapiStream {
     packets: Arc<TimedAudioQueue>,
     packet_capacity: usize,
     scratch: Vec<f32>,
-    last_packet_end: Option<u64>,
+    clock: PacketClock,
+    queue_loss: bool,
     // COM clients are dropped before the event handle and COM apartment.
     _event: Option<OwnedHandle>,
     _apartment: Apartment,
@@ -357,9 +362,15 @@ impl WasapiStream {
         if packet_capacity == 0 || packet_capacity > format.sample_rate as usize * 4 {
             return Err("WASAPI 回傳不支援的緩衝區大小".into());
         }
-        let packets = TimedAudioQueue::new(format.sample_rate as usize, 128, format.channels);
+        // Short device periods can produce many packets before filling the audio ring.
+        let packets = TimedAudioQueue::new(
+            format.sample_rate as usize,
+            PACKET_QUEUE_CAPACITY,
+            format.channels,
+        );
         let scratch_frames = packet_capacity.max(format.sample_rate.div_ceil(5) as usize);
         let scratch = vec![0.0; scratch_frames * format.channels];
+        let clock = PacketClock::new(format.sample_rate);
         let mut stream = Self {
             capture,
             client,
@@ -369,7 +380,8 @@ impl WasapiStream {
             packets,
             packet_capacity,
             scratch,
-            last_packet_end: None,
+            clock,
+            queue_loss: false,
             _event: event,
             _apartment: apartment,
         };
@@ -378,7 +390,8 @@ impl WasapiStream {
     }
 
     fn start(&mut self) -> Result<(), String> {
-        self.last_packet_end = None;
+        self.clock = PacketClock::new(self.format.sample_rate);
+        self.queue_loss = false;
         unsafe { self.client.Start() }.map_err(|error| audio_error("無法開始擷取音訊", error))
     }
 
@@ -444,13 +457,14 @@ impl WasapiStream {
             let mut data = ptr::null_mut();
             let mut frames = 0;
             let mut flags = 0;
+            let mut position = 0;
             let mut qpc_100ns = 0;
             unsafe {
                 self.capture.GetBuffer(
                     &mut data,
                     &mut frames,
                     &mut flags,
-                    None,
+                    Some(&mut position),
                     Some(&mut qpc_100ns),
                 )
             }
@@ -459,7 +473,7 @@ impl WasapiStream {
                 break;
             }
 
-            let result = self.copy_packet(data, frames as usize, flags, qpc_100ns);
+            let result = self.copy_packet(data, frames as usize, flags, position, qpc_100ns);
             let release = unsafe { self.capture.ReleaseBuffer(frames) }
                 .map_err(|error| audio_error("無法釋放音訊封包", error));
             result.and(release)?;
@@ -473,6 +487,7 @@ impl WasapiStream {
         data: *mut u8,
         frames: usize,
         flags: u32,
+        position: u64,
         qpc_100ns: u64,
     ) -> Result<(), String> {
         if frames > self.packet_capacity {
@@ -490,33 +505,40 @@ impl WasapiStream {
                 unsafe { std::slice::from_raw_parts(data, frames * self.format.frame_bytes) };
             self.format.decode(input, samples);
         }
-        let duration = frame_duration_ns(frames, self.format.sample_rate);
         let valid_timestamp =
             qpc_100ns != 0 && flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0;
-        let timestamp_ns = if valid_timestamp {
-            qpc_100ns.saturating_mul(100)
-        } else {
-            self.last_packet_end
-                .unwrap_or_else(|| now_ns().saturating_sub(duration))
-        };
-        self.last_packet_end = Some(timestamp_ns.saturating_add(duration));
-        // Capture cannot block if the UI is busy. A dropped packet leaves a timestamp gap.
-        self.packets
-            .push_interleaved(timestamp_ns, self.format.sample_rate, samples);
+        let stamp = self.clock.timestamp(
+            position,
+            frames,
+            valid_timestamp.then(|| qpc_100ns.saturating_mul(100)),
+            flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0,
+            now_ns,
+        );
+        // Never block the device when the consumer is busy. Tell it explicitly
+        // if a previous queue write discarded audio, including a partial packet.
+        self.queue_loss = self.packets.push_interleaved_with_discontinuity(
+            stamp.timestamp_ns,
+            self.format.sample_rate,
+            samples,
+            stamp.discontinuity || self.queue_loss,
+        ) != frames;
         Ok(())
     }
 
     fn push_idle_silence(&mut self) {
         let frames = self.format.sample_rate.div_ceil(5) as usize;
-        let duration = frame_duration_ns(frames, self.format.sample_rate);
-        let timestamp_ns = self
-            .last_packet_end
-            .unwrap_or_else(|| now_ns().saturating_sub(duration));
-        self.last_packet_end = Some(timestamp_ns.saturating_add(duration));
+        let stamp = self.clock.idle_stamp(frames, now_ns);
         let samples = &mut self.scratch[..frames * self.format.channels];
         samples.fill(0.0);
-        self.packets
-            .push_interleaved(timestamp_ns, self.format.sample_rate, samples);
+        let accepted = self.packets.push_interleaved_with_discontinuity(
+            stamp.timestamp_ns,
+            self.format.sample_rate,
+            samples,
+            stamp.discontinuity || self.queue_loss,
+        );
+        if accepted != 0 {
+            self.queue_loss = false;
+        }
     }
 }
 
@@ -657,10 +679,6 @@ fn open_process_client(pid: u32) -> Result<(IAudioClient, Format, OwnedHandle), 
         "無法初始化應用程式音訊擷取",
         last_error.expect("format attempt"),
     ))
-}
-
-fn frame_duration_ns(frames: usize, rate: u32) -> u64 {
-    (frames as u128 * 1_000_000_000 / u128::from(rate)) as u64
 }
 
 pub(crate) fn now_ns() -> u64 {
@@ -807,33 +825,58 @@ impl Format {
     }
 
     pub(crate) fn route(&self, route: ChannelRoute, input: &[f32], output: &mut Vec<f32>) {
-        output.clear();
-        let Some(channels) = self.route_channels(route) else {
+        if self.route_channels(route).is_none() {
+            output.clear();
             return;
-        };
-        output.reserve(input.len() / self.channels * channels);
-        if route == ChannelRoute::Merged && self.stereo_mix.is_empty() {
+        }
+        self.route_tracks(&[route], input, output);
+    }
+
+    pub(crate) fn route_tracks(
+        &self,
+        routes: &[ChannelRoute],
+        input: &[f32],
+        output: &mut Vec<f32>,
+    ) {
+        output.clear();
+        if routes == [ChannelRoute::Merged] && self.stereo_mix.is_empty() {
             output.extend_from_slice(input);
             return;
         }
+        let channels: usize = routes
+            .iter()
+            .map(|&route| self.route_channels(route).unwrap_or(1))
+            .sum();
+        output.reserve(input.len() / self.channels * channels);
         for frame in input.chunks_exact(self.channels) {
-            match route {
-                ChannelRoute::Left => output.push(frame[self.left.unwrap()]),
-                ChannelRoute::Right => output.push(frame[self.right.unwrap()]),
-                ChannelRoute::Center => output.push(frame[self.center.unwrap()]),
-                ChannelRoute::Mid => {
-                    output.push(frame[self.left.unwrap()] * 0.5 + frame[self.right.unwrap()] * 0.5);
-                }
-                ChannelRoute::Side => {
-                    output.push(frame[self.left.unwrap()] * 0.5 - frame[self.right.unwrap()] * 0.5);
-                }
-                ChannelRoute::Merged => {
-                    let mut mixed = [0.0; 2];
-                    for (&sample, weight) in frame.iter().zip(&self.stereo_mix) {
-                        mixed[0] += sample * weight[0];
-                        mixed[1] += sample * weight[1];
+            let sample = |index: Option<usize>| index.map_or(0.0, |index| frame[index]);
+            for &route in routes {
+                match route {
+                    ChannelRoute::Left => output.push(sample(self.left)),
+                    ChannelRoute::Right => output.push(sample(self.right)),
+                    ChannelRoute::Center => output.push(sample(self.center)),
+                    ChannelRoute::Mid | ChannelRoute::Side => {
+                        let value = self.left.zip(self.right).map_or(0.0, |(left, right)| {
+                            let left = frame[left] * 0.5;
+                            let right = frame[right] * 0.5;
+                            match route {
+                                ChannelRoute::Mid => left + right,
+                                _ => left - right,
+                            }
+                        });
+                        output.push(value);
                     }
-                    output.extend(mixed);
+                    ChannelRoute::Merged if self.stereo_mix.is_empty() => {
+                        output.extend_from_slice(frame)
+                    }
+                    ChannelRoute::Merged => {
+                        let mut mixed = [0.0; 2];
+                        for (&sample, weight) in frame.iter().zip(&self.stereo_mix) {
+                            mixed[0] += sample * weight[0];
+                            mixed[1] += sample * weight[1];
+                        }
+                        output.extend(mixed);
+                    }
                 }
             }
         }
@@ -945,5 +988,35 @@ mod tests {
             native_format(2, 1 | 2).route_channels(ChannelRoute::Center),
             None
         );
+    }
+
+    #[test]
+    fn grouped_routes_use_the_same_native_frames_and_keep_missing_lanes_silent() {
+        let format = native_format(2, 1 | 2);
+        let samples = [0.5, -0.25, -0.5, 0.75];
+        let mut output = Vec::new();
+        format.route_tracks(
+            &[ChannelRoute::Side, ChannelRoute::Mid],
+            &samples,
+            &mut output,
+        );
+        assert_eq!(output, [0.375, 0.125, -0.625, 0.125]);
+        format.route_tracks(
+            &[ChannelRoute::Merged, ChannelRoute::Center],
+            &samples,
+            &mut output,
+        );
+        assert_eq!(output, [0.5, -0.25, 0.0, -0.5, 0.75, 0.0]);
+    }
+
+    #[test]
+    fn short_period_packets_do_not_exhaust_metadata_before_a_ui_poll() {
+        let packets = TimedAudioQueue::new(96_000, PACKET_QUEUE_CAPACITY, 2);
+        let period = [0.25; 64 * 2];
+        for index in 0..256 {
+            let timestamp_ns = index * 64 * 1_000_000_000 / 96_000;
+            assert_eq!(packets.push_interleaved(timestamp_ns, 96_000, &period), 64);
+        }
+        assert_eq!(packets.pending_packets(), 256);
     }
 }
