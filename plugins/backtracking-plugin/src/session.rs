@@ -36,13 +36,15 @@ impl Consumer {
             .is_some_and(|last| last.elapsed() < self.input_timeout)
     }
 
-    fn drain(&mut self, max_blocks: usize) {
+    fn drain(&mut self, max_blocks: usize, mut max_frames: usize) {
         let mut received_input = false;
         for _ in 0..max_blocks {
-            let frames = self.queue.pop_interleaved(&mut self.scratch);
+            let samples = max_frames.min(self.scratch.len() / self.channels) * self.channels;
+            let frames = self.queue.pop_interleaved(&mut self.scratch[..samples]);
             if frames == 0 {
                 break;
             }
+            max_frames -= frames;
             received_input = true;
             let _ = self
                 .capture
@@ -126,6 +128,10 @@ impl Session {
         self.settings.lock().output_dir = output_dir;
     }
 
+    pub(crate) fn set_saved_dir(&self, saved_dir: PathBuf) {
+        self.settings.lock().saved_dir = saved_dir;
+    }
+
     pub(crate) fn set_panel_transparency(&self, panel_transparency: u8) {
         self.settings.lock().panel_transparency = panel_transparency;
     }
@@ -188,7 +194,7 @@ impl Session {
         if let Some(consumer) = &mut state.consumer {
             if was_accepting {
                 // Bring the snapshot up to date with audio already published by the producer.
-                consumer.drain(usize::MAX);
+                consumer.drain(usize::MAX, usize::MAX);
             } else {
                 consumer.queue.discard_pending();
             }
@@ -275,6 +281,18 @@ impl Session {
             .map(|consumer| consumer.capture.snapshot())
     }
 
+    pub(crate) fn snapshot_live(&self) -> Option<Snapshot> {
+        let mut state = self.lock();
+        self.apply_capture_settings(&mut state);
+        let recording = !state.paused && self.accepting.load(Ordering::SeqCst);
+        let consumer = state.consumer.as_mut()?;
+        if recording {
+            let frames = consumer.queue.pending_frames();
+            consumer.drain(usize::MAX, frames);
+        }
+        Some(consumer.capture.snapshot())
+    }
+
     pub(crate) fn waveform(&self, minimum: &mut [f32], maximum: &mut [f32]) -> (usize, u32) {
         let mut state = self.lock();
         self.apply_capture_settings(&mut state);
@@ -332,7 +350,7 @@ impl Session {
         let accepting = self.accepting.load(Ordering::SeqCst);
         if accepting && !paused {
             // Yield the session lock regularly even when a DAW renders ahead of realtime.
-            consumer.drain(8);
+            consumer.drain(8, usize::MAX);
         } else {
             consumer.queue.discard_pending();
         }
@@ -563,6 +581,27 @@ mod tests {
         let recorded = session.snapshot().unwrap();
         assert_eq!(&recorded.samples[..32], &[0.25; 32]);
         assert_eq!(&recorded.samples[32..], &[0.75; 32]);
+    }
+
+    #[test]
+    fn live_snapshot_includes_large_queued_block_without_stopping_capture() {
+        let session = Arc::new(Session::new(SettingsStore::default()));
+        let mut worker = Worker::new(session.clone(), 48_000, 1, 32_768).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+
+        worker.push(&[&mut vec![0.25; 40_000]]);
+        let snapshot = session.snapshot_live().unwrap();
+        assert_eq!(snapshot.frame_count(), 40_000);
+        assert!(!session.is_paused());
+
+        worker.push(&[&mut [0.75; 32]]);
+        let latest = session.snapshot_live().unwrap();
+        assert_eq!(latest.frame_count(), 40_032);
+        assert_eq!(&latest.samples[40_000..], &[0.75; 32]);
+        assert_eq!(snapshot.samples.last(), Some(&0.25));
     }
 
     #[test]

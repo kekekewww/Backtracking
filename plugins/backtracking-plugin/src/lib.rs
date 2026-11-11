@@ -171,6 +171,9 @@ mod tests {
             .join("Backtracking 測試")
             .join("output");
         original.session.set_output_dir(output);
+        original
+            .session
+            .set_saved_dir(std::env::temp_dir().join("Backtracking 測試").join("saved"));
         let worker = Worker::new(original.session.clone(), 1_000, 1, 256).unwrap();
         worker.push(&[&mut [0.5; 32]]);
         original.session.pause();

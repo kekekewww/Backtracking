@@ -40,11 +40,25 @@ enum BacktrackingApp {
     }
 }
 
-private final class CapturePanel: NSPanel {
+private class SnapshotShortcutPanel: NSPanel {
     override var canBecomeKey: Bool { true }
 
+    var onSaveSnapshot: (() -> Void)?
+
+    override func sendEvent(_ event: NSEvent) {
+        let modifiers = event.modifierFlags.intersection([.control, .option, .shift, .command])
+        if isKeyWindow, event.type == .keyDown, modifiers == .control,
+           event.charactersIgnoringModifiers?.lowercased() == "s" {
+            if !event.isARepeat { onSaveSnapshot?() }
+            return
+        }
+        super.sendEvent(event)
+    }
+}
+
+private final class CapturePanel: SnapshotShortcutPanel {
     var onClick: (() -> Void)?
-    var onContextMenu: ((NSEvent) -> Void)?
+    var onOptions: (() -> Void)?
     weak var waveform: WaveformView?
     private var move: MoveGesture?
     private var resize: ResizeGesture?
@@ -134,8 +148,8 @@ private final class CapturePanel: NSPanel {
         case .rightMouseDown:
             onClick?()
             let controlSelect = event.modifierFlags.contains(.control) && waveformContains(event.locationInWindow)
-            if !controlSelect, let onContextMenu {
-                onContextMenu(event)
+            if !controlSelect, let onOptions {
+                onOptions()
                 return
             }
         case .otherMouseDown:
@@ -252,7 +266,7 @@ private final class CapturePanel: NSPanel {
     }
 }
 
-// Created only from frozen history on the UI thread. The worker owns all access to the copy.
+// Created on the UI thread. The worker owns all access to the copy.
 private final class WAVExport: @unchecked Sendable {
     let snapshot: OpaquePointer
 
@@ -273,6 +287,11 @@ private final class WAVExport: @unchecked Sendable {
             return String(validatingUTF8: path).map { URL(fileURLWithPath: $0) }
         }
     }
+}
+
+// Accessed only on the WAV worker queue until the main thread takes ownership.
+private final class PendingProvisionalWAVs: @unchecked Sendable {
+    var urls = Set<URL>()
 }
 
 private final class CaptureLamp: NSView {
@@ -380,12 +399,23 @@ private enum MeterMode: UInt32, CaseIterable {
     }
 }
 
+private enum ExportFolder: Int {
+    case output
+    case saved
+
+    var key: String { self == .output ? "outputDirectory" : "savedDirectory" }
+    var component: String { self == .output ? "output" : "saved" }
+    var label: String { self == .output ? "預設資料夾" : "保存資料夾" }
+}
+
 @MainActor
 private final class BacktrackingController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private let defaults = UserDefaults.standard
     private let worker = DispatchQueue(label: "backtracking.wav-export", qos: .userInitiated)
+    private let pendingProvisionalWAVs = PendingProvisionalWAVs()
     private var tap: SystemAudioTap?
     private var panel: CapturePanel?
+    private var optionsPanel: SnapshotShortcutPanel?
     private var statusItem: NSStatusItem?
     private var background: CaptureBackground?
     private var waveform: WaveformView?
@@ -393,8 +423,21 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private let captureButton = NSButton(title: "", target: nil, action: nil)
     private let captureLamp = CaptureLamp(frame: .zero)
     private let clearButton = NSButton(title: "清除目前錄音", target: nil, action: nil)
+    private let pinButton = NSButton(title: "置頂", target: nil, action: nil)
     private let meterButton = NSButton(title: "— dBFS", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
+    private var optionsCaptureButton: NSButton?
+    private var optionsClearButton: NSButton?
+    private var optionsSaveButton: NSButton?
+    private var optionsCancelSelectionButton: NSButton?
+    private var optionsPinButton: NSButton?
+    private var optionsWaveformButton: NSButton?
+    private var optionsLoginButton: NSButton?
+    private var optionsVisibilityButton: NSButton?
+    private var optionsMeterPopup: NSPopUpButton?
+    private var optionsNotice: NSTextField?
+    private var outputPathLabel: NSTextField?
+    private var savedPathLabel: NSTextField?
     private var toolbar: NSStackView?
     private var toolbarTrailing: NSLayoutConstraint?
     private var waveformMinimumHeight: NSLayoutConstraint?
@@ -414,7 +457,6 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var editing = false
     private var lastClick = ProcessInfo.processInfo.systemUptime
     private var notice: String?
-    private var output = ""
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let saved = unsignedSetting("history"), timeChoices.contains(saved) {
@@ -441,13 +483,6 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         alwaysOnTop = defaults.object(forKey: "alwaysOnTop") as? Bool ?? true
         waveformOnly = defaults.object(forKey: "waveformOnly") as? Bool ?? false
-        if let saved = defaults.string(forKey: "outputDirectory"), saved.hasPrefix("/"), !saved.utf8.contains(0) {
-            output = saved
-        } else {
-            output = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Backtracking/output", isDirectory: true).path
-        }
-
         configureMenu()
         configurePanel()
         configureStatusItem()
@@ -462,11 +497,25 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         return UInt32(exactly: number.doubleValue)
     }
 
+    private func directory(for folder: ExportFolder) -> String {
+        if let saved = defaults.string(forKey: folder.key), saved.hasPrefix("/"), !saved.utf8.contains(0) {
+            return saved
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Backtracking/\(folder.component)", isDirectory: true).path
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         panel?.saveFrame(usingName: frameAutosaveName)
         timer?.invalidate()
         timer = nil
         tap = nil
+        // Worker jobs dispatch their completion asynchronously and never wait for this thread.
+        worker.sync {
+            for url in pendingProvisionalWAVs.urls { try? FileManager.default.removeItem(at: url) }
+            pendingProvisionalWAVs.urls.removeAll()
+        }
+        waveform?.discardPreparedFile()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -517,6 +566,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         visibility.target = self
         menu.addItem(visibility)
         menu.addItem(captureMenuItem())
+        let options = NSMenuItem(title: "設定…", action: #selector(showOptions), keyEquivalent: "")
+        options.target = self
+        menu.addItem(options)
         menu.addItem(loginItem())
         menu.addItem(.separator())
         menu.addItem(quitItem())
@@ -534,6 +586,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private func hidePanel(_ panel: NSWindow) {
         panel.saveFrame(usingName: frameAutosaveName)
         panel.orderOut(nil)
+        updateOptionsVisibility()
     }
 
     private func showPanel(_ panel: NSWindow) {
@@ -541,6 +594,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         refreshWaveform()
         updateStatus()
         panel.orderFrontRegardless()
+        updateOptionsVisibility()
     }
 
     private func configurePanel() {
@@ -558,7 +612,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         window.acceptsMouseMovedEvents = true
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .fullScreenDisallowsTiling]
         window.onClick = { [weak self] in self?.registerClick() }
-        window.onContextMenu = { [weak self] event in self?.showContextMenu(event) }
+        window.onOptions = { [weak self] in self?.showOptions() }
+        window.onSaveSnapshot = { [weak self] in self?.saveCurrentSnapshot() }
 
         let waveform = WaveformView(frame: .zero)
         waveform.controller = self
@@ -585,10 +640,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         meterButton.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         meterButton.widthAnchor.constraint(equalToConstant: 88).isActive = true
 
-        let pinButton = NSButton(title: "置頂", target: self, action: #selector(pinChanged(_:)))
+        pinButton.target = self
+        pinButton.action = #selector(pinChanged(_:))
         pinButton.setButtonType(.pushOnPushOff)
         pinButton.bezelStyle = .rounded
-        let settingsButton = NSButton(title: "設定", target: self, action: #selector(showSettings(_:)))
+        let settingsButton = NSButton(title: "設定", target: self, action: #selector(showOptions))
         settingsButton.bezelStyle = .rounded
         setIcon("gearshape", label: "設定", on: settingsButton)
         let spacer = NSView(frame: .zero)
@@ -626,7 +682,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         waveformTopBelowToolbar?.isActive = true
         waveformTopWithoutToolbar = waveform.topAnchor.constraint(equalTo: content.topAnchor, constant: panelVerticalInset)
         panel = window
-        applyPin(to: pinButton)
+        applyPin()
         applyWaveformOnly()
         let restoredFrame = window.setFrameUsingName(frameAutosaveName, force: true)
         _ = window.setFrameAutosaveName(frameAutosaveName)
@@ -656,69 +712,204 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         button.setAccessibilityLabel(label)
     }
 
-    @objc private func showSettings(_ sender: NSButton) {
-        showMenu(settingsMenu(), below: sender)
+    @objc private func showOptions() {
+        guard !editing else { return }
+        registerClick()
+        let window = optionsPanel ?? makeOptionsPanel()
+        optionsPanel = window
+        updateOptionsVisibility()
+        updateLoginOption()
+        updateStatus()
+        keepPanelVisible(window)
+        NSApp.activate()
+        window.makeKeyAndOrderFront(nil)
     }
 
-    private func showContextMenu(_ event: NSEvent) {
-        guard !editing, let content = panel?.contentView else { return }
-        NSMenu.popUpContextMenu(settingsMenu(), with: event, for: content)
-    }
+    private func makeOptionsPanel() -> SnapshotShortcutPanel {
+        let window = SnapshotShortcutPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 470, height: 300),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false
+        )
+        window.title = "Backtracking 設定"
+        window.isReleasedWhenClosed = false
+        window.isFloatingPanel = true
+        window.level = .floating
+        window.hidesOnDeactivate = false
+        window.onSaveSnapshot = { [weak self] in self?.saveCurrentSnapshot() }
 
-    private func settingsMenu() -> NSMenu {
-        let menu = NSMenu(title: "設定")
-        if waveformOnly {
-            menu.addItem(captureMenuItem())
-            menu.addItem(.separator())
+        let content = NSView(frame: .zero)
+        let tabs = NSTabView(frame: .zero)
+        tabs.addTabViewItem(makeActionTab())
+        tabs.addTabViewItem(makeCaptureTab())
+        tabs.addTabViewItem(makeAppearanceTab())
+        let notice = NSTextField(labelWithString: "")
+        notice.textColor = .secondaryLabelColor
+        notice.lineBreakMode = .byTruncatingMiddle
+        notice.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        optionsNotice = notice
+        for view in [tabs as NSView, notice] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(view)
         }
-        menu.addItem(choiceMenu(
-            title: "保留時間", choices: timeChoices, selected: history,
-            action: #selector(historyChanged(_:))
-        ) { "\($0) 秒" })
-        menu.addItem(choiceMenu(
-            title: "自動續錄", choices: autoResumeChoices, selected: idleSeconds,
-            action: #selector(idleChanged(_:))
-        ) { "\($0) 秒" })
-        menu.addItem(choiceMenu(
-            title: "背景透明度", choices: transparencyChoices, selected: transparency,
-            action: #selector(transparencyChanged(_:))
-        ) { "\($0)%" })
-        let accent = NSMenuItem(title: "主題色…", action: #selector(chooseAccentColor), keyEquivalent: "")
-        accent.target = self
-        menu.addItem(accent)
-        let meterItem = NSMenuItem(title: "電平顯示", action: nil, keyEquivalent: "")
-        meterItem.submenu = meterMenu()
-        menu.addItem(meterItem)
-        menu.addItem(exportFormatMenuItem())
-        let waveformItem = NSMenuItem(title: "只顯示波形", action: #selector(toggleWaveformOnly), keyEquivalent: "")
-        waveformItem.target = self
-        waveformItem.state = waveformOnly ? .on : .off
-        menu.addItem(waveformItem)
-        let outputItem = NSMenuItem(title: "選擇儲存資料夾…", action: #selector(chooseOutput), keyEquivalent: "")
-        outputItem.target = self
-        menu.addItem(outputItem)
-        let revealItem = NSMenuItem(title: "前往儲存資料夾", action: #selector(openOutputFolder), keyEquivalent: "")
-        revealItem.target = self
-        menu.addItem(revealItem)
-        menu.addItem(loginItem())
-        menu.addItem(.separator())
-        menu.addItem(quitItem())
-        return menu
+        NSLayoutConstraint.activate([
+            tabs.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
+            tabs.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            tabs.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            tabs.bottomAnchor.constraint(equalTo: notice.topAnchor, constant: -8),
+            notice.leadingAnchor.constraint(equalTo: tabs.leadingAnchor, constant: 4),
+            notice.trailingAnchor.constraint(equalTo: tabs.trailingAnchor, constant: -4),
+            notice.heightAnchor.constraint(equalToConstant: 16),
+            notice.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10)
+        ])
+        window.contentView = content
+        window.center()
+        return window
     }
 
-    private func exportFormatMenuItem() -> NSMenuItem {
-        let item = NSMenuItem(title: "WAV 匯出格式", action: nil, keyEquivalent: "")
-        let menu = NSMenu(title: item.title)
-        menu.addItem(choiceMenu(
-            title: "取樣率", choices: exportSampleRates, selected: exportSampleRate,
-            action: #selector(exportSampleRateChanged(_:))
-        ) { $0 == 44_100 ? "44.1 kHz" : "\($0 / 1_000) kHz" })
-        menu.addItem(choiceMenu(
-            title: "編碼", choices: exportBitDepths, selected: exportBitsPerSample,
-            action: #selector(exportEncodingChanged(_:))
-        ) { $0 == 32 ? "32-bit float" : "\($0)-bit PCM" })
-        item.submenu = menu
-        return item
+    private func makeActionTab() -> NSTabViewItem {
+        let capture = NSButton(title: captureActionLabel, target: self, action: #selector(toggleCapture(_:)))
+        let save = NSButton(title: "保存快照（Ctrl+S）", target: self, action: #selector(saveCurrentSnapshot))
+        let clear = NSButton(title: "清除目前錄音", target: self, action: #selector(clearCapture))
+        let cancel = NSButton(title: "取消選取", target: self, action: #selector(cancelWaveformSelection))
+        let visibility = NSButton(title: "隱藏波形", target: self, action: #selector(togglePanelVisibility))
+        let quit = NSButton(title: "結束 Backtracking", target: NSApp, action: #selector(NSApplication.terminate(_:)))
+        optionsCaptureButton = capture
+        optionsSaveButton = save
+        optionsClearButton = clear
+        optionsCancelSelectionButton = cancel
+        optionsVisibilityButton = visibility
+        return optionsTab("動作", rows: [
+            controlRow(capture, save, clear),
+            folderOptions(.output),
+            folderOptions(.saved),
+            controlRow(cancel, visibility, quit)
+        ])
+    }
+
+    private func makeCaptureTab() -> NSTabViewItem {
+        optionsTab("錄音與 WAV", rows: [
+            optionChoice(
+                "保留時間", choices: timeChoices, selected: history, action: #selector(historyChanged(_:))
+            ) { "\($0) 秒" },
+            optionChoice(
+                "自動續錄", choices: autoResumeChoices, selected: idleSeconds, action: #selector(idleChanged(_:))
+            ) { "\($0) 秒" },
+            optionChoice(
+                "WAV 取樣率", choices: exportSampleRates, selected: exportSampleRate,
+                action: #selector(exportSampleRateChanged(_:))
+            ) { $0 == 44_100 ? "44.1 kHz" : "\($0 / 1_000) kHz" },
+            optionChoice(
+                "WAV 編碼", choices: exportBitDepths, selected: exportBitsPerSample,
+                action: #selector(exportEncodingChanged(_:))
+            ) { $0 == 32 ? "32-bit float" : "\($0)-bit PCM" }
+        ])
+    }
+
+    private func makeAppearanceTab() -> NSTabViewItem {
+        let waveform = NSButton(checkboxWithTitle: "只顯示波形", target: self, action: #selector(toggleWaveformOnly))
+        waveform.state = waveformOnly ? .on : .off
+        optionsWaveformButton = waveform
+        let pin = NSButton(checkboxWithTitle: "置頂", target: self, action: #selector(pinChanged(_:)))
+        pin.state = alwaysOnTop ? .on : .off
+        optionsPinButton = pin
+        let login = NSButton(checkboxWithTitle: "登入時啟動", target: self, action: #selector(toggleLaunchAtLogin))
+        optionsLoginButton = login
+        let meter = choiceControl(
+            MeterMode.allCases.map(\.rawValue), selected: meterMode.rawValue, action: #selector(meterChanged(_:))
+        ) { MeterMode(rawValue: $0)?.label ?? "" }
+        optionsMeterPopup = meter
+        let accent = NSButton(title: "選擇…", target: self, action: #selector(chooseAccentColor))
+        return optionsTab("外觀與系統", rows: [
+            optionChoice(
+                "背景透明度", choices: transparencyChoices, selected: transparency,
+                action: #selector(transparencyChanged(_:))
+            ) { "\($0)%" },
+            labeledOption("主題色", accent),
+            labeledOption("電平顯示", meter),
+            controlRow(waveform, pin),
+            login
+        ])
+    }
+
+    private func optionsTab(_ title: String, rows: [NSView]) -> NSTabViewItem {
+        let tab = NSTabViewItem(identifier: title)
+        tab.label = title
+        let content = NSView(frame: .zero)
+        let stack = NSStackView(views: rows)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -14),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -14)
+        ])
+        tab.view = content
+        return tab
+    }
+
+    private func controlRow(_ views: NSView...) -> NSStackView {
+        let row = NSStackView(views: views)
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        return row
+    }
+
+    private func labeledOption(_ title: String, _ control: NSView) -> NSStackView {
+        let label = NSTextField(labelWithString: title)
+        label.widthAnchor.constraint(equalToConstant: 92).isActive = true
+        control.setAccessibilityLabel(title)
+        return controlRow(label, control)
+    }
+
+    private func optionChoice(
+        _ title: String, choices: [UInt32], selected: UInt32, action: Selector, label: (UInt32) -> String
+    ) -> NSStackView {
+        labeledOption(title, choiceControl(choices, selected: selected, action: action, label: label))
+    }
+
+    private func choiceControl(
+        _ choices: [UInt32], selected: UInt32, action: Selector, label: (UInt32) -> String
+    ) -> NSPopUpButton {
+        let popup = NSPopUpButton(frame: .zero, pullsDown: false)
+        for choice in choices {
+            popup.addItem(withTitle: label(choice))
+            popup.lastItem?.tag = Int(choice)
+        }
+        popup.selectItem(withTag: Int(selected))
+        popup.target = self
+        popup.action = action
+        return popup
+    }
+
+    private func folderOptions(_ folder: ExportFolder) -> NSStackView {
+        let choose = NSButton(title: "選擇…", target: self, action: #selector(chooseFolder(_:)))
+        let reveal = NSButton(title: "在 Finder 開啟", target: self, action: #selector(openFolder(_:)))
+        choose.tag = folder.rawValue
+        reveal.tag = folder.rawValue
+        choose.setAccessibilityLabel("選擇\(folder.label)")
+        reveal.setAccessibilityLabel("在 Finder 開啟\(folder.label)")
+        let controls = controlRow(NSTextField(labelWithString: folder.label), choose, reveal)
+        let path = NSTextField(labelWithString: directory(for: folder))
+        path.toolTip = path.stringValue
+        path.textColor = .secondaryLabelColor
+        path.lineBreakMode = .byTruncatingMiddle
+        path.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        path.widthAnchor.constraint(lessThanOrEqualToConstant: 388).isActive = true
+        if folder == .output { outputPathLabel = path } else { savedPathLabel = path }
+        let group = NSStackView(views: [controls, path])
+        group.orientation = .vertical
+        group.alignment = .leading
+        group.spacing = 3
+        return group
+    }
+
+    private func updateOptionsVisibility() {
+        optionsVisibilityButton?.title = panel?.isVisible == true ? "隱藏波形" : "顯示波形"
     }
 
     @objc private func showMeterOptions(_ sender: NSButton) {
@@ -765,6 +956,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     @objc private func toggleLaunchAtLogin() {
+        defer { updateLoginOption() }
         let service = SMAppService.mainApp
         do {
             if service.status == .enabled || service.status == .requiresApproval {
@@ -783,6 +975,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 _ = alert.runModal()
             }
         }
+    }
+
+    private func updateLoginOption() {
+        let status = SMAppService.mainApp.status
+        optionsLoginButton?.allowsMixedState = status == .requiresApproval
+        optionsLoginButton?.title = status == .requiresApproval ? "登入時啟動（待核准）" : "登入時啟動"
+        optionsLoginButton?.state = status == .enabled ? .on : (status == .requiresApproval ? .mixed : .off)
     }
 
     @objc private func chooseAccentColor() {
@@ -809,24 +1008,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         waveform?.accentRGB = rgb
     }
 
-    private func choiceMenu(title: String, choices: [UInt32], selected: UInt32, action: Selector, label: (UInt32) -> String) -> NSMenuItem {
-        let section = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        let submenu = NSMenu(title: title)
-        for choice in choices {
-            let item = NSMenuItem(title: label(choice), action: action, keyEquivalent: "")
-            item.tag = Int(choice)
-            item.target = self
-            item.state = choice == selected ? .on : .off
-            submenu.addItem(item)
-        }
-        section.submenu = submenu
-        return section
+    private func selectedValue(_ sender: NSPopUpButton) -> UInt32? {
+        guard let tag = sender.selectedItem?.tag else { return nil }
+        return UInt32(exactly: tag)
     }
 
-    @objc private func historyChanged(_ sender: NSMenuItem) {
-        guard let selected = UInt32(exactly: sender.tag), timeChoices.contains(selected) else { return }
+    @objc private func historyChanged(_ sender: NSPopUpButton) {
+        guard let selected = selectedValue(sender), timeChoices.contains(selected) else { return }
         registerClick()
         if let core = tap?.core, bt_set_history(core, selected) != 1 {
+            sender.selectItem(withTag: Int(history))
             setNotice("無法調整保留時間")
             return
         }
@@ -836,15 +1027,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         refreshWaveform()
     }
 
-    @objc private func idleChanged(_ sender: NSMenuItem) {
-        guard let selected = UInt32(exactly: sender.tag), autoResumeChoices.contains(selected) else { return }
+    @objc private func idleChanged(_ sender: NSPopUpButton) {
+        guard let selected = selectedValue(sender), autoResumeChoices.contains(selected) else { return }
         idleSeconds = selected
         defaults.set(Int(idleSeconds), forKey: autoResumePreferenceKey)
         registerClick()
     }
 
-    @objc private func transparencyChanged(_ sender: NSMenuItem) {
-        guard let selected = UInt32(exactly: sender.tag), transparencyChoices.contains(selected) else { return }
+    @objc private func transparencyChanged(_ sender: NSPopUpButton) {
+        guard let selected = selectedValue(sender), transparencyChoices.contains(selected) else { return }
         transparency = selected
         defaults.set(Int(selected), forKey: "backgroundTransparency")
         registerClick()
@@ -861,23 +1052,25 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         background?.backgroundOpacity = 1 - CGFloat(effectiveTransparency) / 100
     }
 
-    @objc private func meterChanged(_ sender: NSMenuItem) {
-        guard let raw = UInt32(exactly: sender.tag), let mode = MeterMode(rawValue: raw) else { return }
+    @objc private func meterChanged(_ sender: Any) {
+        let tag = (sender as? NSPopUpButton)?.selectedItem?.tag ?? (sender as? NSMenuItem)?.tag
+        guard let tag, let raw = UInt32(exactly: tag), let mode = MeterMode(rawValue: raw) else { return }
         meterMode = mode
         defaults.set(Int(raw), forKey: "meterMode")
+        optionsMeterPopup?.selectItem(withTag: tag)
         registerClick()
         updateMeter()
     }
 
-    @objc private func exportSampleRateChanged(_ sender: NSMenuItem) {
-        guard let rate = UInt32(exactly: sender.tag), exportSampleRates.contains(rate), rate != exportSampleRate else { return }
+    @objc private func exportSampleRateChanged(_ sender: NSPopUpButton) {
+        guard let rate = selectedValue(sender), exportSampleRates.contains(rate), rate != exportSampleRate else { return }
         exportSampleRate = rate
         defaults.set(Int(rate), forKey: "exportSampleRate")
         invalidateExportFormat()
     }
 
-    @objc private func exportEncodingChanged(_ sender: NSMenuItem) {
-        guard let bits = UInt32(exactly: sender.tag), exportBitDepths.contains(bits), bits != exportBitsPerSample else { return }
+    @objc private func exportEncodingChanged(_ sender: NSPopUpButton) {
+        guard let bits = selectedValue(sender), exportBitDepths.contains(bits), bits != exportBitsPerSample else { return }
         exportBitsPerSample = bits
         defaults.set(Int(bits), forKey: "exportBitsPerSample")
         invalidateExportFormat()
@@ -905,15 +1098,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     @objc private func pinChanged(_ sender: NSButton) {
         alwaysOnTop = sender.state == .on
         defaults.set(alwaysOnTop, forKey: "alwaysOnTop")
-        applyPin(to: sender)
+        applyPin()
     }
 
-    private func applyPin(to button: NSButton) {
-        button.state = alwaysOnTop ? .on : .off
+    private func applyPin() {
+        pinButton.state = alwaysOnTop ? .on : .off
+        optionsPinButton?.state = pinButton.state
         panel?.isFloatingPanel = alwaysOnTop
         panel?.hidesOnDeactivate = false
         panel?.level = alwaysOnTop ? .floating : .normal
-        setIcon(alwaysOnTop ? "pin.fill" : "pin", label: alwaysOnTop ? "取消置頂" : "置頂", on: button)
+        setIcon(alwaysOnTop ? "pin.fill" : "pin", label: alwaysOnTop ? "取消置頂" : "置頂", on: pinButton)
     }
 
     @objc private func toggleWaveformOnly() {
@@ -924,6 +1118,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func applyWaveformOnly() {
+        optionsWaveformButton?.state = waveformOnly ? .on : .off
         if waveformOnly, let waveform {
             panel?.contentView?.layoutSubtreeIfNeeded()
             waveform.maximumTraceHeight = max(waveform.bounds.height, fullWaveformMinimumHeight)
@@ -970,31 +1165,36 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         panel.setFrame(adjusted, display: true)
     }
 
-    @objc private func chooseOutput() {
+    @objc private func chooseFolder(_ sender: NSButton) {
+        guard let folder = ExportFolder(rawValue: sender.tag), let window = optionsPanel, !editing else { return }
         let wasPaused = paused
-        beginEditing()
+        if folder == .output { beginEditing() }
         let chooser = NSOpenPanel()
-        chooser.title = "選擇 WAV 儲存資料夾"
+        chooser.title = "選擇\(folder.label)"
         chooser.canChooseDirectories = true
         chooser.canChooseFiles = false
         chooser.canCreateDirectories = true
         chooser.allowsMultipleSelection = false
-        chooser.directoryURL = URL(fileURLWithPath: output, isDirectory: true)
-        chooser.begin { [weak self] response in
+        chooser.directoryURL = URL(fileURLWithPath: directory(for: folder), isDirectory: true)
+        chooser.beginSheetModal(for: window) { [weak self] response in
             guard let self else { return }
             if response == .OK, let url = chooser.url {
-                self.output = url.path
-                self.defaults.set(self.output, forKey: "outputDirectory")
-                self.waveform?.discardPreparedFile()
-                self.setNotice("輸出位置 \(self.output)")
+                self.defaults.set(url.path, forKey: folder.key)
+                if folder == .output { self.waveform?.discardPreparedFile() }
+                let label = folder == .output ? self.outputPathLabel : self.savedPathLabel
+                label?.stringValue = url.path
+                label?.toolTip = url.path
             }
-            self.endEditing(allowImmediateResume: !wasPaused)
+            if folder == .output {
+                self.endEditing(allowImmediateResume: !wasPaused)
+            }
         }
     }
 
-    @objc private func openOutputFolder() {
+    @objc private func openFolder(_ sender: NSButton) {
+        guard let folder = ExportFolder(rawValue: sender.tag) else { return }
         registerClick()
-        let url = URL(fileURLWithPath: output, isDirectory: true)
+        let url = URL(fileURLWithPath: directory(for: folder), isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         } catch {
@@ -1072,6 +1272,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         updateStatus()
     }
 
+    @objc private func cancelWaveformSelection() {
+        _ = waveform?.cancelSelection()
+    }
+
     private func pauseCapture() {
         if !paused {
             do {
@@ -1118,7 +1322,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             registerClick()
             resume()
         }
-        if panelVisible { updateStatus() }
+        if panelVisible || optionsPanel?.isVisible == true { updateStatus() }
     }
 
     func refreshWaveform() {
@@ -1143,6 +1347,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         captureButton.isEnabled = !editing
         clearButton.isEnabled = tap?.core != nil && !editing
+        if let optionsCaptureButton, optionsCaptureButton.title != label {
+            optionsCaptureButton.title = label
+        }
+        optionsCaptureButton?.isEnabled = captureButton.isEnabled
+        optionsClearButton?.isEnabled = clearButton.isEnabled
+        optionsSaveButton?.isEnabled = clearButton.isEnabled
+        optionsCancelSelectionButton?.isEnabled = waveform?.canCancelSelection == true
         updateMeter()
 
         let now = ProcessInfo.processInfo.systemUptime
@@ -1154,6 +1365,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         captureLamp.update(state, now: now, detail: detail)
         let message = notice ?? captureError ?? ""
+        if let optionsNotice, optionsNotice.stringValue != message {
+            optionsNotice.stringValue = message
+            optionsNotice.toolTip = message.isEmpty ? nil : message
+        }
         if statusLabel.stringValue != message {
             statusLabel.stringValue = message
             statusLabel.toolTip = message.isEmpty ? nil : message
@@ -1168,8 +1383,33 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     func frozenExport() -> WAVExport? {
-        guard paused, let core = tap?.core, let snapshot = bt_snapshot(core) else { return nil }
+        guard paused else { return nil }
+        return captureSnapshot()
+    }
+
+    private func captureSnapshot() -> WAVExport? {
+        guard let core = tap?.core else { return nil }
+        if !paused { bt_poll(core) }
+        guard let snapshot = bt_snapshot(core) else { return nil }
         return WAVExport(snapshot)
+    }
+
+    @objc private func saveCurrentSnapshot() {
+        guard !editing else { return }
+        let selected = waveform?.selectionForSaving()
+        guard let job = selected?.snapshot ?? captureSnapshot() else {
+            setNotice("還沒有可保存的錄音")
+            return
+        }
+        if paused {
+            resume()
+        } else if selected != nil {
+            waveform?.clearSelection()
+            refreshWaveform()
+        }
+        writeExport(job, range: selected?.range ?? 0...1, directory: directory(for: .saved), provisional: false) { _ in
+            true
+        }
     }
 
     func export(
@@ -1179,13 +1419,23 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             if completion(nil) { setNotice("還沒有可匯出的錄音") }
             return
         }
-        let directory = output
+        writeExport(job, range: range, directory: directory(for: .output), provisional: provisional, completion: completion)
+    }
+
+    private func writeExport(
+        _ job: WAVExport, range: ClosedRange<Double>, directory: String,
+        provisional: Bool, completion: @escaping (URL?) -> Bool
+    ) {
         let sampleRate = exportSampleRate
         let bitsPerSample = exportBitsPerSample
         setNotice(provisional ? "正在準備拖放…" : "正在寫入 WAV…")
-        worker.async { [weak self] in
+        worker.async { [weak self, worker, pendingProvisionalWAVs] in
             let url = job.write(range: range, directory: directory, sampleRate: sampleRate, bitsPerSample: bitsPerSample)
+            if provisional, let url { pendingProvisionalWAVs.urls.insert(url) }
             DispatchQueue.main.async {
+                if provisional, let url {
+                    worker.async { _ = pendingProvisionalWAVs.urls.remove(url) }
+                }
                 guard completion(url) else {
                     if provisional, let url { try? FileManager.default.removeItem(at: url) }
                     return
@@ -1229,11 +1479,7 @@ private final class WaveformView: NSView, NSDraggingSource {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var acceptsFirstResponder: Bool { true }
-    override var needsPanelToBecomeKey: Bool {
-        let modifiers = NSEvent.modifierFlags
-        return selection != nil ||
-            (!movesFromWaveform(modifiers) && !modifiers.intersection([.option, .control]).isEmpty)
-    }
+    override var needsPanelToBecomeKey: Bool { true }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -1270,8 +1516,15 @@ private final class WaveformView: NSView, NSDraggingSource {
         needsDisplay = true
     }
 
+    func selectionForSaving() -> (range: ClosedRange<Double>, snapshot: WAVExport)? {
+        guard let selection, let selectedSnapshot else { return nil }
+        return (selection, selectedSnapshot)
+    }
+
+    var canCancelSelection: Bool { !dragging && (anchor != nil || selection != nil) }
+
     func cancelSelection() -> Bool {
-        guard !dragging, anchor != nil || selection != nil else { return false }
+        guard canCancelSelection else { return false }
         anchor = nil
         mouseDownEvent = nil
         dragRequested = false

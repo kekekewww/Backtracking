@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
 use std::io::{self, Cursor};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -28,7 +29,6 @@ mod win_drag;
 const BINS: usize = 512;
 const REFRESH: Duration = Duration::from_millis(80);
 const RECORDING_BLINK: Duration = Duration::from_millis(500);
-const SETTINGS_POPUP_ID: &str = "backtracking-settings-popup";
 const TOOLBAR_CONTROL_HEIGHT: f32 = 25.0;
 const MIN_WAVEFORM_HEIGHT: f32 = 60.0;
 const PRODUCT_ICON: &[u8] = include_bytes!("../../../assets/backtracking-icon.png");
@@ -49,7 +49,8 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
             next_refresh: Instant::now(),
             recording_since: None,
             displayed_settings: None,
-            context_menu_position: None,
+            options_open: false,
+            options_tab: OptionsTab::Actions,
             full_waveform_height: None,
             frozen: None,
             selection: None,
@@ -57,6 +58,7 @@ pub(crate) fn create(session: Arc<Session>) -> Option<CaptureEditor> {
             gesture: None,
             export: None,
             pending_exports: VecDeque::new(),
+            snapshot_writer: None,
             exported: None,
             revision: 0,
             native_dragging: Arc::new(AtomicBool::new(false)),
@@ -76,7 +78,8 @@ pub struct CaptureUi {
     next_refresh: Instant,
     recording_since: Option<Instant>,
     displayed_settings: Option<SessionSettings>,
-    context_menu_position: Option<Pos2>,
+    options_open: bool,
+    options_tab: OptionsTab,
     full_waveform_height: Option<f32>,
     frozen: Option<Arc<Snapshot>>,
     selection: Option<Range<f32>>,
@@ -84,6 +87,7 @@ pub struct CaptureUi {
     gesture: Option<Gesture>,
     export: Option<ExportJob>,
     pending_exports: VecDeque<ExportRequest>,
+    snapshot_writer: Option<SnapshotWriter>,
     exported: Option<ExportedWav>,
     revision: u64,
     native_dragging: Arc<AtomicBool>,
@@ -106,8 +110,38 @@ enum Gesture {
 }
 
 enum FolderAction {
-    Select,
-    Open,
+    Select(FolderKind),
+    Open(FolderKind),
+}
+
+#[derive(Clone, Copy)]
+enum FolderKind {
+    Export,
+    Saved,
+}
+
+impl FolderKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Export => "Export folder",
+            Self::Saved => "Saved snapshots",
+        }
+    }
+
+    fn path(self, settings: &SessionSettings) -> &Path {
+        match self {
+            Self::Export => &settings.output_dir,
+            Self::Saved => &settings.saved_dir,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OptionsTab {
+    Actions,
+    Capture,
+    Appearance,
+    Folders,
 }
 
 impl MeterMode {
@@ -128,14 +162,18 @@ struct ExportJob {
 
 struct ExportRequest {
     revision: u64,
-    profile: WavExportProfile,
     immediate: bool,
+    clip: WavClip,
+}
+
+struct WavClip {
+    profile: WavExportProfile,
     output: PathBuf,
     snapshot: Arc<Snapshot>,
     range: Range<usize>,
 }
 
-impl ExportRequest {
+impl WavClip {
     fn write(self) -> io::Result<PathBuf> {
         let samples = self
             .snapshot
@@ -149,6 +187,36 @@ impl ExportRequest {
             self.profile,
         )?
         .canonicalize()
+    }
+}
+
+struct SnapshotWriter {
+    requests: Sender<WavClip>,
+    results: Receiver<io::Result<PathBuf>>,
+    worker: JoinHandle<()>,
+}
+
+impl SnapshotWriter {
+    fn start() -> io::Result<Self> {
+        let (requests, incoming) = mpsc::channel::<WavClip>();
+        let (completed, results) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("backtracking-snapshot".into())
+            .spawn(move || {
+                for clip in incoming {
+                    let _ = completed.send(clip.write());
+                }
+            })?;
+        Ok(Self {
+            requests,
+            results,
+            worker,
+        })
+    }
+
+    fn finish(self) {
+        drop(self.requests);
+        let _ = self.worker.join();
     }
 }
 
@@ -182,9 +250,16 @@ impl NiceEguiApp for CaptureUi {
         &mut self,
         context: egui::Context,
         _: GuiContext,
-        _: &mut Frame,
+        _frame: &mut Frame,
     ) -> Result<(), nice_plug_egui::baseview::HandlerError> {
         self.product_icon = product_icon(&context);
+        self.options_open = false;
+        // Baseview still sends ignored keys to egui. Let AppKit forward Cmd+S to the DAW.
+        #[cfg(target_os = "macos")]
+        _frame.set_key_capture(nice_plug_egui::KeyCapture::IgnoreKeys(vec![
+            nice_plug_egui::Key::Character("s".into()),
+            nice_plug_egui::Key::Character("S".into()),
+        ]));
         context.add_font(egui::FontInsert {
             name: waveform::HINT_BOLD_FAMILY.to_owned(),
             data: egui::FontData::from_static(waveform::HINT_BOLD_FONT),
@@ -228,8 +303,13 @@ impl NiceEguiApp for CaptureUi {
             }
         }
         self.collect_export();
-        let popup_id = egui::Id::unique(SETTINGS_POPUP_ID);
-        let canceled_selection = !egui::Popup::is_id_open(ui.ctx(), popup_id)
+        self.collect_saved_snapshots();
+        let save_shortcut = take_save_shortcut(ui) && frame.baseview_window().has_focus();
+        let save_after_gesture = save_shortcut && !self.can_toggle_capture();
+        if save_shortcut && !save_after_gesture {
+            self.save_snapshot(&settings);
+        }
+        let canceled_selection = !self.options_open
             && self.can_cancel_selection()
             && ui.input_mut(|input| {
                 let event_count = input.events.len();
@@ -265,18 +345,18 @@ impl NiceEguiApp for CaptureUi {
         });
         let can_toggle = self.can_toggle_capture();
         let canvas = ui.max_rect().intersect(ui.clip_rect());
-        let context_at = ui.input(|input| {
-            if can_toggle && input.pointer.secondary_clicked() {
-                input
-                    .pointer
-                    .interact_pos()
-                    .filter(|position| canvas.contains(*position))
-            } else {
-                None
-            }
-        });
-        let controls_enabled =
-            can_toggle && context_at.is_none() && !egui::Popup::is_id_open(ui.ctx(), popup_id);
+        if can_toggle
+            && ui.input(|input| {
+                input.pointer.secondary_clicked()
+                    && input
+                        .pointer
+                        .interact_pos()
+                        .is_some_and(|position| canvas.contains(position))
+            })
+        {
+            self.options_open = true;
+        }
+        let controls_enabled = can_toggle && !self.options_open;
         let gear = if waveform_only {
             self.recording_since = None;
             None
@@ -324,14 +404,13 @@ impl NiceEguiApp for CaptureUi {
         };
         let wave_size = Vec2::new(ui.available_width(), wave_height);
         let (rect, response) = ui.allocate_exact_size(wave_size, Sense::click_and_drag());
-        let settings_open = self.settings_menu(
-            frame,
-            &mut settings,
-            paused,
-            gear.as_ref(),
-            &response,
-            context_at,
-        );
+        if can_toggle && gear.is_some_and(|response| response.clicked()) {
+            self.options_open = true;
+        }
+        let settings_open = self.options_open;
+        if settings_open {
+            self.show_options(ui, frame, &mut settings);
+        }
         let configured_seconds = settings.retention.seconds() as f32;
         if !canceled_selection {
             self.interact_waveform(
@@ -345,6 +424,9 @@ impl NiceEguiApp for CaptureUi {
         }
         if canceled_selection {
             response.surrender_focus();
+        }
+        if save_after_gesture && self.can_toggle_capture() {
+            self.save_snapshot(&settings);
         }
         // Keep the transparent overlay's entire gesture area and center only the drawing.
         let draw_rect = if waveform_only {
@@ -394,7 +476,7 @@ impl NiceEguiApp for CaptureUi {
     fn editor_closed(&mut self) {
         self.gesture = None;
         self.recording_since = None;
-        self.context_menu_position = None;
+        self.options_open = false;
         if !self.native_dragging.load(Ordering::Acquire) {
             self.session.end_waveform_gesture();
         }
@@ -408,6 +490,9 @@ impl Drop for CaptureUi {
     fn drop(&mut self) {
         if !self.native_dragging.load(Ordering::Acquire) {
             self.session.end_waveform_gesture();
+        }
+        if let Some(writer) = self.snapshot_writer.take() {
+            writer.finish();
         }
         self.finish_exports();
     }
@@ -457,230 +542,168 @@ impl CaptureUi {
         response.on_hover_text(status);
     }
 
-    fn settings_menu(
-        &mut self,
-        frame: &mut Frame,
-        settings: &mut SessionSettings,
-        paused: bool,
-        gear: Option<&egui::Response>,
-        waveform: &egui::Response,
-        context_at: Option<Pos2>,
-    ) -> bool {
-        let ctx = &waveform.ctx;
-        let popup_id = egui::Id::unique(SETTINGS_POPUP_ID);
-        let was_open = egui::Popup::is_id_open(ctx, popup_id);
-        let open = if let Some(position) = context_at {
-            self.context_menu_position = Some(position);
-            Some(egui::SetOpenCommand::Bool(true))
-        } else if gear.is_some_and(egui::Response::clicked) {
-            let from_context = self.context_menu_position.take().is_some();
-            Some(egui::SetOpenCommand::Bool(!was_open || from_context))
-        } else {
-            None
-        };
-        let popup = egui::Popup::menu(gear.unwrap_or(waveform))
-            .id(popup_id)
-            .accessible_name("Settings")
-            .open_memory(open)
-            .gap(4.0);
-        let popup = if let Some(position) = self.context_menu_position {
-            popup.at_position(position)
-        } else if gear.is_some() {
-            popup.align(egui::RectAlign::BOTTOM_END)
-        } else {
-            egui::Popup::close_id(ctx, popup_id);
-            return was_open;
-        };
-        let close_behavior = if context_at.is_some() {
-            egui::PopupCloseBehavior::IgnoreClicks
-        } else {
-            egui::PopupCloseBehavior::CloseOnClickOutside
-        };
-        let menu_content_height = (ctx.viewport_rect().height() - 68.0).max(60.0);
-        let menu = popup.close_behavior(close_behavior).show(|ui| {
-            let mut retention = settings.retention;
-            let mut idle_resume = settings.idle_resume;
-            let mut panel_transparency = settings.panel_transparency;
-            let mut accent = settings.accent;
-            let mut meter_mode = settings.meter_mode;
-            let mut wav_profile = settings.wav_profile;
-            let mut waveform_only = settings.show_waveform_only;
-            egui::ScrollArea::vertical()
-                .max_height(menu_content_height)
-                .show(ui, |ui| {
-                    if waveform_only {
-                        let label = if paused { "Play" } else { "Pause" };
-                        if ui
-                            .add_enabled(self.can_toggle_capture(), egui::Button::new(label))
-                            .clicked()
-                        {
-                            self.toggle_capture(ui, paused);
-                            ui.close();
-                        }
+    fn show_options(&mut self, ui: &egui::Ui, frame: &mut Frame, settings: &mut SessionSettings) {
+        let bounds = ui.ctx().viewport_rect();
+        let mut open =
+            !ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let mut edited = settings.clone();
+        let mut folder_action = None;
+        egui::Window::new("Options")
+            .id(egui::Id::unique("backtracking-options"))
+            .open(&mut open)
+            .default_pos(bounds.center() - Vec2::new(230.0, 80.0))
+            .default_width(460.0)
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    for (tab, label) in [
+                        (OptionsTab::Actions, "Actions"),
+                        (OptionsTab::Capture, "Capture"),
+                        (OptionsTab::Appearance, "Appearance"),
+                        (OptionsTab::Folders, "Folders"),
+                    ] {
+                        ui.selectable_value(&mut self.options_tab, tab, label);
                     }
-                    ui.checkbox(&mut waveform_only, "Show waveform only");
-                    ui.separator();
-                    egui::Grid::new("capture-settings")
-                        .spacing([12.0, 3.0])
-                        .show(ui, |ui| {
-                            ui.label("History");
-                            ui.horizontal(|ui| {
-                                for duration in DurationChoice::ALL {
-                                    ui.selectable_value(
-                                        &mut retention,
-                                        duration,
-                                        format!("{} s", duration.seconds()),
-                                    );
-                                }
-                            });
-                            ui.end_row();
-                            ui.label("Panel transparency").on_hover_text(
-                                "Fades the panel fill. The DAW may keep the editor backing opaque.",
-                            );
-                            ui.horizontal(|ui| {
-                                for percent in TRANSPARENCY_LEVELS {
-                                    ui.selectable_value(
-                                        &mut panel_transparency,
-                                        percent,
-                                        format!("{percent}%"),
-                                    );
-                                }
-                            });
-                            ui.end_row();
-                            ui.label("Meter");
-                            ui.horizontal(|ui| {
-                                for mode in MeterMode::ALL {
-                                    ui.selectable_value(&mut meter_mode, mode, mode.label());
-                                }
-                            });
-                            ui.end_row();
-                            ui.label("Auto-resume");
-                            ui.horizontal(|ui| {
-                                for duration in AutoResumeDelay::ALL {
-                                    ui.selectable_value(
-                                        &mut idle_resume,
-                                        duration,
-                                        format!("{} s", duration.seconds()),
-                                    );
-                                }
-                            });
-                            ui.end_row();
-                            wav_format_controls(ui, &mut wav_profile);
-                        });
-                    ui.collapsing("Theme color", |ui| {
-                        ui.spacing_mut().slider_width = 120.0;
-                        let mut color = Color32::from_rgb(accent[0], accent[1], accent[2]);
-                        if egui::color_picker::color_picker_color32(
-                            ui,
-                            &mut color,
-                            egui::color_picker::Alpha::Opaque,
-                        ) {
-                            accent = [color.r(), color.g(), color.b()];
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("options-content")
+                    .max_height((bounds.height() - 80.0).max(42.0))
+                    .show(ui, |ui| {
+                        match self.options_tab {
+                            OptionsTab::Actions => self.capture_actions(ui, settings),
+                            OptionsTab::Capture => capture_options(ui, &mut edited),
+                            OptionsTab::Appearance => appearance_options(ui, &mut edited),
+                            OptionsTab::Folders => folder_action = folder_options(ui, settings),
                         }
-                        if ui.button("Reset color").clicked() {
-                            accent = DEFAULT_ACCENT;
+                        if !self.message.is_empty() {
+                            ui.add(egui::Label::new(&self.message).truncate())
+                                .on_hover_text(&self.message);
                         }
                     });
-                });
-            if retention != settings.retention {
-                self.session.set_retention(retention);
-                settings.retention = retention;
-                self.reset_frozen();
-                self.message.clear();
-                self.refresh_waveform(paused, settings.idle_resume);
-            }
-            if idle_resume != settings.idle_resume {
-                self.session.set_idle_resume(idle_resume);
-                settings.idle_resume = idle_resume;
-            }
-            if panel_transparency != settings.panel_transparency {
-                self.session.set_panel_transparency(panel_transparency);
-                settings.panel_transparency = panel_transparency;
-            }
-            if accent != settings.accent {
-                self.session.set_accent(accent);
-                settings.accent = accent;
-            }
-            if meter_mode != settings.meter_mode {
-                self.session.set_meter_mode(meter_mode);
-                settings.meter_mode = meter_mode;
-            }
-            if wav_profile != settings.wav_profile {
-                self.session.set_wav_profile(wav_profile);
-                settings.wav_profile = wav_profile;
-                self.invalidate_export();
-                self.message.clear();
-            }
-            if waveform_only != settings.show_waveform_only {
-                self.session.set_show_waveform_only(waveform_only);
-                settings.show_waveform_only = waveform_only;
-            }
-            ui.separator();
-            let action = ui
-                .horizontal(|ui| {
-                    let folder = settings.output_dir.display().to_string();
-                    let select = ui
-                        .button("Select save folder")
-                        .on_hover_text(&folder)
-                        .clicked();
-                    let open = ui
-                        .button("Go to save folder")
-                        .on_hover_text(folder)
-                        .clicked();
-                    if select {
-                        Some(FolderAction::Select)
-                    } else if open {
-                        Some(FolderAction::Open)
-                    } else {
-                        None
-                    }
-                })
-                .inner;
-            if action.is_some() {
-                ui.close();
-            }
-            action
-        });
-        if !egui::Popup::is_id_open(ctx, popup_id) {
-            self.context_menu_position = None;
+            });
+        self.options_open = open;
+        self.apply_options(settings, edited);
+        if let Some(action) = folder_action {
+            self.apply_folder_action(frame, settings, action);
         }
-        let shown = menu.is_some();
-        match menu.and_then(|menu| menu.inner) {
-            Some(FolderAction::Select) => {
+    }
+
+    fn capture_actions(&mut self, ui: &mut egui::Ui, settings: &SessionSettings) {
+        let paused = self.session.is_paused();
+        let can_toggle = self.can_toggle_capture();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    can_toggle,
+                    egui::Button::new(if paused { "Play" } else { "Pause" }),
+                )
+                .clicked()
+            {
+                self.toggle_capture(ui, paused);
+            }
+            if ui
+                .add_enabled(
+                    can_toggle && self.seconds > 0.0,
+                    egui::Button::new("Clear capture"),
+                )
+                .clicked()
+            {
+                self.clear_capture();
+            }
+            if ui
+                .add_enabled(can_toggle, egui::Button::new("Save snapshot"))
+                .on_hover_text("Ctrl+S")
+                .clicked()
+            {
+                self.save_snapshot(settings);
+            }
+            if ui
+                .add_enabled(
+                    self.can_cancel_selection(),
+                    egui::Button::new("Cancel selection"),
+                )
+                .on_hover_text("Esc / Backspace")
+                .clicked()
+            {
+                self.cancel_selection();
+            }
+        });
+    }
+
+    fn apply_options(&mut self, settings: &mut SessionSettings, edited: SessionSettings) {
+        if edited.retention != settings.retention {
+            self.session.set_retention(edited.retention);
+            self.reset_frozen();
+            self.message.clear();
+        }
+        if edited.idle_resume != settings.idle_resume {
+            self.session.set_idle_resume(edited.idle_resume);
+        }
+        if edited.panel_transparency != settings.panel_transparency {
+            self.session
+                .set_panel_transparency(edited.panel_transparency);
+        }
+        if edited.accent != settings.accent {
+            self.session.set_accent(edited.accent);
+        }
+        if edited.meter_mode != settings.meter_mode {
+            self.session.set_meter_mode(edited.meter_mode);
+        }
+        if edited.wav_profile != settings.wav_profile {
+            self.session.set_wav_profile(edited.wav_profile);
+            self.invalidate_export();
+            self.message.clear();
+        }
+        if edited.show_waveform_only != settings.show_waveform_only {
+            self.session
+                .set_show_waveform_only(edited.show_waveform_only);
+        }
+        *settings = edited;
+    }
+
+    fn apply_folder_action(
+        &mut self,
+        frame: &Frame,
+        settings: &mut SessionSettings,
+        action: FolderAction,
+    ) {
+        match action {
+            FolderAction::Select(kind) => {
                 self.session.set_gesture_active(true);
-                let selection = rfd::FileDialog::new()
-                    .set_title("Select save folder")
-                    .set_parent(frame.baseview_window())
-                    .pick_folder();
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title(kind.label())
+                    .set_parent(frame.baseview_window());
+                if kind.path(settings).is_dir() {
+                    dialog = dialog.set_directory(kind.path(settings));
+                }
+                let selection = dialog.pick_folder();
                 self.session.set_gesture_active(false);
                 if let Some(folder) = selection {
-                    self.session.set_output_dir(folder.clone());
-                    self.invalidate_export();
-                    self.message = format!("Output: {}", folder.display());
-                    settings.output_dir = folder;
-                }
-            }
-            Some(FolderAction::Open) => {
-                if let Err(error) = std::fs::create_dir_all(&settings.output_dir)
-                    .and_then(|()| open::that_detached(&settings.output_dir))
-                {
-                    self.message = format!("Could not open save folder: {error}");
-                    if settings.show_waveform_only {
-                        self.session.set_gesture_active(true);
-                        rfd::MessageDialog::new()
-                            .set_level(rfd::MessageLevel::Warning)
-                            .set_title("Backtracking")
-                            .set_description(&self.message)
-                            .set_parent(frame.baseview_window())
-                            .show();
-                        self.session.set_gesture_active(false);
+                    self.message = format!("{}: {}", kind.label(), folder.display());
+                    match kind {
+                        FolderKind::Export => {
+                            self.session.set_output_dir(folder.clone());
+                            settings.output_dir = folder;
+                            self.invalidate_export();
+                        }
+                        FolderKind::Saved => {
+                            self.session.set_saved_dir(folder.clone());
+                            settings.saved_dir = folder;
+                        }
                     }
                 }
             }
-            None => {}
+            FolderAction::Open(kind) => {
+                let folder = kind.path(settings);
+                if let Err(error) =
+                    std::fs::create_dir_all(folder).and_then(|()| open::that_detached(folder))
+                {
+                    self.message = format!("Could not open {}: {error}", kind.label());
+                }
+            }
         }
-        // A waveform click that dismisses the popup must not also start an export.
-        was_open || shown
     }
 
     fn refresh_waveform(&mut self, paused: bool, idle_resume: AutoResumeDelay) {
@@ -1078,7 +1101,7 @@ impl CaptureUi {
             || self
                 .pending_exports
                 .iter()
-                .any(|request| request.revision == self.revision && request.profile == profile)
+                .any(|request| request.revision == self.revision && request.clip.profile == profile)
         {
             return;
         }
@@ -1092,20 +1115,68 @@ impl CaptureUi {
             self.message = "No captured audio to save yet.".into();
             return;
         };
-        let frames = snapshot.frame_count();
-        let range = self.selection.as_ref().map_or(0..frames, |range| {
-            let first = (range.start * frames as f32).floor() as usize;
-            let last = (range.end * frames as f32).ceil() as usize;
-            first.min(frames - 1)..last.clamp(first.min(frames - 1) + 1, frames)
-        });
-        let request = ExportRequest {
+        self.queue_export(ExportRequest {
             revision: self.revision,
-            profile,
             immediate: settings.idle_resume == AutoResumeDelay::Immediate,
-            output: settings.output_dir,
-            snapshot,
-            range,
+            clip: WavClip {
+                profile,
+                output: settings.output_dir,
+                range: export_frame_range(snapshot.frame_count(), self.selection.as_ref()),
+                snapshot,
+            },
+        });
+    }
+
+    fn save_snapshot(&mut self, settings: &SessionSettings) {
+        let selected = self.selection.is_some();
+        let snapshot = if selected {
+            self.frozen.clone()
+        } else {
+            self.session.snapshot_live().map(Arc::new)
         };
+        let Some(snapshot) = snapshot.filter(|snapshot| snapshot.frame_count() > 0) else {
+            self.message = "No captured audio to save yet.".into();
+            return;
+        };
+        let range = export_frame_range(snapshot.frame_count(), self.selection.as_ref());
+        if selected || self.session.is_paused() {
+            self.cancel_selection();
+        }
+        let result = self.queue_saved_snapshot(WavClip {
+            profile: settings.wav_profile,
+            output: settings.saved_dir.clone(),
+            range,
+            snapshot,
+        });
+        self.message = match result {
+            Ok(()) => "Saving snapshot…".into(),
+            Err(error) => format!("Could not save snapshot: {error}"),
+        };
+    }
+
+    fn queue_saved_snapshot(&mut self, clip: WavClip) -> io::Result<()> {
+        let writer = match &self.snapshot_writer {
+            Some(writer) => writer,
+            None => self.snapshot_writer.insert(SnapshotWriter::start()?),
+        };
+        writer
+            .requests
+            .send(clip)
+            .map_err(|_| io::Error::other("snapshot writer stopped unexpectedly"))
+    }
+
+    fn collect_saved_snapshots(&mut self) {
+        if let Some(writer) = &self.snapshot_writer {
+            for result in writer.results.try_iter() {
+                self.message = match result {
+                    Ok(path) => format!("Saved snapshot {}", path.display()),
+                    Err(error) => format!("Could not save snapshot: {error}"),
+                };
+            }
+        }
+    }
+
+    fn queue_export(&mut self, request: ExportRequest) {
         if self.export.is_some() || !self.pending_exports.is_empty() {
             if !request.immediate {
                 self.pending_exports.retain(|request| request.immediate);
@@ -1118,10 +1189,10 @@ impl CaptureUi {
 
     fn spawn_export(&mut self, request: ExportRequest) {
         let revision = request.revision;
-        let profile = request.profile;
+        let profile = request.clip.profile;
         let worker = thread::Builder::new()
             .name("backtracking-wav".into())
-            .spawn(move || request.write());
+            .spawn(move || request.clip.write());
         match worker {
             Ok(worker) => {
                 self.export = Some(ExportJob {
@@ -1179,7 +1250,7 @@ impl CaptureUi {
             .drain(..)
             .filter(|request| request.immediate)
         {
-            let _ = request.write();
+            let _ = request.clip.write();
         }
     }
 
@@ -1220,6 +1291,112 @@ impl CaptureUi {
 
 fn muted_accent([r, g, b]: [u8; 3]) -> Color32 {
     Color32::from_rgb(r / 3, g / 3, b / 3)
+}
+
+fn take_save_shortcut(ui: &egui::Ui) -> bool {
+    ui.input_mut(|input| {
+        let event_count = input.events.len();
+        input.events.retain(|event| {
+            !matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::S,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } if modifiers.ctrl && !modifiers.alt && !modifiers.shift && !modifiers.mac_cmd
+            )
+        });
+        input.events.len() != event_count
+    })
+}
+
+fn export_frame_range(frames: usize, selection: Option<&Range<f32>>) -> Range<usize> {
+    selection.map_or(0..frames, |range| {
+        let first = ((range.start * frames as f32).floor() as usize).min(frames - 1);
+        let last = (range.end * frames as f32).ceil() as usize;
+        first..last.clamp(first + 1, frames)
+    })
+}
+
+fn capture_options(ui: &mut egui::Ui, settings: &mut SessionSettings) {
+    egui::Grid::new("capture-options").show(ui, |ui| {
+        ui.label("History");
+        ui.horizontal(|ui| {
+            for duration in DurationChoice::ALL {
+                ui.selectable_value(
+                    &mut settings.retention,
+                    duration,
+                    format!("{} s", duration.seconds()),
+                );
+            }
+        });
+        ui.end_row();
+        ui.label("Auto-resume");
+        ui.horizontal(|ui| {
+            for duration in AutoResumeDelay::ALL {
+                ui.selectable_value(
+                    &mut settings.idle_resume,
+                    duration,
+                    format!("{} s", duration.seconds()),
+                );
+            }
+        });
+        ui.end_row();
+        wav_format_controls(ui, &mut settings.wav_profile);
+    });
+}
+
+fn appearance_options(ui: &mut egui::Ui, settings: &mut SessionSettings) {
+    ui.checkbox(&mut settings.show_waveform_only, "Show waveform only");
+    egui::Grid::new("appearance-options").show(ui, |ui| {
+        ui.label("Panel transparency")
+            .on_hover_text("Fades the panel fill. The DAW may keep the editor backing opaque.");
+        ui.horizontal(|ui| {
+            for percent in TRANSPARENCY_LEVELS {
+                ui.selectable_value(
+                    &mut settings.panel_transparency,
+                    percent,
+                    format!("{percent}%"),
+                );
+            }
+        });
+        ui.end_row();
+        ui.label("Meter");
+        ui.horizontal(|ui| {
+            for mode in MeterMode::ALL {
+                ui.selectable_value(&mut settings.meter_mode, mode, mode.label());
+            }
+        });
+        ui.end_row();
+        ui.label("Theme color");
+        ui.horizontal(|ui| {
+            ui.color_edit_button_srgb(&mut settings.accent);
+            if ui.button("Reset color").clicked() {
+                settings.accent = DEFAULT_ACCENT;
+            }
+        });
+        ui.end_row();
+    });
+}
+
+fn folder_options(ui: &mut egui::Ui, settings: &SessionSettings) -> Option<FolderAction> {
+    let mut action = None;
+    egui::Grid::new("folder-options").show(ui, |ui| {
+        for kind in [FolderKind::Export, FolderKind::Saved] {
+            let folder = kind.path(settings).display().to_string();
+            ui.label(kind.label()).on_hover_text(&folder);
+            if ui.button("Select folder").on_hover_text(&folder).clicked() {
+                action = Some(FolderAction::Select(kind));
+            }
+            if ui.button("Open folder").on_hover_text(folder).clicked() {
+                action = Some(FolderAction::Open(kind));
+            }
+            ui.end_row();
+        }
+    });
+    action
 }
 
 fn wav_format_controls(ui: &mut egui::Ui, profile: &mut WavExportProfile) {
@@ -1281,7 +1458,7 @@ fn capture_button(ui: &mut egui::Ui, paused: bool, enabled: bool) -> egui::Respo
 
 fn settings_button(ui: &mut egui::Ui) -> egui::Response {
     let response = ui.add(egui::Button::new("").min_size(Vec2::splat(TOOLBAR_CONTROL_HEIGHT)));
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Settings"));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Options"));
     let center = response.rect.center();
     let stroke = ui.style().interact(&response).fg_stroke;
     let outline = (0..32)
@@ -1293,7 +1470,7 @@ fn settings_button(ui: &mut egui::Ui) -> egui::Response {
         .collect();
     ui.painter().add(egui::Shape::closed_line(outline, stroke));
     ui.painter().circle_stroke(center, 2.1, stroke);
-    response.on_hover_text("Settings")
+    response.on_hover_text("Options")
 }
 
 fn clear_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
@@ -1323,6 +1500,53 @@ fn clear_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
 
 fn position_in_audio(rect: Rect, x: f32) -> f32 {
     ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_snapshots_finish_without_editor_frames() {
+        let output = std::env::temp_dir().join(format!(
+            "backtracking-plugin-snapshot-test-{}",
+            std::process::id()
+        ));
+        let writer = SnapshotWriter::start().unwrap();
+        let snapshot = Arc::new(Snapshot {
+            sample_rate: 48_000,
+            channels: 1,
+            samples: vec![0.25; 32],
+        });
+        for range in [0..16, 0..32] {
+            writer
+                .requests
+                .send(WavClip {
+                    profile: WavExportProfile::default(),
+                    output: output.clone(),
+                    snapshot: snapshot.clone(),
+                    range,
+                })
+                .unwrap();
+        }
+        let first = writer
+            .results
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let second = writer
+            .results
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        writer.finish();
+        assert_ne!(first, second);
+        assert_eq!(
+            second.metadata().unwrap().len() - first.metadata().unwrap().len(),
+            64
+        );
+        std::fs::remove_dir_all(output).unwrap();
+    }
 }
 
 // A small RGBA PNG waveform preview for the native file-drag cursor.

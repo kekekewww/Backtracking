@@ -21,7 +21,7 @@ Backtracking 是給作曲與混音用的回溯錄音取樣器。聽到想留下�
 3. 未框選時，在波形任意位置點擊可存下整段保留音訊，按住拖曳可把整段 WAV 送入 DAW。若只需其中一段，Windows 用 `Ctrl`、macOS 用 `Option` 加拖曳可框選起訖點，再點擊或拖出波形變色的區間。
 4. 在完整介面用工具列的 **Play／Pause** 啟用或暫停錄音。紅燈閃爍時正在收錄。操作波形也會暫停錄音，完成後可選 **Play** 或等待已設定的自動續錄。
 
-齒輪旁的即時音量表可顯示 **dBFS、VU 或瞬時 LUFS**。點齒輪或按右鍵可開啟相同的設定選單。**只顯示波形** 預設關閉，開啟後畫面只保留波形，可從右鍵選單啟用或暫停錄音，也可切回完整介面。桌面版可拖曳視窗內緣縮成細條。自動續錄可選 **0、5 或 10 秒**，預設 10 秒。選 0 秒會在波形操作完成後立刻恢復待命。清除錄音只會清空記憶體中的擷取內容。
+齒輪旁的即時音量表可顯示 **dBFS、VU 或瞬時 LUFS**。桌面版可點齒輪或按右鍵開啟獨立的 **Options** 視窗。**只顯示波形** 預設關閉，開啟後畫面只保留波形，可從 Options 啟用或暫停錄音，也可切回完整介面。桌面版可拖曳視窗內緣縮成細條。自動續錄可選 **0、5 或 10 秒**，預設 10 秒。選 0 秒會在波形操作完成後立刻恢復待命。清除錄音只會清空記憶體中的擷取內容。
 
 切換至 **只顯示波形** 時，波形會以原本的高度垂直置中。Windows 和 macOS 桌面版的最小尺寸為 **240 × 48**，分別以邏輯像素和點計算。視窗越窄，同一段錄音顯示在越短的距離內，波形在畫面上也就捲動得越慢。無邊框視窗可自由拖曳，靠近螢幕邊緣時不會自動貼齊。可在工具列切換置頂，或從設定選單結束程式。
 
@@ -29,7 +29,9 @@ Backtracking 是給作曲與混音用的回溯錄音取樣器。聽到想留下�
 
 桌面版會還原上次的視窗位置。Windows 從系統匣控制顯示、隱藏與結束，macOS 從選單列控制。可在設定啟用登入時自動啟動。VST3／CLAP 的設定跟著各自的插件實例存進 DAW 專案，修改後請儲存專案。要保留錄音素材，請先匯出 WAV。
 
-在設定選單可選擇 WAV 取樣率 **44.1、48 或 96 kHz**，以及 **16-bit PCM、24-bit PCM 或 32-bit IEEE float** 編碼。預設為 **48 kHz、32-bit float**。用 **選擇儲存資料夾／Select save folder** 指定 WAV 的實際存放位置，再用 **前往儲存資料夾／Go to save folder** 開啟。
+在 Backtracking 有焦點時，按 `Ctrl+S` 可把當下快照保存到保存資料夾。已框選時只保存該段，並立即恢復錄音待命。錄音中未框選時，保存整段保留的音訊，錄音會持續進行。波形點擊與拖曳使用預設輸出資料夾，兩個資料夾都可在 Options 自訂。
+
+在 Options 可選擇 WAV 取樣率 **44.1、48 或 96 kHz**，以及 **16-bit PCM、24-bit PCM 或 32-bit IEEE float** 編碼。預設為 **48 kHz、32-bit float**。
 
 [完整操作手冊](docs/USER_GUIDE.md#繁體中文) · [桌面視窗操作](docs/USER_GUIDE.md#移動與縮放桌面視窗) · [安裝與建置](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
 
@@ -50,7 +52,7 @@ Backtracking is a retrospective audio sampler for music production and mixing. W
 3. With no selection, click anywhere on the waveform to save all retained audio, or hold and drag to drop the full WAV into your DAW. For a shorter clip, hold `Ctrl` on Windows or `Option` on macOS while dragging to select a range, then click or drag out the section shown in a different waveform color.
 4. In the full interface, use the toolbar's **Play/Pause** control to arm or pause capture. A blinking red indicator means audio is being recorded. Working with the waveform also pauses capture. Choose **Play** when done or let the configured auto-resume timer re-arm capture.
 
-The live meter next to the gear can show **dBFS, VU, or momentary LUFS**. Click the gear or right-click to open the same settings menu. **Show waveform only** defaults to Off. When enabled, only the waveform is visible. Use the right-click menu to arm or pause capture, or to restore the full interface. On desktop, drag an inside edge to resize it into a thin strip. Auto-resume offers **0, 5, or 10 seconds**, with 10 seconds as the default. At 0 seconds, capture re-arms as soon as the waveform gesture ends. The clear action empties the audio held in memory.
+The live meter next to the gear can show **dBFS, VU, or momentary LUFS**. On desktop, click the gear or right-click to open the separate **Options** window. **Show waveform only** defaults to Off. When enabled, only the waveform is visible. Open Options to arm or pause capture, or to restore the full interface. On desktop, drag an inside edge to resize it into a thin strip. Auto-resume offers **0, 5, or 10 seconds**, with 10 seconds as the default. At 0 seconds, capture re-arms as soon as the waveform gesture ends. The clear action empties the audio held in memory.
 
 The waveform keeps its previous height and moves to the vertical center when you switch to **Show waveform only**. The desktop window can shrink to **240 × 48** in Windows logical pixels or macOS points. A narrower window shows the same audio over a shorter distance, so the waveform scrolls more slowly on screen. The frameless desktop windows can be moved without snapping to screen edges. Use **Keep on top** in the toolbar or **Quit** in the settings menu.
 
@@ -58,7 +60,9 @@ Use the color picker in the gear or right-click menu to change the theme accent.
 
 The desktop app restores its last window position. On Windows, use the system tray to show, hide, or quit the app. On macOS, use the menu bar. You can enable launch at sign-in in Settings. For VST3 and CLAP, save your DAW project after making changes to store each instance's settings. Export a WAV to keep captured audio.
 
-Choose a WAV sample rate of **44.1, 48, or 96 kHz** and **16-bit PCM, 24-bit PCM, or 32-bit IEEE float** encoding in the settings menu. The default is **48 kHz, 32-bit float**. Use **Select save folder** to choose the exact destination and **Go to save folder** to open it.
+With Backtracking focused, press `Ctrl+S` to save the current snapshot to the saved snapshots folder. If a range is selected, it saves that range and immediately re-arms capture. With no selection, it saves all retained audio while active capture continues. Waveform clicks and drags use the default export folder. Both folders can be set in Options.
+
+Choose a WAV sample rate of **44.1, 48, or 96 kHz** and **16-bit PCM, 24-bit PCM, or 32-bit IEEE float** encoding in Options. The default is **48 kHz, 32-bit float**.
 
 [Full user guide](docs/USER_GUIDE.md#english) · [Desktop window controls](docs/USER_GUIDE.md#move-and-resize-the-desktop-window) · [Installation and build](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
 

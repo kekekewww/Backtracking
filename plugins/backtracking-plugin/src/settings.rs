@@ -39,6 +39,7 @@ pub(crate) struct SessionSettings {
     pub(crate) wav_profile: WavExportProfile,
     pub(crate) show_waveform_only: bool,
     pub(crate) output_dir: PathBuf,
+    pub(crate) saved_dir: PathBuf,
 }
 
 impl Default for SessionSettings {
@@ -47,6 +48,7 @@ impl Default for SessionSettings {
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
             .unwrap_or_else(std::env::temp_dir);
+        let backtracking = home.join("Backtracking");
         Self {
             retention: DurationChoice::Seconds20,
             idle_resume: AutoResumeDelay::default(),
@@ -55,7 +57,8 @@ impl Default for SessionSettings {
             meter_mode: MeterMode::Dbfs,
             wav_profile: WavExportProfile::default(),
             show_waveform_only: false,
-            output_dir: home.join("Backtracking").join("output"),
+            output_dir: backtracking.join("output"),
+            saved_dir: backtracking.join("saved"),
         }
     }
 }
@@ -77,11 +80,15 @@ impl SettingsStore {
 impl PersistentField<'_, PersistedFields> for SettingsStore {
     fn set(&self, fields: PersistedFields) {
         let defaults = SessionSettings::default();
-        let output_dir = fields
-            .get("output_dir")
-            .and_then(|value| deserialize_field::<OsString>(value).ok())
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute() && !path.as_os_str().as_encoded_bytes().contains(&0));
+        let read_dir = |key| {
+            fields
+                .get(key)
+                .and_then(|value| deserialize_field::<OsString>(value).ok())
+                .map(PathBuf::from)
+                .filter(|path| {
+                    path.is_absolute() && !path.as_os_str().as_encoded_bytes().contains(&0)
+                })
+        };
         let restored = SessionSettings {
             retention: fields
                 .get("history_seconds")
@@ -126,7 +133,8 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
             show_waveform_only: fields
                 .get("show_waveform_only")
                 .is_some_and(|value| value == "true"),
-            output_dir: output_dir.unwrap_or(defaults.output_dir),
+            output_dir: read_dir("output_dir").unwrap_or(defaults.output_dir),
+            saved_dir: read_dir("saved_dir").unwrap_or(defaults.saved_dir),
         };
         *self.lock() = restored;
     }
@@ -170,6 +178,9 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
         // The framework's serde codec preserves native paths, including non-Unicode names.
         if let Ok(path) = serialize_field(settings.output_dir.as_os_str()) {
             fields.insert("output_dir".into(), path);
+        }
+        if let Ok(path) = serialize_field(settings.saved_dir.as_os_str()) {
+            fields.insert("saved_dir".into(), path);
         }
         if let Ok(accent) = serialize_field(&settings.accent) {
             fields.insert("accent_rgb".into(), accent);
