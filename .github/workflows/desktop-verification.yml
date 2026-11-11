@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: native-desktop-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -37,21 +41,22 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust
         run: rustup toolchain install 1.99.1 --profile minimal
-      - name: Test capture core and plug-in
+      - name: Build and verify macOS app
         run: |
-          cargo +1.99.1 test --workspace --locked
-          cargo +1.99.1 test --locked --manifest-path plugins/backtracking-plugin/Cargo.toml
+          RUSTUP_TOOLCHAIN=1.99.1 bash desktop/macos/build.sh
+          codesign --verify --strict --deep target/bundled/Backtracking.app
       - name: Test signed update and rollback on macOS
+        if: ${{ !cancelled() }}
         run: |
           xcrun swiftc -swift-version 5 -parse-as-library -D BACKTRACKING_UPDATER_TESTS \
             desktop/macos/StartupUpdater.swift desktop/macos/tests/StartupUpdaterTests.swift \
             -framework AppKit -o "$RUNNER_TEMP/backtracking-updater-tests"
           "$RUNNER_TEMP/backtracking-updater-tests"
-      - name: Build and verify macOS app
-        if: ${{ !cancelled() }}
-        run: |
-          RUSTUP_TOOLCHAIN=1.99.1 bash desktop/macos/build.sh
-          codesign --verify --strict --deep target/bundled/Backtracking.app
       - name: Verify Swift capture routes and paired WAV export
         if: ${{ !cancelled() }}
         run: RUSTUP_TOOLCHAIN=1.99.1 bash desktop/macos/verify-capture.sh
+      - name: Test capture core and plug-in
+        if: ${{ !cancelled() }}
+        run: |
+          cargo +1.99.1 test --workspace --locked
+          cargo +1.99.1 test --locked --manifest-path plugins/backtracking-plugin/Cargo.toml

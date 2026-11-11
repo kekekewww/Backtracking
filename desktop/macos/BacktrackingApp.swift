@@ -299,19 +299,22 @@ private final class WAVExport: @unchecked Sendable {
     }
 
     func write(range: Range<UInt64>, directory: String, sampleRate: UInt32, bitsPerSample: UInt32) -> [URL] {
-        directory.withCString { destination in
+        directory.withCString { destination -> [URL] in
             if snapshots.count == 2 {
                 var a: UnsafeMutablePointer<CChar>?
                 var b: UnsafeMutablePointer<CChar>?
                 guard bt_snapshots_export_pair_frames_with_profile(
                     snapshots[0], snapshots[1], range.lowerBound, range.upperBound, destination,
                     sampleRate, bitsPerSample, &a, &b
-                ) == 1, let a, let b else { return [] }
+                ) == 1, let pathA = a, let pathB = b else { return [] }
                 defer {
-                    bt_string_free(a)
-                    bt_string_free(b)
+                    bt_string_free(pathA)
+                    bt_string_free(pathB)
                 }
-                return [a, b].map { URL(fileURLWithPath: String(cString: $0)) }
+                return [
+                    URL(fileURLWithPath: String(cString: pathA)),
+                    URL(fileURLWithPath: String(cString: pathB))
+                ]
             }
             guard let path = bt_snapshot_export_frames_with_profile(
                 snapshots[0], range.lowerBound, range.upperBound, destination, sampleRate, bitsPerSample
@@ -386,8 +389,7 @@ private final class CaptureBackground: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        NSColor.clear.setFill()
-        NSRectFillUsingOperation(dirtyRect, .copy)
+        NSGraphicsContext.current?.cgContext.clear(dirtyRect)
         guard backgroundOpacity > 0 else { return }
         let fill = NSBezierPath(rect: bounds)
         let waveShape = waveform.map { NSBezierPath(roundedRect: convert($0.bounds, from: $0), xRadius: 6, yRadius: 6) }
@@ -894,14 +896,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             source.widthAnchor.constraint(lessThanOrEqualToConstant: 300).isActive = true
             sourcePopups.append(source)
             let route = choiceControl(
-                CaptureRoute.allCases.map(.rawValue), selected: configuration.route.rawValue,
+                CaptureRoute.allCases.map { $0.rawValue }, selected: configuration.route.rawValue,
                 action: #selector(captureRouteChanged(_:))
             ) { CaptureRoute(rawValue: $0)?.label ?? "" }
             route.tag = index
             route.autoenablesItems = false
             routePopups.append(route)
-            rows.append(labeledOption("(label) 擷取來源", source))
-            rows.append(labeledOption("(label) 聲道路由", route))
+            rows.append(labeledOption("\(label) 擷取來源", source))
+            rows.append(labeledOption("\(label) 聲道路由", route))
         }
         let stereo = choiceControl(
             [0, 1], selected: stereoWaveform ? 1 : 0, action: #selector(waveformModeChanged(_:))
@@ -920,13 +922,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             var selectedIndex: Int?
             var usedTitles = Set<String>()
             for choice in choices {
-                let title = usedTitles.insert(choice.title).inserted ? choice.title : "(choice.title) · (choice.source.key)"
+                let title = usedTitles.insert(choice.title).inserted ? choice.title : "\(choice.title) · \(choice.source.key)"
                 source.addItem(withTitle: title)
                 source.lastItem?.representedObject = choice.source.key
                 if lane.source == choice.source { selectedIndex = source.numberOfItems - 1 }
             }
             if selectedIndex == nil {
-                source.addItem(withTitle: "(lane.source.label)（目前未連線）")
+                source.addItem(withTitle: "\(lane.source.label)（目前未連線）")
                 source.lastItem?.representedObject = lane.source.key
                 selectedIndex = source.numberOfItems - 1
             }
@@ -977,8 +979,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private func storeLane(_ lane: CaptureLane, index: Int) {
         let suffix = index == 0 ? "A" : "B"
         if index == 0 { laneA = lane } else { laneB = lane }
-        defaults.set(lane.source.key, forKey: "captureSource(suffix)")
-        defaults.set(Int(lane.route.rawValue), forKey: "captureRoute(suffix)")
+        defaults.set(lane.source.key, forKey: "captureSource\(suffix)")
+        defaults.set(Int(lane.route.rawValue), forKey: "captureRoute\(suffix)")
         reconnectConfiguredSources()
     }
 
@@ -1308,12 +1310,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             let reading = core.map { mode.value(from: bt_tracks_meter_readings($0, UInt32(lane))) } ?? -Float.infinity
             let value = reading.isFinite ? String(format: "%.1f", Double(reading)) : "—"
             let prefix = dualSource ? (lane == 0 ? "A " : "B ") : ""
-            let title = "(prefix)(value) (mode.label)"
+            let title = "\(prefix)\(value) \(mode.label)"
             if button.title != title || button.toolTip == nil {
                 button.title = title
-                button.setAccessibilityLabel("(title)，點擊切換單位")
+                button.setAccessibilityLabel("\(title)，點擊切換單位")
             }
-            let detail = "(prefix)(mode.detail) · 點擊切換單位"
+            let detail = "\(prefix)\(mode.detail) · 點擊切換單位"
             if button.toolTip != detail { button.toolTip = detail }
         }
     }
@@ -1683,7 +1685,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                     return
                 }
                 if let first = urls.first {
-                    self?.setNotice(provisional ? nil : (urls.count == 2 ? "已存入 A／B WAV" : "已存入 (first.lastPathComponent)"))
+                    self?.setNotice(provisional ? nil : (urls.count == 2 ? "已存入 A／B WAV" : "已存入 \(first.lastPathComponent)"))
                 } else {
                     self?.setNotice("無法匯出 WAV，請確認有錄音及資料夾寫入權限")
                 }
