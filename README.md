@@ -72,57 +72,81 @@ Flags mark the previous range. Hold `Shift` near either flag while selecting to 
 
 ## 硬體使用量 / Hardware utilization
 
-測試於 2026-11-09 進行。程式版本為 `09f4ee8`，環境是 Linux 6.18.57 x86-64，CPU 顯示為 AMD EPYC 9V74，有 9 個邏輯 CPU 可用。量測範圍為 Linux CLAP 與共用 WAV 匯出核心。Windows、macOS、VST3 及實體 GPU 尚待量測。
+測試於 2026-11-12（UTC+8）進行，版本為 Backtracking v0.1.5（`ba19f18`）。環境為 Linux 6.18.57 x86-64，回報的 CPU 為 AMD EPYC 7763，程序可使用 9 個邏輯 CPU。量測涵蓋 Linux CLAP 及共用擷取、波形與 WAV 匯出核心。Windows、macOS、VST3 與實體 GPU 的硬體使用量尚待量測。
 
-Measured on 2026-11-09 at revision `09f4ee8` in a Linux 6.18.57 x86-64 environment reporting an AMD EPYC 9V74 and 9 available logical CPUs. Measurements cover Linux CLAP and the shared WAV export core. Windows, macOS, VST3, and physical GPU measurements are pending.
+Measured on 2026-11-12 (UTC+8) using Backtracking v0.1.5 (`ba19f18`) on Linux 6.18.57 x86-64. The environment reported an AMD EPYC 7763 and 9 logical CPUs available to the process. Measurements cover Linux CLAP and the shared capture, waveform, and WAV export core. Windows, macOS, VST3, and physical GPU utilization remain unmeasured.
 
 ### 關閉插件介面 / Plug-in editor closed
 
-Release 版 CLAP 由小型測試宿主載入。輸入為 48 kHz 立體聲 float32，每 10 ms 送出 480 幀。各情境在暖機後各量測一次、每次 30 秒，持續錄音情境在量測前填滿緩衝區。CPU 以一個邏輯 CPU 的 100% 為基準，包含測試宿主及插件的執行緒。RSS 是量測結束時的程序常駐記憶體。
+小型測試宿主載入 Release 版 CLAP，並固定使用兩個邏輯 CPU。音訊輸入為 48 kHz 立體聲 float32，每 10 ms 送出 480 幀。每種情境以三個獨立程序各量測 8 秒，先暖機，持續錄音的情境也會先填滿保留區間。CPU 是宿主與插件所在程序的用量，以單一邏輯 CPU 為 100%，表列中位數及最小至最大值。RSS 每秒取樣，表列各次量測中位數的中位數。
 
-A minimal host loaded the release CLAP. The input used 48 kHz stereo float32, with 480 frames per 10 ms. Each scenario was measured once for 30 seconds after warm-up. For continuous recording, the history was filled before measurement. CPU is relative to one logical CPU and includes the host and plug-in threads. RSS is the process resident memory at the end of the interval.
+A minimal host loaded the release CLAP and was pinned to two logical CPUs. Audio input was 48 kHz stereo float32, 480 frames every 10 ms. Three fresh processes ran each scenario for 8 seconds after warm-up, with history prefilled for continuous recording. CPU includes the host and plug-in, with one logical CPU equal to 100%. The table shows the median and observed range. RSS was sampled once per second and summarized as the median of the per-run medians.
 
 | 情境 / Scenario | 保留時間 / History | CPU (%) | RSS (MiB) |
 | --- | ---: | ---: | ---: |
-| 測試宿主基準 / Host only | — | 0.18 | 1.26 |
-| 插件啟用、宿主未送音訊 / Active, no audio callbacks | 20 s | 0.53 | 15.57 |
-| 待命、輸入數位靜音 / Armed, digital silence | 20 s | 0.60 | 15.63 |
-| 持續錄音 / Continuous recording | 10 s | 0.66 | 15.46 |
-| 持續錄音 / Continuous recording | 20 s | 0.67 | 15.65 |
-| 持續錄音 / Continuous recording | 30 s | 0.71 | 15.65 |
+| 測試宿主基準 / Host only | — | 0.87 (0.52–1.02) | 1.33 |
+| 插件啟用、宿主未送音訊 / Active, no audio callbacks | 20 s | 1.46 (1.33–2.36) | 26.89 |
+| 待命、輸入數位靜音 / Armed, digital silence | 20 s | 2.18 (1.72–3.04) | 26.85 |
+| 持續錄音 / Continuous recording | 10 s | 1.60 (1.19–2.09) | 26.75 |
+| 持續錄音 / Continuous recording | 20 s | 1.73 (1.39–2.75) | 26.71 |
+| 持續錄音 / Continuous recording | 30 s | 1.56 (1.22–2.02) | 26.92 |
+| 持續錄音 / Continuous recording | 60 s | 2.12 (1.33–2.61) | 26.71 |
 
-量測當時的版本預先配置 30 秒的錄音環形緩衝區，因此表內不同保留時間的常駐記憶體接近。新版可保留 60 秒，48 kHz、立體聲 float32 的緩衝區容量約為 22 MiB。表內的數值為舊版實測。
+CLAP 會依 60 秒上限預先配置錄音環形緩衝區。48 kHz 立體聲 float32 的取樣資料約占 22 MiB，因此各種保留時間的程序 RSS 接近。
 
-The measured revision preallocated a 30-second recording ring, which accounts for the similar RSS across history lengths. With 60-second support, the ring capacity is about 22 MiB at 48 kHz stereo float32. The table reports measurements from the earlier revision.
+CLAP preallocates its recording ring for the 60-second limit. Its 48 kHz stereo float32 samples take about 22 MiB, which accounts for the similar process RSS across history settings.
 
 ### 開啟插件介面 / Plug-in editor open
 
-使用 640 × 212 的 Release 版 CLAP 介面，在 Xvfb 以 llvmpipe 軟體 OpenGL 繪製。測試宿主與 Xvfb 限用兩個邏輯 CPU。音訊規格同上，保留時間設為 20 秒並預先填滿，自動續錄關閉。各情境量測兩次、每次 12 秒。表中的 CPU 是兩次量測的範圍，RSS 為每秒取樣的中位數，兩者均指測試宿主和插件所在的程序。Xvfb 另占 0.67–0.83% CPU、約 37–38 MiB RSS。
+640 × 212 的 Release 版 CLAP 介面以 Xorg 虛擬顯示器執行，使用 Mesa 25.0.7 的 llvmpipe 軟體 OpenGL。測試宿主與 Xorg 固定在同兩個邏輯 CPU。音訊規格同上，先填滿 20 秒的保留區間並使用合併波形。暫停組以介面手動暫停，宿主持續送入音訊。各情境用兩個獨立程序各量測 8 秒。表列宿主與插件所在程序的 CPU 範圍及 RSS，RSS 每秒取樣並採各次量測中位數的中位數。
 
-The 640 × 212 release CLAP editor used llvmpipe software OpenGL under Xvfb. The host and Xvfb were pinned to two logical CPUs. The input format was unchanged, with a prefilled 20-second history and auto-resume set to Off. Each scenario ran twice for 12 seconds. CPU is the range across both runs. RSS is the median of one-second samples. Both describe the host process with the plug-in loaded. Xvfb separately used 0.67–0.83% CPU and about 37–38 MiB RSS.
+The 640 × 212 release CLAP editor used Mesa 25.0.7 llvmpipe software OpenGL on an Xorg virtual display. The host and Xorg were pinned to the same two logical CPUs. The input format was unchanged. The host prefilled 20 seconds of history and the editor used the merged waveform view. The paused cases used the editor's Pause control while the host continued sending audio. Two fresh processes ran each scenario for 8 seconds. The table shows the CPU range and RSS for the host process with the plug-in loaded. RSS was sampled once per second and summarized as the median of the per-run medians.
 
 | 介面 / Editor | 狀態 / Capture state | CPU (%) | RSS (MiB) |
 | --- | --- | ---: | ---: |
-| 完整 / Full | 錄音中 / Recording | 9.41–10.16 | 94.8 |
-| 完整 / Full | 暫停 / Paused | 6.25–6.83 | 102.1 |
-| 僅波形 / Waveform only | 錄音中 / Recording | 9.50–9.58 | 85.5 |
-| 僅波形 / Waveform only | 暫停 / Paused | 6.00–6.50 | 92.8 |
+| 完整 / Full | 錄音中 / Recording | 11.58–14.52 | 103.6 |
+| 完整 / Full | 暫停 / Paused | 8.74–9.98 | 111.0 |
+| 僅波形 / Waveform only | 錄音中 / Recording | 12.88–13.08 | 102.1 |
+| 僅波形 / Waveform only | 暫停 / Paused | 6.73–7.14 | 110.7 |
 
-按下暫停時會建立凍結快照，供框選及拖曳使用。這組測試的暫停 RSS 約增加 7.3 MiB。
+暫停會建立可供框選與匯出的凍結快照，本次暫停情境的 RSS 高出約 7–9 MiB。Xorg 程序另占 0.87–1.50% CPU 與約 37–38 MiB RSS。
 
-Pausing creates a frozen snapshot for selection and dragging. In this test, paused RSS was about 7.3 MiB higher.
+Pausing creates a frozen snapshot for selection and export. In this test the paused cases used about 7–9 MiB more RSS. The separate Xorg process used 0.87–1.50% CPU and about 37–38 MiB RSS.
+
+### A／B 擷取與波形核心 / A/B capture and waveform core
+
+Release 版共用核心以單一邏輯 CPU 處理合成 A／B 音訊。輸入已分為兩路 float32 單聲道，每 10 ms 為一個區塊。每組先填滿指定的錄音歷史，並暖機 10 次波形掃描。五個獨立程序各量測 60 秒音訊的批次處理，以及兩路各 384 個區間的 30 次波形掃描。表列程序 CPU 時間的中位數，RSS 在錄音歷史填滿後取樣。範圍包含擷取核心、音量表與波形極值掃描。
+
+The shared release core processed synthetic A/B audio on one logical CPU. The input was already split into two mono float32 lanes in 10 ms blocks. Each run prefilled the selected history and warmed up with 10 waveform scans. Five fresh processes each measured a 60-second batch of audio and 30 waveform scans at 384 bins per lane. The table reports median process CPU time and RSS after prefill. The workload covers the capture core, metering, and waveform peak scans.
+
+| 來源取樣率 / Source rate | 保留時間 / History | 處理每秒音訊 / CPU ms per second of audio | 更新兩路波形 / CPU ms per A/B scan | RSS (MiB) |
+| --- | ---: | ---: | ---: | ---: |
+| 48 kHz | 20 s | 1.38 | 2.86 | 23.8 |
+| 48 kHz | 60 s | 1.20 | 9.35 | 23.8 |
+| 96 kHz | 20 s | 3.22 | 9.86 | 46.3 |
+| 96 kHz | 60 s | 2.95 | 20.44 | 46.3 |
 
 ### WAV 匯出成本 / WAV export cost
 
-使用 Release 版共用匯出核心，將 20 秒、48 kHz、立體聲 float32 合成音訊寫入 RAM 檔案系統。每個格式採 5 次測量的中位數。CPU 時間從呼叫匯出函式量到 WAV 寫完，包含取樣率轉換、編碼和寫入。峰值 RSS 包含測試程式、來源樣本和轉換用記憶體。
+Release 版共用匯出核心將 20 秒、48 kHz、立體聲 float32 合成音訊寫到 `/dev/shm`。每種取樣率與編碼各用 5 個獨立程序量測，並固定在同一個邏輯 CPU。表列程序 CPU 時間的中位數，包含取樣率轉換、編碼和寫入。峰值 RSS 取各格式的中位數，再列出同取樣率各編碼的範圍。
 
-The release export core wrote 20 seconds of synthetic 48 kHz stereo float32 audio to a RAM filesystem. Each result is the median of 5 runs. CPU time covers resampling, encoding, and writing the WAV. Peak RSS includes the harness, input samples, and resampling buffers.
+The shared release export core wrote 20 seconds of synthetic 48 kHz stereo float32 audio to `/dev/shm`. Five fresh processes ran each rate and encoding combination on the same logical CPU. Median process CPU time covers resampling, encoding, and writing. The peak RSS column spans the median peak RSS for each encoding at that rate.
 
 | 輸出取樣率 / Output rate | 16-bit PCM CPU (ms) | 24-bit PCM CPU (ms) | 32-bit float CPU (ms) | 峰值 RSS / Peak RSS (MiB) |
 | --- | ---: | ---: | ---: | ---: |
-| 44.1 kHz | 203.3 | 204.8 | 195.2 | 15.27 |
-| 48 kHz | 11.2 | 11.8 | 8.3 | 8.60 |
-| 96 kHz | 367.3 | 375.0 | 381.5 | 23.15–23.18 |
+| 44.1 kHz | 253.5 | 247.1 | 232.4 | 15.29–15.32 |
+| 48 kHz | 18.4 | 17.9 | 14.0 | 8.41–8.44 |
+| 96 kHz | 501.3 | 482.5 | 450.8 | 23.16–23.18 |
+
+另外以同樣長度的 48 kHz 合成輸入測量 A／B 成對匯出。每次分別輸出一個 Side 立體聲和一個 Mid 單聲道的 32-bit float WAV。每組仍採 5 個獨立程序的中位數。
+
+A separate test used the same input length and source rate to export an A/B pair. Each run wrote a stereo Side file and a mono Mid file as 32-bit float WAVs. Each result is the median of five fresh processes.
+
+| 輸出取樣率 / Output rate | 成對匯出 CPU / Pair CPU (ms) | 峰值 RSS / Peak RSS (MiB) |
+| --- | ---: | ---: |
+| 44.1 kHz | 516.9 | 11.92 |
+| 48 kHz | 35.3 | 8.39 |
+| 96 kHz | 945.1 | 15.91 |
 
 ## 開發測試 / Development checks
 
