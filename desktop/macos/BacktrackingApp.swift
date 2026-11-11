@@ -106,8 +106,10 @@ private final class CapturePanel: SnapshotShortcutPanel {
         switch event.type {
         case .keyDown:
             // Hardware codes 51 and 53 are Backspace and Escape on macOS.
-            if !event.modifierFlags.contains(.command), event.keyCode == 51 || event.keyCode == 53,
-               waveform?.cancelSelection() == true { return }
+            if !event.modifierFlags.contains(.command), event.keyCode == 51 || event.keyCode == 53 {
+                if waveform?.cancelSelection() == true { return }
+                if event.keyCode == 53, waveform?.cancelPendingDrag() == true { return }
+            }
         case .leftMouseDown:
             onClick?()
             move = nil
@@ -510,12 +512,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         timer?.invalidate()
         timer = nil
         tap = nil
+        waveform?.discardPreparedFile()
         // Worker jobs dispatch their completion asynchronously and never wait for this thread.
         worker.sync {
             for url in pendingProvisionalWAVs.urls { try? FileManager.default.removeItem(at: url) }
             pendingProvisionalWAVs.urls.removeAll()
         }
-        waveform?.discardPreparedFile()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -1412,24 +1414,25 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
-    func export(
-        _ range: ClosedRange<Double>, snapshot: WAVExport?, provisional: Bool, completion: @escaping (URL?) -> Bool
-    ) {
+    func prepareDrag(
+        _ range: ClosedRange<Double>, snapshot: WAVExport?, completion: @escaping (URL?) -> Bool
+    ) -> DispatchWorkItem? {
         guard let job = snapshot ?? frozenExport() else {
             if completion(nil) { setNotice("還沒有可匯出的錄音") }
-            return
+            return nil
         }
-        writeExport(job, range: range, directory: directory(for: .output), provisional: provisional, completion: completion)
+        return writeExport(job, range: range, directory: directory(for: .output), provisional: true, completion: completion)
     }
 
+    @discardableResult
     private func writeExport(
         _ job: WAVExport, range: ClosedRange<Double>, directory: String,
         provisional: Bool, completion: @escaping (URL?) -> Bool
-    ) {
+    ) -> DispatchWorkItem {
         let sampleRate = exportSampleRate
         let bitsPerSample = exportBitsPerSample
         setNotice(provisional ? "正在準備拖放…" : "正在寫入 WAV…")
-        worker.async { [weak self, worker, pendingProvisionalWAVs] in
+        let write = DispatchWorkItem { @Sendable [weak self, worker, pendingProvisionalWAVs] in
             let url = job.write(range: range, directory: directory, sampleRate: sampleRate, bitsPerSample: bitsPerSample)
             if provisional, let url { pendingProvisionalWAVs.urls.insert(url) }
             DispatchQueue.main.async {
@@ -1447,6 +1450,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 }
             }
         }
+        worker.async(execute: write)
+        return write
     }
 }
 
@@ -1470,11 +1475,9 @@ private final class WaveformView: NSView, NSDraggingSource {
     private var pointerArea: NSTrackingArea?
     private var mouseDownEvent: NSEvent?
     private var dragRequested = false
+    private var pendingDragWrite: DispatchWorkItem?
     private var dragging = false
     private var readyFile: URL?
-    private var readyFileIsProvisional = false
-    private var preparingFile = false
-    private var preparedRange: ClosedRange<Double>?
     private var exportVersion: UInt64 = 0
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -1527,20 +1530,26 @@ private final class WaveformView: NSView, NSDraggingSource {
         guard canCancelSelection else { return false }
         anchor = nil
         mouseDownEvent = nil
-        dragRequested = false
         clearSelection()
         controller?.resumeAfterSelectionCancellation()
         return true
     }
 
+    func cancelPendingDrag() -> Bool {
+        guard dragRequested, !dragging else { return false }
+        mouseDownEvent = nil
+        discardPreparedFile()
+        controller?.setNotice(nil)
+        endGesture()
+        return true
+    }
+
     func discardPreparedFile() {
-        if readyFileIsProvisional, let readyFile {
-            try? FileManager.default.removeItem(at: readyFile)
-        }
+        pendingDragWrite?.cancel()
+        pendingDragWrite = nil
+        if let readyFile { try? FileManager.default.removeItem(at: readyFile) }
         readyFile = nil
-        readyFileIsProvisional = false
-        preparingFile = false
-        preparedRange = nil
+        dragRequested = false
         exportVersion &+= 1
         needsDisplay = true
     }
@@ -1600,8 +1609,6 @@ private final class WaveformView: NSView, NSDraggingSource {
         }
 
         mouseDownEvent = event
-        dragRequested = false
-        if selectedSnapshot == nil { prepareExport(exportRange) }
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -1614,13 +1621,18 @@ private final class WaveformView: NSView, NSDraggingSource {
             let position = normalized(event)
             selection = min(anchor, position)...max(anchor, position)
             needsDisplay = true
-        } else if let mouseDownEvent {
+        } else if !dragging, let window, let mouseDownEvent {
             let start = mouseDownEvent.locationInWindow
             let current = event.locationInWindow
+            if pointerIsInApp(at: window.convertPoint(toScreen: current)) {
+                if dragRequested {
+                    discardPreparedFile()
+                    controller?.setNotice(nil)
+                }
+                return
+            }
             if !dragRequested && hypot(current.x - start.x, current.y - start.y) >= 4 {
-                dragRequested = true
-                if selectedSnapshot != nil { prepareExport(exportRange, provisional: true) }
-                tryStartDrag()
+                prepareDrag()
             }
         }
     }
@@ -1632,7 +1644,7 @@ private final class WaveformView: NSView, NSDraggingSource {
     override func mouseUp(with event: NSEvent) {
         trackPointer(event)
         guard anchor != nil || mouseDownEvent != nil else { return }
-        var keepSelection = false
+        var keepSelection = selectedSnapshot != nil
         if anchor != nil {
             mouseDragged(with: event)
             anchor = nil
@@ -1643,18 +1655,11 @@ private final class WaveformView: NSView, NSDraggingSource {
             } else {
                 clearSelection()
             }
-        } else if !dragging, selectedSnapshot != nil {
-            if !dragRequested {
-                prepareExport(exportRange)
-            } else {
-                // The button was released before the selected WAV could be dragged.
-                discardPreparedFile()
-                controller?.setNotice(nil)
-                keepSelection = true
-            }
+        } else if !dragging && dragRequested {
+            discardPreparedFile()
+            controller?.setNotice(nil)
         }
         mouseDownEvent = nil
-        dragRequested = false
         if !dragging { endGesture(keepingSelection: keepSelection) }
     }
 
@@ -1662,29 +1667,31 @@ private final class WaveformView: NSView, NSDraggingSource {
         if anchor != nil { mouseUp(with: event) }
     }
 
-    private func prepareExport(_ range: ClosedRange<Double>, provisional: Bool = false) {
-        if preparedRange == range {
-            if preparingFile { return }
-            if let readyFile, FileManager.default.fileExists(atPath: readyFile.path) { return }
-        }
-        discardPreparedFile()
-        preparedRange = range
-        preparingFile = true
+    private func pointerIsInApp(at point: NSPoint) -> Bool {
+        NSApp.windows.contains { $0.isVisible && $0.frame.contains(point) }
+    }
+
+    private func prepareDrag() {
+        dragRequested = true
         let version = exportVersion
-        controller?.export(range, snapshot: selectedSnapshot, provisional: provisional) { [weak self] url in
+        // File-URL drops need a real path for DAWs that reference the exported WAV in place.
+        // Only prepare it once the pointer has left Backtracking, and retain it on acceptance.
+        pendingDragWrite = controller?.prepareDrag(exportRange, snapshot: selectedSnapshot) { [weak self] url in
             guard let self, self.exportVersion == version else { return false }
-            self.preparingFile = false
-            self.readyFile = url
-            self.readyFileIsProvisional = provisional && url != nil
-            self.needsDisplay = true
-            self.tryStartDrag()
+            self.pendingDragWrite = nil
+            guard let event = self.mouseDownEvent, NSEvent.pressedMouseButtons & 1 != 0,
+                  !self.pointerIsInApp(at: NSEvent.mouseLocation) else {
+                self.discardPreparedFile()
+                self.controller?.setNotice(nil)
+                return false
+            }
+            if let url { self.beginFileDrag(url, event: event) }
             return true
         }
     }
 
-    private func tryStartDrag() {
-        guard dragRequested, !dragging, let event = mouseDownEvent, let url = readyFile,
-              NSEvent.pressedMouseButtons & 1 != 0 else { return }
+    private func beginFileDrag(_ url: URL, event: NSEvent) {
+        readyFile = url
         dragging = true
         let item = NSDraggingItem(pasteboardWriter: url as NSURL)
         let icon = NSWorkspace.shared.icon(forFile: url.path)
@@ -1695,7 +1702,7 @@ private final class WaveformView: NSView, NSDraggingSource {
     }
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
-        .copy
+        context == .outsideApplication ? .copy : []
     }
 
     func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { true }
@@ -1709,11 +1716,10 @@ private final class WaveformView: NSView, NSDraggingSource {
         dragRequested = false
         mouseDownEvent = nil
         trackDragPointer()
-        if readyFileIsProvisional {
-            if operation.isEmpty { discardPreparedFile() }
-            else { readyFileIsProvisional = false }
-        }
-        endGesture(keepingSelection: operation.isEmpty && selectedSnapshot != nil)
+        let accepted = operation.contains(.copy)
+        if accepted { readyFile = nil }
+        else { discardPreparedFile() }
+        endGesture(keepingSelection: !accepted && selectedSnapshot != nil)
     }
 
     private func endGesture(keepingSelection: Bool = false) {
@@ -1721,8 +1727,6 @@ private final class WaveformView: NSView, NSDraggingSource {
         if controller.resumesImmediately && !keepingSelection {
             selection = nil
             selectedSnapshot = nil
-            // Allow the current WAV write to finish, but take a fresh snapshot on the next click.
-            preparedRange = nil
             needsDisplay = true
         }
         controller.endEditing()
@@ -1740,10 +1744,8 @@ private final class WaveformView: NSView, NSDraggingSource {
             action = "Drag to Select"
         } else if selection != nil {
             action = "Drag and Drop   Esc to Cancel"
-        } else if readyFile != nil {
-            action = "Drag and Drop   Option + Click"
         } else {
-            action = "Click   Option + Click"
+            action = "Drag and Drop   Option + Drag"
         }
 
         let label = NSAttributedString(string: action, attributes: [

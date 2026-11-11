@@ -76,21 +76,22 @@ macOS 桌面版可從選單列顯示、隱藏或結束 Backtracking，也可啟�
 
 響度量測參考文件。 [ITU-R BS.1770](https://www.itu.int/rec/R-REC-BS.1770-5-202311-I/en) · [EBU Tech 3341](https://tech.ebu.ch/publications/tech3341)
 
-### 點擊、框選與拖曳
+### 框選與拖放
 
-在完整介面中，未框選時將游標移到波形上會預覽整段保留音訊。從波形任意位置點擊或開始拖曳，都會匯出這整段音訊。例如保留時間設為 20 秒，錄滿時匯出 20 秒，目前只收錄 7 秒時就匯出 7 秒。完整介面和只顯示波形模式都以波形線條的反相配色標示 `Ctrl` 或 `Option` 框選區間。匯出時使用該區間。
+在完整介面中，未框選時將游標移到波形上會預覽整段保留音訊。從波形按住左鍵拖出 Backtracking 視窗，成功放到接受 WAV 的位置後，即可匯出這整段音訊。例如保留時間設為 20 秒，錄滿時匯出 20 秒，目前只收錄 7 秒時就匯出 7 秒。完整介面和只顯示波形模式都以波形線條的反相配色標示 `Ctrl` 或 `Option` 框選區間。匯出時使用該區間。
 
 完整介面會在相關操作時顯示波形提示。介面會依右、左、下、上的順序尋找可以放下提示的位置，並將提示留在視窗內。
 
 | 動作 | Windows | macOS | 結果 |
 | --- | --- | --- | --- |
-| 查看可用操作 | 將游標移到波形 | 將游標移到波形 | 提示會列出 **Click** 及 **Ctrl + Click** 或 **Option + Click**。已有選取區或 WAV 可拖曳時，主要提示會顯示 **Drag and Drop**。 |
+| 查看可用操作 | 將游標移到波形 | 將游標移到波形 | 提示會顯示拖放與框選的操作方式。 |
 | 進入框選模式 | 游標在波形上時按住 `Ctrl` | 游標在波形上時按住 `Option` | 提示切換為 **Drag to Select**。 |
-| 直接存檔 | 點一下波形 | 點一下波形 | 固定波形並存成 WAV。未框選時存下整段保留音訊。 |
 | 匯入 DAW | 在波形上按住滑鼠左鍵並拖出 | 在波形上按住滑鼠左鍵並拖出 | 按住時顯示 **Drag and Drop**。檔案就緒後，拖到 REAPER 時間軸、FL Studio Playlist 或其他接受 WAV 的位置。 |
-| 指定起訖點 | 按住 `Ctrl`，在波形上按住左鍵拖曳 | 按住 `Option`，在波形上按住左鍵拖曳 | 顯示 **Drag to Select**。放開後保留框選區間，再放開修飾鍵並點擊或拖出選取區。 |
+| 指定起訖點 | 按住 `Ctrl`，在波形上按住左鍵拖曳 | 按住 `Option`，在波形上按住左鍵拖曳 | 顯示 **Drag to Select**。放開後保留框選區間，再放開修飾鍵並拖出選取區。 |
 
-完成框選後，片段先保留在記憶體，可點擊、拖曳或按 `Ctrl+S` 匯出。在 Backtracking 視窗有焦點時，按 `Esc` 或 `Backspace` 可取消選取並立刻恢復待命，這次框選不會產生 WAV。第一次匯出或需要轉換取樣率時，可維持按住滑鼠，等檔案就緒再放開。若 DAW 沒有接受拖放，可開啟預設輸出資料夾並直接匯入已匯出的 WAV。
+單擊、框選和視窗內的拖曳只會操作波形。要匯出框選片段，請拖出後放到可接受 WAV 的位置，或按 `Ctrl+S` 保存。取消拖曳、拖回原視窗放開或目標拒絕時，不會留下匯出檔。若 WAV 還在準備，請保持按住滑鼠再放開。DAW 拒絕拖放時，可按 `Ctrl+S` 保存，再從保存資料夾手動匯入。
+
+Backtracking 視窗有焦點時，按 `Esc` 或 `Backspace` 可取消框選並立刻恢復錄音待命。
 
 ### 保存快照
 
@@ -112,7 +113,7 @@ macOS 桌面版可從選單列顯示、隱藏或結束 Backtracking，也可啟�
 
 ### 輸出位置與檔案規格
 
-在 Options 可各自指定並開啟兩個資料夾。波形點擊與拖曳使用預設輸出資料夾，`Ctrl+S` 和 **Save snapshot** 使用保存資料夾。原先設定的匯出目的地會沿用。
+在 Options 可各自指定並開啟兩個資料夾。成功拖放使用預設輸出資料夾，`Ctrl+S` 和 **Save snapshot** 使用保存資料夾。原先設定的匯出目的地會沿用。
 
 | 版本 | 預設輸出資料夾 | 保存資料夾的預設位置 |
 | --- | --- | --- |
@@ -133,7 +134,7 @@ macOS 桌面版可從選單列顯示、隱藏或結束 Backtracking，也可啟�
 | 取樣率 | 44.1 kHz、48 kHz、96 kHz | 48 kHz |
 | 編碼 | 16-bit PCM、24-bit PCM、32-bit IEEE float | 32-bit float |
 
-點擊存檔、框選後匯出及拖曳到 DAW 都使用目前選定的 WAV 規格。錄音與音量表以來源取樣率運作，取樣率轉換在匯出時進行。WAV 保留擷取結果的 mono 或 stereo 聲道配置，Windows 桌面版會將多聲道輸出裝置的混音轉為 stereo。回溯歷史儲存在記憶體，關閉桌面程式或移除插件前，請先存下需要的片段。
+快照保存及拖放匯出都使用目前選定的 WAV 規格。錄音與音量表以來源取樣率運作，取樣率轉換在匯出時進行。WAV 保留擷取結果的 mono 或 stereo 聲道配置，Windows 桌面版會將多聲道輸出裝置的混音轉為 stereo。回溯歷史儲存在記憶體，關閉桌面程式或移除插件前，請先存下需要的片段。
 
 ### 保存與還原設定
 
@@ -151,7 +152,7 @@ Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續�
 | 播放有聲音，但波形沒有更新 | 將游標移到狀態燈確認狀態。若已暫停，按 **Play**。Windows 確認來源使用預設播放裝置。macOS 確認系統音訊錄製權限。插件確認音軌正在播放或監聽，且 Backtracking 的插入點收得到訊號。 |
 | Windows 切換喇叭或耳機後無法擷取 | 確認新的裝置已是系統預設播放裝置，再按 **Play** 重新連線。 |
 | DAW 掃描不到插件 | 確認已複製完整 `.vst3` 或 `.clap`，架構與 DAW 相容，且檔案位於 DAW 會掃描的資料夾。依下方步驟重新掃描。 |
-| 能存檔，但拖不到 DAW | 等 WAV 完成後再拖，確認落點是可接受音訊檔的時間軸或 Playlist。也可從輸出資料夾將 WAV 拖入或手動匯入。 |
+| DAW 拒絕拖放 | 拖出視窗後保持按住滑鼠，等 WAV 準備完成，再放到可接受音訊檔的時間軸或 Playlist。也可按 `Ctrl+S` 保存，再從保存資料夾手動匯入。 |
 | 無法寫入 WAV | 確認波形有可用的音訊，再選擇可寫入的存檔資料夾。 |
 
 **離線渲染**。CLAP 在宿主回報離線模式時會略過擷取。VST3 使用的 nice-plug 0.4.2 有時會回報前一次的處理模式，離線渲染仍可能進入回溯歷史。渲染前若要保留目前的素材，請先匯出。若要在渲染期間維持凍結，先將自動續錄設為 **0 秒**，再按 **Pause**。
@@ -230,21 +231,22 @@ The meter next to the gear reads the incoming audio signal and defaults to dBFS.
 
 Loudness measurement references. [ITU-R BS.1770](https://www.itu.int/rec/R-REC-BS.1770-5-202311-I/en) · [EBU Tech 3341](https://tech.ebu.ch/publications/tech3341)
 
-### Click, select, and drag
+### Select and drag out
 
-In the full interface, hover over an unselected waveform to preview all retained audio. Clicking or starting a drag anywhere on the waveform exports that full range. For example, a full 20-second buffer exports 20 seconds. If only 7 seconds have been captured, the WAV is 7 seconds long. Both display modes mark a `Ctrl` or `Option` selection by inverting the waveform line color within that range. The selected range is used for export.
+In the full interface, hover over an unselected waveform to preview all retained audio. Drag from anywhere on the waveform outside the Backtracking window and drop on a target that accepts WAV files to export that full range. For example, a full 20-second buffer exports 20 seconds. If only 7 seconds have been captured, the WAV is 7 seconds long. Both display modes mark a `Ctrl` or `Option` selection by inverting the waveform line color within that range. The selected range is used for export.
 
 Gesture hints appear as you interact in the full interface. The tooltip tries the right, left, below, and above in that order and stays within the interface.
 
 | Action | Windows | macOS | Result |
 | --- | --- | --- | --- |
-| See the available actions | Hover over the waveform | Hover over the waveform | The hint shows **Click** alongside **Ctrl + Click** or **Option + Click**. If a selection or WAV is ready to drag, the main hint changes to **Drag and Drop**. |
+| See the available actions | Hover over the waveform | Hover over the waveform | The hint shows how to drag out audio or select a range. |
 | Enter selection mode | Hold `Ctrl` over the waveform | Hold `Option` over the waveform | The hint changes to **Drag to Select**. |
-| Save the clip | Click the waveform | Click the waveform | Capture pauses and saves a WAV. With no selection, the file contains all retained audio. |
 | Drop a clip into a DAW | Hold the primary mouse button on the waveform and drag out | Hold the primary mouse button on the waveform and drag out | The hint shows **Drag and Drop**. Once ready, drop the WAV onto the REAPER timeline, FL Studio Playlist, or another WAV drop target. |
-| Choose both ends | Hold `Ctrl` and drag across the waveform | Hold `Option` and drag across the waveform | The hint shows **Drag to Select**. Release to keep the selection, then release the modifier and click or drag the highlighted range. |
+| Choose both ends | Hold `Ctrl` and drag across the waveform | Hold `Option` and drag across the waveform | The hint shows **Drag to Select**. Release to keep the selection, then release the modifier and drag out the highlighted range. |
 
-When you finish selecting a range, Backtracking keeps it in memory until you click, drag, or press `Ctrl+S` to export it. With Backtracking focused, press `Esc` or `Backspace` to clear the selection and re-arm capture immediately without writing a WAV for that selection. Keep the mouse button held while an export finishes preparing. If the DAW does not accept the drop, open the default export folder and import the exported WAV from there.
+Clicking, selecting, and dragging within the window only affect the waveform. To export a selected clip, drag it out and drop it on a target that accepts WAV files, or press `Ctrl+S` to save. Canceled or rejected drops, including drops back in the source window, leave no export file. Keep the mouse button held while an export finishes preparing. If the DAW rejects the drop, press `Ctrl+S` and import the WAV from the saved snapshots folder.
+
+With Backtracking focused, press `Esc` or `Backspace` to clear the selection and re-arm capture immediately.
 
 ### Save a snapshot
 
@@ -266,7 +268,7 @@ Click the trash icon in the toolbar. It is labeled **Clear capture** on Windows 
 
 ### Output location and file format
 
-You can choose and open both folders from Options. Waveform clicks and drags use the default export folder. `Ctrl+S` and **Save snapshot** use the saved snapshots folder. Existing export destinations are carried forward.
+You can choose and open both folders from Options. Successful drops use the default export folder. `Ctrl+S` and **Save snapshot** use the saved snapshots folder. Existing export destinations are carried forward.
 
 | Edition | Default export folder | Default saved snapshots folder |
 | --- | --- | --- |
@@ -287,7 +289,7 @@ Choose the sample rate and encoding independently in the gear menu.
 | Sample rate | 44.1 kHz, 48 kHz, 96 kHz | 48 kHz |
 | Encoding | 16-bit PCM, 24-bit PCM, 32-bit IEEE float | 32-bit float |
 
-Clicking to save, exporting a selection, and dragging into a DAW all use the current WAV format. Capture and metering run at the source sample rate. Any sample rate conversion happens during export. The WAV preserves the captured mono or stereo layout. The Windows desktop app mixes multichannel playback to stereo. The rolling history lives in memory, so export any clips you need before closing the app or removing the plug-in.
+Saving a snapshot and exporting by drag and drop both use the current WAV format. Capture and metering run at the source sample rate. Any sample rate conversion happens during export. The WAV preserves the captured mono or stereo layout. The Windows desktop app mixes multichannel playback to stereo. The rolling history lives in memory, so export any clips you need before closing the app or removing the plug-in.
 
 ### Save and restore settings
 
@@ -305,7 +307,7 @@ For **VST3 and CLAP**, the DAW project stores each plug-in instance's history le
 | Audio plays but the waveform stays still | Hover over the indicator to check the capture state. If paused, press **Play**. On Windows, verify the source uses the default playback device. On macOS, verify system audio recording permission. In a DAW, check playback or monitoring and the signal at the plug-in insert. |
 | Capture stops after switching Windows playback devices | Set the new device as the default playback device, then press **Play** to reconnect. |
 | The plug-in does not appear in the DAW | Verify that the entire `.vst3` or `.clap` is in a scanned folder and that its architecture matches the DAW. Rescan using the steps below. |
-| A WAV saves but the DAW refuses the drop | Wait for export to finish and drop on an audio timeline or Playlist. You can also drag the file from the output folder or import it manually. |
+| The DAW refuses the drop | Drag outside the window, keep the mouse button held while the WAV prepares, and release on an audio timeline or Playlist. You can also press `Ctrl+S` and import the WAV from the saved snapshots folder. |
 | The WAV could not be written | Check that the waveform contains audio and choose a writable save folder. |
 
 **Offline rendering**. CLAP skips capture when the host reports offline mode. The nice-plug 0.4.2 VST3 wrapper can pass the previous processing mode to Backtracking, so an offline render may enter the capture history. Export important clips before rendering. To keep capture frozen during the render, set auto-resume to **0 seconds** and press **Pause** first.
@@ -392,9 +394,9 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 2. 將自動續錄設為 **0 秒**。播放有聲音時確認紅燈閃爍，再按 **Pause**，確認波形停止更新。按 **Play** 重新待命，接著框選一段波形，確認放開滑鼠後恢復待命，而且仍能拖出剛選的片段。
 
    Set auto-resume to **0 seconds**. Play a sound and check that the red indicator blinks. Press **Pause** and check that the waveform freezes. Press **Play**, then select a range and verify that capture re-arms on release and you can still drag out the selected clip.
-3. 選擇預設輸出資料夾，將 WAV 設為 44.1 kHz、24-bit PCM。框選一小段並拖進 DAW，再從 Options 開啟預設輸出資料夾，確認 WAV 直接存到指定位置，且規格正確。若使用插件，分別在 VST3 和 CLAP 實例操作一次。
+3. 選擇預設輸出資料夾，將 WAV 設為 44.1 kHz、24-bit PCM。分別單擊、框選、在視窗內拖放，以及拖到無效位置，確認輸出資料夾沒有新增 WAV。再將框選的片段拖進 DAW，確認有一個新 WAV，且規格正確。若使用插件，分別在 VST3 和 CLAP 實例操作一次。
 
-   Choose an export folder and set the WAV format to 44.1 kHz, 24-bit PCM. Select a short clip and drag it into the DAW. Open the export folder from Options to check that the WAV is in the selected folder and uses the chosen format. For plug-in use, try a VST3 instance and a CLAP instance.
+   Choose an export folder and set the WAV format to 44.1 kHz, 24-bit PCM. Click the waveform, select a range, drag inside the window, and drop outside on an invalid target. Verify that none leave a new WAV in the export folder. Then drag a selected clip into your DAW and check that one new WAV uses the chosen format. For plug-in use, try a VST3 instance and a CLAP instance.
 4. 修改一項偏好後重開桌面版，確認設定有還原。測試插件時，修改設定後先儲存 DAW 專案，再重開該專案確認。
 
    Change a preference and relaunch the desktop app to check that it is restored. For the plug-in, change a setting, save the DAW project, and reopen it to check the saved value.

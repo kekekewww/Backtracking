@@ -4,11 +4,11 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::controller::Controller;
+use crate::file_drag;
 use crate::preferences::{
     DEFAULT_ACCENT, Key, MeterMode, Preferences, Settings, wav_sample_format_preference,
 };
@@ -64,7 +64,7 @@ const WAVEFORM_MIN_HEIGHT: f32 = 48.0;
 // Plot height in the default full window, used when launching directly into waveform-only mode.
 const DEFAULT_WAVEFORM_HEIGHT: f32 = 59.0;
 const WAVEFORM_INSET: f32 = 8.0;
-const WRITING_WAV: &str = "Writing WAV…";
+const PREPARING_WAV: &str = "Preparing WAV…";
 
 pub(crate) fn run(controller: Controller) -> eframe::Result<()> {
     let preferences = Preferences::for_current_user();
@@ -239,7 +239,6 @@ struct Recorder {
     gesture: Option<Gesture>,
     window_drag: Option<WindowDrag>,
     export: Option<ExportJob>,
-    pending_exports: VecDeque<ExportClip>,
     snapshot_save: Option<JoinHandle<io::Result<PathBuf>>>,
     pending_snapshot_saves: VecDeque<WavClip>,
     clip_revision: u64,
@@ -249,7 +248,7 @@ struct Recorder {
 
 enum Gesture {
     Select { anchor: f32, cursor: f32 },
-    Export { origin: Pos2, drag_requested: bool },
+    Export { preparing: bool },
 }
 
 #[derive(Clone, Copy)]
@@ -394,22 +393,6 @@ struct ExportJob {
     worker: JoinHandle<io::Result<ExportedWav>>,
 }
 
-struct ExportClip {
-    revision: u64,
-    wav: WavClip,
-    immediate: bool,
-    provisional: bool,
-}
-
-impl ExportClip {
-    fn write(self) -> io::Result<ExportedWav> {
-        Ok(ExportedWav {
-            path: self.wav.write()?,
-            provisional: self.provisional,
-        })
-    }
-}
-
 struct WavClip {
     snapshot: Arc<Snapshot>,
     frames: Range<usize>,
@@ -458,13 +441,13 @@ impl WavClip {
 
 struct ExportedWav {
     path: PathBuf,
-    provisional: bool,
+    keep: bool,
 }
 
 impl Drop for ExportedWav {
     fn drop(&mut self) {
-        // A selected drag needs a real file path before OLE starts. Keep it only after a drop.
-        if self.provisional {
+        // Native file drags need a readable path, which must remain stable after acceptance.
+        if !self.keep {
             let _ = std::fs::remove_file(&self.path);
         }
     }
@@ -509,7 +492,6 @@ impl Recorder {
             gesture: None,
             window_drag: None,
             export: None,
-            pending_exports: VecDeque::new(),
             snapshot_save: None,
             pending_snapshot_saves: VecDeque::new(),
             clip_revision: 0,
@@ -547,6 +529,7 @@ impl Recorder {
         self.options_open = false;
         self.window_drag = None;
         if self.gesture.take().is_some() {
+            self.invalidate_export();
             self.resume();
         }
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
@@ -679,7 +662,6 @@ impl Recorder {
         if self.snapshot.is_none()
             && let Some(snapshot) = self.controller.snapshot()
         {
-            self.advance_clip_revision();
             self.seconds = snapshot.frame_count() as f32 / snapshot.sample_rate.max(1) as f32;
             waveform::peaks(
                 &snapshot.samples,
@@ -708,7 +690,6 @@ impl Recorder {
         if self.idle_resume == AutoResumeDelay::Immediate {
             self.controller.resume();
             if !self.controller.is_paused() && !keep_selection {
-                // Let the current WAV finish. A new snapshot will invalidate its cache.
                 self.reset_snapshot();
             }
         }
@@ -735,15 +716,9 @@ impl Recorder {
     }
 
     fn invalidate_export(&mut self) {
-        self.advance_clip_revision();
-        self.pending_exports
-            .retain(|clip| clip.immediate && !clip.provisional);
-    }
-
-    fn advance_clip_revision(&mut self) {
         self.clip_revision = self.clip_revision.wrapping_add(1);
         self.exported = None;
-        if self.message == WRITING_WAV {
+        if self.message == PREPARING_WAV {
             self.message.clear();
         }
     }
@@ -1492,20 +1467,7 @@ impl Recorder {
         }
     }
 
-    fn start_export(&mut self, provisional: bool) {
-        let revision = self.clip_revision;
-        if self.exported.is_some()
-            || self
-                .export
-                .as_ref()
-                .is_some_and(|job| job.revision == revision)
-            || self
-                .pending_exports
-                .iter()
-                .any(|clip| clip.revision == revision)
-        {
-            return;
-        }
+    fn start_export(&mut self) {
         let Some(wav) = self.snapshot.clone().and_then(|snapshot| {
             WavClip::new(
                 snapshot,
@@ -1517,35 +1479,24 @@ impl Recorder {
             self.message = "No audio captured yet.".into();
             return;
         };
-        let clip = ExportClip {
-            revision,
-            wav,
-            immediate: self.idle_resume == AutoResumeDelay::Immediate,
-            provisional,
-        };
-        if self.export.is_none() && self.pending_exports.is_empty() {
-            self.spawn_export(clip);
-        } else {
-            if !clip.immediate {
-                self.pending_exports.retain(|clip| clip.immediate);
-            }
-            self.pending_exports.push_back(clip);
-        }
-    }
-
-    fn spawn_export(&mut self, clip: ExportClip) {
-        let revision = clip.revision;
         match thread::Builder::new()
             .name("backtracking-wav".into())
-            .spawn(move || clip.write())
-        {
+            .spawn(move || {
+                let mut file = ExportedWav {
+                    path: wav.write()?,
+                    keep: false,
+                };
+                file.path = dunce::canonicalize(&file.path)?;
+                Ok(file)
+            }) {
             Ok(worker) => {
-                self.export = Some(ExportJob { worker, revision });
-                if revision == self.clip_revision {
-                    self.message = WRITING_WAV.into();
-                }
+                self.export = Some(ExportJob {
+                    worker,
+                    revision: self.clip_revision,
+                });
+                self.message = PREPARING_WAV.into();
             }
-            Err(error) => self.message = format!("Could not start export: {error}"),
+            Err(error) => self.message = format!("Could not prepare WAV: {error}"),
         }
     }
 
@@ -1561,21 +1512,11 @@ impl Recorder {
             let result = job.worker.join();
             if job.revision == self.clip_revision {
                 match result {
-                    Ok(Ok(file)) => {
-                        if file.provisional {
-                            self.message.clear();
-                        } else {
-                            self.message = format!("Saved {}", file.path.display());
-                        }
-                        self.exported = Some(file);
-                    }
-                    Ok(Err(error)) => self.message = format!("Could not save WAV: {error}"),
+                    Ok(Ok(file)) => self.exported = Some(file),
+                    Ok(Err(error)) => self.message = format!("Could not prepare WAV: {error}"),
                     Err(_) => self.message = "WAV export worker stopped unexpectedly.".into(),
                 }
             }
-        }
-        if let Some(clip) = self.pending_exports.pop_front() {
-            self.spawn_export(clip);
         }
     }
 
@@ -1594,26 +1535,25 @@ impl Recorder {
         Rect::from_min_max(Pos2::new(inner.right() - width, inner.top()), inner.max)
     }
 
-    fn interact_waveform(
-        &mut self,
-        ui: &egui::Ui,
-        frame: &eframe::Frame,
-        response: &egui::Response,
-    ) {
-        let rect = response.rect;
-        let (position, pressed, down, selecting) = ui.input(|input| {
+    fn interact_waveform(&mut self, ui: &egui::Ui, frame: &eframe::Frame, rect: Rect) {
+        let (position, press, down) = ui.input(|input| {
+            let press = input.events.iter().rev().find_map(|event| match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                } => Some((*pos, modifiers.ctrl)),
+                _ => None,
+            });
             (
                 input.pointer.interact_pos(),
-                input.pointer.button_pressed(PointerButton::Primary),
+                press,
                 input.pointer.button_down(PointerButton::Primary),
-                input.modifiers.ctrl,
             )
         });
 
-        if pressed
-            && response.contains_pointer()
-            && let Some(position) = position
-        {
+        if let Some((position, selecting)) = press.filter(|(point, _)| rect.contains(*point)) {
             if selecting && !self.controller.is_paused() {
                 self.reset_snapshot();
             }
@@ -1625,13 +1565,7 @@ impl Recorder {
                     cursor: start,
                 });
             } else {
-                if self.selection.is_none() {
-                    self.start_export(false);
-                }
-                self.gesture = Some(Gesture::Export {
-                    origin: position,
-                    drag_requested: false,
-                });
+                self.gesture = Some(Gesture::Export { preparing: false });
             }
         }
 
@@ -1642,64 +1576,12 @@ impl Recorder {
             *cursor = fraction(audio_rect, position.x);
         }
 
-        if down {
-            if let (
-                Some(Gesture::Export {
-                    origin,
-                    drag_requested,
-                }),
-                Some(position),
-            ) = (&mut self.gesture, position)
-                && !*drag_requested
-                && position.distance(*origin) >= 4.0
-            {
-                *drag_requested = true;
-                if self.selection.is_some() {
-                    self.start_export(true);
-                }
-            }
-            if matches!(
-                self.gesture,
-                Some(Gesture::Export {
-                    drag_requested: true,
-                    ..
-                })
-            ) && let Some(file) = &mut self.exported
-            {
-                let dropped = Arc::new(AtomicBool::new(false));
-                let drop_outcome = Arc::clone(&dropped);
-                // OLE holds the UI thread until the mouse is released.
-                let result = drag::start_drag(
-                    frame,
-                    drag::DragItem::Files(vec![file.path.clone()]),
-                    drag::Image::Raw(DRAG_ICON.to_vec()),
-                    move |result, _| {
-                        drop_outcome.store(
-                            matches!(result, drag::DragResult::Dropped),
-                            Ordering::Relaxed,
-                        );
-                    },
-                    drag::Options::default(),
-                );
-                self.gesture = None;
-                if let Err(error) = result {
-                    let keep_selection = self.selection.is_some();
-                    if keep_selection {
-                        self.invalidate_export();
-                    }
-                    self.finish_waveform_gesture(keep_selection);
-                    self.message = format!("Could not start file drag: {error}");
-                } else if dropped.load(Ordering::Relaxed) {
-                    file.provisional = false;
-                    self.message = format!("Saved {}", file.path.display());
-                    self.finish_waveform_gesture(false);
-                } else if self.selection.is_some() {
-                    self.cancel_selection();
-                } else {
-                    self.finish_waveform_gesture(false);
-                }
-            }
-        } else if let Some(gesture) = self.gesture.take() {
+        // egui may lose its local pointer position when the cursor exits the viewport.
+        let held = match self.gesture {
+            Some(Gesture::Export { .. }) => file_drag::primary_button_down(),
+            _ => down,
+        };
+        if !held && let Some(gesture) = self.gesture.take() {
             let keep_selection = match gesture {
                 Gesture::Select { anchor, cursor } => {
                     let range = anchor.min(cursor)..anchor.max(cursor);
@@ -1709,18 +1591,47 @@ impl Recorder {
                     }
                     self.selection.is_some()
                 }
-                Gesture::Export { drag_requested, .. } if self.selection.is_some() => {
-                    if drag_requested {
-                        // The button was released before the WAV was ready to drag.
-                        self.invalidate_export();
-                    } else {
-                        self.start_export(false);
-                    }
-                    drag_requested
+                Gesture::Export { .. } => {
+                    self.invalidate_export();
+                    self.selection.is_some()
                 }
-                Gesture::Export { .. } => false,
             };
             self.finish_waveform_gesture(keep_selection);
+            return;
+        }
+
+        let Some(Gesture::Export { preparing }) = self.gesture else {
+            return;
+        };
+        let Ok(window) = frame.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(handle) = window.as_raw() else {
+            return;
+        };
+        let hwnd = HWND(handle.hwnd.get() as _);
+        if !file_drag::cursor_outside_app(hwnd) {
+            return;
+        }
+        if let Some(mut file) = self.exported.take() {
+            self.gesture = None;
+            let result = file_drag::drag_file(hwnd, &file.path);
+            self.invalidate_export();
+            match result {
+                Ok(true) => {
+                    file.keep = true;
+                    self.message = format!("Saved {}", file.path.display());
+                    self.finish_waveform_gesture(false);
+                }
+                Ok(false) => self.finish_waveform_gesture(self.selection.is_some()),
+                Err(error) => {
+                    self.finish_waveform_gesture(self.selection.is_some());
+                    self.message = format!("Could not start file drag: {error}");
+                }
+            }
+        } else if !preparing && self.export.is_none() {
+            self.gesture = Some(Gesture::Export { preparing: true });
+            self.start_export();
         }
     }
 
@@ -1830,12 +1741,9 @@ impl Recorder {
         };
         let hint = match self.gesture {
             Some(Gesture::Select { .. }) => "Drag to Select",
-            Some(Gesture::Export { .. }) => "Drag and Drop",
+            Some(Gesture::Export { .. }) => "Drag Out",
             None if modifier => "Drag to Select",
-            None if self.exported.is_some() || self.selection.is_some() => {
-                "Drag and Drop   ·   Ctrl + Click"
-            }
-            None => "Click   ·   Ctrl + Click",
+            None => "Drag Out   ·   Ctrl + Drag",
         };
         let bounds = ui.ctx().content_rect().shrink(5.0);
         let painter = ui.painter().with_clip_rect(bounds);
@@ -1886,18 +1794,21 @@ impl eframe::App for Recorder {
         }
         let can_resize = viewport.maximized != Some(true);
         let menu_open = egui::Popup::is_any_open(ctx);
-        if !menu_open
-            && (self.selection.is_some() || matches!(self.gesture, Some(Gesture::Select { .. })))
-        {
-            let cancel_key = |event: &egui::Event| {
-                matches!(
-                    event,
-                    egui::Event::Key {
-                        key: egui::Key::Escape | egui::Key::Backspace,
-                        pressed: true,
-                        ..
-                    }
-                )
+        let selection_active =
+            self.selection.is_some() || matches!(self.gesture, Some(Gesture::Select { .. }));
+        if !menu_open && (selection_active || self.gesture.is_some()) {
+            let cancel_key = |event: &egui::Event| match event {
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    pressed: true,
+                    ..
+                } => true,
+                egui::Event::Key {
+                    key: egui::Key::Backspace,
+                    pressed: true,
+                    ..
+                } => selection_active,
+                _ => false,
             };
             if input.events.iter().any(cancel_key) {
                 input.events.retain(|event| !cancel_key(event));
@@ -2054,7 +1965,7 @@ impl eframe::App for Recorder {
                     self.full_waveform_height = rect.height() - 2.0 * WAVEFORM_INSET;
                 }
                 if !interaction_blocked {
-                    self.interact_waveform(ui, frame, &response);
+                    self.interact_waveform(ui, frame, rect);
                 }
                 self.handle_snapshot_shortcut(ui.ctx());
                 self.draw_waveform(ui, rect, !interaction_blocked && window_cursor.is_none());
@@ -2082,13 +1993,6 @@ impl Drop for Recorder {
         self.save_window_position();
         if let Some(job) = self.export.take() {
             let _ = job.worker.join();
-        }
-        for clip in self
-            .pending_exports
-            .drain(..)
-            .filter(|clip| clip.immediate && !clip.provisional)
-        {
-            let _ = clip.write();
         }
         if let Some(worker) = self.snapshot_save.take() {
             let _ = worker.join();
@@ -2193,16 +2097,3 @@ fn drag_bounds(
     }
     bounds
 }
-
-const DRAG_ICON: &[u8] = &[
-    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
-    0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0x18, 0x08, 0x06, 0x00, 0x00, 0x00, 0xed, 0x69, 0x4d,
-    0xbf, 0x00, 0x00, 0x00, 0x60, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x10, 0x93, 0x92, 0xfd,
-    0x3f, 0x10, 0x98, 0x61, 0xd4, 0x62, 0x62, 0x71, 0xfa, 0xf3, 0xad, 0x23, 0xc4, 0x62, 0x98, 0x85,
-    0x83, 0xce, 0x62, 0x62, 0x1d, 0xc4, 0x40, 0x6a, 0x90, 0xa2, 0x5b, 0x8c, 0x4b, 0x7e, 0xc0, 0x2c,
-    0x26, 0xe4, 0x00, 0x06, 0x52, 0x83, 0x14, 0x97, 0xc5, 0x84, 0x1c, 0x44, 0xb6, 0xc5, 0xe4, 0xd2,
-    0x44, 0x5b, 0x4c, 0x2d, 0x0b, 0x09, 0x39, 0x60, 0xd4, 0xe2, 0x81, 0x8b, 0xe3, 0x01, 0x4f, 0xd5,
-    0x03, 0x96, 0x8f, 0x07, 0xbc, 0xe4, 0x1a, 0xb0, 0xb2, 0x7a, 0xd0, 0xd4, 0x4e, 0x23, 0xaf, 0x21,
-    0x30, 0xe4, 0x1b, 0x7b, 0x00, 0x7b, 0x1f, 0x56, 0x37, 0xd2, 0x94, 0x7f, 0xd1, 0x00, 0x00, 0x00,
-    0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-];
