@@ -84,25 +84,56 @@ struct CaptureLane: Equatable {
 }
 
 @MainActor
-func availableCaptureSources() -> [(source: CaptureSource, title: String)] {
-    var choices: [(CaptureSource, String)] = [
-        (.system, CaptureSource.system.label),
-        (.microphone(""), CaptureSource.microphone("").label)
-    ]
-    for device in audioObjects(kAudioHardwarePropertyDevices) {
-        guard inputChannels(device) > 0,
-              let uid = audioString(device, kAudioDevicePropertyDeviceUID),
+func availableCaptureSources(excluding privateDevices: Set<AudioObjectID>) -> [(source: CaptureSource, title: String)] {
+    var choices: [(CaptureSource, String)] = []
+    if defaultDevice(kAudioHardwarePropertyDefaultOutputDevice) != nil {
+        choices.append((.system, CaptureSource.system.label))
+    }
+    let inputDevices = audioObjects(kAudioHardwarePropertyDevices).filter { device in
+        !privateDevices.contains(device)
+            && (audioUInt32(device, kAudioDevicePropertyDeviceIsAlive) ?? 0) != 0
+            && inputChannels(device) > 0
+    }
+    if let device = defaultDevice(kAudioHardwarePropertyDefaultInputDevice), inputDevices.contains(device) {
+        choices.append((.microphone(""), CaptureSource.microphone("").label))
+    }
+    for device in inputDevices {
+        guard let uid = audioString(device, kAudioDevicePropertyDeviceUID), !uid.isEmpty,
               let name = audioString(device, kAudioObjectPropertyName) else { continue }
         choices.append((.microphone(uid), "麥克風 · \(name)"))
     }
-    var seen = Set<String>()
-    for app in NSWorkspace.shared.runningApplications.sorted(by: {
-        ($0.localizedName ?? "").localizedStandardCompare($1.localizedName ?? "") == .orderedAscending
-    }) {
-        guard app.activationPolicy == .regular,
-              let identifier = app.bundleIdentifier, !identifier.isEmpty, seen.insert(identifier).inserted else { continue }
-        choices.append((.application(identifier), "應用程式 · \(app.localizedName ?? identifier)"))
+
+    // Workspace metadata names HAL playback clients and associates helper processes with their app.
+    let apps = NSWorkspace.shared.runningApplications.filter {
+        $0.activationPolicy != .prohibited && $0.bundleIdentifier != nil
     }
+    let appsByPID = Dictionary(apps.map { ($0.processIdentifier, $0) }, uniquingKeysWith: { first, _ in first })
+    let ownPID = ProcessInfo.processInfo.processIdentifier
+    let ownBundle = Bundle.main.bundleIdentifier
+    var namesByBundle: [String: String] = [:]
+    for object in audioObjects(kAudioHardwarePropertyProcessObjectList) {
+        guard hasPlaybackStream(object), let pid = processID(object), pid != ownPID else { continue }
+        let bundle = audioString(object, kAudioProcessPropertyBundleID)
+        var owner = appsByPID[pid]
+        if owner?.activationPolicy != .regular {
+            let helperOwner = apps.first { app in
+                guard let identifier = app.bundleIdentifier else { return false }
+                return bundle?.hasPrefix(identifier + ".helper") == true
+            }
+            let ancestor = helperOwner ?? processLineage(pid).dropFirst()
+                .first(where: { appsByPID[$0]?.activationPolicy == .regular }).flatMap { appsByPID[$0] }
+            owner = ancestor ?? owner ?? apps.first { $0.bundleIdentifier == bundle }
+        }
+        guard let identifier = owner?.bundleIdentifier ?? bundle, !identifier.isEmpty,
+              identifier != ownBundle else { continue }
+        namesByBundle[identifier] = owner?.localizedName ?? NSRunningApplication(processIdentifier: pid)?.localizedName
+            ?? namesByBundle[identifier] ?? identifier
+    }
+    let sortedApps = namesByBundle.sorted {
+        let order = $0.value.localizedStandardCompare($1.value)
+        return order == .orderedSame ? $0.key < $1.key : order == .orderedAscending
+    }
+    choices += sortedApps.map { (.application($0.key), "應用程式 · \($0.value)") }
     return choices
 }
 
@@ -125,6 +156,23 @@ private func audioObjects(_ selector: AudioObjectPropertySelector) -> [AudioObje
         AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, $0.baseAddress!)
     }
     return status == noErr ? Array(values.prefix(Int(size) / MemoryLayout<AudioObjectID>.stride)) : []
+}
+
+private func audioUInt32(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> UInt32? {
+    var address = property(selector)
+    var value: UInt32 = 0
+    var size = UInt32(MemoryLayout.size(ofValue: value))
+    guard AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value) == noErr else { return nil }
+    return value
+}
+
+private func hasPlaybackStream(_ object: AudioObjectID) -> Bool {
+    if (audioUInt32(object, kAudioProcessPropertyIsRunningOutput) ?? 0) != 0 { return true }
+    // Include clients that still have an output device attached while their stream is idle.
+    var address = property(kAudioProcessPropertyDevices, kAudioObjectPropertyScopeOutput)
+    var size: UInt32 = 0
+    return AudioObjectGetPropertyDataSize(object, &address, 0, nil, &size) == noErr
+        && size >= UInt32(MemoryLayout<AudioObjectID>.stride)
 }
 
 private func audioString(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
@@ -216,6 +264,10 @@ private func parentProcess(_ pid: pid_t) -> pid_t? {
     return parent > 1 && parent != pid ? parent : nil
 }
 
+private func processLineage(_ pid: pid_t) -> some Sequence<pid_t> {
+    sequence(first: pid, next: parentProcess).prefix(32)
+}
+
 @MainActor
 private func processObjects(for identifier: String) -> [AudioObjectID] {
     let roots = Set<pid_t>(NSRunningApplication.runningApplications(withBundleIdentifier: identifier).map {
@@ -225,14 +277,8 @@ private func processObjects(for identifier: String) -> [AudioObjectID] {
         let bundle = audioString(object, kAudioProcessPropertyBundleID)
         if bundle == identifier { return true }
         guard !roots.isEmpty, let pid = processID(object) else { return false }
-        var child: pid_t? = pid
         // Include audio-producing children of the selected app, including browser renderers.
-        for _ in 0..<32 {
-            guard let current = child else { break }
-            if roots.contains(current) { return true }
-            child = parentProcess(current)
-        }
-        return bundle?.hasPrefix(identifier + ".helper") == true
+        return bundle?.hasPrefix(identifier + ".helper") == true || processLineage(pid).contains(where: roots.contains)
     }.sorted()
 }
 
@@ -444,7 +490,7 @@ private protocol NativeInput: AnyObject {
 
 private final class PlaybackTap: NativeInput {
     private var tapID = unknownObject
-    private var aggregateID = unknownObject
+    private(set) var aggregateID = unknownObject
     private var ioProc: AudioDeviceIOProcID?
     private var running = false
     private var streamFormat: InputFormat?
@@ -610,6 +656,9 @@ final class SystemAudioTap {
     private var running = false
     var core: OpaquePointer { timeline.core }
     var laneCount: Int { lanes.count }
+    var privatePlaybackDevices: Set<AudioObjectID> {
+        Set(slots.compactMap { ($0.input as? PlaybackTap)?.aggregateID })
+    }
 
     init(history: UInt32, lanes: [CaptureLane]) throws {
         guard (1...2).contains(lanes.count) else { throw CaptureError("可擷取一或兩路來源") }

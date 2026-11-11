@@ -226,6 +226,7 @@ struct Recorder {
     options_focus_requested: bool,
     available_sources: Vec<CaptureSource>,
     source_list_worker: Option<JoinHandle<Vec<CaptureSource>>>,
+    source_list_refresh_pending: bool,
     updates: UpdateOptions,
     window_position: Option<[i32; 2]>,
     window_position_changed: Option<Instant>,
@@ -529,6 +530,7 @@ impl Recorder {
             options_focus_requested: false,
             available_sources: vec![CaptureSource::System, CaptureSource::DefaultMicrophone],
             source_list_worker: None,
+            source_list_refresh_pending: false,
             updates: UpdateOptions::default(),
             window_position: settings.window_position,
             window_position_changed: None,
@@ -1110,9 +1112,7 @@ impl Recorder {
     }
 
     fn open_options(&mut self, ctx: &egui::Context) {
-        if !self.options_open {
-            self.refresh_source_list();
-        }
+        self.refresh_source_list();
         self.options_open = true;
         self.options_focus_requested = true;
         ctx.send_viewport_cmd(ViewportCommand::RequestPaintWhileHidden);
@@ -1397,16 +1397,9 @@ impl Recorder {
     }
 
     fn source_options(&mut self, ui: &mut egui::Ui) {
-        if ui
-            .add_enabled(
-                self.source_list_worker.is_none(),
-                egui::Button::new("Refresh source list").small(),
-            )
-            .clicked()
-        {
-            self.refresh_source_list();
-        }
         let choices = self.available_sources.as_slice();
+        let scanning = self.source_list_worker.is_some();
+        let mut source_menu_opened = false;
         let mut sources = self.controller.sources().clone();
         ui.add_enabled_ui(self.gesture.is_none(), |ui| {
             for (lane, settings) in sources.iter_mut().enumerate() {
@@ -1415,8 +1408,20 @@ impl Recorder {
                     let mut source = configured.as_ref().map(|settings| settings.source.clone());
                     ui.horizontal(|ui| {
                         ui.strong(lane_name(lane));
-                        egui::ComboBox::from_id_salt("source")
-                            .selected_text(source.as_ref().map_or("Off", CaptureSource::label))
+                        let source_menu = "source";
+                        let was_open = egui::ComboBox::is_open(
+                            ui.ctx(),
+                            ui.make_persistent_id(egui::IdSalt::new(source_menu)),
+                        );
+                        let label = source.as_ref().map_or("Off", |source| {
+                            choices
+                                .iter()
+                                .find(|choice| choice.same_source(source))
+                                .unwrap_or(source)
+                                .label()
+                        });
+                        egui::ComboBox::from_id_salt(source_menu)
+                            .selected_text(label)
                             .width(196.0)
                             .height(280.0)
                             .truncate()
@@ -1424,12 +1429,19 @@ impl Recorder {
                                 if lane == 1 {
                                     ui.selectable_value(&mut source, None, "Off");
                                 }
+                                source_menu_opened |= !was_open;
+                                if !was_open || scanning {
+                                    ui.spinner();
+                                    return;
+                                }
                                 for choice in choices {
-                                    let row = ui.selectable_value(
-                                        &mut source,
-                                        Some(choice.clone()),
-                                        choice.label(),
-                                    );
+                                    let selected = source
+                                        .as_ref()
+                                        .is_some_and(|source| choice.same_source(source));
+                                    let row = ui.selectable_label(selected, choice.label());
+                                    if row.clicked() && !selected {
+                                        source = Some(choice.clone());
+                                    }
                                     if let CaptureSource::Application { path, .. } = choice {
                                         row.on_hover_text(path);
                                     }
@@ -1468,6 +1480,9 @@ impl Recorder {
                 });
             }
         });
+        if source_menu_opened {
+            self.refresh_source_list();
+        }
         if !CaptureSource::supports_app_capture() {
             ui.small("Individual app capture requires Windows build 20348 or newer.");
         }
@@ -1480,6 +1495,7 @@ impl Recorder {
 
     fn refresh_source_list(&mut self) {
         if self.source_list_worker.is_some() {
+            self.source_list_refresh_pending = true;
             return;
         }
         match thread::Builder::new()
@@ -1501,6 +1517,9 @@ impl Recorder {
             match worker.join() {
                 Ok(sources) => self.available_sources = sources,
                 Err(_) => self.message = "Source list worker stopped unexpectedly.".into(),
+            }
+            if std::mem::take(&mut self.source_list_refresh_pending) {
+                self.refresh_source_list();
             }
         }
     }

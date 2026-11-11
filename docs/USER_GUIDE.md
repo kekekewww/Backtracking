@@ -26,6 +26,7 @@ macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`C
 ### 來源、波形與旗標
 
 - 在桌面版 Options 選擇系統播放、麥克風或指定 App。Windows 的指定 App 擷取需 OS build 20348 以上。macOS 首次擷取系統聲或麥克風時，請允許對應權限。
+- 每次打開來源下拉選單都會更新清單。Windows 會列出仍有播放串流的 App，包含串流已暫停的情況。macOS 會列出 Core Audio 辨識到有播放輸出的 App。找不到要選的 App 時，先讓它播放一段音訊，再重新打開選單。麥克風來源會列出系統目前可用的輸入裝置。
 - 可同時啟用 A 和 B。兩路各自選擇來源與 Left、Right、Center、Mid、Side 或 Merged。Merged 沿用來源的單聲道或雙聲道輸出。Center 需要來源提供原生中央聲道。
 - 單一來源可顯示合併波形或上下兩列 L／R。啟用 A／B 時，上列顯示 A、下列顯示 B，各占波形區的一半，並各自顯示音量。
 - 完成框選或明確保存整段時，波形會標記範圍頭尾。框選時按住 `Shift`，靠近可見旗標即可吸附。旗標會隨錄音歷史移動，並在各自離開可視範圍時消失。
@@ -192,6 +193,7 @@ The settings menu offers five background transparency levels. Choose 0%, 25%, 50
 ### Sources, waveforms, and flags
 
 - Choose system playback, a microphone, or a specific app in desktop Options. App capture requires Windows OS build 20348 or later. On macOS, grant the relevant system audio or microphone permission when prompted.
+- The source list updates each time you open the drop-down. Windows lists apps with an open playback stream, including paused streams. macOS lists apps that Core Audio identifies as playback sources. If an app is missing, play some audio in it and reopen the list. Microphone entries come from the input devices the system currently makes available.
 - Enable A and B to capture two routes. For each, choose a source and Left, Right, Center, Mid, Side, or Merged. Merged uses the source's mono or stereo output format. Center requires a native center channel.
 - For one source, choose a merged waveform or two L/R rows. With A/B enabled, A and B each use half the waveform area and have independent meters.
 - Flags mark the boundaries after selecting a range or saving the full capture. Hold `Shift` while selecting near a visible flag to snap to it. Each flag follows the retained audio and disappears when it leaves view.
