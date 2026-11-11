@@ -3,7 +3,11 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use backtracking_core::{AutoResumeDelay, DurationChoice, WavExportProfile, WavSampleFormat};
+use backtracking_core::{
+    AutoResumeDelay, ChannelRoute, DurationChoice, WavExportProfile, WavSampleFormat,
+};
+
+use crate::controller::{CaptureSource, SourceSettings};
 
 const MAX_VALUE_BYTES: u64 = 128 * 1024;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +37,9 @@ pub(crate) enum Key {
     Transparency,
     Accent,
     Meter,
+    MeterB,
+    SplitWaveform,
+    CaptureSources,
     WavSampleRate,
     WavSampleFormat,
     Output,
@@ -51,6 +58,9 @@ impl Key {
             Self::Transparency => "transparency-percent",
             Self::Accent => "theme-color",
             Self::Meter => "meter-unit",
+            Self::MeterB => "meter-b-unit",
+            Self::SplitWaveform => "split-waveform",
+            Self::CaptureSources => "capture-sources",
             Self::WavSampleRate => "wav-sample-rate",
             Self::WavSampleFormat => "wav-sample-format",
             Self::Output => "output-folder",
@@ -68,6 +78,9 @@ pub(crate) struct Settings {
     pub(crate) transparency: u8,
     pub(crate) accent: [u8; 3],
     pub(crate) meter_mode: MeterMode,
+    pub(crate) meter_b_mode: MeterMode,
+    pub(crate) split_waveform: bool,
+    pub(crate) sources: [Option<SourceSettings>; 2],
     pub(crate) wav_profile: WavExportProfile,
     pub(crate) output: PathBuf,
     pub(crate) saved_output: PathBuf,
@@ -88,6 +101,15 @@ impl Default for Settings {
             transparency: 0,
             accent: DEFAULT_ACCENT,
             meter_mode: MeterMode::Dbfs,
+            meter_b_mode: MeterMode::Dbfs,
+            split_waveform: false,
+            sources: [
+                Some(SourceSettings {
+                    source: CaptureSource::System,
+                    route: ChannelRoute::Merged,
+                }),
+                None,
+            ],
             wav_profile: WavExportProfile::default(),
             output: directory.join("output"),
             saved_output: directory.join("saved"),
@@ -134,11 +156,16 @@ impl Preferences {
         if let Some(accent) = self.read(Key::Accent).as_deref().and_then(parse_accent) {
             settings.accent = accent;
         }
-        settings.meter_mode = match self.read(Key::Meter).as_deref().map(str::trim) {
-            Some("VU") => MeterMode::Vu,
-            Some("LUFS") => MeterMode::Lufs,
-            _ => MeterMode::Dbfs,
-        };
+        settings.meter_mode = self.meter_mode(Key::Meter);
+        settings.meter_b_mode = self.meter_mode(Key::MeterB);
+        settings.split_waveform = self.read_number::<u8>(Key::SplitWaveform) == Some(1);
+        if let Some(sources) = self
+            .read(Key::CaptureSources)
+            .as_deref()
+            .and_then(parse_sources)
+        {
+            settings.sources = sources;
+        }
         if let Some(rate @ (44_100 | 48_000 | 96_000)) = self.read_number(Key::WavSampleRate) {
             settings.wav_profile.sample_rate = rate;
         }
@@ -171,6 +198,14 @@ impl Preferences {
 
     fn read_number<T: std::str::FromStr>(&self, key: Key) -> Option<T> {
         self.read(key)?.trim().parse().ok()
+    }
+
+    fn meter_mode(&self, key: Key) -> MeterMode {
+        match self.read(key).as_deref().map(str::trim) {
+            Some("VU") => MeterMode::Vu,
+            Some("LUFS") => MeterMode::Lufs,
+            _ => MeterMode::Dbfs,
+        }
     }
 
     fn read_absolute_path(&self, key: Key) -> Option<PathBuf> {
@@ -243,6 +278,87 @@ pub(crate) fn wav_sample_format_preference(format: WavSampleFormat) -> &'static 
     }
 }
 
+pub(crate) fn serialize_sources(sources: &[Option<SourceSettings>; 2]) -> String {
+    fn encode_slot(settings: Option<&SourceSettings>) -> String {
+        let Some(settings) = settings else {
+            return "off".into();
+        };
+        let route = settings.route as u32;
+        match &settings.source {
+            CaptureSource::System => format!("{route}\tsystem"),
+            CaptureSource::DefaultMicrophone => format!("{route}\tdefault-mic"),
+            CaptureSource::Microphone { id, name } => {
+                format!("{route}\tmic\t{}\t{}", encode_text(id), encode_text(name))
+            }
+            CaptureSource::Application { path, name } => {
+                format!("{route}\tapp\t{}\t{}", encode_text(path), encode_text(name))
+            }
+        }
+    }
+    format!(
+        "{}\n{}",
+        encode_slot(sources[0].as_ref()),
+        encode_slot(sources[1].as_ref()),
+    )
+}
+
+fn parse_sources(value: &str) -> Option<[Option<SourceSettings>; 2]> {
+    fn parse_slot(line: &str) -> Option<SourceSettings> {
+        let mut fields = line.split('\t');
+        let route = ChannelRoute::from_code(fields.next()?.parse().ok()?)?;
+        let source = match fields.next()? {
+            "system" => CaptureSource::System,
+            "default-mic" => CaptureSource::DefaultMicrophone,
+            "mic" => CaptureSource::Microphone {
+                id: decode_text(fields.next()?)?,
+                name: decode_text(fields.next()?)?,
+            },
+            "app" => CaptureSource::Application {
+                path: decode_text(fields.next()?)?,
+                name: decode_text(fields.next()?)?,
+            },
+            _ => return None,
+        };
+        fields
+            .next()
+            .is_none()
+            .then_some(SourceSettings { source, route })
+    }
+    let (a, b) = value.split_once('\n')?;
+    Some([
+        Some(parse_slot(a)?),
+        if b == "off" {
+            None
+        } else {
+            Some(parse_slot(b)?)
+        },
+    ])
+}
+
+fn encode_text(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.bytes() {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn decode_text(value: &str) -> Option<String> {
+    let (bytes, remainder) = value.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    let bytes = bytes
+        .iter()
+        .map(|chunk| u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    if bytes.is_empty() || bytes.contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 fn parse_accent(value: &str) -> Option<[u8; 3]> {
     let hex = value.trim().strip_prefix('#')?;
     if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -250,4 +366,34 @@ fn parse_accent(value: &str) -> Option<[u8; 3]> {
     }
     let [_, r, g, b] = u32::from_str_radix(hex, 16).ok()?.to_be_bytes();
     Some([r, g, b])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_lanes_keep_unicode_source_identity_and_independent_routes() {
+        let source = CaptureSource::Application {
+            path: r"C:\瀏覽器\chrome.exe".into(),
+            name: "Chrome\t瀏覽器".into(),
+        };
+        let sources = [
+            Some(SourceSettings {
+                source: source.clone(),
+                route: ChannelRoute::Left,
+            }),
+            Some(SourceSettings {
+                source,
+                route: ChannelRoute::Right,
+            }),
+        ];
+        assert_eq!(parse_sources(&serialize_sources(&sources)), Some(sources));
+        let one_source = Settings::default().sources;
+        assert_eq!(
+            parse_sources(&serialize_sources(&one_source)),
+            Some(one_source)
+        );
+        assert_eq!(parse_sources("off\noff"), None);
+    }
 }

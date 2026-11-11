@@ -31,6 +31,7 @@ private func movesFromWaveform(_ modifiers: NSEvent.ModifierFlags) -> Bool {
 enum BacktrackingApp {
     @MainActor
     static func main() {
+        if StartupUpdater.runHelperIfRequested() { return }
         let app = NSApplication.shared
         let delegate = BacktrackingController()
         app.delegate = delegate
@@ -268,25 +269,58 @@ private final class CapturePanel: SnapshotShortcutPanel {
     }
 }
 
-// Created on the UI thread. The worker owns all access to the copy.
+// A frozen, shared interval. The worker owns all export access to its samples.
 private final class WAVExport: @unchecked Sendable {
-    let snapshot: OpaquePointer
+    private let snapshots: [OpaquePointer]
+    let span: Range<UInt64>
 
-    init(_ snapshot: OpaquePointer) {
-        self.snapshot = snapshot
-    }
-
-    deinit { bt_snapshot_free(snapshot) }
-
-    func write(range: ClosedRange<Double>, directory: String, sampleRate: UInt32, bitsPerSample: UInt32) -> URL? {
-        directory.withCString { destination in
-            guard let path = bt_snapshot_export_with_profile(
-                snapshot, range.lowerBound, range.upperBound, destination, sampleRate, bitsPerSample
-            ) else {
+    init?(core: OpaquePointer, laneCount: Int) {
+        guard let first = bt_tracks_snapshot(core, 0) else { return nil }
+        let count = bt_snapshot_frame_count(first)
+        guard count > 0 else {
+            bt_snapshot_free(first)
+            return nil
+        }
+        let start = bt_snapshot_first_frame(first)
+        span = start..<(start + count)
+        if laneCount == 2 {
+            guard let second = bt_tracks_snapshot(core, 1) else {
+                bt_snapshot_free(first)
                 return nil
             }
+            snapshots = [first, second]
+        } else {
+            snapshots = [first]
+        }
+    }
+
+    deinit {
+        for snapshot in snapshots { bt_snapshot_free(snapshot) }
+    }
+
+    func write(range: Range<UInt64>, directory: String, sampleRate: UInt32, bitsPerSample: UInt32) -> [URL] {
+        directory.withCString { destination -> [URL] in
+            if snapshots.count == 2 {
+                var a: UnsafeMutablePointer<CChar>?
+                var b: UnsafeMutablePointer<CChar>?
+                guard bt_snapshots_export_pair_frames_with_profile(
+                    snapshots[0], snapshots[1], range.lowerBound, range.upperBound, destination,
+                    sampleRate, bitsPerSample, &a, &b
+                ) == 1, let pathA = a, let pathB = b else { return [] }
+                defer {
+                    bt_string_free(pathA)
+                    bt_string_free(pathB)
+                }
+                return [
+                    URL(fileURLWithPath: String(cString: pathA)),
+                    URL(fileURLWithPath: String(cString: pathB))
+                ]
+            }
+            guard let path = bt_snapshot_export_frames_with_profile(
+                snapshots[0], range.lowerBound, range.upperBound, destination, sampleRate, bitsPerSample
+            ) else { return [] }
             defer { bt_string_free(path) }
-            return String(validatingUTF8: path).map { URL(fileURLWithPath: $0) }
+            return [URL(fileURLWithPath: String(cString: path))]
         }
     }
 }
@@ -355,8 +389,7 @@ private final class CaptureBackground: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        NSColor.clear.setFill()
-        NSRectFillUsingOperation(dirtyRect, .copy)
+        NSGraphicsContext.current?.cgContext.clear(dirtyRect)
         guard backgroundOpacity > 0 else { return }
         let fill = NSBezierPath(rect: bounds)
         let waveShape = waveform.map { NSBezierPath(roundedRect: convert($0.bounds, from: $0), xRadius: 6, yRadius: 6) }
@@ -413,6 +446,7 @@ private enum ExportFolder: Int {
 @MainActor
 private final class BacktrackingController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private let defaults = UserDefaults.standard
+    private let startupUpdater = StartupUpdater()
     private let worker = DispatchQueue(label: "backtracking.wav-export", qos: .userInitiated)
     private let pendingProvisionalWAVs = PendingProvisionalWAVs()
     private var tap: SystemAudioTap?
@@ -427,6 +461,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private let clearButton = NSButton(title: "清除目前錄音", target: nil, action: nil)
     private let pinButton = NSButton(title: "置頂", target: nil, action: nil)
     private let meterButton = NSButton(title: "— dBFS", target: nil, action: nil)
+    private let meterBButton = NSButton(title: "B — dBFS", target: nil, action: nil)
+    private var sourcePopups: [NSPopUpButton] = []
+    private var routePopups: [NSPopUpButton] = []
+    private var dualSourceButton: NSButton?
+    private var waveformModePopup: NSPopUpButton?
     private let statusLabel = NSTextField(labelWithString: "")
     private var optionsCaptureButton: NSButton?
     private var optionsClearButton: NSButton?
@@ -437,6 +476,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var optionsLoginButton: NSButton?
     private var optionsVisibilityButton: NSButton?
     private var optionsMeterPopup: NSPopUpButton?
+    private var optionsMeterBPopup: NSPopUpButton?
     private var optionsNotice: NSTextField?
     private var outputPathLabel: NSTextField?
     private var savedPathLabel: NSTextField?
@@ -450,6 +490,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var transparency: UInt32 = 0
     private var accentRGB = defaultAccentRGB
     private var meterMode: MeterMode = .dbfs
+    private var meterModeB: MeterMode = .dbfs
+    private var laneA = CaptureLane(source: .system)
+    private var laneB = CaptureLane(source: .microphone(""))
+    private var dualSource = false
+    private var stereoWaveform = false
+    private var microphonePromptPending = false
+    private var lastSourceCheck = 0.0
+
+    private var captureLanes: [CaptureLane] { dualSource ? [laneA, laneB] : [laneA] }
     private var exportSampleRate: UInt32 = 48_000
     private var exportBitsPerSample: UInt32 = 32
     private var alwaysOnTop = true
@@ -485,6 +534,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         alwaysOnTop = defaults.object(forKey: "alwaysOnTop") as? Bool ?? true
         waveformOnly = defaults.object(forKey: "waveformOnly") as? Bool ?? false
+        startupUpdater.checkAtLaunch { [weak self] in self?.beginCaptureAfterUpdate() }
+    }
+
+    private func beginCaptureAfterUpdate() {
+        loadCapturePreferences()
         configureMenu()
         configurePanel()
         configureStatusItem()
@@ -492,6 +546,20 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let timer = Timer(timeInterval: 1.0 / 15.0, target: self, selector: #selector(tick(_:)), userInfo: nil, repeats: true)
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func loadCapturePreferences() {
+        if let saved = defaults.string(forKey: "captureSourceA"), let source = CaptureSource(key: saved) {
+            laneA.source = source
+        }
+        if let saved = defaults.string(forKey: "captureSourceB"), let source = CaptureSource(key: saved) {
+            laneB.source = source
+        }
+        if let raw = unsignedSetting("captureRouteA"), let route = CaptureRoute(rawValue: raw) { laneA.route = route }
+        if let raw = unsignedSetting("captureRouteB"), let route = CaptureRoute(rawValue: raw) { laneB.route = route }
+        if let raw = unsignedSetting("meterModeB"), let mode = MeterMode(rawValue: raw) { meterModeB = mode }
+        dualSource = defaults.bool(forKey: "dualCaptureSource")
+        stereoWaveform = defaults.bool(forKey: "stereoWaveform")
     }
 
     private func unsignedSetting(_ key: String) -> UInt32? {
@@ -620,6 +688,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let waveform = WaveformView(frame: .zero)
         waveform.controller = self
         waveform.accentRGB = accentRGB
+        waveform.stereo = stereoWaveform
         let minimumWaveformHeight = waveform.heightAnchor.constraint(greaterThanOrEqualToConstant: fullWaveformMinimumHeight)
         minimumWaveformHeight.isActive = true
         waveformMinimumHeight = minimumWaveformHeight
@@ -636,11 +705,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         clearButton.bezelStyle = .rounded
         setIcon("trash", label: "清除目前錄音", on: clearButton)
         clearButton.toolTip = "清除目前錄音，保留已匯出的 WAV"
-        meterButton.target = self
-        meterButton.action = #selector(showMeterOptions(_:))
-        meterButton.bezelStyle = .rounded
-        meterButton.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        meterButton.widthAnchor.constraint(equalToConstant: 88).isActive = true
+        for (lane, button) in [meterButton, meterBButton].enumerated() {
+            button.tag = lane
+            button.target = self
+            button.action = #selector(showMeterOptions(_:))
+            button.bezelStyle = .rounded
+            button.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+            button.widthAnchor.constraint(equalToConstant: 100).isActive = true
+        }
+        meterBButton.isHidden = !dualSource
 
         pinButton.target = self
         pinButton.action = #selector(pinChanged(_:))
@@ -651,7 +724,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         setIcon("gearshape", label: "設定", on: settingsButton)
         let spacer = NSView(frame: .zero)
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let controls = NSStackView(views: [captureButton, captureLamp, clearButton, statusLabel, spacer, pinButton, meterButton, settingsButton])
+        let controls = NSStackView(views: [captureButton, captureLamp, clearButton, statusLabel, spacer, pinButton, meterButton, meterBButton, settingsButton])
         controls.orientation = .horizontal
         controls.spacing = 6
         controls.alignment = .centerY
@@ -719,6 +792,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         registerClick()
         let window = optionsPanel ?? makeOptionsPanel()
         optionsPanel = window
+        refreshSourceOptions()
         updateOptionsVisibility()
         updateLoginOption()
         updateStatus()
@@ -743,7 +817,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let tabs = NSTabView(frame: .zero)
         tabs.addTabViewItem(makeActionTab())
         tabs.addTabViewItem(makeCaptureTab())
+        tabs.addTabViewItem(makeSourceTab())
         tabs.addTabViewItem(makeAppearanceTab())
+        tabs.addTabViewItem(startupUpdater.makeOptionsTab())
         let notice = NSTextField(labelWithString: "")
         notice.textColor = .secondaryLabelColor
         notice.lineBreakMode = .byTruncatingMiddle
@@ -807,6 +883,134 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         ])
     }
 
+    private func makeSourceTab() -> NSTabViewItem {
+        let dual = NSButton(checkboxWithTitle: "同時錄製 A 與 B", target: self, action: #selector(dualSourceChanged(_:)))
+        dualSourceButton = dual
+        var rows: [NSView] = [dual]
+        for (index, configuration) in [laneA, laneB].enumerated() {
+            let label = index == 0 ? "A" : "B"
+            let source = NSPopUpButton(frame: .zero, pullsDown: false)
+            source.target = self
+            source.tag = index
+            source.action = #selector(captureSourceChanged(_:))
+            source.widthAnchor.constraint(lessThanOrEqualToConstant: 300).isActive = true
+            sourcePopups.append(source)
+            let route = choiceControl(
+                CaptureRoute.allCases.map { $0.rawValue }, selected: configuration.route.rawValue,
+                action: #selector(captureRouteChanged(_:))
+            ) { CaptureRoute(rawValue: $0)?.label ?? "" }
+            route.tag = index
+            route.autoenablesItems = false
+            routePopups.append(route)
+            rows.append(labeledOption("\(label) 擷取來源", source))
+            rows.append(labeledOption("\(label) 聲道路由", route))
+        }
+        let stereo = choiceControl(
+            [0, 1], selected: stereoWaveform ? 1 : 0, action: #selector(waveformModeChanged(_:))
+        ) { $0 == 0 ? "單聲道合併" : "雙聲道 L／R" }
+        waveformModePopup = stereo
+        rows.append(labeledOption("單一來源顯示", stereo))
+        return optionsTab("擷取來源", rows: rows)
+    }
+
+    private func refreshSourceOptions() {
+        guard sourcePopups.count == 2, routePopups.count == 2 else { return }
+        let choices = availableCaptureSources()
+        for (index, lane) in [laneA, laneB].enumerated() {
+            let source = sourcePopups[index]
+            source.removeAllItems()
+            var selectedIndex: Int?
+            var usedTitles = Set<String>()
+            for choice in choices {
+                let title = usedTitles.insert(choice.title).inserted ? choice.title : "\(choice.title) · \(choice.source.key)"
+                source.addItem(withTitle: title)
+                source.lastItem?.representedObject = choice.source.key
+                if lane.source == choice.source { selectedIndex = source.numberOfItems - 1 }
+            }
+            if selectedIndex == nil {
+                source.addItem(withTitle: "\(lane.source.label)（目前未連線）")
+                source.lastItem?.representedObject = lane.source.key
+                selectedIndex = source.numberOfItems - 1
+            }
+            if let selectedIndex { source.selectItem(at: selectedIndex) }
+            source.isEnabled = index == 0 || dualSource
+            let route = routePopups[index]
+            route.isEnabled = source.isEnabled
+            route.selectItem(withTag: Int(lane.route.rawValue))
+            for item in route.itemArray {
+                guard let raw = UInt32(exactly: item.tag), let selection = CaptureRoute(rawValue: raw) else { continue }
+                item.isEnabled = selection == lane.route || tap?.supports(selection, lane: index) == true
+                    || (tap == nil && selection != .center)
+            }
+        }
+        dualSourceButton?.state = dualSource ? .on : .off
+        waveformModePopup?.isEnabled = !dualSource
+        optionsMeterBPopup?.isEnabled = dualSource
+    }
+
+    @objc private func dualSourceChanged(_ sender: NSButton) {
+        guard !editing else { refreshSourceOptions(); return }
+        dualSource = sender.state == .on
+        defaults.set(dualSource, forKey: "dualCaptureSource")
+        reconnectConfiguredSources()
+    }
+
+    @objc private func captureSourceChanged(_ sender: NSPopUpButton) {
+        guard !editing, let key = sender.selectedItem?.representedObject as? String,
+              let source = CaptureSource(key: key) else { refreshSourceOptions(); return }
+        var lane = sender.tag == 0 ? laneA : laneB
+        guard lane.source != source else { return }
+        lane.source = source
+        lane.route = .merged
+        storeLane(lane, index: sender.tag)
+    }
+
+    @objc private func captureRouteChanged(_ sender: NSPopUpButton) {
+        guard !editing, let value = selectedValue(sender), let route = CaptureRoute(rawValue: value) else {
+            refreshSourceOptions()
+            return
+        }
+        var lane = sender.tag == 0 ? laneA : laneB
+        guard route != lane.route else { return }
+        lane.route = route
+        storeLane(lane, index: sender.tag)
+    }
+
+    private func storeLane(_ lane: CaptureLane, index: Int) {
+        let suffix = index == 0 ? "A" : "B"
+        if index == 0 { laneA = lane } else { laneB = lane }
+        defaults.set(lane.source.key, forKey: "captureSource\(suffix)")
+        defaults.set(Int(lane.route.rawValue), forKey: "captureRoute\(suffix)")
+        reconnectConfiguredSources()
+    }
+
+    private func reconnectConfiguredSources() {
+        let wasRunning = !paused
+        if wasRunning { pauseCapture() }
+        tap = nil
+        waveform?.resetTimeline()
+        notice = nil
+        captureError = nil
+        registerClick()
+        if wasRunning {
+            resume()
+        } else {
+            do { tap = try SystemAudioTap(history: history, lanes: captureLanes) }
+            catch { captureError = error.localizedDescription }
+        }
+        refreshWaveform()
+        refreshSourceOptions()
+        updateStatus()
+    }
+
+    @objc private func waveformModeChanged(_ sender: NSPopUpButton) {
+        guard let value = selectedValue(sender) else { return }
+        stereoWaveform = value == 1
+        defaults.set(stereoWaveform, forKey: "stereoWaveform")
+        waveform?.stereo = stereoWaveform
+        refreshWaveform()
+    }
+
     private func makeAppearanceTab() -> NSTabViewItem {
         let waveform = NSButton(checkboxWithTitle: "只顯示波形", target: self, action: #selector(toggleWaveformOnly))
         waveform.state = waveformOnly ? .on : .off
@@ -820,6 +1024,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             MeterMode.allCases.map(\.rawValue), selected: meterMode.rawValue, action: #selector(meterChanged(_:))
         ) { MeterMode(rawValue: $0)?.label ?? "" }
         optionsMeterPopup = meter
+        let meterB = choiceControl(
+            MeterMode.allCases.map(\.rawValue), selected: meterModeB.rawValue, action: #selector(meterChanged(_:))
+        ) { MeterMode(rawValue: $0)?.label ?? "" }
+        meterB.tag = 1
+        optionsMeterBPopup = meterB
         let accent = NSButton(title: "選擇…", target: self, action: #selector(chooseAccentColor))
         return optionsTab("外觀與系統", rows: [
             optionChoice(
@@ -827,7 +1036,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 action: #selector(transparencyChanged(_:))
             ) { "\($0)%" },
             labeledOption("主題色", accent),
-            labeledOption("電平顯示", meter),
+            labeledOption("A 電平顯示", meter),
+            labeledOption("B 電平顯示", meterB),
             controlRow(waveform, pin),
             login
         ])
@@ -915,16 +1125,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     @objc private func showMeterOptions(_ sender: NSButton) {
-        showMenu(meterMenu(), below: sender)
+        showMenu(meterMenu(lane: sender.tag), below: sender)
     }
 
-    private func meterMenu() -> NSMenu {
+    private func meterMenu(lane: Int) -> NSMenu {
         let menu = NSMenu(title: "電平顯示")
         for mode in MeterMode.allCases {
             let item = NSMenuItem(title: mode.label, action: #selector(meterChanged(_:)), keyEquivalent: "")
             item.tag = Int(mode.rawValue)
             item.target = self
-            item.state = mode == meterMode ? .on : .off
+            item.representedObject = lane
+            item.state = mode == (lane == 0 ? meterMode : meterModeB) ? .on : .off
             menu.addItem(item)
         }
         return menu
@@ -1018,7 +1229,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     @objc private func historyChanged(_ sender: NSPopUpButton) {
         guard let selected = selectedValue(sender), timeChoices.contains(selected) else { return }
         registerClick()
-        if let core = tap?.core, bt_set_history(core, selected) != 1 {
+        if let core = tap?.core, bt_tracks_set_history(core, selected) != 1 {
             sender.selectItem(withTag: Int(history))
             setNotice("無法調整保留時間")
             return
@@ -1057,9 +1268,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     @objc private func meterChanged(_ sender: Any) {
         let tag = (sender as? NSPopUpButton)?.selectedItem?.tag ?? (sender as? NSMenuItem)?.tag
         guard let tag, let raw = UInt32(exactly: tag), let mode = MeterMode(rawValue: raw) else { return }
-        meterMode = mode
-        defaults.set(Int(raw), forKey: "meterMode")
-        optionsMeterPopup?.selectItem(withTag: tag)
+        let lane = (sender as? NSPopUpButton)?.tag ?? ((sender as? NSMenuItem)?.representedObject as? Int) ?? 0
+        if lane == 0 {
+            meterMode = mode
+            defaults.set(Int(raw), forKey: "meterMode")
+            optionsMeterPopup?.selectItem(withTag: tag)
+        } else {
+            meterModeB = mode
+            defaults.set(Int(raw), forKey: "meterModeB")
+            optionsMeterBPopup?.selectItem(withTag: tag)
+        }
         registerClick()
         updateMeter()
     }
@@ -1085,16 +1303,21 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func updateMeter() {
+        meterBButton.isHidden = !dualSource
         let core = tap?.core
-        let reading = core.map { meterMode.value(from: bt_meter_readings($0)) } ?? -Float.infinity
-        let value = reading.isFinite ? String(format: "%.1f", Double(reading)) : "—"
-        let title = "\(value) \(meterMode.label)"
-        if meterButton.title != title || meterButton.toolTip == nil {
-            meterButton.title = title
-            meterButton.setAccessibilityLabel("\(title)，點擊切換單位")
+        for (lane, item) in [(meterButton, meterMode), (meterBButton, meterModeB)].enumerated() {
+            let (button, mode) = item
+            let reading = core.map { mode.value(from: bt_tracks_meter_readings($0, UInt32(lane))) } ?? -Float.infinity
+            let value = reading.isFinite ? String(format: "%.1f", Double(reading)) : "—"
+            let prefix = dualSource ? (lane == 0 ? "A " : "B ") : ""
+            let title = "\(prefix)\(value) \(mode.label)"
+            if button.title != title || button.toolTip == nil {
+                button.title = title
+                button.setAccessibilityLabel("\(title)，點擊切換單位")
+            }
+            let detail = "\(prefix)\(mode.detail) · 點擊切換單位"
+            if button.toolTip != detail { button.toolTip = detail }
         }
-        let detail = "\(meterMode.detail) · 點擊切換單位"
-        if meterButton.toolTip != detail { meterButton.toolTip = detail }
     }
 
     @objc private func pinChanged(_ sender: NSButton) {
@@ -1267,8 +1490,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     @objc private func clearCapture() {
         guard !editing, let core = tap?.core else { return }
         registerClick()
-        bt_clear(core)
-        waveform?.clearSelection()
+        bt_tracks_clear(core)
+        waveform?.resetTimeline()
         refreshWaveform()
         notice = nil
         updateStatus()
@@ -1296,8 +1519,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard paused, !editing else { return }
         do {
             if tap == nil {
-                tap = try SystemAudioTap(history: history)
+                tap = try SystemAudioTap(history: history, lanes: captureLanes)
             }
+            requestMicrophonePermissionIfNeeded()
             try tap?.resume()
             if clearingSelection { waveform?.clearSelection() }
             paused = false
@@ -1312,11 +1536,28 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         updateStatus()
     }
 
+    private func requestMicrophonePermissionIfNeeded() {
+        guard !microphonePromptPending, captureLanes.contains(where: { $0.source.isMicrophone }),
+              SystemAudioTap.requiresMicrophonePrompt else { return }
+        microphonePromptPending = true
+        SystemAudioTap.requestMicrophonePermission { [weak self] in
+            DispatchQueue.main.async {
+                self?.microphonePromptPending = false
+                self?.lastSourceCheck = 0
+            }
+        }
+    }
+
     @objc private func tick(_: Timer) {
         let panelVisible = panel?.isVisible == true
         if panelVisible { waveform?.refreshHintModifiers() }
+        let now = ProcessInfo.processInfo.systemUptime
+        if !paused, !editing, now - lastSourceCheck >= 1 {
+            lastSourceCheck = now
+            if tap?.refreshSources() == true { reconnectConfiguredSources() }
+        }
         if let core = tap?.core, !paused {
-            bt_poll(core)
+            bt_tracks_poll(core)
             if panelVisible { refreshWaveform() }
         }
         if paused && !editing && tap != nil && idleSeconds > 0 &&
@@ -1328,8 +1569,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     func refreshWaveform() {
-        guard let waveform, let tap, let core = tap.core else { return }
-        waveform.refresh(core: core, sampleRate: tap.sampleRate)
+        guard let waveform, let tap else { return }
+        waveform.refresh(core: tap.core, laneCount: tap.laneCount)
     }
 
     private func updateStatus() {
@@ -1338,7 +1579,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             state = .unavailable
         } else if paused {
             state = .paused
-        } else if let core = tap?.core, bt_state(core) == 1 {
+        } else if let core = tap?.core, bt_tracks_state(core) == 1 {
             state = .recording
         } else {
             state = .waiting
@@ -1366,7 +1607,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             detail += " · \(remaining) 秒後續錄"
         }
         captureLamp.update(state, now: now, detail: detail)
-        let message = notice ?? captureError ?? ""
+        let message = notice ?? captureError ?? tap?.sourceMessage ?? ""
         if let optionsNotice, optionsNotice.stringValue != message {
             optionsNotice.stringValue = message
             optionsNotice.toolTip = message.isEmpty ? nil : message
@@ -1390,10 +1631,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func captureSnapshot() -> WAVExport? {
-        guard let core = tap?.core else { return nil }
-        if !paused { bt_poll(core) }
-        guard let snapshot = bt_snapshot(core) else { return nil }
-        return WAVExport(snapshot)
+        guard let tap else { return nil }
+        if !paused { bt_tracks_poll(tap.core) }
+        return WAVExport(core: tap.core, laneCount: tap.laneCount)
     }
 
     @objc private func saveCurrentSnapshot() {
@@ -1403,48 +1643,49 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             setNotice("還沒有可保存的錄音")
             return
         }
+        let range = selected?.range ?? job.span
+        let ticket = waveform?.reserveMarker()
         if paused {
             resume()
         } else if selected != nil {
             waveform?.clearSelection()
             refreshWaveform()
         }
-        writeExport(job, range: selected?.range ?? 0...1, directory: directory(for: .saved), provisional: false) { _ in
-            true
+        writeExport(job, range: range, directory: directory(for: .saved), provisional: false) { [weak self] urls in
+            if !urls.isEmpty, let ticket { self?.waveform?.commitMarker(range, ticket: ticket) }
+            return true
         }
     }
 
     func prepareDrag(
-        _ range: ClosedRange<Double>, snapshot: WAVExport?, completion: @escaping (URL?) -> Bool
-    ) -> DispatchWorkItem? {
-        guard let job = snapshot ?? frozenExport() else {
-            if completion(nil) { setNotice("還沒有可匯出的錄音") }
-            return nil
-        }
-        return writeExport(job, range: range, directory: directory(for: .output), provisional: true, completion: completion)
+        _ job: WAVExport, range: Range<UInt64>, completion: @escaping ([URL]) -> Bool
+    ) -> DispatchWorkItem {
+        writeExport(job, range: range, directory: directory(for: .output), provisional: true, completion: completion)
     }
 
     @discardableResult
     private func writeExport(
-        _ job: WAVExport, range: ClosedRange<Double>, directory: String,
-        provisional: Bool, completion: @escaping (URL?) -> Bool
+        _ job: WAVExport, range: Range<UInt64>, directory: String,
+        provisional: Bool, completion: @escaping ([URL]) -> Bool
     ) -> DispatchWorkItem {
         let sampleRate = exportSampleRate
         let bitsPerSample = exportBitsPerSample
         setNotice(provisional ? "正在準備拖放…" : "正在寫入 WAV…")
         let write = DispatchWorkItem { @Sendable [weak self, worker, pendingProvisionalWAVs] in
-            let url = job.write(range: range, directory: directory, sampleRate: sampleRate, bitsPerSample: bitsPerSample)
-            if provisional, let url { pendingProvisionalWAVs.urls.insert(url) }
+            let urls = job.write(range: range, directory: directory, sampleRate: sampleRate, bitsPerSample: bitsPerSample)
+            if provisional { pendingProvisionalWAVs.urls.formUnion(urls) }
             DispatchQueue.main.async {
-                if provisional, let url {
-                    worker.async { _ = pendingProvisionalWAVs.urls.remove(url) }
+                if provisional {
+                    worker.async { pendingProvisionalWAVs.urls.subtract(urls) }
                 }
-                guard completion(url) else {
-                    if provisional, let url { try? FileManager.default.removeItem(at: url) }
+                guard completion(urls) else {
+                    if provisional {
+                        for url in urls { try? FileManager.default.removeItem(at: url) }
+                    }
                     return
                 }
-                if let url {
-                    self?.setNotice(provisional ? nil : "已存入 \(url.lastPathComponent)")
+                if let first = urls.first {
+                    self?.setNotice(provisional ? nil : (urls.count == 2 ? "已存入 A／B WAV" : "已存入 \(first.lastPathComponent)"))
                 } else {
                     self?.setNotice("無法匯出 WAV，請確認有錄音及資料夾寫入權限")
                 }
@@ -1453,6 +1694,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         worker.async(execute: write)
         return write
     }
+
 }
 
 private final class WaveformView: NSView, NSDraggingSource {
@@ -1460,15 +1702,35 @@ private final class WaveformView: NSView, NSDraggingSource {
     var showsOverlay = true { didSet { needsDisplay = true } }
     var maximumTraceHeight: CGFloat? { didSet { needsDisplay = true } }
     var accentRGB = defaultAccentRGB { didSet { needsDisplay = true } }
-    private var low = [Float](repeating: 0, count: 256)
-    private var high = [Float](repeating: 0, count: 256)
-    private var frames: UInt64 = 0
-    private var sampleRate = 0.0
+    var stereo = false {
+        didSet { if stereo != oldValue { revision = nil } }
+    }
+
+    private struct Trace {
+        var low = [Float](repeating: 0, count: 256)
+        var high = [Float](repeating: 0, count: 256)
+
+        mutating func refresh(core: OpaquePointer, lane: UInt32, channel: UInt32) {
+            let bins = UInt32(low.count)
+            low.withUnsafeMutableBufferPointer { minimum in
+                high.withUnsafeMutableBufferPointer { maximum in
+                    _ = bt_tracks_waveform(core, lane, channel, minimum.baseAddress!, maximum.baseAddress!, bins)
+                }
+            }
+        }
+    }
+
+    private var traces = [Trace(), Trace()]
+    private var traceCount = 1
+    private var visibleFrames: Range<UInt64> = 0..<0
     private var revision: UInt64?
-    private var selection: ClosedRange<Double>?
+    private var selection: Range<UInt64>?
     private var selectedSnapshot: WAVExport?
-    private var exportRange: ClosedRange<Double> { selection ?? 0...1 }
-    private var anchor: Double?
+    private var marker: Range<UInt64>?
+    private var markerRevision: UInt64 = 0
+    private var committedMarkerRevision: UInt64 = 0
+    private var pendingDragMarker: (range: Range<UInt64>, ticket: UInt64)?
+    private var anchor: UInt64?
     private var pointer: NSPoint?
     private var pointerModifiers: NSEvent.ModifierFlags = []
     private var selectionModifierDown: Bool { !pointerModifiers.intersection([.option, .control]).isEmpty }
@@ -1477,7 +1739,7 @@ private final class WaveformView: NSView, NSDraggingSource {
     private var dragRequested = false
     private var pendingDragWrite: DispatchWorkItem?
     private var dragging = false
-    private var readyFile: URL?
+    private var readyFiles: [URL] = []
     private var exportVersion: UInt64 = 0
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -1496,18 +1758,24 @@ private final class WaveformView: NSView, NSDraggingSource {
         pointerArea = area
     }
 
-    func refresh(core: OpaquePointer, sampleRate: Double) {
-        // Keep the selection preview aligned with the retained snapshot while capture continues.
-        guard selectedSnapshot == nil else { return }
-        let currentRevision = bt_revision(core)
-        guard currentRevision != revision || sampleRate != self.sampleRate else { return }
+    func refresh(core: OpaquePointer, laneCount: Int) {
+        let currentRevision = bt_tracks_revision(core)
+        guard currentRevision != revision else { return }
         revision = currentRevision
-        self.sampleRate = sampleRate
-        let bins = UInt32(low.count)
-        frames = low.withUnsafeMutableBufferPointer { minimum in
-            high.withUnsafeMutableBufferPointer { maximum in
-                bt_waveform(core, minimum.baseAddress!, maximum.baseAddress!, bins)
-            }
+        let start = bt_tracks_first_frame(core)
+        let end = bt_tracks_end_frame(core)
+        visibleFrames = start..<max(start, end)
+        if laneCount == 2 {
+            traceCount = 2
+            traces[0].refresh(core: core, lane: 0, channel: 0)
+            traces[1].refresh(core: core, lane: 1, channel: 0)
+        } else if stereo && bt_tracks_channels(core, 0) == 2 {
+            traceCount = 2
+            traces[0].refresh(core: core, lane: 0, channel: 1)
+            traces[1].refresh(core: core, lane: 0, channel: 2)
+        } else {
+            traceCount = 1
+            traces[0].refresh(core: core, lane: 0, channel: 0)
         }
         needsDisplay = true
     }
@@ -1519,7 +1787,29 @@ private final class WaveformView: NSView, NSDraggingSource {
         needsDisplay = true
     }
 
-    func selectionForSaving() -> (range: ClosedRange<Double>, snapshot: WAVExport)? {
+    func resetTimeline() {
+        clearSelection()
+        anchor = nil
+        mouseDownEvent = nil
+        visibleFrames = 0..<0
+        revision = nil
+        marker = nil
+        committedMarkerRevision = reserveMarker()
+    }
+
+    func reserveMarker() -> UInt64 {
+        markerRevision &+= 1
+        return markerRevision
+    }
+
+    func commitMarker(_ range: Range<UInt64>, ticket: UInt64) {
+        guard ticket > committedMarkerRevision, !range.isEmpty else { return }
+        committedMarkerRevision = ticket
+        marker = range
+        needsDisplay = true
+    }
+
+    func selectionForSaving() -> (range: Range<UInt64>, snapshot: WAVExport)? {
         guard let selection, let selectedSnapshot else { return nil }
         return (selection, selectedSnapshot)
     }
@@ -1547,21 +1837,42 @@ private final class WaveformView: NSView, NSDraggingSource {
     func discardPreparedFile() {
         pendingDragWrite?.cancel()
         pendingDragWrite = nil
-        if let readyFile { try? FileManager.default.removeItem(at: readyFile) }
-        readyFile = nil
+        for file in readyFiles { try? FileManager.default.removeItem(at: file) }
+        readyFiles.removeAll()
+        pendingDragMarker = nil
         dragRequested = false
         exportVersion &+= 1
         needsDisplay = true
     }
 
-    private func normalized(_ event: NSEvent) -> Double {
+    private func x(for frame: UInt64) -> CGFloat {
+        let fraction = Double(frame - visibleFrames.lowerBound)
+            / Double(max(1, visibleFrames.upperBound - visibleFrames.lowerBound))
+        return bounds.minX + bounds.width * CGFloat(fraction)
+    }
+
+    private func isVisible(_ frame: UInt64) -> Bool {
+        !visibleFrames.isEmpty && frame >= visibleFrames.lowerBound && frame <= visibleFrames.upperBound
+    }
+
+    private func snapTarget(near position: CGFloat) -> UInt64? {
+        guard let marker else { return nil }
+        let candidates = [marker.lowerBound, marker.upperBound].filter(isVisible)
+        return candidates.min(by: { abs(x(for: $0) - position) < abs(x(for: $1) - position) })
+            .flatMap { abs(x(for: $0) - position) <= 8 ? $0 : nil }
+    }
+
+    private func frame(at event: NSEvent) -> UInt64 {
         let position = convert(event.locationInWindow, from: nil).x
-        return Double(min(1, max(0, (position - bounds.minX) / max(1, bounds.width))))
+        if event.modifierFlags.contains(.shift), let snapped = snapTarget(near: position) { return snapped }
+        let fraction = Double(min(1, max(0, (position - bounds.minX) / max(1, bounds.width))))
+        let count = visibleFrames.upperBound - visibleFrames.lowerBound
+        return visibleFrames.lowerBound + UInt64((fraction * Double(count)).rounded())
     }
 
     func refreshHintModifiers() {
         guard pointer != nil, anchor == nil, mouseDownEvent == nil, !dragging else { return }
-        let current = NSEvent.modifierFlags.intersection([.option, .control, .command])
+        let current = NSEvent.modifierFlags.intersection([.option, .control, .command, .shift])
         guard current != pointerModifiers else { return }
         pointerModifiers = current
         needsDisplay = true
@@ -1570,7 +1881,7 @@ private final class WaveformView: NSView, NSDraggingSource {
     private func trackPointer(_ event: NSEvent) {
         let position = convert(event.locationInWindow, from: nil)
         pointer = bounds.contains(position) ? position : nil
-        pointerModifiers = event.modifierFlags.intersection([.option, .control, .command])
+        pointerModifiers = event.modifierFlags.intersection([.option, .control, .command, .shift])
         needsDisplay = true
     }
 
@@ -1602,8 +1913,8 @@ private final class WaveformView: NSView, NSDraggingSource {
             window?.makeKey()
             window?.makeFirstResponder(self)
             controller.refreshWaveform()
-            anchor = normalized(event)
-            selection = anchor.map { $0...$0 }
+            anchor = frame(at: event)
+            selection = anchor.map { $0..<$0 }
             needsDisplay = true
             return
         }
@@ -1618,8 +1929,8 @@ private final class WaveformView: NSView, NSDraggingSource {
     override func mouseDragged(with event: NSEvent) {
         trackPointer(event)
         if let anchor {
-            let position = normalized(event)
-            selection = min(anchor, position)...max(anchor, position)
+            let position = frame(at: event)
+            selection = min(anchor, position)..<max(anchor, position)
             needsDisplay = true
         } else if !dragging, let window, let mouseDownEvent {
             let start = mouseDownEvent.locationInWindow
@@ -1648,10 +1959,10 @@ private final class WaveformView: NSView, NSDraggingSource {
         if anchor != nil {
             mouseDragged(with: event)
             anchor = nil
-            if let selection, selection.upperBound - selection.lowerBound > 0.001 {
-                if frames != 0 { selectedSnapshot = controller?.frozenExport() }
-                keepSelection = selectedSnapshot != nil
-                if !keepSelection { clearSelection() }
+            if let selection, !selection.isEmpty, let snapshot = controller?.frozenExport() {
+                selectedSnapshot = snapshot
+                keepSelection = true
+                commitMarker(selection, ticket: reserveMarker())
             } else {
                 clearSelection()
             }
@@ -1673,10 +1984,15 @@ private final class WaveformView: NSView, NSDraggingSource {
 
     private func prepareDrag() {
         dragRequested = true
+        guard let controller, let job = selectedSnapshot ?? controller.frozenExport() else {
+            controller?.setNotice("還沒有可匯出的錄音")
+            return
+        }
         let version = exportVersion
-        // File-URL drops need a real path for DAWs that reference the exported WAV in place.
-        // Only prepare it once the pointer has left Backtracking, and retain it on acceptance.
-        pendingDragWrite = controller?.prepareDrag(exportRange, snapshot: selectedSnapshot) { [weak self] url in
+        let range = selection ?? job.span
+        let ticket = reserveMarker()
+        // DAWs can keep the file URLs after the external drop. Treat both paths as one take.
+        pendingDragWrite = controller.prepareDrag(job, range: range) { [weak self] urls in
             guard let self, self.exportVersion == version else { return false }
             self.pendingDragWrite = nil
             guard let event = self.mouseDownEvent, NSEvent.pressedMouseButtons & 1 != 0,
@@ -1685,19 +2001,28 @@ private final class WaveformView: NSView, NSDraggingSource {
                 self.controller?.setNotice(nil)
                 return false
             }
-            if let url { self.beginFileDrag(url, event: event) }
+            if !urls.isEmpty {
+                self.pendingDragMarker = (range, ticket)
+                self.beginFileDrag(urls, event: event)
+            }
             return true
         }
     }
 
-    private func beginFileDrag(_ url: URL, event: NSEvent) {
-        readyFile = url
+    private func beginFileDrag(_ urls: [URL], event: NSEvent) {
+        readyFiles = urls
         dragging = true
-        let item = NSDraggingItem(pasteboardWriter: url as NSURL)
-        let icon = NSWorkspace.shared.icon(forFile: url.path)
         let point = convert(event.locationInWindow, from: nil)
-        item.setDraggingFrame(NSRect(x: point.x - 16, y: point.y - 16, width: 32, height: 32), contents: icon)
-        let session = beginDraggingSession(with: [item], event: event, source: self)
+        let items = urls.enumerated().map { index, url in
+            let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+            let icon = NSWorkspace.shared.icon(forFile: url.path)
+            let offset = CGFloat(index) * 6
+            item.setDraggingFrame(
+                NSRect(x: point.x - 16 + offset, y: point.y - 16 - offset, width: 32, height: 32), contents: icon
+            )
+            return item
+        }
+        let session = beginDraggingSession(with: items, event: event, source: self)
         session.animatesToStartingPositionsOnCancelOrFail = true
     }
 
@@ -1717,8 +2042,11 @@ private final class WaveformView: NSView, NSDraggingSource {
         mouseDownEvent = nil
         trackDragPointer()
         let accepted = operation.contains(.copy)
-        if accepted { readyFile = nil }
-        else { discardPreparedFile() }
+        if accepted {
+            readyFiles.removeAll()
+            if let pendingDragMarker { commitMarker(pendingDragMarker.range, ticket: pendingDragMarker.ticket) }
+            pendingDragMarker = nil
+        } else { discardPreparedFile() }
         endGesture(keepingSelection: !accepted && selectedSnapshot != nil)
     }
 
@@ -1733,7 +2061,7 @@ private final class WaveformView: NSView, NSDraggingSource {
     }
 
     private func drawActionHint() {
-        guard showsOverlay, frames != 0, let pointer, bounds.contains(pointer) else { return }
+        guard showsOverlay, !visibleFrames.isEmpty, let pointer, bounds.contains(pointer) else { return }
         if anchor == nil && mouseDownEvent == nil && !dragging && movesFromWaveform(pointerModifiers) { return }
         let action: String
         if anchor != nil {
@@ -1782,11 +2110,61 @@ private final class WaveformView: NSView, NSDraggingSource {
         label.draw(at: NSPoint(x: rect.minX + 7, y: rect.minY + 4))
     }
 
-    private func waveformRect(for range: ClosedRange<Double>) -> NSRect {
-        NSRect(
-            x: bounds.minX + bounds.width * CGFloat(range.lowerBound), y: bounds.minY,
-            width: bounds.width * CGFloat(range.upperBound - range.lowerBound), height: bounds.height
-        )
+    private func waveformRect(for range: Range<UInt64>) -> NSRect? {
+        let first = max(range.lowerBound, visibleFrames.lowerBound)
+        let end = min(range.upperBound, visibleFrames.upperBound)
+        guard first < end else { return nil }
+        return NSRect(x: x(for: first), y: bounds.minY, width: x(for: end) - x(for: first), height: bounds.height)
+    }
+
+    private func drawFlag(_ frame: UInt64, pointsRight: Bool) {
+        guard isVisible(frame) else { return }
+        let lineX = min(bounds.maxX - 1.5, max(bounds.minX + 1.5, x(for: frame)))
+        let top = bounds.maxY - 3
+        let flagWidth: CGFloat = pointsRight ? 6 : -6
+        let shape = NSBezierPath()
+        shape.move(to: NSPoint(x: lineX, y: top - 11))
+        shape.line(to: NSPoint(x: lineX, y: top))
+        shape.lineWidth = 1.5
+        let snapped = pointerModifiers.contains(.shift) && pointer.flatMap { snapTarget(near: $0.x) } == frame
+        let color = snapped ? NSColor.systemYellow : NSColor.white.withAlphaComponent(0.9)
+        color.setStroke()
+        shape.stroke()
+
+        let flag = NSBezierPath()
+        flag.move(to: NSPoint(x: lineX, y: top))
+        flag.line(to: NSPoint(x: lineX + flagWidth, y: top - 2.5))
+        flag.line(to: NSPoint(x: lineX, y: top - 5))
+        flag.close()
+        color.setFill()
+        flag.fill()
+    }
+
+    private func tracePath() -> NSBezierPath {
+        let trace = NSBezierPath()
+        let totalHeight = min(bounds.height, maximumTraceHeight ?? bounds.height)
+        let rowHeight = totalHeight / CGFloat(traceCount)
+        let step = bounds.width / CGFloat(traces[0].low.count)
+        for lane in 0..<traceCount {
+            let middle = bounds.midY + totalHeight / 2 - (CGFloat(lane) + 0.5) * rowHeight
+            if showsOverlay {
+                NSColor.white.withAlphaComponent(0.17).setStroke()
+                NSBezierPath.strokeLine(
+                    from: NSPoint(x: bounds.minX, y: middle), to: NSPoint(x: bounds.maxX, y: middle)
+                )
+            }
+            if visibleFrames.isEmpty { continue }
+            let bins = traces[lane]
+            for index in bins.low.indices {
+                let x = bounds.minX + (CGFloat(index) + 0.5) * step
+                let bottom = middle + CGFloat(max(-1, min(1, bins.low[index]))) * rowHeight * 0.46
+                let top = middle + CGFloat(max(-1, min(1, bins.high[index]))) * rowHeight * 0.46
+                trace.move(to: NSPoint(x: x, y: bottom))
+                trace.line(to: NSPoint(x: x, y: max(top, bottom + 0.7)))
+            }
+        }
+        trace.lineWidth = max(1, step * 0.75)
+        return trace
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -1794,66 +2172,34 @@ private final class WaveformView: NSView, NSDraggingSource {
         let panel = NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6)
         NSGraphicsContext.saveGraphicsState()
         panel.addClip()
-        let middle = bounds.midY
-        let height = min(bounds.height, maximumTraceHeight ?? bounds.height) * 0.46
-        let preview = selection != nil || pointer != nil || mouseDownEvent != nil || dragging ? exportRange : nil
-        let selectedRect = selection.map { waveformRect(for: $0) }
-        if showsOverlay, let preview, selectedRect == nil, frames != 0 {
+        if showsOverlay, selection == nil, !visibleFrames.isEmpty,
+           pointer != nil || mouseDownEvent != nil || dragging {
             accentColor(accentRGB).withAlphaComponent(0.23).setFill()
-            NSBezierPath.fill(waveformRect(for: preview))
+            NSBezierPath.fill(bounds)
         }
 
-        if showsOverlay {
-            NSColor.white.withAlphaComponent(0.17).setStroke()
-            NSBezierPath.strokeLine(from: NSPoint(x: 0, y: middle), to: NSPoint(x: bounds.width, y: middle))
-        }
+        let trace = tracePath()
+        accentColor(accentRGB).setStroke()
+        if let selectedRect = selection.flatMap(waveformRect(for:)) {
+            let outside = NSBezierPath(rect: bounds)
+            outside.append(NSBezierPath(rect: selectedRect))
+            outside.windingRule = .evenOdd
+            NSGraphicsContext.saveGraphicsState()
+            outside.addClip()
+            trace.stroke()
+            NSGraphicsContext.restoreGraphicsState()
 
-        if frames != 0 {
-            let trace = NSBezierPath()
-            let step = bounds.width / CGFloat(low.count)
-            for index in low.indices {
-                let x = (CGFloat(index) + 0.5) * step
-                let bottom = middle + CGFloat(max(-1, min(1, low[index]))) * height
-                let top = middle + CGFloat(max(-1, min(1, high[index]))) * height
-                trace.move(to: NSPoint(x: x, y: bottom))
-                trace.line(to: NSPoint(x: x, y: max(top, bottom + 0.7)))
-            }
-            accentColor(accentRGB).setStroke()
-            trace.lineWidth = max(1, step * 0.75)
-            if let selectedRect, !selectedRect.isEmpty {
-                let outside = NSBezierPath(rect: bounds)
-                outside.append(NSBezierPath(rect: selectedRect))
-                outside.windingRule = .evenOdd
-                NSGraphicsContext.saveGraphicsState()
-                outside.addClip()
-                trace.stroke()
-                NSGraphicsContext.restoreGraphicsState()
-
-                NSGraphicsContext.saveGraphicsState()
-                NSBezierPath(rect: selectedRect).addClip()
-                accentColor(accentRGB ^ 0xFFFFFF).setStroke()
-                trace.stroke()
-                NSGraphicsContext.restoreGraphicsState()
-            } else {
-                trace.stroke()
-            }
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: selectedRect).addClip()
+            accentColor(accentRGB ^ 0xFFFFFF).setStroke()
+            trace.stroke()
+            NSGraphicsContext.restoreGraphicsState()
+        } else {
+            trace.stroke()
         }
-        if showsOverlay, let pointer, anchor != nil || (selectionModifierDown && !movesFromWaveform(pointerModifiers)) {
-            NSColor.white.withAlphaComponent(0.4).setStroke()
-            NSBezierPath.strokeLine(
-                from: NSPoint(x: pointer.x, y: bounds.minY),
-                to: NSPoint(x: pointer.x, y: bounds.maxY)
-            )
-        }
-        if showsOverlay, let preview, frames != 0, sampleRate > 0 {
-            let seconds = Double(frames) / sampleRate * (preview.upperBound - preview.lowerBound)
-            let label = NSAttributedString(string: String(format: "%.2f 秒", seconds), attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium),
-                .foregroundColor: NSColor.white
-            ])
-            let size = label.size()
-            let origin = NSPoint(x: bounds.maxX - size.width - 7, y: bounds.maxY - size.height - 4)
-            label.draw(at: origin)
+        if let marker {
+            drawFlag(marker.lowerBound, pointsRight: true)
+            drawFlag(marker.upperBound, pointsRight: false)
         }
         drawActionHint()
         NSGraphicsContext.restoreGraphicsState()

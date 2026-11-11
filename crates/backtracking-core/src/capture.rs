@@ -2,6 +2,7 @@ use std::time::Instant;
 use std::{error::Error, fmt, ops::Range};
 
 use crate::meter::{Meter, MeterReadings};
+use crate::waveform::WaveformView;
 
 const OPEN_LEVEL: f32 = 0.001;
 const CLOSE_LEVEL: f32 = 0.000_5;
@@ -80,11 +81,17 @@ pub struct Snapshot {
     pub sample_rate: u32,
     pub channels: usize,
     pub samples: Vec<f32>,
+    /// The first frame's index on the retained-audio timeline.
+    pub first_frame: u64,
 }
 
 impl Snapshot {
     pub fn frame_count(&self) -> usize {
         self.samples.len().checked_div(self.channels).unwrap_or(0)
+    }
+
+    pub fn frame_range(&self) -> Range<u64> {
+        self.first_frame..self.first_frame.saturating_add(self.frame_count() as u64)
     }
 
     pub fn frames(&self, range: Range<usize>) -> Option<&[f32]> {
@@ -100,6 +107,7 @@ impl Snapshot {
 pub struct Capture {
     sample_rate: u32,
     channels: usize,
+    a_channels: usize,
     retention_frames: usize,
     history: FrameRing,
     pre_roll: FrameRing,
@@ -108,6 +116,7 @@ pub struct Capture {
     state: CaptureState,
     revision: u64,
     meter: Meter,
+    meter_b: Option<Meter>,
 }
 
 impl Capture {
@@ -116,12 +125,37 @@ impl Capture {
         channels: usize,
         retention: DurationChoice,
     ) -> Result<Self, CaptureError> {
+        Self::build(sample_rate, channels, None, retention)
+    }
+
+    /// Creates a shared history for one or two independently metered mono/stereo lanes.
+    pub fn new_tracks(
+        sample_rate: u32,
+        a_channels: usize,
+        b_channels: Option<usize>,
+        retention: DurationChoice,
+    ) -> Result<Self, CaptureError> {
+        if !(1..=2).contains(&a_channels)
+            || b_channels.is_some_and(|channels| !(1..=2).contains(&channels))
+        {
+            return Err(CaptureError::InvalidChannelCount);
+        }
+        Self::build(sample_rate, a_channels, b_channels, retention)
+    }
+
+    fn build(
+        sample_rate: u32,
+        a_channels: usize,
+        b_channels: Option<usize>,
+        retention: DurationChoice,
+    ) -> Result<Self, CaptureError> {
         if sample_rate == 0 {
             return Err(CaptureError::InvalidSampleRate);
         }
-        if channels == 0 {
+        if a_channels == 0 {
             return Err(CaptureError::InvalidChannelCount);
         }
+        let channels = a_channels + b_channels.unwrap_or(0);
 
         let capacity_frames = usize::try_from(
             u64::from(sample_rate) * u64::from(DurationChoice::Seconds60.seconds()),
@@ -132,6 +166,7 @@ impl Capture {
         Ok(Self {
             sample_rate,
             channels,
+            a_channels,
             retention_frames: sample_rate as usize * retention.seconds() as usize,
             history: FrameRing::new(capacity_frames, channels)?,
             pre_roll: FrameRing::new(frames_for_ms(PRE_ROLL_MS), channels)?,
@@ -139,7 +174,10 @@ impl Capture {
             quiet_frames: 0,
             state: CaptureState::Waiting,
             revision: 0,
-            meter: Meter::new(sample_rate, channels)?,
+            meter: Meter::new(sample_rate, a_channels)?,
+            meter_b: b_channels
+                .map(|channels| Meter::new(sample_rate, channels))
+                .transpose()?,
         })
     }
 
@@ -152,10 +190,18 @@ impl Capture {
             return Ok(());
         }
 
-        self.meter.begin_block(Instant::now());
+        let now = Instant::now();
+        self.meter.begin_block(now);
+        if let Some(meter) = &mut self.meter_b {
+            meter.begin_block(now);
+        }
         let mut changed = false;
         for frame in frames {
-            let peak = self.meter.push_frame(frame);
+            let (a, b) = frame.split_at(self.a_channels);
+            let mut peak = self.meter.push_frame(a);
+            if let Some(meter) = &mut self.meter_b {
+                peak = peak.max(meter.push_frame(b));
+            }
 
             if self.state == CaptureState::Waiting {
                 if peak < OPEN_LEVEL {
@@ -192,7 +238,11 @@ impl Capture {
         if changed {
             self.revision = self.revision.wrapping_add(1);
         }
-        self.meter.end_block(Instant::now());
+        let now = Instant::now();
+        self.meter.end_block(now);
+        if let Some(meter) = &mut self.meter_b {
+            meter.end_block(now);
+        }
         Ok(())
     }
 
@@ -201,6 +251,9 @@ impl Capture {
         self.quiet_frames = 0;
         self.pre_roll.clear();
         self.meter.reset();
+        if let Some(meter) = &mut self.meter_b {
+            meter.reset();
+        }
     }
 
     pub fn resume(&mut self) {
@@ -217,9 +270,38 @@ impl Capture {
         self.meter.readings(Instant::now())
     }
 
+    pub fn track_meter_readings(&self, lane: usize) -> Option<MeterReadings> {
+        match lane {
+            0 => Some(self.meter_readings()),
+            1 => self
+                .meter_b
+                .as_ref()
+                .map(|meter| meter.readings(Instant::now())),
+            _ => None,
+        }
+    }
+
+    fn track_range(&self, lane: usize) -> Option<Range<usize>> {
+        match lane {
+            0 => Some(0..self.a_channels),
+            1 if self.a_channels < self.channels => Some(self.a_channels..self.channels),
+            _ => None,
+        }
+    }
+
+    pub fn track_channels(&self, lane: usize) -> Option<usize> {
+        self.track_range(lane).map(|range| range.len())
+    }
+
     /// Changes whenever the retained samples change.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// These indices describe audio kept by the shared silence gate.
+    pub fn frame_range(&self) -> Range<u64> {
+        let end = self.history.total_frames;
+        end - self.history.len_frames as u64..end
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -231,11 +313,58 @@ impl Capture {
             sample_rate: self.sample_rate,
             channels: self.channels,
             samples,
+            first_frame: self.frame_range().start,
         }
+    }
+
+    pub fn track_snapshot(&self, lane: usize) -> Option<Snapshot> {
+        let range = self.track_range(lane)?;
+        if range.len() == self.channels {
+            return Some(self.snapshot());
+        }
+        let (first, second) = self.history.as_slices();
+        let mut samples = Vec::with_capacity(self.history.len_frames * range.len());
+        for frame in first
+            .chunks_exact(self.channels)
+            .chain(second.chunks_exact(self.channels))
+        {
+            samples.extend_from_slice(&frame[range.clone()]);
+        }
+        Some(Snapshot {
+            sample_rate: self.sample_rate,
+            channels: range.len(),
+            samples,
+            first_frame: self.frame_range().start,
+        })
     }
 
     /// Writes chronological waveform bins spanning the entire retained history.
     pub fn waveform(&self, minimum: &mut [f32], maximum: &mut [f32]) -> usize {
+        self.waveform_for(0..self.channels, None, minimum, maximum)
+    }
+
+    pub fn track_waveform(
+        &self,
+        lane: usize,
+        view: WaveformView,
+        minimum: &mut [f32],
+        maximum: &mut [f32],
+    ) -> usize {
+        let Some(track) = self.track_range(lane) else {
+            minimum.fill(0.);
+            maximum.fill(0.);
+            return 0;
+        };
+        self.waveform_for(track, Some(view), minimum, maximum)
+    }
+
+    fn waveform_for(
+        &self,
+        track: Range<usize>,
+        view: Option<WaveformView>,
+        minimum: &mut [f32],
+        maximum: &mut [f32],
+    ) -> usize {
         minimum.fill(0.0);
         maximum.fill(0.0);
         let bin_count = minimum.len().min(maximum.len());
@@ -256,20 +385,16 @@ impl Capture {
             let first_end = end.min(first_frames) * self.channels;
             let second_start = start.saturating_sub(first_frames) * self.channels;
             let second_end = end.saturating_sub(first_frames) * self.channels;
-            let mut samples = first[first_start..first_end]
-                .iter()
-                .chain(&second[second_start..second_end])
-                .copied()
-                .filter(|sample| sample.is_finite());
-
-            if let Some(first_sample) = samples.next() {
-                let (low, high) = samples
-                    .fold((first_sample, first_sample), |(low, high), sample| {
-                        (low.min(sample), high.max(sample))
-                    });
-                minimum[bin] = low;
-                maximum[bin] = high;
-            }
+            let frames = first[first_start..first_end]
+                .chunks_exact(self.channels)
+                .chain(second[second_start..second_end].chunks_exact(self.channels))
+                .map(|frame| &frame[track.clone()]);
+            let (low, high) = match view {
+                Some(view) => crate::waveform::extrema(frames.map(|frame| view.sample(frame))),
+                None => crate::waveform::extrema(frames.flatten().copied()),
+            };
+            minimum[bin] = low;
+            maximum[bin] = high;
         }
         frame_count
     }
@@ -291,6 +416,9 @@ impl Capture {
         self.pre_roll.clear();
         self.quiet_frames = 0;
         self.meter.reset();
+        if let Some(meter) = &mut self.meter_b {
+            meter.reset();
+        }
         if self.state == CaptureState::Recording {
             self.state = CaptureState::Waiting;
         }
@@ -303,6 +431,7 @@ struct FrameRing {
     capacity_frames: usize,
     next_frame: usize,
     len_frames: usize,
+    total_frames: u64,
 }
 
 impl FrameRing {
@@ -322,6 +451,7 @@ impl FrameRing {
             capacity_frames,
             next_frame: 0,
             len_frames: 0,
+            total_frames: 0,
         })
     }
 
@@ -333,6 +463,7 @@ impl FrameRing {
             self.next_frame = 0;
         }
         self.len_frames = (self.len_frames + 1).min(self.capacity_frames);
+        self.total_frames = self.total_frames.saturating_add(1);
     }
 
     fn truncate_to(&mut self, capacity_frames: usize) {
@@ -361,6 +492,18 @@ impl FrameRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_retained_frame_range_survives_wrap_and_clear() {
+        let mut capture = Capture::new(1000, 1, DurationChoice::Seconds10).unwrap();
+        capture.push_interleaved(&[0.5; 65_000]).unwrap();
+        assert_eq!(capture.frame_range(), 55_000..65_000);
+        assert_eq!(capture.snapshot().frame_range(), 55_000..65_000);
+        capture.clear();
+        assert_eq!(capture.frame_range(), 65_000..65_000);
+        capture.push_interleaved(&[0.75; 2]).unwrap();
+        assert_eq!(capture.frame_range(), 65_000..65_002);
+    }
 
     #[test]
     fn long_silence_preserves_history_and_joins_once_with_pre_roll_and_tail() {

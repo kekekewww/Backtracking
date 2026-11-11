@@ -1,3 +1,101 @@
+use std::ops::Range;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u32)]
+pub enum WaveformView {
+    #[default]
+    Merged = 0,
+    Left = 1,
+    Right = 2,
+}
+
+impl WaveformView {
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::Merged),
+            1 => Some(Self::Left),
+            2 => Some(Self::Right),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn sample(self, frame: &[f32]) -> f32 {
+        match self {
+            Self::Merged => match frame {
+                [mono] => *mono,
+                [left, right] => left * 0.5 + right * 0.5,
+                _ => {
+                    (frame.iter().map(|&sample| f64::from(sample)).sum::<f64>()
+                        / frame.len() as f64) as f32
+                }
+            },
+            Self::Left => frame[0],
+            Self::Right => frame.get(1).copied().unwrap_or(frame[0]),
+        }
+    }
+}
+
+pub(crate) fn extrema(samples: impl Iterator<Item = f32>) -> (f32, f32) {
+    let mut samples = samples.filter(|sample| sample.is_finite());
+    let Some(first) = samples.next() else {
+        return (0., 0.);
+    };
+    samples.fold((first, first), |(low, high), sample| {
+        (low.min(sample), high.max(sample))
+    })
+}
+
+/// Computes signed peaks from one selected channel or a mono fold-down.
+pub fn view_peaks(
+    interleaved: &[f32],
+    channels: usize,
+    view: WaveformView,
+    minimum: &mut [f32],
+    maximum: &mut [f32],
+) {
+    minimum.fill(0.);
+    maximum.fill(0.);
+    let bins = minimum.len().min(maximum.len());
+    let frames = interleaved.len().checked_div(channels).unwrap_or(0);
+    if frames == 0 {
+        return;
+    }
+    for bin in 0..bins {
+        let first = bin * frames / bins;
+        let end = ((bin + 1) * frames / bins).max(first + 1);
+        (minimum[bin], maximum[bin]) = extrema(
+            interleaved[first * channels..end * channels]
+                .chunks_exact(channels)
+                .map(|frame| view.sample(frame)),
+        );
+    }
+}
+
+/// The right boundary of a clip may coincide with the right edge of the visible window.
+pub fn flag_fraction(position: u64, visible: Range<u64>) -> Option<f64> {
+    if visible.is_empty() || position < visible.start || position > visible.end {
+        return None;
+    }
+    Some((position - visible.start) as f64 / (visible.end - visible.start) as f64)
+}
+
+/// Snaps to the nearest visible boundary within a caller-provided screen distance.
+pub fn snap_to_flags(
+    fraction: f64,
+    visible: Range<u64>,
+    flags: Option<&Range<u64>>,
+    tolerance_fraction: f64,
+) -> f64 {
+    let Some(flags) = flags else { return fraction };
+    [flags.start, flags.end]
+        .into_iter()
+        .filter_map(|position| flag_fraction(position, visible.clone()))
+        .map(|flag| (flag, (flag - fraction).abs()))
+        .filter(|&(_, distance)| distance <= tolerance_fraction)
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map_or(fraction, |(flag, _)| flag)
+}
+
 /// Aggregate signed peaks across channels for a small waveform display.
 pub fn peaks(interleaved: &[f32], channels: usize, minimum: &mut [f32], maximum: &mut [f32]) {
     minimum.fill(0.0);
@@ -56,7 +154,35 @@ pub fn hint_position(cursor: [f32; 2], size: [f32; 2], bounds: [f32; 4]) -> [f32
 
 #[cfg(test)]
 mod tests {
-    use super::hint_position;
+    use super::{flag_fraction, hint_position, snap_to_flags, view_peaks, WaveformView};
+
+    #[test]
+    fn fold_down_and_separate_views_read_the_requested_samples() {
+        let audio = [0.75, -0.75, -0.5, 0.25];
+        let mut low = [0.; 2];
+        let mut high = [0.; 2];
+        for (view, expected) in [
+            (WaveformView::Left, [0.75, -0.5]),
+            (WaveformView::Right, [-0.75, 0.25]),
+            (WaveformView::Merged, [0., -0.125]),
+        ] {
+            view_peaks(&audio, 2, view, &mut low, &mut high);
+            assert_eq!(low, expected);
+            assert_eq!(high, expected);
+        }
+    }
+
+    #[test]
+    fn flags_move_with_audio_and_only_visible_nearby_edges_snap() {
+        let flags = 100..150;
+        assert_eq!(flag_fraction(flags.start, 50..150), Some(0.5));
+        assert_eq!(flag_fraction(flags.end, 50..150), Some(1.0));
+        assert_eq!(flag_fraction(flags.start, 120..220), None);
+        assert_eq!(flag_fraction(flags.end, 120..220), Some(0.3));
+        assert_eq!(snap_to_flags(0.28, 120..220, Some(&flags), 0.05), 0.3);
+        assert_eq!(snap_to_flags(0.22, 120..220, Some(&flags), 0.05), 0.22);
+        assert_eq!(snap_to_flags(0.0, 120..220, Some(&flags), 0.05), 0.0);
+    }
 
     #[test]
     fn cursor_hint_uses_direction_priority() {

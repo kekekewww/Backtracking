@@ -8,7 +8,8 @@
 
 | 我想留下的聲音 | 使用方式 |
 | --- | --- |
-| 瀏覽器、播放器或其他程式的聲音 | 開啟桌面版。Windows 使用預設播放裝置的 WASAPI 共享混音，macOS 使用 Core Audio 系統音訊擷取。 |
+| 瀏覽器、播放器或其他程式的聲音 | 開啟桌面版，在 Options 選擇系統播放或指定 App。 |
+| 麥克風，或系統聲加麥克風 | 開啟桌面版，在 Options 選擇麥克風，或啟用 A／B 分開擷取。 |
 | 某一軌、群組或主輸出的聲音 | 把 VST3 或 CLAP 插入對應的效果鏈。插件接收該位置的 mono 或 stereo 音訊，並將音訊原樣傳給下游。 |
 | 軟體樂器加效果後的聲音 | 把插件放在樂器及要納入取樣的效果後面。若需要乾聲，就放在那些效果前面。 |
 
@@ -21,6 +22,16 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`Control` 搭配波形上的點擊與拖曳用於框選。
 
 設定選單的背景透明度可選 0%、25%、50%、75% 或 100%。0% 為不透明，100% 為透明。桌面版在 100% 時仍可開啟設定選單調整透明度。VST3／CLAP 的 **Panel transparency** 調整插件內的波形面板背景，實際看到的底色取決於 DAW 的視窗背景。
+
+### 來源、波形與旗標
+
+- 在桌面版 Options 選擇系統播放、麥克風或指定 App。Windows 的指定 App 擷取需 OS build 20348 以上。macOS 首次擷取系統聲或麥克風時，請允許對應權限。
+- 可同時啟用 A 和 B。兩路各自選擇來源與 Left、Right、Center、Mid、Side 或 Merged。Merged 沿用來源的單聲道或雙聲道輸出。Center 需要來源提供原生中央聲道。
+- 單一來源可顯示合併波形或上下兩列 L／R。啟用 A／B 時，上列顯示 A、下列顯示 B，各占波形區的一半，並各自顯示音量。
+- 完成框選或明確保存整段時，波形會標記範圍頭尾。框選時按住 `Shift`，靠近可見旗標即可吸附。旗標會隨錄音歷史移動，並在各自離開可視範圍時消失。
+- `Ctrl+S` 與成功拖放會同時匯出 A／B。兩個 WAV 使用同一起訖和取樣率。若 DAW 要求指定匯入位置，可選擇分開音軌並使用相同開始位置。
+
+[桌面版更新設定](UPDATES.md)
 
 ### 只顯示波形
 
@@ -163,7 +174,8 @@ Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續�
 
 | What you want to sample | Which edition to use |
 | --- | --- |
-| A browser, media player, or another desktop app | Open the desktop recorder. Windows uses WASAPI loopback on the default playback device. macOS uses a Core Audio system tap. |
+| A browser, media player, or another desktop app | Open the desktop recorder and choose system playback or the app in Options. |
+| A microphone, or system playback plus a microphone | Choose a microphone in desktop Options or enable A/B to capture them separately. |
 | One DAW track, a bus, or the master output | Insert the VST3 or CLAP plug-in on the relevant effects chain. It captures mono or stereo audio at that point and passes the input through unchanged. |
 | A software instrument with effects | Insert Backtracking after the instrument and any effects you want in the sample. Move it ahead of those effects to capture the dry signal. |
 
@@ -176,6 +188,16 @@ Click the gear in the toolbar or right-click inside the Backtracking window to o
 In the macOS desktop app, use a mouse right-click or the trackpad's secondary click to open the menu. Use `Control` with a click and drag over the waveform to select audio.
 
 The settings menu offers five background transparency levels. Choose 0%, 25%, 50%, 75%, or 100%, where 0% is opaque and 100% is clear. On the desktop apps, you can open Settings and adjust the value even at 100%. In VST3 and CLAP, **Panel transparency** fades the waveform panel's fill. The DAW provides the background behind it.
+
+### Sources, waveforms, and flags
+
+- Choose system playback, a microphone, or a specific app in desktop Options. App capture requires Windows OS build 20348 or later. On macOS, grant the relevant system audio or microphone permission when prompted.
+- Enable A and B to capture two routes. For each, choose a source and Left, Right, Center, Mid, Side, or Merged. Merged uses the source's mono or stereo output format. Center requires a native center channel.
+- For one source, choose a merged waveform or two L/R rows. With A/B enabled, A and B each use half the waveform area and have independent meters.
+- Flags mark the boundaries after selecting a range or saving the full capture. Hold `Shift` while selecting near a visible flag to snap to it. Each flag follows the retained audio and disappears when it leaves view.
+- `Ctrl+S` and accepted drops export both tracks with the same boundaries and sample rate. If your DAW prompts for placement, choose separate tracks at the same start position.
+
+[Desktop update settings](UPDATES.md)
 
 ### Show waveform only
 

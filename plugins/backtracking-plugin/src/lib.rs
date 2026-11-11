@@ -152,7 +152,7 @@ mod tests {
     use nice_plug::params::persist::serialize_field;
 
     use super::*;
-    use crate::settings::{MeterMode, SessionSettings};
+    use crate::settings::{MeterMode, SessionSettings, WaveformLayout};
 
     #[test]
     fn plugin_state_round_trips_instance_settings_without_audio_or_pause() {
@@ -163,6 +163,7 @@ mod tests {
         original.session.set_accent([224, 90, 155]);
         original.session.set_meter_mode(MeterMode::Lufs);
         original.session.set_show_waveform_only(true);
+        original.session.set_waveform_layout(WaveformLayout::Stereo);
         original.session.set_wav_profile(WavExportProfile {
             sample_rate: 96_000,
             sample_format: WavSampleFormat::Pcm24,
@@ -202,6 +203,7 @@ mod tests {
             ("panel_transparency", "250".to_owned()),
             ("accent_rgb", "[0, 256, 0]".to_owned()),
             ("meter_unit", "VU".to_owned()),
+            ("waveform_layout", "unsupported".to_owned()),
             (
                 "output_dir",
                 serialize_field(std::ffi::OsStr::new("relative/output")).unwrap(),

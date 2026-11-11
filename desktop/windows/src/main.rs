@@ -17,6 +17,10 @@ mod startup;
 mod tray;
 #[cfg(target_os = "windows")]
 mod ui;
+#[cfg(any(target_os = "windows", test))]
+mod update_protocol;
+#[cfg(target_os = "windows")]
+mod updater;
 #[cfg(target_os = "windows")]
 mod window_order;
 
@@ -26,9 +30,15 @@ fn main() {
     use windows::core::{HSTRING, PCWSTR, w};
 
     let result = (|| {
+        if updater::run_helper()? || updater::other_launch_during_update() {
+            return Ok(());
+        }
         let Some(_instance) = startup::Instance::acquire()? else {
             return Ok(());
         };
+        if updater::install_before_start() {
+            return Ok(());
+        }
         ui::run(controller::Controller::new())?;
         Ok::<(), Box<dyn std::error::Error>>(())
     })();

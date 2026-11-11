@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -6,10 +7,49 @@ use std::time::{Duration, Instant};
 
 use backtracking_core::{
     AudioQueue, AutoResumeDelay, Capture, CaptureState, DurationChoice, MeterReadings, Snapshot,
-    WavExportProfile,
+    WavExportProfile, WaveformView,
 };
 
-use crate::settings::{MeterMode, SessionSettings, SettingsStore};
+use crate::settings::{MeterMode, SessionSettings, SettingsStore, WaveformLayout};
+
+pub(crate) const WAVEFORM_BINS: usize = 512;
+
+#[derive(Clone, Copy)]
+pub(crate) struct WaveformPeaks {
+    pub(crate) minimum: [f32; WAVEFORM_BINS],
+    pub(crate) maximum: [f32; WAVEFORM_BINS],
+}
+
+impl Default for WaveformPeaks {
+    fn default() -> Self {
+        Self {
+            minimum: [0.0; WAVEFORM_BINS],
+            maximum: [0.0; WAVEFORM_BINS],
+        }
+    }
+}
+
+pub(crate) fn waveform_views(layout: WaveformLayout, channels: usize) -> &'static [WaveformView] {
+    if layout == WaveformLayout::Stereo && channels == 2 {
+        &[WaveformView::Left, WaveformView::Right]
+    } else {
+        &[WaveformView::Merged]
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct WaveformTimeline {
+    pub(crate) epoch: u64,
+    pub(crate) frames: Range<u64>,
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: usize,
+}
+
+impl WaveformTimeline {
+    pub(crate) fn duration(&self) -> f32 {
+        (self.frames.end - self.frames.start) as f32 / self.sample_rate.max(1) as f32
+    }
+}
 
 struct Consumer {
     queue: Arc<AudioQueue>,
@@ -25,9 +65,8 @@ struct Consumer {
 #[derive(Default)]
 struct WaveformCache {
     revision: Option<u64>,
-    minimum: Vec<f32>,
-    maximum: Vec<f32>,
-    frames: usize,
+    layout: WaveformLayout,
+    peaks: [WaveformPeaks; 2],
 }
 
 impl Consumer {
@@ -55,23 +94,21 @@ impl Consumer {
         }
     }
 
-    fn waveform(&mut self, minimum: &mut [f32], maximum: &mut [f32]) -> usize {
+    fn waveform(&mut self, layout: WaveformLayout, peaks: &mut [WaveformPeaks; 2]) {
         let cache = &mut self.waveform;
         let revision = self.capture.revision();
-        if cache.revision != Some(revision)
-            || cache.minimum.len() != minimum.len()
-            || cache.maximum.len() != maximum.len()
-        {
-            cache.minimum.resize(minimum.len(), 0.0);
-            cache.maximum.resize(maximum.len(), 0.0);
-            cache.frames = self
-                .capture
-                .waveform(&mut cache.minimum, &mut cache.maximum);
+        if cache.revision != Some(revision) || cache.layout != layout {
+            for (&view, trace) in waveform_views(layout, self.channels)
+                .iter()
+                .zip(&mut cache.peaks)
+            {
+                self.capture
+                    .track_waveform(0, view, &mut trace.minimum, &mut trace.maximum);
+            }
             cache.revision = Some(revision);
+            cache.layout = layout;
         }
-        minimum.copy_from_slice(&cache.minimum);
-        maximum.copy_from_slice(&cache.maximum);
-        cache.frames
+        *peaks = cache.peaks;
     }
 }
 
@@ -79,6 +116,7 @@ struct State {
     retention: DurationChoice,
     idle_resume: AutoResumeDelay,
     consumer: Option<Consumer>,
+    timeline_epoch: u64,
     paused: bool,
     gesture_active: bool,
     last_interaction: Instant,
@@ -104,6 +142,7 @@ impl Session {
                 retention,
                 idle_resume,
                 consumer: None,
+                timeline_epoch: 0,
                 paused: false,
                 gesture_active: false,
                 last_interaction: Instant::now(),
@@ -150,6 +189,10 @@ impl Session {
 
     pub(crate) fn set_show_waveform_only(&self, show_waveform_only: bool) {
         self.settings.lock().show_waveform_only = show_waveform_only;
+    }
+
+    pub(crate) fn set_waveform_layout(&self, layout: WaveformLayout) {
+        self.settings.lock().waveform_layout = layout;
     }
 
     pub(crate) fn set_retention(&self, retention: DurationChoice) {
@@ -210,6 +253,7 @@ impl Session {
     pub(crate) fn clear(&self) {
         let mut state = self.lock();
         state.last_interaction = Instant::now();
+        state.timeline_epoch = state.timeline_epoch.wrapping_add(1);
         self.accepting.store(false, Ordering::SeqCst);
         if let Some(consumer) = &mut state.consumer {
             // Discard audio published before the clear. The worker re-arms only after any
@@ -272,36 +316,56 @@ impl Session {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> Option<Snapshot> {
-        let mut state = self.lock();
-        self.apply_capture_settings(&mut state);
-        state
-            .consumer
-            .as_ref()
-            .map(|consumer| consumer.capture.snapshot())
+    pub(crate) fn timeline_epoch(&self) -> u64 {
+        self.lock().timeline_epoch
     }
 
-    pub(crate) fn snapshot_live(&self) -> Option<Snapshot> {
+    pub(crate) fn positioned_snapshot(&self, live: bool) -> Option<(u64, Snapshot)> {
         let mut state = self.lock();
         self.apply_capture_settings(&mut state);
-        let recording = !state.paused && self.accepting.load(Ordering::SeqCst);
+        let recording = live && !state.paused && self.accepting.load(Ordering::SeqCst);
+        let epoch = state.timeline_epoch;
         let consumer = state.consumer.as_mut()?;
         if recording {
             let frames = consumer.queue.pending_frames();
             consumer.drain(usize::MAX, frames);
         }
-        Some(consumer.capture.snapshot())
+        Some((epoch, consumer.capture.snapshot()))
     }
 
-    pub(crate) fn waveform(&self, minimum: &mut [f32], maximum: &mut [f32]) -> (usize, u32) {
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> Option<Snapshot> {
+        self.positioned_snapshot(false)
+            .map(|(_, snapshot)| snapshot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_live(&self) -> Option<Snapshot> {
+        self.positioned_snapshot(true).map(|(_, snapshot)| snapshot)
+    }
+
+    pub(crate) fn waveform(
+        &self,
+        layout: WaveformLayout,
+        peaks: &mut [WaveformPeaks; 2],
+    ) -> WaveformTimeline {
         let mut state = self.lock();
         self.apply_capture_settings(&mut state);
+        let epoch = state.timeline_epoch;
         let Some(consumer) = &mut state.consumer else {
-            minimum.fill(0.0);
-            maximum.fill(0.0);
-            return (0, 0);
+            peaks.fill(WaveformPeaks::default());
+            return WaveformTimeline {
+                epoch,
+                ..WaveformTimeline::default()
+            };
         };
-        (consumer.waveform(minimum, maximum), consumer.sample_rate)
+        consumer.waveform(layout, peaks);
+        WaveformTimeline {
+            epoch,
+            frames: consumer.capture.frame_range(),
+            sample_rate: consumer.sample_rate,
+            channels: consumer.channels,
+        }
     }
 
     pub(crate) fn is_paused(&self) -> bool {
@@ -402,6 +466,7 @@ impl Worker {
                 .max(4096)
                 .next_power_of_two();
             let queue = AudioQueue::new(capacity_frames, channels);
+            state.timeline_epoch = state.timeline_epoch.wrapping_add(1);
             state.consumer = Some(Consumer {
                 queue: queue.clone(),
                 capture,
@@ -481,7 +546,9 @@ impl Drop for Worker {
             let _ = thread.join();
         }
         self.session.accepting.store(false, Ordering::SeqCst);
-        self.session.lock().consumer = None;
+        let mut state = self.session.lock();
+        state.consumer = None;
+        state.timeline_epoch = state.timeline_epoch.wrapping_add(1);
     }
 }
 
@@ -492,6 +559,26 @@ mod tests {
     use nice_plug::params::persist::PersistentField;
 
     use super::*;
+
+    #[test]
+    fn split_and_merged_waveforms_preserve_the_same_stereo_capture() {
+        let session = Arc::new(Session::new(SettingsStore::default()));
+        let worker = Worker::new(session.clone(), 48_000, 2, 256).unwrap();
+        worker.push(&[&mut [0.5; 64], &mut [-0.5; 64]]);
+        session.pause();
+        let original = session.snapshot().unwrap();
+        let mut peaks = [WaveformPeaks::default(); 2];
+        let merged = session.waveform(WaveformLayout::Merged, &mut peaks);
+        assert_eq!(merged.frames, original.frame_range());
+        assert!(peaks[0].minimum.iter().all(|&sample| sample == 0.0));
+        assert!(peaks[0].maximum.iter().all(|&sample| sample == 0.0));
+        let split = session.waveform(WaveformLayout::Stereo, &mut peaks);
+        assert_eq!(split.frames, merged.frames);
+        assert_eq!(split.epoch, merged.epoch);
+        assert!(peaks[0].maximum.iter().all(|&sample| sample == 0.5));
+        assert!(peaks[1].minimum.iter().all(|&sample| sample == -0.5));
+        assert_eq!(session.snapshot().unwrap(), original);
+    }
 
     #[test]
     fn fresh_instances_default_to_ten_second_idle_resume() {

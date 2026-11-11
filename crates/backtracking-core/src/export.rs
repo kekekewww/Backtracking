@@ -2,9 +2,12 @@ use std::borrow::Cow;
 use std::f64::consts::PI;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::Snapshot;
 
 const PHASES: usize = 256;
 static NEXT_EXPORT: AtomicU64 = AtomicU64::new(0);
@@ -176,20 +179,102 @@ pub fn export_wav_with_profile(
     profile: WavExportProfile,
 ) -> io::Result<PathBuf> {
     fs::create_dir_all(output_dir)?;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let process = std::process::id();
     loop {
-        let serial = NEXT_EXPORT.fetch_add(1, Ordering::Relaxed);
-        let path = output_dir.join(format!("Backtracking-{timestamp}-{process}-{serial}.wav"));
+        let prefix = take_name();
+        let path = output_dir.join(format!("{prefix}.wav"));
         match write_wav_with_profile(&path, source_sample_rate, channels, interleaved, profile) {
             Ok(()) => return Ok(path),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err),
         }
     }
+}
+
+fn take_name() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let process = std::process::id();
+    let serial = NEXT_EXPORT.fetch_add(1, Ordering::Relaxed);
+    format!("Backtracking-{timestamp}-{process}-{serial}")
+}
+
+/// Exports one or two lanes from the same retained time range.
+/// Both files in a pair share a take name, with A/B suffixes.
+pub fn export_tracks_with_profile(
+    output_dir: &Path,
+    snapshots: &[Snapshot],
+    frames: Range<usize>,
+    profile: WavExportProfile,
+) -> io::Result<Vec<PathBuf>> {
+    match snapshots {
+        [one] => export_track_refs(output_dir, &[one], frames, profile),
+        [a, b] => export_track_refs(output_dir, &[a, b], frames, profile),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected one or two audio lanes",
+        )),
+    }
+}
+
+pub(crate) fn export_track_refs(
+    output_dir: &Path,
+    snapshots: &[&Snapshot],
+    frames: Range<usize>,
+    profile: WavExportProfile,
+) -> io::Result<Vec<PathBuf>> {
+    match snapshots {
+        [snapshot] => export_wav_with_profile(
+            output_dir,
+            snapshot.sample_rate,
+            snapshot.channels,
+            track_clip(snapshot, frames)?,
+            profile,
+        )
+        .map(|path| vec![path]),
+        [a, b] if a.sample_rate == b.sample_rate && a.frame_range() == b.frame_range() => {
+            let a_samples = track_clip(a, frames.clone())?;
+            let b_samples = track_clip(b, frames)?;
+            fs::create_dir_all(output_dir)?;
+            loop {
+                let prefix = take_name();
+                let a_path = output_dir.join(format!("{prefix}-A.wav"));
+                let b_path = output_dir.join(format!("{prefix}-B.wav"));
+                match write_wav_with_profile(&a_path, a.sample_rate, a.channels, a_samples, profile)
+                {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => return Err(err),
+                }
+                match write_wav_with_profile(&b_path, b.sample_rate, b.channels, b_samples, profile)
+                {
+                    Ok(()) => return Ok(vec![a_path, b_path]),
+                    Err(err) => {
+                        fs::remove_file(a_path)?;
+                        if err.kind() != io::ErrorKind::AlreadyExists {
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+        }
+        _ => Err(invalid_tracks()),
+    }
+}
+
+fn track_clip(snapshot: &Snapshot, frames: Range<usize>) -> io::Result<&[f32]> {
+    snapshot
+        .frames(frames)
+        .filter(|samples| !samples.is_empty())
+        .ok_or_else(invalid_tracks)
+}
+
+fn invalid_tracks() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "expected aligned nonempty audio lanes",
+    )
 }
 
 fn write_wave(
@@ -275,26 +360,44 @@ fn resample(
     frames: usize,
 ) -> Vec<f32> {
     let step = f64::from(source_rate) / f64::from(target_rate);
-    let cutoff = if step > 1.0 { 0.95 / step } else { 1.0 };
-    let radius = (24.0 / cutoff).ceil().min(192.0) as isize;
-    let kernels = phase_kernels(cutoff, radius);
-    let last_frame = (samples.len() / channels - 1) as isize;
+    let kernel = ResamplingKernel::new(step);
     let mut output = Vec::with_capacity(frames * channels);
     for frame in 0..frames {
-        let position = frame as f64 * step;
-        let first = position.floor() as isize - radius;
+        let frame = kernel.at(samples, channels, frame as f64 * step);
+        output.extend_from_slice(&frame[..channels]);
+    }
+    output
+}
+
+pub(crate) struct ResamplingKernel {
+    radius: isize,
+    phases: Vec<Vec<f64>>,
+}
+
+impl ResamplingKernel {
+    pub(crate) fn new(step: f64) -> Self {
+        let cutoff = if step > 1.0 { 0.95 / step } else { 1.0 };
+        let radius = (24.0 / cutoff).ceil().min(192.0) as isize;
+        Self {
+            radius,
+            phases: phase_kernels(cutoff, radius),
+        }
+    }
+
+    pub(crate) fn at(&self, samples: &[f32], channels: usize, position: f64) -> [f32; 2] {
+        let last_frame = (samples.len() / channels - 1) as isize;
+        let first = position.floor() as isize - self.radius;
         let phase = (position.fract() * PHASES as f64).round() as usize;
         let mut value = [0.0f64; 2];
-        for (tap, &weight) in kernels[phase].iter().enumerate() {
+        for (tap, &weight) in self.phases[phase].iter().enumerate() {
             let source_frame = (first + tap as isize).clamp(0, last_frame) as usize;
             let source = &samples[source_frame * channels..][..channels];
             for (sum, &sample) in value.iter_mut().zip(source) {
                 *sum += f64::from(sample) * weight;
             }
         }
-        output.extend(value[..channels].iter().map(|sample| *sample as f32));
+        value.map(|sample| sample as f32)
     }
-    output
 }
 
 // Precompute Blackman-windowed sinc weights by fractional phase so processing
@@ -333,6 +436,44 @@ fn phase_kernels(cutoff: f64, radius: isize) -> Vec<Vec<f64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grouped_exports_keep_exact_l_r_samples_and_remove_incomplete_pair() {
+        let dir = std::env::temp_dir().join(take_name());
+        let profile = WavExportProfile::default();
+        let a = Snapshot {
+            sample_rate: 48_000,
+            channels: 1,
+            samples: vec![0.125, 0.25, 0.5, 0.75],
+            first_frame: 42,
+        };
+        let b = Snapshot {
+            samples: vec![-0.125, -0.25, -0.5, -0.75],
+            ..a.clone()
+        };
+        let paths = export_tracks_with_profile(&dir, &[a.clone(), b], 1..3, profile).unwrap();
+        let name_a = paths[0].file_name().unwrap().to_str().unwrap();
+        let name_b = paths[1].file_name().unwrap().to_str().unwrap();
+        assert_eq!(name_a.strip_suffix("-A.wav"), name_b.strip_suffix("-B.wav"));
+        for (path, expected) in paths.iter().zip([[0.25, 0.5], [-0.25, -0.5]]) {
+            let bytes = fs::read(path).unwrap();
+            assert_eq!(&bytes[46..50], &2u32.to_le_bytes());
+            let pcm: Vec<_> = bytes[58..]
+                .chunks_exact(4)
+                .map(|sample| f32::from_le_bytes(sample.try_into().unwrap()))
+                .collect();
+            assert_eq!(pcm, expected);
+        }
+
+        let invalid = Snapshot {
+            channels: 3,
+            samples: vec![0.5; 12],
+            ..a.clone()
+        };
+        assert!(export_tracks_with_profile(&dir, &[a, invalid], 1..3, profile).is_err());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn wave_header_and_samples_are_ieee_float_stereo() {
