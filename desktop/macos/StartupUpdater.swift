@@ -126,8 +126,13 @@ private extension Data {
         let bytes = Array(text.utf8)
         guard bytes.count.isMultiple(of: 2),
               bytes.allSatisfy({ 48...57 ~= $0 || 97...102 ~= $0 }) else { return nil }
-        let digits = bytes.map { $0 <= 57 ? $0 - 48 : $0 - 87 }
-        self.init((0..<(digits.count / 2)).map { digits[2 * $0] * 16 + digits[2 * $0 + 1] })
+        let digits: [UInt8] = bytes.map { $0 <= 57 ? $0 - 48 : $0 - 87 }
+        self.init()
+        reserveCapacity(digits.count / 2)
+        for offset in stride(from: 0, to: digits.count, by: 2) {
+            let high: UInt8 = digits[offset] << 4
+            append(high | digits[offset + 1])
+        }
     }
 }
 

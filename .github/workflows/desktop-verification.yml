@@ -48,8 +48,10 @@ jobs:
             -framework AppKit -o "$RUNNER_TEMP/backtracking-updater-tests"
           "$RUNNER_TEMP/backtracking-updater-tests"
       - name: Build and verify macOS app
+        if: ${{ !cancelled() }}
         run: |
           RUSTUP_TOOLCHAIN=1.99.1 bash desktop/macos/build.sh
           codesign --verify --strict --deep target/bundled/Backtracking.app
       - name: Verify Swift capture routes and paired WAV export
+        if: ${{ !cancelled() }}
         run: RUSTUP_TOOLCHAIN=1.99.1 bash desktop/macos/verify-capture.sh
