@@ -32,7 +32,20 @@ jobs:
         run: cargo +1.99.1 test --locked --manifest-path plugins/backtracking-plugin/Cargo.toml
       - name: Build Windows releases
         run: |
+          if ($env:GITHUB_REPOSITORY -eq 'kekekewww/Backtracking') {
+            $env:BACKTRACKING_UPDATE_PUBLIC_KEY = (Get-Content -Raw desktop/update-public-key.hex).Trim()
+          }
           cargo +1.99.1 build --locked --release --manifest-path desktop/windows/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($env:BACKTRACKING_UPDATE_PUBLIC_KEY) {
+            $exe = Join-Path $PWD 'desktop/windows/target/release/Backtracking.exe'
+            $binaryHex = [Convert]::ToHexString([IO.File]::ReadAllBytes($exe))
+            $key = $env:BACKTRACKING_UPDATE_PUBLIC_KEY
+            $keyTextHex = [Convert]::ToHexString([Text.Encoding]::ASCII.GetBytes($key))
+            if (!$binaryHex.Contains($key.ToUpperInvariant()) -and !$binaryHex.Contains($keyTextHex)) {
+              throw 'Backtracking.exe does not contain the configured update public key.'
+            }
+          }
           cargo +1.99.1 build --locked --release --manifest-path plugins/backtracking-plugin/Cargo.toml
 
   macos:
@@ -43,7 +56,15 @@ jobs:
         run: rustup toolchain install 1.99.1 --profile minimal
       - name: Build and verify macOS app
         run: |
+          if [[ "$GITHUB_REPOSITORY" == "kekekewww/Backtracking" ]]; then
+            read -r BACKTRACKING_UPDATE_PUBLIC_KEY < desktop/update-public-key.hex
+            export BACKTRACKING_UPDATE_PUBLIC_KEY
+          fi
           RUSTUP_TOOLCHAIN=1.99.1 bash desktop/macos/build.sh
+          if [[ -n "${BACKTRACKING_UPDATE_PUBLIC_KEY:-}" ]]; then
+            embedded_key=$(/usr/libexec/PlistBuddy -c 'Print :BacktrackingUpdatePublicKey' target/bundled/Backtracking.app/Contents/Info.plist)
+            test "$embedded_key" = "$BACKTRACKING_UPDATE_PUBLIC_KEY"
+          fi
           codesign --verify --strict --deep target/bundled/Backtracking.app
       - name: Test signed update and rollback on macOS
         if: ${{ !cancelled() }}
