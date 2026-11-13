@@ -19,7 +19,9 @@ openssl genpkey -algorithm ED25519 -out /private/path/backtracking-update-key.pe
 python3 tools/sign_backtracking_update.py public-key /private/path/backtracking-update-key.pem
 ```
 
-Pass the resulting 64 lowercase hexadecimal characters as `BACKTRACKING_UPDATE_PUBLIC_KEY` when building the first and every subsequent updater-enabled release. CI may store that public key as a repository variable. Keep the private key in the maintainer’s secure signing environment. A development build without an embedded key shows the GitHub download link in Options.
+Backtracking's release public key is stored in [`desktop/update-public-key.hex`](../desktop/update-public-key.hex). CI in the official repository supplies it to both desktop release builds. For a local release build, set `BACKTRACKING_UPDATE_PUBLIC_KEY` to the contents of that file before running the Windows or macOS build command. Keep the matching private key in the maintainer's signing environment. Windows builds without an embedded key show the GitHub download link in Options. On macOS, the manual check reports that the key is unconfigured.
+
+正式版公鑰已收錄在 [`desktop/update-public-key.hex`](../desktop/update-public-key.hex)，官方 CI 會將它提供給 Windows 與 macOS 桌面版建置。本機建置正式版前，請將檔案中的公鑰設為 `BACKTRACKING_UPDATE_PUBLIC_KEY`。每次發布仍須使用對應的私鑰簽署各平台更新檔。
 
 ## Build and sign
 
