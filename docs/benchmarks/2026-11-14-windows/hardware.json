@@ -1,0 +1,46 @@
+{
+  "captured_utc": "2026-11-13T16:06:57.7567726Z",
+  "source_commit": "d321bd310f284b9df5e807ada4c13ec6a7f741b7",
+  "source_has_uncommitted_changes": true,
+  "desktop_exe_sha256": "1A26B26399B3ACA9BCAE220F7F1D9ED0722025285C630784D5DA7CB26C3A54DB",
+  "plugin_dll_sha256": "5C24211C6755D4C5A3F9CE20BF3FE8D878B95F688D0650CAB18610B7B6A6877F",
+  "cpu": [
+    {
+      "Name": "13th Gen Intel(R) Core(TM) i9-13980HX",
+      "NumberOfCores": 24,
+      "NumberOfLogicalProcessors": 32,
+      "MaxClockSpeed": 2200
+    }
+  ],
+  "operating_system": {
+    "Caption": "Microsoft Windows 11 家用版",
+    "Version": "10.0.26200",
+    "BuildNumber": "26200",
+    "OSArchitecture": "64-bit",
+    "TotalVisibleMemorySize": 33163892
+  },
+  "physical_memory": {
+    "Manufacturer": "ASUSTeK COMPUTER INC.",
+    "Model": "ROG Strix G614JI_G614JI",
+    "TotalPhysicalMemory": 33959825408
+  },
+  "graphics": [
+    {
+      "Name": "IddSampleDriver Device",
+      "DriverVersion": "17.57.32.886"
+    },
+    {
+      "Name": "Intel(R) UHD Graphics",
+      "DriverVersion": "32.0.101.6790"
+    },
+    {
+      "Name": "NVIDIA GeForce RTX 4070 Laptop GPU",
+      "DriverVersion": "32.0.15.9200"
+    }
+  ],
+  "graphics_note": "Adapter models only; engine-to-adapter mapping was not established. Win32_VideoController.AdapterRAM is omitted because its 32-bit field can truncate VRAM capacity.",
+  "app_launch_arguments": [
+    "--new-capture-window",
+    "--show-options"
+  ]
+}

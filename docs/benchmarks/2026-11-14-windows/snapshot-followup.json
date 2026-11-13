@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "inspector": "tools/inspect_wav.py",
+  "inspected_utc": "2026-11-13T23:07:38.525949Z",
+  "context": "Separate user-approved Save snapshot test after the hardware monitoring session, using a new secondary instance while continuous-stereo.wav was played. This inspection applies only to this newly exported short segment; it does not validate the earlier 600-second retention setting, missing-frame or audible-artifact behavior, or selected-range export.",
+  "source": {
+    "label": "user-approved-live-snapshot.wav",
+    "file_size_bytes": 74505706,
+    "sha256": "98ae3da2989cf1306c2e899add381732aa7cd82fd874bbca4aac190851955fc9"
+  },
+  "format": {
+    "container": "RIFF/WAVE",
+    "format_tag": 3,
+    "encoding": "IEEE float",
+    "sample_rate_hz": 96000,
+    "channels": 2,
+    "bits_per_sample": 32,
+    "valid_bits_per_sample": 32,
+    "channel_mask": null,
+    "byte_rate": 768000,
+    "block_align_bytes": 8
+  },
+  "layout": {
+    "riff_size_field_bytes": 74505698,
+    "riff_extent_bytes": 74505706,
+    "data_size_bytes": 74505648,
+    "non_data_size_bytes": 58,
+    "frame_count": 9313206,
+    "fact_frame_count": 9313206,
+    "duration_seconds": 97.0125625,
+    "chunks": [
+      {
+        "id": "fmt ",
+        "header_offset": 12,
+        "data_offset": 20,
+        "size_bytes": 18,
+        "padded_end_offset": 38
+      },
+      {
+        "id": "fact",
+        "header_offset": 38,
+        "data_offset": 46,
+        "size_bytes": 4,
+        "padded_end_offset": 50
+      },
+      {
+        "id": "data",
+        "header_offset": 50,
+        "data_offset": 58,
+        "size_bytes": 74505648,
+        "padded_end_offset": 74505706
+      }
+    ]
+  },
+  "samples": {
+    "count": 18626412,
+    "finite_samples": 18626412,
+    "non_finite_samples": 0,
+    "full_scale_or_over_samples": 0,
+    "full_scale_threshold_linear": 1.0,
+    "peak_linear": 0.08000405132770538,
+    "peak_dbfs": -21.937760403981837,
+    "rms_linear": 0.03678125340665433,
+    "rms_dbfs": -28.68746950504828,
+    "per_channel": [
+      {
+        "finite_samples": 9313206,
+        "non_finite_samples": 0,
+        "zero_samples": 5622,
+        "full_scale_or_over_samples": 0,
+        "peak_linear": 0.08000405132770538,
+        "minimum": -0.08000405132770538,
+        "maximum": 0.07823511213064194,
+        "rms_linear": 0.03824710906356186,
+        "peak_dbfs": -21.937760403981837,
+        "rms_dbfs": -28.34802771488233
+      },
+      {
+        "finite_samples": 9313206,
+        "non_finite_samples": 0,
+        "zero_samples": 5622,
+        "full_scale_or_over_samples": 0,
+        "peak_linear": 0.077117919921875,
+        "minimum": -0.05895381048321724,
+        "maximum": 0.077117919921875,
+        "rms_linear": 0.035254501168064285,
+        "peak_dbfs": -22.256893860796065,
+        "rms_dbfs": -29.05570851946349
+      }
+    ]
+  },
+  "checks": {
+    "riff_size_matches_file_size": true,
+    "chunks_end_at_file_end": true,
+    "byte_rate_matches_format": true,
+    "data_contains_complete_frames": true,
+    "fact_matches_data_frame_count": true,
+    "all_samples_finite": true,
+    "no_full_scale_or_over_samples": true,
+    "file_unchanged_during_inspection": true
+  },
+  "all_applicable_checks_passed": true,
+  "limitations": [
+    "Duration is derived from this file; no expected capture interval was compared.",
+    "This inspection does not validate the earlier 600-second retention setting or a 600-second WAV.",
+    "Sample statistics do not establish absence of missing or duplicated frames, clicks, audible artifacts, or prior clipping.",
+    "Full-scale counts describe decoded stored samples, using absolute value >= 1.0; they are not a complete clipping detector.",
+    "This inspection does not exercise or validate selected-range export."
+  ]
+}

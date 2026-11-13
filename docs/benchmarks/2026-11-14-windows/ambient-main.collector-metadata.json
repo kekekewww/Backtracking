@@ -1,0 +1,15 @@
+[
+  {
+    "schema_version": 1,
+    "session_id": "87652351bf414b298d6b255e6d66a373",
+    "started_utc": "2026-11-13T15:59:54.9330973Z",
+    "logical_processor_count": 32,
+    "sample_interval_seconds": 1,
+    "gpu_interval_seconds": 5,
+    "duration_limit_seconds": 1800,
+    "powershell_version": "5.1.26100.9818",
+    "os_version": "Microsoft Windows NT 10.0.26200.0",
+    "process_architecture_bits": 64,
+    "native_counter_status": "available"
+  }
+]

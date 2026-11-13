@@ -72,6 +72,7 @@ const FLAG_COLOR: Color32 = Color32::from_rgb(255, 201, 109);
 const PREPARING_WAV: &str = "Preparing WAV…";
 
 pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
+    let show_options_on_start = std::env::args_os().any(|arg| arg == "--show-options");
     let preferences = Preferences::for_current_user();
     let settings = preferences.load();
     let icon =
@@ -114,6 +115,10 @@ pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
                 window_order::restore_position(window, position);
             }
             let mut recorder = Recorder::new(controller, preferences, settings, primary);
+            recorder.options_in_taskbar = show_options_on_start;
+            if show_options_on_start {
+                recorder.open_options(&context.egui_ctx);
+            }
             if primary {
                 match SnapshotHotkey::start(context.egui_ctx.clone()) {
                     Ok(hotkey) => recorder.hotkey = Some(hotkey),
@@ -244,6 +249,7 @@ struct Recorder {
     second_lines: bool,
     second_interval: u8,
     options_open: bool,
+    options_in_taskbar: bool,
     options_focus_requested: bool,
     options_section: OptionsSection,
     available_sources: Vec<CaptureSource>,
@@ -317,6 +323,59 @@ impl OptionsSection {
         (Self::Export, "Export"),
         (Self::Updates, "Updates"),
     ];
+
+    fn title(self) -> &'static str {
+        Self::ALL.iter().find(|(section, _)| *section == self).unwrap().1
+    }
+}
+
+fn options_list<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 9.0;
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        contents(ui)
+    }).inner
+}
+
+fn options_field<R>(ui: &mut egui::Ui, label: &str, control: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.vertical(|ui| {
+        ui.strong(label);
+        let result = control(ui);
+        ui.add_space(7.0);
+        result
+    }).inner
+}
+
+fn options_choice<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    id: &str,
+    selected: &mut T,
+    choices: impl IntoIterator<Item = (T, String)>,
+) -> bool {
+    let choices: Vec<_> = choices.into_iter().collect();
+    let text = choices.iter().find(|(value, _)| value == selected)
+        .map_or_else(String::new, |(_, text)| text.clone());
+    let before = *selected;
+    let width = ui.available_width().min(360.0);
+    egui::ComboBox::from_id_salt(id)
+        .width(width)
+        .selected_text(&text)
+        .truncate()
+        .show_ui(ui, |ui| {
+            ui.set_max_width(width);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            for (value, label) in choices {
+                ui.selectable_value(selected, value, label);
+            }
+        }).response.on_hover_text(text);
+    *selected != before
+}
+
+fn history_label(value: DurationChoice) -> String {
+    let seconds = value.seconds();
+    if seconds <= 60 { format!("{seconds} seconds") }
+    else { format!("{} minutes", seconds / 60) }
 }
 
 #[derive(Clone, Copy)]
@@ -609,6 +668,7 @@ impl Recorder {
             second_lines: settings.second_lines,
             second_interval: settings.second_interval,
             options_open: false,
+            options_in_taskbar: false,
             options_focus_requested: false,
             options_section: OptionsSection::Actions,
             available_sources: vec![CaptureSource::System, CaptureSource::DefaultMicrophone],
@@ -1264,10 +1324,11 @@ impl Recorder {
         };
         let builder = egui::ViewportBuilder::default()
             .with_title(&title)
-            .with_inner_size([660.0, 460.0])
-            .with_min_inner_size([570.0, 320.0])
-            .with_maximize_button(false)
-            .with_taskbar(false)
+            .with_inner_size([760.0, 580.0])
+            .with_min_inner_size([640.0, 420.0])
+            .with_resizable(true)
+            .with_maximize_button(true)
+            .with_taskbar(self.options_in_taskbar)
             .with_visible(false)
             .with_window_level(if self.pinned {
                 egui::WindowLevel::AlwaysOnTop
@@ -1281,7 +1342,9 @@ impl Recorder {
             if std::mem::take(&mut self.options_focus_requested)
                 && class == egui::ViewportClass::Immediate
             {
-                tray::prepare_options_window(&title);
+                if !self.options_in_taskbar {
+                    tray::prepare_options_window(&title);
+                }
                 ui.ctx().send_viewport_cmd(ViewportCommand::Visible(true));
                 ui.ctx()
                     .send_viewport_cmd(ViewportCommand::Minimized(false));
@@ -1328,67 +1391,68 @@ impl Recorder {
         ui: &mut egui::Ui,
         frame: &eframe::Frame,
     ) -> Option<OptionsAction> {
-        egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(ui.style()).inner_margin(16))
+        let close = egui::Panel::bottom("options-footer")
+            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(12))
             .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width(166.0);
-                        for (section, label) in OptionsSection::ALL {
-                            if !self.primary && section == OptionsSection::Updates {
-                                continue;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let close = ui.add_sized([88.0, 30.0], egui::Button::new("Close")).clicked();
+                    let message = if self.message.is_empty() { "Changes apply immediately." } else { &self.message };
+                    ui.add(egui::Label::new(message).truncate()).on_hover_text(message);
+                    close
+                }).inner
+            }).inner;
+        egui::Panel::left("options-navigation")
+            .exact_size(178.0)
+            .resizable(false)
+            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(12))
+            .show(ui, |ui| {
+                ui.strong("Backtracking");
+                ui.add_space(14.0);
+                for (section, label) in OptionsSection::ALL {
+                    if !self.primary && section == OptionsSection::Updates { continue; }
+                    if ui.add_sized(
+                        [ui.available_width(), 38.0],
+                        egui::Button::new(label).selected(self.options_section == section).wrap(),
+                    ).clicked() { self.options_section = section; }
+                }
+            });
+        let action = egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(22))
+            .show(ui, |ui| {
+                ui.heading(self.options_section.title());
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(10.0);
+                egui::ScrollArea::vertical()
+                    .id_salt(self.options_section)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| options_list(ui, |ui| {
+                        match self.options_section {
+                            OptionsSection::Actions => {
+                                self.capture_action_options(ui);
+                                ui.separator();
+                                self.snapshot_options(ui);
+                                ui.separator();
+                                self.app_options(ui, frame)
                             }
-                            ui.selectable_value(&mut self.options_section, section, label);
+                            OptionsSection::Capture => { self.capture_options(ui); None }
+                            OptionsSection::Sources => { self.source_options(ui); None }
+                            OptionsSection::Appearance => { self.appearance_options(ui); None }
+                            OptionsSection::Export => {
+                                self.wav_settings(ui);
+                                ui.separator();
+                                self.folder_options(ui)
+                            }
+                            OptionsSection::Updates => self.updates.show(ui).then_some(OptionsAction::Quit),
                         }
-                    });
-                    ui.separator();
-                    egui::ScrollArea::vertical()
-                        .id_salt(self.options_section)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let action = match self.options_section {
-                                OptionsSection::Actions => {
-                                    self.snapshot_options(ui);
-                                    self.app_options(ui, frame)
-                                }
-                                OptionsSection::Capture => {
-                                    self.capture_options(ui);
-                                    None
-                                }
-                                OptionsSection::Sources => {
-                                    self.source_options(ui);
-                                    None
-                                }
-                                OptionsSection::Appearance => {
-                                    self.appearance_options(ui);
-                                    None
-                                }
-                                OptionsSection::Export => {
-                                egui::Grid::new("wav-options").show(ui, |ui| self.wav_settings(ui));
-                                    ui.separator();
-                                    self.folder_options(ui)
-                                }
-                                OptionsSection::Updates => {
-                                    self.updates.show(ui).then_some(OptionsAction::Quit)
-                                }
-                            };
-                            if !self.message.is_empty() {
-                                ui.add_space(8.0);
-                                ui.label(&self.message);
-                            }
-                            action
-                        })
-                        .inner
-                })
-                .inner
-            })
-            .inner
+                    })).inner
+            }).inner;
+        if close { Some(OptionsAction::Close) } else { action }
     }
 
     fn snapshot_options(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Save snapshot").clicked() {
-            self.save_snapshot();
-        }
+        ui.strong("Snapshots");
+        if ui.button("Save snapshot").clicked() { self.save_snapshot(); }
         if ui.button("New capture window").clicked() {
             let launched = std::env::current_exe().and_then(|exe| {
                 Command::new(exe).arg("--new-capture-window").spawn()
@@ -1397,138 +1461,112 @@ impl Recorder {
                 self.message = format!("Could not open capture window: {error}");
             }
         }
-        if !self.primary {
-            return;
-        }
-        ui.label("Global shortcut: Win + `");
-        if let Some(error) = &self.hotkey_error {
-            ui.small(format!("Could not register the shortcut: {error}"));
-        }
+        if !self.primary { return; }
+        ui.add_space(6.0);
+        options_field(ui, "Global shortcut", |ui| {
+            ui.label("Alt + the key left of 1");
+            ui.small("No Shift. Works while another app is in front.");
+            if let Some(error) = &self.hotkey_error {
+                ui.add(egui::Label::new(format!("Could not register the shortcut: {error}")).wrap());
+            }
+        });
         if Instant::now() >= self.snapshot_target_scan {
             self.snapshot_targets = backtracking_core::discover_snapshot_targets();
             self.snapshot_target_scan = Instant::now() + Duration::from_secs(1);
         }
-        let targets = &self.snapshot_targets;
         let current = self.snapshot_target.as_deref().map_or("Desktop recorder", |id| {
-            targets.iter().find(|target| target.id == id)
+            self.snapshot_targets.iter().find(|target| target.id == id)
                 .map_or("Plugin unavailable", |target| target.name.as_str())
-        });
+        }).to_owned();
         let mut target = self.snapshot_target.clone();
-        ui.horizontal(|ui| {
-            ui.label("Shortcut target");
+        options_field(ui, "Shortcut target", |ui| {
+            let width = ui.available_width().min(360.0);
             egui::ComboBox::from_id_salt("snapshot-target")
-                .selected_text(current)
+                .width(width)
+                .selected_text(&current).truncate()
                 .show_ui(ui, |ui| {
+                    ui.set_max_width(width);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                     ui.selectable_value(&mut target, None, "Desktop recorder");
-                    for plugin in targets {
-                        let suffix = plugin.id.get(plugin.id.len().saturating_sub(6)..)
-                            .unwrap_or(&plugin.id);
-                        ui.selectable_value(
-                            &mut target, Some(plugin.id.clone()), format!("{} ({suffix})", plugin.name)
-                        );
+                    for plugin in &self.snapshot_targets {
+                        let suffix = plugin.id.get(plugin.id.len().saturating_sub(6)..).unwrap_or(&plugin.id);
+                        ui.selectable_value(&mut target, Some(plugin.id.clone()), format!("{} ({suffix})", plugin.name));
                     }
-                });
+                }).response.on_hover_text(current);
+            ui.small("Each key press saves from one recorder.");
         });
         if self.snapshot_target != target {
             self.save_preference(Key::SnapshotTarget, target.as_deref().unwrap_or(""));
             self.snapshot_target = target;
         }
-        ui.separator();
+    }
+
+    fn capture_action_options(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Capture controls");
+        let can_toggle = self.gesture.is_none();
+        let transport = if self.controller.error().is_some() { "Retry capture" }
+            else if self.controller.is_paused() { "Play" } else { "Pause" };
+        if ui.add_enabled(can_toggle, egui::Button::new(transport)).clicked() { self.toggle_capture(); }
+        if ui.add_enabled(self.selection.is_some(), egui::Button::new("Cancel selection")).clicked() {
+            self.cancel_selection();
+        }
+        if ui.add_enabled(can_toggle, egui::Button::new("Clear capture")).clicked() { self.clear_capture(); }
+        ui.add_space(6.0);
     }
 
     fn capture_options(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let can_toggle = self.gesture.is_none();
-            let transport = if self.controller.error().is_some() {
-                "Retry capture"
-            } else if self.controller.is_paused() {
-                "Play"
-            } else {
-                "Pause"
-            };
-            if ui
-                .add_enabled(can_toggle, egui::Button::new(transport))
-                .clicked()
-            {
-                self.toggle_capture();
+        options_field(ui, "Retain the latest audio", |ui| {
+            let mut retention = self.controller.retention();
+            if options_choice(ui, "history", &mut retention,
+                DurationChoice::ALL.into_iter().map(|value| (value, history_label(value)))) {
+                self.controller.set_retention(retention);
+                self.invalidate_export();
+                self.live_revision = None;
+                self.next_refresh = Instant::now();
+                self.save_preference(Key::History, retention.seconds().to_string());
             }
-            if ui
-                .add_enabled(can_toggle, egui::Button::new("Clear capture"))
-                .clicked()
-            {
-                self.clear_capture();
-            }
-            if ui
-                .add_enabled(
-                    self.selection.is_some(),
-                    egui::Button::new("Cancel selection"),
-                )
-                .clicked()
-            {
-                self.cancel_selection();
-            }
+            ui.small("Shortening the buffer trims the oldest audio.");
         });
-        egui::Grid::new("capture-options").show(ui, |ui| {
-            ui.label("History");
-            ui.horizontal_wrapped(|ui| {
-                let mut retention = self.controller.retention();
-                for value in DurationChoice::ALL {
-                    let seconds = value.seconds();
-                    let label = if seconds <= 60 {
-                        format!("{seconds} s")
-                    } else {
-                        format!("{} min", seconds / 60)
-                    };
-                    ui.selectable_value(&mut retention, value, label);
-                }
-                if retention != self.controller.retention() {
-                    self.controller.set_retention(retention);
-                    self.invalidate_export();
-                    self.live_revision = None;
-                    self.next_refresh = Instant::now();
-                    self.save_preference(Key::History, retention.seconds().to_string());
-                }
-            });
-            ui.end_row();
-            ui.label("Auto-resume");
-            ui.horizontal(|ui| {
-                let before = self.idle_resume;
-                for value in AutoResumeDelay::ALL {
-                    ui.selectable_value(
-                        &mut self.idle_resume,
-                        value,
-                        format!("{} s", value.seconds()),
-                    );
-                }
-                if self.idle_resume != before {
-                    self.save_preference(Key::IdleResume, self.idle_resume.seconds().to_string());
-                }
-            });
-            ui.end_row();
+        options_field(ui, "Auto-resume delay", |ui| {
+            if options_choice(ui, "auto-resume", &mut self.idle_resume,
+                AutoResumeDelay::ALL.into_iter().map(|value| (value, format!("{} seconds", value.seconds())))) {
+                self.save_preference(Key::IdleResume, self.idle_resume.seconds().to_string());
+            }
+            ui.small("A selected range keeps capture paused until you finish with it.");
         });
     }
 
     fn appearance_options(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Window");
         ui.checkbox(&mut self.waveform_only, "Show waveform only");
         ui.checkbox(&mut self.pinned, "Keep on top");
-        if ui.checkbox(&mut self.bar_lines, "Bar lines").changed() {
+        options_field(ui, "Background transparency", |ui| {
+            if options_choice(ui, "transparency", &mut self.transparency,
+                TRANSPARENCIES.into_iter().map(|value| (value, format!("{value}%")))) {
+                self.save_preference(Key::Transparency, self.transparency.to_string());
+            }
+            ui.small("0% is solid; 100% is fully transparent.");
+        });
+        self.accent_settings(ui);
+        ui.separator();
+        ui.strong("Timeline guides");
+        if ui.checkbox(&mut self.bar_lines, "Show bar lines").changed() {
             self.save_preference(Key::BarLines, u8::from(self.bar_lines).to_string());
         }
-        ui.horizontal(|ui| {
-            if ui.checkbox(&mut self.second_lines, "Second lines").changed() {
-                self.save_preference(Key::SecondsLines, u8::from(self.second_lines).to_string());
-            }
+        if ui.checkbox(&mut self.second_lines, "Show seconds lines").changed() {
+            self.save_preference(Key::SecondsLines, u8::from(self.second_lines).to_string());
+        }
+        options_field(ui, "Seconds interval", |ui| {
             ui.add_enabled_ui(self.second_lines, |ui| {
-                let before = self.second_interval;
-                for interval in [1, 5, 10] {
-                    ui.selectable_value(&mut self.second_interval, interval, format!("{interval} s"));
-                }
-                if self.second_interval != before {
+                if options_choice(ui, "seconds-interval", &mut self.second_interval,
+                    [1, 5, 10].into_iter().map(|value| (value, format!("{value} seconds")))) {
                     self.save_preference(Key::SecondsInterval, self.second_interval.to_string());
                 }
             });
         });
-        if ui.checkbox(&mut self.waveform_border, "Waveform border").changed() {
+        ui.separator();
+        ui.strong("Waveform border");
+        if ui.checkbox(&mut self.waveform_border, "Show a thin border").changed() {
             self.save_preference(Key::WaveformBorder, u8::from(self.waveform_border).to_string());
         }
         ui.add_enabled_ui(self.waveform_border, |ui| {
@@ -1536,84 +1574,42 @@ impl Recorder {
             let theme_changed = ui.checkbox(&mut theme, "Use theme color").changed();
             let [r, g, b, _] = self.waveform_border_color.unwrap_or(self.accent).to_array();
             let mut color = [r, g, b];
-            let color_changed = ui
-                .add_enabled_ui(!theme, |ui| ui.color_edit_button_srgb(&mut color))
-                .inner
-                .changed();
+            let color_changed = options_field(ui, "Custom border color", |ui| {
+                ui.add_enabled_ui(!theme, |ui| ui.color_edit_button_srgb(&mut color)).inner.changed()
+            });
             if theme_changed || color_changed {
                 self.waveform_border_color = (!theme).then(|| accent_color(color));
                 let [r, g, b] = color;
-                self.save_preference(
-                    Key::WaveformBorderColor,
-                    if theme { String::new() } else { format!("#{r:02x}{g:02x}{b:02x}") },
-                );
+                self.save_preference(Key::WaveformBorderColor,
+                    if theme { String::new() } else { format!("#{r:02x}{g:02x}{b:02x}") });
             }
-            if ui
-                .checkbox(&mut self.waveform_border_follows_background, "Follow background opacity")
-                .changed()
-            {
-                self.save_preference(
-                    Key::WaveformBorderFollowsBackground,
-                    u8::from(self.waveform_border_follows_background).to_string(),
-                );
+            if ui.checkbox(&mut self.waveform_border_follows_background, "Follow background opacity").changed() {
+                self.save_preference(Key::WaveformBorderFollowsBackground,
+                    u8::from(self.waveform_border_follows_background).to_string());
             }
         });
-        egui::Grid::new("appearance-options").show(ui, |ui| {
-            ui.label("Background transparency");
-            ui.horizontal(|ui| {
-                let before = self.transparency;
-                for value in TRANSPARENCIES {
-                    ui.selectable_value(&mut self.transparency, value, format!("{value}%"));
-                }
-                if self.transparency != before {
-                    self.save_preference(Key::Transparency, self.transparency.to_string());
-                }
-            });
-            ui.end_row();
-            ui.label("Waveform display");
+        ui.separator();
+        ui.strong("Display");
+        options_field(ui, "Single-source waveform", |ui| {
             ui.add_enabled_ui(!self.dual_source(), |ui| {
-                ui.horizontal(|ui| {
-                    let before = self.split_waveform;
-                    ui.selectable_value(&mut self.split_waveform, false, "Merged");
-                    ui.selectable_value(&mut self.split_waveform, true, "Left / Right");
-                    if self.split_waveform != before {
-                        self.save_preference(
-                            Key::SplitWaveform,
-                            if self.split_waveform { "1" } else { "0" },
-                        );
-                        self.live_revision = None;
-                        self.next_refresh = Instant::now();
-                    }
-                });
-            })
-            .response
-            .on_disabled_hover_text("Dual source uses two rows, A and B");
-            ui.end_row();
-            let dual = self.dual_source();
-            for lane in 0..if dual { 2 } else { 1 } {
-                if dual {
-                    ui.label(format!("Meter {}", lane_name(lane)));
-                } else {
-                    ui.label("Meter");
+                if options_choice(ui, "waveform-layout", &mut self.split_waveform,
+                    [(false, "Merged".to_owned()), (true, "Left / Right".to_owned())]) {
+                    self.save_preference(Key::SplitWaveform, if self.split_waveform { "1" } else { "0" });
+                    self.live_revision = None;
+                    self.next_refresh = Instant::now();
                 }
-                ui.horizontal(|ui| {
-                    let before = self.meter_modes[lane];
-                    for mode in MeterMode::OPTIONS {
-                        ui.selectable_value(&mut self.meter_modes[lane], mode, mode.unit())
-                            .on_hover_text(mode.description());
-                    }
-                    let mode = self.meter_modes[lane];
-                    if mode != before {
-                        self.save_preference(
-                            if lane == 0 { Key::Meter } else { Key::MeterB },
-                            mode.unit(),
-                        );
-                    }
-                });
-                ui.end_row();
-            }
+            }).response.on_disabled_hover_text("Two sources use separate A and B rows.");
         });
-        self.accent_settings(ui);
+        let dual = self.dual_source();
+        for lane in 0..if dual { 2 } else { 1 } {
+            let label = if dual { format!("Meter {}", lane_name(lane)) } else { "Meter".to_owned() };
+            ui.push_id(lane, |ui| options_field(ui, &label, |ui| {
+                if options_choice(ui, "meter", &mut self.meter_modes[lane],
+                    MeterMode::OPTIONS.into_iter().map(|mode| (mode, mode.unit().to_owned()))) {
+                    self.save_preference(if lane == 0 { Key::Meter } else { Key::MeterB }, self.meter_modes[lane].unit());
+                }
+            }));
+        }
     }
 
     fn source_options(&mut self, ui: &mut egui::Ui) {
@@ -1624,98 +1620,64 @@ impl Recorder {
         ui.add_enabled_ui(self.gesture.is_none(), |ui| {
             for (lane, settings) in sources.iter_mut().enumerate() {
                 ui.push_id(lane, |ui| {
+                    ui.strong(format!("Source {}", lane_name(lane)));
                     let configured = settings.clone();
                     let mut source = configured.as_ref().map(|settings| settings.source.clone());
-                    ui.horizontal(|ui| {
-                        ui.strong(lane_name(lane));
+                    options_field(ui, "Audio source", |ui| {
                         let source_menu = "source";
-                        let was_open = egui::ComboBox::is_open(
-                            ui.ctx(),
-                            ui.make_persistent_id(egui::IdSalt::new(source_menu)),
-                        );
+                        let was_open = egui::ComboBox::is_open(ui.ctx(), ui.make_persistent_id(egui::IdSalt::new(source_menu)));
                         let label = source.as_ref().map_or_else(
                             || std::borrow::Cow::Borrowed("Off"),
-                            |source| source_picker_label(
-                                choices
-                                .iter()
-                                .find(|choice| choice.same_source(source))
-                                .unwrap_or(source),
-                                choices,
-                            ),
-                        );
+                            |source| source_picker_label(choices.iter().find(|choice| choice.same_source(source)).unwrap_or(source), choices),
+                        ).into_owned();
+                        let width = ui.available_width().min(360.0);
                         egui::ComboBox::from_id_salt(source_menu)
-                            .selected_text(label)
-                            .width(196.0)
-                            .height(280.0)
-                            .truncate()
-                            .show_ui(ui, |ui| {
-                                if lane == 1 {
-                                    ui.selectable_value(&mut source, None, "Off");
-                                }
+                            .selected_text(&label).width(width)
+                            .height(280.0).truncate().show_ui(ui, |ui| {
+                                ui.set_max_width(width);
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                if lane == 1 { ui.selectable_value(&mut source, None, "Off"); }
                                 source_menu_opened |= !was_open;
-                                if !was_open || scanning {
-                                    ui.spinner();
-                                    return;
-                                }
+                                if !was_open || scanning { ui.spinner(); return; }
                                 for choice in choices {
-                                    let selected = source
-                                        .as_ref()
-                                        .is_some_and(|source| choice.same_source(source));
+                                    let selected = source.as_ref().is_some_and(|source| choice.same_source(source));
                                     let label = source_picker_label(choice, choices);
                                     let row = ui.selectable_label(selected, label.as_ref());
-                                    if row.clicked() && !selected {
-                                        source = Some(choice.clone());
-                                    }
+                                    if row.clicked() && !selected { source = Some(choice.clone()); }
                                     match choice {
-                                        CaptureSource::Application { path, .. } => {
-                                            row.on_hover_text(path);
-                                        }
-                                        CaptureSource::Sender { id, .. } => {
-                                            row.on_hover_text(format!("Sender instance {id}"));
-                                        }
+                                        CaptureSource::Application { path, .. } => { row.on_hover_text(path); }
+                                        CaptureSource::Sender { id, .. } => { row.on_hover_text(format!("Sender instance {id}")); }
                                         _ => {}
                                     }
                                 }
-                            });
-                        let same_source = source.as_ref().zip(configured.as_ref()).is_some_and(
-                            |(source, configured)| source.same_source(&configured.source),
-                        );
-                        *settings = source.map(|source| SourceSettings {
-                            source,
-                            route: configured
-                                .filter(|_| same_source)
-                                .map_or(ChannelRoute::Merged, |settings| settings.route),
-                        });
-                        if let Some(settings) = settings {
+                            }).response.on_hover_text(label);
+                    });
+                    let same_source = source.as_ref().zip(configured.as_ref())
+                        .is_some_and(|(source, configured)| source.same_source(&configured.source));
+                    *settings = source.map(|source| SourceSettings {
+                        source,
+                        route: configured.filter(|_| same_source).map_or(ChannelRoute::Merged, |settings| settings.route),
+                    });
+                    if let Some(settings) = settings {
+                        options_field(ui, "Channel route", |ui| {
                             egui::ComboBox::from_id_salt("route")
-                                .selected_text(settings.route.label())
-                                .show_ui(ui, |ui| {
+                                .selected_text(settings.route.label()).width(ui.available_width().min(360.0))
+                                .truncate().show_ui(ui, |ui| {
                                     for route in ChannelRoute::ALL {
-                                        let enabled = same_source
-                                            && self.controller.route_available(lane, route);
-                                        ui.add_enabled_ui(enabled, |ui| {
-                                            ui.selectable_value(
-                                                &mut settings.route,
-                                                route,
-                                                route.label(),
-                                            );
-                                        });
+                                        let enabled = same_source && self.controller.route_available(lane, route);
+                                        ui.add_enabled_ui(enabled, |ui| { ui.selectable_value(&mut settings.route, route, route.label()); });
                                     }
                                 });
-                        }
-                    });
-                    if let Some(status) = self.controller.source_status(lane) {
-                        ui.small(status);
+                        });
                     }
+                    if let Some(status) = self.controller.source_status(lane) { ui.small(status); }
+                    ui.add_space(8.0);
+                    if lane == 0 { ui.separator(); }
                 });
             }
         });
-        if source_menu_opened {
-            self.refresh_source_list();
-        }
-        if !CaptureSource::supports_app_capture() {
-            ui.small("Individual app capture requires Windows build 20348 or newer.");
-        }
+        if source_menu_opened { self.refresh_source_list(); }
+        if !CaptureSource::supports_app_capture() { ui.small("Individual app capture requires Windows build 20348 or newer."); }
         if sources != *self.controller.sources() {
             self.save_preference(Key::CaptureSources, serialize_sources(&sources));
             self.controller.set_sources(sources);
@@ -1755,66 +1717,38 @@ impl Recorder {
     }
 
     fn folder_options(&self, ui: &mut egui::Ui) -> Option<OptionsAction> {
-        let waveform = ui
-            .horizontal(|ui| {
-                let select = ui.button("Select save folder").clicked();
-                let open = ui
-                    .button("Go to save folder")
-                    .on_hover_text(self.output.display().to_string())
-                    .clicked();
-                if select {
-                    Some(OptionsAction::SelectSaveFolder)
-                } else {
-                    open.then_some(OptionsAction::GoToSaveFolder)
-                }
-            })
-            .inner;
-        let snapshot = ui
-            .horizontal(|ui| {
-                let select = ui.button("Select snapshot folder").clicked();
-                let open = ui
-                    .button("Go to snapshot folder")
-                    .on_hover_text(self.saved_output.display().to_string())
-                    .clicked();
-                if select {
-                    Some(OptionsAction::SelectSnapshotFolder)
-                } else {
-                    open.then_some(OptionsAction::OpenSnapshotFolder)
-                }
-            })
-            .inner;
+        let waveform = options_field(ui, "Drag-and-drop folder", |ui| {
+            ui.add(egui::Label::new(self.output.display().to_string()).truncate()).on_hover_text(self.output.display().to_string());
+            ui.horizontal_wrapped(|ui| {
+                let select = ui.button("Choose folder...").clicked();
+                let open = ui.button("Open folder").clicked();
+                if select { Some(OptionsAction::SelectSaveFolder) } else { open.then_some(OptionsAction::GoToSaveFolder) }
+            }).inner
+        });
+        let snapshot = options_field(ui, "Saved snapshots folder", |ui| {
+            ui.add(egui::Label::new(self.saved_output.display().to_string()).truncate()).on_hover_text(self.saved_output.display().to_string());
+            ui.horizontal_wrapped(|ui| {
+                let select = ui.button("Choose folder...").clicked();
+                let open = ui.button("Open folder").clicked();
+                if select { Some(OptionsAction::SelectSnapshotFolder) } else { open.then_some(OptionsAction::OpenSnapshotFolder) }
+            }).inner
+        });
         waveform.or(snapshot)
     }
 
     fn app_options(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) -> Option<OptionsAction> {
+        ui.strong("Application");
         let mut enabled = self.launch_at_login;
-        if self.primary && ui
-            .checkbox(&mut enabled, "Start with Windows")
-            .on_hover_text("Launch Backtracking from its current location when you sign in")
-            .changed()
-        {
+        if self.primary && ui.checkbox(&mut enabled, "Start with Windows")
+            .on_hover_text("Launch Backtracking from its current location when you sign in").changed() {
             self.set_launch_at_login(enabled, frame);
         }
-        let visible = frame
-            .winit_window()
-            .is_none_or(|window| !window_is_hidden(window));
-        ui.horizontal(|ui| {
-            let visibility = if visible {
-                ui.add_enabled(self.tray_available, egui::Button::new("Hide waveform"))
-                    .clicked()
-                    .then_some(OptionsAction::Hide)
-            } else {
-                ui.button("Show waveform")
-                    .clicked()
-                    .then_some(OptionsAction::Show)
-            };
-            let quit = ui.button("Quit Backtracking").clicked();
-            let close = ui.button("Close Options").clicked();
-            visibility
-                .or_else(|| quit.then_some(OptionsAction::Quit))
-                .or_else(|| close.then_some(OptionsAction::Close))
-        })
-        .inner
+        let visible = frame.winit_window().is_none_or(|window| !window_is_hidden(window));
+        let visibility = if visible {
+            ui.add_enabled(self.tray_available, egui::Button::new("Hide waveform")).clicked().then_some(OptionsAction::Hide)
+        } else { ui.button("Show waveform").clicked().then_some(OptionsAction::Show) };
+        let quit = ui.button("Quit Backtracking").clicked();
+        visibility.or_else(|| quit.then_some(OptionsAction::Quit))
     }
 
     fn select_save_folder(&mut self, frame: &eframe::Frame) {
@@ -1886,62 +1820,38 @@ impl Recorder {
 
     fn wav_settings(&mut self, ui: &mut egui::Ui) {
         let previous = self.wav_profile;
-        ui.label("WAV rate");
-        ui.horizontal(|ui| {
-            for (rate, label) in WAV_SAMPLE_RATES {
-                ui.selectable_value(&mut self.wav_profile.sample_rate, rate, label);
-            }
+        options_field(ui, "WAV sample rate", |ui| {
+            options_choice(ui, "wav-rate", &mut self.wav_profile.sample_rate,
+                WAV_SAMPLE_RATES.into_iter().map(|(rate, label)| (rate, label.to_owned())));
         });
-        ui.end_row();
-        ui.label("WAV encoding");
-        ui.horizontal(|ui| {
-            for (format, label) in WAV_SAMPLE_FORMATS {
-                ui.selectable_value(&mut self.wav_profile.sample_format, format, label);
-            }
+        options_field(ui, "WAV encoding", |ui| {
+            options_choice(ui, "wav-encoding", &mut self.wav_profile.sample_format,
+                WAV_SAMPLE_FORMATS.into_iter().map(|(format, label)| (format, label.to_owned())));
         });
-        ui.end_row();
-        ui.label("WAV channels");
-        let mono_changed = ui
-            .checkbox(&mut self.wav_force_mono, "Export every file as mono")
-            .changed();
-        ui.end_row();
-
+        let mono_changed = ui.checkbox(&mut self.wav_force_mono, "Export every file as mono").changed();
         if self.wav_profile != previous || mono_changed {
             self.invalidate_export();
             self.message.clear();
-            if mono_changed {
-                self.save_preference(
-                    Key::WavForceMono,
-                    if self.wav_force_mono { "1" } else { "0" },
-                );
-            }
+            if mono_changed { self.save_preference(Key::WavForceMono, if self.wav_force_mono { "1" } else { "0" }); }
             if self.wav_profile.sample_rate != previous.sample_rate {
                 self.save_preference(Key::WavSampleRate, self.wav_profile.sample_rate.to_string());
             }
             if self.wav_profile.sample_format != previous.sample_format {
-                self.save_preference(
-                    Key::WavSampleFormat,
-                    wav_sample_format_preference(self.wav_profile.sample_format),
-                );
+                self.save_preference(Key::WavSampleFormat, wav_sample_format_preference(self.wav_profile.sample_format));
             }
         }
+        ui.add_space(8.0);
     }
 
     fn accent_settings(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("Theme color", |ui| {
-            ui.spacing_mut().slider_width = 112.0;
-            let mut accent = self.accent;
-            let changed = egui::color_picker::color_picker_color32(
-                ui,
-                &mut accent,
-                egui::color_picker::Alpha::Opaque,
-            );
-            if ui.button("Reset color").clicked() {
-                accent = accent_color(DEFAULT_ACCENT);
-            } else if !changed {
-                return;
-            }
-            if accent != self.accent {
+        options_field(ui, "Theme color", |ui| {
+            let [r, g, b, _] = self.accent.to_array();
+            let mut color = [r, g, b];
+            let changed = ui.color_edit_button_srgb(&mut color).changed();
+            let mut accent = accent_color(color);
+            let reset = ui.button("Reset theme color").clicked();
+            if reset { accent = accent_color(DEFAULT_ACCENT); }
+            if (changed || reset) && accent != self.accent {
                 self.accent = accent;
                 apply_accent(ui.ctx(), accent);
             }
@@ -2965,6 +2875,47 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn options_list_stacks_controls_and_scrolls_without_horizontal_overflow() {
+        for width in [280.0, 360.0, 480.0] {
+            let context = egui::Context::default();
+            for _ in 0..3 {
+                context.run_ui(egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 150.0))),
+                    ..Default::default()
+                }, |ui| {
+                    ui.horizontal_top(|ui| {
+                        let mut rows = Vec::new();
+                        let output = egui::ScrollArea::vertical().auto_shrink([false, false])
+                            .show(ui, |ui| options_list(ui, |ui| {
+                                let mut enabled = true;
+                                for label in ["Show waveform only", "Keep on top", "Show bar lines"] {
+                                    rows.push(ui.checkbox(&mut enabled, label).rect);
+                                }
+                                let mut retention = DurationChoice::Minutes10;
+                                options_field(ui, "Retain the latest audio", |ui| {
+                                    options_choice(ui, "test-history", &mut retention,
+                                        DurationChoice::ALL.into_iter().map(|value| (value, history_label(value))));
+                                });
+                                let mut source = 0;
+                                options_field(ui, "Audio source", |ui| {
+                                    options_choice(ui, "test-source", &mut source,
+                                        [(0, "A long sender name that must stay inside the dropdown ".repeat(5))]);
+                                });
+                                ui.add(egui::Label::new("A long output folder path ".repeat(12)).truncate());
+                            }));
+                        assert!(rows.windows(2).all(|pair| pair[1].top() >= pair[0].bottom()),
+                            "Setting rows must extend down even inside a horizontal parent: {rows:?}");
+                        assert!(output.content_size.x <= output.inner_rect.width() + 1.0,
+                            "Form overflow at width {width}: {:?}", output.content_size);
+                        assert!(output.content_size.y > output.inner_rect.height(),
+                            "A long settings list must scroll vertically");
+                    });
+                }).drop_without_applying_deltas();
+            }
+        }
+    }
 
     #[test]
     fn waveform_pan_clamps_to_retained_frames_and_preserves_view_length() {

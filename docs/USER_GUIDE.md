@@ -1,6 +1,6 @@
 # Backtracking 操作手冊 / User Guide
 
-[繁體中文](#繁體中文) · [English](#english) · [安裝與建置 / Installation and build](#安裝與建置--installation-and-build)
+[繁體中文](#繁體中文) · [English](#english) · [安裝與建置 / Installation and build](#安裝與建置--installation-and-build) · [硬體使用量 / Hardware usage](HARDWARE_USAGE.md)
 
 ## 繁體中文
 
@@ -19,6 +19,8 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 點擊工具列的齒輪，或在 Backtracking 視窗內按滑鼠右鍵，可開啟 **Options**。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
 
+Options 左側是分類，右側以一列一項的直向清單顯示設定。保留時間、自動續錄、透明度和 WAV 格式使用下拉選單；內容較長時向下捲動。桌面設定視窗可調整大小，底部的關閉按鈕維持可見。插件會向 DAW 要求放大設定視窗，關閉後恢復原尺寸。
+
 macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`Control` 搭配波形上的點擊與拖曳用於框選。
 
 設定選單的背景透明度可選 0%、25%、50%、75% 或 100%。0% 為不透明，100% 為透明。桌面版在 100% 時仍可開啟設定選單調整透明度。VST3／CLAP 的 **Panel transparency** 調整插件內的波形面板背景，實際看到的底色取決於 DAW 的視窗背景。
@@ -31,24 +33,24 @@ macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`C
 - Windows 的 A／B 選用同一來源時，會以裝置的原始取樣率保留兩路音訊，例如 System Side／System Mid。若 WAV 設定使用不同取樣率，會在匯出整段選取時才轉換。暫停後重新開始錄音時，會平滑前後片段的接縫。
 - 單一來源可顯示合併波形或上下兩列 L／R。啟用 A／B 時，上列顯示 A、下列顯示 B，各占波形區的一半，並各自顯示音量。
 - 完成框選或明確保存整段時，波形會標記範圍頭尾。框選時按住 `Shift`，靠近可見旗標即可吸附。旗標會隨錄音歷史移動，並在各自離開可視範圍時消失。
-- `Ctrl+S` 與成功拖放會同時匯出 A／B。兩個 WAV 使用同一起訖和取樣率。若 DAW 要求指定匯入位置，可選擇分開音軌並使用相同開始位置。
+- **Save snapshot**、全域快照快捷鍵與成功拖放會同時匯出 A／B。兩個 WAV 使用同一起訖和取樣率。若 DAW 要求指定匯入位置，可選擇分開音軌並使用相同開始位置。
 
 [桌面版更新設定](UPDATES.md)
 
 ### 只顯示波形
 
-開啟 **只顯示波形／Show waveform only** 後，Backtracking 會隱藏自身的外框與深色底板，畫面只保留波形。桌面版的背景會變透明。VST3／CLAP 的視窗尺寸由 DAW 宿主決定，內嵌時可能看得到宿主視窗的外框或不透明底色。這個選項預設關閉，並跟著桌面偏好設定或 DAW 專案中的插件設定儲存。
+開啟 **只顯示波形／Show waveform only** 後，Windows／macOS 原生桌面視窗會縮到波形面板加可見外框的高度，並關閉原生陰影。背景透明度仍依 Options 設定，可保留實色、半透明或全透明；100% 透明時，波形與旗標仍可見、可操作。插件可向 DAW 要求縮小，宿主外框、陰影與底色由 DAW 管理。這個選項預設關閉，並跟著桌面偏好設定或 DAW 專案中的插件設定儲存。
 
 在波形上按右鍵開啟 Options。錄音已暫停時，可選 **開始錄音／Play**。錄音已待命或正在收錄時，可選 **暫停錄音／Pause**。
 
-切換時，波形會保持完整介面中的高度並垂直置中，視窗尺寸也會保留。拖曳桌面視窗的左右內緣可調整寬度，拖曳上下內緣可調整高度。視窗變窄時，同樣的錄音保留時間會顯示在更短的距離上，波形每秒移動的像素會減少。可用高度不足時，波形會跟著縮小。取消勾選時，視窗會視需要放大以容納完整介面。
+切換時保留波形面板高度，桌面視窗貼合面板，移除上下多餘的透明區。拖曳桌面視窗的左右內緣可調整寬度，拖曳上下內緣可調整高度。視窗變窄時，同樣的錄音保留時間會顯示在更短的距離上，波形每秒移動的像素會減少。可用高度不足時，波形會跟著縮小。取消勾選時，桌面視窗恢復切換前的完整模式尺寸。
 
 | 桌面版 | 只顯示波形最小尺寸 | 完整介面最小尺寸 |
 | --- | --- | --- |
 | Windows | 240 × 48 邏輯像素 | 510 × 132 邏輯像素 |
 | macOS | 240 × 48 點 | 560 × 100 點 |
 
-要回到完整介面，在波形上按右鍵，再取消勾選 **只顯示波形／Show waveform only**。只顯示波形時，Backtracking 會向 Windows 要求關閉原生陰影、邊框與圓角。
+要回到完整介面，在波形上按右鍵，再取消勾選 **只顯示波形／Show waveform only**。Windows／macOS 在此模式關閉原生陰影；可見細外框則由 Options 的外觀設定控制。
 
 ### 移動與縮放桌面視窗
 
@@ -102,21 +104,21 @@ macOS 桌面版可從選單列顯示、隱藏或結束 Backtracking，也可啟�
 | 匯入 DAW | 在波形上按住滑鼠左鍵並拖出 | 在波形上按住滑鼠左鍵並拖出 | 按住時顯示 **Drag and Drop**。檔案就緒後，拖到 REAPER 時間軸、FL Studio Playlist 或其他接受 WAV 的位置。 |
 | 指定起訖點 | 按住 `Ctrl`，在波形上按住左鍵拖曳 | 按住 `Option`，在波形上按住左鍵拖曳 | 顯示 **Drag to Select**。放開後保留框選區間，再放開修飾鍵並拖出選取區。 |
 
-單擊、框選和視窗內的拖曳只會操作波形。要匯出框選片段，請拖出後放到可接受 WAV 的位置，或按 `Ctrl+S` 保存。取消拖曳、拖回原視窗放開或目標拒絕時，不會留下匯出檔。若 WAV 還在準備，請保持按住滑鼠再放開。DAW 拒絕拖放時，可按 `Ctrl+S` 保存，再從保存資料夾手動匯入。
+單擊、框選和視窗內的拖曳只會操作波形。要匯出框選片段，請拖出後放到可接受 WAV 的位置，或從 Options 選擇 **Save snapshot**。取消拖曳、拖回原視窗放開或目標拒絕時，不會留下匯出檔。若 WAV 還在準備，請保持按住滑鼠再放開。DAW 拒絕拖放時，可從 Options 選擇 **Save snapshot**，再從保存資料夾手動匯入。
 
 Backtracking 視窗有焦點時，按 `Esc` 或 `Backspace` 可取消框選並立刻恢復錄音待命。
 
 ### 保存快照
 
-在 Backtracking 有焦點時，按 `Ctrl+S`，或從 Options 選擇 **Save snapshot**。有框選時只保存選取的音訊，並立即恢復錄音待命。未框選時保存按鍵當下保留的整段音訊。錄音中可以一邊保存一邊錄音，已暫停時則在取得快照後恢復待命。
+從 Options 選擇 **Save snapshot**，即可保存目前錄音器的快照。有框選時只保存選取的音訊，並立即恢復錄音待命。未框選時保存觸發當下保留的整段音訊。錄音中可以一邊保存一邊錄音，已暫停時則在取得快照後恢復待命。
 
-如果 DAW 攔截 `Ctrl+S` 作為專案儲存快捷鍵，可從插件的 Options 選擇 **Save snapshot**。
+Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift），macOS 使用 Fn／Globe 加同一位置的鍵，可在背景觸發快照，不必讓 Backtracking 或插件視窗取得焦點。Linux 請使用[快照快捷鍵常駐程式](../desktop/linux/README.md)。在 Options 可指定單一插件實例作為全域快照快捷鍵的目標。Backtracking 沒有綁定 `Ctrl+S`；在 DAW 中仍可用它儲存專案。
 
 ### 啟用、暫停與自動續錄
 
 選擇 **Play** 進入錄音待命，或選擇 **Pause** 手動暫停。完整介面可使用工具列，只顯示波形時可從右鍵開啟 Options。重新待命後，下一段收錄的音訊會接在原有歷史後方，受保留時間上限約束。
 
-**自動續錄／Auto-resume** 可在設定選單選擇 **0、5 或 10 秒**，預設 **10 秒**。選 **0 秒**時，點擊、框選或拖出 WAV 完成後會立刻恢復待命。框選的片段會保留，可在錄音接續時拖出。手動按 **Pause** 後會維持暫停，直到按 **Play** 或完成下一次波形操作。選 **5 秒**或 **10 秒**時，手動暫停或操作波形後會從取樣器視窗內最後一次點擊或手勢結束時開始計時。拖曳期間會保持暫停。恢復待命後，聲音超過靜音偵測門檻時才會收錄。
+**自動續錄／Auto-resume** 可在設定選單選擇 **0、5 或 10 秒**，預設 **10 秒**。框選放開後保留選區並維持暫停，選區存在期間這三種延遲都不計時；縮放、平移與拖曳旗標會保留選區和暫停狀態。取消選取（`Esc`／`Backspace`）、普通波形點擊或匯出拖曳結束後會立即恢復待命。手動按 **Pause** 後可按 **Play** 恢復；沒有保留選區時，5／10 秒設定從最後一次操作後計時。拖曳期間保持暫停。恢復待命後，聲音超過靜音偵測門檻時才會收錄。
 
 舊版儲存的 **Off、20 秒、30 秒**會改用 **10 秒**。
 
@@ -126,7 +128,7 @@ Backtracking 視窗有焦點時，按 `Esc` 或 `Backspace` 可取消框選並�
 
 ### 輸出位置與檔案規格
 
-在 Options 可各自指定並開啟兩個資料夾。成功拖放使用預設輸出資料夾，`Ctrl+S` 和 **Save snapshot** 使用保存資料夾。原先設定的匯出目的地會沿用。
+在 Options 可各自指定並開啟兩個資料夾。成功拖放使用預設輸出資料夾，全域快照快捷鍵和 **Save snapshot** 使用保存資料夾。原先設定的匯出目的地會沿用。
 
 | 版本 | 預設輸出資料夾 | 保存資料夾的預設位置 |
 | --- | --- | --- |
@@ -167,7 +169,7 @@ Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續�
 | 播放有聲音，但波形沒有更新 | 將游標移到狀態燈確認狀態。若已暫停，按 **Play**。Windows 確認來源使用預設播放裝置。macOS 確認系統音訊錄製權限。插件確認音軌正在播放或監聽，且 Backtracking 的插入點收得到訊號。 |
 | Windows 切換喇叭或耳機後無法擷取 | 確認新的裝置已是系統預設播放裝置，再按 **Play** 重新連線。 |
 | DAW 掃描不到插件 | 確認已複製完整 `.vst3` 或 `.clap`，架構與 DAW 相容，且檔案位於 DAW 會掃描的資料夾。依下方步驟重新掃描。 |
-| DAW 拒絕拖放 | 拖出視窗後保持按住滑鼠，等 WAV 準備完成，再放到可接受音訊檔的時間軸或 Playlist。也可按 `Ctrl+S` 保存，再從保存資料夾手動匯入。 |
+| DAW 拒絕拖放 | 拖出視窗後保持按住滑鼠，等 WAV 準備完成，再放到可接受音訊檔的時間軸或 Playlist。也可從 Options 選擇 **Save snapshot**，再從保存資料夾手動匯入。 |
 | 無法寫入 WAV | 確認波形有可用的音訊，再選擇可寫入的存檔資料夾。 |
 
 **離線渲染**。CLAP 在宿主回報離線模式時會略過擷取。VST3 使用的 nice-plug 0.4.2 有時會回報前一次的處理模式，離線渲染仍可能進入回溯歷史。渲染前若要保留目前的素材，請先匯出。若要在渲染期間維持凍結，先將自動續錄設為 **0 秒**，再按 **Pause**。
@@ -189,6 +191,8 @@ On Windows, route the source to the default playback device. If a DAW uses ASIO,
 
 Click the gear in the toolbar or right-click inside the Backtracking window to open **Options**. The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
 
+Choose a category on the left, then use the vertical settings list on the right. History, auto-resume, transparency, and WAV format use dropdowns. Scroll down for more settings. Desktop Options can be resized and keeps Close visible at the bottom. The plug-in requests a larger editor for Options and restores its previous size when closed.
+
 In the macOS desktop app, use a mouse right-click or the trackpad's secondary click to open the menu. Use `Control` with a click and drag over the waveform to select audio.
 
 The settings menu offers five background transparency levels. Choose 0%, 25%, 50%, 75%, or 100%, where 0% is opaque and 100% is clear. On the desktop apps, you can open Settings and adjust the value even at 100%. In VST3 and CLAP, **Panel transparency** fades the waveform panel's fill. The DAW provides the background behind it.
@@ -201,24 +205,24 @@ The settings menu offers five background transparency levels. Choose 0%, 25%, 50
 - On Windows, A/B routes from the same source, such as System Side and System Mid, use the device's native sample rate. Export converts the whole selection if the WAV rate differs. Capture also smooths the splice when you resume after a pause.
 - For one source, choose a merged waveform or two L/R rows. With A/B enabled, A and B each use half the waveform area and have independent meters.
 - Flags mark the boundaries after selecting a range or saving the full capture. Hold `Shift` while selecting near a visible flag to snap to it. Each flag follows the retained audio and disappears when it leaves view.
-- `Ctrl+S` and accepted drops export both tracks with the same boundaries and sample rate. If your DAW prompts for placement, choose separate tracks at the same start position.
+- **Save snapshot**, the global snapshot shortcut, and accepted drops export both tracks with the same boundaries and sample rate. If your DAW prompts for placement, choose separate tracks at the same start position.
 
 [Desktop update settings](UPDATES.md)
 
 ### Show waveform only
 
-Turn on **Show waveform only** to hide Backtracking's frame and dark panel background. Only the waveform is visible. The desktop window uses a transparent background. The DAW controls the VST3 or CLAP editor size and may supply its own window frame or opaque background. This setting defaults to Off and is saved with the desktop preferences or the plug-in's DAW project settings.
+Turn on **Show waveform only** to shrink the native Windows/macOS desktop window to the waveform panel plus its visible border and disable the native shadow. Background transparency still follows Options: opaque, translucent, or fully transparent. Waveforms and flags remain visible and interactive at 100% transparency. Plug-ins can request a smaller editor; the DAW manages its outer frame, shadow, and background. This setting defaults to Off and is saved with the desktop preferences or the plug-in's DAW project settings.
 
 Right-click the waveform to open Options. Choose **Play** (**開始錄音** in the macOS app) when capture is paused, or **Pause** (**暫停錄音**) when capture is armed or recording.
 
-When you switch modes, the waveform keeps the height it had in the full interface and moves to the vertical center. The window keeps its size. Drag either inside side edge to adjust the desktop window's width or the top and bottom edges to adjust its height. A narrower window shows the same retained duration over a shorter distance, reducing the number of pixels the waveform scrolls per second. The waveform shrinks to fit a shorter window. When you turn the mode off, the window grows if needed to fit the full interface.
+When you switch modes, the desktop window fits the waveform panel's existing height and removes excess transparent space above and below it. Drag either inside side edge to adjust the width or the top and bottom edges to adjust the height. A narrower window shows the same retained duration over a shorter distance, reducing the number of pixels the waveform scrolls per second. The waveform shrinks to fit a shorter window. Turning the mode off restores the previous full-interface window size.
 
 | Desktop app | Waveform-only minimum size | Full interface minimum size |
 | --- | --- | --- |
 | Windows | 240 × 48 logical pixels | 510 × 132 logical pixels |
 | macOS | 240 × 48 points | 560 × 100 points |
 
-To restore the full interface, right-click the waveform and turn off **Show waveform only**. In waveform-only mode, Backtracking asks Windows to suppress the native shadow, border, and rounded corners.
+To restore the full interface, right-click the waveform and turn off **Show waveform only**. Windows/macOS native shadows are disabled in this mode; the optional thin border is controlled separately in Appearance Options.
 
 ### Move and resize the desktop window
 
@@ -272,21 +276,21 @@ Gesture hints appear as you interact in the full interface. The tooltip tries th
 | Drop a clip into a DAW | Hold the primary mouse button on the waveform and drag out | Hold the primary mouse button on the waveform and drag out | The hint shows **Drag and Drop**. Once ready, drop the WAV onto the REAPER timeline, FL Studio Playlist, or another WAV drop target. |
 | Choose both ends | Hold `Ctrl` and drag across the waveform | Hold `Option` and drag across the waveform | The hint shows **Drag to Select**. Release to keep the selection, then release the modifier and drag out the highlighted range. |
 
-Clicking, selecting, and dragging within the window only affect the waveform. To export a selected clip, drag it out and drop it on a target that accepts WAV files, or press `Ctrl+S` to save. Canceled or rejected drops, including drops back in the source window, leave no export file. Keep the mouse button held while an export finishes preparing. If the DAW rejects the drop, press `Ctrl+S` and import the WAV from the saved snapshots folder.
+Clicking, selecting, and dragging within the window only affect the waveform. To export a selected clip, drag it out and drop it on a target that accepts WAV files, or choose **Save snapshot** in Options. Canceled or rejected drops, including drops back in the source window, leave no export file. Keep the mouse button held while an export finishes preparing. If the DAW rejects the drop, choose **Save snapshot** in Options and import the WAV from the saved snapshots folder.
 
 With Backtracking focused, press `Esc` or `Backspace` to clear the selection and re-arm capture immediately.
 
 ### Save a snapshot
 
-With Backtracking focused, press `Ctrl+S` or choose **Save snapshot** in Options. With a selection, it saves only that range and re-arms capture immediately. With no selection, it saves all audio retained at the time of the keypress. Active capture continues while saving. If capture was paused, it re-arms after the snapshot is taken.
+Choose **Save snapshot** in Options to save from the current recorder. With a selection, it saves only that range and re-arms capture immediately. With no selection, it saves all audio retained when triggered. Active capture continues while saving. If capture was paused, it re-arms after the snapshot is taken.
 
-If your DAW intercepts `Ctrl+S` to save its project, choose **Save snapshot** in the plug-in's Options.
+On Windows, press Alt plus the physical key to the left of 1 (the ~ / grave key, without Shift). On macOS, press Fn/Globe plus that same physical key. The global shortcut works from the background, without focusing Backtracking or the plug-in editor. On Linux, use the [snapshot shortcut helper](../desktop/linux/README.md). Options can select one plug-in instance as the global shortcut target. Backtracking does not bind `Ctrl+S`; it remains available to save the DAW project.
 
 ### Arm, pause, and auto-resume capture
 
 Choose **Play** to arm capture or **Pause** to pause it manually. Use the toolbar in the full interface or right-click to open Options in waveform-only mode. Once re-armed, the next sound is appended to the existing history within the selected limit.
 
-**Auto-resume** offers **0, 5, or 10 seconds** in Settings and defaults to **10 seconds**. At **0 seconds**, capture re-arms as soon as you finish clicking, selecting a range, or dragging out a WAV. A selected clip remains available to drag out while capture continues. After you manually press **Pause**, capture stays paused until you press **Play** or finish another waveform gesture. With **5 seconds** or **10 seconds**, the timer starts after the last click in the sampler or the end of a gesture. Capture stays paused during a drag. Once re-armed, capture waits for the incoming signal to cross the silence threshold.
+**Auto-resume** offers **0, 5, or 10 seconds** in Settings and defaults to **10 seconds**. Releasing a selection preserves it and holds capture paused; all three delays stop counting while a selection exists. Zooming, panning, and adjusting flags preserve the selection and paused state. Canceling the selection (`Esc`/`Backspace`), an ordinary waveform click, or finishing an export drag re-arms capture immediately. After manual **Pause**, use **Play** to resume; with no retained selection, the 5/10-second timer starts after the last interaction. Capture stays paused during a drag. Once re-armed, capture waits for the incoming signal to cross the silence threshold.
 
 Existing **Off**, **20-second**, and **30-second** settings use the **10-second** default.
 
@@ -296,7 +300,7 @@ Click the trash icon in the toolbar. It is labeled **Clear capture** on Windows 
 
 ### Output location and file format
 
-You can choose and open both folders from Options. Successful drops use the default export folder. `Ctrl+S` and **Save snapshot** use the saved snapshots folder. Existing export destinations are carried forward.
+You can choose and open both folders from Options. Successful drops use the default export folder. The global snapshot shortcut and **Save snapshot** use the saved snapshots folder. Existing export destinations are carried forward.
 
 | Edition | Default export folder | Default saved snapshots folder |
 | --- | --- | --- |
@@ -337,7 +341,7 @@ For **VST3 and CLAP**, the DAW project stores each plug-in instance's history le
 | Audio plays but the waveform stays still | Hover over the indicator to check the capture state. If paused, press **Play**. On Windows, verify the source uses the default playback device. On macOS, verify system audio recording permission. In a DAW, check playback or monitoring and the signal at the plug-in insert. |
 | Capture stops after switching Windows playback devices | Set the new device as the default playback device, then press **Play** to reconnect. |
 | The plug-in does not appear in the DAW | Verify that the entire `.vst3` or `.clap` is in a scanned folder and that its architecture matches the DAW. Rescan using the steps below. |
-| The DAW refuses the drop | Drag outside the window, keep the mouse button held while the WAV prepares, and release on an audio timeline or Playlist. You can also press `Ctrl+S` and import the WAV from the saved snapshots folder. |
+| The DAW refuses the drop | Drag outside the window, keep the mouse button held while the WAV prepares, and release on an audio timeline or Playlist. You can also choose **Save snapshot** in Options and import the WAV from the saved snapshots folder. |
 | The WAV could not be written | Check that the waveform contains audio and choose a writable save folder. |
 
 **Offline rendering**. CLAP skips capture when the host reports offline mode. The nice-plug 0.4.2 VST3 wrapper can pass the previous processing mode to Backtracking, so an offline render may enter the capture history. Export important clips before rendering. To keep capture frozen during the render, set auto-resume to **0 seconds** and press **Pause** first.
@@ -354,6 +358,10 @@ cd Backtracking
 ```
 
 ### Windows 桌面版 / Windows desktop
+
+可用 Windows Setup 安裝桌面版，分別勾選 VST3／CLAP，並各自選擇安裝的掃描根目錄。Setup 預設安裝到目前使用者的目錄；請將所選插件路徑加入 DAW 掃描設定。解除安裝會保留錄音與設定。[Setup 路徑選擇、建置與安裝說明](../desktop/windows/installer/README.md)
+
+Use Windows Setup to install the desktop app, select VST3/CLAP independently, and choose a separate scan-root folder for each format. Defaults are per user; add your chosen plug-in roots to the DAW's scan paths. Uninstall preserves recordings and settings. [Setup path selection, build, and installation instructions](../desktop/windows/installer/README.md)
 
 需要 Windows 10／11 x64、Visual Studio C++ Build Tools 和 Windows SDK。以下指令適用於 PowerShell。
 
@@ -421,26 +429,26 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 1. 播放兩小段聲音，中間留一段長靜音。確認波形留下兩段有效音訊。
 
    Play two short sounds with a long pause between them and check that both remain in the waveform.
-2. 將自動續錄設為 **0 秒**。播放有聲音時確認紅燈閃爍，再按 **Pause**，確認波形停止更新。按 **Play** 重新待命，接著框選一段波形，確認放開滑鼠後恢復待命，而且仍能拖出剛選的片段。
+2. 將自動續錄設為 **0 秒**。播放有聲音時確認紅燈閃爍，再按 **Pause**，確認波形停止更新。按 **Play** 重新待命，接著框選一段波形，確認放開滑鼠後保留選區並維持暫停。改用 **5／10 秒**重試，選區維持期間也不應計時；取消選取或匯出拖曳結束後應立即恢復待命。
 
-   Set auto-resume to **0 seconds**. Play a sound and check that the red indicator blinks. Press **Pause** and check that the waveform freezes. Press **Play**, then select a range and verify that capture re-arms on release and you can still drag out the selected clip.
+   Set auto-resume to **0 seconds**. Play a sound and check that the red indicator blinks. Press **Pause** and check that the waveform freezes. Press **Play**, then select a range and verify that releasing it preserves the selection and keeps capture paused. Repeat at **5/10 seconds**; neither timer should run while the selection remains. Canceling the selection or finishing an export drag should re-arm capture immediately.
 3. 選擇預設輸出資料夾，將 WAV 設為 44.1 kHz、24-bit PCM。分別單擊、框選、在視窗內拖放，以及拖到無效位置，確認輸出資料夾沒有新增 WAV。再將框選的片段拖進 DAW，確認有一個新 WAV，且規格正確。若使用插件，分別在 VST3 和 CLAP 實例操作一次。
 
    Choose an export folder and set the WAV format to 44.1 kHz, 24-bit PCM. Click the waveform, select a range, drag inside the window, and drop outside on an invalid target. Verify that none leave a new WAV in the export folder. Then drag a selected clip into your DAW and check that one new WAV uses the chosen format. For plug-in use, try a VST3 instance and a CLAP instance.
 4. 修改一項偏好後重開桌面版，確認設定有還原。測試插件時，修改設定後先儲存 DAW 專案，再重開該專案確認。
 
    Change a preference and relaunch the desktop app to check that it is restored. For the plug-in, change a setting, save the DAW project, and reopen it to check the saved value.
-5. 開啟 **只顯示波形**，確認波形高度維持原樣並垂直置中。按右鍵開啟 Options，測試暫停和啟用錄音，再確認框選時區間內的波形會變色。桌面版可將視窗拖到螢幕邊緣附近，確認仍停在放開的位置，再將視窗縮到最小尺寸，並從 Options 切回完整介面。
+5. 開啟 **只顯示波形**，確認桌面視窗貼合原波形面板高度，並測試 0%／50%／100% 背景透明度；全透明時波形與旗標仍應可見、可操作。按右鍵開啟 Options，測試暫停和啟用錄音，再確認框選時區間內的波形會變色。桌面版可將視窗拖到螢幕邊緣附近，確認仍停在放開的位置，再將視窗縮到最小尺寸，並從 Options 切回完整介面，確認恢復原尺寸。
 
-   Turn on **Show waveform only** and check that the waveform keeps its height and moves to the vertical center. Right-click to open Options and test pausing and arming capture. Check that selecting a range changes its waveform color. On desktop, move the window near a screen edge and check that it stays where you release it, then resize it to the minimum size and restore the full interface from Options.
+   Turn on **Show waveform only** and check that the desktop window fits the waveform panel's prior height. Test 0%/50%/100% background transparency; waveforms and flags should stay visible and interactive when fully transparent. Right-click to open Options and test pausing and arming capture. Check that selecting a range changes its waveform color. On desktop, move the window near a screen edge and check that it stays where you release it, then resize it to the minimum size and restore the full interface and its prior size from Options.
 6. 將保留時間切到 **60 秒**，並用調色盤改色。切到 **10 秒**自動續錄，框選後按 `Esc`，再用 `Backspace` 重試。每次都應立刻恢復待命，且存檔資料夾不應新增 WAV。
 
    Set history to **60 seconds** and change the theme color. Set auto-resume to **10 seconds**, select a range, and press `Esc`. Repeat with `Backspace`. Capture should re-arm immediately each time and the save folder should have no new WAV.
 7. 移動桌面視窗，用系統匣或選單列隱藏視窗，播放音訊，再顯示並檢查波形。結束並重新開啟後，確認視窗位置有還原。若開啟了登入時自動啟動，可登出再登入確認。
 
    Move the desktop window, hide it from the tray or menu bar, play audio, then show it and check the waveform. Quit and reopen the app to check that the position is restored. If you enabled launch at login, sign out and back in to verify it.
-8. 指定保存資料夾。錄音中按 `Ctrl+S`，確認波形持續更新，再框選一段並按 `Ctrl+S`。確認保存資料夾內分別出現完整快照和框選片段，且存下框選後已恢復待命。
+8. 指定保存資料夾。錄音中從 Options 選擇 **Save snapshot**，確認波形持續更新，再框選一段並再次保存。確認保存資料夾內分別出現完整快照和框選片段，且存下框選後已恢復待命。切換到其他程式後，Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift），macOS 按 Fn／Globe 加同一位置的鍵，確認背景快照可用。使用插件時，從 Options 指定一個目標實例，確認全域快捷鍵只保存該實例；在 DAW 按 `Ctrl+S` 不應觸發快照。
 
-   Choose a saved snapshots folder. Press `Ctrl+S` while recording and check that the waveform continues updating. Select a range and press `Ctrl+S` again. Verify that the saved snapshots folder contains the full snapshot and the selected clip, and that capture re-arms after saving the selection.
+   Choose a saved snapshots folder. Choose **Save snapshot** in Options while recording and check that the waveform continues updating. Select a range and save again. Verify that the saved snapshots folder contains the full snapshot and the selected clip, and that capture re-arms after saving the selection. Switch to another app and verify a background snapshot with Alt plus the physical key left of 1 (the ~ / grave key, without Shift) on Windows, or Fn/Globe plus that key on macOS. For plug-ins, choose one target instance in Options and verify that the global shortcut saves only that instance; pressing `Ctrl+S` in the DAW should not trigger a snapshot.
 
 [回到專案首頁 / Back to the project README](../README.md)

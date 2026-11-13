@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use eframe::egui::{Context, ViewportId};
 use windows::Win32::UI::{
     Input::KeyboardAndMouse::{
-        GetKeyboardLayout, MAPVK_VSC_TO_VK_EX, MOD_NOREPEAT, MOD_WIN, MapVirtualKeyExW,
+        GetKeyboardLayout, MAPVK_VSC_TO_VK_EX, MOD_ALT, MOD_NOREPEAT, MapVirtualKeyExW,
         RegisterHotKey, UnregisterHotKey, VK_OEM_3,
     },
     WindowsAndMessaging::{
@@ -70,7 +70,7 @@ impl SnapshotHotkey {
                                 let _ = UnregisterHotKey(None, HOTKEY_ID);
                             }
                             mapped_key = Some(key);
-                            let result = RegisterHotKey(None, HOTKEY_ID, MOD_WIN | MOD_NOREPEAT, key);
+                            let result = RegisterHotKey(None, HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, key);
                             registered = result.is_ok();
                             publish(Event::Availability(result.map_err(|error| error.to_string())));
                         }
@@ -102,7 +102,7 @@ impl Drop for SnapshotHotkey {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
-    use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_SHIFT, VK_F11};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_CONTROL, MOD_SHIFT, VK_F11};
 
     fn registration(hotkey: &SnapshotHotkey) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -116,9 +116,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "temporarily reserves the real Win+grave shortcut in the Windows session"]
-    fn win_grave_registers_reports_conflicts_and_is_released_on_exit() {
-        // Distinguish a restricted/noninteractive desktop from a Win+grave collision.
+    #[ignore = "temporarily reserves the real Alt+grave shortcut in the Windows session"]
+    fn alt_grave_registers_reports_conflicts_and_is_released_on_exit() {
+        // Distinguish a restricted/noninteractive desktop from an Alt+grave collision.
         unsafe {
             let modifier = MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT;
             RegisterHotKey(None, HOTKEY_ID, modifier, u32::from(VK_F11.0))
@@ -126,12 +126,12 @@ mod tests {
             UnregisterHotKey(None, HOTKEY_ID).unwrap();
         }
         let first = SnapshotHotkey::start(Context::default()).unwrap();
-        registration(&first).expect("Win+grave must be available in this Windows session");
+        registration(&first).expect("Alt+grave must be available in this Windows session");
         let second = SnapshotHotkey::start(Context::default()).unwrap();
         assert!(registration(&second).is_err());
         drop(second);
         drop(first);
         let restarted = SnapshotHotkey::start(Context::default()).unwrap();
-        registration(&restarted).expect("the previous listener must release Win+grave");
+        registration(&restarted).expect("the previous listener must release Alt+grave");
     }
 }

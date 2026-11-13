@@ -103,6 +103,10 @@ private class KeyPanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
+private final class OptionsDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 private final class CapturePanel: KeyPanel {
     var onClick: (() -> Void)?
     var onOptions: (() -> Void)?
@@ -945,10 +949,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     private func makeOptionsPanel() -> KeyPanel {
         let window = KeyPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 615, height: 445),
-            styleMask: [.titled, .closable], backing: .buffered, defer: false
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 560),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false
         )
         window.title = "Backtracking 設定"
+        window.contentMinSize = NSSize(width: 680, height: 460)
         window.isReleasedWhenClosed = false
         window.isFloatingPanel = true
         window.level = .floating
@@ -958,7 +963,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let tabs = NSTabView(frame: .zero)
         tabs.tabViewType = .noTabsNoBorder
         var pages = [makeActionTab(), makeCaptureTab(), makeSourceTab(), makeAppearanceTab(), makeExportTab()]
-        if !independentWindow { pages.append(startupUpdater.makeOptionsTab()) }
+        if !independentWindow { pages.append(makeUpdateTab()) }
         for page in pages { tabs.addTabViewItem(page) }
         optionTabs = tabs
         optionCategoryButtons = pages.enumerated().map { index, page in
@@ -974,34 +979,51 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let sidebar = NSStackView(views: optionCategoryButtons)
         sidebar.orientation = .vertical
         sidebar.alignment = .leading
-        sidebar.spacing = 8
+        sidebar.spacing = 6
+        for button in optionCategoryButtons {
+            button.widthAnchor.constraint(equalTo: sidebar.widthAnchor).isActive = true
+        }
         let notice = NSTextField(labelWithString: "")
         notice.textColor = .secondaryLabelColor
         notice.lineBreakMode = .byTruncatingMiddle
+        notice.maximumNumberOfLines = 1
         notice.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         optionsNotice = notice
         let separator = NSBox(frame: .zero)
         separator.boxType = .separator
-        for view in [sidebar as NSView, separator, tabs, notice] {
+        let footerSeparator = NSBox(frame: .zero)
+        footerSeparator.boxType = .separator
+        let close = NSButton(title: "關閉", target: window, action: #selector(NSWindow.performClose(_:)))
+        close.bezelStyle = .rounded
+        close.keyEquivalent = "\u{1b}"
+        for view in [sidebar as NSView, separator, tabs, footerSeparator, notice, close] {
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(view)
         }
         NSLayoutConstraint.activate([
             sidebar.topAnchor.constraint(equalTo: content.topAnchor, constant: 22),
             sidebar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
-            sidebar.widthAnchor.constraint(equalToConstant: 112),
-            separator.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: 5),
+            sidebar.widthAnchor.constraint(equalToConstant: 136),
+            sidebar.bottomAnchor.constraint(lessThanOrEqualTo: footerSeparator.topAnchor, constant: -12),
+            separator.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: 10),
             separator.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
-            separator.bottomAnchor.constraint(equalTo: notice.topAnchor, constant: -9),
+            separator.bottomAnchor.constraint(equalTo: footerSeparator.topAnchor, constant: -10),
             separator.widthAnchor.constraint(equalToConstant: 1),
-            tabs.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
-            tabs.leadingAnchor.constraint(equalTo: separator.trailingAnchor, constant: 5),
+            tabs.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            tabs.leadingAnchor.constraint(equalTo: separator.trailingAnchor, constant: 10),
             tabs.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
-            tabs.bottomAnchor.constraint(equalTo: notice.topAnchor, constant: -8),
+            tabs.bottomAnchor.constraint(equalTo: footerSeparator.topAnchor, constant: -10),
+            footerSeparator.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
+            footerSeparator.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
+            footerSeparator.heightAnchor.constraint(equalToConstant: 1),
+            footerSeparator.bottomAnchor.constraint(equalTo: close.topAnchor, constant: -10),
             notice.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
-            notice.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
+            notice.trailingAnchor.constraint(equalTo: close.leadingAnchor, constant: -12),
             notice.heightAnchor.constraint(equalToConstant: 16),
-            notice.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10)
+            notice.centerYAnchor.constraint(equalTo: close.centerYAnchor),
+            close.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
+            close.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
+            close.widthAnchor.constraint(greaterThanOrEqualToConstant: 72)
         ])
         window.contentView = content
         window.center()
@@ -1030,7 +1052,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if independentWindow {
             quit.title = "關閉接收視窗"
             return optionsTab("動作與快捷鍵", rows: [
-                controlRow(capture, save, clear), controlRow(cancel, quit)
+                optionGroup("錄音動作", description: "管理這個接收視窗的錄音與選取範圍。", rows: [
+                    capture, save, clear, cancel
+                ]),
+                optionGroup("接收視窗", description: "結束這個獨立接收視窗。", rows: [quit])
             ])
         }
         optionsVisibilityButton = visibility
@@ -1039,7 +1064,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         target.action = #selector(snapshotTargetChanged(_:))
         target.autoenablesItems = false
         target.menu?.delegate = self
-        target.widthAnchor.constraint(lessThanOrEqualToConstant: 315).isActive = true
+        prepareOptionPopup(target)
         snapshotTargetPopup = target
         refreshSnapshotTargets()
         let shortcut = NSTextField(labelWithString: "Fn／Globe + 左上角反引號鍵")
@@ -1047,12 +1072,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         shortcutPermissionButton = permission
         refreshShortcutPermission()
         return optionsTab("動作與快捷鍵", rows: [
-            controlRow(capture, save, clear),
-            controlRow(cancel, visibility, quit),
-            labeledOption("全域快捷鍵", shortcut),
-            labeledOption("快照目標", target),
-            permission,
-            login
+            optionGroup("錄音動作", description: "管理目前保留的錄音與選取範圍。", rows: [
+                capture, save, clear, cancel
+            ]),
+            optionGroup("全域快捷鍵", description: "使用快捷鍵將快照保存到選定的目標。", rows: [
+                labeledOption("按鍵組合", shortcut),
+                labeledOption("快照目標", target),
+                permission
+            ]),
+            optionGroup("應用程式", description: "調整啟動方式與波形視窗的顯示。", rows: [
+                login, visibility, quit
+            ])
         ])
     }
 
@@ -1066,6 +1096,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             let title = usedTitles.insert(target.name).inserted ? target.name : "\(target.name) · \(target.id)"
             popup.addItem(withTitle: title)
             popup.lastItem?.representedObject = target.id
+            popup.lastItem?.toolTip = title
             if snapshotTargetID == target.id { selectedIndex = popup.numberOfItems - 1 }
         }
         if let snapshotTargetID, selectedIndex == 0 {
@@ -1075,11 +1106,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             selectedIndex = popup.numberOfItems - 1
         }
         popup.selectItem(at: selectedIndex)
+        popup.toolTip = popup.titleOfSelectedItem
     }
 
     @objc private func snapshotTargetChanged(_ sender: NSPopUpButton) {
         snapshotTargetID = sender.selectedItem?.representedObject as? String
         defaults.set(snapshotTargetID, forKey: "snapshotTargetID")
+        sender.toolTip = sender.titleOfSelectedItem
     }
 
     private func dispatchSnapshotShortcut() {
@@ -1104,12 +1137,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     private func makeCaptureTab() -> NSTabViewItem {
         optionsTab("擷取", rows: [
-            optionChoice(
-                "保留時間", choices: timeChoices, selected: history, action: #selector(historyChanged(_:))
-            ) { $0 > 60 ? "\($0 / 60) 分鐘" : "\($0) 秒" },
-            optionChoice(
-                "自動續錄", choices: autoResumeChoices, selected: idleSeconds, action: #selector(idleChanged(_:))
-            ) { "\($0) 秒" }
+            optionGroup("錄音緩衝", description: "設定保留的錄音長度，以及停止操作後的續錄時間。", rows: [
+                optionChoice(
+                    "保留時間", choices: timeChoices, selected: history, action: #selector(historyChanged(_:))
+                ) { $0 > 60 ? "\($0 / 60) 分鐘" : "\($0) 秒" },
+                optionChoice(
+                    "自動續錄", choices: autoResumeChoices, selected: idleSeconds, action: #selector(idleChanged(_:))
+                ) { "\($0) 秒" }
+            ])
         ])
     }
 
@@ -1119,24 +1154,29 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         )
         mono.state = forceMonoExport ? .on : .off
         return optionsTab("匯出", rows: [
-            optionChoice(
-                "WAV 取樣率", choices: exportSampleRates, selected: exportSampleRate,
-                action: #selector(exportSampleRateChanged(_:))
-            ) { $0 == 44_100 ? "44.1 kHz" : "\($0 / 1_000) kHz" },
-            optionChoice(
-                "WAV 編碼", choices: exportBitDepths, selected: exportBitsPerSample,
-                action: #selector(exportEncodingChanged(_:))
-            ) { $0 == 32 ? "32-bit float" : "\($0)-bit PCM" },
-            mono,
-            folderOptions(.output),
-            folderOptions(.saved)
+            optionGroup("音訊格式", description: "設定保存快照與匯出 WAV 時使用的格式。", rows: [
+                optionChoice(
+                    "WAV 取樣率", choices: exportSampleRates, selected: exportSampleRate,
+                    action: #selector(exportSampleRateChanged(_:))
+                ) { $0 == 44_100 ? "44.1 kHz" : "\($0 / 1_000) kHz" },
+                optionChoice(
+                    "WAV 編碼", choices: exportBitDepths, selected: exportBitsPerSample,
+                    action: #selector(exportEncodingChanged(_:))
+                ) { $0 == 32 ? "32-bit float" : "\($0)-bit PCM" },
+                mono
+            ]),
+            optionGroup("儲存位置", description: "選擇資料夾，或在 Finder 中查看已保存的檔案。", rows: [
+                folderOptions(.output), folderOptions(.saved)
+            ])
         ])
     }
 
     private func makeSourceTab() -> NSTabViewItem {
         let dual = NSButton(checkboxWithTitle: "同時錄製 A 與 B", target: self, action: #selector(dualSourceChanged(_:)))
         dualSourceButton = dual
-        var rows: [NSView] = [dual]
+        var rows: [NSView] = [
+            optionGroup("擷取模式", description: "開啟雙來源後，可分別設定 A 與 B 的來源和聲道路由。", rows: [dual])
+        ]
         for (index, configuration) in [laneA, laneB].enumerated() {
             let label = index == 0 ? "A" : "B"
             let source = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -1145,7 +1185,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             source.action = #selector(captureSourceChanged(_:))
             source.autoenablesItems = false
             source.menu?.delegate = self
-            source.widthAnchor.constraint(lessThanOrEqualToConstant: 300).isActive = true
+            prepareOptionPopup(source)
             sourcePopups.append(source)
             let route = choiceControl(
                 CaptureRoute.allCases.map { $0.rawValue }, selected: configuration.route.rawValue,
@@ -1154,16 +1194,20 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             route.tag = index
             route.autoenablesItems = false
             routePopups.append(route)
-            rows.append(labeledOption("\(label) 擷取來源", source))
-            rows.append(labeledOption("\(label) 聲道路由", route))
+            rows.append(optionGroup(
+                "來源 \(label)", description: index == 0 ? "主要錄音來源。" : "啟用同時錄製 A 與 B 後使用。", rows: [
+                    labeledOption("\(label) 擷取來源", source), labeledOption("\(label) 聲道路由", route)
+                ]
+            ))
         }
         let stereo = choiceControl(
             [0, 1], selected: stereoWaveform ? 1 : 0, action: #selector(waveformModeChanged(_:))
         ) { $0 == 0 ? "單聲道合併" : "雙聲道 L／R" }
         waveformModePopup = stereo
-        rows.append(labeledOption("單一來源顯示", stereo))
         let receiver = NSButton(title: "開啟獨立接收視窗", target: self, action: #selector(openReceiverWindow))
-        rows.append(receiver)
+        rows.append(optionGroup("顯示與連線", description: "選擇單一來源的波形呈現方式，或另開接收視窗。", rows: [
+            labeledOption("單一來源顯示", stereo), receiver
+        ]))
         return optionsTab("來源與連線", rows: rows)
     }
 
@@ -1211,6 +1255,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             let title = usedTitles.insert(choice.title).inserted ? choice.title : "\(choice.title) · \(choice.source.key)"
             popup.addItem(withTitle: title)
             popup.lastItem?.representedObject = choice.source.key
+            popup.lastItem?.toolTip = title
             if configured == choice.source { selectedIndex = popup.numberOfItems - 1 }
         }
         if selectedIndex == nil {
@@ -1218,6 +1263,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             popup.lastItem?.isEnabled = false
         }
         popup.selectItem(at: selectedIndex ?? popup.numberOfItems - 1)
+        popup.toolTip = popup.titleOfSelectedItem
     }
 
     @objc private func dualSourceChanged(_ sender: NSButton) {
@@ -1318,53 +1364,135 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         ) { $0 == 0 ? "跟隨主題色" : "自訂色" }
         let outlineColor = NSButton(title: "選色…", target: self, action: #selector(chooseOutlineColor))
         return optionsTab("波形與外觀", rows: [
-            optionChoice(
-                "背景透明度", choices: transparencyChoices, selected: transparency,
-                action: #selector(transparencyChanged(_:))
-            ) { "\($0)%" },
-            labeledOption("主題色", accent),
-            labeledOption("A 電平顯示", meter),
-            labeledOption("B 電平顯示", meterB),
-            controlRow(waveform, pin),
-            controlRow(bars, seconds, interval),
-            controlRow(outline, outlineMode, outlineColor),
-            outlineFollows
+            optionGroup("視窗", description: "調整波形視窗的顯示方式與背景。", rows: [
+                waveform,
+                pin,
+                optionChoice(
+                    "背景透明度", choices: transparencyChoices, selected: transparency,
+                    action: #selector(transparencyChanged(_:))
+                ) { "\($0)%" },
+                labeledOption("主題色", accent)
+            ]),
+            optionGroup("電平", description: "分別選擇 A 與 B 的電平顯示方式。", rows: [
+                labeledOption("A 電平顯示", meter), labeledOption("B 電平顯示", meterB)
+            ]),
+            optionGroup("時間標記", description: "在波形上顯示小節或秒數參考線。", rows: [
+                bars, seconds, labeledOption("秒數線間隔", interval)
+            ]),
+            optionGroup("外框", description: "設定波形視窗外框的顏色與不透明度。", rows: [
+                outline,
+                labeledOption("外框配色", outlineMode),
+                labeledOption("自訂外框色", outlineColor),
+                outlineFollows
+            ])
+        ])
+    }
+
+    private func makeUpdateTab() -> NSTabViewItem {
+        let tab = startupUpdater.makeOptionsTab()
+        // Keep the updater's existing controls and callbacks, but give each action its own list row.
+        func takeRows(from stack: NSStackView) -> [NSView] {
+            let children = stack.arrangedSubviews
+            var rows: [NSView] = []
+            for child in children {
+                stack.removeArrangedSubview(child)
+                child.removeFromSuperview()
+                if let actions = child as? NSStackView {
+                    rows.append(contentsOf: takeRows(from: actions))
+                } else {
+                    rows.append(child)
+                }
+            }
+            return rows
+        }
+        let rows: [NSView]
+        if let stack = tab.view as? NSStackView {
+            rows = takeRows(from: stack)
+        } else {
+            rows = tab.view.map { [$0] } ?? []
+        }
+        return optionsTab(tab.label, rows: [
+            optionGroup("版本與更新", description: "設定啟動時的更新方式，或手動檢查新版本。", rows: rows)
         ])
     }
 
     private func optionsTab(_ title: String, rows: [NSView]) -> NSTabViewItem {
         let tab = NSTabViewItem(identifier: title)
         tab.label = title
-        let content = NSView(frame: .zero)
-        let stack = NSStackView(views: rows)
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 10
+        let heading = NSTextField(labelWithString: title)
+        heading.font = .systemFont(ofSize: 21, weight: .semibold)
+        let stack = optionsStack([heading] + rows, spacing: 22)
+        let content = OptionsDocumentView(frame: .zero)
+        let scroll = NSScrollView(frame: .zero)
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.setAccessibilityLabel("\(title)設定列表")
+        content.translatesAutoresizingMaskIntoConstraints = false
         stack.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = content
         content.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -14),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -14)
+            content.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            content.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            content.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20)
         ])
-        tab.view = content
+        tab.view = scroll
         return tab
     }
 
-    private func controlRow(_ views: NSView...) -> NSStackView {
-        let row = NSStackView(views: views)
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 8
+    private func optionsStack(_ views: [NSView], spacing: CGFloat) -> NSStackView {
+        let stack = NSStackView(views: views)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = spacing
+        for view in views {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        return stack
+    }
+
+    private func optionGroup(_ title: String, description: String, rows: [NSView]) -> NSStackView {
+        let heading = NSTextField(labelWithString: title)
+        heading.font = .systemFont(ofSize: 13, weight: .semibold)
+        let detail = NSTextField(wrappingLabelWithString: description)
+        detail.font = .systemFont(ofSize: 11)
+        detail.textColor = .secondaryLabelColor
+        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return optionsStack([heading, detail] + rows.map { optionControlRow($0) }, spacing: 10)
+    }
+
+    private func optionControlRow(_ control: NSView) -> NSView {
+        control.translatesAutoresizingMaskIntoConstraints = false
+        control.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [control])
+        row.orientation = .vertical
+        row.alignment = .leading
+        row.spacing = 0
+        row.detachesHiddenViews = true
+        if control is NSPopUpButton || control is NSTextField || control is NSStackView {
+            control.widthAnchor.constraint(equalTo: row.widthAnchor).isActive = true
+        }
         return row
     }
 
     private func labeledOption(_ title: String, _ control: NSView) -> NSStackView {
         let label = NSTextField(labelWithString: title)
-        label.widthAnchor.constraint(equalToConstant: 92).isActive = true
+        label.font = .systemFont(ofSize: 12)
         control.setAccessibilityLabel(title)
-        return controlRow(label, control)
+        if let text = control as? NSTextField {
+            text.lineBreakMode = .byTruncatingMiddle
+            text.maximumNumberOfLines = 1
+            text.toolTip = text.stringValue
+        }
+        return optionsStack([label, optionControlRow(control)], spacing: 5)
     }
 
     private func optionChoice(
@@ -1384,7 +1512,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         popup.selectItem(withTag: Int(selected))
         popup.target = self
         popup.action = action
+        prepareOptionPopup(popup)
         return popup
+    }
+
+    private func prepareOptionPopup(_ popup: NSPopUpButton) {
+        popup.cell?.lineBreakMode = .byTruncatingMiddle
+        popup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        popup.setContentHuggingPriority(.defaultLow, for: .horizontal)
     }
 
     private func folderOptions(_ folder: ExportFolder) -> NSStackView {
@@ -1394,19 +1529,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         reveal.tag = folder.rawValue
         choose.setAccessibilityLabel("選擇\(folder.label)")
         reveal.setAccessibilityLabel("在 Finder 開啟\(folder.label)")
-        let controls = controlRow(NSTextField(labelWithString: folder.label), choose, reveal)
+        let label = NSTextField(labelWithString: folder.label)
+        label.font = .systemFont(ofSize: 12, weight: .medium)
         let path = NSTextField(labelWithString: directory(for: folder))
         path.toolTip = path.stringValue
         path.textColor = .secondaryLabelColor
         path.lineBreakMode = .byTruncatingMiddle
         path.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        path.widthAnchor.constraint(lessThanOrEqualToConstant: 388).isActive = true
+        path.maximumNumberOfLines = 1
         if folder == .output { outputPathLabel = path } else { savedPathLabel = path }
-        let group = NSStackView(views: [controls, path])
-        group.orientation = .vertical
-        group.alignment = .leading
-        group.spacing = 3
-        return group
+        return optionsStack([label, path, optionControlRow(choose), optionControlRow(reveal)], spacing: 6)
     }
 
     private func updateOptionsVisibility() {
