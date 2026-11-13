@@ -1,11 +1,13 @@
 #ifndef BACKTRACKING_H
 #define BACKTRACKING_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct BtCore BtCore;
 typedef struct BtTracks BtTracks;
 typedef struct BtSnapshot BtSnapshot;
+typedef struct BtSenders BtSenders;
 
 typedef struct BtMeterReadings {
     float peak_dbfs;
@@ -17,7 +19,7 @@ typedef struct BtMeterReadings {
 // producer. The input arrays must contain the requested number of frames.
 // Stop and join the producer before rearming after a pause, changing devices,
 // or freeing the handle.
-// History durations are 10, 20, 30, or 60 seconds.
+// History durations are 10, 20, 30, 60, 180, 300, or 600 seconds.
 BtCore *bt_new(double sample_rate, uint32_t channels, uint32_t history_secs);
 void bt_free(BtCore *core);
 uint32_t bt_push_interleaved(const BtCore *core, const float *data, uint32_t frames);
@@ -107,5 +109,20 @@ uint64_t bt_tracks_first_frame(const BtTracks *core);
 uint64_t bt_tracks_end_frame(const BtTracks *core);
 uint32_t bt_tracks_channels(const BtTracks *core, uint32_t lane);
 BtSnapshot *bt_tracks_snapshot(const BtTracks *core, uint32_t lane);
+BtSnapshot *bt_tracks_snapshot_range(const BtTracks *core, uint32_t lane, uint64_t first, uint64_t end);
+
+uint32_t bt_tracks_sample_rate(const BtTracks *core);
+uint64_t bt_tracks_waveform_range(const BtTracks *core, uint32_t lane, uint32_t view,
+                                  uint64_t first, uint64_t end, float *minimum, float *maximum, uint32_t bins);
+size_t bt_tracks_copy_bar_markers(const BtTracks *core, uint64_t first, uint64_t end,
+                                   uint64_t *markers, size_t capacity);
+int32_t bt_tracks_attach_sender(const BtTracks *core, uint32_t lane, const char *id, uint32_t route);
+void bt_tracks_detach_sender(const BtTracks *core, uint32_t lane);
+BtSenders *bt_senders_new(int32_t audio_only);
+void bt_senders_free(BtSenders *senders);
+size_t bt_senders_count(const BtSenders *senders);
+char *bt_senders_string(const BtSenders *senders, size_t index, int32_t name);
+uint32_t bt_senders_format(const BtSenders *senders, size_t index, uint32_t *channels);
+int32_t bt_sender_request_snapshot(const char *id);
 
 #endif

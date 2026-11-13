@@ -29,11 +29,13 @@ Backtracking 是給作曲與混音用的回溯錄音取樣器。聽到想留下�
 
 桌面版會還原上次的視窗位置。Windows 從系統匣控制顯示、隱藏與結束，macOS 從選單列控制。可在設定啟用登入時自動啟動。VST3／CLAP 的設定跟著各自的插件實例存進 DAW 專案，修改後請儲存專案。要保留錄音素材，請先匯出 WAV。
 
-在 Backtracking 有焦點時，按 `Ctrl+S` 可把當下快照保存到保存資料夾。已框選時只保存該段，並立即恢復錄音待命。錄音中未框選時，保存整段保留的音訊，錄音會持續進行。成功拖放使用預設輸出資料夾。單擊、框選及留在視窗內的拖曳不會寫檔。兩個資料夾都可在 Options 自訂。
+Windows 按 Win 加數字 1 左側的實體鍵，macOS 使用 Fn／Globe 加同一位置的鍵，即可在背景儲存快照。Linux 請使用[快照快捷鍵常駐程式](desktop/linux/README.md)。Options 可指定一個插件實例為全域快捷鍵的目標，也可直接儲存目前錄音器的快照。有選區時儲存選段並立即恢復待命。儲存整段保留音訊時會持續擷取。
+
 
 在 Options 可選擇 WAV 取樣率 **44.1、48 或 96 kHz**，以及 **16-bit PCM、24-bit PCM 或 32-bit IEEE float** 編碼。預設為 **48 kHz、32-bit float**。
 
-上次選段的兩端以旗標標記。框選時按住 `Shift`，游標靠近旗標即可吸附。Options 可切換合併或 L／R 波形。桌面版可為 A／B 各指定來源及聲道路由，同次 `Ctrl+S` 或拖放會匯出同起訖的兩個 WAV。**更新**設定提供啟動時自動安裝與手動檢查。 [擷取與波形](docs/USER_GUIDE.md#來源波形與旗標) · [啟動更新](docs/UPDATES.md)
+Windows 按 Win 加數字 1 左側的實體鍵，macOS 使用 Fn／Globe 加同一位置的鍵，即可在背景儲存快照。Linux 請使用[快照快捷鍵常駐程式](desktop/linux/README.md)。Options 可指定一個插件實例為全域快捷鍵的目標，也可直接儲存目前錄音器的快照。有選區時儲存選段並立即恢復待命。儲存整段保留音訊時會持續擷取。
+
 
 [完整操作手冊](docs/USER_GUIDE.md#繁體中文) · [桌面視窗操作](docs/USER_GUIDE.md#移動與縮放桌面視窗) · [安裝與建置](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
 
@@ -62,13 +64,24 @@ Use the color picker in the gear or right-click menu to change the theme accent.
 
 The desktop app restores its last window position. On Windows, use the system tray to show, hide, or quit the app. On macOS, use the menu bar. You can enable launch at sign-in in Settings. For VST3 and CLAP, save your DAW project after making changes to store each instance's settings. Export a WAV to keep captured audio.
 
-With Backtracking focused, press `Ctrl+S` to save the current snapshot to the saved snapshots folder. If a range is selected, it saves that range and immediately re-arms capture. With no selection, it saves all retained audio while active capture continues. Successful drops use the default export folder. Clicking, selecting, and dragging within the window do not write files. Both folders can be set in Options.
+Use Win plus the physical key to the left of 1 on Windows, or Fn/Globe plus that key on macOS, to save from the background. On Linux, use the [snapshot shortcut helper](desktop/linux/README.md). Options can route the shortcut to one plug-in instance and also provides Save snapshot for the current recorder. Saving a selection re-arms capture. Saving the full retained history leaves capture running.
+
 
 Choose a WAV sample rate of **44.1, 48, or 96 kHz** and **16-bit PCM, 24-bit PCM, or 32-bit IEEE float** encoding in Options. The default is **48 kHz, 32-bit float**.
 
 Flags mark the previous range. Hold `Shift` near either flag while selecting to snap to it. Choose a merged or L/R waveform in Options. The desktop app can capture independent A/B sources and channel routes, then save or drag out two aligned WAVs. The update settings support installation at launch and manual checks. [Capture and waveform](docs/USER_GUIDE.md#sources-waveforms-and-flags) · [Startup updates](docs/UPDATES.md)
 
 [Full user guide](docs/USER_GUIDE.md#english) · [Desktop window controls](docs/USER_GUIDE.md#move-and-resize-the-desktop-window) · [Installation and build](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
+
+## 波形時間軸與 Sender / Waveform timeline and Sender
+
+框選放開後會保持暫停。用滾輪以游標為中心縮放，按住滾輪左右拖曳以平移，拖曳旗標可微調選區。按住 Shift 可吸附附近的可見小節線或旗標。Options 可開關秒數線及小節線，並選擇 1、5 或 10 秒間距。錄音保留時間為 10／20／30／60 秒或 3／5／10 分鐘，縮短時只會裁除超出新保留時間的最舊內容。
+
+A completed selection holds capture paused. Scroll to zoom around the pointer, drag with the middle button to pan, and drag a flag to adjust the selection. Shift snaps to nearby visible bars and flags. Options can show bar lines and a seconds grid at 1, 5, or 10 seconds. The recording history can retain 10, 20, 30, or 60 seconds, or 3, 5, or 10 minutes. Shortening it removes only the oldest frames outside the new duration.
+
+每個插件可個別啟用 Sender。桌面 Options 的 A／B 來源可選擇同一台電腦上的 Sender，也可另外開啟擷取視窗。Audacity 若用 loopback 錄製系統播放，在 Backtracking 選擇 System Audio。若只要擷取 Audacity 的播放輸出，請選擇 Audacity 應用程式來源。
+
+Enable Sender per plug-in instance. Desktop recorders can select a local Sender as either source or open another capture window. To capture the same system playback that Audacity records through loopback, choose System Audio. To capture playback from Audacity itself, choose Audacity as the application source.
 
 ## 硬體使用量 / Hardware utilization
 

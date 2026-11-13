@@ -122,6 +122,7 @@ struct PacketSlot {
     sample_rate: AtomicU32,
     frames: AtomicUsize,
     discontinuity: AtomicBool,
+    tags: [AtomicU64; 2],
 }
 
 /// Bounded timestamped transfer between one audio producer and one consumer.
@@ -145,6 +146,7 @@ impl TimedAudioQueue {
                     sample_rate: AtomicU32::new(0),
                     frames: AtomicUsize::new(0),
                     discontinuity: AtomicBool::new(false),
+                    tags: [AtomicU64::new(0), AtomicU64::new(0)],
                 })
                 .collect(),
             channels,
@@ -168,7 +170,7 @@ impl TimedAudioQueue {
         samples: &[f32],
         discontinuity: bool,
     ) -> usize {
-        self.push(timestamp_ns, sample_rate, discontinuity, || {
+        self.push(timestamp_ns, sample_rate, discontinuity, [0; 2], || {
             self.audio.push_interleaved(samples)
         })
     }
@@ -180,8 +182,22 @@ impl TimedAudioQueue {
         left: &[f32],
         right: Option<&[f32]>,
     ) -> usize {
-        self.push(timestamp_ns, sample_rate, false, || {
+        self.push(timestamp_ns, sample_rate, false, [0; 2], || {
             self.audio.push_planar(left, right)
+        })
+    }
+
+    /// Copies a producer block and publishes its caller-defined tags atomically with the packet.
+    pub fn push_tagged(
+        &self,
+        timestamp_ns: u64,
+        sample_rate: u32,
+        frames: usize,
+        tags: [u64; 2],
+        sample: impl Fn(usize, usize) -> f32,
+    ) -> usize {
+        self.push(timestamp_ns, sample_rate, false, tags, || {
+            self.audio.push(frames, sample)
         })
     }
 
@@ -190,6 +206,7 @@ impl TimedAudioQueue {
         timestamp_ns: u64,
         sample_rate: u32,
         discontinuity: bool,
+        tags: [u64; 2],
         write_audio: impl FnOnce() -> usize,
     ) -> usize {
         let write = self.write.load(Ordering::Relaxed);
@@ -206,12 +223,19 @@ impl TimedAudioQueue {
         slot.sample_rate.store(sample_rate, Ordering::Relaxed);
         slot.frames.store(frames, Ordering::Relaxed);
         slot.discontinuity.store(discontinuity, Ordering::Relaxed);
+        for (slot, value) in slot.tags.iter().zip(tags) {
+            slot.store(value, Ordering::Relaxed);
+        }
         self.write.store(write.wrapping_add(1), Ordering::Release);
         frames
     }
 
     /// Resizes the consumer-owned scratch vector to hold exactly one packet.
     pub fn pop(&self, scratch: &mut Vec<f32>) -> Option<TimedPacket> {
+        self.pop_tagged(scratch).map(|(packet, _)| packet)
+    }
+
+    pub fn pop_tagged(&self, scratch: &mut Vec<f32>) -> Option<(TimedPacket, [u64; 2])> {
         let read = self.read.load(Ordering::Relaxed);
         if read == self.write.load(Ordering::Acquire) {
             return None;
@@ -221,16 +245,22 @@ impl TimedAudioQueue {
         let sample_rate = slot.sample_rate.load(Ordering::Relaxed);
         let frames = slot.frames.load(Ordering::Relaxed);
         let discontinuity = slot.discontinuity.load(Ordering::Relaxed);
+        let tags = slot.tags.each_ref().map(|tag| tag.load(Ordering::Relaxed));
         scratch.resize(frames * self.channels, 0.);
         let copied = self.audio.pop_interleaved(scratch);
         debug_assert_eq!(copied, frames);
         self.read.store(read.wrapping_add(1), Ordering::Release);
-        Some(TimedPacket {
-            timestamp_ns,
-            sample_rate,
-            frames,
-            discontinuity,
-        })
+        Some((
+            TimedPacket { timestamp_ns, sample_rate, frames, discontinuity },
+            tags,
+        ))
+    }
+
+    /// Drops exactly the packets visible when this call begins.
+    pub fn discard_pending(&self, scratch: &mut Vec<f32>) {
+        for _ in 0..self.pending_packets() {
+            self.pop_tagged(scratch);
+        }
     }
 
     /// Number of already published packets. Call only from the consumer.

@@ -12,6 +12,8 @@ mod loopback;
 #[cfg(target_os = "windows")]
 mod preferences;
 #[cfg(target_os = "windows")]
+mod snapshot_hotkey;
+#[cfg(target_os = "windows")]
 mod startup;
 #[cfg(target_os = "windows")]
 mod tray;
@@ -33,13 +35,19 @@ fn main() {
         if updater::run_helper()? || updater::other_launch_during_update() {
             return Ok(());
         }
-        let Some(_instance) = startup::Instance::acquire()? else {
-            return Ok(());
+        let primary = !std::env::args_os().any(|arg| arg == "--new-capture-window");
+        let _instance = if primary {
+            let Some(instance) = startup::Instance::acquire()? else {
+                return Ok(());
+            };
+            if updater::install_before_start() {
+                return Ok(());
+            }
+            Some(instance)
+        } else {
+            None
         };
-        if updater::install_before_start() {
-            return Ok(());
-        }
-        ui::run(controller::Controller::new())?;
+        ui::run(controller::Controller::new()?, primary)?;
         Ok::<(), Box<dyn std::error::Error>>(())
     })();
     if let Err(error) = result {

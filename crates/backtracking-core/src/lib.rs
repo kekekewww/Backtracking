@@ -3,6 +3,7 @@ mod export;
 mod ffi;
 mod meter;
 mod queue;
+mod sender;
 mod synchronized;
 mod track_ffi;
 pub mod waveform;
@@ -15,6 +16,7 @@ pub use export::{
 };
 pub use meter::MeterReadings;
 pub use queue::{AudioQueue, TimedAudioQueue, TimedPacket};
+pub use sender::{capture_clock_ns, discover_senders, discover_snapshot_targets, new_sender_id, request_sender_snapshot, SenderEndpoint, SenderInfo, SenderPacket, SenderReceiver};
 pub use synchronized::{ChannelRoute, SynchronizedCapture};
 pub use waveform::WaveformView;
 

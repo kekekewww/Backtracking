@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Backtracking Snapshot Shortcut
+Exec=backtracking-shortcut
+Terminal=false
+NoDisplay=true
+Categories=AudioVideo;Audio;

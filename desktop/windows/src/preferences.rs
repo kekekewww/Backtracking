@@ -47,6 +47,13 @@ pub(crate) enum Key {
     SavedSnapshots,
     AlwaysOnTop,
     WaveformOnly,
+    WaveformBorder,
+    WaveformBorderColor,
+    WaveformBorderFollowsBackground,
+    BarLines,
+    SecondsLines,
+    SecondsInterval,
+    SnapshotTarget,
     WindowPosition,
 }
 
@@ -69,6 +76,13 @@ impl Key {
             Self::SavedSnapshots => "saved-snapshots-folder",
             Self::AlwaysOnTop => "always-on-top",
             Self::WaveformOnly => "waveform-only",
+            Self::WaveformBorder => "waveform-border",
+            Self::WaveformBorderColor => "waveform-border-color",
+            Self::WaveformBorderFollowsBackground => "waveform-border-follows-background",
+            Self::BarLines => "show-bar-lines",
+            Self::SecondsLines => "show-second-lines",
+            Self::SecondsInterval => "second-line-interval",
+            Self::SnapshotTarget => "snapshot-target",
             Self::WindowPosition => "window-position",
         }
     }
@@ -89,6 +103,13 @@ pub(crate) struct Settings {
     pub(crate) saved_output: PathBuf,
     pub(crate) pinned: bool,
     pub(crate) waveform_only: bool,
+    pub(crate) waveform_border: bool,
+    pub(crate) waveform_border_color: Option<[u8; 3]>,
+    pub(crate) waveform_border_follows_background: bool,
+    pub(crate) bar_lines: bool,
+    pub(crate) second_lines: bool,
+    pub(crate) second_interval: u8,
+    pub(crate) snapshot_target: Option<String>,
     pub(crate) window_position: Option<[i32; 2]>,
 }
 
@@ -119,6 +140,13 @@ impl Default for Settings {
             saved_output: directory.join("saved"),
             pinned: true,
             waveform_only: false,
+            waveform_border: false,
+            waveform_border_color: None,
+            waveform_border_follows_background: false,
+            bar_lines: false,
+            second_lines: false,
+            second_interval: 5,
+            snapshot_target: None,
             window_position: None,
         }
     }
@@ -192,6 +220,21 @@ impl Preferences {
             _ => {}
         }
         settings.waveform_only = self.read_number::<u8>(Key::WaveformOnly) == Some(1);
+        settings.waveform_border = self.read_number::<u8>(Key::WaveformBorder) == Some(1);
+        settings.waveform_border_color = self
+            .read(Key::WaveformBorderColor)
+            .as_deref()
+            .and_then(parse_accent);
+        settings.waveform_border_follows_background =
+            self.read_number::<u8>(Key::WaveformBorderFollowsBackground) == Some(1);
+        settings.bar_lines = self.read_number::<u8>(Key::BarLines) == Some(1);
+        settings.second_lines = self.read_number::<u8>(Key::SecondsLines) == Some(1);
+        if let Some(interval @ (1 | 5 | 10)) = self.read_number(Key::SecondsInterval) {
+            settings.second_interval = interval;
+        }
+        settings.snapshot_target = self.read(Key::SnapshotTarget).filter(|id| {
+            !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control)
+        });
         settings.window_position = self.read(Key::WindowPosition).and_then(|value| {
             let mut parts = value.split_whitespace();
             let x = parts.next()?.parse().ok()?;
@@ -298,6 +341,9 @@ pub(crate) fn serialize_sources(sources: &[Option<SourceSettings>; 2]) -> String
             CaptureSource::Application { path, name } => {
                 format!("{route}\tapp\t{}\t{}", encode_text(path), encode_text(name))
             }
+            CaptureSource::Sender { id, name } => {
+                format!("{route}\tsender\t{}\t{}", encode_text(id), encode_text(name))
+            }
         }
     }
     format!(
@@ -320,6 +366,10 @@ fn parse_sources(value: &str) -> Option<[Option<SourceSettings>; 2]> {
             },
             "app" => CaptureSource::Application {
                 path: decode_text(fields.next()?)?,
+                name: decode_text(fields.next()?)?,
+            },
+            "sender" => CaptureSource::Sender {
+                id: decode_text(fields.next()?)?,
                 name: decode_text(fields.next()?)?,
             },
             _ => return None,
@@ -421,5 +471,19 @@ mod tests {
             Some(one_source)
         );
         assert_eq!(parse_sources("off\noff"), None);
+    }
+
+    #[test]
+    fn same_name_sender_choices_keep_separate_ids_after_reload() {
+        let sources = ["sender-one", "sender-two"].map(|id| {
+            Some(SourceSettings {
+                source: CaptureSource::Sender {
+                    id: id.into(),
+                    name: "Shared name".into(),
+                },
+                route: ChannelRoute::Merged,
+            })
+        });
+        assert_eq!(parse_sources(&serialize_sources(&sources)), Some(sources));
     }
 }

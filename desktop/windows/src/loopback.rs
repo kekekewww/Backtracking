@@ -321,7 +321,7 @@ impl WasapiStream {
                             .map_err(|error| audio_error("找不到已選取的麥克風", error))?,
                         0,
                     ),
-                    CaptureSource::Application { .. } => unreachable!(),
+                    CaptureSource::Application { .. } | CaptureSource::Sender { .. } => unreachable!(),
                 };
                 let binding = match source {
                     CaptureSource::System => SourceBinding::DefaultRender(endpoint_id(&device)?),
@@ -329,7 +329,7 @@ impl WasapiStream {
                         SourceBinding::DefaultCapture(endpoint_id(&device)?)
                     }
                     CaptureSource::Microphone { id, .. } => SourceBinding::Microphone(id),
-                    CaptureSource::Application { .. } => unreachable!(),
+                    CaptureSource::Application { .. } | CaptureSource::Sender { .. } => unreachable!(),
                 };
                 let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
                     .map_err(|error| audio_error("無法開啟已選取的音訊來源", error))?;
@@ -734,6 +734,20 @@ impl Encoding {
 }
 
 impl Format {
+    pub(crate) fn sender(sample_rate: u32, channels: usize) -> Self {
+        Self {
+            sample_rate,
+            channels,
+            frame_bytes: channels * size_of::<f32>(),
+            sample_bytes: size_of::<f32>(),
+            encoding: Encoding::Float32,
+            stereo_mix: Vec::new(),
+            left: Some(0),
+            right: (channels == 2).then_some(1),
+            center: None,
+        }
+    }
+
     // GetMixFormat provides a WAVEFORMATEX followed by its stated extension bytes.
     unsafe fn parse(native: NonNull<WAVEFORMATEX>) -> Result<Self, String> {
         let base = unsafe { native.as_ptr().read_unaligned() };

@@ -32,11 +32,13 @@ enum CaptureSource: Hashable {
     case system
     case microphone(String)
     case application(String)
+    case sender(String)
 
     init?(key: String) {
         if key == "system" { self = .system }
         else if key.hasPrefix("mic:") { self = .microphone(String(key.dropFirst(4))) }
         else if key.hasPrefix("app:"), key.count > 4 { self = .application(String(key.dropFirst(4))) }
+        else if key.hasPrefix("sender:"), key.count > 7 { self = .sender(String(key.dropFirst(7))) }
         else { return nil }
     }
 
@@ -45,6 +47,7 @@ enum CaptureSource: Hashable {
         case .system: "system"
         case .microphone(let uid): "mic:\(uid)"
         case .application(let identifier): "app:\(identifier)"
+        case .sender(let id): "sender:\(id)"
         }
     }
 
@@ -54,7 +57,13 @@ enum CaptureSource: Hashable {
         case .microphone(let uid):
             if uid.isEmpty { "預設麥克風" } else { "麥克風 · \(uid)" }
         case .application(let identifier): "應用程式 · \(identifier)"
+        case .sender: "【Sender】"
         }
+    }
+
+    var isSender: Bool {
+        if case .sender = self { return true }
+        return false
     }
 
     var isMicrophone: Bool {
@@ -93,6 +102,40 @@ enum CaptureRoute: UInt32, CaseIterable {
 struct CaptureLane: Equatable {
     var source: CaptureSource
     var route: CaptureRoute = .merged
+}
+
+private struct SenderDescriptor {
+    let id: String
+    let name: String
+    let sampleRate: UInt32
+    let channels: UInt32
+}
+
+private func senderDescriptors(audioOnly: Bool) -> [SenderDescriptor] {
+    guard let list = bt_senders_new(audioOnly ? 1 : 0) else { return [] }
+    defer { bt_senders_free(list) }
+    return (0..<bt_senders_count(list)).compactMap { index in
+        guard let id = bt_senders_string(list, index, 0) else { return nil }
+        defer { bt_string_free(id) }
+        guard let name = bt_senders_string(list, index, 1) else { return nil }
+        defer { bt_string_free(name) }
+        var channels: UInt32 = 0
+        let sampleRate = bt_senders_format(list, index, &channels)
+        return SenderDescriptor(id: String(cString: id), name: String(cString: name),
+                                sampleRate: sampleRate, channels: channels)
+    }
+}
+
+func availableSenders() -> [(id: String, name: String)] {
+    senderDescriptors(audioOnly: true).map { ($0.id, $0.name) }
+}
+
+func availableSnapshotTargets() -> [(id: String, name: String)] {
+    senderDescriptors(audioOnly: false).map { ($0.id, $0.name) }
+}
+
+func requestSenderSnapshot(_ id: String) -> Bool {
+    id.withCString { bt_sender_request_snapshot($0) != 0 }
 }
 
 @MainActor
@@ -146,6 +189,7 @@ func availableCaptureSources(excluding privateDevices: Set<AudioObjectID>) -> [(
         return order == .orderedSame ? $0.key < $1.key : order == .orderedAscending
     }
     choices += sortedApps.map { (.application($0.key), "應用程式 · \($0.value)") }
+    choices += availableSenders().map { (.sender($0.id), "【Sender】\($0.name)") }
     return choices
 }
 
@@ -305,11 +349,15 @@ private enum InputIdentity: Equatable {
     case system(AudioObjectID, Double)
     case microphone(AudioObjectID, Double)
     case application([AudioObjectID], AudioObjectID, Double)
+    case sender(String, UInt32, UInt32)
 }
 
 @MainActor
 private func identity(for source: CaptureSource) -> InputIdentity? {
     switch source {
+    case .sender(let id):
+        return senderDescriptors(audioOnly: true).first { $0.id == id }
+            .map { .sender(id, $0.sampleRate, $0.channels) }
     case .system:
         return defaultDevice(kAudioHardwarePropertyDefaultOutputDevice).map { .system($0, nominalRate($0)) }
     case .application(let identifier):
@@ -335,6 +383,16 @@ private struct InputFormat {
     let right: Int?
     let center: Int?
     let mix: [(channel: Int, left: Float, right: Float)]
+
+    init(senderChannels: UInt32, sampleRate: UInt32) {
+        channels = Int(senderChannels)
+        self.sampleRate = Double(sampleRate)
+        planar = false
+        left = 0
+        right = channels == 2 ? 1 : nil
+        center = nil
+        mix = []
+    }
 
     init(_ stream: AudioStreamBasicDescription, labels: [AudioChannelLabel]) throws {
         let count = Int(stream.mChannelsPerFrame)
@@ -435,6 +493,14 @@ private final class LaneProducer {
 
     deinit { scratch.deallocate() }
 
+    func attachSender(_ id: String) -> Bool {
+        id.withCString { bt_tracks_attach_sender(timeline.core, lane, $0, route.wavRouteCode) != 0 }
+    }
+
+    func detachSender() {
+        bt_tracks_detach_sender(timeline.core, lane)
+    }
+
     func push(_ buffers: UnsafeMutableAudioBufferListPointer, format: InputFormat, frameLimit: Int, time: UInt64) {
         let frames = format.availableFrames(buffers, limit: frameLimit)
         guard frames > 0 else { return }
@@ -498,6 +564,32 @@ private protocol NativeInput: AnyObject {
     func bind(_ producers: [LaneProducer]) throws
     func start() throws
     func stop() throws
+}
+
+private final class SenderInput: NativeInput {
+    let format: InputFormat
+    private let id: String
+    private var producers: [LaneProducer] = []
+
+    init(id: String, rate: UInt32, channels: UInt32) {
+        self.id = id
+        format = InputFormat(senderChannels: channels, sampleRate: rate)
+    }
+
+    func bind(_ producers: [LaneProducer]) throws { self.producers = producers }
+
+    func start() throws {
+        for producer in producers {
+            guard producer.attachSender(id) else {
+                try stop()
+                throw CaptureError("Sender 無法連線")
+            }
+        }
+    }
+
+    func stop() throws {
+        for producer in producers { producer.detachSender() }
+    }
 }
 
 private final class PlaybackTap: NativeInput {
@@ -666,6 +758,8 @@ final class SystemAudioTap {
     private let widths: [UInt32]
     private var slots: [Slot]
     private var running = false
+    private let captureQueue = DispatchQueue(label: "Backtracking.capture")
+    private var pollInFlight = false
     var core: OpaquePointer { timeline.core }
     var laneCount: Int { lanes.count }
     var captureRoutes: [CaptureRoute] { lanes.map(\.route) }
@@ -721,6 +815,7 @@ final class SystemAudioTap {
         case .application(let processes, let device, _):
             try PlaybackTap(processes: processes, device: device, preferNativeLayout: preferNative)
         case .microphone(let device, _): try MicrophoneInput(device: device)
+        case .sender(let id, let rate, let channels): SenderInput(id: id, rate: rate, channels: channels)
         case nil: nil
         }
     }
@@ -744,7 +839,7 @@ final class SystemAudioTap {
         guard let format = slots.first(where: { $0.indexes.contains(lane) })?.input?.format else {
             return route != .center
         }
-        if route == .center, format.center == nil, !lanes[lane].source.isMicrophone,
+        if route == .center, format.center == nil, !lanes[lane].source.isMicrophone, !lanes[lane].source.isSender,
            let device = defaultDevice(kAudioHardwarePropertyDefaultOutputDevice) {
             // A normal stereo tap can be recreated for an explicitly selected native Center.
             return deviceLabels(device, scope: kAudioDevicePropertyScopeOutput).contains(kAudioChannelLabel_Center)
@@ -777,6 +872,41 @@ final class SystemAudioTap {
         } catch {
             slots[index].error = error.localizedDescription
             slots[index].retryAt = ProcessInfo.processInfo.systemUptime + 5
+        }
+    }
+
+    func pollCapture(synchronous: Bool = false) {
+        let timeline = self.timeline
+        if synchronous {
+            captureQueue.sync { bt_tracks_poll(timeline.core) }
+            return
+        }
+        guard !pollInFlight else { return }
+        pollInFlight = true
+        captureQueue.async { [weak self] in
+            bt_tracks_poll(timeline.core)
+            DispatchQueue.main.async { [weak self] in self?.pollInFlight = false }
+        }
+    }
+
+    func withCaptureRead<T>(_ read: (OpaquePointer) -> T) -> T {
+        let timeline = self.timeline
+        return captureQueue.sync { read(timeline.core) }
+    }
+
+    func withCaptureSnapshot<T>(_ read: (OpaquePointer) -> T) -> T {
+        let timeline = self.timeline
+        return captureQueue.sync {
+            bt_tracks_poll(timeline.core)
+            return read(timeline.core)
+        }
+    }
+
+    func setHistory(_ seconds: UInt32, completion: @escaping (Bool) -> Void) {
+        let timeline = self.timeline
+        captureQueue.async {
+            let success = bt_tracks_set_history(timeline.core, seconds) == 1
+            DispatchQueue.main.async { completion(success) }
         }
     }
 

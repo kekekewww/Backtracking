@@ -1,5 +1,6 @@
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -7,7 +8,7 @@ use windows::Win32::Foundation::{
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, HWND, LPARAM, LRESULT, POINT,
     RECT, S_OK, WPARAM,
 };
-use windows::Win32::System::Com::IDataObject;
+use windows::Win32::System::Com::{CoTaskMemFree, IDataObject};
 use windows::Win32::System::Ole::{
     DROPEFFECT, DROPEFFECT_COPY, DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize,
     OleUninitialize,
@@ -17,14 +18,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetCapture, VK_LBUTTON, VK_RBUTTON,
 };
 use windows::Win32::UI::Shell::{
-    BHID_DataObject, DefSubclassProc, IShellItem, IShellItemArray, RemoveWindowSubclass,
-    SHCreateItemFromParsingName, SHCreateShellItemArrayFromShellItem, SetWindowSubclass,
+    BHID_DataObject, DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetSystemMetrics, GetWindowRect, PostMessageW, SM_SWAPBUTTON, SendMessageW,
     WM_APP, WM_LBUTTONUP, WM_NCDESTROY,
 };
 use windows::core::{BOOL, HRESULT, PCWSTR, implement};
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+use windows::Win32::UI::Shell::{SHCreateShellItemArrayFromIDLists, SHParseDisplayName};
 
 use super::ActiveDrag;
 
@@ -104,7 +106,7 @@ unsafe extern "system" fn drag_message(
         // the host closes the editor while it is running.
         if unsafe { RemoveWindowSubclass(hwnd, Some(drag_message), id) }.as_bool() {
             let mut drag = unsafe { Box::from_raw(data as *mut ActiveDrag) };
-            match drag_file(hwnd, &drag.file.wav.path) {
+            match drag_files(hwnd, &drag.file.wav.paths) {
                 Ok(true) => drag.accept(),
                 Ok(false) => {}
                 Err(error) => {
@@ -131,20 +133,40 @@ impl Drop for OleApartment {
     }
 }
 
-fn drag_file(hwnd: HWND, path: &Path) -> windows::core::Result<bool> {
-    unsafe {
-        if !primary_button_pressed() || !pointer_outside(hwnd) {
-            return Ok(false);
-        }
-        OleInitialize(None)?;
-        let _ole = OleApartment;
+struct ShellId(*mut ITEMIDLIST);
+
+impl ShellId {
+    fn from_path(path: &Path) -> windows::core::Result<Self> {
         let wide_path: Vec<_> = dunce::simplified(path)
             .as_os_str()
             .encode_wide()
             .chain([0])
             .collect();
-        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide_path.as_ptr()), None)?;
-        let items: IShellItemArray = SHCreateShellItemArrayFromShellItem(&item)?;
+        let mut id = Self(null_mut());
+        unsafe { SHParseDisplayName(PCWSTR(wide_path.as_ptr()), None, &mut id.0, 0, None)? };
+        Ok(id)
+    }
+}
+
+impl Drop for ShellId {
+    fn drop(&mut self) {
+        unsafe { CoTaskMemFree(Some(self.0.cast())) };
+    }
+}
+
+fn drag_files(hwnd: HWND, paths: &[PathBuf]) -> windows::core::Result<bool> {
+    unsafe {
+        if paths.is_empty() || !primary_button_pressed() || !pointer_outside(hwnd) {
+            return Ok(false);
+        }
+        OleInitialize(None)?;
+        let _ole = OleApartment;
+        let ids = paths
+            .iter()
+            .map(|path| ShellId::from_path(path))
+            .collect::<windows::core::Result<Vec<_>>>()?;
+        let pointers: Vec<_> = ids.iter().map(|id| id.0.cast_const()).collect();
+        let items = SHCreateShellItemArrayFromIDLists(&pointers)?;
         let data: IDataObject = items.BindToHandler(None, &BHID_DataObject)?;
         if !primary_button_pressed() || !pointer_outside(hwnd) {
             return Ok(false);

@@ -154,6 +154,7 @@ struct Packet {
     fade_in: bool,
     fade_out: bool,
     samples: Vec<f32>,
+    bar_frames: Vec<u64>,
 }
 
 impl Packet {
@@ -256,12 +257,14 @@ impl Lane {
         self.waiting_after_gap = false;
     }
 
-    fn append_frame(&mut self, frame: u64, fade_frames: u64, output: &mut Vec<f32>) {
+    fn append_frame(&mut self, frame: u64, fade_frames: u64, output: &mut Vec<f32>) -> bool {
         self.discard_before(frame);
         if let Some(packet) = self.packets.front().filter(|packet| packet.start <= frame) {
             packet.append_frame(frame, self.channels, fade_frames, output);
+            packet.bar_frames.binary_search(&frame).is_ok()
         } else {
             output.resize(output.len() + self.channels, 0.);
+            false
         }
     }
 
@@ -283,6 +286,8 @@ pub struct SynchronizedCapture {
     cursor: Option<u64>,
     native_end_ns: Option<u64>,
     scratch: Vec<f32>,
+    bar_scratch: Vec<usize>,
+    capture_error: Option<CaptureError>,
 }
 
 impl SynchronizedCapture {
@@ -300,6 +305,8 @@ impl SynchronizedCapture {
             cursor: None,
             native_end_ns: None,
             scratch: Vec::with_capacity(DRAIN_FRAMES * (a_channels + b_channels.unwrap_or(0))),
+            bar_scratch: Vec::new(),
+            capture_error: None,
         })
     }
 
@@ -309,6 +316,11 @@ impl SynchronizedCapture {
 
     pub fn capture_mut(&mut self) -> &mut Capture {
         &mut self.capture
+    }
+
+    /// Returns the last history allocation failure from asynchronous lane draining.
+    pub fn take_capture_error(&mut self) -> Option<CaptureError> {
+        self.capture_error.take()
     }
 
     pub fn reset_input(&mut self) {
@@ -326,6 +338,17 @@ impl SynchronizedCapture {
         timestamp_ns: u64,
         interleaved: &[f32],
         discontinuity: bool,
+    ) -> Result<(), CaptureError> {
+        self.push_native_interleaved_with_markers(timestamp_ns, interleaved, discontinuity, &[])
+    }
+
+    /// Native-clock variant carrying sorted bar starts relative to the first input frame.
+    pub fn push_native_interleaved_with_markers(
+        &mut self,
+        timestamp_ns: u64,
+        interleaved: &[f32],
+        discontinuity: bool,
+        source_block_offset_of_bars: &[usize],
     ) -> Result<(), CaptureError> {
         let channels: usize = self.lanes.iter().flatten().map(|lane| lane.channels).sum();
         let frames = interleaved.len() / channels;
@@ -360,7 +383,8 @@ impl SynchronizedCapture {
                 }
             }
         }
-        self.capture.push_interleaved(interleaved)?;
+        self.capture
+            .push_interleaved_with_markers(interleaved, source_block_offset_of_bars)?;
         let duration_ns = (frames as u128 * NANOS_PER_SECOND / u128::from(self.sample_rate))
             .min(u128::from(u64::MAX)) as u64;
         self.native_end_ns = Some(timestamp_ns.saturating_add(duration_ns));
@@ -385,6 +409,19 @@ impl SynchronizedCapture {
         source_rate: u32,
         interleaved: &[f32],
         discontinuity: bool,
+    ) -> Result<(), CaptureError> {
+        self.push_with_markers(lane, timestamp_ns, source_rate, interleaved, discontinuity, &[])
+    }
+
+    /// Projects packet-relative bar starts onto the same time grid as both audio lanes.
+    pub fn push_with_markers(
+        &mut self,
+        lane: usize,
+        timestamp_ns: u64,
+        source_rate: u32,
+        interleaved: &[f32],
+        discontinuity: bool,
+        source_block_offset_of_bars: &[usize],
     ) -> Result<(), CaptureError> {
         let lane = self
             .lanes
@@ -494,6 +531,13 @@ impl SynchronizedCapture {
             lane.waiting_after_gap |= first > start;
             return Ok(());
         }
+        let bar_frames = source_block_offset_of_bars
+            .iter()
+            .copied()
+            .filter(|&offset| offset < frames)
+            .map(|offset| ceil_grid(origin + offset as f64 * duration / frames as f64))
+            .filter(|&frame| first <= frame && frame < end)
+            .collect();
         let waiting_after_gap = std::mem::take(&mut lane.waiting_after_gap);
         lane.packets.push_back(Packet {
             start: first,
@@ -508,6 +552,7 @@ impl SynchronizedCapture {
             fade_in: restart || first > start || waiting_after_gap,
             fade_out: false,
             samples,
+            bar_frames,
         });
         let backlog = u64::from(self.sample_rate) * u64::from(MAX_PENDING_SECONDS);
         lane.discard_before(end.saturating_sub(backlog));
@@ -607,13 +652,23 @@ impl SynchronizedCapture {
 
     fn push_block(&mut self, start: u64, end: u64, fade_frames: u64) {
         self.scratch.clear();
+        self.bar_scratch.clear();
         for frame in start..end {
+            let mut bar = false;
             for lane in self.lanes.iter_mut().flatten() {
-                lane.append_frame(frame, fade_frames, &mut self.scratch);
+                bar |= lane.append_frame(frame, fade_frames, &mut self.scratch);
+            }
+            if bar {
+                self.bar_scratch.push((frame - start) as usize);
             }
         }
         // Each lane appends exactly its configured channel count to every frame.
-        let _ = self.capture.push_interleaved(&self.scratch);
+        if let Err(error) = self
+            .capture
+            .push_interleaved_with_markers(&self.scratch, &self.bar_scratch)
+        {
+            self.capture_error = Some(error);
+        }
     }
 }
 
@@ -635,6 +690,33 @@ fn ceil_grid(position: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sender_bars_use_the_shared_grid_and_survive_only_with_retained_audio() {
+        let mut capture =
+            SynchronizedCapture::new(100, 1, Some(1), DurationChoice::Seconds10).unwrap();
+        capture
+            .push_with_markers(0, 0, 50, &[0.; 20], false, &[1, 18, 19])
+            .unwrap();
+        capture
+            .push_with_markers(0, 400_000_000, 50, &[0.5; 20], false, &[0, 5])
+            .unwrap();
+        capture
+            .push_with_markers(1, 400_000_000, 100, &[0.25; 40], false, &[0, 20])
+            .unwrap();
+        capture.drain(true);
+        let capture = capture.capture();
+        assert_eq!(
+            capture.track_snapshot(0).unwrap().frame_range(),
+            capture.track_snapshot(1).unwrap().frame_range()
+        );
+        let markers = capture.bar_markers(0..80);
+        assert_eq!(markers.len(), 5);
+        assert_eq!(
+            &markers[1..],
+            &[markers[0] + 2, markers[0] + 4, markers[0] + 14, markers[0] + 24]
+        );
+    }
 
     #[test]
     fn same_source_mid_and_side_keep_every_native_frame_under_timestamp_jitter() {
