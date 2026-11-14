@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-11-14T00:55:30.765941Z",
+  "source_base_commit": "58dee34f419d56e572e2e99cba0bdbdfef4540ec",
+  "source_has_uncommitted_changes": true,
+  "artifacts": [
+    {
+      "role": "windows_desktop",
+      "artifact": "desktop/windows/target/release/Backtracking.exe",
+      "size_bytes": 8190976,
+      "sha256": "5A4A20484991E8C85249BAAAC22D2F453C4B5E886BC24A17A8029C7C4EA2390A"
+    },
+    {
+      "role": "windows_plugin",
+      "artifact": "plugins/backtracking-plugin/target/release/backtracking_plugin.dll",
+      "size_bytes": 7344128,
+      "sha256": "ED28229A16714BB2C18243FD5F4A2AFA2E51624920D376A300EAF9C4F3789866"
+    },
+    {
+      "role": "windows_setup",
+      "artifact": "target/setup/Backtracking-0.1.5-Windows-x64-Setup.exe",
+      "size_bytes": 3486718,
+      "sha256": "A65B99A0B5C2A1502A3F58EB164CE75AD3D51AA36AE62857D6967A4A3E6F72B7"
+    }
+  ],
+  "fresh_checks": {
+    "core": {
+      "passed": 61,
+      "ignored": 1,
+      "example_checks_passed": 2
+    },
+    "windows": {
+      "passed": 47,
+      "ignored": 2
+    },
+    "plugin": {
+      "passed": 46,
+      "ignored": 0
+    }
+  },
+  "final_desktop_native_observations": [
+    "Final desktop hash matches the runtime-tested copy-cleanup build.",
+    "Options footer is empty; instructional helper paragraphs and floating gesture tutorials are absent.",
+    "Native drag-resize from observed 900x300 to 700x230 remained operable, with waveform/bar/seconds rendering visible.",
+    "All synthetic fixtures were stopped.",
+    "The final desktop was restarted using the existing user profile and its clean Options window was observed operable."
+  ],
+  "intermediate_feature_test": {
+    "windows_exe_sha256": "0D31F1B6CC302D61C6D6CB258828158675DE9FE142727122C3022F99D8F3B279",
+    "evidence": "native-editing-observations.json",
+    "scope": "Earlier 1500x500 selection/play/ten-second rollover/selected-WAV and native zoom observations; not claimed to have all been repeated on the final build."
+  },
+  "packaging_scope": "Installer logic was unchanged; Setup was repackaged after the guide was frozen. Desktop/VST3/CLAP payload binaries and the bundled guide were byte-compared with their sources. Earlier 17 compile scenarios and 19 installation cases were not rerun for this payload.",
+  "limits": [
+    "No native physical Shift-drag was performed; RawInput/shared automated regressions cover modifier behavior separately.",
+    "Selected-WAV inspection does not establish exact source-sample sequence continuity, absence of duplicated/missing frames, or artifact-free audio.",
+    "No new CPU/GPU monitoring is inferred from the native GUI observations.",
+    "No WAV or private screenshot is published in this evidence set.",
+    "macOS native build and specified CI tests succeeded on 55baeac; GUI/Fn/permission/DAW runtime remains unverified. Linux X11 follow-up succeeded on 52af947, while Wayland and interactive hardware/compositor behavior are unverified. Original failed runs remain historical; CI binaries are not claimed identical to local artifacts."
+  ],
+  "bundled_guide": {
+    "source": "docs/USER_GUIDE.md",
+    "sha256": "C8024011C78AFFC2E158A4D6D63C080FFFBA80952B7AFBD248D76EF784286D73",
+    "frozen_before_final_setup_packaging": true
+  },
+  "payload_byte_comparisons": [
+    {
+      "component": "desktop_binary",
+      "matches_current_source_bytes": true
+    },
+    {
+      "component": "vst3_binary",
+      "matches_current_source_bytes": true
+    },
+    {
+      "component": "clap_binary",
+      "matches_current_source_bytes": true
+    },
+    {
+      "component": "bundled_user_guide",
+      "matches_current_source_bytes": true
+    }
+  ],
+  "remote_ci": {
+    "evidence": "cross-platform-ci.json",
+    "product_commit": "55baeacd07a26b4358475609eeb3ccdbc51e3469",
+    "product_run_id": 43537657689,
+    "workflow_only_linux_retry_id": 43538353959,
+    "workflow_only_linux_retry_conclusion": "failure",
+    "local_artifact_hashes_unchanged": true,
+    "ci_binaries_claimed_identical_to_local_artifacts": false,
+    "linux_diagnostic_retry_id": 43539038043,
+    "linux_diagnostic_retry_conclusion": "failure",
+    "product_run_overall_conclusion": "failure",
+    "linux_followup_run_id": 43539505931,
+    "linux_followup_commit": "52af947930585169ea539d8a274bf10d5f23bf60",
+    "linux_followup_conclusion": "success",
+    "latest_linux_job": "success",
+    "windows_macos_rerun_in_linux_followup": false,
+    "product_run_jobs": {
+      "windows": "success",
+      "macos": "success",
+      "linux": "failure"
+    }
+  }
+}

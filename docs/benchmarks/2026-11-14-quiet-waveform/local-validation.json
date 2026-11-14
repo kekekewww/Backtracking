@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-11-14T03:00:48.938570Z",
+  "evidence_origin": "integration owner reports fresh local suite executions and native GUI observations; raw suite/GUI logs and private screenshots are not published",
+  "local_suites": [
+    {
+      "component": "core library",
+      "passed": 82,
+      "ignored": 1,
+      "ignored_scope": "TCP loopback"
+    },
+    {
+      "component": "Timeline Sender example",
+      "passed": 2
+    },
+    {
+      "component": "Windows desktop",
+      "passed": 73,
+      "ignored": 3
+    },
+    {
+      "component": "Windows native quiet smoke",
+      "passed": 1,
+      "execution": "separate opt-in case, not added to ordinary suite passed count",
+      "detail": "native-quiet-smoke.json"
+    },
+    {
+      "component": "VST3/CLAP plug-in",
+      "passed": 64,
+      "ignored": 0
+    }
+  ],
+  "intermediate_windows_gui": {
+    "desktop_sha256": "5b95b567eb5858447c0ead266cb1c31136cd3c032767cc03c914fab6bd2e0c7a",
+    "artifact_role": "intermediate Release, before Options secondary title PID removal; not the final rebuilt or packaged binary",
+    "observations": [
+      "Capture quiet checkbox defaults unchecked",
+      "checkbox changed On then Off",
+      "no helper paragraphs",
+      "Clear followed by a full 10.00-second visible span showed a continuous envelope",
+      "manual Pause followed by wheel zoom through 10.00, 4.51, 0.42, 0.04 and 0.01 seconds remained continuous, without comb or scattered-point appearance"
+    ],
+    "visible_history_seconds": 10.0,
+    "short_span_interpretation": "earlier 0.02-second view reflected manual zoom/short-history state, not demonstrated capture loss",
+    "not_measured": [
+      "GUI frame time or latency",
+      "CPU/RAM performance",
+      "exported audio integrity"
+    ],
+    "observed_zoom_seconds": [
+      10.0,
+      4.51,
+      0.42,
+      0.04,
+      0.01
+    ],
+    "not_newly_verified": [
+      "physical Shift-drag",
+      "native resize"
+    ],
+    "session_ended": true
+  },
+  "plugin_processing_contract": {
+    "CLAP_live_keep_alive": "retain_silence || sender_enabled",
+    "CLAP_live_status": "KeepAlive / CLAP_CONTINUE only when the expression is true",
+    "offline_status": "Normal",
+    "VST3_status": "Normal / kNoTail",
+    "reason": "avoid declaring infinite tail for VST3 offline export/freeze",
+    "RT_state": "AtomicBool",
+    "wake_limitation": "public GuiContext/ProcessContext has no safe request_process interface; sleeping/stopped hosts require the next real callback; no fabricated audio without callbacks",
+    "no_added_paths": [
+      "vendor hook",
+      "dummy parameter",
+      "restart",
+      "wake call"
+    ],
+    "DAW_runtime_verified": false
+  },
+  "pending": [],
+  "limitations": [
+    "Local suites are not full-platform runtime acceptance.",
+    "Existing historical hardware/responsive evidence and artifact hashes are not reused for this round.",
+    "No private screenshots or audio are published.",
+    "Final built/packaged/desktop-refresh metadata is separate in package-validation.json; GUI feature observations still belong to the intermediate build.",
+    "Final normal tray/toolwindow could not be selected by the computer-use inventory; no fresh final-binary GUI interaction is claimed.",
+    "New packaged plug-ins were not installed by the desktop-only refresh; pre-existing installed plug-ins remain unchanged.",
+    "No new physical Shift-drag or native resize observation was added in this round."
+  ],
+  "source_commit_for_final_build": "5fe9224c3dc54d0a2a655ec6b66522c43bd7a238",
+  "ci_reference": "cross-platform-ci.json: completed success for Windows, macOS and Linux on the same source commit"
+}

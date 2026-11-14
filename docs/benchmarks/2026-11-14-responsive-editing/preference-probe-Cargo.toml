@@ -1,0 +1,11 @@
+[package]
+name = "backtracking-preference-disk-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+backtracking-core = { path = "../../../crates/backtracking-core" }
+serde_json = "1.0"

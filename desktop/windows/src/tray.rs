@@ -64,10 +64,11 @@ struct TrayState {
     taskbar_button_created: u32,
     recheck_taskbar: Cell<bool>,
     show_existing: u32,
+    primary: bool,
 }
 
 impl Tray {
-    pub(crate) fn attach(window: &Window, ctx: &Context) -> io::Result<Self> {
+    pub(crate) fn attach(window: &Window, ctx: &Context, primary: bool) -> io::Result<Self> {
         let handle = window
             .window_handle()
             .map_err(|error| io::Error::other(error.to_string()))?;
@@ -112,7 +113,8 @@ impl Tray {
                 RegisterWindowMessageW(w!("TaskbarButtonCreated").as_ptr())
             },
             recheck_taskbar: Cell::new(false),
-            show_existing: startup::show_message(),
+            show_existing: if primary { startup::show_message() } else { 0 },
+            primary,
         });
         // The subclass owns a strong reference until it is removed or the HWND is destroyed.
         let data = Rc::into_raw(Rc::clone(&state));
@@ -135,7 +137,8 @@ impl Tray {
             data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
             data.uCallbackMessage = CALLBACK;
             data.hIcon = self.state.icon;
-            for (output, unit) in data.szTip.iter_mut().zip("Backtracking".encode_utf16()) {
+            let name = if self.state.primary { "Backtracking" } else { "Backtracking Capture" };
+            for (output, unit) in data.szTip.iter_mut().zip(name.encode_utf16()) {
                 *output = unit;
             }
             if unsafe { Shell_NotifyIconW(NIM_ADD, &data) } != 0 {
@@ -170,8 +173,8 @@ pub(crate) fn suppress_taskbar(window: &Window) {
     window.set_skip_taskbar(true);
 }
 
-pub(crate) fn prepare_options_window() {
-    let title: Vec<u16> = OPTIONS_TITLE
+pub(crate) fn prepare_options_window(title: &str) {
+    let title: Vec<u16> = title
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -353,7 +356,7 @@ fn tray_menu(hwnd: HWND, state: &TrayState) -> Option<Action> {
         return None;
     }
     let visible = unsafe { IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 };
-    let startup_checked = startup::enabled().unwrap_or_default();
+    let startup_checked = state.primary && startup::enabled().unwrap_or_default();
     let menu = unsafe { CreatePopupMenu() };
     if menu.is_null() {
         return None;
@@ -372,7 +375,7 @@ fn tray_menu(hwnd: HWND, state: &TrayState) -> Option<Action> {
         };
         if AppendMenuW(menu.0, MF_STRING, 1, visibility.as_ptr()) == 0
             || AppendMenuW(menu.0, MF_STRING, 4, w!("Options").as_ptr()) == 0
-            || AppendMenuW(menu.0, startup_flags, 2, w!("Start with Windows").as_ptr()) == 0
+            || (state.primary && AppendMenuW(menu.0, startup_flags, 2, w!("Start with Windows").as_ptr()) == 0)
             || AppendMenuW(menu.0, MF_SEPARATOR, 0, null()) == 0
             || AppendMenuW(menu.0, MF_STRING, 3, w!("Quit").as_ptr()) == 0
         {

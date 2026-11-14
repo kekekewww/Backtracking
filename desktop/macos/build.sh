@@ -34,7 +34,7 @@ xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library -O \
   -import-objc-header "$repo_dir/crates/backtracking-core/include/backtracking.h" \
   "$source_dir/BacktrackingApp.swift" "$source_dir/SystemAudioTap.swift" "$source_dir/StartupUpdater.swift" \
   "$target_dir/$rust_target/release/libbacktracking_core.a" \
-  -framework AppKit -framework CoreAudio -framework AudioToolbox -framework AVFoundation -framework ServiceManagement \
+  -framework AppKit -framework CoreAudio -framework AudioToolbox -framework AVFoundation -framework ServiceManagement -framework Carbon -framework CoreGraphics \
   -o "$app_dir/Contents/MacOS/Backtracking"
 identity="${BACKTRACKING_MAC_CODESIGN_IDENTITY:--}"
 if [[ "$identity" == - ]]; then

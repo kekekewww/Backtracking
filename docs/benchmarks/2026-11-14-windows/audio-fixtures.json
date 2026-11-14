@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "generator": "tools/generate_test_audio.py",
+  "target_peak_linear": 0.08,
+  "target_peak_dbfs": -21.93820026016113,
+  "boundary_convention": "Frame ranges are zero-based and end-exclusive.",
+  "signal": {
+    "left_fundamental_hz": 440,
+    "right_fundamental_hz": 660,
+    "character": "Slow amplitude/frequency variation, harmonics, and faded 150 ms pulses every 2.5 s.",
+    "continuous_loop_seconds": 20,
+    "gated_loop_seconds": 30,
+    "gated_audio_fade_frames": 480
+  },
+  "fixtures": [
+    {
+      "path": "continuous-stereo.wav",
+      "description": "Uninterrupted stereo mixture; all modulations repeat exactly every 20 seconds.",
+      "sample_rate_hz": 48000,
+      "channels": 2,
+      "sample_width_bytes": 2,
+      "encoding": "PCM signed 16-bit little-endian",
+      "duration_seconds": 20,
+      "frame_count": 960000,
+      "file_size_bytes": 3840044,
+      "peak_linear": 0.079986572265625,
+      "peak_dbfs": -21.93965828026235,
+      "rms_linear": 0.03663763697495811,
+      "rms_dbfs": -28.72145089758957,
+      "channel_peak_linear": [
+        0.079986572265625,
+        0.077117919921875
+      ],
+      "channel_rms_linear": [
+        0.038097724312609174,
+        0.03511689462948089
+      ],
+      "pcm_sha256": "cf5d48c9dbe85f63beceab733f5dea5471bf38421170b683be303b15da4d7345",
+      "segments": [
+        {
+          "kind": "audio",
+          "start_frame": 0,
+          "end_frame_exclusive": 960000,
+          "start_seconds": 0,
+          "end_seconds_exclusive": 20,
+          "fade_in_frames": 0,
+          "fade_out_frames": 0
+        }
+      ]
+    },
+    {
+      "path": "gated-stereo.wav",
+      "description": "Three 5-second stereo mixtures alternating with exact 5-second digital silence.",
+      "sample_rate_hz": 48000,
+      "channels": 2,
+      "sample_width_bytes": 2,
+      "encoding": "PCM signed 16-bit little-endian",
+      "duration_seconds": 30,
+      "frame_count": 1440000,
+      "file_size_bytes": 5760044,
+      "peak_linear": 0.079986572265625,
+      "peak_dbfs": -21.93965828026235,
+      "rms_linear": 0.028257625034042638,
+      "rms_dbfs": -30.977286841223524,
+      "channel_peak_linear": [
+        0.079986572265625,
+        0.077117919921875
+      ],
+      "channel_rms_linear": [
+        0.029384393312091434,
+        0.027084020654426895
+      ],
+      "pcm_sha256": "369b147736bfaf295889dfd859c7da54c9032dc368543e5ce4e7c9671fdf5edf",
+      "segments": [
+        {
+          "kind": "audio",
+          "start_frame": 0,
+          "end_frame_exclusive": 240000,
+          "start_seconds": 0,
+          "end_seconds_exclusive": 5,
+          "fade_in_frames": 480,
+          "fade_out_frames": 480
+        },
+        {
+          "kind": "digital_silence",
+          "start_frame": 240000,
+          "end_frame_exclusive": 480000,
+          "start_seconds": 5,
+          "end_seconds_exclusive": 10,
+          "fade_in_frames": 0,
+          "fade_out_frames": 0
+        },
+        {
+          "kind": "audio",
+          "start_frame": 480000,
+          "end_frame_exclusive": 720000,
+          "start_seconds": 10,
+          "end_seconds_exclusive": 15,
+          "fade_in_frames": 480,
+          "fade_out_frames": 480
+        },
+        {
+          "kind": "digital_silence",
+          "start_frame": 720000,
+          "end_frame_exclusive": 960000,
+          "start_seconds": 15,
+          "end_seconds_exclusive": 20,
+          "fade_in_frames": 0,
+          "fade_out_frames": 0
+        },
+        {
+          "kind": "audio",
+          "start_frame": 960000,
+          "end_frame_exclusive": 1200000,
+          "start_seconds": 20,
+          "end_seconds_exclusive": 25,
+          "fade_in_frames": 480,
+          "fade_out_frames": 480
+        },
+        {
+          "kind": "digital_silence",
+          "start_frame": 1200000,
+          "end_frame_exclusive": 1440000,
+          "start_seconds": 25,
+          "end_seconds_exclusive": 30,
+          "fade_in_frames": 0,
+          "fade_out_frames": 0
+        }
+      ]
+    }
+  ]
+}

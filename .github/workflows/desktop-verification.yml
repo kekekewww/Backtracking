@@ -9,16 +9,27 @@ on:
       - 'desktop/**'
       - 'plugins/**'
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to verify
+        type: choice
+        options:
+          - all
+          - windows
+          - macos
+          - linux
+        default: all
 
 permissions:
   contents: read
 
 concurrency:
-  group: native-desktop-${{ github.event.pull_request.number || github.ref }}
+  group: native-desktop-${{ github.event.pull_request.number || github.ref }}-${{ inputs.platform || 'all' }}
   cancel-in-progress: true
 
 jobs:
   windows:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +60,7 @@ jobs:
           cargo +1.99.1 build --locked --release --manifest-path plugins/backtracking-plugin/Cargo.toml
 
   macos:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos' }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -81,3 +93,64 @@ jobs:
         run: |
           cargo +1.99.1 test --workspace --locked
           cargo +1.99.1 test --locked --manifest-path plugins/backtracking-plugin/Cargo.toml
+
+  linux:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.99.1 --profile minimal
+      - name: Install Linux shortcut build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libglib2.0-dev xvfb xdotool
+      - name: Test Linux shortcut helper
+        run: cargo +1.99.1 test --locked --manifest-path desktop/linux/Cargo.toml
+      - name: Verify independent plug-in Sender connections
+        run: cargo +1.99.1 test --locked --workspace same_named_senders_fan_out_and_snapshot_targets_are_independent -- --ignored
+      - name: Verify X11 shortcut activation and duplicate registration
+        run: |
+          cargo +1.99.1 build --locked --manifest-path desktop/linux/Cargo.toml
+          env -u WAYLAND_DISPLAY XDG_SESSION_TYPE=x11 xvfb-run -a bash -euo pipefail <<'SCRIPT'
+          shortcut=desktop/linux/target/debug/backtracking-shortcut
+          "$shortcut" >shortcut.log 2>&1 &
+          helper_pid=$!
+          cleanup() {
+            result=$?
+            trap - EXIT
+            kill "$helper_pid" 2>/dev/null || true
+            wait "$helper_pid" 2>/dev/null || true
+            if (( result != 0 )); then
+              for log in shortcut.log duplicate.log; do
+                if [[ -f "$log" ]]; then
+                  printf '%s\n' "X11 diagnostic: $log"
+                  cat "$log"
+                fi
+              done
+              if command -v xmodmap >/dev/null 2>&1; then
+                printf '%s\n' 'X11 diagnostic: modifier map'
+                xmodmap -pm || true
+                printf '%s\n' 'X11 diagnostic: relevant key symbols'
+                xmodmap -pke | awk '/grave|asciitilde|Super_L|Super_R/' || true
+              fi
+              if command -v xkbcomp >/dev/null 2>&1; then
+                printf '%s\n' 'X11 diagnostic: physical key names and Super symbols'
+                xkbcomp -w 0 -xkb "$DISPLAY" - |
+                  awk '/xkb_keycodes|minimum|maximum|<TLDE>|<LWIN>|<RWIN>|modifier_map|Super_L|Super_R/' || true
+              fi
+            fi
+            exit "$result"
+          }
+          trap cleanup EXIT
+          for attempt in {1..25}; do
+            if grep -q 'listening for Super+grave' shortcut.log; then break; fi
+            sleep 0.1
+          done
+          grep 'listening for Super+grave' shortcut.log
+          if "$shortcut" >duplicate.log 2>&1; then exit 1; fi
+          grep 'already registered' duplicate.log
+          xdotool keydown Super_L keydown grave
+          sleep 1.2
+          xdotool keyup grave keyup Super_L
+          sleep 0.2
+          test "$(grep -c 'no running Backtracking plug-in instance' shortcut.log)" -eq 1
+          SCRIPT

@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-11-14T02:36:08.566345Z",
+  "status": "complete for recorded scope: local suites, intermediate Windows GUI, native smoke, final local package/desktop refresh, and successful current-source Windows/macOS/Linux CI",
+  "evidence_type": "sanitized native smoke, integration-owner local suite/GUI reports, independently checked package bytes and desktop-refresh metadata",
+  "historical_evidence_policy": "earlier Windows hardware and responsive-editing reports, traces and build hashes remain unchanged",
+  "files": [
+    {
+      "name": "cross-platform-ci.json",
+      "size_bytes": 8024,
+      "sha256": "6dbd2fa28b8d21d5ccd8ec65bd4f9db3bf77b505739e13d1bf87915d41911a90"
+    },
+    {
+      "name": "local-validation.json",
+      "size_bytes": 3696,
+      "sha256": "5e0e0d04db49b7aae876d5640703c23d1c5f48e5989b0a9260a7c5ab96c6cd2a"
+    },
+    {
+      "name": "native-quiet-smoke.json",
+      "size_bytes": 5520,
+      "sha256": "d1b87236d30100a314209a750fa91f73fbc68cc87864abbe154846c2504bb850"
+    },
+    {
+      "name": "package-validation.json",
+      "size_bytes": 4034,
+      "sha256": "ed791f7b728ac4af9582359e94f650354bcc46fea273b49705a02945086bcbe1"
+    },
+    {
+      "name": "README.md",
+      "size_bytes": 3346,
+      "sha256": "a681e2ac82fba8114652232b38ab8c49c582d26195cefe32d58bef256d744d71"
+    }
+  ],
+  "tool_sources": [
+    {
+      "path": "tools/quiet_process_fixture.rs",
+      "size_bytes": 576,
+      "sha256": "ae09d1b4459cf520cba5917d60742cd6ff1ed2d00fe1ead716f0856362c8175e",
+      "provenance": "matches successful fixture source hash"
+    },
+    {
+      "path": "tools/run_native_quiet_smoke.ps1",
+      "size_bytes": 3930,
+      "sha256": "a544e409ef754d1d2988aa3f32c61eea1b114f2e60130c4292b291ea120ce99c",
+      "provenance": "reproduction runner source at publication; historical runs did not record a runner hash"
+    }
+  ],
+  "limitations": [
+    "No private logs, process IDs, screenshots or audio are published.",
+    "Recorded debug native smoke is not a Release/Setup/DAW/GUI or general latency result.",
+    "Local suites and intermediate GUI observations are integration-owner reports, separate from parsed native smoke, independently checked local package bytes and public CI metadata. CI success does not imply interactive macOS/Fn/DAW/Wayland, physical Shift-drag, new native resize or general audio-quality acceptance."
+  ],
+  "updated_utc": "2026-11-14T03:11:10.092530Z",
+  "product_source_commit": "5fe9224c3dc54d0a2a655ec6b66522c43bd7a238"
+}

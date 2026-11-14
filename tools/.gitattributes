@@ -1,0 +1,9 @@
+# These source files are hashed by the hardware evidence manifest.
+monitor_backtracking.ps1 text eol=lf
+summarize_hardware.py text eol=lf
+generate_test_audio.py text eol=lf
+inspect_wav.py text eol=lf
+
+# Quiet capture evidence.
+quiet_process_fixture.rs text eol=lf
+run_native_quiet_smoke.ps1 text eol=lf

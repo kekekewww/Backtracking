@@ -27,6 +27,7 @@ pub(crate) enum CaptureSource {
     DefaultMicrophone,
     Microphone { id: String, name: String },
     Application { path: String, name: String },
+    Sender { id: String, name: String },
 }
 
 impl CaptureSource {
@@ -34,7 +35,7 @@ impl CaptureSource {
         match self {
             Self::System => "System audio",
             Self::DefaultMicrophone => "Default microphone",
-            Self::Microphone { name, .. } | Self::Application { name, .. } => name,
+            Self::Microphone { name, .. } | Self::Application { name, .. } | Self::Sender { name, .. } => name,
         }
     }
 
@@ -43,7 +44,8 @@ impl CaptureSource {
             (Self::System, Self::System) | (Self::DefaultMicrophone, Self::DefaultMicrophone) => {
                 true
             }
-            (Self::Microphone { id, .. }, Self::Microphone { id: other, .. }) => id == other,
+            (Self::Microphone { id, .. }, Self::Microphone { id: other, .. })
+            | (Self::Sender { id, .. }, Self::Sender { id: other, .. }) => id == other,
             (Self::Application { path, .. }, Self::Application { path: other, .. }) => {
                 same_path(path, other)
             }

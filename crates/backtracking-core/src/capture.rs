@@ -1,8 +1,12 @@
+mod history;
+
+use std::collections::VecDeque;
 use std::time::Instant;
 use std::{error::Error, fmt, ops::Range};
 
 use crate::meter::{Meter, MeterReadings};
 use crate::waveform::WaveformView;
+use history::History;
 
 const OPEN_LEVEL: f32 = 0.001;
 const CLOSE_LEVEL: f32 = 0.000_5;
@@ -17,14 +21,20 @@ pub enum DurationChoice {
     Seconds20,
     Seconds30,
     Seconds60,
+    Minutes3,
+    Minutes5,
+    Minutes10,
 }
 
 impl DurationChoice {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 7] = [
         Self::Seconds10,
         Self::Seconds20,
         Self::Seconds30,
         Self::Seconds60,
+        Self::Minutes3,
+        Self::Minutes5,
+        Self::Minutes10,
     ];
 
     pub const fn from_seconds(seconds: u32) -> Option<Self> {
@@ -33,6 +43,9 @@ impl DurationChoice {
             20 => Some(Self::Seconds20),
             30 => Some(Self::Seconds30),
             60 => Some(Self::Seconds60),
+            180 => Some(Self::Minutes3),
+            300 => Some(Self::Minutes5),
+            600 => Some(Self::Minutes10),
             _ => None,
         }
     }
@@ -43,6 +56,9 @@ impl DurationChoice {
             Self::Seconds20 => 20,
             Self::Seconds30 => 30,
             Self::Seconds60 => 60,
+            Self::Minutes3 => 180,
+            Self::Minutes5 => 300,
+            Self::Minutes10 => 600,
         }
     }
 }
@@ -110,12 +126,16 @@ pub struct Capture {
     channels: usize,
     a_channels: usize,
     retention_frames: usize,
-    history: FrameRing,
+    history: History,
     pre_roll: FrameRing,
+    bar_markers: VecDeque<u64>,
+    pending_bars: VecDeque<u64>,
     tail_frames: usize,
     quiet_frames: usize,
     join_fade_frames: usize,
     join_fade: JoinFade,
+    retain_silence: bool,
+    gate_recording: bool,
     state: CaptureState,
     revision: u64,
     meter: Meter,
@@ -132,11 +152,17 @@ enum JoinFade {
 }
 
 impl JoinFade {
-    fn push(&mut self, history: &mut FrameRing, frame: &[f32], fade_frames: usize) {
+    fn push(
+        &mut self,
+        history: &mut History,
+        frame: &[f32],
+        fade_frames: usize,
+    ) -> Result<(), CaptureError> {
+        history.ensure_append_capacity()?;
         let remaining = match *self {
             Self::None => {
-                history.push(frame);
-                return;
+                history.push(frame, 1.0);
+                return Ok(());
             }
             Self::Pending {
                 fade_tail,
@@ -147,24 +173,25 @@ impl JoinFade {
                 }
                 if wait_for_signal && frame.iter().all(|&sample| sample == 0.0) {
                     // A gap's synthetic pre-roll must not use up the fade-in.
-                    history.push(frame);
+                    history.push(frame, 1.0);
                     *self = Self::Pending {
                         fade_tail: false,
                         wait_for_signal: true,
                     };
-                    return;
+                    return Ok(());
                 }
                 fade_frames
             }
             Self::FadeIn(remaining) => remaining,
         };
         let gain = (fade_frames - remaining) as f32 / fade_frames.saturating_sub(1).max(1) as f32;
-        history.push_with_gain(frame, gain);
+        history.push(frame, gain);
         *self = if remaining > 1 {
             Self::FadeIn(remaining - 1)
         } else {
             Self::None
         };
+        Ok(())
     }
 }
 
@@ -204,25 +231,29 @@ impl Capture {
         if a_channels == 0 {
             return Err(CaptureError::InvalidChannelCount);
         }
-        let channels = a_channels + b_channels.unwrap_or(0);
-
-        let capacity_frames = usize::try_from(
-            u64::from(sample_rate) * u64::from(DurationChoice::Seconds60.seconds()),
-        )
-        .map_err(|_| CaptureError::BufferTooLarge)?;
+        let channels = a_channels
+            .checked_add(b_channels.unwrap_or(0))
+            .ok_or(CaptureError::BufferTooLarge)?;
+        let retention_frames = (sample_rate as usize)
+            .checked_mul(retention.seconds() as usize)
+            .ok_or(CaptureError::BufferTooLarge)?;
         let frames_for_ms = |ms| (u64::from(sample_rate) * u64::from(ms)).div_ceil(1_000) as usize;
 
         Ok(Self {
             sample_rate,
             channels,
             a_channels,
-            retention_frames: sample_rate as usize * retention.seconds() as usize,
-            history: FrameRing::new(capacity_frames, channels)?,
+            retention_frames,
+            history: History::new(sample_rate as usize, channels, a_channels)?,
             pre_roll: FrameRing::new(frames_for_ms(PRE_ROLL_MS), channels)?,
+            bar_markers: VecDeque::new(),
+            pending_bars: VecDeque::new(),
             tail_frames: frames_for_ms(TAIL_MS),
             quiet_frames: 0,
             join_fade_frames: frames_for_ms(JOIN_FADE_MS),
             join_fade: JoinFade::None,
+            retain_silence: false,
+            gate_recording: false,
             state: CaptureState::Waiting,
             revision: 0,
             meter: Meter::new(sample_rate, a_channels)?,
@@ -233,6 +264,93 @@ impl Capture {
     }
 
     pub fn push_interleaved(&mut self, samples: &[f32]) -> Result<(), CaptureError> {
+        self.push_interleaved_with_markers(samples, &[])
+    }
+
+    pub fn retain_silence(&self) -> bool {
+        self.retain_silence
+    }
+
+    /// Applies to future input without restoring discarded pre-roll or changing pause.
+    pub fn set_retain_silence(&mut self, enabled: bool) {
+        if self.retain_silence == enabled {
+            return;
+        }
+        if enabled {
+            self.gate_recording = self.state == CaptureState::Recording;
+        } else if self.state != CaptureState::Paused {
+            self.state = if self.gate_recording {
+                CaptureState::Recording
+            } else {
+                CaptureState::Waiting
+            };
+        }
+        self.retain_silence = enabled;
+        self.pre_roll.clear();
+        self.pending_bars.clear();
+    }
+
+    pub(crate) fn append_known_silence(&mut self, frames: u64) -> Result<(), CaptureError> {
+        if !self.retain_silence || self.state == CaptureState::Paused || frames == 0 {
+            return Ok(());
+        }
+        let previous_end = self.history.total_frames();
+        previous_end.checked_add(frames).ok_or(CaptureError::BufferTooLarge)?;
+        let mut zero = Vec::new();
+        zero.try_reserve_exact(self.channels).map_err(|_| CaptureError::AllocationFailed)?;
+        zero.resize(self.channels, 0.0);
+        let now = Instant::now();
+        self.meter.begin_block(now);
+        if let Some(meter) = &mut self.meter_b { meter.begin_block(now); }
+        let prefix = if matches!(self.join_fade, JoinFade::None) { 0 }
+            else { frames.min(self.join_fade_frames as u64) };
+        let result = self.retain_frames(std::iter::repeat(zero.as_slice()).take(prefix as usize), &[])
+            .and_then(|()| self.history.append_silence(frames - prefix, self.retention_frames));
+        let retained = self.history.total_frames() - previous_end;
+        let bulk = retained.saturating_sub(prefix);
+        if bulk != 0 {
+            self.advance_quiet_gate(bulk);
+            self.state = CaptureState::Recording;
+            // An input gap this long is already stale to the meters. Short gaps
+            // still replay every frame, preserving their release/window behavior.
+            if bulk >= u64::from(self.sample_rate) {
+                self.meter.reset();
+                if let Some(meter) = &mut self.meter_b { meter.reset(); }
+            } else {
+                let (a, b) = zero.split_at(self.a_channels);
+                for _ in 0..bulk {
+                    self.meter.push_frame(a);
+                    if let Some(meter) = &mut self.meter_b { meter.push_frame(b); }
+                }
+            }
+        }
+        let now = Instant::now();
+        self.meter.end_block(now);
+        if let Some(meter) = &mut self.meter_b { meter.end_block(now); }
+        if retained != 0 {
+            self.revision = self.revision.wrapping_add(1);
+            self.prune_bars();
+        }
+        result
+    }
+
+    fn advance_quiet_gate(&mut self, frames: u64) {
+        if self.gate_recording {
+            if frames >= self.tail_frames.saturating_sub(self.quiet_frames) as u64 {
+                self.gate_recording = false;
+                self.quiet_frames = 0;
+            } else {
+                self.quiet_frames += frames as usize;
+            }
+        }
+    }
+
+    /// Bar offsets are sorted positions within this block, before silence is removed.
+    pub fn push_interleaved_with_markers(
+        &mut self,
+        samples: &[f32],
+        source_block_offset_of_bars: &[usize],
+    ) -> Result<(), CaptureError> {
         let frames = samples.chunks_exact(self.channels);
         if !frames.remainder().is_empty() {
             return Err(CaptureError::IncompleteFrame);
@@ -246,37 +364,102 @@ impl Capture {
         if let Some(meter) = &mut self.meter_b {
             meter.begin_block(now);
         }
-        let mut changed = false;
-        for frame in frames {
+        let previous_end = self.history.total_frames();
+        let result = self.retain_frames(frames, source_block_offset_of_bars);
+        if self.history.total_frames() != previous_end {
+            self.revision = self.revision.wrapping_add(1);
+            self.prune_bars();
+        }
+        let now = Instant::now();
+        self.meter.end_block(now);
+        if let Some(meter) = &mut self.meter_b {
+            meter.end_block(now);
+        }
+        result
+    }
+
+    fn retain_frames<'a>(
+        &mut self,
+        frames: impl Iterator<Item = &'a [f32]>,
+        source_block_offset_of_bars: &[usize],
+    ) -> Result<(), CaptureError> {
+        let mut bars = source_block_offset_of_bars.iter().copied().peekable();
+        for (offset, frame) in frames.enumerate() {
+            let mut bar_here = false;
+            while let Some(&bar) = bars.peek().filter(|&&bar| bar <= offset) {
+                bars.next();
+                bar_here |= bar == offset;
+            }
             let (a, b) = frame.split_at(self.a_channels);
             let mut peak = self.meter.push_frame(a);
             if let Some(meter) = &mut self.meter_b {
                 peak = peak.max(meter.push_frame(b));
             }
 
+            if self.retain_silence {
+                let retained_frame = self.history.total_frames();
+                self.join_fade.push(&mut self.history, frame, self.join_fade_frames)?;
+                if bar_here { self.bar_markers.push_back(retained_frame); }
+                self.history.truncate_to(self.retention_frames);
+                if !self.gate_recording && peak >= OPEN_LEVEL {
+                    self.gate_recording = true;
+                    self.quiet_frames = 0;
+                }
+                if peak < CLOSE_LEVEL { self.advance_quiet_gate(1); }
+                else { self.quiet_frames = 0; }
+                self.state = CaptureState::Recording;
+                continue;
+            }
+
             if self.state == CaptureState::Waiting {
                 if peak < OPEN_LEVEL {
+                    if bar_here {
+                        self.pending_bars.push_back(self.pre_roll.total_frames);
+                    }
                     self.pre_roll.push(frame);
+                    let pre_roll_start = self.pre_roll.total_frames - self.pre_roll.len_frames as u64;
+                    while self
+                        .pending_bars
+                        .front()
+                        .is_some_and(|&frame| frame < pre_roll_start)
+                    {
+                        self.pending_bars.pop_front();
+                    }
                     continue;
                 }
 
                 // The opening frame has not entered pre-roll, so it will be written only once.
                 let (first, second) = self.pre_roll.as_slices();
-                for pending_frame in first
+                let pre_roll_start = self.pre_roll.total_frames - self.pre_roll.len_frames as u64;
+                let retained_start = self.history.total_frames();
+                let pre_roll_frames = self.pre_roll.len_frames;
+                for (offset, pending_frame) in first
                     .chunks_exact(self.channels)
                     .chain(second.chunks_exact(self.channels))
+                    .enumerate()
                 {
-                    self.join_fade
-                        .push(&mut self.history, pending_frame, self.join_fade_frames);
+                    if let Err(error) = self.join_fade
+                        .push(&mut self.history, pending_frame, self.join_fade_frames)
+                    {
+                        self.commit_pre_roll_bars(pre_roll_start, retained_start, offset);
+                        self.pre_roll.clear();
+                        self.history.truncate_to(self.retention_frames);
+                        return Err(error);
+                    }
                 }
+                self.commit_pre_roll_bars(pre_roll_start, retained_start, pre_roll_frames);
                 self.pre_roll.clear();
+                self.history.truncate_to(self.retention_frames);
                 self.state = CaptureState::Recording;
             }
 
+            let retained_frame = self.history.total_frames();
             self.join_fade
-                .push(&mut self.history, frame, self.join_fade_frames);
+                .push(&mut self.history, frame, self.join_fade_frames)?;
+            if bar_here {
+                self.bar_markers.push_back(retained_frame);
+            }
             self.history.truncate_to(self.retention_frames);
-            changed = true;
 
             if peak < CLOSE_LEVEL {
                 self.quiet_frames += 1;
@@ -288,22 +471,40 @@ impl Capture {
                 self.quiet_frames = 0;
             }
         }
-        if changed {
-            self.revision = self.revision.wrapping_add(1);
-        }
-        let now = Instant::now();
-        self.meter.end_block(now);
-        if let Some(meter) = &mut self.meter_b {
-            meter.end_block(now);
-        }
         Ok(())
+    }
+
+    fn commit_pre_roll_bars(&mut self, source_start: u64, retained_start: u64, frames: usize) {
+        self.bar_markers.extend(self.pending_bars.drain(..).filter_map(|bar| {
+            let offset = bar - source_start;
+            (offset < frames as u64).then_some(retained_start + offset)
+        }));
+    }
+
+    fn prune_bars(&mut self) {
+        let start = self.frame_range().start;
+        while self.bar_markers.front().is_some_and(|&frame| frame < start) {
+            self.bar_markers.pop_front();
+        }
+    }
+
+    /// Locates bar starts on the retained-audio timeline, using a half-open range.
+    pub fn bar_markers(&self, range: Range<u64>) -> Vec<u64> {
+        let first = self.bar_markers.partition_point(|&frame| frame < range.start);
+        let end = self.bar_markers.partition_point(|&frame| frame < range.end);
+        self.bar_markers
+            .range(first..end.max(first))
+            .copied()
+            .collect()
     }
 
     pub fn pause(&mut self) {
         self.state = CaptureState::Paused;
+        self.gate_recording = false;
         self.quiet_frames = 0;
         self.join_fade = JoinFade::None;
         self.pre_roll.clear();
+        self.pending_bars.clear();
         self.meter.reset();
         if let Some(meter) = &mut self.meter_b {
             meter.reset();
@@ -319,7 +520,7 @@ impl Capture {
     /// Ramps down the retained tail and ramps up the resumed audio when it is appended.
     /// The retained history is unchanged until the next frame is kept by the gate.
     pub fn smooth_next_join(&mut self) {
-        if self.history.len_frames != 0 {
+        if !self.frame_range().is_empty() {
             self.join_fade = JoinFade::Pending {
                 fade_tail: true,
                 wait_for_signal: false,
@@ -378,47 +579,59 @@ impl Capture {
 
     /// These indices describe audio kept by the shared silence gate.
     pub fn frame_range(&self) -> Range<u64> {
-        let end = self.history.total_frames;
-        end - self.history.len_frames as u64..end
+        self.history.frame_range()
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        let (first, second) = self.history.as_slices();
-        let mut samples = Vec::with_capacity(first.len() + second.len());
-        samples.extend_from_slice(first);
-        samples.extend_from_slice(second);
+        let range = self.frame_range();
+        let mut samples = Vec::with_capacity((range.end - range.start) as usize * self.channels);
+        for segment in self.history.slices(range.clone()) {
+            samples.extend_from_slice(segment);
+        }
         Snapshot {
             sample_rate: self.sample_rate,
             channels: self.channels,
             samples,
-            first_frame: self.frame_range().start,
+            first_frame: range.start,
         }
     }
 
     pub fn track_snapshot(&self, lane: usize) -> Option<Snapshot> {
-        let range = self.track_range(lane)?;
-        if range.len() == self.channels {
-            return Some(self.snapshot());
+        self.track_snapshot_range(lane, self.frame_range())
+    }
+
+    /// Copies only the requested retained frames, preserving their absolute position.
+    pub fn track_snapshot_range(&self, lane: usize, frames: Range<u64>) -> Option<Snapshot> {
+        let channels = self.track_range(lane)?;
+        let retained = self.frame_range();
+        if frames.start < retained.start || frames.end > retained.end || frames.end < frames.start {
+            return None;
         }
-        let (first, second) = self.history.as_slices();
-        let mut samples = Vec::with_capacity(self.history.len_frames * range.len());
-        for frame in first
-            .chunks_exact(self.channels)
-            .chain(second.chunks_exact(self.channels))
-        {
-            samples.extend_from_slice(&frame[range.clone()]);
+        let capacity = usize::try_from(frames.end - frames.start)
+            .ok()?
+            .checked_mul(channels.len())?;
+        let mut samples = Vec::new();
+        samples.try_reserve_exact(capacity).ok()?;
+        for segment in self.history.slices(frames.clone()) {
+            if channels.len() == self.channels {
+                samples.extend_from_slice(segment);
+            } else {
+                for frame in segment.chunks_exact(self.channels) {
+                    samples.extend_from_slice(&frame[channels.clone()]);
+                }
+            }
         }
         Some(Snapshot {
             sample_rate: self.sample_rate,
-            channels: range.len(),
+            channels: channels.len(),
             samples,
-            first_frame: self.frame_range().start,
+            first_frame: frames.start,
         })
     }
 
     /// Writes chronological waveform bins spanning the entire retained history.
     pub fn waveform(&self, minimum: &mut [f32], maximum: &mut [f32]) -> usize {
-        self.waveform_for(0..self.channels, None, minimum, maximum)
+        self.waveform_for(0, self.frame_range(), minimum, maximum)
     }
 
     pub fn track_waveform(
@@ -428,63 +641,51 @@ impl Capture {
         minimum: &mut [f32],
         maximum: &mut [f32],
     ) -> usize {
-        let Some(track) = self.track_range(lane) else {
+        self.track_waveform_range(lane, view, self.frame_range(), minimum, maximum)
+    }
+
+    /// Writes peaks for the intersection of the requested range and retained history.
+    pub fn track_waveform_range(
+        &self,
+        lane: usize,
+        view: WaveformView,
+        range: Range<u64>,
+        minimum: &mut [f32],
+        maximum: &mut [f32],
+    ) -> usize {
+        if self.track_range(lane).is_none() {
             minimum.fill(0.);
             maximum.fill(0.);
             return 0;
-        };
-        self.waveform_for(track, Some(view), minimum, maximum)
+        }
+        let retained = self.frame_range();
+        let range = range.start.max(retained.start)..range.end.min(retained.end);
+        self.waveform_for(1 + lane * 3 + view as usize, range, minimum, maximum)
     }
 
     fn waveform_for(
         &self,
-        track: Range<usize>,
-        view: Option<WaveformView>,
+        trace: usize,
+        range: Range<u64>,
         minimum: &mut [f32],
         maximum: &mut [f32],
     ) -> usize {
         minimum.fill(0.0);
         maximum.fill(0.0);
         let bin_count = minimum.len().min(maximum.len());
-        let frame_count = self.history.len_frames;
+        let frame_count = range.end.saturating_sub(range.start) as usize;
         if frame_count == 0 || bin_count == 0 {
             return frame_count;
         }
 
-        let (first, second) = self.history.as_slices();
-        let first_frames = first.len() / self.channels;
-        let frame_for_bin = |bin| (bin as u128 * frame_count as u128 / bin_count as u128) as usize;
-        let channel = match view {
-            Some(WaveformView::Left) => Some(track.start),
-            Some(WaveformView::Right) => Some(track.start + usize::from(track.len() > 1)),
-            Some(WaveformView::Merged) if track.len() == 1 => Some(track.start),
-            _ => None,
-        };
+        let frame_for_bin =
+            |bin| range.start + (bin as u128 * frame_count as u128 / bin_count as u128) as u64;
 
         for bin in 0..bin_count {
             let start = frame_for_bin(bin);
             // When there are more bins than frames, repeat the mapped frame.
             let end = frame_for_bin(bin + 1).max(start + 1);
-            let first_start = start.min(first_frames) * self.channels;
-            let first_end = end.min(first_frames) * self.channels;
-            let second_start = start.saturating_sub(first_frames) * self.channels;
-            let second_end = end.saturating_sub(first_frames) * self.channels;
-            let first = &first[first_start..first_end];
-            let second = &second[second_start..second_end];
-            let (low, high) = if let Some(channel) = channel {
-                let first = first.iter().skip(channel).step_by(self.channels);
-                let second = second.iter().skip(channel).step_by(self.channels);
-                crate::waveform::extrema(first.chain(second).copied())
-            } else if view.is_some() {
-                let frames = first
-                    .chunks_exact(self.channels)
-                    .chain(second.chunks_exact(self.channels));
-                crate::waveform::extrema(
-                    frames.map(|frame| WaveformView::Merged.sample(&frame[track.clone()])),
-                )
-            } else {
-                crate::waveform::extrema(first.iter().chain(second).copied())
-            };
+            let (low, high) = self.history.extrema(trace, start..end);
             minimum[bin] = low;
             maximum[bin] = high;
         }
@@ -492,21 +693,28 @@ impl Capture {
     }
 
     pub fn set_retention(&mut self, retention: DurationChoice) {
-        self.retention_frames = self.sample_rate as usize * retention.seconds() as usize;
-        if self.history.len_frames > self.retention_frames {
+        self.retention_frames =
+            (self.sample_rate as usize).saturating_mul(retention.seconds() as usize);
+        let retained = self.frame_range();
+        if retained.end - retained.start > self.retention_frames as u64 {
             self.revision = self.revision.wrapping_add(1);
         }
         self.history.truncate_to(self.retention_frames);
+        self.history.release_unused_capacity(self.retention_frames);
+        self.prune_bars();
     }
 
     /// Drops retained audio and pre-roll. An armed capture waits for fresh signal.
     pub fn clear(&mut self) {
-        if self.history.len_frames != 0 {
+        if !self.frame_range().is_empty() {
             self.revision = self.revision.wrapping_add(1);
         }
         self.history.clear();
         self.pre_roll.clear();
+        self.bar_markers.clear();
+        self.pending_bars.clear();
         self.quiet_frames = 0;
+        self.gate_recording = false;
         self.join_fade = JoinFade::None;
         self.meter.reset();
         if let Some(meter) = &mut self.meter_b {
@@ -570,27 +778,6 @@ impl FrameRing {
         self.total_frames = self.total_frames.saturating_add(1);
     }
 
-    fn fade_out_tail(&mut self, frames: usize) {
-        let count = frames.min(self.len_frames);
-        let denominator = count.saturating_sub(1).max(1) as f32;
-        let mut end = self.next_frame;
-        for distance in 0..count {
-            if end == 0 {
-                end = self.capacity_frames;
-            }
-            end -= 1;
-            let offset = end * self.channels;
-            let gain = distance as f32 / denominator;
-            for sample in &mut self.samples[offset..offset + self.channels] {
-                *sample *= gain;
-            }
-        }
-    }
-
-    fn truncate_to(&mut self, capacity_frames: usize) {
-        self.len_frames = self.len_frames.min(capacity_frames);
-    }
-
     fn clear(&mut self) {
         self.next_frame = 0;
         self.len_frames = 0;
@@ -613,6 +800,169 @@ impl FrameRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_silence_is_opt_in_and_does_not_restore_discarded_pre_roll() {
+        let mut capture = Capture::new(1_000, 1, DurationChoice::Seconds10).unwrap();
+        assert!(!capture.retain_silence());
+        capture.push_interleaved_with_markers(&[0.; 100], &[20]).unwrap();
+        assert!(capture.snapshot().samples.is_empty());
+
+        capture.set_retain_silence(true);
+        assert_eq!(capture.state(), CaptureState::Waiting);
+        let quiet: Vec<_> = [0., 0.000_01, -0.000_4, 0., 0.000_2].repeat(20);
+        capture.push_interleaved_with_markers(&quiet, &[0, 50, 99]).unwrap();
+        assert_eq!(capture.snapshot().samples, quiet);
+        assert_eq!(capture.frame_range(), 0..100);
+        assert_eq!(capture.bar_markers(0..100), [0, 50, 99]);
+        assert_eq!(capture.state(), CaptureState::Recording);
+
+        let previous = capture.snapshot();
+        capture.set_retain_silence(false);
+        assert_eq!(capture.snapshot(), previous);
+        capture.push_interleaved(&[0.; 1_000]).unwrap();
+        let later = capture.snapshot();
+        assert_eq!(&later.samples[..100], previous.samples);
+        assert!(later.frame_count() < 1_100);
+        assert_eq!(capture.state(), CaptureState::Waiting);
+    }
+
+    #[test]
+    fn silence_mode_preserves_manual_pause_clear_and_existing_dual_track_samples() {
+        let mut capture = Capture::new_tracks(1_000, 1, Some(1), DurationChoice::Seconds10).unwrap();
+        capture.set_retain_silence(true);
+        capture.push_interleaved(&[0.000_1, -0.000_2, 0., 0.]).unwrap();
+        let fixed = capture.snapshot();
+        capture.pause();
+        capture.set_retain_silence(false);
+        capture.set_retain_silence(true);
+        capture.push_interleaved(&[0.; 20]).unwrap();
+        capture.append_known_silence(1_000).unwrap();
+        assert_eq!(capture.state(), CaptureState::Paused);
+        assert_eq!(capture.snapshot(), fixed);
+        capture.resume();
+        capture.push_interleaved(&[0.000_3, -0.000_4]).unwrap();
+        assert_eq!(capture.snapshot().samples, [0.000_1, -0.000_2, 0., 0., 0.000_3, -0.000_4]);
+        assert_eq!(capture.track_snapshot(0).unwrap().frame_range(), capture.track_snapshot(1).unwrap().frame_range());
+        capture.clear();
+        assert!(capture.retain_silence());
+        capture.push_interleaved(&[0., 0.]).unwrap();
+        assert_eq!(capture.snapshot().samples, [0., 0.]);
+        capture.push_interleaved(&[0.5, -0.5]).unwrap();
+        capture.clear();
+        capture.push_interleaved(&[0., 0.]).unwrap();
+        capture.set_retain_silence(false);
+        capture.push_interleaved(&[0.; 20]).unwrap();
+        assert_eq!(capture.snapshot().samples, [0., 0.]);
+    }
+
+    #[test]
+    fn long_retained_quiet_gap_advances_the_clock_with_bounded_history() {
+        let mut capture = Capture::new_tracks(1_000, 1, Some(1), DurationChoice::Seconds10).unwrap();
+        capture.set_retain_silence(true);
+        capture.push_interleaved_with_markers(&[0.2, -0.3, 0.4, -0.5], &[0]).unwrap();
+        let fixed = capture.snapshot();
+        capture.append_known_silence(1_000_000).unwrap();
+        assert_eq!(capture.frame_range(), 990_002..1_000_002);
+        assert_eq!(capture.snapshot().samples, vec![0.; 20_000]);
+        assert!(capture.bar_markers(0..u64::MAX).is_empty());
+        assert_eq!(capture.state(), CaptureState::Recording);
+        assert!(capture.history.allocated_frames() <= 60_000);
+        assert_eq!(fixed.samples, [0.2, -0.3, 0.4, -0.5]);
+        capture.push_interleaved(&[0.000_1, -0.000_2]).unwrap();
+        assert_eq!(capture.frame_range(), 990_003..1_000_003);
+        assert_eq!(capture.track_snapshot(0).unwrap().samples.last(), Some(&0.000_1));
+        assert_eq!(capture.track_snapshot(1).unwrap().samples.last(), Some(&-0.000_2));
+        let previous = capture.snapshot();
+        assert_eq!(capture.append_known_silence(u64::MAX), Err(CaptureError::BufferTooLarge));
+        assert_eq!(capture.snapshot(), previous);
+    }
+
+    #[test]
+    fn grows_only_as_audio_is_kept_and_shrinks_without_moving_the_recording_boundary() {
+        let mut capture = Capture::new_tracks(10, 1, Some(2), DurationChoice::Minutes10).unwrap();
+        let original: Vec<f32> = (1..=6_000)
+            .flat_map(|frame| [frame as f32, -(frame as f32), 0.5])
+            .collect();
+        assert_eq!(capture.history.allocated_frames(), 600);
+        capture.push_interleaved(&original[..600]).unwrap();
+        capture.set_retention(DurationChoice::Seconds30);
+        assert_eq!(capture.snapshot().samples, original[..600]);
+        capture.set_retention(DurationChoice::Minutes10);
+        capture.push_interleaved(&original[600..]).unwrap();
+        assert_eq!(capture.history.allocated_frames(), 6_000);
+
+        capture.set_retention(DurationChoice::Minutes3);
+        assert_eq!(capture.frame_range(), 4_200..6_000);
+        assert_eq!(capture.history.allocated_frames(), 1_800);
+        assert_eq!(capture.snapshot().samples, original[4_200 * 3..]);
+        capture.set_retention(DurationChoice::Seconds30);
+        assert_eq!(capture.history.allocated_frames(), 600);
+        assert_eq!(capture.state(), CaptureState::Recording);
+        capture.push_interleaved(&[6_001.0, -6_001.0, 0.5]).unwrap();
+        assert_eq!(capture.frame_range(), 5_701..6_001);
+        let a = capture.track_snapshot(0).unwrap();
+        let b = capture.track_snapshot(1).unwrap();
+        assert_eq!(a.frame_range(), b.frame_range());
+        assert_eq!(
+            a.samples,
+            (5_702..=6_001).map(|i| i as f32).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            b.samples,
+            (5_702..=6_001)
+                .flat_map(|i| [-(i as f32), 0.5])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bar_markers_only_follow_frames_retained_by_the_gate() {
+        let mut capture = Capture::new(100, 1, DurationChoice::Seconds10).unwrap();
+        capture
+            .push_interleaved_with_markers(&[0.0; 30], &[1, 26, 29])
+            .unwrap();
+        assert!(capture.bar_markers(0..10).is_empty());
+        capture
+            .push_interleaved_with_markers(&[0.5; 20], &[0, 10])
+            .unwrap();
+        assert_eq!(capture.frame_range(), 0..24);
+        assert_eq!(capture.bar_markers(0..24), vec![0, 3, 4, 14]);
+        assert_eq!(capture.bar_markers(3..14), vec![3, 4]);
+        capture
+            .push_interleaved_with_markers(&[0.0; 100], &[17, 96, 99])
+            .unwrap();
+        capture.pause();
+        capture
+            .push_interleaved_with_markers(&[0.5; 8], &[0, 7])
+            .unwrap();
+        capture.resume();
+        capture
+            .push_interleaved_with_markers(&[0.5; 8], &[0])
+            .unwrap();
+        assert_eq!(capture.bar_markers(0..100), vec![0, 3, 4, 14, 39]);
+        capture.push_interleaved(&[0.5; 1_010]).unwrap();
+        assert!(capture.bar_markers(0..u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn range_waveform_reads_only_the_requested_retained_frames() {
+        let mut capture = Capture::new(4, 1, DurationChoice::Seconds10).unwrap();
+        let audio: Vec<_> = (1..=60).map(|frame| frame as f32).collect();
+        capture.push_interleaved(&audio).unwrap();
+        let mut low = [0.0; 3];
+        let mut high = [0.0; 3];
+        assert_eq!(
+            capture.track_waveform_range(0, WaveformView::Merged, 17..29, &mut low, &mut high),
+            9
+        );
+        assert_eq!(low, [21.0, 24.0, 27.0]);
+        assert_eq!(high, [23.0, 26.0, 29.0]);
+        let clip = capture.track_snapshot_range(0, 23..29).unwrap();
+        assert_eq!(clip.frame_range(), 23..29);
+        assert_eq!(clip.samples, &audio[23..29]);
+        assert!(capture.track_snapshot_range(0, 17..29).is_none());
+    }
 
     #[test]
     fn resume_fades_both_lanes_across_fragmented_blocks_without_retiming() {
@@ -714,7 +1064,7 @@ mod tests {
         samples[60_000 * 3 + 2] = 4.;
         samples[60_001 * 3 + 2] = f32::INFINITY;
         capture.push_interleaved(&samples).unwrap();
-        assert!(!capture.history.as_slices().1.is_empty());
+        assert!(capture.history.slices(capture.frame_range()).count() > 1);
 
         for bins in [7, 17, 280] {
             let mut low = vec![0.; bins];

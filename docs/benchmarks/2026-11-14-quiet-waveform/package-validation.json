@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-11-14T03:06:01.913675Z",
+  "source_commit": "5fe9224c3dc54d0a2a655ec6b66522c43bd7a238",
+  "source_working_tree_modified_at_packaging": false,
+  "artifacts": [
+    {
+      "role": "Windows desktop Release",
+      "name": "Backtracking.exe",
+      "size_bytes": 8248320,
+      "sha256": "0f22316808dd6001c03633b711546890d4de20b7afec45b9eb696e94dd4f588c"
+    },
+    {
+      "role": "Windows plug-in DLL for VST3/CLAP payloads",
+      "name": "backtracking_plugin.dll",
+      "size_bytes": 7362048,
+      "sha256": "b241a8497af2de172919c50724919d372ca4f6feffd92b1266c4f94f6b689766"
+    },
+    {
+      "role": "Windows Setup",
+      "name": "Backtracking-0.1.5-Windows-x64-Setup.exe",
+      "size_bytes": 3503467,
+      "sha256": "48bf289a04af0b71a09eaebc899bea65aa3ced79eb887b5931a69c9f2ba7b3d8"
+    },
+    {
+      "role": "bundled fixed User Guide",
+      "name": "USER_GUIDE.md",
+      "size_bytes": 52648,
+      "sha256": "3b0123db559b67a492d1cb3e239137ea477677b3749da33ad26a7e7710d88767"
+    }
+  ],
+  "payload_byte_validation": [
+    {
+      "payload": "desktop/Backtracking.exe",
+      "size_bytes": 8248320,
+      "sha256": "0f22316808dd6001c03633b711546890d4de20b7afec45b9eb696e94dd4f588c",
+      "source_bytes_match": true,
+      "independently_rechecked": true
+    },
+    {
+      "payload": "plugins/Backtracking.clap",
+      "size_bytes": 7362048,
+      "sha256": "b241a8497af2de172919c50724919d372ca4f6feffd92b1266c4f94f6b689766",
+      "source_bytes_match": true,
+      "independently_rechecked": true
+    },
+    {
+      "payload": "plugins/Backtracking.vst3/Contents/x86_64-win/Backtracking.vst3",
+      "size_bytes": 7362048,
+      "sha256": "b241a8497af2de172919c50724919d372ca4f6feffd92b1266c4f94f6b689766",
+      "source_bytes_match": true,
+      "independently_rechecked": true
+    },
+    {
+      "payload": "USER_GUIDE.md",
+      "size_bytes": 52648,
+      "sha256": "3b0123db559b67a492d1cb3e239137ea477677b3749da33ad26a7e7710d88767",
+      "source_bytes_match": true,
+      "independently_rechecked": true
+    }
+  ],
+  "installed_desktop_refresh": {
+    "updated_utc": "2026-11-14T03:02:57.5889619Z",
+    "method": "desktop-only local file refresh with backup, not a new Setup install/uninstall run",
+    "updated_files": [
+      "Backtracking.exe",
+      "USER_GUIDE.md",
+      "BUILD-INFO.txt"
+    ],
+    "executable_sha256": "0f22316808dd6001c03633b711546890d4de20b7afec45b9eb696e94dd4f588c",
+    "matches_final_desktop": true,
+    "normal_startup": true,
+    "startup_arguments": "none, reported by integration owner",
+    "installed_plugins_changed": false,
+    "unchanged_installed_plugin_sha256": "5c24211c6755d4c5a3f9ce20bf3fe8d878b95f688d0650cab18610b7b6a6877f",
+    "plugin_hash_provenance": "desktop-refresh build-info records the pre-existing installed plug-in, not the new packaged DLL",
+    "GUI_limit": "computer-use inventory could not target the normal tray/toolwindow; no fresh final-binary GUI interaction is claimed"
+  },
+  "runtime_build_separation": {
+    "feature_GUI_observed_sha256": "5b95b567eb5858447c0ead266cb1c31136cd3c032767cc03c914fab6bd2e0c7a",
+    "final_build_difference_reported": "secondary Options title no longer includes PID; feature GUI observations remain attributed to the intermediate build",
+    "CI_binaries": "remote CI build results do not change the provenance of these locally built artifacts"
+  },
+  "installer_runtime_scope": "installer logic unchanged; payload byte equality verified; new-payload Setup install/uninstall was not rerun",
+  "raw_input_sha256": {
+    "package_metadata": "73f67787c595f4aff3b2249e5fabcbdb09f1b2a6dfda6e20cbf357b7d96b141a",
+    "desktop_refresh_result": "c10f3e92200b065a18e9851709b3f4665936947330634ebc86397382aff75d36",
+    "desktop_refresh_build_info": "94e98401830dbefa6059ff40705e8541d54c4c13eee7097114bb188c37f133ef"
+  },
+  "sanitization": "only whitelisted metadata, relative payload paths and hashes; no local absolute paths, process IDs, backup location, screenshots or audio"
+}

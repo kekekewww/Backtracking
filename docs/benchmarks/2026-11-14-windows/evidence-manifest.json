@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "evidence_type": "sanitized scalar trace",
+  "generated_utc": "2026-11-13T16:32:29.056935Z",
+  "removed_fields": [
+    "local absolute paths",
+    "user name tokens",
+    "process IDs and names",
+    "free-form notes and error messages",
+    "GPU instance identifiers and repeated engine arrays",
+    "Win32 AdapterRAM"
+  ],
+  "limitations": [
+    "Scalar traces preserve per-second GPU caches; summary deduplicates observed_utc",
+    "Source audio and desktop screenshots are not part of this evidence export",
+    "No GPU adapter identity is inferred from engine utilization",
+    "Subsequent snapshot inspection is a separate post-monitoring file check and does not validate the earlier 600-second content or frame continuity."
+  ],
+  "files": [
+    {
+      "name": "ambient-main.collector-metadata.json",
+      "size_bytes": 470,
+      "sha256": "d5407447b4a5e022eab01cd371237a84f7f41360b913c5da87285edfcc2f89f0"
+    },
+    {
+      "name": "ambient-main.collector-status.json",
+      "size_bytes": 222,
+      "sha256": "b14ff8dbbecc6537bc3ad1866787314296e176e86e5e91cfbbe1bee577391feb"
+    },
+    {
+      "name": "ambient-main.scalar-trace.jsonl",
+      "size_bytes": 3296658,
+      "sha256": "ceb3521bb404a2a71a662fc0eacca30dd3baef9d971ee3d58fab731d0ee86766"
+    },
+    {
+      "name": "audio-fixtures.json",
+      "size_bytes": 4163,
+      "sha256": "0f59fa33ce975e76b18c9188f609ae28a120fa96885dc1fa2cc44de8ba2a0506"
+    },
+    {
+      "name": "hardware.json",
+      "size_bytes": 1496,
+      "sha256": "9677eeca8791b931b0dfe938c18f7bafb5037ff0bbf3556b211cdce6dbec34fb"
+    },
+    {
+      "name": "settings-events.jsonl",
+      "size_bytes": 17466,
+      "sha256": "1a2dba2b6d276a66358fd501fc8dd943e71249d58546c521566268546ff3a81c"
+    },
+    {
+      "name": "snapshot-followup.json",
+      "size_bytes": 3899,
+      "sha256": "312408bfeb2017d3ea717e5b0d17066f328ede24efbfea5ea07e75c6d92bdd20"
+    },
+    {
+      "name": "summary.json",
+      "size_bytes": 200092,
+      "sha256": "5752914ac2411dfaf0797e7907b6652ff3e385f6b097f54f4c487e9b067c6259"
+    },
+    {
+      "name": "test-instance.collector-metadata.json",
+      "size_bytes": 470,
+      "sha256": "6023fad87caeb836a19c10d2c4e4ce1e228c139b648c04b616e9d7dd95fed3d3"
+    },
+    {
+      "name": "test-instance.collector-status.json",
+      "size_bytes": 219,
+      "sha256": "e43ed2a2eb202a47661a744a9db1adc87a3a80618fc910af0baf282e4314f756"
+    },
+    {
+      "name": "test-instance.scalar-trace.jsonl",
+      "size_bytes": 3920680,
+      "sha256": "7b40e0c758e6c59abec2e151dc5651ff793a58066ccaba56cc82eece41d94fef"
+    }
+  ],
+  "tool_sources": [
+    {
+      "path": "tools/monitor_backtracking.ps1",
+      "sha256": "0b3b3fe5a0dce37e864a16ca911abebbd910f1c88b5381d9d5bad3d11fc16eba"
+    },
+    {
+      "path": "tools/summarize_hardware.py",
+      "sha256": "ddee621d79c22f6351a6fd7b7e433f6f2eafb77964ab7d6098e0315509c7b014"
+    },
+    {
+      "path": "tools/generate_test_audio.py",
+      "sha256": "1f252e2708df67f9b2cc11d279c2086a2c1ee6cb402c7448d03deb175a399a82"
+    },
+    {
+      "path": "tools/inspect_wav.py",
+      "sha256": "3ba9e5be66f5eada9f076c74424d66f043019580904873828ad2ac75878c0b75"
+    }
+  ],
+  "updated_utc": "2026-11-13T23:10:05.787189Z",
+  "snapshot_followup_inspected_utc": "2026-11-13T23:07:38.525949Z"
+}

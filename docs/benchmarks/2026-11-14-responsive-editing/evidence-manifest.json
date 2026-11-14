@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-11-14T00:14:28.885338Z",
+  "evidence_type": "core operation and standalone preference-save timing probes; not end-to-end UI latency",
+  "source_base_commit": "58dee34f419d56e572e2e99cba0bdbdfef4540ec",
+  "source_has_uncommitted_changes": true,
+  "core_reproduction_command": "cargo run --release --locked -p backtracking-core --example retention_probe",
+  "core_workload": "One new process; sequential 48k stereo, 96k stereo, 48k stereo A/B cases. A new Capture per case, 600 seconds of constant 0.05f32 audio batched in 10ms blocks.",
+  "core_quantiles": "Nearest sorted observation at round((n-1)*q); for n=20 median is the upper central observation, not the average of two central values.",
+  "preference_quantiles": "Linear interpolation between sorted ranks (type 7)",
+  "limitations": [
+    "Initial local harness and official example run are separate observations; workload/case/stage counts match, but system load and CPU frequency were uncontrolled.",
+    "Per-stage n=1 timings are single observations, not independent repeated-run distributions.",
+    "Snapshot copy is one lane, not a complete A/B WAV export.",
+    "The 180-to-30 stage follows a limit increase to 600 without refilling discarded audio; retained content is still 180 seconds.",
+    "Warm 1000 expand/shrink pairs operate on already-shortened content, not repeatedly refilled ten-minute buffers.",
+    "Fresh process/directories do not establish cold boot, paging, storage-device or antivirus causes.",
+    "Preference timings include the full production save call; controller enums in the standalone harness are parsing/default stand-ins.",
+    "No GUI/DAW/GPU/device audio or audible-artifact validation is performed by these probes.",
+    "Historical 2026-11-14-windows traces and hashes remain separate and unchanged.",
+    "Asynchronous writer measurement predates later queue-drain/coalescing and review changes; recorded historical production source hash is not a final-binary latency guarantee.",
+    "Native functional observations refer to an intermediate build; final copy-cleanup/resize and payload-integrity observations are recorded separately in final-builds.json. Neither establishes broad macOS/DAW/physical Shift-drag or new-payload installation acceptance.",
+    "Remote platform coverage comes from separate runs: Windows/macOS jobs succeeded on product 55baeac and Linux X11 succeeded in the Linux-only 52af947 follow-up. Three prior failed runs remain recorded; skipped Windows/macOS jobs were not rerun. Local artifact provenance is unchanged. Mac GUI/Fn/DAW and Linux Wayland/hardware-compositor behavior remain unverified."
+  ],
+  "source_files": [
+    {
+      "path": "crates/backtracking-core/examples/retention_probe.rs",
+      "sha256": "aed908c7fb1e2a17d6bfeb73dfe27377ca97688f9ea1e3386cf3ad29b73d748e"
+    }
+  ],
+  "files": [
+    {
+      "name": "asynchronous-preference-save.json",
+      "size_bytes": 35997,
+      "sha256": "f42ed7561570b0e9bf5b242c83527f91859c38c6ae6f0966f85e139ac8aa7bb5"
+    },
+    {
+      "name": "cross-platform-ci.json",
+      "size_bytes": 17811,
+      "sha256": "f8aca0804384ba6bfb61f5827f724be2aa8f40eb701ab8c28736ba02eb7614bb"
+    },
+    {
+      "name": "final-builds.json",
+      "size_bytes": 4675,
+      "sha256": "f0556853589d66ea2152bbc6f1cbf0fb589b48d91dc3437a9ccca8f98fc11bc4"
+    },
+    {
+      "name": "native-editing-observations.json",
+      "size_bytes": 3002,
+      "sha256": "deee3add09fafb1906bafb7b1163c0d0c08fca5474936ca16fa8d52a6578a684"
+    },
+    {
+      "name": "preference-async-probe-source.rs",
+      "size_bytes": 8715,
+      "sha256": "3aa0d5a3551a8a2b4ccda426d2b5502ffb5ad28447e9b32ba3f4194daded3844"
+    },
+    {
+      "name": "preference-probe-Cargo.lock",
+      "size_bytes": 2744,
+      "sha256": "7ad22ea6eec8960c51e0d3b1c2dea8852b2074afd33320f6f73a66d473ccd1de"
+    },
+    {
+      "name": "preference-probe-Cargo.toml",
+      "size_bytes": 220,
+      "sha256": "979b053ee5fbaf6a398084678c72a64bd56106700629e084bf90a978a4d32384"
+    },
+    {
+      "name": "preference-probe-provenance.json",
+      "size_bytes": 1506,
+      "sha256": "5461bf1a5e4e7c272dfb2bd7ebb3a4106c262540ca576647d62de6e25f300548"
+    },
+    {
+      "name": "preference-probe-source.rs",
+      "size_bytes": 4099,
+      "sha256": "38175a5d960d2210745b15a51775ea91410a6883587a63c3ed4199f7714b2686"
+    },
+    {
+      "name": "README.md",
+      "size_bytes": 7614,
+      "sha256": "10c1a458c8312addff7033c4df51f22f04823daa96a1708a495129c17ea902d5"
+    },
+    {
+      "name": "retention-example-rerun.jsonl",
+      "size_bytes": 4199,
+      "sha256": "539ad4e0cfc9a4242a6f02b1c0d20df806bb95291868f79e8fac400e7c3b1f87"
+    },
+    {
+      "name": "retention-initial-source.rs",
+      "size_bytes": 3425,
+      "sha256": "49376431f2c0cca54fe6c149384a5dc5497c025474923fda27e0f5d29fea24a1"
+    },
+    {
+      "name": "retention-initial.jsonl",
+      "size_bytes": 4187,
+      "sha256": "20858a4f1392de88803df35d7a6d4d0c592d7ca85cfff54f48ee17f2539f3d19"
+    },
+    {
+      "name": "synchronous-preference-save.json",
+      "size_bytes": 2423,
+      "sha256": "0234004e2814e57f237f6b0e849cf5635f29332746c259b53c552a558b352f6a"
+    }
+  ],
+  "updated_utc": "2026-11-14T01:20:04.959693Z"
+}
