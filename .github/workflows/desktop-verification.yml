@@ -9,16 +9,27 @@ on:
       - 'desktop/**'
       - 'plugins/**'
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to verify
+        type: choice
+        options:
+          - all
+          - windows
+          - macos
+          - linux
+        default: all
 
 permissions:
   contents: read
 
 concurrency:
-  group: native-desktop-${{ github.event.pull_request.number || github.ref }}
+  group: native-desktop-${{ github.event.pull_request.number || github.ref }}-${{ inputs.platform || 'all' }}
   cancel-in-progress: true
 
 jobs:
   windows:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +60,7 @@ jobs:
           cargo +1.99.1 build --locked --release --manifest-path plugins/backtracking-plugin/Cargo.toml
 
   macos:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos' }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -83,6 +95,7 @@ jobs:
           cargo +1.99.1 test --locked --manifest-path plugins/backtracking-plugin/Cargo.toml
 
   linux:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -101,7 +114,22 @@ jobs:
           shortcut=desktop/linux/target/debug/backtracking-shortcut
           "$shortcut" >shortcut.log 2>&1 &
           helper_pid=$!
-          trap 'kill "$helper_pid" 2>/dev/null || true' EXIT
+          cleanup() {
+            result=$?
+            trap - EXIT
+            kill "$helper_pid" 2>/dev/null || true
+            wait "$helper_pid" 2>/dev/null || true
+            if (( result != 0 )); then
+              for log in shortcut.log duplicate.log; do
+                if [[ -f "$log" ]]; then
+                  printf '%s\n' "X11 diagnostic: $log"
+                  cat "$log"
+                fi
+              done
+            fi
+            exit "$result"
+          }
+          trap cleanup EXIT
           for attempt in {1..25}; do
             if grep -q 'listening for Super+grave' shortcut.log; then break; fi
             sleep 0.1
