@@ -1,0 +1,7 @@
+# Third-party music from the YouTube Audio Library.
+# Its licence forbids distributing the music files on their own, so they are never committed.
+*.mp3
+*.wav
+*.m4a
+*.ogg
+out/
