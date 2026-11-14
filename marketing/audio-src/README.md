@@ -22,6 +22,10 @@ Consequences for this project:
 - The landing-page demo plays a 16-bar loop of the track. While the track is the demo's sound,
   **"Save WAV" is turned off**, because saving would hand visitors a piece of the music on its own.
   Without the loop file the demo falls back to its built-in synthesised music and saving works.
+- The site never serves the loop as a playable file. `marketing/site/tools/sync-media.py` writes it
+  as `media/demo-loop.bin`, the MP3 behind a reversible byte scramble that the demo script undoes
+  in memory. This is not copy protection (the page can be recorded, like any video); it means the
+  site does not hand out a music file on its own.
 - This is a reading of the licence text, not legal advice. Using the track inside an interactive
   page (rather than a video) relies on the "other content" wording.
 
@@ -37,7 +41,7 @@ node marketing/audio-src/build-audio.mjs      # set FFMPEG=<path to ffmpeg> if i
 | --- | --- | --- |
 | `overview-music.m4a` | `marketing/video` overview (57.5 s) | starts 5.6 s before the drop, so the drop lands on the hard cut at 5.6 s; fades out over the end card; -14 LUFS |
 | `short-music.m4a` | `marketing/video` short (21 s) | starts 3.6 s before the drop, so the drop lands on the cut at 3.6 s; -14 LUFS |
-| `demo-loop.mp3` | `marketing/site` demo | 16 bars from the drop plus 0.5 s either side; loop buffer time 0.5 to 31.97541 s; -16 LUFS |
+| `demo-loop.mp3` | `marketing/site` demo (deployed scrambled, as `media/demo-loop.bin`) | 16 bars from the drop plus 0.5 s either side; loop buffer time 0.5 to 31.97541 s; -16 LUFS |
 
 The five feature loops stay silent (they autoplay muted on the page).
 

@@ -123,7 +123,17 @@ body.guide:lang(zh) { font-family: "Noto Sans TC", "PingFang TC", "Microsoft Jhe
 }
 
 /* tables scroll sideways inside their own box */
-.table-wrap { margin-top: 22px; overflow-x: auto; border: 2px solid var(--ink); background: var(--paper); }
+.table-box { position: relative; margin-top: 22px; }
+.table-wrap { overflow-x: auto; border: 2px solid var(--ink); background: var(--paper); }
+/* scroll cue: a paper fade and an arrow on the right edge while columns are hidden to the right */
+.table-box::after {
+  content: "→"; position: absolute; top: 2px; right: 2px; bottom: 2px; width: 44px;
+  display: flex; align-items: center; justify-content: flex-end; padding-right: 6px;
+  font-weight: 800; font-size: 20px; color: var(--blue);
+  background: linear-gradient(to right, rgba(244, 241, 232, 0), var(--paper) 70%);
+  pointer-events: none; opacity: 0; transition: opacity 0.15s;
+}
+.table-box.more::after { opacity: 1; }
 .table-wrap:focus-visible { outline: 3px solid var(--blue); outline-offset: 3px; }
 .doc-body table { width: 100%; border-collapse: collapse; font-size: 16px; line-height: 1.5; }
 .doc-body:lang(zh) table { font-size: 15.5px; line-height: 1.7; }

@@ -8,7 +8,8 @@ captions carry no trailing 「。」, per its punctuation rule; body sentences k
 
 ## Files (`out/`)
 
-All H.264 MP4, yuv420p (BT.709), 30 fps, `+faststart`. Loops also as VP9 WebM; loops have no audio stream.
+All H.264 MP4, yuv420p, 30 fps, `+faststart`, tagged BT.709 (primaries, transfer and matrix) with TV
+range. Loops also as VP9 WebM with the same tags; loops have no audio stream.
 
 **Soundtrack (overview and short only).** AAC 192 kbit/s, 48 kHz stereo, −14 LUFS, cut to the scene
 timings: the overview's music (57.5 s) drops at 5.6 s on the hard cut to the one-liner and fades out over
@@ -22,15 +23,15 @@ silent and the script prints a warning.
 
 | File | Size | Duration | What it is |
 | --- | --- | --- | --- |
-| `overview-en.mp4` | 5.80 MB | 57.5 s | 1920×1080 overview, English, with soundtrack |
+| `overview-en.mp4` | 5.81 MB | 57.5 s | 1920×1080 overview, English, with soundtrack |
 | `overview-zh-TW.mp4` | 5.82 MB | 57.5 s | 1920×1080 overview, Traditional Chinese, with soundtrack |
-| `short-en.mp4` | 1.71 MB | 21.0 s | 1080×1920 vertical short, English, with soundtrack |
-| `short-zh-TW.mp4` | 1.73 MB | 21.0 s | 1080×1920 vertical short, Traditional Chinese, with soundtrack |
-| `loop-select.mp4` / `.webm` | 331 KB / 280 KB | 6.0 s | Shift-drag selection, Esc cancels (silent) |
-| `loop-drag-out.mp4` / `.webm` | 314 KB / 271 KB | 7.0 s | Drag the selection out onto a DAW track (silent) |
+| `short-en.mp4` | 1.72 MB | 21.0 s | 1080×1920 vertical short, English, with soundtrack |
+| `short-zh-TW.mp4` | 1.74 MB | 21.0 s | 1080×1920 vertical short, Traditional Chinese, with soundtrack |
+| `loop-select.mp4` / `.webm` | 332 KB / 280 KB | 6.0 s | Shift-drag selection, Esc cancels (silent) |
+| `loop-drag-out.mp4` / `.webm` | 313 KB / 271 KB | 7.0 s | Drag the selection out onto a DAW track (silent) |
 | `loop-ab-sources.mp4` / `.webm` | 407 KB / 335 KB | 6.0 s | One source, then A/B with two rows and meters (silent) |
-| `loop-waveform-only.mp4` / `.webm` | 448 KB / 479 KB | 7.0 s | Waveform-only strip, 0–100 % transparency (silent) |
-| `loop-snapshot-shortcut.mp4` / `.webm` | 491 KB / 479 KB | 7.0 s | Alt + ` and fn/Globe + ` snapshots (silent) |
+| `loop-waveform-only.mp4` / `.webm` | 446 KB / 479 KB | 7.0 s | Waveform-only strip, 0–100 % transparency (silent) |
+| `loop-snapshot-shortcut.mp4` / `.webm` | 492 KB / 482 KB | 7.0 s | Alt + ` and fn/Globe + ` snapshots (silent) |
 
 Posters: `overview-poster-en.jpg`, `overview-poster-zh-TW.jpg` (1920×1080, from the end card at 52.6 s),
 `short-poster-en.jpg`, `short-poster-zh-TW.jpg` (1080×1920, from the end card at 18.6 s).
@@ -68,7 +69,7 @@ match) so the UI still reads when embedded around 400 px wide.
 - `loop-drag-out` (7 s): held selection → drag the WAV slab onto a DAW track → clip lands, panel goes live, "Saved …" → tracks scroll up one row → a new Shift-selection is made → same frame as the start.
 - `loop-ab-sources` (6 s): one source (speaker = A, merged row) → B (microphone) enabled: two rows, A and B meters; the B lane starts empty and fills from the right → back to one source.
 - `loop-waveform-only` (7 s): full panel → waveform-only strip → background transparency 0 → 25 → 50 → 75 → 100 % over another window → back.
-- `loop-snapshot-shortcut` (7 s): Alt + ` (Windows), then fn/Globe + ` (macOS) while Backtracking stays in the background; each time the status reads "Saved snapshot …" and a WAV slab shoots into a folder.
+- `loop-snapshot-shortcut` (7 s): Alt + ` (Windows), then fn/Globe + ` (macOS) while Backtracking stays in the background. Each half starts with an empty status line; once the file is written it reads "Saved snapshot C:\Users\you\Backtracking\saved\…" for Alt + ` and "Saved snapshot /Users/you/Backtracking/saved/…" for fn/Globe + ` (the default saved snapshots folders from `docs/USER_GUIDE.md`), and a WAV slab shoots into a folder. The status line clears where the loop switches machine, mid-loop and at the wrap.
 
 ## Re-render
 
@@ -104,7 +105,11 @@ Noto Sans TC did not load, then seeks and screenshots every frame. A full render
 - `overview.html`, `short.html`, `loop.html` — the timelines. Language via `?lang=en|zh-TW`, loop via
   `?id=…`.
 - `strings/en.js`, `strings/zh-TW.js` — every caption, copied from the copy deck. zh-TW feature names
-  come from the zh headings in `docs/USER_GUIDE.md` and the glossary.
+  come from the zh headings in `docs/USER_GUIDE.md` and the glossary. Feature bodies carry a small
+  markup (rendered by `SC.rich` in `scenes.js`): `{…}` never breaks across lines, `[X]` is drawn as an
+  inline keycap (the backtick key is unreadable as a bare character), `\n` is a deliberate line break.
+  Per the copy deck, Chinese never breaks inside a term (瞬時, 指定 App, 起訖, 透明度, 快照, 24-bit, whole
+  key combinations).
 - `video.css` — C tokens and components (Archivo, Noto Sans TC 900 for zh mega lines, set square).
 - `render.mjs` — the one render script.
 

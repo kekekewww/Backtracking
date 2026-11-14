@@ -11,14 +11,16 @@ window.STR = {
     { n: "2", title: "框選想要的那一段", body: "在波形上拖曳框選，按住 Shift 可吸附旗標、小節線或秒數線。" },
     { n: "3", title: "直接拖出成 WAV", body: "放到 DAW 音軌或資料夾，背景會繼續錄音。" }
   ],
+  /* 功能說明使用簡單標記（SC.rich）：{…} 內不換行、[X] 畫成鍵帽、\n 為指定換行。
+     術語不得從中斷開（文案指南〈Edition posters〉）：瞬時、指定 App、起訖、透明度、快照、24-bit 與整組快捷鍵。 */
   features: [
-    { name: "擷取來源", body: "擷取系統播放、麥克風或指定 App。" },
-    { name: "A／B", body: "同時擷取 A／B 兩路，匯出兩個起訖對齊的 WAV。" },
-    { name: "插件", body: "插入任一 DAW 音軌，擷取效果鏈該位置的音訊。" },
-    { name: "快照快捷鍵", body: "背景儲存快照：Windows 按 Alt + `，macOS 按 Fn／Globe + `。" },
-    { name: "只顯示波形", body: "把視窗縮成細長波形條，可調透明度並置頂。" },
-    { name: "即時音量表", body: "即時音量：dBFS、VU 或瞬時 LUFS。" },
-    { name: "WAV 匯出", body: "44.1、48 或 96 kHz；16-bit、24-bit PCM 或 32-bit float。" }
+    { name: "擷取來源", body: "擷取系統播放、麥克風\n或{指定 App}。" },
+    { name: "A／B", body: "同時擷取 {A／B} 兩路，\n匯出兩個{起訖}對齊的 WAV。" },
+    { name: "插件", body: "插入任一 DAW 音軌，\n擷取效果鏈該位置的音訊。" },
+    { name: "快照快捷鍵", body: "背景儲存{快照}：\n{Windows 按 [Alt] + [`]，}\n{macOS 按 [Fn／Globe] + [`]。}" },
+    { name: "只顯示波形", body: "把視窗縮成細長波形條，\n可調{透明度}並置頂。" },
+    { name: "即時音量表", body: "即時音量：\n{dBFS、VU} 或{瞬時 LUFS}。" },
+    { name: "WAV 匯出", body: "{44.1、48 或 96 kHz；}\n{16-bit、24-bit PCM}\n或 {32-bit float}。" }
   ],
   editions: ["Windows", "macOS", "VST3", "CLAP"],
   licence: "開放原始碼 · Apache-2.0",

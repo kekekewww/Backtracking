@@ -66,7 +66,7 @@
 <p>Editing and background capture are separated in this update; see <a href="https://github.com/kekekewww/Backtracking/blob/main/docs/RESPONSIVE_EDITING_2026-11-14.md">integration status and limits</a>.</p>
 <section class="part" id="english">
 <h3 id="choose-what-to-capture">Choose what to capture</h3>
-<div class="table-wrap cols-2" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
+<div class="table-box"><div class="table-wrap cols-2" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
 <thead><tr><th>What you want to sample</th><th>Which edition to use</th></tr></thead>
 <tbody>
 <tr><td>A browser, media player, or another desktop app</td><td>Open the desktop recorder and choose system playback or the app in Options.</td></tr>
@@ -74,7 +74,7 @@
 <tr><td>One DAW track, a bus, or the master output</td><td>Insert the VST3 or CLAP plug-in on the relevant effects chain. It captures mono or stereo audio at that point and passes the input through unchanged.</td></tr>
 <tr><td>A software instrument with effects</td><td>Insert Backtracking after the instrument and any effects you want in the sample. Move it ahead of those effects to capture the dry signal.</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p>On Windows, route the source to the default playback device. If a DAW uses ASIO, exclusive mode, or another direct output path, use the plug-in to sample its track signal. On macOS, grant system audio recording permission when the desktop app first prompts you. <a href="https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording">Windows WASAPI</a> · <a href="https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps">Apple Core Audio</a></p>
 <h3 id="open-settings">Open settings</h3>
 <p>Click the gear in the toolbar or right-click inside the Backtracking window to open <strong>Options</strong>. The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle <strong>Keep on top</strong> from the toolbar.</p>
@@ -109,27 +109,27 @@
 <p>Turn on <strong>Show waveform only</strong> to shrink the native Windows/macOS desktop window to the waveform panel plus its visible border and disable the native shadow. Background transparency still follows Options: opaque, translucent, or fully transparent. Waveforms and flags remain visible and interactive at 100% transparency. Plug-ins can request a smaller editor; the DAW manages its outer frame, shadow, and background. This setting defaults to Off and is saved with the desktop preferences or the plug-in's DAW project settings.</p>
 <p>Right-click the waveform to open Options. Choose <strong>Play</strong> (<strong>開始錄音</strong> in the macOS app) when capture is paused, or <strong>Pause</strong> (<strong>暫停錄音</strong>) when capture is armed or recording.</p>
 <p>When you switch modes, the desktop window fits the waveform panel's existing height and removes excess transparent space above and below it. Drag either inside side edge to adjust the width or the top and bottom edges to adjust the height. A narrower window shows the same retained duration over a shorter distance, reducing the number of pixels the waveform scrolls per second. The waveform shrinks to fit a shorter window. Turning the mode off restores the previous full-interface window size.</p>
-<div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
+<div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
 <thead><tr><th>Desktop app</th><th>Waveform-only minimum size</th><th>Full interface minimum size</th></tr></thead>
 <tbody>
 <tr><td>Windows</td><td>240 × 48 logical pixels</td><td>510 × 132 logical pixels</td></tr>
 <tr><td>macOS</td><td>240 × 48 points</td><td>560 × 100 points</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p>To restore the full interface, right-click the waveform and turn off <strong>Show waveform only</strong>. Windows/macOS native shadows are disabled in this mode; the optional thin border is controlled separately in Appearance Options.</p>
 <h3 id="move-and-resize-the-desktop-window">Move and resize the desktop window</h3>
 <p>The Windows and macOS desktop apps use a frameless window. The gestures below move and resize it without automatic snapping near screen edges. The DAW manages the outer window for VST3 and CLAP. To close the desktop app, choose <strong>Quit</strong> from Settings.</p>
 <p>With <strong>Keep on top</strong> enabled on Windows, Backtracking reasserts its position when the taskbar or another window on the same desktop covers it, while leaving input focus where it is. Windows manages the secure desktop and protected system surfaces.</p>
 <p>Use the Windows system tray icon to show or hide the window. Capture can continue while the window is hidden. Choose <strong>Quit</strong> from the tray or Settings to exit. Place <code>Backtracking.exe</code> in a permanent location and enable <strong>Start with Windows</strong> to open Backtracking at its last window position when you sign in.</p>
 <p>On macOS, use the menu bar item to show, hide, or quit Backtracking, or enable launch at login. If macOS asks for approval, allow the Backtracking login item in System Settings.</p>
-<div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
+<div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
 <thead><tr><th>Action</th><th>Windows desktop</th><th>macOS desktop</th></tr></thead>
 <tbody>
 <tr><td>Move the window</td><td>Hold <code>Alt</code> and left-drag inside the content area.</td><td>Hold <code>Option</code> and left-drag outside the waveform. Hold <code>Command</code> + <code>Option</code> and left-drag from anywhere in the content area.</td></tr>
 <tr><td>Resize the window</td><td>Move the pointer to an inside edge or corner, then left-drag.</td><td>Move the pointer to an inside edge or corner, then left-drag.</td></tr>
 <tr><td>Select audio</td><td>Ctrl-left-drag for free selection or Shift-left-drag for snapping; combine both if desired.</td><td>Option/Control-left-drag for free selection or Shift-left-drag for snapping; adding Shift also snaps.</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <h3 id="read-the-waveform-and-capture-status">Read the waveform and capture status</h3>
 <p>In the full interface, the toolbar's <strong>Play/Pause</strong> icon shows the available action: <strong>Start capture</strong> or <strong>Pause capture</strong>.</p>
 <ul>
@@ -141,25 +141,25 @@
 <p><strong>History / Buffer</strong> offers 10/20/30/60 seconds or 3/5/10 minutes and defaults to 20 seconds. With default silence compression, two five-second sounds a minute apart join with only a short gap; Keep quiet sections also counts known silence against History. Very quiet input may fall below the default gate. Shortening trims the oldest live audio; lengthening gives future audio more room. Fixed editing material is not recut.</p>
 <h3 id="live-audio-meter">Live audio meter</h3>
 <p>The meter next to the gear reads the incoming audio signal and defaults to dBFS. Choose the unit in the gear menu. In the macOS desktop app, you can also click the readout to switch units. The meter displays <code>—</code> while paused or when a reading is unavailable.</p>
-<div class="table-wrap cols-2" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
+<div class="table-box"><div class="table-wrap cols-2" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
 <thead><tr><th>Mode</th><th>What it shows</th></tr></thead>
 <tbody>
 <tr><td><strong>dBFS</strong></td><td>Digital sample peak level. 0 dBFS is digital full scale.</td></tr>
 <tr><td><strong>VU</strong></td><td>A 300-millisecond RMS estimate of average level. A 1 kHz sine wave with a −18 dBFS peak reads 0 VU.</td></tr>
 <tr><td><strong>LUFS</strong></td><td>Momentary loudness estimated with K-weighting and a 400-millisecond sliding window.</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p>Loudness measurement references. <a href="https://www.itu.int/rec/R-REC-BS.1770-5-202311-I/en">ITU-R BS.1770</a> · <a href="https://tech.ebu.ch/publications/tech3341">EBU Tech 3341</a></p>
 <h3 id="select-and-drag-out">Select and drag out</h3>
 <p>In the full interface, hover over an unselected waveform to preview all retained audio. Drag from anywhere on the waveform outside Backtracking onto a WAV target to export that range. For example, a full 20-second buffer exports 20 seconds; if only 7 seconds have been captured, the WAV is 7 seconds long. Both display modes invert the waveform-line color inside free or Shift-snapped selections. The selected range is used for export.</p>
-<div class="table-wrap cols-4" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
+<div class="table-box"><div class="table-wrap cols-4" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
 <thead><tr><th>Action</th><th>Windows</th><th>macOS</th><th>Result</th></tr></thead>
 <tbody>
 <tr><td>Enter selection mode</td><td>Hold <code>Ctrl</code> for free selection or <code>Shift</code> for snapping</td><td>Hold <code>Option</code> for free selection or <code>Shift</code> for snapping</td><td>Adding Shift to Ctrl/Option also snaps.</td></tr>
 <tr><td>Drop a clip into a DAW</td><td>Hold the primary mouse button on the waveform and drag out</td><td>Hold the primary mouse button on the waveform and drag out</td><td>Once ready, drop the WAV onto the REAPER timeline, FL Studio Playlist, or another WAV drop target.</td></tr>
 <tr><td>Choose both ends</td><td>Hold <code>Ctrl</code> or <code>Shift</code> and left-drag</td><td>Hold <code>Option</code> or <code>Shift</code> and left-drag</td><td>Release to keep fixed material/selection while capture keeps its state; release modifiers to drag out the range.</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p>Clicking, selecting, and dragging within the window only affect the waveform. To export a selected clip, drag it out and drop it on a target that accepts WAV files, or choose <strong>Save snapshot</strong> in Options. Canceled or rejected drops, including drops back in the source window, leave no export file. Keep the mouse button held while an export finishes preparing. If the DAW rejects the drop, choose <strong>Save snapshot</strong> in Options and import the WAV from the saved snapshots folder.</p>
 <p>With Backtracking focused, press <code>Esc</code> or <code>Backspace</code> to cancel editing and return to live view without writing a file. Background capture keeps its prior state; a manual Pause is not cleared.</p>
 <h3 id="save-a-snapshot">Save a snapshot</h3>
@@ -173,30 +173,30 @@
 <p>Click the trash icon in the toolbar. It is labeled <strong>Clear capture</strong> on Windows desktop and <strong>Clear captured audio</strong> in the plug-ins. This empties the waveform, selection, and audio held in memory. If capture is armed, incoming sound starts filling the waveform again. You can find previously exported WAVs in the save folder.</p>
 <h3 id="output-location-and-file-format">Output location and file format</h3>
 <p>You can choose and open both folders from Options. Successful drops use the default export folder. The global snapshot shortcut and <strong>Save snapshot</strong> use the saved snapshots folder. Existing export destinations are carried forward.</p>
-<div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
+<div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
 <thead><tr><th>Edition</th><th>Default export folder</th><th>Default saved snapshots folder</th></tr></thead>
 <tbody>
 <tr><td>macOS desktop</td><td><code>~/Backtracking/output/</code></td><td><code>~/Backtracking/saved/</code></td></tr>
 <tr><td>Windows desktop</td><td><code>%USERPROFILE%\Backtracking\output\</code></td><td><code>%USERPROFILE%\Backtracking\saved\</code></td></tr>
 <tr><td>VST3 / CLAP</td><td><code>Backtracking/output/</code> in your home directory</td><td><code>Backtracking/saved/</code> in your home directory</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p>Choose the sample rate and encoding independently in the gear menu.</p>
-<div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
+<div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
 <thead><tr><th>Edition</th><th>Sample rate menu</th><th>Encoding menu</th></tr></thead>
 <tbody>
 <tr><td>Windows desktop</td><td><strong>WAV rate</strong></td><td><strong>WAV encoding</strong></td></tr>
 <tr><td>macOS desktop</td><td><strong>WAV 匯出格式 → 取樣率</strong></td><td><strong>WAV 匯出格式 → 編碼</strong></td></tr>
 <tr><td>VST3 / CLAP</td><td><strong>WAV sample rate</strong></td><td><strong>WAV sample format</strong></td></tr>
 </tbody>
-</table></div>
-<div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
+</table></div></div>
+<div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
 <thead><tr><th>WAV setting</th><th>Options</th><th>Default</th></tr></thead>
 <tbody>
 <tr><td>Sample rate</td><td>44.1 kHz, 48 kHz, 96 kHz</td><td>48 kHz</td></tr>
 <tr><td>Encoding</td><td>16-bit PCM, 24-bit PCM, 32-bit IEEE float</td><td>32-bit float</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p>Snapshot saves and drag-and-drop exports use the current WAV settings. Any sample rate conversion happens during export. On desktop, <strong>Left</strong> and <strong>Right</strong> export as stereo with audio on the corresponding side, <strong>Side</strong> exports as stereo with an inverted right channel, and <strong>Mid</strong> and <strong>Center</strong> export as mono. <strong>Merged</strong> and the plug-ins use the captured channel count.</p>
 <p>Enable <strong>Export every file as mono</strong> to export each WAV in mono. Stereo Merged and stereo plug-in captures average the left and right channels. Side exports the captured Side signal. A and B still export as individual files. The option defaults to Off. The rolling history lives in memory, so export any clips you need before closing the app or removing the plug-in.</p>
 <h3 id="save-and-restore-settings">Save and restore settings</h3>
@@ -207,7 +207,7 @@
 </ul>
 <p>For <strong>VST3 and CLAP</strong>, the DAW project stores each plug-in instance's history length, auto-resume delay, theme accent, panel transparency, meter mode, WAV export settings, both folders, and waveform-only mode. Save the project manually after making changes. When you reopen that project, the DAW restores each instance's settings.</p>
 <h3 id="troubleshooting">Troubleshooting</h3>
-<div class="table-wrap cols-2" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
+<div class="table-box"><div class="table-wrap cols-2" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
 <thead><tr><th>Symptom</th><th>What to check</th></tr></thead>
 <tbody>
 <tr><td>Audio plays but the waveform stays still</td><td>Distinguish a fixed editing view from paused capture: cancel editing to return live, or use <strong>Play</strong> after manual Pause. On Windows, verify the default playback source. On macOS, check audio permission. In a DAW, check playback/monitoring and the signal at the insert.</td></tr>
@@ -216,7 +216,7 @@
 <tr><td>The DAW refuses the drop</td><td>Drag outside the window, keep the mouse button held while the WAV prepares, and release on an audio timeline or Playlist. You can also choose <strong>Save snapshot</strong> in Options and import the WAV from the saved snapshots folder.</td></tr>
 <tr><td>The WAV could not be written</td><td>Check that the waveform contains audio and choose a writable save folder.</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p><strong>Offline rendering</strong>. CLAP skips capture when the host reports offline mode. The nice-plug 0.4.2 VST3 wrapper can pass the previous processing mode to Backtracking, so an offline render may enter the capture history. Export important clips before rendering. To stop capture for the entire render, set auto-resume to <strong>0 seconds</strong>, then press <strong>Pause</strong>, avoiding the 5/10-second timer. A fixed editing view alone does not stop recording.</p>
 </section>
 <section class="part shared">
@@ -243,13 +243,13 @@ cargo nice-plug bundle backtracking-plugin --release --locked --manifest-path pl
 <div class="code"><div class="code-bar"><span class="code-lang">sh</span></div><pre><code class="language-sh">cargo install cargo-nice-plug --locked
 bash plugins/backtracking-plugin/bundle-macos.sh</code></pre></div>
 <p>Copy the complete <code>.vst3</code> or <code>.clap</code> from <code>target/bundled/</code> into a folder scanned by your DAW.</p>
-<div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
+<div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
 <thead><tr><th>System</th><th>VST3</th><th>CLAP</th></tr></thead>
 <tbody>
 <tr><td>Windows</td><td><code>%CommonProgramFiles%\VST3\</code></td><td><code>%CommonProgramFiles%\CLAP\</code></td></tr>
 <tr><td>macOS</td><td><code>/Library/Audio/Plug-Ins/VST3/</code></td><td><code>/Library/Audio/Plug-Ins/CLAP/</code></td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p>For a per-user macOS install, use the corresponding <code>VST3</code> or <code>CLAP</code> subfolder under <code>~/Library/Audio/Plug-Ins/</code> and verify that your DAW scans it. <a href="https://steinbergmedia.github.io/vst3_dev_portal/pages/Technical%2BDocumentation/Locations%2BFormat/Plugin%2BLocations.html">Steinberg VST3 locations</a></p>
 <ol>
 <li><strong>REAPER</strong>. Open Preferences. Under Plug-ins, check the path on the <strong>VST</strong> or <strong>LV2/CLAP</strong> page and rescan. Open <strong>FX</strong> on the target track and search for <strong>Backtracking</strong>. <a href="https://dlx.reaper.fm/userguide/html/">REAPER User Guide</a></li>

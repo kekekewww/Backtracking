@@ -561,7 +561,7 @@ kbd { font-family: var(--mono); font-size: 0.9em; padding: 0 0.3em; border: 1px 
 .poster-img img { display: block; width: 100%; height: auto; }
 .poster-cap { margin-top: calc(var(--shadow-m) + 12px); font-size: 15px; line-height: 1.35; color: var(--paper); }
 .poster-name { font-weight: 700; }
-.poster-size { font-family: var(--mono); font-size: 13px; color: var(--paper-2); white-space: nowrap; }
+.poster-size { display: block; font-family: var(--mono); font-size: 13px; color: var(--paper-2); white-space: nowrap; }
 .poster-dl {
   display: inline-flex; align-items: center; min-height: 44px; margin-top: 2px;
   color: var(--mint); font-weight: 700; font-size: 15px; text-underline-offset: 3px; text-decoration-thickness: 2px;

@@ -9,8 +9,9 @@ What it does (safe to re-run; unchanged files are skipped):
              short-<lang>.mp4, short-poster-<lang>.jpg      -> media/
              loop-<name>.mp4 / .webm                         -> media/loops/  + a still frame <name>.webp
              Files that are missing, too small or have the wrong signature (still rendering) are skipped.
-  - music:   ../audio-src/out/demo-loop.mp3 -> media/demo-loop.mp3 (licensed; listed in .gitignore so it
-             is deployed with the site but never committed; skipped with a message when absent)
+  - music:   ../audio-src/out/demo-loop.mp3 -> media/demo-loop.bin, scrambled with a fixed reversible
+             byte transform so the site never serves a playable music file (licensed; media/ is not
+             committed; skipped with a message when absent). Any old media/demo-loop.mp3 is deleted.
   - pages:   rewrites the blocks between <!-- posters:start --> / <!-- posters:end --> and
              <!-- watch:start --> / <!-- watch:end --> in index.html and zh-tw/index.html from what is
              actually in media/ (gallery order: the five edition posters, then the social formats, as in
@@ -207,10 +208,36 @@ def sync_videos(ff):
     return have
 
 
+SCRAMBLE_MAGIC = b"BTLOOP1\n"  # js/demo.js checks this before unscrambling
+
+
+def scramble(data):
+    """Fixed, reversible byte transform (XOR with a key table and the byte index; applying it twice
+    gives the input back). js/demo.js has the same function. This is NOT copy protection: anyone with
+    the page's JavaScript can reverse it. Its only purpose is that the site does not serve the licensed
+    music as a file that plays on its own; the result has no ID3/MPEG header and players and ffprobe
+    do not recognise it as audio."""
+    key, x = [], 0x9E3779B9
+    for _ in range(256):
+        x ^= (x << 13) & 0xFFFFFFFF
+        x ^= x >> 17
+        x ^= (x << 5) & 0xFFFFFFFF
+        key.append(x & 0xFF)
+    out = bytearray(data)
+    for i in range(len(out)):
+        out[i] ^= key[i & 255] ^ ((i * 131 + (i >> 8)) & 0xFF)
+    return bytes(out)
+
+
 def sync_demo_music():
-    """The demo's licensed loop. Deployed with the site, never committed (see .gitignore)."""
+    """The demo's licensed loop, written scrambled as media/demo-loop.bin (never a playable .mp3).
+    media/ is not committed (see .gitignore); the .bin is deployed with the site."""
     src = os.path.join(AUDIO_OUT, "demo-loop.mp3")
-    dst = os.path.join(MEDIA, "demo-loop.mp3")
+    dst = os.path.join(MEDIA, "demo-loop.bin")
+    old = os.path.join(MEDIA, "demo-loop.mp3")
+    if os.path.exists(old):
+        os.remove(old)
+        log("  removed media/demo-loop.mp3 (the site must not serve the music as a file)")
     ok = os.path.isfile(src) and os.path.getsize(src) > 20000
     if ok:
         with open(src, "rb") as fh:
@@ -220,8 +247,14 @@ def sync_demo_music():
         log("  skip demo music: %s not found (the demo will use its synthesised fallback)"
             % os.path.relpath(src, MKT))
         return
-    if copy(src, dst):
-        log("  copied demo-loop.mp3")
+    if os.path.isfile(dst) and os.path.getmtime(dst) >= os.path.getmtime(src):
+        return
+    with open(src, "rb") as fh:
+        data = fh.read()
+    os.makedirs(MEDIA, exist_ok=True)
+    with open(dst, "wb") as fh:
+        fh.write(SCRAMBLE_MAGIC + scramble(data))
+    log("  wrote demo-loop.bin (scrambled demo-loop.mp3)")
 
 
 def gallery_html(lang, items, prefix):

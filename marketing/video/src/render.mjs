@@ -132,7 +132,10 @@ function mux(job, silent) {
 }
 
 function encode(job, inter) {
-  const color = ["-vf", "scale=out_color_matrix=bt709:out_range=tv:flags=lanczos+accurate_rnd+full_chroma_int,format=yuv420p",
+  // setparams tags the frames themselves: without it the encoders take the (unknown) primaries and
+  // transfer from the frames and the -color_* options alone leave the files tagged "unknown"
+  const color = ["-vf", "scale=out_color_matrix=bt709:out_range=tv:flags=lanczos+accurate_rnd+full_chroma_int,format=yuv420p," +
+    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv",
     "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv"];
   const mp4 = path.join(outDir, `${job.name}.mp4`);
   const bufsize = String(parseInt(job.mp4.maxrate) * 2) + "k";

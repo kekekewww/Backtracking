@@ -30,6 +30,18 @@ canvas { display: block; }
 .mega .ln { display: block; }
 .sub { text-wrap: pretty; font-stretch: 100%; font-weight: 400; color: var(--c-paper-2); line-height: 1.38; }
 .sub b { color: var(--c-paper); font-weight: 600; }
+/* rich body text: unbreakable terms and inline keycaps (same look as the Shift keycap, scaled to text) */
+.nb { white-space: nowrap; }
+.sub:has(.ikey) { line-height: 1.62; }
+/* every cap has the same outer box (sized in the text's em); only the label inside is sized per key */
+/* inline-block + overflow:hidden puts every cap's baseline at its bottom edge, so all caps align alike */
+.ikey { display: inline-block; overflow: hidden; height: 1.3em; min-width: 1.3em; padding: 0 0.32em;
+  margin: 0 0.06em; vertical-align: -0.34em; background: var(--c-paper); color: var(--c-ink); border: 2px solid var(--c-ink);
+  border-radius: 6px; box-shadow: 4px 4px 0 var(--c-ink); white-space: nowrap; box-sizing: border-box; line-height: 1; }
+.ikey > span { display: flex; height: 100%; align-items: center; justify-content: center; font-family: var(--c-sans); font-stretch: 125%; font-weight: 800; font-size: 0.62em; letter-spacing: 0.02em; }
+.ikey.grave > span { font-family: "Geist Mono", monospace; font-stretch: 100%; font-weight: 700; font-size: 1.75em; position: relative; top: 0.3em; }
+html[lang="zh-Hant-TW"] .ikey > span { font-family: var(--c-sans), var(--c-tc); }
+html[lang="zh-Hant-TW"] .ikey.grave > span { font-family: "Geist Mono", monospace; }
 
 /* zh-TW: Noto Sans TC for every caption, square, never squeezed */
 html[lang="zh-Hant-TW"] .mega { font-family: var(--c-tc); font-stretch: 100%; font-weight: 900; letter-spacing: 0; line-height: 1.04; text-transform: none; }

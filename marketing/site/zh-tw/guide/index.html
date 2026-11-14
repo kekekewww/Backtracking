@@ -66,7 +66,7 @@
 <p>本輪將編輯視野與背景擷取分開；最新規則如下，整合驗證進度見<a href="https://github.com/kekekewww/Backtracking/blob/main/docs/RESPONSIVE_EDITING_2026-11-14.md">波形編輯與介面回應</a>。</p>
 <section class="part" id="繁體中文">
 <h3 id="選擇擷取來源">選擇擷取來源</h3>
-<div class="table-wrap cols-2" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
+<div class="table-box"><div class="table-wrap cols-2" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
 <thead><tr><th>我想留下的聲音</th><th>使用方式</th></tr></thead>
 <tbody>
 <tr><td>瀏覽器、播放器或其他程式的聲音</td><td>開啟桌面版，在 Options 選擇系統播放或指定 App。</td></tr>
@@ -74,7 +74,7 @@
 <tr><td>某一軌、群組或主輸出的聲音</td><td>把 VST3 或 CLAP 插入對應的效果鏈。插件接收該位置的 mono 或 stereo 音訊，並將音訊原樣傳給下游。</td></tr>
 <tr><td>軟體樂器加效果後的聲音</td><td>把插件放在樂器及要納入取樣的效果後面。若需要乾聲，就放在那些效果前面。</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p>Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 ASIO、獨占模式或其他直接輸出路徑，使用音軌插件可直接取得該軌訊號。macOS 桌面版首次啟動時，請依系統提示允許錄製系統音訊。 <a href="https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording">Windows WASAPI</a> · <a href="https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps">Apple Core Audio</a></p>
 <h3 id="開啟設定">開啟設定</h3>
 <p>點擊工具列的齒輪，或在 Backtracking 視窗內按滑鼠右鍵，可開啟 <strong>Options</strong>。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 <strong>置頂／Keep on top</strong>。</p>
@@ -109,27 +109,27 @@
 <p>開啟 <strong>只顯示波形／Show waveform only</strong> 後，Windows／macOS 原生桌面視窗會縮到波形面板加可見外框的高度，並關閉原生陰影。背景透明度仍依 Options 設定，可保留實色、半透明或全透明；100% 透明時，波形與旗標仍可見、可操作。插件可向 DAW 要求縮小，宿主外框、陰影與底色由 DAW 管理。這個選項預設關閉，並跟著桌面偏好設定或 DAW 專案中的插件設定儲存。</p>
 <p>在波形上按右鍵開啟 Options。錄音已暫停時，可選 <strong>開始錄音／Play</strong>。錄音已待命或正在收錄時，可選 <strong>暫停錄音／Pause</strong>。</p>
 <p>切換時保留波形面板高度，桌面視窗貼合面板，移除上下多餘的透明區。拖曳桌面視窗的左右內緣可調整寬度，拖曳上下內緣可調整高度。視窗變窄時，同樣的錄音保留時間會顯示在更短的距離上，波形每秒移動的像素會減少。可用高度不足時，波形會跟著縮小。取消勾選時，桌面視窗恢復切換前的完整模式尺寸。</p>
-<div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
+<div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
 <thead><tr><th>桌面版</th><th>只顯示波形最小尺寸</th><th>完整介面最小尺寸</th></tr></thead>
 <tbody>
 <tr><td>Windows</td><td>240 × 48 邏輯像素</td><td>510 × 132 邏輯像素</td></tr>
 <tr><td>macOS</td><td>240 × 48 點</td><td>560 × 100 點</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p>要回到完整介面，在波形上按右鍵，再取消勾選 <strong>只顯示波形／Show waveform only</strong>。Windows／macOS 在此模式關閉原生陰影；可見細外框則由 Options 的外觀設定控制。</p>
 <h3 id="移動與縮放桌面視窗">移動與縮放桌面視窗</h3>
 <p>Windows 和 macOS 桌面版採用無邊框視窗。以下手勢可自由移動或調整大小，靠近螢幕邊緣時不會自動貼齊。VST3／CLAP 的外層視窗由 DAW 管理。要關閉桌面程式，請從設定選單選擇 <strong>結束／Quit</strong>。</p>
 <p>Windows 桌面版啟用 <strong>置頂／Keep on top</strong> 時，若工作列等同一桌面的視窗蓋住 Backtracking，程式會重新提升自身層級，並保留目前的輸入焦點。安全桌面與受保護的系統畫面由 Windows 管理。</p>
 <p>Windows 桌面版可從工作列右側的系統匣顯示或隱藏視窗。隱藏視窗後，錄音仍可在背景繼續。要停止程式，可從系統匣或設定選擇 <strong>Quit</strong>。先將 <code>Backtracking.exe</code> 放在固定位置，再開啟 <strong>Start with Windows</strong>。Backtracking 會在登入 Windows 時開啟並還原上次的視窗位置。</p>
 <p>macOS 桌面版可從選單列顯示、隱藏或結束 Backtracking，也可啟用登入時開啟。系統要求核准時，請在 macOS 系統設定允許 Backtracking 的登入項目。</p>
-<div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
+<div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
 <thead><tr><th>動作</th><th>Windows 桌面版</th><th>macOS 桌面版</th></tr></thead>
 <tbody>
 <tr><td>移動視窗</td><td>在內容區按住 <code>Alt</code>，用滑鼠左鍵拖曳。</td><td>在波形外的內容區按住 <code>Option</code>，用左鍵拖曳。在內容區任意位置可按住 <code>Command</code> + <code>Option</code> 再用左鍵拖曳。</td></tr>
 <tr><td>調整視窗大小</td><td>將游標移到視窗內容區的內緣或內角，按住左鍵拖曳。</td><td>將游標移到視窗內容區的內緣或內角，按住左鍵拖曳。</td></tr>
 <tr><td>框選音訊</td><td><code>Ctrl</code> 加左鍵自由框選，或 <code>Shift</code> 加左鍵吸附框選；兩者可合用。</td><td><code>Option</code>／<code>Control</code> 加左鍵自由框選，或 <code>Shift</code> 加左鍵吸附框選；可再加 Shift 吸附。</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <h3 id="讀懂波形與錄音狀態">讀懂波形與錄音狀態</h3>
 <p>在完整介面中，工具列的 <strong>Play／Pause</strong> 圖示顯示可執行的動作：<strong>開始錄音／Start capture</strong> 或 <strong>暫停錄音／Pause capture</strong>。</p>
 <ul>
@@ -141,25 +141,25 @@
 <p><strong>保留／History／Buffer</strong> 可選 10、20、30、60 秒或 3、5、10 分鐘，預設為 20 秒。這是即時歷史的音訊長度。預設壓縮靜音時，兩段各 5 秒、相隔一分鐘的聲音會接在一起，中間只保留偵測需要的短緩衝；開啟保留安靜片段後，已知安靜時間也占用 History。非常小聲的內容在預設模式可能低於門檻。縮短會裁掉即時歷史最舊的部分，事後加長只增加接下來可保留的長度；固定編輯素材不因此重切。</p>
 <h3 id="即時音量表">即時音量表</h3>
 <p>齒輪旁的音量表顯示目前輸入的音訊，預設模式是 dBFS。從齒輪選單的音量表設定切換單位。macOS 桌面版也可直接點擊讀值切換。暫停錄音或目前無可用讀值時，顯示 <code>—</code>。</p>
-<div class="table-wrap cols-2" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
+<div class="table-box"><div class="table-wrap cols-2" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
 <thead><tr><th>模式</th><th>讀值</th></tr></thead>
 <tbody>
 <tr><td><strong>dBFS</strong></td><td>數位取樣峰值，0 dBFS 是數位滿刻度。</td></tr>
 <tr><td><strong>VU</strong></td><td>以 300 毫秒 RMS 估算平均電平。以 1 kHz、峰值 −18 dBFS 的正弦波校準為 0 VU。</td></tr>
 <tr><td><strong>LUFS</strong></td><td>瞬時響度。以 K 加權和 400 毫秒滑動視窗估算。</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p>響度量測參考文件。 <a href="https://www.itu.int/rec/R-REC-BS.1770-5-202311-I/en">ITU-R BS.1770</a> · <a href="https://tech.ebu.ch/publications/tech3341">EBU Tech 3341</a></p>
 <h3 id="框選與拖放">框選與拖放</h3>
 <p>在完整介面中，未框選時將游標移到波形上會預覽整段保留音訊。從波形按住左鍵拖出 Backtracking 視窗，成功放到接受 WAV 的位置後，即可匯出這整段音訊。例如保留時間設為 20 秒，錄滿時匯出 20 秒，目前只收錄 7 秒時就匯出 7 秒。完整介面和只顯示波形模式都以波形線條的反相配色標示框選區間，自由框選與 <code>Shift</code> 吸附框選皆適用。匯出時使用該區間。</p>
-<div class="table-wrap cols-4" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
+<div class="table-box"><div class="table-wrap cols-4" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
 <thead><tr><th>動作</th><th>Windows</th><th>macOS</th><th>結果</th></tr></thead>
 <tbody>
 <tr><td>進入框選模式</td><td>按住 <code>Ctrl</code> 自由框選，或 <code>Shift</code> 吸附框選</td><td>按住 <code>Option</code> 自由框選，或 <code>Shift</code> 吸附框選</td><td><code>Ctrl</code>／<code>Option</code> 再加 <code>Shift</code> 也可吸附。</td></tr>
 <tr><td>匯入 DAW</td><td>在波形上按住滑鼠左鍵並拖出</td><td>在波形上按住滑鼠左鍵並拖出</td><td>檔案就緒後，拖到 REAPER 時間軸、FL Studio Playlist 或其他接受 WAV 的位置。</td></tr>
 <tr><td>指定起訖點</td><td><code>Ctrl</code> 或 <code>Shift</code> 加左鍵拖曳</td><td><code>Option</code> 或 <code>Shift</code> 加左鍵拖曳</td><td>放開後保留固定素材與選區，背景擷取維持原狀；放開修飾鍵後可拖出選取區。</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p>單擊、框選和視窗內的拖曳只會操作波形。要匯出框選片段，請拖出後放到可接受 WAV 的位置，或從 Options 選擇 <strong>Save snapshot</strong>。取消拖曳、拖回原視窗放開或目標拒絕時，不會留下匯出檔。若 WAV 還在準備，請保持按住滑鼠再放開。DAW 拒絕拖放時，可從 Options 選擇 <strong>Save snapshot</strong>，再從保存資料夾手動匯入。</p>
 <p>Backtracking 視窗有焦點時，按 <code>Esc</code> 或 <code>Backspace</code> 可取消編輯並回到即時視野，不寫檔；背景錄音保持原狀，不會解除手動 Pause。</p>
 <h3 id="保存快照">保存快照</h3>
@@ -173,30 +173,30 @@
 <p>點擊工具列的垃圾桶圖示可執行 <strong>清除目前錄音／Clear capture／Clear captured audio</strong>。這會清空目前的波形、選取區間與記憶體中的錄音。若錄音已待命，接下來收到的聲音會重新填入波形。先前匯出的 WAV 可從存檔資料夾取用。</p>
 <h3 id="輸出位置與檔案規格">輸出位置與檔案規格</h3>
 <p>在 Options 可各自指定並開啟兩個資料夾。成功拖放使用預設輸出資料夾，全域快照快捷鍵和 <strong>Save snapshot</strong> 使用保存資料夾。原先設定的匯出目的地會沿用。</p>
-<div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
+<div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
 <thead><tr><th>版本</th><th>預設輸出資料夾</th><th>保存資料夾的預設位置</th></tr></thead>
 <tbody>
 <tr><td>macOS 桌面版</td><td><code>~/Backtracking/output/</code></td><td><code>~/Backtracking/saved/</code></td></tr>
 <tr><td>Windows 桌面版</td><td><code>%USERPROFILE%\Backtracking\output\</code></td><td><code>%USERPROFILE%\Backtracking\saved\</code></td></tr>
 <tr><td>VST3／CLAP</td><td>使用者家目錄下的 <code>Backtracking/output/</code></td><td>使用者家目錄下的 <code>Backtracking/saved/</code></td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p>取樣率和編碼可在齒輪選單獨立調整。</p>
-<div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
+<div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
 <thead><tr><th>版本</th><th>取樣率選項的位置</th><th>編碼選項的位置</th></tr></thead>
 <tbody>
 <tr><td>Windows 桌面版</td><td><strong>WAV rate</strong></td><td><strong>WAV encoding</strong></td></tr>
 <tr><td>macOS 桌面版</td><td><strong>WAV 匯出格式 → 取樣率</strong></td><td><strong>WAV 匯出格式 → 編碼</strong></td></tr>
 <tr><td>VST3／CLAP</td><td><strong>WAV sample rate</strong></td><td><strong>WAV sample format</strong></td></tr>
 </tbody>
-</table></div>
-<div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
+</table></div></div>
+<div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
 <thead><tr><th>WAV 設定</th><th>選項</th><th>預設</th></tr></thead>
 <tbody>
 <tr><td>取樣率</td><td>44.1 kHz、48 kHz、96 kHz</td><td>48 kHz</td></tr>
 <tr><td>編碼</td><td>16-bit PCM、24-bit PCM、32-bit IEEE float</td><td>32-bit float</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p>快照保存及拖放匯出都使用目前選定的 WAV 規格，取樣率轉換在匯出時進行。桌面版的 <strong>Left</strong> 和 <strong>Right</strong> 匯出為單側有聲的立體聲，<strong>Side</strong> 以左側原相、右側反相匯出為立體聲，<strong>Mid</strong> 和 <strong>Center</strong> 匯出為單聲道。<strong>Merged</strong> 和插件沿用擷取結果的聲道數。</p>
 <p>在 WAV 設定勾選 <strong>全部轉成單聲道／Export every file as mono</strong>，每個檔案都會單獨轉成單聲道。立體聲 Merged 與插件的左右聲道會取平均，Side 則輸出擷取到的 Side 訊號。A／B 仍各自匯出，選項預設關閉。回溯歷史儲存在記憶體，關閉桌面程式或移除插件前，請先存下需要的片段。</p>
 <h3 id="保存與還原設定">保存與還原設定</h3>
@@ -207,7 +207,7 @@
 </ul>
 <p><strong>VST3／CLAP</strong> 的保留時間、自動續錄、主題色、面板透明度、音量表模式、WAV 匯出設定、兩個資料夾及只顯示波形的設定由 DAW 專案保存，每個插件實例可獨立設定。修改後請手動儲存專案。重新開啟同一個專案時，DAW 會還原各實例的設定。</p>
 <h3 id="排除問題">排除問題</h3>
-<div class="table-wrap cols-2" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
+<div class="table-box"><div class="table-wrap cols-2" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
 <thead><tr><th>狀況</th><th>檢查方式</th></tr></thead>
 <tbody>
 <tr><td>播放有聲音，但波形沒有更新</td><td>先確認是固定的編輯視野還是背景擷取已暫停；取消編輯可回到即時視野，手動暫停可用 <strong>Play</strong> 恢復。Windows 確認來源使用預設播放裝置。macOS 確認系統音訊錄製權限。插件確認音軌正在播放或監聽，且 Backtracking 的插入點收得到訊號。</td></tr>
@@ -216,7 +216,7 @@
 <tr><td>DAW 拒絕拖放</td><td>拖出視窗後保持按住滑鼠，等 WAV 準備完成，再放到可接受音訊檔的時間軸或 Playlist。也可從 Options 選擇 <strong>Save snapshot</strong>，再從保存資料夾手動匯入。</td></tr>
 <tr><td>無法寫入 WAV</td><td>確認波形有可用的音訊，再選擇可寫入的存檔資料夾。</td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p><strong>離線渲染</strong>。CLAP 在宿主回報離線模式時會略過擷取。VST3 使用的 nice-plug 0.4.2 有時會回報前一次的處理模式，離線渲染仍可能進入回溯歷史。渲染前若要保留目前的素材，請先匯出。若要停止整段渲染期間的背景擷取，先將自動續錄設為 <strong>0 秒</strong>，再按 <strong>Pause</strong>，避免 5／10 秒計時續錄；只固定編輯視野不等於停止錄音。</p>
 </section>
 <section class="part shared">
@@ -243,13 +243,13 @@ cargo nice-plug bundle backtracking-plugin --release --locked --manifest-path pl
 <div class="code"><div class="code-bar"><span class="code-lang">sh</span></div><pre><code class="language-sh">cargo install cargo-nice-plug --locked
 bash plugins/backtracking-plugin/bundle-macos.sh</code></pre></div>
 <p>將 <code>target/bundled/</code> 產出的整個 <code>.vst3</code> 或 <code>.clap</code> 複製到 DAW 掃描的資料夾。</p>
-<div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
+<div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
 <thead><tr><th>系統</th><th>VST3</th><th>CLAP</th></tr></thead>
 <tbody>
 <tr><td>Windows</td><td><code>%CommonProgramFiles%\VST3\</code></td><td><code>%CommonProgramFiles%\CLAP\</code></td></tr>
 <tr><td>macOS</td><td><code>/Library/Audio/Plug-Ins/VST3/</code></td><td><code>/Library/Audio/Plug-Ins/CLAP/</code></td></tr>
 </tbody>
-</table></div>
+</table></div></div>
 <p>macOS 若要安裝到目前使用者的資料夾，也可使用 <code>~/Library/Audio/Plug-Ins/</code> 下對應的 <code>VST3</code> 或 <code>CLAP</code> 子目錄，並確認 DAW 有掃描該路徑。</p>
 <ol>
 <li><strong>REAPER</strong>。開啟 Preferences，在 Plug-ins 的 <strong>VST</strong> 或 <strong>LV2/CLAP</strong> 頁面確認路徑並重新掃描。開啟目標音軌的 <strong>FX</strong>，搜尋 <strong>Backtracking</strong>。</li>

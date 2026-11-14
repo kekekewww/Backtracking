@@ -63,6 +63,18 @@
     bar.appendChild(live);
   });
 
+  /* tables: show the right-edge cue while more columns are hidden to the right */
+  var boxes = Array.prototype.slice.call(document.querySelectorAll(".table-box"));
+  function cue(box) {
+    var w = box.firstElementChild;
+    box.classList.toggle("more", w.scrollLeft + w.clientWidth < w.scrollWidth - 2);
+  }
+  boxes.forEach(function (box) {
+    box.firstElementChild.addEventListener("scroll", function () { cue(box); }, { passive: true });
+    cue(box);
+  });
+  window.addEventListener("resize", function () { boxes.forEach(cue); });
+
   /* highlight the section being read */
   if (!("IntersectionObserver" in window) || !toc) return;
   var links = {};

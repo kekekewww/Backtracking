@@ -206,7 +206,12 @@
       });
       if (!slabOn) slab.set(0, 0, { hide: true });
       folder.classList.toggle("on", fOn);
-      P.draw({ now: now, status: SC.SNAP });
+      // two machines in turn: each half starts with an empty status line; it shows the saved path once
+      // the file is written (Windows path for Alt + `, macOS path for fn/Globe + `). The reset at
+      // HALF and at the wrap is the same kind of change, so the seam reads like the mid-loop switch.
+      var HALF = 3.4, a1 = shots[0].down + 0.12, a2 = shots[1].down + 0.12;
+      var status = t < a1 ? "" : t < HALF ? SC.SNAP : t < a2 ? "" : SC.SNAP_MAC;
+      P.draw({ now: now, status: status });
     };
   }
 

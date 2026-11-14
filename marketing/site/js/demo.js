@@ -1,7 +1,9 @@
 /* Backtracking landing page: in-browser demo of a retrospective sampler.
  *
- * - Music, started by a user gesture: a 16-bar licensed loop (media/demo-loop.mp3, "Fun Vibe" by Dyalla,
- *   YouTube Audio Library) played with an AudioBufferSourceNode. If that file is absent, cannot be
+ * - Music, started by a user gesture: a 16-bar licensed loop ("Fun Vibe" by Dyalla, YouTube Audio
+ *   Library), served as media/demo-loop.bin (the MP3 behind a reversible byte scramble, so the site
+ *   never serves a playable music file), unscrambled in memory, decoded and played with an
+ *   AudioBufferSourceNode. If that file is absent, cannot be
  *   decoded or takes longer than LOOP_WAIT_MS, an original loop synthesised with the Web Audio API
  *   (createEngine) plays instead. While the licensed loop is the source, Save WAV is turned off and no
  *   file or blob URL of the audio is ever created; Send to track keeps working inside the page.
@@ -108,7 +110,7 @@
   var MAX_SEC = 60, BIN = 128;
   var BPM = 100, BEAT = 60 / BPM, BAR = BEAT * 4; // synth tempo; the licensed loop sets 122
   /* licensed loop: 16 bars at 122 BPM with 0.5 s of real audio either side (buffer time, seconds) */
-  var LOOP_URL = new URL("../media/demo-loop.mp3", SCRIPT_URL).href;
+  var LOOP_URL = new URL("../media/demo-loop.bin", SCRIPT_URL).href; // scrambled, see unscramble()
   var LOOP_START = 0.5, LOOP_END = 31.97541, LOOP_BPM = 122, LOOP_GAIN = 1.6, LOOP_WAIT_MS = 4000;
   var musicSrc = null;          // null until decided on the first Play, then "loop" or "synth"
   var sourcePending = false, loopBuf = null, loopNode = null, loopBus = null, loopStartedAt = 0;
@@ -693,8 +695,9 @@
       if (!res.ok) throw new Error("no loop");
       return res.arrayBuffer();
     }).then(function (data) {
+      var mp3 = unscramble(data); // throws on anything that is not a scrambled loop
       return new Promise(function (ok, no) {
-        var p = ctx.decodeAudioData(data, ok, no); // callback form for older Safari
+        var p = ctx.decodeAudioData(mp3, ok, no); // callback form for older Safari
         if (p && p.catch) p.catch(no);
       });
     }).then(function (buf) {
@@ -702,6 +705,26 @@
       clearTimeout(timer);
       finish("loop", smoothSeam(buf));
     }).catch(fail); // expected when the file is not deployed: the browser logs the 404 itself
+  }
+  /* media/demo-loop.bin is the MP3 run through a fixed, reversible byte transform by
+     tools/sync-media.py (XOR with a key table and the byte index, behind an 8-byte marker). This is
+     not copy protection: the transform is right here. Its only purpose is that the site does not
+     serve the licensed music as a file that plays on its own. */
+  var LOOP_MAGIC = "BTLOOP1\n";
+  function unscramble(data) {
+    var b = new Uint8Array(data), m = LOOP_MAGIC.length, i;
+    if (b.length <= m) throw new Error("not a loop file");
+    for (i = 0; i < m; i++) if (b[i] !== LOOP_MAGIC.charCodeAt(i)) throw new Error("not a loop file");
+    var key = new Uint8Array(256), x = 0x9E3779B9;
+    for (i = 0; i < 256; i++) {
+      x ^= x << 13; x >>>= 0;
+      x ^= x >>> 17;
+      x ^= x << 5; x >>>= 0;
+      key[i] = x & 0xFF;
+    }
+    var out = new Uint8Array(b.length - m);
+    for (i = 0; i < out.length; i++) out[i] = b[i + m] ^ key[i & 255] ^ ((i * 131 + (i >>> 8)) & 0xFF);
+    return out.buffer;
   }
   /* The audio just before loopEnd does not continue into loopStart (the song is louder there than
      in the beat before the drop), so the wrap would step by up to ~0.03. Crossfade the last

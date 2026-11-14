@@ -52,10 +52,15 @@ AudioWorklet module from `file://`, so the demo then falls back to a ScriptProce
 - Nothing audio-related starts until the visitor presses **Play something** (a user gesture). Until then
   the panel shows a dimmed, pre-drawn waveform and a pulsing prompt.
 - **Music** has two modes, decided once, on the first Play:
-  - **Licensed loop** (when `media/demo-loop.mp3` is deployed): 16 bars of "Fun Vibe" by Dyalla (YouTube
-    Audio Library licence, no attribution required; see `../audio-src/README.md`), 122 BPM. The page
-    fetches the file (URL resolved relative to `demo.js`, so it works from `/` and `/zh-tw/`), decodes it
-    and plays it with an `AudioBufferSourceNode`, `loop = true`, loop points 0.5 s to 31.97541 s (64 beats),
+  - **Licensed loop** (when `media/demo-loop.bin` is deployed): 16 bars of "Fun Vibe" by Dyalla (YouTube
+    Audio Library licence, no attribution required; see `../audio-src/README.md`), 122 BPM. The site
+    never serves the music as a playable file: `sync-media.py` writes the MP3 as `media/demo-loop.bin`,
+    behind an 8-byte marker and a fixed, reversible byte transform (XOR with a key table and the byte
+    index), so it has no ID3/MPEG header and players and `ffprobe` do not recognise it as audio. This is
+    **not copy protection** (the reverse transform is in `demo.js` for anyone to read); its only purpose
+    is that the site does not hand out a music file on its own. The page fetches the `.bin` (URL resolved
+    relative to `demo.js`, so it works from `/` and `/zh-tw/`), reverses the transform in memory, decodes
+    the MP3 and plays it with an `AudioBufferSourceNode`, `loop = true`, loop points 0.5 s to 31.97541 s (64 beats),
     starting at 0.5 s so the first sound is the downbeat. Before playing, the last 8 ms before the loop end
     are crossfaded into the real audio that precedes the loop start (the file carries 0.5 s of it), so the
     wrap has no sample step. A gain of 1.6 brings its -4.4 dBFS peaks to about -6 dBFS at the capture
@@ -147,7 +152,7 @@ python tools/sync-media.py      # needs ffmpeg with libwebp ($FFMPEG, PATH, or t
 | `../video/out/overview-<lang>.mp4`, `overview-poster-<lang>.jpg` | `media/` | Watch it, 16:9 player |
 | `../video/out/short-<lang>.mp4`, `short-poster-<lang>.jpg` | `media/` | Watch it, 9:16 player |
 | `../video/out/loop-<name>.mp4` / `.webm` | `media/loops/` + a still frame `loop-<name>.webp` | feature loops |
-| `../audio-src/out/demo-loop.mp3` | `media/demo-loop.mp3` (licensed, never committed) | demo music |
+| `../audio-src/out/demo-loop.mp3` | `media/demo-loop.bin` (scrambled, see "How the demo works"; licensed, never committed) | demo music |
 
 It then rewrites the blocks between `<!-- posters:start -->` / `<!-- posters:end -->` and
 `<!-- watch:start -->` / `<!-- watch:end -->` in both landing pages from what is actually in `media/`
@@ -157,8 +162,10 @@ It then rewrites the blocks between `<!-- posters:start -->` / `<!-- posters:end
 **`media/` and git.** The whole `media/` folder is listed in `.gitignore`. The posters and videos in it
 are copies of files the repository already holds under `../posters/out` and `../video/out`, so run
 `sync-media.py` after cloning and before previewing or deploying. The licence of "Fun Vibe" does not allow
-the music file to be made available on its own, so `media/demo-loop.mp3` is deployed with the site when
-the deploy is made from a working copy that has `../audio-src/out/demo-loop.mp3`, and is never committed.
+the music file to be made available on its own, so the site carries it only as the scrambled
+`media/demo-loop.bin` (never as an `.mp3`; `sync-media.py` deletes any old `media/demo-loop.mp3`). It is
+deployed with the site when the deploy is made from a working copy that has
+`../audio-src/out/demo-loop.mp3`, and is never committed.
 A deploy from a fresh clone ships without it, and the demo then plays its synthesised fallback (with Save
 WAV working).
 

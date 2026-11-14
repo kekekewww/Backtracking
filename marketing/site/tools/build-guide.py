@@ -513,8 +513,9 @@ def render(blocks, ctx, tight=False):
             head = "".join(cell("th", c, aligns[k]) for k, c in enumerate(b["head"]))
             rows = "\n".join("<tr>%s</tr>" % "".join(cell("td", c, aligns[k]) for k, c in enumerate(r)) for r in b["rows"])
             cols = len(b["head"])
-            out.append('<div class="table-wrap cols-%d" role="region" tabindex="0" aria-label="%s">'
-                       '<table>\n<thead><tr>%s</tr></thead>\n<tbody>\n%s\n</tbody>\n</table></div>'
+            # .table-box holds the right-edge fade (js/guide.js shows it while more columns are off-screen)
+            out.append('<div class="table-box"><div class="table-wrap cols-%d" role="region" tabindex="0" aria-label="%s">'
+                       '<table>\n<thead><tr>%s</tr></thead>\n<tbody>\n%s\n</tbody>\n</table></div></div>'
                        % (cols, html.escape(PAGES[ctx.lang]["table"]), head, rows))
         elif t == "list":
             tag = "ol" if b["ordered"] else "ul"

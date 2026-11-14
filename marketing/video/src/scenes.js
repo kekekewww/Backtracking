@@ -9,7 +9,9 @@
 
   SC.SAVED = "Saved C:\\Users\\you\\Backtracking\\output\\Backtracking-1794\u2026-13.wav";
   SC.SNAP = "Saved snapshot C:\\Users\\you\\Backtracking\\saved\\Backtracking-1794\u2026-14.wav";
-  SC.NAME = "Backtracking-1794\u2026-13.wav";
+  // macOS default saved snapshots folder per docs/USER_GUIDE.md: ~/Backtracking/saved/
+  SC.SNAP_MAC = "Saved snapshot /Users/you/Backtracking/saved/Backtracking-1794…-14.wav";
+  SC.NAME ="Backtracking-1794\u2026-13.wav";
   SC.META = function (d, rate, enc) { return d + " \u00b7 " + (rate || "48 kHz") + " \u00b7 " + (enc || "32-bit float"); };
 
   SC.stage = function (W, H) {
@@ -38,6 +40,14 @@
   };
   function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
   SC.esc = esc;
+  /* body markup: {…} = no line break inside, [X] = inline keycap, \n = line break */
+  SC.rich = function (s) {
+    return esc(s)
+      .replace(/\[([^\]]+)\]/g, function (m, k) { return '<span class="ikey' + (k === "`" ? " grave" : "") + '"><span>' + k + "</span></span>"; })
+      .replace(/\{([^}]+)\}/g, '<span class="nb">$1</span>')
+      .replace(/\n/g, "<br>");
+  };
+  SC.plain = function (s) { return String(s).replace(/[{}\[\]]/g, ""); };
 
   /* mega headline: returns the line elements (each slams separately) */
   SC.mega = function (parent, x, y, lines, size, zhSize) {
@@ -167,7 +177,7 @@
       if (L.cap.num) { var n = E.el("div", "cap-num", rw); n.textContent = bt.n; n.style.fontSize = L.cap.num + "px"; n.style.marginBottom = L.cap.row ? "0" : "34px"; parts.push(n); }
       if (L.cap.row) { tx = E.el("div", "", rw); tx.style.flex = "1"; tx.style.paddingTop = "6px"; }
       var ti = E.el("div", "cap-title", tx); ti.textContent = bt.title; ti.style.fontSize = (ZH ? L.cap.zhTitle || L.cap.title : L.cap.title) + "px"; parts.push(ti);
-      if (c.body) { var bo = E.el("div", "sub", tx); bo.textContent = bt.body; bo.style.fontSize = L.cap.body + "px"; bo.style.marginTop = L.cap.row ? "18px" : "26px"; bo.style.color = "var(--c-paper)"; parts.push(bo); }
+      if (c.body) { var bo = E.el("div", "sub", tx); bo.innerHTML = SC.rich(bt.body); bo.style.fontSize = L.cap.body + "px"; bo.style.marginTop = L.cap.row ? "18px" : "26px"; bo.style.color = "var(--c-paper)"; parts.push(bo); }
       parts.forEach(function (p) { p.style.transformOrigin = "0 100%"; });
       return { g: g, parts: parts, at: c.at };
     });

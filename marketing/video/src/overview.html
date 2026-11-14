@@ -55,7 +55,7 @@
     var f = S.features[i];
     var col = SC.txt(sc.el, "", 96, 540, ""); col.style.width = "640px"; col.style.transform = "translateY(-50%)";
     var nm = E.el("div", "feat-name", col); nm.textContent = f.name; nm.style.fontSize = (ZH ? 112 : 150) + "px"; nm.style.whiteSpace = "normal";
-    var bd = E.el("div", "sub", col); bd.textContent = f.body; bd.style.fontSize = (ZH ? 40 : 40) + "px"; bd.style.marginTop = "40px"; bd.style.color = "var(--c-paper)";
+    var bd = E.el("div", "sub", col); bd.innerHTML = SC.rich(f.body); bd.style.fontSize = (ZH ? 40 : 40) + "px"; bd.style.marginTop = "40px"; bd.style.color = "var(--c-paper)";
     nm.style.transformOrigin = bd.style.transformOrigin = "0 100%";
     var vis = build(sc.el);
     sc.render = function (u) { band(F0 + i * FD + u); E.slam(nm, u, 0); E.slam(bd, u, 0.14); vis(u); };
