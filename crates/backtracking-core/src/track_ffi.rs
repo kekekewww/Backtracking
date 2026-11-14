@@ -489,6 +489,22 @@ unsafe extern "C" fn bt_snapshot_waveform(
 }
 
 #[no_mangle]
+unsafe extern "C" fn bt_snapshot_waveform_range(
+    snapshot: *const Snapshot, view: u32, first: u64, end: u64,
+    minimum: *mut f32, maximum: *mut f32, bins: u32,
+) -> u64 {
+    let (Some(snapshot), Some(view)) = (snapshot.as_ref(), WaveformView::from_code(view)) else { return 0 };
+    if minimum.is_null() || maximum.is_null() { return 0; }
+    let Some(frames) = relative_frames(snapshot, first, end) else { return 0 };
+    let Some(samples) = snapshot.frames(frames) else { return 0 };
+    crate::waveform::view_peaks(
+        samples, snapshot.channels, view,
+        slice::from_raw_parts_mut(minimum, bins as usize), slice::from_raw_parts_mut(maximum, bins as usize),
+    );
+    end - first
+}
+
+#[no_mangle]
 unsafe extern "C" fn bt_snapshot_export_frames_with_profile(
     snapshot: *const Snapshot,
     first_frame: u64,
@@ -720,4 +736,58 @@ unsafe fn export_snapshots(
         }
     }
     result
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn frozen_both_lanes_remain_renderable_while_capture_wraps_and_shrinks() {
+        let mut capture = crate::Capture::new_tracks(100, 1, Some(1), DurationChoice::Minutes10).unwrap();
+        capture.push_interleaved(&[0.2, -0.3].repeat(2_000)).unwrap();
+        let material = [capture.track_snapshot_range(0, 1_100..1_500).unwrap(),
+            capture.track_snapshot_range(1, 1_100..1_500).unwrap()];
+        capture.set_retention(DurationChoice::Seconds10);
+        capture.push_interleaved(&[0.75, 0.65].repeat(3_000)).unwrap();
+        assert!(capture.frame_range().start > material[0].frame_range().end);
+        assert_eq!(material[0].frame_range(), material[1].frame_range());
+        for (snapshot, expected) in material.iter().zip([0.2, -0.3]) {
+            let mut low = [0.0; 4];
+            let mut high = [0.0; 4];
+            unsafe {
+                assert_eq!(bt_snapshot_waveform_range(snapshot, 0, 1_200, 1_204,
+                    low.as_mut_ptr(), high.as_mut_ptr(), 4), 4);
+            }
+            assert_eq!(low, [expected; 4]);
+            assert_eq!(high, [expected; 4]);
+        }
+    }
+
+    #[test]
+    fn frozen_waveform_range_keeps_absolute_frames_and_channel_layout() {
+        let snapshot = Snapshot {
+            sample_rate: 100,
+            channels: 2,
+            first_frame: 100,
+            samples: vec![0.1, -0.1, 0.2, -0.2, 0.3, -0.3, 0.4, -0.4],
+        };
+        let mut low = [0.0; 2];
+        let mut high = [0.0; 2];
+        unsafe {
+            assert_eq!(bt_snapshot_waveform_range(
+                &snapshot, 1, 102, 104, low.as_mut_ptr(), high.as_mut_ptr(), 2,
+            ), 2);
+            assert_eq!(low, [0.3, 0.4]);
+            assert_eq!(high, [0.3, 0.4]);
+            assert_eq!(bt_snapshot_waveform_range(
+                &snapshot, 2, 102, 104, low.as_mut_ptr(), high.as_mut_ptr(), 2,
+            ), 2);
+            assert_eq!(low, [-0.3, -0.4]);
+            assert_eq!(high, [-0.3, -0.4]);
+            assert_eq!(bt_snapshot_waveform_range(
+                &snapshot, 0, 99, 104, low.as_mut_ptr(), high.as_mut_ptr(), 2,
+            ), 0);
+        }
+    }
 }

@@ -2,6 +2,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use backtracking_core::{
     AutoResumeDelay, ChannelRoute, DurationChoice, WavExportProfile, WavSampleFormat,
@@ -30,7 +33,7 @@ impl MeterMode {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Key {
     History,
     IdleResume,
@@ -152,6 +155,7 @@ impl Default for Settings {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Preferences {
     directory: Option<PathBuf>,
 }
@@ -280,12 +284,8 @@ impl Preferences {
     }
 
     pub(crate) fn save(&self, key: Key, value: &str) -> io::Result<()> {
-        let directory = self.directory.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "Windows app data directory unavailable",
-            )
-        })?;
+        self.validate_save(value)?;
+        let directory = self.directory.as_ref().expect("validated preferences directory");
         fs::create_dir_all(directory)?;
         let target = directory.join(key.filename());
         // Only replace this preference, leaving concurrent changes to the others intact.
@@ -315,6 +315,201 @@ impl Preferences {
             let _ = fs::remove_file(&temporary);
         }
         result
+    }
+
+    fn validate_save(&self, value: &str) -> io::Result<()> {
+        let directory = self.directory.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Windows app data directory unavailable",
+            )
+        })?;
+        if !directory.is_absolute() || value.len() as u64 > MAX_VALUE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "preference path must be absolute and value must fit the read limit",
+            ));
+        }
+        Ok(())
+    }
+}
+
+const PREFERENCE_COALESCE_WINDOW: Duration = Duration::from_millis(25);
+const MAX_QUEUED_PREFERENCE_DRAIN: usize = 1024;
+
+enum PreferenceCommand {
+    Save(Key, String),
+    Flush(mpsc::SyncSender<io::Result<()>>),
+    Shutdown,
+}
+
+struct FailedPreference {
+    key: Key,
+    value: String,
+    kind: io::ErrorKind,
+    message: String,
+}
+
+impl FailedPreference {
+    fn error(&self) -> io::Error {
+        io::Error::new(self.kind, self.message.clone())
+    }
+}
+
+/// Durable preference I/O belongs to this worker, never to a painting callback.
+/// A successful save means validated and queued; flush confirms disk completion.
+pub(crate) struct PreferenceWriter {
+    preferences: Preferences,
+    commands: mpsc::Sender<PreferenceCommand>,
+    errors: mpsc::Receiver<io::Error>,
+    worker: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl PreferenceWriter {
+    pub(crate) fn new(preferences: Preferences) -> io::Result<Self> {
+        let sink = preferences.clone();
+        Self::with_sink(preferences, move |key, value| sink.save(key, value))
+    }
+
+    fn with_sink(
+        preferences: Preferences,
+        sink: impl FnMut(Key, &str) -> io::Result<()> + Send + 'static,
+    ) -> io::Result<Self> {
+        preferences.validate_save("")?;
+        let (commands, requests) = mpsc::channel();
+        let (errors, failures) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("backtracking-settings".into())
+            .spawn(move || Self::run(requests, errors, sink))?;
+        Ok(Self {
+            preferences,
+            commands,
+            errors: failures,
+            worker: Some(worker),
+        })
+    }
+
+    pub(crate) fn save(&self, key: Key, value: &str) -> io::Result<()> {
+        self.preferences.validate_save(value)?;
+        self.commands
+            .send(PreferenceCommand::Save(key, value.to_owned()))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "settings worker is closed"))
+    }
+
+    pub(crate) fn poll_error(&self) -> Option<io::Error> {
+        self.errors.try_recv().ok()
+    }
+
+    /// A barrier for all saves queued before this call. Failed latest values
+    /// remain available for a later flush retry; newer values replace them.
+    pub(crate) fn flush(&self) -> io::Result<()> {
+        let (reply, result) = mpsc::sync_channel(1);
+        self.commands.send(PreferenceCommand::Flush(reply)).map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "settings worker is closed")
+        })?;
+        result.recv().map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "settings worker stopped before flushing")
+        })?
+    }
+
+    fn run(
+        requests: mpsc::Receiver<PreferenceCommand>,
+        errors: mpsc::Sender<io::Error>,
+        mut sink: impl FnMut(Key, &str) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut failed: Vec<FailedPreference> = Vec::new();
+        loop {
+            let Ok(first) = requests.recv() else {
+                return failed.first().map_or(Ok(()), |failure| Err(failure.error()));
+            };
+            let mut pending = Vec::new();
+            let mut flush = None;
+            let mut shutdown = false;
+            absorb_preference(first, &mut pending, &mut flush, &mut shutdown);
+            let deadline = Instant::now() + PREFERENCE_COALESCE_WINDOW;
+            while flush.is_none() && !shutdown {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() { break; }
+                match requests.recv_timeout(remaining) {
+                    Ok(command) => absorb_preference(command, &mut pending, &mut flush, &mut shutdown),
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => shutdown = true,
+                }
+            }
+            // Values already queued while the previous disk write was slow
+            // belong to this batch even if a scheduling delay used the window.
+            for _ in 0..MAX_QUEUED_PREFERENCE_DRAIN {
+                if flush.is_some() || shutdown { break; }
+                match requests.try_recv() {
+                    Ok(command) => absorb_preference(command, &mut pending, &mut flush, &mut shutdown),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => shutdown = true,
+                }
+            }
+
+            // A flush/shutdown retries previously failed latest values once.
+            // Pending newer values supersede those retries before touching disk.
+            let mut writes = Vec::new();
+            if flush.is_some() || shutdown {
+                for failure in &failed {
+                    coalesce_preference(&mut writes, failure.key, failure.value.clone());
+                }
+            }
+            for (key, value) in pending {
+                coalesce_preference(&mut writes, key, value);
+            }
+            for (key, value) in writes {
+                failed.retain(|failure| failure.key != key);
+                if let Err(error) = sink(key, &value) {
+                    let failure = FailedPreference {
+                        key,
+                        value,
+                        kind: error.kind(),
+                        message: error.to_string(),
+                    };
+                    let _ = errors.send(failure.error());
+                    failed.push(failure);
+                }
+            }
+            if let Some(reply) = flush {
+                let result = failed.first().map_or(Ok(()), |failure| Err(failure.error()));
+                let _ = reply.send(result);
+            }
+            if shutdown {
+                return failed.first().map_or(Ok(()), |failure| Err(failure.error()));
+            }
+        }
+    }
+}
+
+fn coalesce_preference(pending: &mut Vec<(Key, String)>, key: Key, value: String) {
+    pending.retain(|(previous, _)| *previous != key);
+    pending.push((key, value));
+}
+
+fn absorb_preference(
+    command: PreferenceCommand,
+    pending: &mut Vec<(Key, String)>,
+    flush: &mut Option<mpsc::SyncSender<io::Result<()>>>,
+    shutdown: &mut bool,
+) {
+    match command {
+        PreferenceCommand::Save(key, value) => coalesce_preference(pending, key, value),
+        PreferenceCommand::Flush(reply) => *flush = Some(reply),
+        PreferenceCommand::Shutdown => *shutdown = true,
+    }
+}
+
+impl Drop for PreferenceWriter {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = self.commands.send(PreferenceCommand::Shutdown);
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("Could not flush settings at shutdown: {error}"),
+                Err(_) => eprintln!("Settings worker panicked at shutdown"),
+            }
+        }
     }
 }
 
@@ -426,6 +621,207 @@ fn parse_accent(value: &str) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    fn workspace_preferences(label: &str) -> Preferences {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap().to_path_buf();
+        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        Preferences {
+            directory: Some(workspace.join("target/preference-writer-tests").join(format!(
+                "{label}-{}-{sequence}", std::process::id()
+            ))),
+        }
+    }
+
+    #[test]
+    fn slow_disk_never_blocks_enqueue_and_pending_keys_keep_their_latest_order() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&writes);
+        let (entered, entering) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let mut first = true;
+        let writer = PreferenceWriter::with_sink(workspace_preferences("slow"), move |key, value| {
+            if first {
+                first = false;
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            }
+            observed.lock().unwrap().push((key, value.to_owned()));
+            Ok(())
+        }).unwrap();
+        writer.save(Key::Accent, "initial").unwrap();
+        entering.recv().unwrap();
+        let (queued, queue) = mpsc::sync_channel(1);
+        let ui = thread::spawn(move || {
+            for _ in 0..100 {
+                writer.save(Key::History, "10").unwrap();
+            }
+            writer.save(Key::Transparency, "25").unwrap();
+            writer.save(Key::History, "600").unwrap();
+            queued.send(writer).unwrap();
+        });
+        let result = queue.recv_timeout(Duration::from_millis(100));
+        let returned_while_disk_busy = result.is_ok();
+        release.send(()).unwrap();
+        ui.join().unwrap();
+        assert!(returned_while_disk_busy, "enqueue waited for the disk sink");
+        let writer = result.unwrap();
+        writer.flush().unwrap();
+        assert_eq!(*writes.lock().unwrap(), [
+            (Key::Accent, "initial".into()),
+            (Key::Transparency, "25".into()),
+            (Key::History, "600".into()),
+        ]);
+    }
+
+    #[test]
+    fn failed_disk_writes_are_reported_and_flush_preserves_the_latest_retry() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&writes);
+        let writer = PreferenceWriter::with_sink(workspace_preferences("errors"), move |key, value| {
+            observed.lock().unwrap().push((key, value.to_owned()));
+            if value == "10" {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "simulated disk denial"))
+            } else {
+                Ok(())
+            }
+        }).unwrap();
+        writer.save(Key::History, "10").unwrap();
+        assert_eq!(writer.flush().unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        let mut errors = 0;
+        while let Some(error) = writer.poll_error() {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            errors += 1;
+        }
+        assert!(errors > 0);
+        writer.save(Key::History, "600").unwrap();
+        writer.flush().unwrap();
+        assert!(writer.poll_error().is_none());
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.last(), Some(&(Key::History, "600".into())));
+        assert!(writes[..writes.len() - 1].iter().all(|write| write == &(Key::History, "10".into())));
+    }
+
+    #[test]
+    fn flush_barrier_does_not_wait_for_saves_queued_after_it() {
+        let (late, late_started) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let writer = PreferenceWriter::with_sink(workspace_preferences("barrier"), move |_, value| {
+            if value == "600" {
+                late.send(()).unwrap();
+                released.recv().unwrap();
+            }
+            Ok(())
+        }).unwrap();
+        writer.save(Key::History, "10").unwrap();
+        let (barrier, result) = mpsc::sync_channel(1);
+        writer.commands.send(PreferenceCommand::Flush(barrier)).unwrap();
+        writer.save(Key::History, "600").unwrap();
+        late_started.recv().unwrap();
+        let completed_before_late_write = result.recv_timeout(Duration::from_millis(100));
+        release.send(()).unwrap();
+        assert!(completed_before_late_write.is_ok(), "flush crossed its queue barrier");
+        completed_before_late_write.unwrap().unwrap();
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    fn flush_retries_an_unresolved_latest_value_and_never_reports_false_success() {
+        let attempts = Arc::new(Mutex::new(0));
+        let observed = Arc::clone(&attempts);
+        let writable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink_writable = Arc::clone(&writable);
+        let writer = PreferenceWriter::with_sink(workspace_preferences("retry"), move |_, _| {
+            *observed.lock().unwrap() += 1;
+            if sink_writable.load(Ordering::Relaxed) {
+                Ok(())
+            } else {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "simulated disk denial"))
+            }
+        }).unwrap();
+        writer.save(Key::History, "600").unwrap();
+        for _ in 0..2 {
+            assert_eq!(writer.flush().unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            let mut errors = 0;
+            while let Some(error) = writer.poll_error() {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                errors += 1;
+            }
+            assert!(errors > 0);
+        }
+        writable.store(true, Ordering::Relaxed);
+        writer.flush().unwrap();
+        assert!(writer.poll_error().is_none());
+        assert!(*attempts.lock().unwrap() >= 3);
+    }
+
+    #[test]
+    fn writer_drop_drains_latest_values_before_a_new_instance_loads_them() {
+        let preferences = workspace_preferences("restart");
+        {
+            let writer = PreferenceWriter::new(preferences.clone()).unwrap();
+            writer.save(Key::History, "600").unwrap();
+            writer.save(Key::IdleResume, "5").unwrap();
+            writer.save(Key::History, "30").unwrap();
+        }
+        let reloaded = Preferences { directory: preferences.directory.clone() }.load();
+        assert_eq!(reloaded.history, DurationChoice::Seconds30);
+        assert_eq!(reloaded.idle_resume, AutoResumeDelay::from_seconds(5).unwrap());
+    }
+
+    #[test]
+    fn invalid_preferences_fail_synchronously_before_any_disk_work() {
+        assert!(PreferenceWriter::new(Preferences { directory: None }).is_err());
+        let writes = Arc::new(Mutex::new(0));
+        let observed = Arc::clone(&writes);
+        let writer = PreferenceWriter::with_sink(workspace_preferences("validation"), move |_, _| {
+            *observed.lock().unwrap() += 1;
+            Ok(())
+        }).unwrap();
+        assert_eq!(writer.save(Key::History, &"x".repeat(MAX_VALUE_BYTES as usize + 1)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        writer.flush().unwrap();
+        assert_eq!(*writes.lock().unwrap(), 0);
+    }
+
+    #[test]
+    #[ignore = "diagnostic durable writes in the workspace; not a reboot or GUI latency test"]
+    fn preference_save_latency_probe() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap().to_path_buf();
+        let output = workspace.join("target/preference-perf-probe");
+        fs::create_dir_all(&output).unwrap();
+        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let run = output.join(format!("run-{}-{sequence}", std::process::id()));
+        let mut fresh = Vec::new();
+        for index in 0..8 {
+            let preferences = Preferences { directory: Some(run.join(format!("fresh-{index}"))) };
+            let started = std::time::Instant::now();
+            preferences.save(Key::History, "600").unwrap();
+            fresh.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        let preferences = Preferences { directory: Some(run.join("existing")) };
+        preferences.save(Key::History, "600").unwrap();
+        let mut warm = Vec::new();
+        for index in 0..64 {
+            let started = std::time::Instant::now();
+            preferences.save(Key::History, if index % 2 == 0 { "10" } else { "600" }).unwrap();
+            warm.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        assert_eq!(preferences.load().history, DurationChoice::Minutes10);
+        let result = serde_json::json!({
+            "schema_version": 1,
+            "scope": "workspace-only real Preferences::save; durable sync_all and atomic rename retained",
+            "limitations": "new test process; fresh directories are not cold boot, cache eviction, HDD or antivirus emulation; timings are not GUI latency",
+            "value_bytes": 3,
+            "fresh_directory_first_save_ms": fresh,
+            "existing_directory_history_replace_ms": warm,
+        });
+        fs::write(run.join("synchronous-save-results.json"), serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+        println!("{result}");
+    }
 
     #[test]
     fn mono_wav_export_defaults_off_and_persists_changes() {

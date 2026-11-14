@@ -10,6 +10,94 @@ use crate::{
     Snapshot, WavExportProfile, WavSampleFormat, WaveformView,
 };
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BtWaveformDisplayPolicy {
+    pub bins: u32,
+    pub waveform_stroke: f32,
+    pub bar_stroke: f32,
+    pub seconds_stroke: f32,
+    pub bar_spacing_px: f32,
+    pub seconds_spacing_px: f32,
+    pub plot_width: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BtTimelineGuideCounts {
+    pub bars: usize,
+    pub seconds: usize,
+}
+
+#[no_mangle]
+extern "C" fn bt_waveform_display_policy(
+    width: f32, height: f32, visible_frames: u64, sample_rate: u32, interactive: u32,
+) -> BtWaveformDisplayPolicy {
+    let policy = crate::waveform::DisplayPolicy::for_view(width, height, visible_frames, sample_rate, interactive != 0);
+    BtWaveformDisplayPolicy {
+        bins: policy.bins as u32,
+        waveform_stroke: policy.waveform_stroke,
+        bar_stroke: policy.bar_stroke,
+        seconds_stroke: policy.seconds_stroke,
+        bar_spacing_px: policy.bar_spacing_px,
+        seconds_spacing_px: policy.seconds_spacing_px,
+        plot_width: policy.plot_width,
+    }
+}
+
+unsafe fn marker_slice<'a>(markers: *const u64, count: usize) -> Option<&'a [u64]> {
+    if count == 0 { Some(&[]) }
+    else if markers.is_null() || count > isize::MAX as usize / std::mem::size_of::<u64>() { None }
+    else { Some(slice::from_raw_parts(markers, count)) }
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_waveform_timeline_guides(
+    first: u64, end: u64, sample_rate: u32, seconds_interval: u32,
+    bars: *const u64, bar_count: usize, show_bars: u32, show_seconds: u32,
+    background_visible: u32, policy: *const BtWaveformDisplayPolicy,
+    bar_output: *mut u64, bar_capacity: usize, seconds_output: *mut u64, seconds_capacity: usize,
+) -> BtTimelineGuideCounts {
+    let (Some(policy), Some(bars)) = (policy.as_ref(), marker_slice(bars, bar_count)) else {
+        return BtTimelineGuideCounts::default();
+    };
+    if first > end { return BtTimelineGuideCounts::default(); }
+    let policy = crate::waveform::DisplayPolicy {
+        bins: (policy.bins as usize).min(crate::waveform::MAX_WAVEFORM_BINS),
+        waveform_stroke: policy.waveform_stroke,
+        bar_stroke: policy.bar_stroke,
+        seconds_stroke: policy.seconds_stroke,
+        bar_spacing_px: policy.bar_spacing_px,
+        seconds_spacing_px: policy.seconds_spacing_px,
+        plot_width: policy.plot_width,
+    };
+    let guides = crate::waveform::timeline_guides(
+        first..end, sample_rate, seconds_interval, bars, show_bars != 0, show_seconds != 0,
+        background_visible != 0, &policy,
+    );
+    if !bar_output.is_null() {
+        ptr::copy_nonoverlapping(guides.bars.as_ptr(), bar_output, guides.bars.len().min(bar_capacity));
+    }
+    if !seconds_output.is_null() {
+        ptr::copy_nonoverlapping(guides.seconds.as_ptr(), seconds_output, guides.seconds.len().min(seconds_capacity));
+    }
+    BtTimelineGuideCounts { bars: guides.bars.len(), seconds: guides.seconds.len() }
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_waveform_snap_visible(
+    fraction: f64, first: u64, end: u64, flags: *const u64, flag_count: usize,
+    bars: *const u64, bar_count: usize, seconds: *const u64, seconds_count: usize,
+    tolerance_fraction: f64,
+) -> f64 {
+    let (Some(flags), Some(bars), Some(seconds)) = (
+        marker_slice(flags, flag_count), marker_slice(bars, bar_count), marker_slice(seconds, seconds_count),
+    ) else { return fraction };
+    if first > end { return fraction; }
+    let guides = crate::waveform::TimelineGuides { bars: bars.to_vec(), seconds: seconds.to_vec() };
+    crate::waveform::snap_to_visible_markers(fraction, first..end, flags, &guides, tolerance_fraction)
+}
+
 struct Reader {
     capture: Capture,
     scratch: Vec<f32>,
@@ -354,6 +442,53 @@ unsafe extern "C" fn bt_string_free(string: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_policy_ffi_copies_exact_guides_and_reports_required_capacity() {
+        let policy = bt_waveform_display_policy(600.0, 100.0, 300, 100, 0);
+        assert!(policy.bins > 0);
+        unsafe {
+            let required = bt_waveform_timeline_guides(
+                100, 400, 100, 1, ptr::null(), 0, 0, 1, 1, &policy,
+                ptr::null_mut(), 0, ptr::null_mut(), 0,
+            );
+            assert_eq!(required, BtTimelineGuideCounts { bars: 0, seconds: 4 });
+            let mut seconds = [u64::MAX; 2];
+            assert_eq!(bt_waveform_timeline_guides(
+                100, 400, 100, 1, ptr::null(), 0, 0, 1, 1, &policy,
+                ptr::null_mut(), 0, seconds.as_mut_ptr(), seconds.len(),
+            ), required);
+            assert_eq!(seconds, [100, 200]);
+            assert_eq!(bt_waveform_timeline_guides(
+                100, 400, 100, 1, ptr::null(), 0, 0, 1, 0, &policy,
+                ptr::null_mut(), 0, seconds.as_mut_ptr(), seconds.len(),
+            ), BtTimelineGuideCounts::default());
+        }
+    }
+
+    #[test]
+    fn display_snap_ffi_preserves_priority_and_accepts_empty_arrays() {
+        unsafe {
+            let flags = [52];
+            let bars = [50];
+            let seconds = [49];
+            assert_eq!(bt_waveform_snap_visible(
+                0.49, 0, 100, flags.as_ptr(), flags.len(), bars.as_ptr(), bars.len(),
+                seconds.as_ptr(), seconds.len(), 0.04,
+            ), 0.52);
+            assert_eq!(bt_waveform_snap_visible(
+                0.49, 0, 100, ptr::null(), 0, bars.as_ptr(), bars.len(),
+                seconds.as_ptr(), seconds.len(), 0.04,
+            ), 0.5);
+            assert_eq!(bt_waveform_snap_visible(
+                0.49, 0, 100, ptr::null(), 0, ptr::null(), 0,
+                seconds.as_ptr(), seconds.len(), 0.04,
+            ), 0.49);
+            assert_eq!(bt_waveform_snap_visible(
+                0.45, 0, 100, ptr::null(), 1, ptr::null(), 0, ptr::null(), 0, 0.04,
+            ), 0.45);
+        }
+    }
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

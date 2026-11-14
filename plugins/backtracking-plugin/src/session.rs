@@ -16,17 +16,17 @@ use crate::settings::{CaptureInput, MeterMode, SessionSettings, SettingsStore, W
 
 pub(crate) const WAVEFORM_BINS: usize = 512;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct WaveformPeaks {
-    pub(crate) minimum: [f32; WAVEFORM_BINS],
-    pub(crate) maximum: [f32; WAVEFORM_BINS],
+    pub(crate) minimum: Vec<f32>,
+    pub(crate) maximum: Vec<f32>,
 }
 
 impl Default for WaveformPeaks {
     fn default() -> Self {
         Self {
-            minimum: [0.0; WAVEFORM_BINS],
-            maximum: [0.0; WAVEFORM_BINS],
+            minimum: vec![0.0; WAVEFORM_BINS],
+            maximum: vec![0.0; WAVEFORM_BINS],
         }
     }
 }
@@ -39,7 +39,7 @@ pub(crate) fn waveform_views(layout: WaveformLayout, channels: usize) -> &'stati
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct WaveformTimeline {
     pub(crate) epoch: u64,
     pub(crate) frames: Range<u64>,
@@ -47,6 +47,40 @@ pub(crate) struct WaveformTimeline {
     pub(crate) channels: usize,
     pub(crate) b_channels: Option<usize>,
     pub(crate) bar_markers: Vec<u64>,
+}
+
+#[derive(Clone)]
+pub(crate) struct EditingSnapshot {
+    pub(crate) token: u64,
+    pub(crate) timeline: Arc<WaveformTimeline>,
+    pub(crate) snapshots: Arc<[Snapshot]>,
+}
+
+#[derive(Default)]
+struct PublishedState {
+    epoch: u64,
+    paused: bool,
+    recording: bool,
+    input_expires_at: Option<Instant>,
+    meter: MeterReadings,
+    sidechain: bool,
+    host_track_name: Option<String>,
+    editing: Option<EditingSnapshot>,
+    editing_pending: bool,
+}
+
+enum EditorAction {
+    Begin,
+    Selection(Option<Range<u64>>),
+    End(bool),
+    Cancel,
+    Gesture(bool),
+}
+
+struct EditorCommand {
+    epoch: u64,
+    token: u64,
+    action: EditorAction,
 }
 
 impl WaveformTimeline {
@@ -127,15 +161,20 @@ impl Consumer {
         &mut self,
         layout: WaveformLayout,
         range: Range<u64>,
+        bins: usize,
         peaks: &mut [WaveformPeaks; 2],
     ) {
         let cache = &mut self.waveform;
         let revision = self.capture.revision();
-        if cache.revision != Some(revision) || cache.layout != layout || cache.range != range {
+        if cache.revision != Some(revision) || cache.layout != layout || cache.range != range
+            || cache.peaks[0].minimum.len() != bins
+        {
             let a = self.capture.track_channels(0).unwrap_or(1);
             let dual = self.capture.track_channels(1).is_some();
             let views = waveform_views(layout, a);
             for (index, trace) in cache.peaks.iter_mut().enumerate() {
+                trace.minimum.resize(bins, 0.0);
+                trace.maximum.resize(bins, 0.0);
                 let route = if dual {
                     Some((index, WaveformView::Merged))
                 } else {
@@ -146,14 +185,18 @@ impl Consumer {
                         lane, view, range.clone(), &mut trace.minimum, &mut trace.maximum,
                     );
                 } else {
-                    *trace = WaveformPeaks::default();
+                    trace.minimum.fill(0.0);
+                    trace.maximum.fill(0.0);
                 }
             }
             cache.revision = Some(revision);
             cache.layout = layout;
             cache.range = range;
         }
-        *peaks = cache.peaks;
+        for (peaks, cached) in peaks.iter_mut().zip(&cache.peaks) {
+            peaks.minimum.clone_from(&cached.minimum);
+            peaks.maximum.clone_from(&cached.maximum);
+        }
     }
 }
 
@@ -201,6 +244,9 @@ struct State {
     paused: bool,
     gesture_active: bool,
     selection: Option<Range<u64>>,
+    editing: Option<EditingSnapshot>,
+    editing_pending: bool,
+    edit_serial: u64,
     host_track_name: Option<String>,
     last_interaction: Instant,
 }
@@ -208,6 +254,13 @@ struct State {
 pub(crate) struct Session {
     settings: SettingsStore,
     state: Mutex<State>,
+    published: Mutex<PublishedState>,
+    editor_commands: mpsc::Sender<EditorCommand>,
+    editor_requests: Mutex<mpsc::Receiver<EditorCommand>>,
+    edit_requested: AtomicBool,
+    edit_token: AtomicU64,
+    snapshot_commands: mpsc::Sender<u64>,
+    snapshot_requests: Mutex<mpsc::Receiver<u64>>,
     accepting: AtomicBool,
     writer_active: AtomicBool,
     dropped_frames: AtomicUsize,
@@ -222,6 +275,8 @@ impl Session {
             let settings = settings.lock();
             (settings.retention, settings.idle_resume)
         };
+        let (editor_commands, editor_requests) = mpsc::channel();
+        let (snapshot_commands, snapshot_requests) = mpsc::channel();
         Self {
             settings,
             state: Mutex::new(State {
@@ -232,9 +287,19 @@ impl Session {
                 paused: false,
                 gesture_active: false,
                 selection: None,
+                editing: None,
+                editing_pending: false,
+                edit_serial: 0,
                 host_track_name: None,
                 last_interaction: Instant::now(),
             }),
+            published: Mutex::new(PublishedState::default()),
+            editor_commands,
+            editor_requests: Mutex::new(editor_requests),
+            edit_requested: AtomicBool::new(false),
+            edit_token: AtomicU64::new(0),
+            snapshot_commands,
+            snapshot_requests: Mutex::new(snapshot_requests),
             accepting: AtomicBool::new(false),
             writer_active: AtomicBool::new(false),
             dropped_frames: AtomicUsize::new(0),
@@ -246,6 +311,41 @@ impl Session {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn published(&self) -> MutexGuard<'_, PublishedState> {
+        self.published.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn publish(&self, state: &State) {
+        let consumer = state.consumer.as_ref();
+        let fresh = consumer.is_some_and(Consumer::has_fresh_input);
+        let mut published = self.published();
+        published.epoch = state.timeline_epoch;
+        published.paused = state.paused;
+        published.recording = !state.paused && fresh
+            && consumer.is_some_and(|consumer| consumer.capture.state() == CaptureState::Recording);
+        published.input_expires_at = consumer.and_then(|consumer|
+            consumer.last_input.map(|last| last + consumer.input_timeout));
+        published.meter = consumer.filter(|_| !state.paused && fresh)
+            .map_or_else(MeterReadings::default, |consumer| consumer.capture.meter_readings());
+        published.sidechain = consumer.is_some_and(|consumer| consumer.sidechain_channels != 0);
+        published.host_track_name.clone_from(&state.host_track_name);
+        let previous_editing = std::mem::replace(&mut published.editing, state.editing.clone());
+        published.editing_pending = state.editing_pending;
+        drop(published);
+        // Releasing the last large snapshot must never hold the metadata lock.
+        drop(previous_editing);
+    }
+
+    pub(crate) fn editing_snapshot(&self) -> Option<EditingSnapshot> {
+        if !self.edit_requested.load(Ordering::Acquire) { return None; }
+        let token = self.edit_token.load(Ordering::Acquire);
+        self.published().editing.as_ref().filter(|edit| edit.token == token).cloned()
+    }
+
+    pub(crate) fn editing_pending(&self) -> bool {
+        self.edit_requested.load(Ordering::Acquire) && self.editing_snapshot().is_none()
     }
 
     pub(crate) fn settings(&self) -> SessionSettings {
@@ -293,15 +393,17 @@ impl Session {
     }
 
     pub(crate) fn sidechain_available(&self) -> bool {
-        self.lock().consumer.as_ref().is_some_and(|c| c.sidechain_channels != 0)
+        self.published().sidechain
     }
 
     pub(crate) fn host_track_name(&self) -> Option<String> {
-        self.lock().host_track_name.clone()
+        self.published().host_track_name.clone()
     }
 
     pub(crate) fn set_host_track_name(&self, name: Option<&str>) {
-        self.lock().host_track_name = name.filter(|value| !value.trim().is_empty()).map(str::to_owned);
+        let mut state = self.lock();
+        state.host_track_name = name.filter(|value| !value.trim().is_empty()).map(str::to_owned);
+        self.publish(&state);
     }
 
     pub(crate) fn set_retention(&self, retention: DurationChoice) {
@@ -335,7 +437,11 @@ impl Session {
                 consumer.input = input;
                 consumer.waveform = WaveformCache::default();
                 state.timeline_epoch = state.timeline_epoch.wrapping_add(1);
+                state.gesture_active = false;
                 state.selection = None;
+                state.editing = None;
+                state.editing_pending = false;
+                self.edit_requested.store(false, Ordering::Release);
             }
         }
         if retention != state.retention {
@@ -353,6 +459,7 @@ impl Session {
     pub(crate) fn pause(&self) {
         let mut state = self.lock();
         self.pause_locked(&mut state);
+        self.publish(&state);
     }
 
     fn pause_locked(&self, state: &mut State) {
@@ -374,13 +481,17 @@ impl Session {
     }
 
     pub(crate) fn resume(&self) {
-        Self::resume_locked(&mut self.lock());
+        let mut state = self.lock();
+        Self::resume_locked(&mut state);
+        self.publish(&state);
     }
 
     pub(crate) fn clear(&self) {
+        self.edit_requested.store(false, Ordering::Release);
         let mut state = self.lock();
         state.last_interaction = Instant::now();
         state.timeline_epoch = state.timeline_epoch.wrapping_add(1);
+        state.gesture_active = false;
         self.accepting.store(false, Ordering::SeqCst);
         if let Some(consumer) = &mut state.consumer {
             // Discard audio published before the clear. The worker re-arms only after any
@@ -390,6 +501,9 @@ impl Session {
             consumer.last_input = None;
         }
         state.selection = None;
+        state.editing = None;
+        state.editing_pending = false;
+        self.publish(&state);
     }
 
     fn resume_locked(state: &mut State) {
@@ -397,62 +511,96 @@ impl Session {
             consumer.capture.resume();
         }
         state.paused = false;
-        state.selection = None;
         state.last_interaction = Instant::now();
     }
 
     pub(crate) fn mark_interaction(&self) {
-        self.lock().last_interaction = Instant::now();
+        if let Ok(mut state) = self.state.try_lock() {
+            state.last_interaction = Instant::now();
+        }
     }
 
     pub(crate) fn set_gesture_active(&self, active: bool) {
-        let mut state = self.lock();
-        state.gesture_active = active;
-        state.last_interaction = Instant::now();
+        self.queue_editor_action(EditorAction::Gesture(active));
     }
 
     pub(crate) fn begin_waveform_gesture(&self) {
-        let mut state = self.lock();
-        state.gesture_active = true;
-        self.pause_locked(&mut state);
+        if !self.edit_requested.swap(true, Ordering::AcqRel) {
+            self.edit_token.fetch_add(1, Ordering::AcqRel);
+        }
+        self.queue_editor_action(EditorAction::Begin);
     }
 
     pub(crate) fn set_snapshot_selection(&self, selection: Option<Range<u64>>) {
-        self.lock().selection = selection.filter(|range| !range.is_empty());
+        self.queue_editor_action(EditorAction::Selection(selection.filter(|range| !range.is_empty())));
     }
 
     pub(crate) fn end_waveform_gesture(&self, keep_selection: bool) {
-        let mut state = self.lock();
-        if !state.gesture_active {
-            return;
+        if !keep_selection {
+            self.edit_requested.store(false, Ordering::Release);
         }
-        state.gesture_active = false;
-        state.last_interaction = Instant::now();
-        if !keep_selection && state.paused {
-            Self::resume_locked(&mut state);
-            if let Some(consumer) = &mut state.consumer {
-                self.accept_input_when_safe(consumer);
-            }
-        }
+        self.queue_editor_action(EditorAction::End(keep_selection));
     }
 
     pub(crate) fn cancel_waveform_selection(&self) {
-        let mut state = self.lock();
-        state.gesture_active = false;
-        state.selection = None;
-        if state.paused {
-            Self::resume_locked(&mut state);
-            if let Some(consumer) = &mut state.consumer {
-                self.accept_input_when_safe(consumer);
+        self.edit_requested.store(false, Ordering::Release);
+        self.queue_editor_action(EditorAction::Cancel);
+    }
+
+    fn queue_editor_action(&self, action: EditorAction) {
+        let _ = self.editor_commands.send(EditorCommand {
+            epoch: self.published().epoch,
+            token: self.edit_token.load(Ordering::Acquire),
+            action,
+        });
+    }
+
+    fn apply_editor_commands(&self, state: &mut State) {
+        let requests = self.editor_requests.lock().unwrap_or_else(|error| error.into_inner());
+        for command in requests.try_iter() {
+            if command.epoch != state.timeline_epoch { continue; }
+            if !matches!(command.action, EditorAction::Begin | EditorAction::Gesture(_))
+                && command.token != state.edit_serial { continue; }
+            match command.action {
+                EditorAction::Begin => {
+                    state.gesture_active = true;
+                    if state.edit_serial != command.token {
+                        state.edit_serial = command.token;
+                        state.editing = None;
+                        state.editing_pending = true;
+                        state.selection = None;
+                    }
+                }
+                EditorAction::Selection(selection) => state.selection = selection,
+                EditorAction::End(keep) => {
+                    state.gesture_active = false;
+                    if !keep {
+                        state.selection = None;
+                        state.editing = None;
+                        state.editing_pending = false;
+                    }
+                }
+                EditorAction::Cancel => {
+                    state.gesture_active = false;
+                    state.selection = None;
+                    state.editing = None;
+                    state.editing_pending = false;
+                }
+                EditorAction::Gesture(active) => state.gesture_active = active,
             }
+            state.last_interaction = Instant::now();
         }
     }
 
     pub(crate) fn timeline_epoch(&self) -> u64 {
-        self.lock().timeline_epoch
+        self.published().epoch
     }
 
-    pub(crate) fn positioned_snapshots(&self, live: bool) -> Option<(u64, Vec<Snapshot>)> {
+    pub(crate) fn positioned_snapshots(&self, live: bool) -> Option<(u64, Arc<[Snapshot]>)> {
+        if !live && self.edit_requested.load(Ordering::Acquire) {
+            let editing = self.editing_snapshot()?;
+            return Some((editing.timeline.epoch, editing.snapshots));
+        }
         let mut state = self.lock();
         let recording = live && !state.paused && self.accepting.load(Ordering::SeqCst);
         let epoch = state.timeline_epoch;
@@ -460,13 +608,13 @@ impl Session {
         if recording {
             consumer.drain(usize::MAX);
         }
-        Some((epoch, track_snapshots(&consumer.capture)))
+        Some((epoch, track_snapshots(&consumer.capture).into()))
     }
 
     #[cfg(test)]
     fn positioned_snapshot(&self, live: bool) -> Option<(u64, Snapshot)> {
         let (epoch, snapshots) = self.positioned_snapshots(live)?;
-        snapshots.into_iter().next().map(|snapshot| (epoch, snapshot))
+        snapshots.first().cloned().map(|snapshot| (epoch, snapshot))
     }
 
     #[cfg(test)]
@@ -489,13 +637,46 @@ impl Session {
         self.waveform_in_range(layout, None, peaks)
     }
 
+    #[cfg(test)]
     pub(crate) fn waveform_in_range(
         &self,
         layout: WaveformLayout,
         visible: Option<Range<u64>>,
         peaks: &mut [WaveformPeaks; 2],
     ) -> WaveformTimeline {
-        let mut state = self.lock();
+        self.waveform_in_range_with_bins(layout, visible, WAVEFORM_BINS, peaks)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waveform_in_range_with_bins(
+        &self,
+        layout: WaveformLayout,
+        visible: Option<Range<u64>>,
+        bins: usize,
+        peaks: &mut [WaveformPeaks; 2],
+    ) -> WaveformTimeline {
+        Self::render_waveform(&mut self.lock(), layout, visible, bins, peaks)
+    }
+
+    pub(crate) fn try_waveform_in_range_with_bins(
+        &self,
+        layout: WaveformLayout,
+        visible: Option<Range<u64>>,
+        bins: usize,
+        peaks: &mut [WaveformPeaks; 2],
+    ) -> Option<WaveformTimeline> {
+        let mut state = self.state.try_lock().ok()?;
+        Some(Self::render_waveform(&mut state, layout, visible, bins, peaks))
+    }
+
+    fn render_waveform(
+        state: &mut State,
+        layout: WaveformLayout,
+        visible: Option<Range<u64>>,
+        bins: usize,
+        peaks: &mut [WaveformPeaks; 2],
+    ) -> WaveformTimeline {
+        let bins = bins.clamp(1, backtracking_core::waveform::MAX_WAVEFORM_BINS);
         let epoch = state.timeline_epoch;
         let Some(consumer) = &mut state.consumer else {
             peaks.fill(WaveformPeaks::default());
@@ -509,7 +690,7 @@ impl Session {
             .map(|range| range.start.max(frames.start)..range.end.min(frames.end))
             .filter(|range| !range.is_empty())
             .unwrap_or_else(|| frames.clone());
-        consumer.waveform(layout, range, peaks);
+        consumer.waveform(layout, range, bins, peaks);
         WaveformTimeline {
             epoch,
             bar_markers: consumer.capture.bar_markers(frames.clone()),
@@ -520,27 +701,22 @@ impl Session {
         }
     }
 
+
     pub(crate) fn is_paused(&self) -> bool {
-        self.lock().paused
+        self.published().paused
     }
 
     pub(crate) fn is_recording(&self) -> bool {
-        let state = self.lock();
-        state.consumer.as_ref().is_some_and(|consumer| {
-            matches!(consumer.capture.state(), CaptureState::Recording)
-                && consumer.has_fresh_input()
-        })
+        if let Ok(state) = self.state.try_lock() { self.publish(&state); }
+        let published = self.published();
+        published.recording && published.input_expires_at.is_some_and(|deadline| Instant::now() < deadline)
     }
 
     pub(crate) fn meter_readings(&self) -> MeterReadings {
-        let state = self.lock();
-        state
-            .consumer
-            .as_ref()
-            .filter(|consumer| !state.paused && consumer.has_fresh_input())
-            .map_or_else(MeterReadings::default, |consumer| {
-                consumer.capture.meter_readings()
-            })
+        let published = self.published();
+        if published.input_expires_at.is_some_and(|deadline| Instant::now() < deadline) {
+            published.meter
+        } else { MeterReadings::default() }
     }
 
     pub(crate) fn dropped_frames(&self) -> usize {
@@ -551,17 +727,53 @@ impl Session {
         self.snapshot_result.lock().unwrap_or_else(|error| error.into_inner()).take()
     }
 
-    fn snapshot_for_shortcut(&self) -> Option<SnapshotJob> {
+    pub(crate) fn request_snapshot(&self) {
+        let _ = self.snapshot_commands.send(self.timeline_epoch());
+    }
+
+    fn try_snapshot_for_shortcut(&self, expected_epoch: Option<u64>) -> SnapshotAttempt {
+        self.try_snapshot(expected_epoch, false)
+    }
+
+    fn try_snapshot(&self, expected_epoch: Option<u64>, full_history: bool) -> SnapshotAttempt {
         let mut state = self.lock();
-        let settings = self.settings();
-        let selected = state.selection.clone();
-        let epoch = state.timeline_epoch;
-        let recording = !state.paused && self.accepting.load(Ordering::SeqCst);
-        let consumer = state.consumer.as_mut()?;
-        if recording {
-            consumer.drain(usize::MAX);
+        if expected_epoch.is_some_and(|epoch| epoch != state.timeline_epoch) {
+            return SnapshotAttempt::Empty;
         }
-        let available = consumer.capture.frame_range();
+        // A shortcut can arrive after consume() and after the editor queued its
+        // latest selection. Observe those commands before choosing the material.
+        self.apply_editor_commands(&mut state);
+        if full_history {
+            self.pin_editing_material(&mut state);
+        } else if state.editing_pending || state.gesture_active {
+            return SnapshotAttempt::Pending;
+        }
+        self.snapshot_for_shortcut_locked(&mut state, full_history)
+            .map_or(SnapshotAttempt::Empty, SnapshotAttempt::Ready)
+    }
+
+    #[cfg(test)]
+    fn snapshot_for_shortcut(&self) -> Option<SnapshotJob> {
+        match self.try_snapshot_for_shortcut(None) {
+            SnapshotAttempt::Ready(job) => Some(job),
+            SnapshotAttempt::Pending | SnapshotAttempt::Empty => None,
+        }
+    }
+
+    fn snapshot_for_shortcut_locked(&self, state: &mut State, full_history: bool) -> Option<SnapshotJob> {
+        let settings = self.settings();
+        let selected = if full_history { None } else { state.selection.clone() };
+        let epoch = state.timeline_epoch;
+        let snapshots: Arc<[Snapshot]> = if selected.is_some() {
+            if state.editing_pending { return None; }
+            state.editing.as_ref()?.snapshots.clone()
+        } else {
+            let recording = !state.paused && self.accepting.load(Ordering::SeqCst);
+            let consumer = state.consumer.as_mut()?;
+            if recording { consumer.drain(usize::MAX); }
+            track_snapshots(&consumer.capture).into()
+        };
+        let available = snapshots.first()?.frame_range();
         let range = selected
             .clone()
             .map_or(available.clone(), |range| {
@@ -572,14 +784,16 @@ impl Session {
         }
         let first = (range.start - available.start) as usize;
         let end = (range.end - available.start) as usize;
-        let snapshots = track_snapshots(&consumer.capture);
         if selected.is_some() {
-            Self::resume_locked(&mut state);
-            state.gesture_active = false;
-            if let Some(consumer) = &mut state.consumer {
-                self.accept_input_when_safe(consumer);
+            if self.edit_token.load(Ordering::Acquire) == state.edit_serial {
+                self.edit_requested.store(false, Ordering::Release);
             }
+            state.selection = None;
+            state.editing = None;
+            state.editing_pending = false;
+            state.gesture_active = false;
         }
+        self.publish(&state);
         Some(SnapshotJob {
             settings,
             snapshots,
@@ -592,6 +806,9 @@ impl Session {
     fn consume(&self) {
         let mut state = self.lock();
         self.apply_capture_settings(&mut state);
+        self.apply_editor_commands(&mut state);
+        self.pin_editing_material(&mut state);
+        self.publish(&state);
         if state.paused
             && !state.gesture_active
             && state.selection.is_none()
@@ -609,12 +826,35 @@ impl Session {
         let accepting = self.accepting.load(Ordering::SeqCst);
         if accepting && !paused {
             // Yield the session lock regularly even when a DAW renders ahead of realtime.
-            consumer.drain(8);
+            consumer.drain(256);
         } else {
             consumer.discard();
         }
         if !accepting && !paused {
             self.accept_input_when_safe(consumer);
+        }
+        self.publish(&state);
+    }
+
+    fn pin_editing_material(&self, state: &mut State) {
+        // Pin the already displayed material before queued audio advances the
+        // rolling boundary. The audio callback continues accepting packets.
+        if state.editing_pending && let Some(consumer) = &state.consumer {
+            let frames = consumer.capture.frame_range();
+            let editing = EditingSnapshot {
+                token: state.edit_serial,
+                timeline: Arc::new(WaveformTimeline {
+                    epoch: state.timeline_epoch,
+                    bar_markers: consumer.capture.bar_markers(frames.clone()),
+                    frames,
+                    sample_rate: consumer.sample_rate,
+                    channels: consumer.capture.track_channels(0).unwrap_or(1),
+                    b_channels: consumer.capture.track_channels(1),
+                }),
+                snapshots: track_snapshots(&consumer.capture).into(),
+            };
+            state.editing = Some(editing);
+            state.editing_pending = false;
         }
     }
 
@@ -634,10 +874,16 @@ fn track_snapshots(capture: &Capture) -> Vec<Snapshot> {
 
 struct SnapshotJob {
     settings: SessionSettings,
-    snapshots: Vec<Snapshot>,
+    snapshots: Arc<[Snapshot]>,
     epoch: u64,
     range: Range<u64>,
     relative: Range<usize>,
+}
+
+enum SnapshotAttempt {
+    Pending,
+    Empty,
+    Ready(SnapshotJob),
 }
 
 impl SnapshotJob {
@@ -689,7 +935,7 @@ impl Worker {
         if rate == 0 || !(1..=2).contains(&channels) || sidechain > 2 {
             return None;
         }
-        let (queue, capacity_frames) = {
+        let (queue, capacity_frames, metadata_slots) = {
             let mut state = session.lock();
             session.apply_capture_settings(&mut state);
             let input = if sidechain == 0 {
@@ -707,13 +953,20 @@ impl Worker {
                 capture.pause();
             }
             let block_capacity = (max_buffer as usize).saturating_mul(2).min(rate as usize);
-            let capacity_frames = (rate as usize / 4)
+            // A bounded two-second backlog absorbs cold allocation/snapshot work
+            // while the realtime callback keeps publishing without taking locks.
+            let capacity_frames = (rate as usize).saturating_mul(2)
                 .max(block_capacity)
                 .max(4096)
                 .next_power_of_two();
-            let queue = TimedAudioQueue::new(capacity_frames, 4096, channels + sidechain);
+            let metadata_slots = capacity_frames.div_ceil(16).clamp(4096, 65_536);
+            let queue = TimedAudioQueue::new(capacity_frames, metadata_slots, channels + sidechain);
             state.timeline_epoch = state.timeline_epoch.wrapping_add(1);
+            state.gesture_active = false;
             state.selection = None;
+            state.editing = None;
+            state.editing_pending = false;
+            session.edit_requested.store(false, Ordering::Release);
             state.consumer = Some(Consumer {
                 queue: queue.clone(),
                 capture,
@@ -732,13 +985,14 @@ impl Worker {
                 ),
             });
             session.accepting.store(!state.paused, Ordering::SeqCst);
-            (queue, capacity_frames)
+            session.publish(&state);
+            (queue, capacity_frames, metadata_slots)
         };
         session.dropped_frames.store(0, Ordering::Relaxed);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let worker_session = session.clone();
-        let sender_queue = TimedAudioQueue::new(capacity_frames, 4096, channels + sidechain);
+        let sender_queue = TimedAudioQueue::new(capacity_frames, metadata_slots, channels + sidechain);
         let worker_sender_queue = sender_queue.clone();
         let sender_active = Arc::new(AtomicBool::new(false));
         let worker_sender_active = sender_active.clone();
@@ -847,6 +1101,8 @@ struct SenderWorker {
     queue: Arc<TimedAudioQueue>,
     active: Arc<AtomicBool>,
     writer: Option<SyncSender<SnapshotJob>>,
+    pending_snapshots: usize,
+    pending_snapshot_epoch: Option<u64>,
     rate: u32,
     main: usize,
     sidechain: usize,
@@ -869,6 +1125,8 @@ impl SenderWorker {
             queue,
             active,
             writer: None,
+            pending_snapshots: 0,
+            pending_snapshot_epoch: None,
             rate,
             main,
             sidechain,
@@ -879,6 +1137,9 @@ impl SenderWorker {
     }
 
     fn update(&mut self, session: &Session) {
+        // Local saves work independently of the Sender connection. Both paths
+        // collect audio and hand it to the same writer on this worker thread.
+        self.process_local_snapshots(session);
         let (mut name, enabled, input, preferred_id) = {
             let settings = session.settings.lock();
             (
@@ -927,10 +1188,48 @@ impl SenderWorker {
         } else {
             self.queue.discard_pending(&mut self.scratch);
         }
-        if endpoint.take_snapshot_request()
-            && let Some(job) = session.snapshot_for_shortcut()
-        {
+        if endpoint.take_snapshot_request() {
+            self.add_snapshot_request(session.timeline_epoch());
+        }
+        if let Some(job) = self.take_ready_snapshot(session) {
             self.queue_snapshot(session, job);
+        }
+    }
+
+    fn add_snapshot_request(&mut self, epoch: u64) {
+        if self.pending_snapshot_epoch != Some(epoch) {
+            self.pending_snapshots = 0;
+            self.pending_snapshot_epoch = Some(epoch);
+        }
+        self.pending_snapshots = self.pending_snapshots.saturating_add(1);
+    }
+
+    fn process_local_snapshots(&mut self, session: &Session) {
+        let requests = session.snapshot_requests.lock().unwrap_or_else(|error| error.into_inner());
+        for epoch in requests.try_iter() {
+            match session.try_snapshot(Some(epoch), true) {
+                SnapshotAttempt::Ready(job) => self.queue_snapshot(session, job),
+                SnapshotAttempt::Empty => {
+                    *session.snapshot_result.lock().unwrap_or_else(|error| error.into_inner()) =
+                        Some((epoch, 0..0, Err("No captured audio to save yet.".into())));
+                }
+                SnapshotAttempt::Pending => unreachable!("full history snapshots never await a gesture"),
+            }
+        }
+    }
+
+    fn take_ready_snapshot(&mut self, session: &Session) -> Option<SnapshotJob> {
+        if self.pending_snapshots == 0 { return None; }
+        match session.try_snapshot_for_shortcut(self.pending_snapshot_epoch) {
+            SnapshotAttempt::Pending => None,
+            SnapshotAttempt::Empty => {
+                self.pending_snapshots -= 1;
+                None
+            }
+            SnapshotAttempt::Ready(job) => {
+                self.pending_snapshots -= 1;
+                Some(job)
+            }
         }
     }
 
@@ -994,7 +1293,7 @@ mod tests {
         worker.push(&[&mut [0.5; 64], &mut [-0.5; 64]]);
         session.pause();
         let original = session.snapshot().unwrap();
-        let mut peaks = [WaveformPeaks::default(); 2];
+        let mut peaks = std::array::from_fn(|_| WaveformPeaks::default());
         let merged = session.waveform(WaveformLayout::Merged, &mut peaks);
         assert_eq!(merged.frames, original.frame_range());
         assert!(peaks[0].minimum.iter().all(|&sample| sample == 0.0));
@@ -1136,12 +1435,19 @@ mod tests {
     }
 
     #[test]
-    fn idle_resume_waits_during_gestures_and_a_held_selection() {
+    fn idle_resume_does_not_pause_live_edits_or_release_an_explicit_pause() {
         for delay in AutoResumeDelay::ALL {
             let session = Session::new(SettingsStore::default());
             session.set_idle_resume(delay);
             session.begin_waveform_gesture();
             let after_delay = Instant::now() - Duration::from_secs(u64::from(delay.seconds()) + 1);
+            session.lock().last_interaction = after_delay;
+            session.consume();
+            assert!(!session.is_paused());
+            session.end_waveform_gesture(false);
+
+            session.pause();
+            session.begin_waveform_gesture();
             session.lock().last_interaction = after_delay;
             session.consume();
             assert!(session.is_paused());
@@ -1153,12 +1459,222 @@ mod tests {
             assert!(session.is_paused());
 
             session.cancel_waveform_selection();
+            assert!(session.is_paused());
+            session.resume();
             assert!(!session.is_paused());
         }
     }
 
     #[test]
-    fn immediate_resume_follows_waveform_release_but_respects_manual_pause() {
+    fn waveform_gesture_keeps_recording_and_pins_both_original_tracks() {
+        let settings = SettingsStore::default();
+        settings.lock().capture_input = CaptureInput::Both;
+        settings.lock().retention = DurationChoice::Seconds10;
+        let session = Arc::new(Session::new(settings));
+        let mut worker = Worker::with_sidechain(session.clone(), 10, 2, 1, 256).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+        worker.push_block(&[&mut [0.25; 64], &mut [-0.25; 64]], &[&mut [0.75; 64]], None);
+        session.consume();
+        session.begin_waveform_gesture();
+        assert!(!session.is_paused(), "selection must not stop the producer");
+        assert!(session.accepting.load(Ordering::SeqCst));
+        assert!(session.positioned_snapshots(false).is_none(), "pending edits must not export a live replacement");
+        session.consume();
+        session.set_snapshot_selection(Some(8..24));
+        session.end_waveform_gesture(true);
+        worker.push_block(&[&mut [0.5; 256], &mut [-0.5; 256]], &[&mut [0.9; 256]], None);
+        session.consume();
+        assert!(!session.is_paused());
+        let live = session.positioned_snapshots(true).unwrap().1;
+        assert!(live[0].first_frame > 24, "the live ring must continue past the old selection");
+        let job = session.snapshot_for_shortcut().unwrap();
+        assert_eq!(job.range, 8..24);
+        assert_eq!(job.snapshots[0].frames(job.relative.clone()).unwrap(), [0.25, -0.25].repeat(16));
+        assert_eq!(job.snapshots[1].frames(job.relative.clone()).unwrap(), [0.75; 16]);
+        assert!(!session.is_paused());
+    }
+
+    #[test]
+    fn waveform_gesture_does_not_release_an_explicit_pause() {
+        let session = Arc::new(Session::new(SettingsStore::default()));
+        let mut worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+        worker.push(&[&mut [0.25; 32]]);
+        session.pause();
+        session.begin_waveform_gesture();
+        session.consume();
+        session.set_snapshot_selection(Some(8..20));
+        session.end_waveform_gesture(true);
+        session.cancel_waveform_selection();
+        assert!(session.is_paused());
+        worker.push(&[&mut [0.5; 32]]);
+        assert_eq!(session.snapshot().unwrap().samples, [0.25; 32]);
+    }
+
+    #[test]
+    fn editing_commands_and_paint_reads_return_while_the_capture_mutex_is_busy() {
+        let session = Arc::new(Session::new(SettingsStore::default()));
+        let (locked, ready) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let busy = session.clone();
+        let thread = thread::spawn(move || {
+            let _guard = busy.lock();
+            locked.send(()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_millis(250));
+        });
+        ready.recv().unwrap();
+        let started = Instant::now();
+        session.mark_interaction();
+        session.begin_waveform_gesture();
+        assert!(session.editing_pending());
+        assert!(session.positioned_snapshots(false).is_none());
+        session.set_snapshot_selection(Some(8..20));
+        session.end_waveform_gesture(true);
+        session.cancel_waveform_selection();
+        assert!(!session.is_paused());
+        assert!(!session.is_recording());
+        let _ = session.meter_readings();
+        let _ = session.timeline_epoch();
+        let _ = session.sidechain_available();
+        let _ = session.host_track_name();
+        session.request_snapshot();
+        let mut peaks = std::array::from_fn(|_| WaveformPeaks::default());
+        peaks[0].maximum.fill(0.75);
+        assert!(session.try_waveform_in_range_with_bins(
+            WaveformLayout::Merged, None, 128, &mut peaks,
+        ).is_none());
+        assert!(peaks[0].maximum.iter().all(|&sample| sample == 0.75));
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        thread.join().unwrap();
+        assert!(elapsed < Duration::from_millis(50), "UI waited for the capture mutex: {elapsed:?}");
+        assert_eq!(session.snapshot_requests.lock().unwrap().try_recv().unwrap(), session.timeline_epoch());
+        session.consume();
+        assert!(!session.editing_pending());
+        assert!(session.editing_snapshot().is_none());
+    }
+
+    #[test]
+    fn play_and_shorter_history_keep_the_original_edit_material() {
+        let settings = SettingsStore::default();
+        settings.lock().retention = DurationChoice::Minutes3;
+        let session = Arc::new(Session::new(settings));
+        let mut worker = Worker::new(session.clone(), 100, 1, 256).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+        worker.push(&[&mut [0.25; 2000]]);
+        session.consume();
+        session.begin_waveform_gesture();
+        session.consume();
+        session.set_snapshot_selection(Some(8..24));
+        session.end_waveform_gesture(true);
+        session.consume();
+        session.pause();
+        session.resume();
+        assert!(!session.is_paused());
+        assert_eq!(session.lock().selection, Some(8..24));
+        session.set_retention(DurationChoice::Seconds10);
+        session.consume();
+        assert_eq!(session.positioned_snapshots(true).unwrap().1[0].first_frame, 1000);
+        let job = session.snapshot_for_shortcut().unwrap();
+        assert_eq!(job.range, 8..24);
+        assert_eq!(job.snapshots[0].frames(job.relative).unwrap(), [0.25; 16]);
+    }
+
+    #[test]
+    fn clear_and_input_changes_cancel_old_edit_tokens_and_queued_actions() {
+        let settings = SettingsStore::default();
+        settings.lock().capture_input = CaptureInput::Both;
+        let session = Arc::new(Session::new(settings));
+        let mut worker = Worker::with_sidechain(session.clone(), 1_000, 1, 1, 256).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+        worker.push_block(&[&mut [0.25; 32]], &[&mut [0.75; 32]], None);
+        session.consume();
+        session.begin_waveform_gesture();
+        session.consume();
+        session.set_snapshot_selection(Some(8..20)); // Queued against the old epoch.
+        let epoch = session.timeline_epoch();
+        session.clear();
+        session.consume();
+        assert!(session.timeline_epoch() != epoch);
+        assert!(!session.lock().gesture_active);
+        assert!(session.lock().selection.is_none());
+        assert!(session.editing_snapshot().is_none());
+        assert!(!session.editing_pending());
+
+        session.begin_waveform_gesture();
+        session.consume();
+        let epoch = session.timeline_epoch();
+        session.settings.lock().capture_input = CaptureInput::Sidechain;
+        session.consume();
+        assert!(session.timeline_epoch() != epoch);
+        assert!(!session.lock().gesture_active);
+        assert!(session.lock().selection.is_none());
+        assert!(session.editing_snapshot().is_none());
+        assert!(!session.editing_pending());
+    }
+
+    #[test]
+    fn a_one_second_producer_backlog_survives_a_busy_capture_worker() {
+        let session = Arc::new(Session::new(SettingsStore::default()));
+        let mut worker = Worker::new(session.clone(), 48_000, 2, 256).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+        for _ in 0..250 {
+            worker.push(&[&mut [0.25; 192], &mut [-0.25; 192]]);
+        }
+        while worker.queue.pending_packets() > 0 { session.consume(); }
+        assert_eq!(session.dropped_frames(), 0);
+        assert_eq!(session.snapshot_live().unwrap().frame_count(), 48_000);
+    }
+
+    #[test]
+    fn tiny_host_packets_keep_a_full_second_of_backlog_without_metadata_loss() {
+        let session = Arc::new(Session::new(SettingsStore::default()));
+        let mut worker = Worker::new(session.clone(), 96_000, 2, 16).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+        for _ in 0..6000 { worker.push(&[&mut [0.25; 16], &mut [-0.25; 16]]); }
+        while worker.queue.pending_packets() > 0 { session.consume(); }
+        assert_eq!(session.dropped_frames(), 0);
+        assert_eq!(session.snapshot_live().unwrap().frame_count(), 96_000);
+    }
+
+    #[test]
+    fn tiny_host_packets_are_consumed_faster_than_the_normal_poll_arrival_rate() {
+        let session = Arc::new(Session::new(SettingsStore::default()));
+        let mut worker = Worker::new(session.clone(), 96_000, 2, 16).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+        // A 96 kHz host publishes 24 sixteen-frame packets per four milliseconds.
+        for _ in 0..250 {
+            for _ in 0..24 { worker.push(&[&mut [0.25; 16], &mut [-0.25; 16]]); }
+            session.consume();
+        }
+        assert_eq!(worker.queue.pending_packets(), 0, "normal host input must not build an ever-growing backlog");
+        assert_eq!(session.dropped_frames(), 0);
+        assert_eq!(session.snapshot_live().unwrap().frame_count(), 96_000);
+    }
+
+    #[test]
+    fn immediate_resume_keeps_gesture_audio_and_respects_manual_pause() {
         let session = Arc::new(Session::new(SettingsStore::default()));
         let mut worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
         // Verify the first block after release without relying on the periodic worker.
@@ -1169,7 +1685,7 @@ mod tests {
         session.set_idle_resume(AutoResumeDelay::Immediate);
         session.begin_waveform_gesture();
         session.consume();
-        assert!(session.is_paused());
+        assert!(!session.is_paused());
         worker.push(&[&mut [0.25; 32]]);
 
         session.end_waveform_gesture(false);
@@ -1177,7 +1693,7 @@ mod tests {
         worker.push(&[&mut [0.5; 32]]);
 
         session.pause();
-        assert_eq!(session.snapshot().unwrap().samples, vec![0.5; 32]);
+        assert_eq!(session.snapshot().unwrap().samples, [vec![0.25; 32], vec![0.5; 32]].concat());
         session.consume();
         assert!(session.is_paused());
         session.end_waveform_gesture(false);
@@ -1218,7 +1734,7 @@ mod tests {
         assert_eq!(&snapshots[1].samples[32..], &[0.; 32]);
         assert_eq!(left, [0.25; 32]);
         assert_eq!(right, [-0.25; 32]);
-        let mut peaks = [WaveformPeaks::default(); 2];
+        let mut peaks = std::array::from_fn(|_| WaveformPeaks::default());
         let wave = session.waveform_in_range(WaveformLayout::Merged, Some(5..25), &mut peaks);
         assert_eq!(wave.bar_markers, [0, 16, 32, 48]);
         assert_eq!(wave.channels, 2);
@@ -1227,13 +1743,38 @@ mod tests {
     }
 
     #[test]
+    fn waveform_resolution_follows_requested_bins_without_changing_capture() {
+        let session = Arc::new(Session::new(SettingsStore::default()));
+        let worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
+        let mut samples = [0.25; 128];
+        samples[63] = 0.9;
+        worker.push(&[&mut samples]);
+        session.pause();
+        let original = session.snapshot().unwrap();
+        let mut peaks = std::array::from_fn(|_| WaveformPeaks::default());
+        for bins in [32, 1024, 128] {
+            let timeline = session.waveform_in_range_with_bins(
+                WaveformLayout::Merged, None, bins, &mut peaks,
+            );
+            assert_eq!(timeline.frames, original.frame_range());
+            assert_eq!(peaks[0].minimum.len(), bins);
+            assert_eq!(peaks[0].maximum.len(), bins);
+            assert_eq!(peaks[0].maximum.iter().copied().fold(0.0_f32, f32::max), 0.9);
+            assert_eq!(session.snapshot().unwrap(), original);
+        }
+    }
+
+    #[test]
     fn snapshot_hotkey_exports_a_selection_and_resumes_even_without_editor() {
         let session = Arc::new(Session::new(SettingsStore::default()));
         let worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
         worker.push(&[&mut [0.25; 32]]);
+        session.consume();
         session.begin_waveform_gesture();
+        session.consume();
         session.set_snapshot_selection(Some(8..20));
         session.end_waveform_gesture(true);
+        session.consume();
         let job = session.snapshot_for_shortcut().unwrap();
         assert_eq!(job.range, 8..20);
         assert_eq!(job.relative, 8..20);
@@ -1242,5 +1783,149 @@ mod tests {
         let next = session.snapshot_for_shortcut().unwrap();
         assert_eq!(next.range, 0..64);
         assert!(!session.is_paused());
+    }
+
+    #[test]
+    fn local_snapshot_writes_full_history_without_sender_and_preserves_a_later_selection() {
+        let output = std::env::temp_dir().join(format!(
+            "backtracking-local-snapshot-test-{}", std::process::id(),
+        ));
+        let settings = SettingsStore::default();
+        settings.lock().saved_dir = output.clone();
+        settings.lock().capture_input = CaptureInput::Both;
+        let session = Arc::new(Session::new(settings));
+        let mut worker = Worker::with_sidechain(session.clone(), 48_000, 1, 1, 256).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+        let mut sender = SenderWorker::new(
+            worker.sender_queue.clone(), worker.sender_active.clone(), 48_000, 1, 1,
+        );
+        sender.retry_at = Instant::now() + Duration::from_secs(60);
+        worker.push_block(&[&mut [0.25; 32]], &[&mut [0.75; 32]], None);
+        session.consume();
+        session.request_snapshot();
+
+        // A new gesture between the UI request and the worker must neither
+        // narrow the requested full snapshot nor get cancelled by that save.
+        session.begin_waveform_gesture();
+        session.set_snapshot_selection(Some(8..20));
+        session.end_waveform_gesture(true);
+        worker.push_block(&[&mut [0.5; 32]], &[&mut [0.9; 32]], None);
+        sender.update(&session);
+        assert!(sender.endpoint.is_none());
+        assert!(!sender.active.load(Ordering::Relaxed));
+        assert!(!session.is_paused());
+        assert_eq!(session.lock().selection, Some(8..20));
+        assert_eq!(session.editing_snapshot().unwrap().timeline.frames, 0..32);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (epoch, range, result) = loop {
+            if let Some(result) = session.take_snapshot_result() { break result; }
+            assert!(Instant::now() < deadline, "background snapshot writer timed out");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(epoch, session.timeline_epoch());
+        assert_eq!(range, 0..64);
+        let paths = result.unwrap();
+        assert_eq!(paths.len(), 2);
+        for (path, expected) in paths.iter().zip([
+            [vec![0.25_f32; 32], vec![0.5; 32]].concat(),
+            [vec![0.75_f32; 32], vec![0.9; 32]].concat(),
+        ]) {
+            let wav = std::fs::read(path).unwrap();
+            let data = wav.windows(4).position(|chunk| chunk == b"data").unwrap() + 8;
+            let actual: Vec<_> = wav[data..].chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())).collect();
+            assert_eq!(actual, expected);
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::remove_dir(output).unwrap();
+    }
+
+    #[test]
+    fn snapshot_hotkey_observes_editor_commands_between_worker_ticks() {
+        let session = Arc::new(Session::new(SettingsStore::default()));
+        let mut worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+        worker.push(&[&mut [0.25; 32]]);
+        session.consume();
+        session.begin_waveform_gesture();
+        session.consume();
+
+        // The UI finished its drag after the audio worker's latest consume().
+        session.set_snapshot_selection(Some(8..20));
+        session.end_waveform_gesture(true);
+        let job = session.snapshot_for_shortcut().unwrap();
+        assert_eq!(job.range, 8..20);
+        assert_eq!(job.snapshots[0].frames(job.relative).unwrap(), [0.25; 12]);
+
+        session.begin_waveform_gesture();
+        session.consume();
+        session.set_snapshot_selection(Some(5..10));
+        session.end_waveform_gesture(true);
+        session.consume();
+        // Cancel also takes effect before a later consume(), so it cannot save
+        // the selection that the user has already dismissed.
+        session.cancel_waveform_selection();
+        worker.push(&[&mut [0.75; 32]]);
+        let job = session.snapshot_for_shortcut().unwrap();
+        assert_eq!(job.range, 0..64);
+        assert_eq!(job.snapshots[0].frames(32..64).unwrap(), [0.75; 32]);
+    }
+
+    #[test]
+    fn snapshot_hotkey_waits_for_pinned_material_and_a_finished_gesture() {
+        let session = Arc::new(Session::new(SettingsStore::default()));
+        let mut worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+        let mut sender = SenderWorker::new(
+            worker.sender_queue.clone(), worker.sender_active.clone(), 1_000, 1, 0,
+        );
+        worker.push(&[&mut [0.25; 32]]);
+        session.consume();
+        session.begin_waveform_gesture();
+        sender.pending_snapshots = 1;
+        sender.pending_snapshot_epoch = Some(session.timeline_epoch());
+        assert!(sender.take_ready_snapshot(&session).is_none());
+        assert_eq!(sender.pending_snapshots, 1, "pinning must not consume the shortcut");
+        worker.push(&[&mut [0.75; 32]]);
+        session.consume();
+        assert!(sender.take_ready_snapshot(&session).is_none());
+        assert_eq!(sender.pending_snapshots, 1, "an active drag must not save the live buffer");
+        session.set_snapshot_selection(Some(8..20));
+        session.end_waveform_gesture(true);
+        let job = sender.take_ready_snapshot(&session).unwrap();
+        assert_eq!(job.range, 8..20);
+        assert_eq!(job.snapshots[0].frames(job.relative).unwrap(), [0.25; 12]);
+        assert_eq!(sender.pending_snapshots, 0);
+        assert!(sender.take_ready_snapshot(&session).is_none());
+        assert!(!session.is_paused());
+
+        // Clear changes the material generation. A deferred request cannot
+        // accidentally save audio that arrived after that operation.
+        session.begin_waveform_gesture();
+        sender.pending_snapshots = 1;
+        sender.pending_snapshot_epoch = Some(session.timeline_epoch());
+        assert!(sender.take_ready_snapshot(&session).is_none());
+        session.clear();
+        worker.push(&[&mut [0.9; 32]]);
+        session.consume();
+        assert!(sender.take_ready_snapshot(&session).is_none());
+        assert_eq!(sender.pending_snapshots, 0);
+
+        // A request with no available audio is consumed, never postponed until
+        // unrelated audio is recorded later.
+        session.clear();
+        sender.pending_snapshots = 1;
+        sender.pending_snapshot_epoch = Some(session.timeline_epoch());
+        assert!(sender.take_ready_snapshot(&session).is_none());
+        assert_eq!(sender.pending_snapshots, 0);
     }
 }

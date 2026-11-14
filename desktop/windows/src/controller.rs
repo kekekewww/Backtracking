@@ -1,6 +1,6 @@
 use std::io;
 use std::ops::Range;
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -151,6 +151,12 @@ impl Stream {
 type Sources = [Option<SourceSettings>; 2];
 type WaveformBuffers<'a> = (&'a mut [f32], &'a mut [f32]);
 
+pub(crate) struct EditSnapshot {
+    pub(crate) snapshots: Arc<[Snapshot]>,
+    pub(crate) bar_markers: Vec<u64>,
+    pub(crate) generation: u64,
+}
+
 enum CaptureCommand {
     SetSources(Sources),
     SetRetention(DurationChoice),
@@ -161,12 +167,15 @@ enum CaptureCommand {
         selection: Option<Range<u64>>,
         reply: mpsc::SyncSender<Option<Arc<[Snapshot]>>>,
     },
+    EditSnapshot {
+        reply: mpsc::SyncSender<Option<EditSnapshot>>,
+    },
     Shutdown,
 }
 
 struct Request {
     command: CaptureCommand,
-    complete: Option<mpsc::SyncSender<()>>,
+    complete: Option<mpsc::SyncSender<SourceStatus>>,
 }
 
 #[derive(Default)]
@@ -174,6 +183,33 @@ struct SourceStatus {
     formats: [Option<Arc<Format>>; 2],
     statuses: [Option<String>; 2],
     error: Option<String>,
+    paused: bool,
+    recording: bool,
+    generation: u64,
+    revision: u64,
+    channels: [Option<usize>; 2],
+    meters: [Option<MeterReadings>; 2],
+}
+
+impl SourceStatus {
+    fn from_session(state: &CaptureSession) -> Self {
+        let capture = state.capture.as_ref().map(SynchronizedCapture::capture);
+        Self {
+            formats: state.formats.clone(),
+            statuses: state.statuses.clone(),
+            error: state.error.clone(),
+            paused: state.is_paused(),
+            recording: state.is_recording(),
+            generation: state.generation,
+            revision: state.revision,
+            channels: std::array::from_fn(|lane| {
+                capture.and_then(|capture| capture.track_channels(lane))
+            }),
+            meters: std::array::from_fn(|lane| {
+                capture.and_then(|capture| capture.track_meter_readings(lane))
+            }),
+        }
+    }
 }
 
 pub(crate) struct Controller {
@@ -196,7 +232,10 @@ impl Controller {
         Ok(Self {
             sources: [Some(SourceSettings::default()), None],
             retention: DurationChoice::Seconds20,
-            source_status: SourceStatus::default(),
+            source_status: SourceStatus {
+                paused: true,
+                ..SourceStatus::default()
+            },
             state,
             commands,
             worker: Some(worker),
@@ -239,14 +278,12 @@ impl Controller {
     }
 
     pub(crate) fn poll(&mut self) {
-        self.source_status = {
-            let state = lock(&self.state);
-            SourceStatus {
-                formats: state.formats.clone(),
-                statuses: state.statuses.clone(),
-                error: state.error.clone(),
-            }
-        };
+        // Audio work can include a cold allocation, page release, or a snapshot
+        // copy. A paint must retain the last complete metadata instead of
+        // waiting for that work on the UI thread.
+        if let Some(state) = try_lock(&self.state) {
+            self.source_status = SourceStatus::from_session(&state);
+        }
     }
 
     pub(crate) fn pause(&mut self) {
@@ -262,51 +299,84 @@ impl Controller {
     }
 
     pub(crate) fn is_paused(&self) -> bool {
-        lock(&self.state).is_paused()
+        self.source_status.paused
     }
 
     pub(crate) fn is_recording(&self) -> bool {
-        lock(&self.state).is_recording()
+        self.source_status.recording
     }
 
     pub(crate) fn generation(&self) -> u64 {
-        lock(&self.state).generation
+        self.source_status.generation
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshots(&self, selection: Option<Range<u64>>) -> Option<Arc<[Snapshot]>> {
+        self.request_snapshots(selection).recv().ok().flatten()
+    }
+
+    /// Starts a snapshot copy on the capture worker. Receiving its result is
+    /// optional and must be polled, rather than waited for, from the UI thread.
+    pub(crate) fn request_snapshots(
+        &self,
+        selection: Option<Range<u64>>,
+    ) -> mpsc::Receiver<Option<Arc<[Snapshot]>>> {
         let (reply, result) = mpsc::sync_channel(1);
-        self.commands
-            .send(Request {
-                command: CaptureCommand::Snapshot { selection, reply },
-                complete: None,
-            })
-            .ok()?;
-        result.recv().ok().flatten()
+        let _ = self.commands.send(Request {
+            command: CaptureCommand::Snapshot { selection, reply },
+            complete: None,
+        });
+        result
+    }
+
+    /// Pins both audio lanes and the complete matching bar history in one
+    /// worker transaction, independently of the last visible waveform zoom.
+    pub(crate) fn request_edit_snapshot(&self) -> mpsc::Receiver<Option<EditSnapshot>> {
+        let (reply, result) = mpsc::sync_channel(1);
+        let _ = self.commands.send(Request {
+            command: CaptureCommand::EditSnapshot { reply },
+            complete: None,
+        });
+        result
     }
 
     pub(crate) fn track_meter_readings(&self, lane: usize) -> Option<MeterReadings> {
-        lock(&self.state)
-            .capture
-            .as_ref()?
-            .capture()
-            .track_meter_readings(lane)
+        self.source_status.meters.get(lane).copied().flatten()
     }
 
     pub(crate) fn track_channels(&self, lane: usize) -> Option<usize> {
-        lock(&self.state)
-            .capture
-            .as_ref()?
-            .capture()
-            .track_channels(lane)
+        self.source_status.channels.get(lane).copied().flatten()
     }
 
-    pub(crate) fn render_waveforms(
+    #[cfg(test)]
+    fn render_waveforms(
         &self,
         views: &[(usize, WaveformView)],
         zoom: Option<Range<u64>>,
         traces: &mut [WaveformBuffers<'_>],
     ) -> (Range<u64>, Range<u64>, u32, Vec<u64>) {
         let state = lock(&self.state);
+        Self::render_waveforms_from(&state, views, zoom, traces)
+    }
+
+    /// Leaves every output buffer untouched when the capture worker is busy.
+    /// The caller can retain its previous waveform and selection for this frame.
+    pub(crate) fn try_render_waveforms(
+        &self,
+        views: &[(usize, WaveformView)],
+        zoom: Option<Range<u64>>,
+        traces: &mut [WaveformBuffers<'_>],
+    ) -> Option<(Range<u64>, Range<u64>, u32, Vec<u64>)> {
+        let state = try_lock(&self.state)?;
+        Some(Self::render_waveforms_from(&state, views, zoom, traces))
+    }
+
+    fn render_waveforms_from(
+        state: &CaptureSession,
+        views: &[(usize, WaveformView)],
+        zoom: Option<Range<u64>>,
+        traces: &mut [WaveformBuffers<'_>],
+    ) -> (Range<u64>, Range<u64>, u32, Vec<u64>) {
         let rate = state.shape.map_or(COMMON_RATE, |shape| shape.0);
         let Some(capture) = state.capture.as_ref().map(SynchronizedCapture::capture) else {
             for (minimum, maximum) in traces {
@@ -334,7 +404,7 @@ impl Controller {
     }
 
     pub(crate) fn revision(&self) -> u64 {
-        lock(&self.state).revision
+        self.source_status.revision
     }
 
     pub(crate) fn retention(&self) -> DurationChoice {
@@ -363,9 +433,10 @@ impl Controller {
             })
             .is_ok()
         {
-            let _ = result.recv();
+            if let Ok(status) = result.recv() {
+                self.source_status = status;
+            }
         }
-        self.poll();
     }
 }
 
@@ -383,6 +454,14 @@ impl Drop for Controller {
 
 fn lock(state: &Mutex<CaptureSession>) -> MutexGuard<'_, CaptureSession> {
     state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn try_lock(state: &Mutex<CaptureSession>) -> Option<MutexGuard<'_, CaptureSession>> {
+    match state.try_lock() {
+        Ok(state) => Some(state),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
 }
 
 struct CaptureSession {
@@ -452,10 +531,14 @@ impl CaptureSession {
                             state.poll();
                             let _ = reply.send(state.snapshots(selection));
                         }
+                        CaptureCommand::EditSnapshot { reply } => {
+                            state.poll();
+                            let _ = reply.send(state.edit_snapshot());
+                        }
                         CaptureCommand::Shutdown => break,
                     }
                     if let Some(complete) = complete {
-                        let _ = complete.send(());
+                        let _ = complete.send(SourceStatus::from_session(&state));
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => state.poll(),
@@ -897,6 +980,16 @@ impl CaptureSession {
         Some(snapshots.into())
     }
 
+    fn edit_snapshot(&self) -> Option<EditSnapshot> {
+        let capture = self.capture.as_ref()?.capture();
+        let frames = capture.frame_range();
+        Some(EditSnapshot {
+            snapshots: self.snapshots(Some(frames.clone()))?,
+            bar_markers: capture.bar_markers(frames),
+            generation: self.generation,
+        })
+    }
+
     fn clear(&mut self) {
         self.discard_before_ns = now_ns();
         for input in &mut self.inputs {
@@ -932,6 +1025,137 @@ fn missing_channel(format: &Format, route: ChannelRoute) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paint_metadata_never_waits_for_busy_capture_work() {
+        let mut controller = Controller::new().unwrap();
+        {
+            let mut session = lock(&controller.state);
+            session.generation = 7;
+            session.revision = 9;
+            let mut capture =
+                SynchronizedCapture::new(10, 2, None, DurationChoice::Seconds20).unwrap();
+            capture
+                .capture_mut()
+                .push_interleaved(&[0.5, -0.25])
+                .unwrap();
+            session.capture = Some(capture);
+        }
+        controller.poll();
+        let state = Arc::clone(&controller.state);
+        let busy = lock(&state);
+        let (started, start) = mpsc::sync_channel(1);
+        let (finished, finish) = mpsc::sync_channel(1);
+        let paint = thread::spawn(move || {
+            started.send(()).unwrap();
+            controller.poll();
+            assert!(controller.is_paused());
+            assert!(!controller.is_recording());
+            assert_eq!(controller.generation(), 7);
+            assert_eq!(controller.revision(), 9);
+            assert_eq!(controller.track_channels(0), Some(2));
+            assert!(
+                controller
+                    .track_meter_readings(0)
+                    .unwrap()
+                    .peak_dbfs
+                    .is_finite()
+            );
+            let mut minimum = [-123.0; 4];
+            let mut maximum = [456.0; 4];
+            assert!(
+                controller
+                    .try_render_waveforms(
+                        &[(0, WaveformView::Merged)],
+                        None,
+                        &mut [(&mut minimum, &mut maximum)],
+                    )
+                    .is_none()
+            );
+            assert_eq!(minimum, [-123.0; 4]);
+            assert_eq!(maximum, [456.0; 4]);
+            finished.send(()).unwrap();
+        });
+        start.recv().unwrap();
+        let returned_while_busy = finish.recv_timeout(Duration::from_millis(100)).is_ok();
+        drop(busy);
+        paint.join().unwrap();
+        assert!(
+            returned_while_busy,
+            "paint metadata waited for the capture mutex"
+        );
+    }
+
+    #[test]
+    fn snapshot_request_returns_while_busy_and_copies_the_requested_original_frames() {
+        let controller = Controller::new().unwrap();
+        let state = Arc::clone(&controller.state);
+        {
+            let mut session = lock(&state);
+            let mut capture =
+                SynchronizedCapture::new(10, 1, None, DurationChoice::Seconds20).unwrap();
+            capture
+                .capture_mut()
+                .push_interleaved(&[0.1, 0.2, 0.3, 0.4])
+                .unwrap();
+            session.capture = Some(capture);
+        }
+        let busy = lock(&state);
+        let (posted, request) = mpsc::sync_channel(1);
+        let painter = thread::spawn(move || {
+            posted
+                .send(controller.request_snapshots(Some(1..3)))
+                .unwrap();
+        });
+        let result = request.recv_timeout(Duration::from_millis(100));
+        let returned_while_busy = result.is_ok();
+        drop(busy);
+        painter.join().unwrap();
+        assert!(returned_while_busy, "snapshot request waited for capture work");
+        let snapshots = result.unwrap().recv().unwrap().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].frame_range(), 1..3);
+        assert_eq!(snapshots[0].samples, [0.2, 0.3]);
+    }
+
+    #[test]
+    fn edit_snapshot_has_full_atomic_bar_history_and_survives_live_retention_trim() {
+        let mut controller = Controller::new().unwrap();
+        {
+            let mut session = lock(&controller.state);
+            session.sources[1] = Some(SourceSettings::default());
+            session.shape = Some((10, 1, Some(1)));
+            session.generation = 7;
+            let mut capture =
+                SynchronizedCapture::new(10, 1, Some(1), DurationChoice::Minutes10).unwrap();
+            let input: Vec<_> = (0..200).flat_map(|_| [0.25, -0.5]).collect();
+            capture
+                .push_native_interleaved_with_markers(0, &input, false, &[10, 30, 170, 190])
+                .unwrap();
+            session.capture = Some(capture);
+        }
+        let mut minimum = [0.0; 2];
+        let mut maximum = [0.0; 2];
+        let (_, _, _, visible_bars) = controller.render_waveforms(
+            &[(0, WaveformView::Merged)],
+            Some(20..40),
+            &mut [(&mut minimum, &mut maximum)],
+        );
+        assert_eq!(visible_bars, [30]);
+        let edit = controller.request_edit_snapshot().recv().unwrap().unwrap();
+        assert_eq!(edit.generation, 7);
+        assert_eq!(edit.bar_markers, [10, 30, 170, 190]);
+        assert_eq!(edit.snapshots.len(), 2);
+        assert!(edit.snapshots.iter().all(|snapshot| snapshot.frame_range() == (0..200)));
+
+        controller.set_retention(DurationChoice::Seconds10);
+        let live = controller.snapshots(None).unwrap();
+        assert_eq!(live[0].frame_range(), 100..200);
+        assert_eq!(edit.bar_markers, [10, 30, 170, 190]);
+        assert_eq!(edit.snapshots[0].frame_range(), 0..200);
+        assert_eq!(edit.snapshots[0].samples, vec![0.25; 200]);
+        assert_eq!(edit.snapshots[1].samples, vec![-0.5; 200]);
+    }
 
     #[test]
     fn background_retention_and_snapshots_keep_a_and_b_on_the_same_frames() {

@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-11-14T00:50:30.244865Z",
+  "scope": "Native Windows GUI regression with an isolated profile and a synthetic local Sender; WAV files and private screenshots are not published.",
+  "tested_windows_exe_sha256": "0D31F1B6CC302D61C6D6CB258828158675DE9FE142727122C3022F99D8F3B279",
+  "build_status": "Intermediate runtime-tested build before the last footer removal and subsequent plug-in full-save worker changes; not the final packaged binary hash.",
+  "observed_window_dimensions": [
+    1500,
+    500
+  ],
+  "ui_observations": [
+    "All seven History choices were visible in the native dropdown.",
+    "10s -> 600s -> 60s -> 10s changes remained operable with no long stall observed; this is not a timed latency measurement.",
+    "After Pause, a native endpoint drag formed an approximately 19.77-second selection.",
+    "Play resumed capture while the displayed picture/flags stayed fixed and the red LED/dBFS kept updating.",
+    "After live History was reduced to 10 seconds and more than 10 seconds elapsed, the selection still displayed approximately 19.77 seconds.",
+    "Alt+grave saved the selected material and returned the view to live.",
+    "Native zoom changed the visible range and guide density."
+  ],
+  "wav_inspections": [
+    {
+      "sha256": "d51bb7f7cfce636a762409901a25904797a355849e10e0134185b6cecd7777b7",
+      "sample_rate": 48000,
+      "channels": 2,
+      "bits": 32,
+      "format_tag": 3,
+      "frames": 1919040,
+      "duration_seconds": 39.98,
+      "all_samples_finite": true,
+      "peak": 0.07543932646512985,
+      "rms": 0.010335996088887882,
+      "label": "baseline-short-snapshot"
+    },
+    {
+      "sha256": "855bef12255f4cb56ab41df4ad0943c57e5aee9086273126110a06b83300a5df",
+      "sample_rate": 48000,
+      "channels": 2,
+      "bits": 32,
+      "format_tag": 3,
+      "frames": 948868,
+      "duration_seconds": 19.768083333333333,
+      "all_samples_finite": true,
+      "peak": 0.07543932646512985,
+      "rms": 0.010345770495056122,
+      "label": "selection-after-live-rollover"
+    }
+  ],
+  "limitations": [
+    "The baseline snapshot is 39.98 seconds because its longer history was still filling; it is not a verified 60-second export.",
+    "The later selection file is 19.768083333333333 seconds, consistent with the UI-rounded 19.77-second range, but no expected source start/end sample sequence was compared.",
+    "Finite stored samples and duration do not prove absence of dropped/duplicated frames or audible artifacts.",
+    "The run used one stereo synthetic Sender, not a native dual-source A/B verification.",
+    "No physical native Shift-drag was tested; modifier behavior is covered separately by RawInput/shared tests.",
+    "Native window resizing and the final rebuilt UI-copy cleanup were not completed in this observed run.",
+    "No end-to-end latency, DAW/macOS performance, or new GPU/CPU monitoring is inferred."
+  ]
+}

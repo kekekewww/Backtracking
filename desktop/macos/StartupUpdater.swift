@@ -187,12 +187,11 @@ final class StartupUpdater: NSObject {
         checkButton = check
         let open = NSButton(title: "GitHub Releases", target: self, action: #selector(openReleases))
         let notes = NSButton(title: "上次更新內容", target: self, action: #selector(showPreviousNotes))
-        let hint = NSTextField(wrappingLabelWithString: "手動啟動和登入啟動都會先檢查，再開始擷取。")
         let status = NSTextField(wrappingLabelWithString: "")
         self.status = status
         let buttons = NSStackView(views: [check, open, notes])
         buttons.spacing = 8
-        let stack = NSStackView(views: [versionLabel, automatic, buttons, hint, status])
+        let stack = NSStackView(views: [versionLabel, automatic, buttons, status])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12

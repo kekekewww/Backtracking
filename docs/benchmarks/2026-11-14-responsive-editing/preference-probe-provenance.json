@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "measured_result": "synchronous-preference-save.json",
+  "executable_sha256": "f1653821831a3b0572ddd8efbf7637cbefb8675820cad7ab6d817eca7743d616",
+  "harness_source_sha256": "38175a5d960d2210745b15a51775ea91410a6883587a63c3ed4199f7714b2686",
+  "source_scope": "Includes the production Preferences::save implementation; controller parsing enum stand-ins only.",
+  "timing_scope": "Entire Preferences::save call, not File.sync_all in isolation.",
+  "baseline_harness_source": "preference-probe-source.rs",
+  "asynchronous": {
+    "measured_result": "asynchronous-preference-save.json",
+    "executable_sha256": "eeaead5ebe4277fffd5ffe278771cd919738c8d4d97ef56f5da5ad632b952eef",
+    "harness_source_sha256": "3aa0d5a3551a8a2b4ccda426d2b5502ffb5ad28447e9b32ba3f4194daded3844",
+    "production_preferences_source_sha256": "54d8e5b42af8c8bfacf3c5b1bdef1c57e0a7bd54717d3c3c601edfeb1aaf0362",
+    "source_scope": "Actual production PreferenceWriter::new/save/flush and durable Preferences::save sink; controller parsing enum stand-ins only",
+    "timing_scope": "Enqueue is not persistence; flush is timed separately and all eight final values were reloaded as 600 seconds",
+    "harness_source": "preference-async-probe-source.rs",
+    "production_source_hash_note": "Measured writer version before later queued-update coalescing/review changes. This hash is not claimed to match the final production source or binary."
+  },
+  "measured_binaries_published": false
+}

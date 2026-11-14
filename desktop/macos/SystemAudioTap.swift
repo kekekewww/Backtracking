@@ -72,7 +72,7 @@ enum CaptureSource: Hashable {
     }
 }
 
-enum CaptureRoute: UInt32, CaseIterable {
+enum CaptureRoute: UInt32, CaseIterable, Sendable {
     case merged, left, right, center, mid, side
 
     // UserDefaults stores the Swift raw values. WAV export uses the core route codes.
@@ -461,7 +461,7 @@ private struct InputFormat {
     }
 }
 
-private final class TimelineHandle {
+private final class TimelineHandle: @unchecked Sendable {
     let core: OpaquePointer
 
     init(history: UInt32, a: UInt32, b: UInt32) throws {
@@ -760,6 +760,10 @@ final class SystemAudioTap {
     private var running = false
     private let captureQueue = DispatchQueue(label: "Backtracking.capture")
     private var pollInFlight = false
+    private var telemetryVersion: UInt64 = 0
+    private(set) var cachedState: UInt32 = 0
+    private(set) var cachedMeters = Array(repeating:
+        BtMeterReadings(peak_dbfs: -Float.infinity, vu: -Float.infinity, momentary_lufs: -Float.infinity), count: 2)
     var core: OpaquePointer { timeline.core }
     var laneCount: Int { lanes.count }
     var captureRoutes: [CaptureRoute] { lanes.map(\.route) }
@@ -883,9 +887,33 @@ final class SystemAudioTap {
         }
         guard !pollInFlight else { return }
         pollInFlight = true
+        let version = telemetryVersion
         captureQueue.async { [weak self] in
             bt_tracks_poll(timeline.core)
-            DispatchQueue.main.async { [weak self] in self?.pollInFlight = false }
+            let state = bt_tracks_state(timeline.core)
+            let meters = [bt_tracks_meter_readings(timeline.core, 0), bt_tracks_meter_readings(timeline.core, 1)]
+            DispatchQueue.main.async { [weak self] in
+                if self?.telemetryVersion == version {
+                    self?.cachedState = state
+                    self?.cachedMeters = meters
+                }
+                self?.pollInFlight = false
+            }
+        }
+    }
+
+    // UI callers never wait for the capture queue to copy or summarize audio.
+    // Keeping the handle alive in the closure also makes late completions safe
+    // after a source has been replaced on the main thread.
+    func readCapture<T: Sendable>(
+        poll: Bool = true, _ read: @escaping @Sendable (OpaquePointer) -> T,
+        completion: @escaping @MainActor (T) -> Void
+    ) {
+        let timeline = self.timeline
+        captureQueue.async {
+            if poll { bt_tracks_poll(timeline.core) }
+            let result = read(timeline.core)
+            DispatchQueue.main.async { completion(result) }
         }
     }
 
@@ -912,13 +940,19 @@ final class SystemAudioTap {
 
     func resume() throws {
         if running { try pause() }
+        telemetryVersion &+= 1
         bt_tracks_resume(core)
         for index in slots.indices { start(index) }
         running = true
+        cachedState = 0
     }
 
     func pause() throws {
+        telemetryVersion &+= 1
         bt_tracks_pause(core)
+        cachedState = 2
+        cachedMeters = Array(repeating:
+            BtMeterReadings(peak_dbfs: -Float.infinity, vu: -Float.infinity, momentary_lufs: -Float.infinity), count: 2)
         guard running else { return }
         var firstError: Error?
         for input in slots.compactMap(\.input) {
