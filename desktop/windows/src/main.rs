@@ -4,6 +4,8 @@
 )]
 
 #[cfg(target_os = "windows")]
+mod context_menu;
+#[cfg(target_os = "windows")]
 mod controller;
 #[cfg(target_os = "windows")]
 mod file_drag;

@@ -1,20 +1,161 @@
 use std::io;
 use std::ops::Range;
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError, mpsc};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{
-    CaptureError, CaptureState, ChannelRoute, DurationChoice, MeterReadings, SenderReceiver,
-    Snapshot, SynchronizedCapture, TimedPacket, WaveformView, discover_senders,
+    CaptureError, CaptureState, ChannelRoute, DurationChoice, FrozenTrack, MeterReadings,
+    SenderReceiver, SynchronizedCapture, TimedPacket, WaveformView, discover_senders,
 };
 
 pub(crate) use crate::loopback::CaptureSource;
-use crate::loopback::{Format, Loopback, PACKET_QUEUE_CAPACITY, QuietModeBarrier, now_ns};
+use crate::loopback::{
+    DataWake, Format, Loopback, PACKET_QUEUE_CAPACITY, QuietModeBarrier, now_ns,
+};
 
 const COMMON_RATE: u32 = 48_000;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
-const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(4);
+/// A Sender source is a socket that nothing announces, so it is read on a timer:
+/// quickly while its packets keep arriving and slowly while it is silent.
+const SENDER_ACTIVE_POLL: Duration = Duration::from_millis(4);
+const SENDER_IDLE_POLL: Duration = Duration::from_millis(20);
+const SENDER_ACTIVE_WINDOW: Duration = Duration::from_millis(250);
+/// New capture data asks the UI for a repaint at most this often, which is the
+/// rate its refresh timer used to run at.
+const UI_NOTIFY_INTERVAL: Duration = Duration::from_millis(80);
+
+/// Asks the UI thread for one repaint. Safe to call from any thread.
+pub(crate) type RepaintRequest = Arc<dyn Fn() + Send + Sync>;
+
+/// What the capture worker shares with the UI besides the session itself.
+struct UiLink {
+    repaint: OnceLock<RepaintRequest>,
+    /// False while nothing displays the waveform or the meters.
+    watching: AtomicBool,
+}
+
+/// The parts of a session that the UI draws. The worker compares two of these
+/// to decide whether the UI has anything new to show.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct DisplayStamp {
+    /// Everything except the waveform and the meters.
+    status: u64,
+    revision: u64,
+    /// Tenths of a decibel, which is as fine as the readout shows.
+    meters: [Option<[i32; 3]>; 2],
+}
+
+impl DisplayStamp {
+    fn of(state: &CaptureSession) -> Self {
+        let capture = state.capture.as_ref().map(SynchronizedCapture::capture);
+        let mut status = DefaultHasher::new();
+        state.generation.hash(&mut status);
+        state.is_paused().hash(&mut status);
+        state.is_recording().hash(&mut status);
+        state.error.hash(&mut status);
+        state.mode_error.hash(&mut status);
+        state.statuses.hash(&mut status);
+        for (lane, format) in state.formats.iter().enumerate() {
+            format.as_ref().map(Arc::as_ptr).hash(&mut status);
+            capture
+                .and_then(|capture| capture.track_channels(lane))
+                .hash(&mut status);
+        }
+        Self {
+            status: status.finish(),
+            revision: state.revision,
+            meters: std::array::from_fn(|lane| {
+                capture
+                    .and_then(|capture| capture.track_meter_readings(lane))
+                    .map(|meter| {
+                        [meter.peak_dbfs, meter.vu, meter.momentary_lufs]
+                            .map(|value| (value * 10.0).round() as i32)
+                    })
+            }),
+        }
+    }
+
+    /// Waveform and meter changes only count while something displays them.
+    fn differs(&self, shown: &Self, watching: bool) -> bool {
+        self.status != shown.status
+            || (watching && (self.revision != shown.revision || self.meters != shown.meters))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Notify {
+    Now,
+    Later(Duration),
+    Idle,
+}
+
+/// Limits UI repaint requests to one per `UI_NOTIFY_INTERVAL`. The first change
+/// after a quiet spell goes out at once and the last one is never dropped.
+#[derive(Default)]
+struct RepaintThrottle {
+    last: Option<Instant>,
+    dirty: bool,
+}
+
+impl RepaintThrottle {
+    fn update(&mut self, changed: bool, now: Instant) -> Notify {
+        self.dirty |= changed;
+        if !self.dirty {
+            return Notify::Idle;
+        }
+        match self.last.map(|last| now.saturating_duration_since(last)) {
+            Some(since) if since < UI_NOTIFY_INTERVAL => Notify::Later(UI_NOTIFY_INTERVAL - since),
+            _ => {
+                self.dirty = false;
+                self.last = Some(now);
+                Notify::Now
+            }
+        }
+    }
+}
+
+struct WorkerWait {
+    paused: bool,
+    sender_connected: bool,
+    since_sender_packet: Option<Duration>,
+    mode_retry_in: Option<Duration>,
+    source_retry_in: Option<Duration>,
+}
+
+/// How long the capture worker may block before it has work that no command
+/// or capture-thread wake announces. `None` blocks until one arrives.
+fn worker_wait(state: &WorkerWait) -> Option<Duration> {
+    if state.paused {
+        return None;
+    }
+    let sender = state.sender_connected.then(|| {
+        if state
+            .since_sender_packet
+            .is_some_and(|since| since < SENDER_ACTIVE_WINDOW)
+        {
+            SENDER_ACTIVE_POLL
+        } else {
+            SENDER_IDLE_POLL
+        }
+    });
+    [sender, state.mode_retry_in, state.source_retry_in]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+/// Wakes the capture worker when dropped, including during an unwind.
+struct WakeOnDrop(DataWake);
+
+impl Drop for WakeOnDrop {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SourceSettings {
@@ -52,7 +193,7 @@ enum Stream {
 }
 
 impl Stream {
-    fn open(source: CaptureSource) -> Result<Self, String> {
+    fn open(source: CaptureSource, wake: DataWake) -> Result<Self, String> {
         match source {
             CaptureSource::Sender { id, .. } => {
                 let receiver = SenderReceiver::connect(&id).map_err(|error| error.to_string())?;
@@ -67,7 +208,7 @@ impl Stream {
                     error: None,
                 })
             }
-            _ => Loopback::start(source).map(Self::Wasapi),
+            _ => Loopback::start(source, wake).map(Self::Wasapi),
         }
     }
 
@@ -169,7 +310,8 @@ type Sources = [Option<SourceSettings>; 2];
 type WaveformBuffers<'a> = (&'a mut [f32], &'a mut [f32]);
 
 pub(crate) struct EditSnapshot {
-    pub(crate) snapshots: Arc<[Snapshot]>,
+    /// The lanes of one frozen view. They share the capture's pages.
+    pub(crate) snapshots: Arc<[FrozenTrack]>,
     pub(crate) bar_markers: Vec<u64>,
     pub(crate) generation: u64,
 }
@@ -183,11 +325,13 @@ enum CaptureCommand {
     Clear,
     Snapshot {
         selection: Option<Range<u64>>,
-        reply: mpsc::SyncSender<Option<Arc<[Snapshot]>>>,
+        reply: mpsc::SyncSender<Option<Arc<[FrozenTrack]>>>,
     },
     EditSnapshot {
         reply: mpsc::SyncSender<Option<EditSnapshot>>,
     },
+    /// A capture thread queued packets or an error, or a source finished opening.
+    Wake,
     Shutdown,
 }
 
@@ -236,18 +380,40 @@ pub(crate) struct Controller {
     retain_silence: bool,
     source_status: SourceStatus,
     state: Arc<Mutex<CaptureSession>>,
+    ui: Arc<UiLink>,
     commands: mpsc::Sender<Request>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Controller {
     pub(crate) fn new() -> io::Result<Self> {
-        let state = Arc::new(Mutex::new(CaptureSession::new()));
         let (commands, requests) = mpsc::channel();
+        // Many packets can arrive before the worker runs. One queued wake covers them all.
+        let wake_pending = Arc::new(AtomicBool::new(false));
+        let wake: DataWake = {
+            let commands = commands.clone();
+            let pending = Arc::clone(&wake_pending);
+            Arc::new(move || {
+                if !pending.swap(true, Ordering::AcqRel) {
+                    let _ = commands.send(Request {
+                        command: CaptureCommand::Wake,
+                        complete: None,
+                    });
+                }
+            })
+        };
+        let state = Arc::new(Mutex::new(CaptureSession::with_wake(wake)));
+        let ui = Arc::new(UiLink {
+            repaint: OnceLock::new(),
+            watching: AtomicBool::new(true),
+        });
         let worker_state = Arc::clone(&state);
+        let worker_ui = Arc::clone(&ui);
         let worker = thread::Builder::new()
             .name("backtracking-capture".into())
-            .spawn(move || CaptureSession::run(&worker_state, requests))?;
+            .spawn(move || {
+                CaptureSession::run(&worker_state, requests, &wake_pending, &worker_ui)
+            })?;
         Ok(Self {
             sources: [Some(SourceSettings::default()), None],
             retention: DurationChoice::Seconds20,
@@ -257,9 +423,22 @@ impl Controller {
                 ..SourceStatus::default()
             },
             state,
+            ui,
             commands,
             worker: Some(worker),
         })
+    }
+
+    /// Installs the way the capture worker asks for a repaint when what the UI
+    /// draws has changed. Until then the UI only sees the changes it polls for.
+    pub(crate) fn set_repaint(&self, repaint: RepaintRequest) {
+        let _ = self.ui.repaint.set(repaint);
+    }
+
+    /// Tells the worker whether the waveform and meters are on screen. While
+    /// they are not, only status changes ask for a repaint.
+    pub(crate) fn set_watching(&self, watching: bool) {
+        self.ui.watching.store(watching, Ordering::Relaxed);
     }
 
     pub(crate) fn sources(&self) -> &Sources {
@@ -302,13 +481,16 @@ impl Controller {
         self.source_status.statuses.get(lane).and_then(Option::as_deref)
     }
 
-    pub(crate) fn poll(&mut self) {
+    /// Returns false when the capture worker was busy and the status is unchanged.
+    pub(crate) fn poll(&mut self) -> bool {
         // Audio work can include a cold allocation, page release, or a snapshot
         // copy. A paint must retain the last complete metadata instead of
         // waiting for that work on the UI thread.
-        if let Some(state) = try_lock(&self.state) {
-            self.source_status = SourceStatus::from_session(&state);
-        }
+        let Some(state) = try_lock(&self.state) else {
+            return false;
+        };
+        self.source_status = SourceStatus::from_session(&state);
+        true
     }
 
     pub(crate) fn pause(&mut self) {
@@ -336,16 +518,16 @@ impl Controller {
     }
 
     #[cfg(test)]
-    pub(crate) fn snapshots(&self, selection: Option<Range<u64>>) -> Option<Arc<[Snapshot]>> {
+    pub(crate) fn snapshots(&self, selection: Option<Range<u64>>) -> Option<Arc<[FrozenTrack]>> {
         self.request_snapshots(selection).recv().ok().flatten()
     }
 
-    /// Starts a snapshot copy on the capture worker. Receiving its result is
-    /// optional and must be polled, rather than waited for, from the UI thread.
+    /// Asks the capture worker to pin the audio as it is now. Receiving its result
+    /// is optional and must be polled, rather than waited for, from the UI thread.
     pub(crate) fn request_snapshots(
         &self,
         selection: Option<Range<u64>>,
-    ) -> mpsc::Receiver<Option<Arc<[Snapshot]>>> {
+    ) -> mpsc::Receiver<Option<Arc<[FrozenTrack]>>> {
         let (reply, result) = mpsc::sync_channel(1);
         let _ = self.commands.send(Request {
             command: CaptureCommand::Snapshot { selection, reply },
@@ -414,7 +596,7 @@ impl Controller {
         let visible = zoom.map_or_else(
             || history.clone(),
             |zoom| {
-                super::ui::fit_frame_range(
+                backtracking_ui::fit_frame_range(
                     &history,
                     zoom.start,
                     zoom.end.saturating_sub(zoom.start),
@@ -526,10 +708,18 @@ struct CaptureSession {
     error: Option<String>,
     mode_error: Option<String>,
     next_mode_retry: Instant,
+    /// Wakes the worker that owns this session. Every capture thread gets a copy.
+    wake: DataWake,
+    sender_packet_at: Option<Instant>,
 }
 
 impl CaptureSession {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_wake(Arc::new(|| {}))
+    }
+
+    fn with_wake(wake: DataWake) -> Self {
         // The recorder loads the saved source preferences before starting capture.
         Self {
             sources: [Some(SourceSettings::default()), None],
@@ -553,20 +743,28 @@ impl CaptureSession {
             error: None,
             mode_error: None,
             next_mode_retry: Instant::now(),
+            wake,
+            sender_packet_at: None,
         }
     }
 
-    fn run(state: &Mutex<Self>, requests: mpsc::Receiver<Request>) {
-        let mut paused = true;
+    fn run(
+        session: &Mutex<Self>,
+        requests: mpsc::Receiver<Request>,
+        wake_pending: &AtomicBool,
+        ui: &UiLink,
+    ) {
+        let mut wait = None;
+        let mut shown = DisplayStamp::default();
+        let mut throttle = RepaintThrottle::default();
         loop {
-            let request = if paused {
-                requests
+            let request = match wait {
+                Some(wait) => requests.recv_timeout(wait),
+                None => requests
                     .recv()
-                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
-            } else {
-                requests.recv_timeout(CAPTURE_POLL_INTERVAL)
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
             };
-            let mut state = lock(state);
+            let mut state = lock(session);
             match request {
                 Ok(Request { command, complete }) => {
                     match command {
@@ -586,6 +784,11 @@ impl CaptureSession {
                             state.poll();
                             let _ = reply.send(state.edit_snapshot());
                         }
+                        CaptureCommand::Wake => {
+                            // Cleared first: a packet queued from here on sends a new wake.
+                            wake_pending.store(false, Ordering::Release);
+                            state.poll();
+                        }
                         CaptureCommand::Shutdown => break,
                     }
                     if let Some(complete) = complete {
@@ -595,8 +798,53 @@ impl CaptureSession {
                 Err(mpsc::RecvTimeoutError::Timeout) => state.poll(),
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            paused = state.paused;
+            let now = Instant::now();
+            let stamp = DisplayStamp::of(&state);
+            wait = state.next_wait(now);
+            drop(state);
+            let changed = stamp.differs(&shown, ui.watching.load(Ordering::Relaxed));
+            match throttle.update(changed, now) {
+                Notify::Now => {
+                    shown = stamp;
+                    if let Some(repaint) = ui.repaint.get() {
+                        repaint();
+                    }
+                }
+                // Wake up to deliver the newest state even if nothing else happens.
+                Notify::Later(delay) => wait = Some(wait.map_or(delay, |wait| wait.min(delay))),
+                Notify::Idle => {}
+            }
         }
+    }
+
+    fn source_missing(&self) -> bool {
+        self.sources.iter().flatten().any(|lane| {
+            !self
+                .inputs
+                .iter()
+                .any(|input| input.source.same_source(&lane.source))
+                && !self
+                    .pending
+                    .iter()
+                    .any(|pending| pending.source.same_source(&lane.source))
+        })
+    }
+
+    fn next_wait(&self, now: Instant) -> Option<Duration> {
+        worker_wait(&WorkerWait {
+            paused: self.paused,
+            sender_connected: self.inputs.iter().any(|input| {
+                matches!(&input.stream, Stream::Sender { receiver: Some(_), .. })
+            }),
+            since_sender_packet: self
+                .sender_packet_at
+                .map(|at| now.saturating_duration_since(at)),
+            mode_retry_in: (self.requested_retain_silence != self.retain_silence)
+                .then(|| self.next_mode_retry.saturating_duration_since(now)),
+            source_retry_in: self
+                .source_missing()
+                .then(|| self.next_retry.saturating_duration_since(now)),
+        })
     }
 
     fn set_sources(&mut self, sources: Sources) {
@@ -712,10 +960,15 @@ impl CaptureSession {
             }
             let selected = source.clone();
             let (sender, result) = mpsc::sync_channel(1);
+            let wake = Arc::clone(&self.wake);
             match thread::Builder::new()
                 .name("backtracking-source-open".into())
                 .spawn(move || {
-                    let _ = sender.send(Stream::open(selected));
+                    // Declared first so that it runs last: by then the result is
+                    // queued or, after a panic, its sender is gone.
+                    let _wake = WakeOnDrop(Arc::clone(&wake));
+                    let sender = sender;
+                    let _ = sender.send(Stream::open(selected, wake));
                 }) {
                 Ok(_) => self.pending.push(PendingInput { source, result }),
                 Err(error) => self.set_source_status(&source, error.to_string()),
@@ -887,6 +1140,9 @@ impl CaptureSession {
                     continue;
                 };
                 found = true;
+                if matches!(input.stream, Stream::Sender { .. }) {
+                    self.sender_packet_at = Some(Instant::now());
+                }
                 let format = input.stream.format();
                 let delta = self.discard_before_ns.saturating_sub(packet.timestamp_ns);
                 let skip = (u128::from(delta) * u128::from(packet.sample_rate))
@@ -1031,17 +1287,21 @@ impl CaptureSession {
                 .is_some_and(|capture| capture.capture().state() == CaptureState::Recording)
     }
 
-    fn snapshots(&self, selection: Option<Range<u64>>) -> Option<Arc<[Snapshot]>> {
+    /// Pins the requested frames of every active lane. The lanes share the capture's
+    /// one-second pages, so while the capture lock is held this clones one pointer per
+    /// retained second and copies only the page still being written.
+    fn snapshots(&self, selection: Option<Range<u64>>) -> Option<Arc<[FrozenTrack]>> {
         let capture = self.capture.as_ref()?.capture();
         let frames = selection.unwrap_or_else(|| capture.frame_range());
         if frames.is_empty() {
             return None;
         }
         let count = if self.sources[1].is_some() { 2 } else { 1 };
-        let snapshots = (0..count)
-            .map(|lane| capture.track_snapshot_range(lane, frames.clone()))
+        let frozen = capture.freeze_range(frames)?;
+        let tracks = (0..count)
+            .map(|lane| frozen.track(lane))
             .collect::<Option<Vec<_>>>()?;
-        Some(snapshots.into())
+        Some(tracks.into())
     }
 
     fn edit_snapshot(&self) -> Option<EditSnapshot> {
@@ -1224,7 +1484,7 @@ mod tests {
         let pinned = controller.request_edit_snapshot().recv().unwrap().unwrap();
         let pinned_range = pinned.snapshots[0].frame_range();
         assert!(pinned_range.end >= on_end);
-        assert!(pinned.snapshots.iter().flat_map(|snapshot| snapshot.samples.iter()).all(|&sample| sample == 0.0),
+        assert!(pinned.snapshots.iter().flat_map(|track| track.snapshot().samples).all(|sample| sample == 0.0),
             "the isolated silent fixture unexpectedly produced nonzero audio");
 
         controller.set_retain_silence(false);
@@ -1323,14 +1583,14 @@ mod tests {
         }
         let live = controller.snapshots(None).unwrap();
         assert!(live.iter().all(|snapshot| snapshot.frame_range() == (0..16)));
-        assert_eq!(&live[0].samples[..6], &[0.25; 6]);
-        assert_eq!(&live[1].samples[..6], &[-0.5; 6]);
-        assert_eq!(&live[0].samples[6..], &[0.0; 10]);
-        assert_eq!(&live[1].samples[6..], &[0.0; 10]);
+        assert_eq!(&live[0].snapshot().samples[..6], &[0.25; 6]);
+        assert_eq!(&live[1].snapshot().samples[..6], &[-0.5; 6]);
+        assert_eq!(&live[0].snapshot().samples[6..], &[0.0; 10]);
+        assert_eq!(&live[1].snapshot().samples[6..], &[0.0; 10]);
         assert_eq!(edit.generation, 7);
         assert_eq!(edit.bar_markers, [1]);
-        assert_eq!(edit.snapshots[0].samples, [0.25; 6]);
-        assert_eq!(edit.snapshots[1].samples, [-0.5; 6]);
+        assert_eq!(edit.snapshots[0].snapshot().samples, [0.25; 6]);
+        assert_eq!(edit.snapshots[1].snapshot().samples, [-0.5; 6]);
 
         controller.set_retain_silence(false);
         controller.request_snapshots(None).recv().unwrap();
@@ -1346,8 +1606,8 @@ mod tests {
         assert!(after[0].frame_range().end < 116);
         assert!(after[0].frame_range().end >= 16);
         assert_eq!(after[0].frame_range(), after[1].frame_range());
-        assert_eq!(&after[0].samples[..16], &live[0].samples);
-        assert_eq!(&after[1].samples[..16], &live[1].samples);
+        assert_eq!(&after[0].snapshot().samples[..16], &live[0].snapshot().samples);
+        assert_eq!(&after[1].snapshot().samples[..16], &live[1].snapshot().samples);
     }
 
     #[test]
@@ -1478,7 +1738,7 @@ mod tests {
         let snapshots = result.unwrap().recv().unwrap().unwrap();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].frame_range(), 1..3);
-        assert_eq!(snapshots[0].samples, [0.2, 0.3]);
+        assert_eq!(snapshots[0].snapshot().samples, [0.2, 0.3]);
     }
 
     #[test]
@@ -1516,8 +1776,50 @@ mod tests {
         assert_eq!(live[0].frame_range(), 100..200);
         assert_eq!(edit.bar_markers, [10, 30, 170, 190]);
         assert_eq!(edit.snapshots[0].frame_range(), 0..200);
-        assert_eq!(edit.snapshots[0].samples, vec![0.25; 200]);
-        assert_eq!(edit.snapshots[1].samples, vec![-0.5; 200]);
+        assert_eq!(edit.snapshots[0].snapshot().samples, vec![0.25; 200]);
+        assert_eq!(edit.snapshots[1].snapshot().samples, vec![-0.5; 200]);
+    }
+
+    #[test]
+    fn edit_snapshots_share_the_capture_pages_and_copy_only_the_one_being_written() {
+        let controller = Controller::new().unwrap();
+        {
+            let mut session = lock(&controller.state);
+            session.sources[1] = Some(SourceSettings::default());
+            session.shape = Some((10, 1, Some(1)));
+            let mut capture =
+                SynchronizedCapture::new(10, 1, Some(1), DurationChoice::Seconds20).unwrap();
+            let input: Vec<_> = (1..=95)
+                .flat_map(|frame| [frame as f32, -(frame as f32)])
+                .collect();
+            capture
+                .push_native_interleaved_with_markers(0, &input, false, &[])
+                .unwrap();
+            session.capture = Some(capture);
+        }
+        let first = controller.request_edit_snapshot().recv().unwrap().unwrap();
+        let second = controller.request_edit_snapshot().recv().unwrap().unwrap();
+        // 95 frames at 10 Hz are nine complete one-second pages and one still open.
+        let view = first.snapshots[0].capture();
+        assert_eq!(first.snapshots[0].frame_range(), 0..95);
+        assert_eq!(view.page_count(), 10);
+        // Both lanes read one view, and a second freeze reuses every complete page.
+        assert_eq!(view.shared_pages(first.snapshots[1].capture()), 10);
+        assert_eq!(view.shared_pages(second.snapshots[0].capture()), 9);
+        {
+            let session = lock(&controller.state);
+            let live = session.capture.as_ref().unwrap().capture().freeze();
+            assert_eq!(view.shared_pages(&live), 9, "the edit copied the capture's pages");
+        }
+        // A selection pins only the pages it touches, at its absolute frames.
+        let selected = controller.snapshots(Some(28..41)).unwrap();
+        assert_eq!(selected[0].frame_range(), 28..41);
+        assert_eq!(selected[0].capture().page_count(), 3);
+        assert_eq!(selected[0].capture().shared_pages(view), 3);
+        assert_eq!(selected[1].snapshot().samples[0], -29.0);
+        let expected: Vec<f32> = (1..=95).map(|frame| frame as f32).collect();
+        assert_eq!(first.snapshots[0].snapshot().samples, expected);
+        assert_eq!(second.snapshots[1].snapshot().samples[94], -95.0);
     }
 
     #[test]
@@ -1543,12 +1845,12 @@ mod tests {
         assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[0].frame_range(), 200..500);
         assert_eq!(snapshots[1].frame_range(), 200..500);
-        assert_eq!(snapshots[0].samples[0], 201.0);
-        assert_eq!(snapshots[1].samples[0], -201.0);
+        assert_eq!(snapshots[0].snapshot().samples[0], 201.0);
+        assert_eq!(snapshots[1].snapshot().samples[0], -201.0);
         let selected = controller.snapshots(Some(298..302)).unwrap();
         assert_eq!(selected[0].frame_range(), 298..302);
-        assert_eq!(selected[0].samples, [299.0, 300.0, 301.0, 302.0]);
-        assert_eq!(selected[1].samples, [-299.0, -300.0, -301.0, -302.0]);
+        assert_eq!(selected[0].snapshot().samples, [299.0, 300.0, 301.0, 302.0]);
+        assert_eq!(selected[1].snapshot().samples, [-299.0, -300.0, -301.0, -302.0]);
 
         let mut low = [0.0; 2];
         let mut high = [0.0; 2];
@@ -1563,5 +1865,173 @@ mod tests {
         assert_eq!(markers, [300]);
         assert_eq!(low, [-350.0, -400.0]);
         assert_eq!(high, [-301.0, -351.0]);
+    }
+
+    fn waiting(change: impl FnOnce(&mut WorkerWait)) -> Option<Duration> {
+        let mut state = WorkerWait {
+            paused: false,
+            sender_connected: false,
+            since_sender_packet: None,
+            mode_retry_in: None,
+            source_retry_in: None,
+        };
+        change(&mut state);
+        worker_wait(&state)
+    }
+
+    #[test]
+    fn a_paused_or_fully_connected_worker_blocks_until_it_is_woken() {
+        assert_eq!(waiting(|_| {}), None);
+        assert_eq!(
+            waiting(|state| {
+                state.paused = true;
+                state.sender_connected = true;
+                state.mode_retry_in = Some(Duration::ZERO);
+                state.source_retry_in = Some(Duration::ZERO);
+            }),
+            None,
+        );
+    }
+
+    #[test]
+    fn the_worker_wakes_for_the_earliest_retry_it_owes() {
+        let source = Duration::from_millis(1_500);
+        let mode = Duration::from_millis(300);
+        assert_eq!(waiting(|state| state.source_retry_in = Some(source)), Some(source));
+        assert_eq!(
+            waiting(|state| {
+                state.source_retry_in = Some(source);
+                state.mode_retry_in = Some(mode);
+            }),
+            Some(mode),
+        );
+        assert_eq!(waiting(|state| state.mode_retry_in = Some(Duration::ZERO)), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn a_sender_source_is_read_quickly_only_while_its_packets_keep_arriving() {
+        let sender = |since: Option<u64>| {
+            waiting(|state| {
+                state.sender_connected = true;
+                state.since_sender_packet = since.map(Duration::from_millis);
+                state.source_retry_in = Some(Duration::from_secs(2));
+            })
+        };
+        assert_eq!(sender(None), Some(SENDER_IDLE_POLL));
+        assert_eq!(sender(Some(0)), Some(SENDER_ACTIVE_POLL));
+        assert_eq!(sender(Some(249)), Some(SENDER_ACTIVE_POLL));
+        assert_eq!(sender(Some(250)), Some(SENDER_IDLE_POLL));
+        // A lost connection stops the socket timer; reconnecting is the source retry.
+        assert_eq!(
+            waiting(|state| {
+                state.since_sender_packet = Some(Duration::ZERO);
+                state.source_retry_in = Some(Duration::from_secs(2));
+            }),
+            Some(Duration::from_secs(2)),
+        );
+    }
+
+    #[test]
+    fn a_missing_source_is_one_that_is_neither_open_nor_being_opened() {
+        let mut session = CaptureSession::new();
+        session.paused = false;
+        session.next_retry = Instant::now() + Duration::from_secs(1);
+        assert!(session.source_missing());
+        let wait = session.next_wait(Instant::now()).unwrap();
+        assert!(wait <= Duration::from_secs(1) && wait > Duration::from_millis(500));
+        let (_sender, result) = mpsc::sync_channel(1);
+        session.pending.push(PendingInput { source: CaptureSource::System, result });
+        assert!(!session.source_missing());
+        // The open thread wakes the worker itself when it finishes.
+        assert_eq!(session.next_wait(Instant::now()), None);
+    }
+
+    #[test]
+    fn repaint_requests_go_out_at_once_then_once_per_interval_and_keep_the_last_change() {
+        let start = Instant::now();
+        let at = |milliseconds| start + Duration::from_millis(milliseconds);
+        let mut throttle = RepaintThrottle::default();
+        assert_eq!(throttle.update(false, at(0)), Notify::Idle);
+        assert_eq!(throttle.update(true, at(0)), Notify::Now);
+        // One second of a stream that delivers a packet every 10 ms.
+        let mut requests = 0;
+        for tick in 1..=100 {
+            match throttle.update(true, at(tick * 10)) {
+                Notify::Now => requests += 1,
+                Notify::Later(delay) => assert!(!delay.is_zero() && delay < UI_NOTIFY_INTERVAL),
+                Notify::Idle => panic!("a change was dropped"),
+            }
+        }
+        assert_eq!(requests, 12, "no more repaints than the old 80 ms refresh timer");
+        // The stream stops. Its last change is still delivered, once.
+        assert_eq!(throttle.update(false, at(1_000)), Notify::Later(Duration::from_millis(40)));
+        assert_eq!(throttle.update(false, at(1_040)), Notify::Now);
+        assert_eq!(throttle.update(false, at(1_041)), Notify::Idle);
+        assert_eq!(throttle.update(true, at(9_000)), Notify::Now);
+    }
+
+    #[test]
+    fn the_display_stamp_separates_status_changes_from_waveform_and_meter_data() {
+        let mut session = CaptureSession::new();
+        let idle = DisplayStamp::of(&session);
+        assert!(!DisplayStamp::of(&session).differs(&idle, true));
+
+        session.revision += 1;
+        let data = DisplayStamp::of(&session);
+        assert!(data.differs(&idle, true));
+        assert!(!data.differs(&idle, false), "nothing displays the waveform");
+
+        let mut meters = data.clone();
+        meters.meters[0] = Some([-120, -200, -230]);
+        assert!(meters.differs(&data, true));
+        assert!(!meters.differs(&data, false));
+
+        session.statuses[1] = Some("device lost".into());
+        let status = DisplayStamp::of(&session);
+        assert!(status.differs(&data, false));
+        session.statuses[1] = None;
+        assert!(!DisplayStamp::of(&session).differs(&data, false));
+        session.error = Some("no source".into());
+        assert!(DisplayStamp::of(&session).differs(&data, false));
+        session.error = None;
+        session.generation += 1;
+        assert!(DisplayStamp::of(&session).differs(&data, false));
+    }
+
+    #[test]
+    fn a_wake_reaches_the_blocked_worker_which_asks_for_a_repaint_only_on_a_change() {
+        let controller = Controller::new().unwrap();
+        let (requested, repaints) = mpsc::channel();
+        controller.set_repaint(Arc::new(move || {
+            let _ = requested.send(());
+        }));
+        let wake = Arc::clone(&lock(&controller.state).wake);
+        let long = Duration::from_secs(5);
+        let brief = Duration::from_millis(300);
+
+        // The session is paused, so the worker is blocked without a timeout.
+        lock(&controller.state).statuses[0] = Some("first".into());
+        wake();
+        assert!(repaints.recv_timeout(long).is_ok());
+        wake();
+        assert!(repaints.recv_timeout(brief).is_err(), "nothing changed");
+
+        // Two changes in quick succession: the second one is held back, not lost.
+        lock(&controller.state).statuses[0] = Some("second".into());
+        wake();
+        assert!(repaints.recv_timeout(long).is_ok());
+        lock(&controller.state).statuses[0] = Some("third".into());
+        wake();
+        assert!(repaints.recv_timeout(long).is_ok());
+        assert!(repaints.recv_timeout(brief).is_err());
+
+        // While nothing displays the waveform, new audio alone asks for nothing.
+        controller.set_watching(false);
+        lock(&controller.state).revision += 1;
+        wake();
+        assert!(repaints.recv_timeout(brief).is_err());
+        controller.set_watching(true);
+        wake();
+        assert!(repaints.recv_timeout(long).is_ok());
     }
 }

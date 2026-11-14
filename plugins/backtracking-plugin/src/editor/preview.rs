@@ -1,12 +1,12 @@
-//! Background peak scans for a pinned selection view. No capture/session state is
-//! retained here: closing the editor may detach a finishing scan safely.
+//! Background peak lookups for a pinned selection view. No capture/session state is
+//! retained here: closing the editor may detach a finishing lookup safely.
 
 use std::io;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-use backtracking_core::{Snapshot, WaveformView, waveform};
+use backtracking_core::{FrozenTrack, WaveformView, waveform};
 
 use crate::session::{WaveformPeaks, waveform_views};
 use crate::settings::WaveformLayout;
@@ -22,7 +22,7 @@ pub(super) struct PreviewKey {
 
 pub(super) struct PreviewRequest {
     pub(super) key: PreviewKey,
-    pub(super) snapshots: Arc<[Snapshot]>,
+    pub(super) snapshots: Arc<[FrozenTrack]>,
 }
 
 pub(super) struct PreviewResult {
@@ -40,9 +40,9 @@ pub(super) struct PreviewWorker {
 #[derive(Default)]
 struct PendingRequests {
     latest: Option<PreviewRequest>,
-    // A replaced request can own the last reference to an old, large edit buffer.
+    // A replaced request can own the last reference to an old edit's audio pages.
     // The caller only transfers ownership; the worker releases these outside locks.
-    retired: Vec<Arc<[Snapshot]>>,
+    retired: Vec<Arc<[FrozenTrack]>>,
 }
 
 impl PreviewWorker {
@@ -67,7 +67,7 @@ impl PreviewWorker {
                 drop(retired);
                 let Some(mut request) = request else { continue };
                 loop {
-                    // The raw scan may be long. Neither slot lock is held here.
+                    // Rendering may take a while. Neither slot lock is held here.
                     let output = render(request);
                     let mut slot = requests.lock().unwrap();
                     let retired = std::mem::take(&mut slot.retired);
@@ -125,17 +125,12 @@ fn render_preview(request: PreviewRequest) -> PreviewResult {
         let route = if dual {
             snapshots.get(index).map(|snapshot| (snapshot, WaveformView::Merged))
         } else {
-            waveform_views(key.layout, first.channels).get(index).map(|&view| (first, view))
+            waveform_views(key.layout, first.channels()).get(index).map(|&view| (first, view))
         };
-        let Some((snapshot, view)) = route else { continue };
-        let (Ok(start), Ok(end)) = (
-            usize::try_from(key.range.start - snapshot.first_frame),
-            usize::try_from(key.range.end - snapshot.first_frame),
-        ) else { continue };
-        if let Some(samples) = snapshot.frames(start..end) {
-            waveform::view_peaks(samples, snapshot.channels, view,
-                &mut peaks.minimum, &mut peaks.maximum);
-        }
+        let Some((track, view)) = route else { continue };
+        // Whole peak blocks come from the capture's peak cache. Only the partial
+        // blocks at the ends of a bin are read sample by sample.
+        track.waveform(view, key.range.clone(), &mut peaks.minimum, &mut peaks.maximum);
     }
     PreviewResult { key, peaks }
 }
@@ -149,12 +144,12 @@ mod tests {
     fn request(epoch: u64, layout: WaveformLayout, bins: usize) -> PreviewRequest {
         PreviewRequest {
             key: PreviewKey { epoch, editing_token: epoch * 10, range: 102..106, layout, bins },
-            snapshots: vec![Snapshot {
-                first_frame: 100,
-                sample_rate: 48_000,
-                channels: 2,
-                samples: (0..8).flat_map(|frame| [frame as f32 / 10.0, -(frame as f32) / 20.0]).collect(),
-            }].into(),
+            snapshots: vec![FrozenTrack::from_interleaved(
+                48_000,
+                2,
+                100,
+                &(0..8).flat_map(|frame| [frame as f32 / 10.0, -(frame as f32) / 20.0]).collect::<Vec<_>>(),
+            ).unwrap()].into(),
         }
     }
 
@@ -173,12 +168,12 @@ mod tests {
         assert!(merged.peaks[1].maximum.iter().all(|&value| value == 0.0));
 
         let mut dual = request(6, WaveformLayout::Stereo, 2);
-        dual.snapshots = vec![dual.snapshots[0].clone(), Snapshot {
-            first_frame: 100,
-            sample_rate: 48_000,
-            channels: 1,
-            samples: (0..8).map(|frame| -(frame as f32) / 10.0).collect(),
-        }].into();
+        dual.snapshots = vec![dual.snapshots[0].clone(), FrozenTrack::from_interleaved(
+            48_000,
+            1,
+            100,
+            &(0..8).map(|frame| -(frame as f32) / 10.0).collect::<Vec<_>>(),
+        ).unwrap()].into();
         let dual = render_preview(dual);
         assert_eq!(dual.peaks[0].minimum, [0.05, 0.1]);
         assert_eq!(dual.peaks[1].minimum, [-0.3, -0.5]);
@@ -242,7 +237,7 @@ mod tests {
         assert_eq!(rendering.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
         assert_eq!(rendering.recv_timeout(Duration::from_secs(2)).unwrap(), 3);
         assert!(alive_while_blocked,
-            "Replacing a queued view must not free the last large Snapshot owner on the UI thread");
+            "Replacing a queued view must not free the last owner of an edit's audio on the UI thread");
         assert!(old_owner.upgrade().is_none(), "The worker must retire replaced material after its scan");
     }
 
@@ -262,6 +257,6 @@ mod tests {
         let returned = dropping.recv_timeout(Duration::from_millis(500)).is_ok();
         release.send(()).unwrap();
         drop_thread.join().unwrap();
-        assert!(returned, "Closing the editor must not join an in-progress raw scan");
+        assert!(returned, "Closing the editor must not join an in-progress preview");
     }
 }

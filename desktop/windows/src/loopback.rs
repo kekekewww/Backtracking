@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{ChannelRoute, TimedAudioQueue, TimedPacket};
-use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+use windows::Win32::Foundation::{HANDLE, RPC_E_CHANGED_MODE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
     AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED,
@@ -27,7 +27,9 @@ use windows::Win32::System::Com::{
     CoUninitialize, IAgileObject, IAgileObject_Impl,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows::Win32::System::Threading::CreateEventW;
+use windows::Win32::System::Threading::{
+    CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+};
 use windows::Win32::System::Variant::VT_BLOB;
 use windows::core::{Error, GUID, HRESULT, HSTRING, Interface, PCWSTR, Ref, implement};
 
@@ -37,7 +39,17 @@ pub(crate) use sources::CaptureSource;
 use sources::{OwnedHandle, RunningProcess, target_process};
 use timing::PacketClock;
 
-const POLL_INTERVAL: Duration = Duration::from_millis(4);
+/// Retained silence stops this far behind the newest frame the device could
+/// still be holding, so a packet that is being delivered is never overwritten.
+const IDLE_CUTOFF_GUARD: Duration = Duration::from_millis(4);
+/// Bounds for the timed-polling fallback, which follows the device period.
+const MIN_POLL_INTERVAL: Duration = Duration::from_millis(3);
+const MAX_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Until a stream's notification event has announced a packet, never sleep
+/// longer than this (or half the endpoint buffer, whichever is shorter).
+const MAX_UNPROVEN_WAIT: Duration = Duration::from_millis(50);
+const DEVICE_BUFFER_100NS: i64 = 1_000_000;
 const IDLE_PACKET_GAP: Duration = Duration::from_millis(200);
 const RETAINED_IDLE_INTERVAL: Duration = Duration::from_millis(20);
 const QUIET_MODE_TIMEOUT: Duration = Duration::from_millis(250);
@@ -52,6 +64,168 @@ const SUBTYPE_IEEE_FLOAT: GUID = GUID::from_u128(0x00000003_0000_0010_8000_00aa0
 
 type Reply = mpsc::SyncSender<Result<(), String>>;
 
+/// Called by the capture thread after it queued packets or reported an error,
+/// so the consumer can block instead of polling the queue.
+pub(crate) type DataWake = Arc<dyn Fn() + Send + Sync>;
+
+/// Auto-reset Win32 event that wakes the capture thread for commands.
+struct Signal(OwnedHandle);
+
+// Event handles may be signalled and waited on from any thread.
+unsafe impl Send for Signal {}
+unsafe impl Sync for Signal {}
+
+impl Signal {
+    fn new() -> Result<Self, String> {
+        unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
+            .map(|handle| Self(OwnedHandle(handle)))
+            .map_err(|error| audio_error("無法建立 WASAPI 喚醒事件", error))
+    }
+
+    fn set(&self) {
+        let _ = unsafe { SetEvent(self.0.0) };
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Woke {
+    Signal,
+    Audio,
+    Timeout,
+}
+
+/// Blocks until a command wake, the audio notification event, or the timeout.
+/// `None` waits indefinitely.
+fn wait_for(signal: &Signal, audio: Option<HANDLE>, timeout: Option<Duration>) -> Woke {
+    let milliseconds = timeout.map_or(INFINITE, |timeout| {
+        // Round up so a deadline is never serviced early and re-armed at zero.
+        timeout.as_nanos().div_ceil(1_000_000).min(u128::from(INFINITE - 1)) as u32
+    });
+    let handles = [signal.0.0, audio.unwrap_or_default()];
+    let count = if audio.is_some() { 2 } else { 1 };
+    let result = unsafe { WaitForMultipleObjects(&handles[..count], false, milliseconds) };
+    if result == WAIT_OBJECT_0 {
+        Woke::Signal
+    } else if audio.is_some() && result.0 == WAIT_OBJECT_0.0 + 1 {
+        Woke::Audio
+    } else {
+        if result != WAIT_TIMEOUT {
+            // A failed wait must not turn the capture loop into a busy spin.
+            thread::sleep(timeout.unwrap_or(MAX_POLL_INTERVAL).min(MAX_POLL_INTERVAL));
+        }
+        Woke::Timeout
+    }
+}
+
+/// Consumes a pending signal of an auto-reset event without waiting.
+fn event_is_set(event: HANDLE) -> bool {
+    unsafe { WaitForSingleObject(event, 0) == WAIT_OBJECT_0 }
+}
+
+/// Whether the stream's notification event can be relied on to announce packets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventWatch {
+    /// No packet has been announced by the event yet.
+    Unproven,
+    Trusted,
+    /// One packet arrived without its event; look again after one poll interval.
+    Suspect,
+    /// The event is absent or missed packets; use timed polling for this stream.
+    Polling,
+}
+
+impl EventWatch {
+    fn new(has_event: bool) -> Self {
+        if has_event { Self::Unproven } else { Self::Polling }
+    }
+
+    /// `by_event` is true when the event was signalled for this read, even if
+    /// that was only observed right after a timeout.
+    fn observe(&mut self, by_event: bool, had_packets: bool) {
+        *self = match (*self, by_event, had_packets) {
+            (Self::Polling, ..) => Self::Polling,
+            (_, true, true) => Self::Trusted,
+            (Self::Unproven | Self::Suspect, false, true) => Self::Polling,
+            (Self::Trusted, false, true) => Self::Suspect,
+            (Self::Suspect, false, false) => Self::Trusted,
+            (state, _, false) => state,
+        };
+    }
+
+    fn uses_event(self) -> bool {
+        self != Self::Polling
+    }
+
+    /// Longest sleep that cannot lose audio if the event stays silent.
+    fn wait_cap(self, poll_interval: Duration, unproven_wait: Duration) -> Option<Duration> {
+        match self {
+            Self::Trusted => None,
+            Self::Unproven => Some(unproven_wait),
+            Self::Suspect | Self::Polling => Some(poll_interval),
+        }
+    }
+
+    /// Longest time a delivered packet can sit unread in the endpoint buffer.
+    fn read_latency(self, poll_interval: Duration) -> Duration {
+        match self {
+            Self::Trusted => Duration::ZERO,
+            // An unproven event is assumed absent until it shows otherwise.
+            Self::Unproven | Self::Suspect | Self::Polling => poll_interval,
+        }
+    }
+}
+
+struct WaitState {
+    running: bool,
+    backlog: bool,
+    quiet_pending: bool,
+    retain_silence: bool,
+    idle_reported: bool,
+    idle_for: Duration,
+    since_padding: Duration,
+    since_source_check: Duration,
+    wait_cap: Option<Duration>,
+}
+
+/// How long the capture thread may sleep before it has work that no event
+/// announces. `None` means only a command can produce work.
+fn wait_timeout(state: &WaitState) -> Option<Duration> {
+    if !state.running {
+        return None;
+    }
+    if state.backlog {
+        return Some(Duration::ZERO);
+    }
+    let mut timeout = ENDPOINT_CHECK_INTERVAL.saturating_sub(state.since_source_check);
+    if let Some(cap) = state.wait_cap {
+        timeout = timeout.min(cap);
+    }
+    if !state.quiet_pending {
+        let until_gap = IDLE_PACKET_GAP.saturating_sub(state.idle_for);
+        if state.retain_silence {
+            let until_padding = RETAINED_IDLE_INTERVAL.saturating_sub(state.since_padding);
+            timeout = timeout.min(until_gap.max(until_padding));
+        } else if !state.idle_reported {
+            timeout = timeout.min(until_gap);
+        }
+    }
+    Some(timeout)
+}
+
+fn poll_interval(device_period_100ns: Option<i64>) -> Duration {
+    device_period_100ns
+        .filter(|&period| period > 0)
+        .map_or(DEFAULT_POLL_INTERVAL, |period| {
+            Duration::from_nanos(period as u64 * 100).clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)
+        })
+}
+
+fn unproven_wait(buffer_frames: usize, sample_rate: u32, poll_interval: Duration) -> Duration {
+    let half_buffer =
+        Duration::from_nanos(buffer_frames as u64 * 500_000_000 / u64::from(sample_rate.max(1)));
+    half_buffer.min(MAX_UNPROVEN_WAIT).max(poll_interval)
+}
+
 enum Command {
     Pause(Reply),
     Resume(Reply),
@@ -61,11 +235,13 @@ enum Command {
 
 pub(crate) struct QuietModeBarrier {
     release: Option<mpsc::SyncSender<u64>>,
+    wake: Arc<Signal>,
 }
 
 impl QuietModeBarrier {
     pub(crate) fn cancel(mut self) {
         drop(self.release.take());
+        self.wake.set();
     }
 }
 
@@ -73,6 +249,8 @@ impl Drop for QuietModeBarrier {
     fn drop(&mut self) {
         if let Some(release) = self.release.take() {
             let _ = release.send(now_ns());
+            // A paused capture thread waits without a timeout.
+            self.wake.set();
         }
     }
 }
@@ -144,18 +322,6 @@ impl QuietModeState {
     }
 }
 
-fn next_command(
-    commands: &mpsc::Receiver<Command>,
-    running: bool,
-    pending_quiet_mode: bool,
-) -> Result<Command, mpsc::RecvTimeoutError> {
-    if running || pending_quiet_mode {
-        commands.recv_timeout(POLL_INTERVAL)
-    } else {
-        commands.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
-    }
-}
-
 struct Started {
     format: Arc<Format>,
     packets: Arc<TimedAudioQueue>,
@@ -165,18 +331,31 @@ pub(crate) struct Loopback {
     pub(crate) format: Arc<Format>,
     packets: Arc<TimedAudioQueue>,
     commands: mpsc::Sender<Command>,
+    wake: Arc<Signal>,
     errors: mpsc::Receiver<String>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Loopback {
-    pub(crate) fn start(source: CaptureSource) -> Result<Self, String> {
+    /// `data_wake` runs on the capture thread after it queued packets or an error.
+    pub(crate) fn start(source: CaptureSource, data_wake: DataWake) -> Result<Self, String> {
         let (commands, command_reader) = mpsc::channel();
         let (errors_writer, errors) = mpsc::channel();
         let (startup_writer, startup) = mpsc::sync_channel(1);
+        let wake = Arc::new(Signal::new()?);
+        let thread_wake = Arc::clone(&wake);
         let worker = thread::Builder::new()
             .name("backtracking-wasapi".into())
-            .spawn(move || capture_thread(source, command_reader, startup_writer, errors_writer))
+            .spawn(move || {
+                capture_thread(
+                    source,
+                    command_reader,
+                    &thread_wake,
+                    startup_writer,
+                    errors_writer,
+                    data_wake,
+                )
+            })
             .map_err(|error| format!("無法建立 WASAPI 擷取執行緒（{error}）"))?;
 
         match startup.recv() {
@@ -184,6 +363,7 @@ impl Loopback {
                 format,
                 packets,
                 commands,
+                wake,
                 errors,
                 worker: Some(worker),
             }),
@@ -211,8 +391,12 @@ impl Loopback {
         let (release, released) = mpsc::sync_channel(1);
         self.commands.send(Command::PrepareRetainSilence(enabled, reply, released))
             .map_err(|_| "WASAPI 連線已中斷".to_string())?;
+        self.wake.set();
         match ready.recv_timeout(QUIET_MODE_TIMEOUT) {
-            Ok(Ok(())) => Ok(QuietModeBarrier { release: Some(release) }),
+            Ok(Ok(())) => Ok(QuietModeBarrier {
+                release: Some(release),
+                wake: Arc::clone(&self.wake),
+            }),
             Ok(Err(error)) => Err(error),
             Err(mpsc::RecvTimeoutError::Timeout) => Err("WASAPI 音訊來源設定更新逾時".into()),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err("WASAPI 連線已中斷".into()),
@@ -244,10 +428,11 @@ impl Loopback {
 
     fn request(&self, command: fn(Reply) -> Command) -> Result<(), String> {
         let (reply, result) = mpsc::sync_channel(1);
-        if self.commands.send(command(reply)).is_ok()
-            && let Ok(result) = result.recv()
-        {
-            return result;
+        if self.commands.send(command(reply)).is_ok() {
+            self.wake.set();
+            if let Ok(result) = result.recv() {
+                return result;
+            }
         }
         Err(self
             .take_error()
@@ -258,6 +443,7 @@ impl Loopback {
 impl Drop for Loopback {
     fn drop(&mut self) {
         let _ = self.commands.send(Command::Shutdown);
+        self.wake.set();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -272,8 +458,10 @@ pub(crate) fn resolved_process_id_for_test(path: &str) -> Result<u32, String> {
 fn capture_thread(
     source: CaptureSource,
     commands: mpsc::Receiver<Command>,
+    wake: &Signal,
     startup: mpsc::SyncSender<Result<Started, String>>,
     errors: mpsc::Sender<String>,
+    data_wake: DataWake,
 ) {
     let mut stream = match WasapiStream::open(source) {
         Ok(stream) => stream,
@@ -295,22 +483,93 @@ fn capture_thread(
     let mut last_source_check = last_packet;
     let mut quiet_mode = QuietModeState::default();
     let mut last_padding_attempt = last_packet;
+    let mut watch = EventWatch::new(stream.audio_event.is_some());
+    let report = |error: String| {
+        let _ = errors.send(error);
+        data_wake();
+    };
     loop {
         if let Some((enabled, since_ns)) = quiet_mode.poll_release() {
             stream.clock.set_retain_silence(enabled, since_ns);
             last_padding_attempt = Instant::now();
         }
-        let command = next_command(&commands, running, quiet_mode.pending.is_some());
-        if let Some((enabled, since_ns)) = quiet_mode.poll_release() {
-            stream.clock.set_retain_silence(enabled, since_ns);
-            last_padding_attempt = Instant::now();
-        }
+        // Commands are taken before every wait; the wake signal only ends a wait.
+        let command = match commands.try_recv() {
+            Ok(command) => command,
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {
+                let timeout = wait_timeout(&WaitState {
+                    running,
+                    backlog: stream.backlog,
+                    quiet_pending: quiet_mode.pending.is_some(),
+                    retain_silence: quiet_mode.retain_silence,
+                    idle_reported: quiet_mode.idle_reported,
+                    idle_for: last_packet.elapsed(),
+                    since_padding: last_padding_attempt.elapsed(),
+                    since_source_check: last_source_check.elapsed(),
+                    wait_cap: watch.wait_cap(stream.poll_interval, stream.unproven_wait),
+                });
+                let audio_event = stream
+                    .audio_event
+                    .as_ref()
+                    .filter(|_| running && watch.uses_event())
+                    .map(|event| event.0);
+                let woke = wait_for(wake, audio_event, timeout);
+                if woke == Woke::Signal || !running {
+                    continue;
+                }
+                if let Some((enabled, since_ns)) = quiet_mode.poll_release() {
+                    stream.clock.set_retain_silence(enabled, since_ns);
+                    last_padding_attempt = Instant::now();
+                }
+                if last_source_check.elapsed() >= ENDPOINT_CHECK_INTERVAL {
+                    last_source_check = Instant::now();
+                    if let Err(error) = stream.verify_source() {
+                        report(error);
+                        break;
+                    }
+                }
+                let read = stream.read_packets();
+                if let Ok(had_packets) = read {
+                    // An event that fires between the timeout and this read was on time.
+                    let by_event = woke == Woke::Audio
+                        || (had_packets && audio_event.is_some_and(event_is_set));
+                    watch.observe(by_event, had_packets);
+                }
+                match read {
+                    Ok(true) => {
+                        last_packet = Instant::now();
+                        quiet_mode.note_real_packet();
+                        data_wake();
+                    }
+                    Ok(false) if quiet_mode.should_emit_retained(last_packet.elapsed(), last_padding_attempt.elapsed()) => {
+                        last_padding_attempt = Instant::now();
+                        let guard = IDLE_CUTOFF_GUARD.max(watch.read_latency(stream.poll_interval));
+                        if stream.push_retained_idle_silence(guard) {
+                            quiet_mode.note_synthetic_packet();
+                            data_wake();
+                        }
+                    }
+                    Ok(false) if quiet_mode.should_emit_tail(last_packet.elapsed()) => {
+                        stream.push_idle_silence();
+                        quiet_mode.note_synthetic_packet();
+                        data_wake();
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        report(error);
+                        break;
+                    }
+                }
+                continue;
+            }
+        };
         match command {
-            Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Ok(Command::PrepareRetainSilence(enabled, reply, release)) => {
+            Command::Shutdown => break,
+            Command::PrepareRetainSilence(enabled, reply, release) => {
                 quiet_mode.prepare(enabled, reply, release);
             }
-            Ok(Command::Pause(reply)) => {
+            Command::Pause(reply) => {
                 let result = if running { stream.pause() } else { Ok(()) };
                 let failed = result.is_err();
                 let _ = reply.send(result);
@@ -319,7 +578,7 @@ fn capture_thread(
                 }
                 running = false;
             }
-            Ok(Command::Resume(reply)) => {
+            Command::Resume(reply) => {
                 let result = if running {
                     Ok(())
                 } else {
@@ -335,37 +594,6 @@ fn capture_thread(
                 last_source_check = last_packet;
                 last_padding_attempt = last_packet;
                 quiet_mode.restore_after_resume(&mut stream.clock, now_ns());
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) if !running => {}
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if last_source_check.elapsed() >= ENDPOINT_CHECK_INTERVAL {
-                    last_source_check = Instant::now();
-                    if let Err(error) = stream.verify_source() {
-                        let _ = errors.send(error);
-                        break;
-                    }
-                }
-                match stream.read_packets() {
-                    Ok(true) => {
-                        last_packet = Instant::now();
-                        quiet_mode.note_real_packet();
-                    }
-                    Ok(false) if quiet_mode.should_emit_retained(last_packet.elapsed(), last_padding_attempt.elapsed()) => {
-                        last_padding_attempt = Instant::now();
-                        if stream.push_retained_idle_silence() {
-                            quiet_mode.note_synthetic_packet();
-                        }
-                    }
-                    Ok(false) if quiet_mode.should_emit_tail(last_packet.elapsed()) => {
-                        stream.push_idle_silence();
-                        quiet_mode.note_synthetic_packet();
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        let _ = errors.send(error);
-                        break;
-                    }
-                }
             }
         }
     }
@@ -421,8 +649,13 @@ struct WasapiStream {
     scratch: Vec<f32>,
     clock: PacketClock,
     queue_loss: bool,
+    /// More packets were waiting when the last read reached its per-pass limit.
+    backlog: bool,
+    /// Timed-polling interval for streams whose event is absent or unreliable.
+    poll_interval: Duration,
+    unproven_wait: Duration,
     // COM clients are dropped before the event handle and COM apartment.
-    _event: Option<OwnedHandle>,
+    audio_event: Option<OwnedHandle>,
     _apartment: Apartment,
 }
 
@@ -469,26 +702,8 @@ impl WasapiStream {
                     CaptureSource::Microphone { id, .. } => SourceBinding::Microphone(id),
                     CaptureSource::Application { .. } | CaptureSource::Sender { .. } => unreachable!(),
                 };
-                let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
-                    .map_err(|error| audio_error("無法開啟已選取的音訊來源", error))?;
-                let native = unsafe { client.GetMixFormat() }
-                    .map_err(|error| audio_error("無法讀取來源格式", error))?;
-                let native = MixFormat(NonNull::new(native).ok_or("WASAPI 未提供有效的來源格式")?);
-                let format = unsafe { Format::parse(native.0) }?;
-                unsafe {
-                    client.Initialize(
-                        AUDCLNT_SHAREMODE_SHARED,
-                        flags,
-                        1_000_000,
-                        0,
-                        native.0.as_ptr(),
-                        None,
-                    )
-                }
-                .map_err(|error| {
-                    audio_error("無法初始化 WASAPI 音訊擷取，請檢查裝置和麥克風權限", error)
-                })?;
-                (client, format, binding, Some(enumerator), None)
+                let (client, format, event) = open_device_client(&device, flags)?;
+                (client, format, binding, Some(enumerator), event)
             }
         };
 
@@ -500,6 +715,13 @@ impl WasapiStream {
         if packet_capacity == 0 || packet_capacity > format.sample_rate as usize * 4 {
             return Err("WASAPI 回傳不支援的緩衝區大小".into());
         }
+        let mut device_period = 0;
+        let poll_interval = poll_interval(
+            unsafe { client.GetDevicePeriod(Some(&mut device_period), None) }
+                .ok()
+                .map(|()| device_period),
+        );
+        let unproven_wait = unproven_wait(packet_capacity, format.sample_rate, poll_interval);
         // Short device periods can produce many packets before filling the audio ring.
         let packets = TimedAudioQueue::new(
             format.sample_rate as usize,
@@ -520,7 +742,10 @@ impl WasapiStream {
             scratch,
             clock,
             queue_loss: false,
-            _event: event,
+            backlog: false,
+            poll_interval,
+            unproven_wait,
+            audio_event: event,
             _apartment: apartment,
         };
         stream.start()?;
@@ -530,6 +755,11 @@ impl WasapiStream {
     fn start(&mut self) -> Result<(), String> {
         self.clock = PacketClock::new(self.format.sample_rate);
         self.queue_loss = false;
+        self.backlog = false;
+        if let Some(event) = &self.audio_event {
+            // WASAPI expects the notification event to be nonsignaled at Start.
+            let _ = unsafe { ResetEvent(event.0) };
+        }
         unsafe { self.client.Start() }.map_err(|error| audio_error("無法開始擷取音訊", error))
     }
 
@@ -585,10 +815,14 @@ impl WasapiStream {
 
     fn read_packets(&mut self) -> Result<bool, String> {
         let mut had_packet = false;
+        // The notification event fires once per device period, so a pass that
+        // stops at its limit must be continued without waiting for the next one.
+        self.backlog = true;
         for _ in 0..64 {
             let next = unsafe { self.capture.GetNextPacketSize() }
                 .map_err(|error| audio_error("無法讀取音訊封包", error))?;
             if next == 0 {
+                self.backlog = false;
                 break;
             }
 
@@ -608,6 +842,7 @@ impl WasapiStream {
             }
             .map_err(|error| audio_error("無法取出音訊封包", error))?;
             if frames == 0 {
+                self.backlog = false;
                 break;
             }
 
@@ -679,13 +914,13 @@ impl WasapiStream {
         }
     }
 
-    fn push_retained_idle_silence(&mut self) -> bool {
+    fn push_retained_idle_silence(&mut self, guard: Duration) -> bool {
         let max_frames = self.format.sample_rate.div_ceil(5) as usize;
         // GetBuffer timestamps refer to each packet's first frame. Leave a
-        // complete device buffer plus one poll in flight rather than replacing
+        // complete device buffer plus one read in flight rather than replacing
         // samples that the engine has not made available yet with virtual zeroes.
         let until_ns = self.clock.idle_cutoff_ns(now_ns(), self.packet_capacity,
-            POLL_INTERVAL.as_nanos() as u64);
+            guard.as_nanos() as u64);
         let Some((stamp, frames)) = self.clock.retained_idle_stamp(until_ns, max_frames) else {
             return false;
         };
@@ -807,6 +1042,63 @@ fn activate_process(pid: u32) -> Result<IAudioClient, String> {
         .ok_or_else(|| "Windows 未提供應用程式音訊介面".to_owned())?
         .cast()
         .map_err(|error| audio_error("應用程式音訊介面不支援 WASAPI", error))
+}
+
+/// Opens a shared-mode device stream, preferring event-driven delivery and
+/// falling back to a stream that is read on a timer.
+fn open_device_client(
+    device: &IMMDevice,
+    flags: u32,
+) -> Result<(IAudioClient, Format, Option<OwnedHandle>), String> {
+    let loopback = flags & AUDCLNT_STREAMFLAGS_LOOPBACK != 0;
+    // Keep today's 100 ms endpoint buffer first. Microsoft documents a zero
+    // duration for event-driven shared streams, so try that before giving up
+    // on events. A client whose Initialize failed cannot be reused.
+    let attempts: &[(bool, i64)] = if !loopback || sources::supports_event_loopback() {
+        &[(true, DEVICE_BUFFER_100NS), (true, 0), (false, DEVICE_BUFFER_100NS)]
+    } else {
+        &[(false, DEVICE_BUFFER_100NS)]
+    };
+    let mut last_error = None;
+    for &(with_event, buffer_100ns) in attempts {
+        let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
+            .map_err(|error| audio_error("無法開啟已選取的音訊來源", error))?;
+        let native = unsafe { client.GetMixFormat() }
+            .map_err(|error| audio_error("無法讀取來源格式", error))?;
+        let native = MixFormat(NonNull::new(native).ok_or("WASAPI 未提供有效的來源格式")?);
+        let format = unsafe { Format::parse(native.0) }?;
+        let stream_flags = if with_event {
+            flags | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+        } else {
+            flags
+        };
+        if let Err(error) = unsafe {
+            client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                stream_flags,
+                buffer_100ns,
+                0,
+                native.0.as_ptr(),
+                None,
+            )
+        } {
+            last_error = Some(error);
+            continue;
+        }
+        if !with_event {
+            return Ok((client, format, None));
+        }
+        if let Ok(event) = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
+            .map(OwnedHandle)
+            && unsafe { client.SetEventHandle(event.0) }.is_ok()
+        {
+            return Ok((client, format, Some(event)));
+        }
+    }
+    Err(audio_error(
+        "無法初始化 WASAPI 音訊擷取，請檢查裝置和麥克風權限",
+        last_error.expect("the timed attempt only ends by returning or failing Initialize"),
+    ))
 }
 
 fn open_process_client(pid: u32) -> Result<(IAudioClient, Format, OwnedHandle), String> {
@@ -1150,7 +1442,197 @@ mod tests {
         let (release, released) = mpsc::sync_channel(1);
         state.prepare(enabled, reply, released);
         assert!(matches!(ready.try_recv(), Ok(Ok(()))));
-        QuietModeBarrier { release: Some(release) }
+        QuietModeBarrier { release: Some(release), wake: Arc::new(Signal::new().unwrap()) }
+    }
+
+    fn waiting(state: impl FnOnce(&mut WaitState)) -> Option<Duration> {
+        let mut inputs = WaitState {
+            running: true,
+            backlog: false,
+            quiet_pending: false,
+            retain_silence: false,
+            idle_reported: true,
+            idle_for: Duration::from_secs(60),
+            since_padding: Duration::from_secs(60),
+            since_source_check: Duration::ZERO,
+            wait_cap: None,
+        };
+        state(&mut inputs);
+        wait_timeout(&inputs)
+    }
+
+    #[test]
+    fn an_idle_event_driven_stream_sleeps_until_the_next_endpoint_check() {
+        assert_eq!(waiting(|_| {}), Some(ENDPOINT_CHECK_INTERVAL));
+        assert_eq!(
+            waiting(|state| state.since_source_check = Duration::from_millis(1_500)),
+            Some(Duration::from_millis(500)),
+        );
+        assert_eq!(
+            waiting(|state| state.since_source_check = Duration::from_secs(9)),
+            Some(Duration::ZERO),
+        );
+    }
+
+    #[test]
+    fn a_paused_stream_waits_only_for_commands() {
+        assert_eq!(waiting(|state| state.running = false), None);
+        assert_eq!(
+            waiting(|state| {
+                state.running = false;
+                state.backlog = true;
+                state.quiet_pending = true;
+                state.wait_cap = Some(Duration::from_millis(10));
+            }),
+            None,
+        );
+    }
+
+    #[test]
+    fn the_wait_ends_when_the_silence_tail_or_retained_padding_is_due() {
+        let tail = |idle_ms| {
+            waiting(|state| {
+                state.idle_reported = false;
+                state.idle_for = Duration::from_millis(idle_ms);
+            })
+        };
+        assert_eq!(tail(0), Some(IDLE_PACKET_GAP));
+        assert_eq!(tail(150), Some(Duration::from_millis(50)));
+        assert_eq!(tail(900), Some(Duration::ZERO));
+
+        let retained = |idle_ms, padding_ms| {
+            waiting(|state| {
+                state.retain_silence = true;
+                state.idle_for = Duration::from_millis(idle_ms);
+                state.since_padding = Duration::from_millis(padding_ms);
+            })
+        };
+        // Padding starts after the gap and then repeats at its own interval.
+        assert_eq!(retained(50, 50), Some(Duration::from_millis(150)));
+        assert_eq!(retained(5_000, 0), Some(RETAINED_IDLE_INTERVAL));
+        assert_eq!(retained(5_000, 15), Some(Duration::from_millis(5)));
+        assert_eq!(retained(5_000, 500), Some(Duration::ZERO));
+        // Each due state is one that the capture loop services and re-arms.
+        let state = QuietModeState { retain_silence: true, ..Default::default() };
+        assert!(state.should_emit_retained(Duration::from_secs(5), Duration::from_millis(500)));
+        assert!(QuietModeState::default().should_emit_tail(Duration::from_millis(900)));
+    }
+
+    #[test]
+    fn a_pending_quiet_change_and_a_reported_idle_tail_schedule_no_padding() {
+        let frozen = waiting(|state| {
+            state.quiet_pending = true;
+            state.idle_reported = false;
+            state.retain_silence = true;
+        });
+        assert_eq!(frozen, Some(ENDPOINT_CHECK_INTERVAL));
+        assert_eq!(waiting(|state| state.idle_reported = true), Some(ENDPOINT_CHECK_INTERVAL));
+    }
+
+    #[test]
+    fn polling_caps_and_backlogs_shorten_the_wait() {
+        let capped = waiting(|state| state.wait_cap = Some(Duration::from_millis(10)));
+        assert_eq!(capped, Some(Duration::from_millis(10)));
+        assert_eq!(
+            waiting(|state| {
+                state.wait_cap = Some(Duration::from_millis(10));
+                state.idle_reported = false;
+                state.idle_for = Duration::from_millis(197);
+            }),
+            Some(Duration::from_millis(3)),
+        );
+        assert_eq!(waiting(|state| state.backlog = true), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn the_polling_interval_follows_the_device_period_within_bounds() {
+        assert_eq!(poll_interval(Some(100_000)), Duration::from_millis(10));
+        assert_eq!(poll_interval(Some(26_667)), MIN_POLL_INTERVAL);
+        assert_eq!(poll_interval(Some(53_333)), Duration::from_nanos(5_333_300));
+        assert_eq!(poll_interval(Some(1_000_000)), MAX_POLL_INTERVAL);
+        assert_eq!(poll_interval(Some(0)), DEFAULT_POLL_INTERVAL);
+        assert_eq!(poll_interval(Some(-1)), DEFAULT_POLL_INTERVAL);
+        assert_eq!(poll_interval(None), DEFAULT_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn an_unproven_event_never_waits_longer_than_half_the_endpoint_buffer() {
+        let poll = Duration::from_millis(10);
+        assert_eq!(unproven_wait(4_800, 48_000, poll), Duration::from_millis(50));
+        assert_eq!(unproven_wait(48_000, 48_000, poll), MAX_UNPROVEN_WAIT);
+        assert_eq!(unproven_wait(1_056, 48_000, poll), Duration::from_millis(11));
+        // A tiny buffer cannot be read more often than the polling fallback would.
+        assert_eq!(unproven_wait(480, 48_000, poll), poll);
+    }
+
+    #[test]
+    fn the_event_watch_trusts_events_only_after_they_announce_a_packet() {
+        let poll = Duration::from_millis(10);
+        let unproven = Duration::from_millis(50);
+        let mut watch = EventWatch::new(true);
+        assert_eq!(watch.wait_cap(poll, unproven), Some(unproven));
+        assert!(watch.uses_event());
+        // Timeouts and empty event wakes prove nothing either way.
+        watch.observe(false, false);
+        watch.observe(true, false);
+        assert_eq!(watch, EventWatch::Unproven);
+        watch.observe(true, true);
+        assert_eq!(watch, EventWatch::Trusted);
+        assert_eq!(watch.wait_cap(poll, unproven), None);
+        assert_eq!(watch.read_latency(poll), Duration::ZERO);
+    }
+
+    #[test]
+    fn packets_that_arrive_without_their_event_switch_the_stream_to_polling() {
+        let poll = Duration::from_millis(10);
+        let unproven = Duration::from_millis(50);
+        let mut never_signalled = EventWatch::new(true);
+        never_signalled.observe(false, true);
+        assert_eq!(never_signalled, EventWatch::Polling);
+
+        let mut watch = EventWatch::Trusted;
+        watch.observe(false, true);
+        assert_eq!(watch, EventWatch::Suspect);
+        assert_eq!(watch.wait_cap(poll, unproven), Some(poll));
+        // One isolated miss followed by a quiet poll is forgiven.
+        watch.observe(false, false);
+        assert_eq!(watch, EventWatch::Trusted);
+        watch.observe(false, true);
+        watch.observe(true, true);
+        assert_eq!(watch, EventWatch::Trusted);
+        // Two consecutive misses are not.
+        watch.observe(false, true);
+        watch.observe(false, true);
+        assert_eq!(watch, EventWatch::Polling);
+        assert!(!watch.uses_event());
+        assert_eq!(watch.wait_cap(poll, unproven), Some(poll));
+        assert_eq!(watch.read_latency(poll), poll);
+        for (by_event, had_packets) in [(true, true), (true, false), (false, false)] {
+            watch.observe(by_event, had_packets);
+            assert_eq!(watch, EventWatch::Polling);
+        }
+        assert_eq!(EventWatch::new(false), EventWatch::Polling);
+    }
+
+    #[test]
+    fn the_capture_wait_reports_which_object_ended_it() {
+        let signal = Signal::new().unwrap();
+        let audio = Signal::new().unwrap();
+        let audio_handle = Some(audio.0.0);
+        let brief = Some(Duration::from_millis(1));
+        assert_eq!(wait_for(&signal, audio_handle, brief), Woke::Timeout);
+        audio.set();
+        assert_eq!(wait_for(&signal, audio_handle, None), Woke::Audio);
+        // Auto-reset: the audio event was consumed by the wait it ended.
+        assert!(!event_is_set(audio.0.0));
+        audio.set();
+        signal.set();
+        // A command wake wins and leaves the audio event signalled for the next wait.
+        assert_eq!(wait_for(&signal, audio_handle, None), Woke::Signal);
+        assert_eq!(wait_for(&signal, audio_handle, brief), Woke::Audio);
+        signal.set();
+        assert_eq!(wait_for(&signal, None, None), Woke::Signal);
+        assert_eq!(wait_for(&signal, None, Some(Duration::ZERO)), Woke::Timeout);
     }
 
     fn commit_mode_at(mut barrier: QuietModeBarrier, since_ns: u64) {
@@ -1201,24 +1683,41 @@ mod tests {
         let (reply, ready) = mpsc::sync_channel(1);
         let (release, released) = mpsc::sync_channel(1);
         let (done, finished) = mpsc::channel();
+        let wake = Arc::new(Signal::new().unwrap());
+        let thread_wake = Arc::clone(&wake);
         let worker = thread::spawn(move || {
             let mut state = QuietModeState::default();
             state.prepare(true, reply, released);
             loop {
-                if matches!(next_command(&receiver, false, state.pending.is_some()),
-                    Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected)) {
-                    break;
-                }
                 if let Some((enabled, _)) = state.poll_release() {
                     let _ = done.send(enabled && state.pending.is_none());
                     break;
                 }
+                if matches!(receiver.try_recv(),
+                    Ok(Command::Shutdown) | Err(mpsc::TryRecvError::Disconnected)) {
+                    break;
+                }
+                // A paused stream has no timeout: only the barrier can end this wait.
+                let paused = wait_timeout(&WaitState {
+                    running: false,
+                    backlog: false,
+                    quiet_pending: state.pending.is_some(),
+                    retain_silence: state.retain_silence,
+                    idle_reported: state.idle_reported,
+                    idle_for: Duration::ZERO,
+                    since_padding: Duration::ZERO,
+                    since_source_check: Duration::ZERO,
+                    wait_cap: None,
+                });
+                assert_eq!(paused, None);
+                wait_for(&thread_wake, None, paused);
             }
         });
         assert!(matches!(ready.recv(), Ok(Ok(()))));
-        drop(QuietModeBarrier { release: Some(release) });
-        let completed_without_wake = finished.recv_timeout(Duration::from_millis(100));
+        drop(QuietModeBarrier { release: Some(release), wake: Arc::clone(&wake) });
+        let completed_without_wake = finished.recv_timeout(Duration::from_secs(2));
         let _ = commands.send(Command::Shutdown);
+        wake.set();
         worker.join().unwrap();
         assert!(matches!(completed_without_wake, Ok(true)));
     }
@@ -1231,6 +1730,7 @@ mod tests {
             format: Arc::new(native_format(2, 1 | 2)),
             packets: TimedAudioQueue::new(48_000, PACKET_QUEUE_CAPACITY, 2),
             commands,
+            wake: Arc::new(Signal::new().unwrap()),
             errors,
             worker: None,
         };
@@ -1257,7 +1757,7 @@ mod tests {
         clock.set_retain_silence(enabled, since_ns);
         clock.timestamp(0, 480, Some(start), false, || unreachable!());
         let now = start + 1_000_000_000;
-        let cutoff = clock.idle_cutoff_ns(now, 4_800, POLL_INTERVAL.as_nanos() as u64);
+        let cutoff = clock.idle_cutoff_ns(now, 4_800, IDLE_CUTOFF_GUARD.as_nanos() as u64);
         while clock.retained_idle_stamp(cutoff, 9_600).is_some() {
             state.note_synthetic_packet();
         }
@@ -1299,7 +1799,7 @@ mod tests {
         let first = clock.timestamp(0, 480, Some(start), false, || unreachable!());
         capture.push_native_interleaved(first.timestamp_ns, &[0.5; 480], first.discontinuity).unwrap();
         let now = start + 1_000_000_000;
-        let cutoff = clock.idle_cutoff_ns(now, 4_800, POLL_INTERVAL.as_nanos() as u64);
+        let cutoff = clock.idle_cutoff_ns(now, 4_800, IDLE_CUTOFF_GUARD.as_nanos() as u64);
         while let Some((stamp, frames)) = clock.retained_idle_stamp(cutoff, 9_600) {
             assert!(!stamp.discontinuity);
             capture.push_native_interleaved(stamp.timestamp_ns, &vec![0.; frames], stamp.discontinuity).unwrap();

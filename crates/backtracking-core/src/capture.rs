@@ -1,3 +1,4 @@
+mod frozen;
 mod history;
 
 use std::collections::VecDeque;
@@ -6,7 +7,8 @@ use std::{error::Error, fmt, ops::Range};
 
 use crate::meter::{Meter, MeterReadings};
 use crate::waveform::WaveformView;
-use history::History;
+pub use frozen::{FrozenCapture, FrozenTrack};
+use history::{History, Layout};
 
 const OPEN_LEVEL: f32 = 0.001;
 const CLOSE_LEVEL: f32 = 0.000_5;
@@ -169,7 +171,9 @@ impl JoinFade {
                 wait_for_signal,
             } => {
                 if fade_tail {
-                    history.fade_out_tail(fade_frames);
+                    // Nothing has changed yet if a shared page could not be copied,
+                    // so the fade is tried again with the next frame.
+                    history.fade_out_tail(fade_frames)?;
                 }
                 if wait_for_signal && frame.iter().all(|&sample| sample == 0.0) {
                     // A gap's synthetic pre-roll must not use up the fade-in.
@@ -596,6 +600,35 @@ impl Capture {
         }
     }
 
+    /// Pins all retained audio as it is now. The view shares the capture's complete
+    /// one-second pages, so it costs a pointer per retained second and a copy of at
+    /// most the one page still being written. Audio pushed, faded, trimmed or cleared
+    /// afterwards never changes it: the capture copies a page the view holds before
+    /// writing to it, and leaves pages that roll out of the history to the view.
+    pub fn freeze(&self) -> FrozenCapture {
+        let frames = self.frame_range();
+        FrozenCapture::new(
+            self.sample_rate,
+            self.history.layout(),
+            self.history.share(&frames),
+            frames,
+        )
+    }
+
+    /// Pins only the requested retained frames, preserving their absolute position.
+    pub fn freeze_range(&self, frames: Range<u64>) -> Option<FrozenCapture> {
+        let retained = self.frame_range();
+        if frames.start < retained.start || frames.end > retained.end || frames.end < frames.start {
+            return None;
+        }
+        Some(FrozenCapture::new(
+            self.sample_rate,
+            self.history.layout(),
+            self.history.share(&frames),
+            frames,
+        ))
+    }
+
     pub fn track_snapshot(&self, lane: usize) -> Option<Snapshot> {
         self.track_snapshot_range(lane, self.frame_range())
     }
@@ -660,7 +693,7 @@ impl Capture {
         }
         let retained = self.frame_range();
         let range = range.start.max(retained.start)..range.end.min(retained.end);
-        self.waveform_for(1 + lane * 3 + view as usize, range, minimum, maximum)
+        self.waveform_for(Layout::trace(lane, view), range, minimum, maximum)
     }
 
     fn waveform_for(
@@ -670,26 +703,9 @@ impl Capture {
         minimum: &mut [f32],
         maximum: &mut [f32],
     ) -> usize {
-        minimum.fill(0.0);
-        maximum.fill(0.0);
-        let bin_count = minimum.len().min(maximum.len());
-        let frame_count = range.end.saturating_sub(range.start) as usize;
-        if frame_count == 0 || bin_count == 0 {
-            return frame_count;
-        }
-
-        let frame_for_bin =
-            |bin| range.start + (bin as u128 * frame_count as u128 / bin_count as u128) as u64;
-
-        for bin in 0..bin_count {
-            let start = frame_for_bin(bin);
-            // When there are more bins than frames, repeat the mapped frame.
-            let end = frame_for_bin(bin + 1).max(start + 1);
-            let (low, high) = self.history.extrema(trace, start..end);
-            minimum[bin] = low;
-            maximum[bin] = high;
-        }
-        frame_count
+        waveform_bins(range, minimum, maximum, |frames| {
+            self.history.extrema(trace, frames)
+        })
     }
 
     pub fn set_retention(&mut self, retention: DurationChoice) {
@@ -724,6 +740,35 @@ impl Capture {
             self.state = CaptureState::Waiting;
         }
     }
+}
+
+/// Writes one pair of extrema per chronological bin of `range` and returns its frame count.
+fn waveform_bins(
+    range: Range<u64>,
+    minimum: &mut [f32],
+    maximum: &mut [f32],
+    extrema: impl Fn(Range<u64>) -> (f32, f32),
+) -> usize {
+    minimum.fill(0.0);
+    maximum.fill(0.0);
+    let bin_count = minimum.len().min(maximum.len());
+    let frame_count = range.end.saturating_sub(range.start) as usize;
+    if frame_count == 0 || bin_count == 0 {
+        return frame_count;
+    }
+
+    let frame_for_bin =
+        |bin| range.start + (bin as u128 * frame_count as u128 / bin_count as u128) as u64;
+
+    for bin in 0..bin_count {
+        let start = frame_for_bin(bin);
+        // When there are more bins than frames, repeat the mapped frame.
+        let end = frame_for_bin(bin + 1).max(start + 1);
+        let (low, high) = extrema(start..end);
+        minimum[bin] = low;
+        maximum[bin] = high;
+    }
+    frame_count
 }
 
 struct FrameRing {

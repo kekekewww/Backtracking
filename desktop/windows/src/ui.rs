@@ -7,6 +7,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::context_menu::{self, WindowCommand};
 use crate::controller::{CaptureSource, Controller, EditSnapshot, SourceSettings};
 use crate::file_drag;
 use crate::preferences::{
@@ -19,8 +20,15 @@ use crate::tray::{self, Tray};
 use crate::updater::UpdateOptions;
 use crate::window_order;
 use backtracking_core::{
-    AutoResumeDelay, ChannelRoute, DurationChoice, MeterReadings, Snapshot, WavExportProfile,
-    WavSampleFormat, WaveformView, export_routed_tracks_with_profile, waveform,
+    AutoResumeDelay, ChannelRoute, DurationChoice, FrozenTrack, MeterReadings, WavExportProfile,
+    WaveformView, export_routed_tracks_with_profile, waveform,
+};
+use backtracking_ui::{
+    CENTER_LINE, FlagReach, LoneSample, PLOT_BACKGROUND, RECORDING_DIM, RECORDING_LIT,
+    TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES, accent_color,
+    combo_popup_height, fit_frame_range, flag_handle_at, icon_button, meter_number, muted_accent,
+    paint_guide_lines, paint_transport_glyph, paint_waveform_trace, selected_waveform_color,
+    status_led, waveform_press,
 };
 use eframe::egui::{
     self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection, Stroke, Vec2,
@@ -42,22 +50,116 @@ use winit::{
 };
 
 const DEFAULT_BINS: usize = 384;
+/// How often the window looks at work that only reports progress when asked.
 const REFRESH: Duration = Duration::from_millis(80);
+/// Frame interval while a drag, gesture, export or pending reply is in progress.
+/// It is also the shortest wait the window ever asks for.
+const BUSY_REFRESH: Duration = Duration::from_millis(16);
+/// The capture worker announces new audio every 80 ms. The waveform may be
+/// redrawn slightly sooner, so that timer jitter never skips an announcement.
+const WAVEFORM_REFRESH: Duration = Duration::from_millis(70);
+/// A meter reads silence 400 ms after its last input, which nothing announces.
+const METER_STALE_CHECK: Duration = Duration::from_millis(420);
+/// The waveform is drawn finer for this long after the last interaction.
+const FINE_EDIT_SETTLE: Duration = Duration::from_millis(250);
+/// With nothing to wait for, the window still looks at everything this often,
+/// which bounds the cost of any wake-up that was missed.
+const SAFETY_TICK: Duration = Duration::from_secs(2);
 const PIN_RETRY: Duration = Duration::from_millis(320);
 const WINDOW_POSITION_SAVE_DELAY: Duration = Duration::from_millis(250);
+/// A retry that keeps failing, or a rescan that cannot run, never repeats faster.
+const RETRY_FLOOR: Duration = Duration::from_millis(250);
+
+/// What the window is waiting for that neither an input event, the capture
+/// worker nor another thread's repaint request will announce.
+#[derive(Clone, Debug, Default)]
+struct Waits {
+    /// The window is hidden or minimized, so nothing on screen can change.
+    hidden: bool,
+    /// A drag, gesture, export or reply that is checked every frame.
+    busy: bool,
+    /// A background job that is only checked for completion.
+    polling: bool,
+    tray_retry: Option<Duration>,
+    position_save: Option<Duration>,
+    /// Time left before a paused capture resumes by itself.
+    auto_resume: Option<Duration>,
+    /// The "resumes in N s" text is on screen or one hover away.
+    countdown_shown: bool,
+    /// Seconds into the recording blink, while the LED is shown.
+    blink: Option<f64>,
+    meters_live: bool,
+    /// Time since the last interaction, while the waveform is still drawn finer.
+    fine_edit: Option<Duration>,
+    /// Time until newer audio than the waveform shows may be drawn.
+    waveform: Option<Duration>,
+    /// Time until the Options window rescans what it lists.
+    options_scan: Option<Duration>,
+}
+
+/// Time until the "resumes in N s" countdown shows a different number.
+fn countdown_tick(remaining: Duration) -> Duration {
+    let part = Duration::from_nanos(u64::from(remaining.subsec_nanos()));
+    // The label rounds up, so a whole number of seconds is already showing.
+    let next = if part.is_zero() { Duration::from_secs(1) } else { part };
+    next.min(remaining) + Duration::from_millis(2)
+}
+
+/// Time until the recording LED, lit for the first half of each second, changes.
+fn blink_tick(seconds: f64) -> Duration {
+    let into_half = seconds.max(0.0).rem_euclid(0.5);
+    Duration::from_secs_f64(0.5 - into_half) + Duration::from_millis(2)
+}
+
+/// How long the window may sleep before it must run again without being asked.
+fn next_wake(waits: &Waits) -> Duration {
+    let mut wake = SAFETY_TICK;
+    let mut by = |delay: Option<Duration>| {
+        if let Some(delay) = delay {
+            wake = wake.min(delay);
+        }
+    };
+    by(waits.busy.then_some(BUSY_REFRESH));
+    by(waits.polling.then_some(REFRESH));
+    by(waits.tray_retry.map(|retry| retry.max(RETRY_FLOOR)));
+    by(waits.position_save);
+    // Without the countdown on screen, only the resume itself needs a wake-up.
+    by(waits.auto_resume.map(|remaining| {
+        if waits.countdown_shown && !waits.hidden {
+            countdown_tick(remaining)
+        } else {
+            remaining
+        }
+    }));
+    if !waits.hidden {
+        by(waits.blink.map(blink_tick));
+        by(waits.meters_live.then_some(METER_STALE_CHECK));
+        by(waits.fine_edit.map(|since| {
+            FINE_EDIT_SETTLE.saturating_sub(since) + Duration::from_millis(1)
+        }));
+        by(waits.waveform);
+        by(waits.options_scan.map(|scan| scan.max(RETRY_FLOOR)));
+    }
+    wake.max(BUSY_REFRESH)
+}
 const TRANSPARENCIES: [u8; 5] = [0, 25, 50, 75, 100];
-const WAV_SAMPLE_RATES: [(u32, &str); 3] =
-    [(44_100, "44.1 kHz"), (48_000, "48 kHz"), (96_000, "96 kHz")];
-const WAV_SAMPLE_FORMATS: [(WavSampleFormat, &str); 3] = [
-    (WavSampleFormat::Pcm16, "16-bit PCM"),
-    (WavSampleFormat::Pcm24, "24-bit PCM"),
-    (WavSampleFormat::Float32, "32-bit float"),
-];
-const RECORDING_LIT: Color32 = Color32::from_rgb(249, 78, 88);
-const RECORDING_DIM: Color32 = Color32::from_rgb(103, 44, 48);
+/// The space between two rows of an open Options drop-down.
+const OPTIONS_MENU_ROW_GAP: f32 = 4.0;
 const WAITING_LED: Color32 = Color32::from_rgb(76, 86, 88);
 const PAUSED_LED: Color32 = Color32::from_rgb(54, 57, 60);
 const ERROR_LED: Color32 = Color32::from_rgb(246, 196, 118);
+// The toolbar's paused and waiting LEDs are too dark to read on the bare waveform.
+const COMPACT_PAUSED: Color32 = Color32::from_gray(214);
+const COMPACT_WAITING: Color32 = Color32::from_gray(132);
+// Centre of the waveform-only status mark, measured from the plot's top-left corner.
+const COMPACT_STATUS_OFFSET: Vec2 = Vec2::new(12.0, 11.0);
+const NO_AUDIO_HINT: &str = "No captured audio";
+const TOOLBAR_BUTTON_SIZE: f32 = 24.0;
+const TRANSPORT_GLYPH: TransportGlyph = TransportGlyph {
+    play: [Vec2::new(-3.5, -5.5), Vec2::new(5.0, 0.0), Vec2::new(-3.5, 5.5)],
+    pause_offset: 2.4,
+    pause_bar: Vec2::new(2.4, 10.0),
+};
 const RESIZE_EDGE: f32 = 7.0;
 const RESIZE_CORNER: f32 = 14.0;
 const FULL_MIN_WIDTH: f32 = 510.0;
@@ -68,7 +170,12 @@ const WAVEFORM_MIN_HEIGHT: f32 = 48.0;
 const DEFAULT_WAVEFORM_HEIGHT: f32 = 59.0;
 const WAVEFORM_INSET: f32 = 8.0;
 const FLAG_SNAP_DISTANCE: f64 = 8.0;
+const FLAG_REACH: FlagReach = FlagReach { above: 2.0, below: 13.0, radius: FLAG_SNAP_DISTANCE as f32 };
+/// Alt is taken: dragging with it moves the window.
+const ALT_SELECTS: bool = false;
 const FLAG_COLOR: Color32 = Color32::from_rgb(255, 201, 109);
+/// The selected waveform takes the accent's complement when it differs by at least this much.
+const SELECTION_CONTRAST: u8 = 80;
 const PREPARING_WAV: &str = "Preparing WAV…";
 
 pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
@@ -112,6 +219,11 @@ pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
                 window_order::restore_position(window, position);
             }
             let mut recorder = Recorder::new(controller, preferences, settings, primary);
+            let repaint = context.egui_ctx.clone();
+            recorder.controller.set_repaint(Arc::new(move || {
+                // A delayed request runs one pass. An immediate one runs two.
+                repaint.request_repaint_after_for(Duration::from_millis(1), egui::ViewportId::ROOT);
+            }));
             recorder.options_in_taskbar = show_options_on_start;
             if show_options_on_start {
                 recorder.open_options(&context.egui_ctx);
@@ -216,14 +328,6 @@ fn configure_style(ctx: &egui::Context, accent: Color32) {
     ctx.set_fonts(fonts);
 }
 
-fn accent_color([r, g, b]: [u8; 3]) -> Color32 {
-    Color32::from_rgb(r, g, b)
-}
-
-fn muted_accent(color: Color32) -> Color32 {
-    Color32::from_rgb(color.r() / 3, color.g() / 3, color.b() / 3)
-}
-
 fn apply_accent(ctx: &egui::Context, accent: Color32) {
     ctx.global_style_mut(|style| {
         style.visuals.selection.bg_fill = muted_accent(accent);
@@ -246,7 +350,10 @@ struct Recorder {
     output: PathBuf,
     saved_output: PathBuf,
     pinned: bool,
+    pin_watch: Option<window_order::PinWatch>,
     next_pin_check: Instant,
+    /// The last status poll found the capture worker holding the session.
+    controller_busy: bool,
     waveform_only: bool,
     full_waveform_height: f32,
     full_window_size: Vec2,
@@ -377,21 +484,14 @@ fn options_list<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R)
     }).inner
 }
 
-fn options_menu_row_height(ui: &egui::Ui) -> f32 {
-    ui.spacing().interact_size.y.max(
-        ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y,
-    )
-}
-
 fn options_menu_height(ui: &egui::Ui, item_count: usize) -> f32 {
-    let rows = item_count.clamp(1, 10) as f32;
-    rows * options_menu_row_height(ui) + (rows - 1.0) * 4.0
+    combo_popup_height(ui, item_count, OPTIONS_MENU_ROW_GAP)
 }
 
 fn configure_options_menu(ui: &mut egui::Ui, width: f32) {
     configure_options_style(ui);
     ui.set_max_width(width);
-    ui.spacing_mut().item_spacing.y = 4.0;
+    ui.spacing_mut().item_spacing.y = OPTIONS_MENU_ROW_GAP;
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
 }
 
@@ -429,6 +529,127 @@ fn options_choice<T: Copy + PartialEq>(
     *selected != before
 }
 
+/// "Off" leaves a paused capture paused. It is stored as 0 seconds, which never meant "at once".
+fn auto_resume_label(value: AutoResumeDelay) -> String {
+    match value.delay() {
+        Some(delay) => format!("{} seconds", delay.as_secs()),
+        None => "Off".into(),
+    }
+}
+
+/// What capture is doing right now. The toolbar LED and the waveform-only mark both show it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureIndicator {
+    Unavailable,
+    Paused,
+    Recording,
+    Waiting,
+}
+
+impl CaptureIndicator {
+    fn new(unavailable: bool, paused: bool, recording: bool) -> Self {
+        if unavailable {
+            Self::Unavailable
+        } else if paused {
+            Self::Paused
+        } else if recording {
+            Self::Recording
+        } else {
+            Self::Waiting
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unavailable => "Capture unavailable",
+            Self::Paused => "Paused",
+            Self::Recording => "Recording",
+            Self::Waiting => "Waiting for sound",
+        }
+    }
+
+    /// `lit` is the bright half of the recording blink.
+    fn led_color(self, lit: bool) -> Color32 {
+        match self {
+            Self::Unavailable => ERROR_LED,
+            Self::Paused => PAUSED_LED,
+            Self::Recording if lit => RECORDING_LIT,
+            Self::Recording => RECORDING_DIM,
+            Self::Waiting => WAITING_LED,
+        }
+    }
+
+    /// The same states on the bare waveform, where the toolbar's dark LEDs would disappear.
+    fn compact_color(self, lit: bool) -> Color32 {
+        match self {
+            Self::Paused => COMPACT_PAUSED,
+            Self::Waiting => COMPACT_WAITING,
+            Self::Unavailable | Self::Recording => self.led_color(lit),
+        }
+    }
+}
+
+/// The source failure the user has to read: the capture error, or else one lane's problem.
+fn capture_problem(error: Option<&str>, lanes: [Option<&str>; 2], dual: bool) -> Option<String> {
+    if let Some(error) = error {
+        return Some(error.to_owned());
+    }
+    lanes.into_iter().enumerate().find_map(|(lane, status)| {
+        let status = status?;
+        Some(if dual {
+            format!("Source {}: {status}", lane_name(lane))
+        } else {
+            status.to_owned()
+        })
+    })
+}
+
+/// `remaining` is the time until capture resumes by itself, when it is going to.
+fn paused_status(remaining: Option<Duration>) -> String {
+    match remaining {
+        Some(remaining) => {
+            let seconds = (remaining.as_secs_f64().ceil() as u64).max(1);
+            format!("Paused · resumes in {seconds} s")
+        }
+        None => "Paused".into(),
+    }
+}
+
+/// The line under the waveform while nothing more specific is going on.
+fn idle_status(paused: Option<String>, message: &str) -> String {
+    match paused {
+        Some(paused) if message.is_empty() => paused,
+        Some(paused) => format!("{paused} · {message}"),
+        None => message.to_owned(),
+    }
+}
+
+/// Everything the waveform-only mark stands for. It stays one paragraph because its tooltip
+/// has to fit inside a window that can be 48 px tall.
+fn compact_status_text(state: &str, problem: Option<&str>, message: &str) -> String {
+    let mut parts = vec![state];
+    parts.extend(problem);
+    if !message.is_empty() && Some(message) != problem {
+        parts.push(message);
+    }
+    parts.join(" · ")
+}
+
+/// The recorder window's own keys. Held keys do not repeat a command.
+fn window_shortcut(events: &[egui::Event]) -> Option<WindowCommand> {
+    events.iter().find_map(|event| {
+        let egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } = event else {
+            return None;
+        };
+        match key {
+            egui::Key::Space if modifiers.is_none() => Some(WindowCommand::ToggleCapture),
+            egui::Key::Delete if modifiers.is_none() => Some(WindowCommand::Clear),
+            egui::Key::S if modifiers.command_only() => Some(WindowCommand::SaveSnapshot),
+            _ => None,
+        }
+    })
+}
+
 fn history_label(value: DurationChoice) -> String {
     let seconds = value.seconds();
     if seconds <= 60 { format!("{seconds} seconds") }
@@ -448,14 +669,14 @@ impl WaveformPeaks {
 }
 
 struct FrozenEdit {
-    snapshots: Arc<[Snapshot]>,
+    snapshots: Arc<[FrozenTrack]>,
     bars: Vec<u64>,
     retention_seconds: u32,
 }
 
 impl FrozenEdit {
     fn frames(&self) -> Range<u64> {
-        self.snapshots.first().map_or(0..0, Snapshot::frame_range)
+        self.snapshots.first().map_or(0..0, FrozenTrack::frame_range)
     }
 }
 
@@ -480,7 +701,7 @@ struct EditPreviewJob {
 }
 
 struct SnapshotRead {
-    result: mpsc::Receiver<Option<Arc<[Snapshot]>>>,
+    result: mpsc::Receiver<Option<Arc<[FrozenTrack]>>>,
     saves: Vec<SnapshotSpec>,
 }
 
@@ -521,7 +742,7 @@ impl Drop for UiRetirement {
 }
 
 impl SnapshotSpec {
-    fn clip(mut self, snapshots: Arc<[Snapshot]>) -> Option<WavClip> {
+    fn clip(mut self, snapshots: Arc<[FrozenTrack]>) -> Option<WavClip> {
         if let Some(flags) = &mut self.flags {
             flags.frames = snapshots.first()?.frame_range();
         }
@@ -530,18 +751,15 @@ impl SnapshotSpec {
     }
 }
 
-fn edit_preview(snapshots: &[Snapshot], key: &EditPreviewKey) -> [WaveformPeaks; 2] {
+fn edit_preview(snapshots: &[FrozenTrack], key: &EditPreviewKey) -> [WaveformPeaks; 2] {
     std::array::from_fn(|row| {
         let mut peaks = WaveformPeaks::empty(key.bins);
         if row >= key.rows { return peaks; }
         let (lane, view) = key.views[row];
-        let Some(snapshot) = snapshots.get(lane) else { return peaks; };
-        let frames = snapshot.frame_range();
-        let start = key.frames.start.max(frames.start);
-        let end = key.frames.end.min(frames.end).max(start);
-        let Some(samples) = snapshot.frames((start - frames.start) as usize..(end - frames.start) as usize)
-        else { return peaks; };
-        waveform::view_peaks(samples, snapshot.channels, view, &mut peaks.low, &mut peaks.high);
+        let Some(track) = snapshots.get(lane) else { return peaks; };
+        // The track answers whole peak blocks from the capture's peak cache and
+        // clips the request to the frames it holds.
+        track.waveform(view, key.frames.clone(), &mut peaks.low, &mut peaks.high);
         peaks
     })
 }
@@ -553,10 +771,10 @@ struct FlagUpdate {
 }
 
 fn snapshot_source(
-    editing: Option<&Arc<[Snapshot]>>,
+    editing: Option<&Arc<[FrozenTrack]>>,
     pending: bool,
-    live: impl FnOnce() -> Option<Arc<[Snapshot]>>,
-) -> Option<Arc<[Snapshot]>> {
+    live: impl FnOnce() -> Option<Arc<[FrozenTrack]>>,
+) -> Option<Arc<[FrozenTrack]>> {
     if let Some(editing) = editing {
         Some(Arc::clone(editing))
     } else if pending {
@@ -569,7 +787,7 @@ fn snapshot_source(
 fn edit_snapshot_matches(snapshot: &EditSnapshot, generation: u64) -> bool {
     snapshot.generation == generation && snapshot.snapshots.first().is_some_and(|first| {
         !first.frame_range().is_empty() && snapshot.snapshots.iter().all(|next|
-            next.frame_range() == first.frame_range() && next.sample_rate == first.sample_rate)
+            next.frame_range() == first.frame_range() && next.sample_rate() == first.sample_rate())
     })
 }
 
@@ -589,14 +807,6 @@ fn frame_from_pointer(
     }
     let length = visible.end.saturating_sub(visible.start);
     visible.start.saturating_add(((length as f64 * fraction.clamp(0.0, 1.0)).round() as u64).min(length))
-}
-
-fn waveform_press(events: &[egui::Event]) -> Option<(Pos2, bool, bool)> {
-    events.iter().rev().find_map(|event| match event {
-        egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, modifiers } =>
-            Some((*pos, modifiers.ctrl || modifiers.shift, modifiers.shift)),
-        _ => None,
-    })
 }
 
 #[derive(Clone, Copy)]
@@ -742,7 +952,7 @@ struct ExportJob {
 }
 
 struct WavClip {
-    snapshots: Arc<[Snapshot]>,
+    snapshots: Arc<[FrozenTrack]>,
     frames: Range<usize>,
     output: PathBuf,
     profile: WavExportProfile,
@@ -753,7 +963,7 @@ struct WavClip {
 
 impl WavClip {
     fn new(
-        snapshots: Arc<[Snapshot]>,
+        snapshots: Arc<[FrozenTrack]>,
         selection: Option<&Range<u64>>,
         output: PathBuf,
         profile: WavExportProfile,
@@ -903,7 +1113,9 @@ impl Recorder {
             output: settings.output,
             saved_output: settings.saved_output,
             pinned: settings.pinned,
+            pin_watch: None,
             next_pin_check: Instant::now(),
+            controller_busy: false,
             waveform_only: settings.waveform_only,
             full_waveform_height: DEFAULT_WAVEFORM_HEIGHT,
             full_window_size: Vec2::new(610.0, 144.0),
@@ -1155,7 +1367,7 @@ impl Recorder {
         self.controller.sources()[1].is_some()
     }
 
-    fn current_snapshots(&self) -> Option<Arc<[Snapshot]>> {
+    fn current_snapshots(&self) -> Option<Arc<[FrozenTrack]>> {
         snapshot_source(self.editing.as_ref().map(|edit| &edit.snapshots),
             self.edit_request.is_some(), || None)
     }
@@ -1384,12 +1596,105 @@ impl Recorder {
             self.last_interaction = now;
         }
         self.live_revision = Some(revision);
-        self.next_refresh = now + REFRESH;
+        self.next_refresh = now + WAVEFORM_REFRESH;
     }
 
     fn is_fine_editing(&self) -> bool {
         self.gesture.is_some() || self.pan.is_some()
-            || self.last_interaction.elapsed() < Duration::from_millis(250)
+            || self.last_interaction.elapsed() < FINE_EDIT_SETTLE
+    }
+
+    /// Keeps a pinned window above other topmost windows. The check runs on a
+    /// native timer, so it does not need a repaint.
+    fn watch_pin(&mut self, frame: &eframe::Frame, now: Instant) {
+        // A hidden window cannot be covered. Showing it runs a pass that re-arms this.
+        let wanted = self.pinned
+            && !self.options_open
+            && !frame.winit_window().is_some_and(|window| window_is_hidden(window));
+        if wanted && self.pin_watch.is_none() {
+            self.pin_watch = frame.winit_window().and_then(|window| window_order::PinWatch::attach(window));
+        }
+        if let Some(watch) = &mut self.pin_watch {
+            watch.set_active(wanted);
+        } else if wanted && now >= self.next_pin_check {
+            // Without the timer, look whenever the window runs anyway.
+            let attempted = frame
+                .winit_window()
+                .is_some_and(|window| window_order::raise_if_covered(window));
+            self.next_pin_check = now + if attempted { PIN_RETRY } else { REFRESH };
+        }
+    }
+
+    fn waits(&self, ctx: &egui::Context, frame: &eframe::Frame) -> Waits {
+        let now = Instant::now();
+        let window = frame.winit_window();
+        let hidden = window.is_some_and(|window| window_is_hidden(window));
+        let meter_shown = |lane: usize| {
+            self.controller
+                .track_meter_readings(lane)
+                .is_some_and(|readings| self.meter_modes[lane].value(readings).is_finite())
+        };
+        let live = self.editing.is_none() && self.edit_request.is_none();
+        Waits {
+            hidden,
+            busy: self.controller_busy
+                || self.window_drag.is_some()
+                || self.gesture.is_some()
+                || self.pan.is_some()
+                || self.export.is_some()
+                || self.edit_request.is_some()
+                || self.edit_preview.is_some()
+                || !self.pending_snapshot_reads.is_empty()
+                || !self.pending_edit_save_reads.is_empty()
+                || self.snapshot_save.is_some()
+                || !self.pending_snapshot_saves.is_empty()
+                || self.plugin_snapshot_request.is_some()
+                || !self.pending_plugin_snapshots.is_empty(),
+            polling: self.source_list_worker.is_some(),
+            tray_retry: if self.options_in_taskbar {
+                None
+            } else if let Some(tray) = &self.tray {
+                tray.retry_in()
+            } else {
+                Some(self.next_tray_attach.saturating_duration_since(now))
+            },
+            // A minimized window keeps its unsaved position until it is restored.
+            position_save: self.window_position_changed.filter(|_| !hidden).map(|changed| {
+                let waited = now.saturating_duration_since(changed);
+                if waited < WINDOW_POSITION_SAVE_DELAY {
+                    WINDOW_POSITION_SAVE_DELAY - waited
+                } else {
+                    WINDOW_POSITION_SAVE_DELAY
+                }
+            }),
+            auto_resume: self.auto_resume_remaining(),
+            // Waveform-only mode shows the countdown in a tooltip.
+            countdown_shown: !self.waveform_only || ctx.input(|input| input.pointer.has_pointer()),
+            blink: self
+                .recording_started
+                .filter(|_| self.controller.is_recording())
+                .map(|started| ctx.input(|input| input.time) - started),
+            meters_live: !self.waveform_only
+                && (meter_shown(0) || (self.dual_source() && meter_shown(1))),
+            fine_edit: Some(now.saturating_duration_since(self.last_interaction))
+                .filter(|&since| since < FINE_EDIT_SETTLE),
+            waveform: (live && self.live_revision != Some(self.controller.revision()))
+                .then(|| self.next_refresh.saturating_duration_since(now)),
+            options_scan: (self.options_open
+                && self.primary
+                && self.options_section == OptionsSection::Actions)
+                .then(|| self.snapshot_target_scan.saturating_duration_since(now)),
+        }
+    }
+
+    /// Asks for the next pass. Everything else that changes the window asks for
+    /// its own repaint: input, the capture worker, the tray, the shortcut and the
+    /// updater threads.
+    fn schedule_wake(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let waits = self.waits(ctx, frame);
+        // A hidden window shows neither the waveform nor the meters.
+        self.controller.set_watching(!waits.hidden);
+        ctx.request_repaint_after_for(next_wake(&waits), egui::ViewportId::ROOT);
     }
 
     fn display_policy(&self, audio: Rect, visible: Range<u64>) -> waveform::DisplayPolicy {
@@ -1421,7 +1726,7 @@ impl Recorder {
                     // pointer geometry until this preview is actually ready.
                     let edit = self.editing.as_ref().expect("material remains available");
                     self.history_frames = edit.frames();
-                    self.sample_rate = edit.snapshots[0].sample_rate;
+                    self.sample_rate = edit.snapshots[0].sample_rate();
                     self.bar_markers.clone_from(&edit.bars);
                     self.peaks = peaks;
                     self.visible_frames = key.frames.clone();
@@ -1445,7 +1750,7 @@ impl Recorder {
         if self.dual_source() {
             ([(0, WaveformView::Merged), (1, WaveformView::Merged)], 2)
         } else if self.split_waveform && self.editing.as_ref()
-            .and_then(|edit| edit.snapshots.first()).map(|snapshot| snapshot.channels)
+            .and_then(|edit| edit.snapshots.first()).map(FrozenTrack::channels)
             .or_else(|| self.controller.track_channels(0)) == Some(2) {
             ([(0, WaveformView::Left), (0, WaveformView::Right)], 2)
         } else {
@@ -1480,7 +1785,7 @@ impl Recorder {
 
     fn transport_button(&mut self, ui: &mut egui::Ui, menu_open: bool) {
         let can_toggle = !menu_open && self.gesture.is_none();
-        let response = ui.add_enabled(can_toggle, icon_button());
+        let response = ui.add_enabled(can_toggle, icon_button(TOOLBAR_BUTTON_SIZE));
         if response.clicked() {
             self.toggle_capture();
         }
@@ -1496,53 +1801,147 @@ impl Recorder {
         let response = response.on_hover_text(label);
         let center = response.rect.center();
         let color = ui.style().interact(&response).fg_stroke.color;
-        if paused {
-            ui.painter().add(egui::Shape::convex_polygon(
-                vec![
-                    center + Vec2::new(-3.5, -5.5),
-                    center + Vec2::new(5.0, 0.0),
-                    center + Vec2::new(-3.5, 5.5),
-                ],
-                color,
-                Stroke::NONE,
-            ));
-        } else {
-            for x in [-2.4, 2.4] {
-                ui.painter().rect_filled(
-                    Rect::from_center_size(center + Vec2::new(x, 0.0), Vec2::new(2.4, 10.0)),
-                    0.5,
-                    color,
-                );
-            }
+        paint_transport_glyph(ui.painter(), center, paused, color, &TRANSPORT_GLYPH);
+    }
+
+    fn capture_indicator(&self) -> CaptureIndicator {
+        CaptureIndicator::new(
+            self.controller.error().is_some(),
+            self.controller.is_paused(),
+            self.controller.is_recording(),
+        )
+    }
+
+    /// The bright half of the one-second recording blink, which starts lit.
+    fn recording_lit(&mut self, time: f64) -> bool {
+        if !self.controller.is_recording() {
+            self.recording_started = None;
+            return false;
         }
+        let started = *self.recording_started.get_or_insert(time);
+        (time - started).rem_euclid(1.0) < 0.5
     }
 
     fn recording_indicator(&mut self, ui: &mut egui::Ui) {
-        let (status, color) = if self.controller.error().is_some() {
-            ("Capture unavailable", ERROR_LED)
-        } else if self.controller.is_paused() {
-            ("Paused", PAUSED_LED)
-        } else if self.controller.is_recording() {
-            let time = ui.input(|input| input.time);
-            let started = *self.recording_started.get_or_insert(time);
-            let lit = (time - started).rem_euclid(1.0) < 0.5;
-            ("Recording", if lit { RECORDING_LIT } else { RECORDING_DIM })
-        } else {
-            ("Waiting for sound", WAITING_LED)
-        };
-        if !self.controller.is_recording() {
-            self.recording_started = None;
-        }
+        let indicator = self.capture_indicator();
+        let status = indicator.label();
+        let color = indicator.led_color(self.recording_lit(ui.input(|input| input.time)));
 
-        let (rect, response) = ui.allocate_exact_size(Vec2::new(15.0, 24.0), egui::Sense::hover());
-        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Status, true, status));
-        response.on_hover_text(status);
-        ui.painter().circle_filled(rect.center(), 4.5, color);
+        status_led(ui, Vec2::new(15.0, 24.0), 4.5, color, status);
+    }
+
+    /// Time left before a paused capture resumes by itself, if it is going to.
+    /// A gesture or a selection holds the pause, and `Off` never resumes.
+    fn auto_resume_remaining(&self) -> Option<Duration> {
+        if !self.controller.is_paused() || self.gesture.is_some() || self.selection.is_some() {
+            return None;
+        }
+        self.idle_resume.remaining(self.last_interaction.elapsed())
+    }
+
+    fn capture_problem(&self) -> Option<String> {
+        capture_problem(
+            self.controller.error(),
+            [0, 1].map(|lane| self.controller.source_status(lane)),
+            self.dual_source(),
+        )
+    }
+
+    /// The status line under the waveform in the full window.
+    fn status_text(&self) -> String {
+        if let Some(error) = self.controller.error() {
+            return error.to_owned();
+        }
+        let paused = self.controller.is_paused();
+        if self.edit_request.is_some() {
+            "Preparing selection…".into()
+        } else if self.editing.is_some() && self.export.is_none() && self.snapshot_save.is_none() {
+            if paused { "Selection / Paused" } else { "Selection" }.into()
+        } else {
+            idle_status(
+                paused.then(|| paused_status(self.auto_resume_remaining())),
+                &self.message,
+            )
+        }
+    }
+
+    /// Waveform-only mode has no toolbar and no status line, so the plot carries the state: a
+    /// small mark in the corner, the failure text when a source has a problem, and a tooltip
+    /// with the rest.
+    fn draw_compact_status(&mut self, ui: &egui::Ui, rect: Rect) {
+        let rect = rect.shrink(self.border_inset());
+        let indicator = self.capture_indicator();
+        let problem = self.capture_problem();
+        let lit = self.recording_lit(ui.input(|input| input.time));
+        let hover = paint_compact_status(
+            &ui.painter_at(rect), rect, indicator, lit, problem.as_deref(),
+        );
+
+        let state = if indicator == CaptureIndicator::Paused {
+            paused_status(self.auto_resume_remaining())
+        } else {
+            indicator.label().to_owned()
+        };
+        let status = compact_status_text(&state, problem.as_deref(), &self.message);
+        let response = ui.interact(hover, egui::Id::unique("capture-status"), egui::Sense::hover());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Status, true, &status));
+        response.on_hover_text(&status);
+    }
+
+    fn menu_state(&self) -> context_menu::State {
+        context_menu::State {
+            transport: if self.controller.error().is_some() {
+                context_menu::Transport::Retry
+            } else if self.controller.is_paused() {
+                context_menu::Transport::Resume
+            } else {
+                context_menu::Transport::Pause
+            },
+            capture_controls: self.gesture.is_none(),
+            waveform_only: self.waveform_only,
+            keep_on_top: self.pinned,
+        }
+    }
+
+    /// Runs a command from the right-click menu or the keyboard through the same methods as
+    /// the toolbar and the Options window, so behaviour and saved preferences match.
+    fn run_command(&mut self, command: WindowCommand, ctx: &egui::Context, frame: &eframe::Frame) {
+        let capture_controls = self.gesture.is_none();
+        match command {
+            WindowCommand::ToggleCapture if capture_controls => self.toggle_capture(),
+            WindowCommand::Clear if capture_controls => self.clear_capture(),
+            WindowCommand::SaveSnapshot if capture_controls => self.save_snapshot(),
+            WindowCommand::ToggleCapture | WindowCommand::Clear | WindowCommand::SaveSnapshot => {}
+            WindowCommand::WaveformOnly => {
+                self.waveform_only = !self.waveform_only;
+                self.apply_waveform_mode(ctx, frame);
+            }
+            WindowCommand::KeepOnTop => {
+                self.pinned = !self.pinned;
+                self.apply_pinned(ctx);
+            }
+            WindowCommand::Options => self.open_options(ctx),
+            WindowCommand::Quit => self.quit(ctx),
+        }
+    }
+
+    fn show_context_menu(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(window) = frame.winit_window() else {
+            // Without a native window there is nowhere to anchor a menu. Keep right-click useful.
+            self.open_options(ctx);
+            return;
+        };
+        let command = context_menu::show(window, &context_menu::entries(self.menu_state()));
+        // The menu ran its own message loop. Time spent reading it is not idle time.
+        self.last_interaction = Instant::now();
+        if let Some(command) = command {
+            self.run_command(command, ctx, frame);
+        }
     }
 
     fn clear_button(&mut self, ui: &mut egui::Ui, menu_open: bool) {
         let enabled = !menu_open && self.gesture.is_none();
-        let response = ui.add_enabled(enabled, icon_button());
+        let response = ui.add_enabled(enabled, icon_button(TOOLBAR_BUTTON_SIZE));
         if response.clicked() {
             self.clear_capture();
         }
@@ -1576,15 +1975,7 @@ impl Recorder {
             .controller
             .track_meter_readings(lane)
             .map(|readings| mode.value(readings));
-        let number = if let Some(value) = value.filter(|value| value.is_finite()) {
-            if mode == MeterMode::Vu {
-                format!("{value:+.1}")
-            } else {
-                format!("{value:.1}")
-            }
-        } else {
-            "—".into()
-        };
+        let number = meter_number(value, mode == MeterMode::Vu);
         let text = if self.dual_source() {
             format!("{} {number} {}", lane_name(lane), mode.unit())
         } else {
@@ -1606,7 +1997,7 @@ impl Recorder {
     }
 
     fn pin_button(&mut self, ui: &mut egui::Ui, menu_open: bool) {
-        let response = ui.add_enabled(!menu_open, icon_button());
+        let response = ui.add_enabled(!menu_open, icon_button(TOOLBAR_BUTTON_SIZE));
         if response.clicked() {
             self.pinned = !self.pinned;
             self.apply_pinned(ui.ctx());
@@ -1664,7 +2055,7 @@ impl Recorder {
 
     fn options_button(&mut self, ui: &mut egui::Ui, enabled: bool) {
         let response = ui
-            .add_enabled(enabled, icon_button())
+            .add_enabled(enabled, icon_button(TOOLBAR_BUTTON_SIZE))
             .on_hover_text("Options");
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, "Options"));
         let center = response.rect.center();
@@ -1955,7 +2346,7 @@ impl Recorder {
         }
         options_field(ui, "Auto-resume delay", |ui| {
             if options_choice(ui, "auto-resume", &mut self.idle_resume,
-                AutoResumeDelay::ALL.into_iter().map(|value| (value, format!("{} seconds", value.seconds())))) {
+                AutoResumeDelay::ALL.into_iter().map(|value| (value, auto_resume_label(value)))) {
                 self.save_preference(Key::IdleResume, self.idle_resume.seconds().to_string());
             }
         });
@@ -2355,7 +2746,7 @@ impl Recorder {
         self.collect_snapshot_saves();
     }
 
-    fn wav_clip(&mut self, snapshots: Arc<[Snapshot]>, output: PathBuf) -> Option<WavClip> {
+    fn wav_clip(&mut self, snapshots: Arc<[FrozenTrack]>, output: PathBuf) -> Option<WavClip> {
         let flags = if self.selection.is_none() {
             Some(self.flag_update(snapshots.first()?.frame_range()))
         } else {
@@ -2531,7 +2922,7 @@ impl Recorder {
             return;
         }
         let (position, press, down, snap) = ui.input(|input| {
-            let press = waveform_press(&input.events);
+            let press = waveform_press(&input.events, ALT_SELECTS);
             (
                 input.pointer.interact_pos(),
                 press,
@@ -2716,22 +3107,10 @@ impl Recorder {
     }
 
     fn flag_endpoints(&self, audio: Rect, position: Pos2) -> Option<(u64, u64)> {
-        if position.y < audio.top() - 2.0 || position.y > audio.top() + 13.0 {
-            return None;
-        }
-        let flags = self.selection.as_ref().or_else(|| self.flags.as_ref().map(|flags| &flags.frames))?.clone();
-        [(flags.start, flags.end), (flags.end, flags.start)]
-            .into_iter()
-            .filter_map(|(moved, fixed)| {
-                let fraction = waveform::flag_fraction(moved, self.visible_frames.clone())?;
-                let x = audio.left() + fraction as f32 * audio.width();
-                let distance = (x - position.x).abs();
-                (distance <= FLAG_SNAP_DISTANCE as f32).then_some((distance, fixed, moved))
-            })
-            .min_by(|(a, _, _), (b, _, _)| a.total_cmp(b))
-            .map(|(_, fixed, moved)| {
-                (fixed.clamp(self.history_frames.start, self.history_frames.end), moved)
-            })
+        let flags = self.selection.as_ref().or_else(|| self.flags.as_ref().map(|flags| &flags.frames))?;
+        let (fixed, moved) =
+            flag_handle_at(audio, self.visible_frames.clone(), flags, position, FLAG_REACH)?;
+        Some((fixed.clamp(self.history_frames.start, self.history_frames.end), moved))
     }
 
     fn frame_at(&self, audio: Rect, x: f32, snap: bool) -> u64 {
@@ -2764,11 +3143,11 @@ impl Recorder {
         let rect = rect.shrink(self.border_inset());
         let painter = ui.painter_at(rect);
         if self.waveform_only {
-            painter.rect_filled(rect, 0.0, self.background_color(Color32::from_rgb(22, 26, 29)));
+            painter.rect_filled(rect, 0.0, self.background_color(PLOT_BACKGROUND));
         } else {
             // The panel already supplies the chosen alpha when translucent.
             if self.transparency == 0 {
-                painter.rect_filled(rect, 6.0, Color32::from_rgb(22, 26, 29));
+                painter.rect_filled(rect, 6.0, PLOT_BACKGROUND);
             }
         }
         let audio = self.audio_rect(rect);
@@ -2777,9 +3156,18 @@ impl Recorder {
                 painter.text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "No captured audio",
+                    NO_AUDIO_HINT,
                     egui::FontId::proportional(13.0),
                     Color32::GRAY,
+                );
+            } else if self.capture_problem().is_none() {
+                // Dimmed, and left out when a source problem is already written on the plot.
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    NO_AUDIO_HINT,
+                    egui::FontId::proportional(12.0),
+                    Color32::from_gray(104),
                 );
             }
             return;
@@ -2825,7 +3213,7 @@ impl Recorder {
                 painter.hline(
                     row.x_range(),
                     row.center().y,
-                    Stroke::new(1.0, Color32::from_rgb(47, 60, 64)),
+                    Stroke::new(1.0, CENTER_LINE),
                 );
                 if rows == 2 {
                     let label = if self.dual_source() {
@@ -2874,19 +3262,13 @@ impl Recorder {
     fn paint_time_lines(&self, painter: &egui::Painter, audio: Rect) {
         let guides = self.visible_guides(audio);
         let policy = self.display_policy(audio, self.visible_frames.clone());
-        let draw = |frame, alpha: u16, stroke| {
-            if let Some(fraction) = waveform::flag_fraction(frame, self.visible_frames.clone()) {
-                let x = audio.left() + fraction as f32 * audio.width();
-                let alpha = alpha * u16::from(100 - self.transparency) / 100;
-                painter.vline(x, audio.y_range(), Stroke::new(stroke, Color32::from_white_alpha(alpha as u8)));
-            }
+        let draw = |frames: &[u64], alpha: u16, stroke| {
+            let alpha = alpha * u16::from(100 - self.transparency) / 100;
+            paint_guide_lines(painter, audio, &self.visible_frames, frames,
+                Stroke::new(stroke, Color32::from_white_alpha(alpha as u8)));
         };
-        for frame in guides.seconds {
-            draw(frame, 52, policy.seconds_stroke);
-        }
-        for frame in guides.bars {
-            draw(frame, 104, policy.bar_stroke);
-        }
+        draw(&guides.seconds, 52, policy.seconds_stroke);
+        draw(&guides.bars, 104, policy.bar_stroke);
     }
 
     fn paint_flags(&self, painter: &egui::Painter, audio: Rect) {
@@ -2934,15 +3316,7 @@ impl Recorder {
     ) {
         let policy = self.display_policy(audio, self.visible_frames.clone());
         let geometry = waveform::waveform_geometry(&peaks.low, &peaks.high, self.visible_frames.clone());
-        let [r, g, b, _] = self.accent.to_array();
-        let selected = if [r, g, b]
-            .into_iter()
-            .any(|channel| channel.abs_diff(255 - channel) >= 80)
-        {
-            Color32::from_rgb(255 - r, 255 - g, 255 - b)
-        } else {
-            Color32::WHITE
-        };
+        let selected = selected_waveform_color(self.accent, SELECTION_CONTRAST);
         let painter = painter.with_clip_rect(audio);
         let paint_range = |range: Range<f32>, color| {
             if range.is_empty() { return; }
@@ -2965,6 +3339,52 @@ impl Recorder {
 
 }
 
+/// Paints the waveform-only status mark in the top-left corner of the plot: a dot coloured by
+/// state, or pause bars, with the source problem written beside it when there is one.
+/// Returns the area whose tooltip explains the mark.
+fn paint_compact_status(
+    painter: &egui::Painter,
+    rect: Rect,
+    indicator: CaptureIndicator,
+    lit: bool,
+    problem: Option<&str>,
+) -> Rect {
+    let color = if problem.is_some() { ERROR_LED } else { indicator.compact_color(lit) };
+    let center = rect.left_top() + COMPACT_STATUS_OFFSET;
+    // The backing keeps the mark readable over a loud waveform or a transparent window.
+    let backing = Color32::from_black_alpha(168);
+    painter.circle_filled(center, 6.5, backing);
+    if indicator == CaptureIndicator::Paused && problem.is_none() {
+        for x in [-2.0, 2.0] {
+            painter.rect_filled(
+                Rect::from_center_size(center + Vec2::new(x, 0.0), Vec2::new(2.0, 7.0)),
+                0.5,
+                color,
+            );
+        }
+    } else {
+        painter.circle_filled(center, 3.5, color);
+    }
+
+    let mut hover = Rect::from_center_size(center, Vec2::splat(15.0));
+    let left = center.x + 11.0;
+    let width = rect.right() - left - 8.0;
+    if let Some(problem) = problem.filter(|_| width > 0.0) {
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            problem.to_owned(), egui::FontId::proportional(12.0), ERROR_LED,
+        );
+        job.wrap = egui::text::TextWrapping::truncate_at_width(width);
+        let galley = painter.layout_job(job);
+        let text = Rect::from_min_size(
+            Pos2::new(left, center.y - galley.size().y * 0.5), galley.size(),
+        );
+        painter.rect_filled(text.expand2(Vec2::new(4.0, 1.5)), 3.0, backing);
+        painter.galley(text.min, galley, ERROR_LED);
+        hover = hover.union(text);
+    }
+    hover.intersect(rect)
+}
+
 fn paint_waveform_geometry(
     painter: &egui::Painter,
     audio: Rect,
@@ -2976,43 +3396,11 @@ fn paint_waveform_geometry(
         audio.left() + x * audio.width(),
         audio.center().y - value * audio.height() * 0.47,
     );
-    match geometry {
-        waveform::WaveformGeometry::Empty => {}
-        waveform::WaveformGeometry::Samples(runs) => {
-            for run in runs {
-                let points: Vec<_> = run.iter().map(|point| position(point.x, point.value)).collect();
-                if let [point] = points.as_slice() {
-                    painter.circle_filled(*point, stroke * 0.55, color);
-                } else if !points.is_empty() {
-                    painter.add(egui::Shape::line(points, Stroke::new(stroke, color)));
-                }
-            }
-        }
-        waveform::WaveformGeometry::Envelope(runs) => {
-            for run in runs {
-                let mut mesh = egui::Mesh::default();
-                let mut upper = Vec::with_capacity(run.len());
-                let mut lower = Vec::with_capacity(run.len());
-                let fill = color.linear_multiply(0.4);
-                for (index, column) in run.iter().enumerate() {
-                    let top = position(column.x, column.maximum);
-                    let bottom = position(column.x, column.minimum);
-                    mesh.colored_vertex(top, fill);
-                    mesh.colored_vertex(bottom, fill);
-                    upper.push(top);
-                    lower.push(bottom);
-                    if index > 0 {
-                        let vertex = index as u32 * 2;
-                        mesh.add_triangle(vertex - 2, vertex - 1, vertex);
-                        mesh.add_triangle(vertex, vertex - 1, vertex + 1);
-                    }
-                }
-                painter.add(egui::Shape::mesh(mesh));
-                painter.add(egui::Shape::line(upper, Stroke::new(stroke, color)));
-                painter.add(egui::Shape::line(lower, Stroke::new(stroke, color)));
-            }
-        }
-    }
+    paint_waveform_trace(painter, geometry, position, &TraceStyle {
+        stroke: Stroke::new(stroke, color),
+        fill: color.linear_multiply(0.4),
+        lone_sample: LoneSample::Dot(stroke * 0.55),
+    });
 }
 
 impl eframe::App for Recorder {
@@ -3103,12 +3491,7 @@ impl eframe::App for Recorder {
         self.poll_snapshot_hotkey();
         self.collect_source_list();
         let now = Instant::now();
-        if self.pinned && !self.options_open && now >= self.next_pin_check {
-            let attempted = frame
-                .winit_window()
-                .is_some_and(|window| window_order::raise_if_covered(window));
-            self.next_pin_check = now + if attempted { PIN_RETRY } else { REFRESH };
-        }
+        self.watch_pin(frame, now);
         if let Some(drag) = &mut self.window_drag
             && frame
                 .winit_window()
@@ -3129,7 +3512,7 @@ impl eframe::App for Recorder {
         if !ctx.input(|input| input.pointer.any_down()) {
             self.save_accent();
         }
-        self.controller.poll();
+        self.controller_busy = !self.controller.poll();
         self.sync_generation();
         self.collect_editing();
         if let Some(error) = self.preference_writer.as_ref().and_then(PreferenceWriter::poll_error) {
@@ -3140,32 +3523,11 @@ impl eframe::App for Recorder {
         }
         self.collect_export();
         self.collect_snapshot_saves();
-        if self.controller.is_paused()
-            && self.gesture.is_none()
-            && self.selection.is_none()
-            && self.idle_resume != AutoResumeDelay::Immediate
-            && self.last_interaction.elapsed()
-                >= Duration::from_secs(u64::from(self.idle_resume.seconds()))
-        {
+        if self.auto_resume_remaining().is_some_and(|remaining| remaining.is_zero()) {
             self.resume();
         }
-        ctx.request_repaint_after(
-            if self.window_drag.is_some()
-                || self.gesture.is_some()
-                || self.pan.is_some()
-                || self.export.is_some()
-                || self.edit_request.is_some()
-                || self.edit_preview.is_some()
-                || !self.pending_snapshot_reads.is_empty()
-                || !self.pending_edit_save_reads.is_empty()
-                || self.snapshot_save.is_some()
-                || self.plugin_snapshot_request.is_some()
-            {
-                Duration::from_millis(16)
-            } else {
-                REFRESH
-            },
-        );
+        // The window is not always drawn after this, so ask for the next pass here too.
+        self.schedule_wake(ctx, frame);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -3177,17 +3539,23 @@ impl eframe::App for Recorder {
         } else {
             panel.fill(self.background_color(ui.visuals().panel_fill))
         };
+        // Menu and keyboard commands wait until the frame is laid out, like the Options window's
+        // changes: some of them resize the window or switch its mode.
+        let commands_allowed = self.window_drag.is_none() && self.gesture.is_none();
+        let open_menu = commands_allowed
+            && ui.input(|input| input.pointer.button_clicked(PointerButton::Secondary));
+        // A focused widget (a text field, or a button reached with Tab) owns the keyboard, and
+        // keys pressed in the Options window never reach this viewport's input at all.
+        let shortcut = (commands_allowed
+            && !egui::Popup::is_any_open(ui.ctx())
+            && ui.memory(|memory| memory.focused().is_none()))
+        .then(|| ui.input(|input| window_shortcut(&input.events)))
+        .flatten();
         egui::CentralPanel::default()
             .frame(frame_style)
             .show(ui, |ui| {
                 let window_drag = self.window_drag.as_ref().map(|drag| drag.interaction);
                 let interaction_blocked = window_drag.is_some();
-                if !interaction_blocked
-                    && self.gesture.is_none()
-                    && ui.input(|input| input.pointer.button_clicked(PointerButton::Secondary))
-                {
-                    self.open_options(ui.ctx());
-                }
                 if !self.waveform_only {
                     self.controls(ui, interaction_blocked);
                 }
@@ -3228,16 +3596,14 @@ impl eframe::App for Recorder {
                     self.interact_waveform(ui, frame, rect.shrink(self.border_inset()));
                 }
                 self.draw_waveform(ui, rect, !interaction_blocked && window_cursor.is_none());
-                let status = self.controller.error().unwrap_or_else(|| {
-                    if self.edit_request.is_some() { "Preparing selection…" }
-                    else if self.editing.is_some() && self.export.is_none() && self.snapshot_save.is_none() {
-                        if self.controller.is_paused() { "Selection / Paused" }
-                        else { "Selection" }
-                    } else { &self.message }
-                });
-                if !self.waveform_only && !status.is_empty() {
-                    ui.add(egui::Label::new(status).truncate())
-                        .on_hover_text(status);
+                if self.waveform_only {
+                    self.draw_compact_status(ui, rect);
+                } else {
+                    let status = self.status_text();
+                    if !status.is_empty() {
+                        ui.add(egui::Label::new(&status).truncate())
+                            .on_hover_text(&status);
+                    }
                 }
                 if let Some(cursor) = window_cursor {
                     ui.ctx().set_cursor_icon(cursor);
@@ -3245,7 +3611,23 @@ impl eframe::App for Recorder {
                     response.on_hover_cursor(CursorIcon::Grab);
                 }
             });
+        if self.gesture.is_some() {
+            // A press in this same frame started a waveform gesture, and that comes first.
+        } else if open_menu {
+            self.show_context_menu(ui.ctx(), frame);
+        } else if let Some(command) = shortcut {
+            // Delete with a selection on screen drops the selection, as Backspace and Escape do.
+            // Wiping the whole capture takes a second press.
+            if command == WindowCommand::Clear && self.selection.is_some() {
+                self.cancel_selection();
+            } else {
+                self.run_command(command, ui.ctx(), frame);
+            }
+        }
         self.draw_options_window(ui.ctx(), frame);
+        // Drawing can start a gesture, an export or the recording blink.
+        self.watch_pin(frame, Instant::now());
+        self.schedule_wake(ui.ctx(), frame);
     }
 }
 
@@ -3295,12 +3677,6 @@ impl Drop for Recorder {
     }
 }
 
-pub(crate) fn fit_frame_range(history: &Range<u64>, start: u64, count: u64) -> Range<u64> {
-    let count = count.min(history.end - history.start);
-    let start = start.clamp(history.start, history.end - count);
-    start..start + count
-}
-
 fn lane_name(lane: usize) -> &'static str {
     if lane == 0 { "A" } else { "B" }
 }
@@ -3317,10 +3693,6 @@ fn source_picker_label<'a>(
     } else {
         source.label().into()
     }
-}
-
-fn icon_button() -> egui::Button<'static> {
-    egui::Button::new("").min_size(Vec2::splat(24.0))
 }
 
 fn window_interaction(
@@ -3472,24 +3844,14 @@ mod tests {
 
     #[test]
     fn editing_snapshot_remains_the_source_after_live_audio_has_rolled_out() {
-        let retained: Arc<[Snapshot]> = vec![Snapshot {
-            first_frame: 100,
-            sample_rate: 48_000,
-            channels: 1,
-            samples: vec![0.1, 0.2, 0.3, 0.4],
-        }].into();
-        let newer: Arc<[Snapshot]> = vec![Snapshot {
-            first_frame: 500,
-            sample_rate: 48_000,
-            channels: 1,
-            samples: vec![0.9; 4],
-        }].into();
+        let retained: Arc<[FrozenTrack]> = vec![FrozenTrack::from_interleaved(48_000, 1, 100, &[0.1, 0.2, 0.3, 0.4]).unwrap()].into();
+        let newer: Arc<[FrozenTrack]> = vec![FrozenTrack::from_interleaved(48_000, 1, 500, &[0.9; 4]).unwrap()].into();
         let source = snapshot_source(Some(&retained), false, || Some(newer)).unwrap();
         assert!(Arc::ptr_eq(&source, &retained));
         let clip = WavClip::new(source, Some(&(101..103)), PathBuf::new(),
             WavExportProfile::default(), [ChannelRoute::Merged; 2], false, None).unwrap();
         assert_eq!(clip.frames, 1..3);
-        assert_eq!(clip.snapshots[0].frames(clip.frames.clone()), Some(&[0.2, 0.3][..]));
+        assert_eq!(clip.snapshots[0].snapshot().frames(clip.frames.clone()), Some(&[0.2, 0.3][..]));
     }
 
     #[test]
@@ -3508,8 +3870,8 @@ mod tests {
         let make_reply = |generation, second_first| EditSnapshot {
             generation, bar_markers: vec![101],
             snapshots: vec![
-                Snapshot { first_frame: 100, sample_rate: 48000, channels: 1, samples: vec![0.1; 4] },
-                Snapshot { first_frame: second_first, sample_rate: 48000, channels: 1, samples: vec![-0.1; 4] },
+                FrozenTrack::from_interleaved(48000, 1, 100, &[0.1; 4]).unwrap(),
+                FrozenTrack::from_interleaved(48000, 1, second_first, &[-0.1; 4]).unwrap(),
             ].into(),
         };
         assert!(!edit_snapshot_matches(&make_reply(2, 100), 1),
@@ -3534,6 +3896,288 @@ mod tests {
     }
 
     #[test]
+    fn auto_resume_choices_are_labelled_by_what_they_do() {
+        let labels = AutoResumeDelay::ALL.map(auto_resume_label);
+        assert_eq!(labels, ["Off", "5 seconds", "10 seconds"]);
+    }
+
+    fn milliseconds(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    #[test]
+    fn an_idle_window_only_runs_its_safety_tick() {
+        assert_eq!(next_wake(&Waits::default()), SAFETY_TICK);
+        // Hidden or not, with nothing pending there is nothing sooner to do.
+        assert_eq!(next_wake(&Waits { hidden: true, ..Waits::default() }), SAFETY_TICK);
+    }
+
+    #[test]
+    fn work_in_progress_keeps_the_frame_cadence_it_had() {
+        assert_eq!(next_wake(&Waits { busy: true, ..Waits::default() }), BUSY_REFRESH);
+        assert_eq!(next_wake(&Waits { polling: true, ..Waits::default() }), REFRESH);
+        assert_eq!(
+            next_wake(&Waits { busy: true, polling: true, hidden: true, ..Waits::default() }),
+            BUSY_REFRESH,
+        );
+    }
+
+    #[test]
+    fn deadlines_wake_the_window_when_they_are_due_and_never_spin_it() {
+        let position = Waits { position_save: Some(milliseconds(120)), ..Waits::default() };
+        assert_eq!(next_wake(&position), milliseconds(120));
+        let overdue = Waits { position_save: Some(Duration::ZERO), ..Waits::default() };
+        assert_eq!(next_wake(&overdue), BUSY_REFRESH);
+        // A tray that cannot be added is retried, but not in a tight loop.
+        let tray = Waits { tray_retry: Some(Duration::ZERO), ..Waits::default() };
+        assert_eq!(next_wake(&tray), RETRY_FLOOR);
+        let tray = Waits { tray_retry: Some(milliseconds(1_400)), ..Waits::default() };
+        assert_eq!(next_wake(&tray), milliseconds(1_400));
+        let scan = Waits { options_scan: Some(milliseconds(900)), ..Waits::default() };
+        assert_eq!(next_wake(&scan), milliseconds(900));
+        let stuck = Waits { options_scan: Some(Duration::ZERO), ..Waits::default() };
+        assert_eq!(next_wake(&stuck), RETRY_FLOOR);
+    }
+
+    #[test]
+    fn the_resume_countdown_wakes_once_per_shown_second_and_at_the_resume() {
+        assert_eq!(countdown_tick(milliseconds(4_300)), milliseconds(302));
+        // "4" is already showing at exactly four seconds; "3" follows a second later.
+        assert_eq!(countdown_tick(Duration::from_secs(4)), milliseconds(1_002));
+        assert_eq!(countdown_tick(milliseconds(700)), milliseconds(702));
+        for remaining in [4_300, 4_000, 700, 1] {
+            let remaining = milliseconds(remaining);
+            let before = paused_status(Some(remaining));
+            let after = remaining.saturating_sub(countdown_tick(remaining));
+            assert!(after.is_zero() || paused_status(Some(after)) != before);
+        }
+
+        let shown = Waits {
+            auto_resume: Some(milliseconds(4_300)),
+            countdown_shown: true,
+            ..Waits::default()
+        };
+        assert_eq!(next_wake(&shown), milliseconds(302));
+        // Unseen, the countdown costs nothing until capture actually resumes.
+        let unseen = Waits { countdown_shown: false, ..shown.clone() };
+        assert_eq!(next_wake(&unseen), SAFETY_TICK);
+        let hidden = Waits { hidden: true, auto_resume: Some(milliseconds(900)), ..shown };
+        assert_eq!(next_wake(&hidden), milliseconds(900));
+    }
+
+    #[test]
+    fn the_recording_blink_wakes_at_each_half_second_while_it_is_visible() {
+        assert_eq!(blink_tick(0.0), milliseconds(502));
+        assert_eq!(blink_tick(0.2), milliseconds(302));
+        assert_eq!(blink_tick(0.75).as_millis(), 252);
+        assert_eq!(blink_tick(12.9).as_millis(), 102);
+        // The LED really is in its other half when that wake-up arrives.
+        for seconds in [0.0, 0.2, 0.499, 0.5, 0.75, 12.9] {
+            let lit = |time: f64| time.rem_euclid(1.0) < 0.5;
+            assert_ne!(lit(seconds), lit(seconds + blink_tick(seconds).as_secs_f64()));
+        }
+        let recording = Waits { blink: Some(0.2), ..Waits::default() };
+        assert_eq!(next_wake(&recording), milliseconds(302));
+        assert_eq!(next_wake(&Waits { hidden: true, ..recording }), SAFETY_TICK);
+    }
+
+    #[test]
+    fn display_only_waits_stop_while_the_window_is_hidden() {
+        let shown = Waits {
+            meters_live: true,
+            fine_edit: Some(milliseconds(100)),
+            waveform: Some(milliseconds(40)),
+            options_scan: Some(milliseconds(600)),
+            ..Waits::default()
+        };
+        assert_eq!(next_wake(&shown), milliseconds(40));
+        assert_eq!(next_wake(&Waits { waveform: None, ..shown.clone() }), milliseconds(151));
+        assert_eq!(
+            next_wake(&Waits { waveform: None, fine_edit: None, ..shown.clone() }),
+            METER_STALE_CHECK,
+        );
+        // A waveform that is already due is drawn on the next frame, not in a spin.
+        assert_eq!(next_wake(&Waits { waveform: Some(Duration::ZERO), ..shown.clone() }), BUSY_REFRESH);
+        assert_eq!(next_wake(&Waits { hidden: true, ..shown }), SAFETY_TICK);
+    }
+
+    #[test]
+    fn paused_status_counts_down_to_the_resume_and_stays_plain_when_there_is_none() {
+        assert_eq!(paused_status(None), "Paused");
+        let remaining = |idle| AutoResumeDelay::Seconds10.remaining(Duration::from_millis(idle));
+        assert_eq!(paused_status(remaining(0)), "Paused · resumes in 10 s");
+        assert_eq!(paused_status(remaining(2_100)), "Paused · resumes in 8 s");
+        assert_eq!(paused_status(remaining(9_950)), "Paused · resumes in 1 s");
+        // The frame on which the delay runs out resumes capture and shows no zero.
+        assert_eq!(paused_status(remaining(10_000)), "Paused · resumes in 1 s");
+        assert_eq!(
+            paused_status(AutoResumeDelay::Off.remaining(Duration::from_secs(60))),
+            "Paused"
+        );
+
+        assert_eq!(idle_status(None, ""), "");
+        assert_eq!(idle_status(None, "Saved snapshot a.wav"), "Saved snapshot a.wav");
+        assert_eq!(idle_status(Some("Paused".into()), ""), "Paused");
+        assert_eq!(
+            idle_status(Some(paused_status(remaining(3_000))), "Saved snapshot a.wav"),
+            "Paused · resumes in 7 s · Saved snapshot a.wav"
+        );
+    }
+
+    #[test]
+    fn capture_indicator_ranks_failure_over_pause_over_recording_over_waiting() {
+        use CaptureIndicator::{Paused, Recording, Unavailable, Waiting};
+        assert_eq!(CaptureIndicator::new(true, true, true), Unavailable);
+        assert_eq!(CaptureIndicator::new(false, true, true), Paused);
+        assert_eq!(CaptureIndicator::new(false, false, true), Recording);
+        assert_eq!(CaptureIndicator::new(false, false, false), Waiting);
+        assert_eq!(
+            [Unavailable, Paused, Recording, Waiting].map(CaptureIndicator::label),
+            ["Capture unavailable", "Paused", "Recording", "Waiting for sound"]
+        );
+
+        // In waveform-only mode colour alone has to tell the four states apart, in both halves
+        // of the recording blink, against the dark plot.
+        let plot = Color32::from_rgb(22, 26, 29);
+        let distance = |a: Color32, b: Color32| {
+            a.to_array().into_iter().zip(b.to_array()).take(3)
+                .map(|(a, b)| u32::from(a.abs_diff(b))).sum::<u32>()
+        };
+        for lit in [false, true] {
+            let colors = [Unavailable, Paused, Recording, Waiting].map(|state| state.compact_color(lit));
+            for (index, color) in colors.iter().enumerate() {
+                assert!(distance(*color, plot) >= 90, "{color:?} is lost on the plot");
+                for other in &colors[index + 1..] {
+                    assert!(distance(*color, *other) >= 90, "{color:?} is too close to {other:?}");
+                }
+            }
+        }
+        assert_eq!(Recording.compact_color(true), Recording.led_color(true));
+        assert_eq!(Unavailable.compact_color(false), ERROR_LED);
+    }
+
+    #[test]
+    fn compact_status_reports_the_failing_source_and_keeps_the_latest_message() {
+        assert_eq!(capture_problem(None, [None, None], true), None);
+        assert_eq!(
+            capture_problem(Some("No audio device"), [Some("unplugged"), None], true).as_deref(),
+            Some("No audio device")
+        );
+        // One lane can fail while the other keeps recording, so name the lane.
+        assert_eq!(
+            capture_problem(None, [None, Some("unplugged")], true).as_deref(),
+            Some("Source B: unplugged")
+        );
+        assert_eq!(
+            capture_problem(None, [Some("no center channel"), None], false).as_deref(),
+            Some("no center channel")
+        );
+
+        assert_eq!(compact_status_text("Recording", None, ""), "Recording");
+        assert_eq!(
+            compact_status_text("Paused · resumes in 7 s", None, "Saved snapshot a.wav"),
+            "Paused · resumes in 7 s · Saved snapshot a.wav"
+        );
+        assert_eq!(
+            compact_status_text("Capture unavailable", Some("No audio device"), "No audio device"),
+            "Capture unavailable · No audio device"
+        );
+    }
+
+    #[test]
+    fn compact_status_mark_fits_the_smallest_window_and_truncates_a_long_problem() {
+        let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(WAVEFORM_MIN_WIDTH, WAVEFORM_MIN_HEIGHT));
+        let paint = |indicator, problem: Option<&str>| {
+            let context = egui::Context::default();
+            let mut hover = Rect::NOTHING;
+            let mut output = context.run_ui(egui::RawInput {
+                screen_rect: Some(plot),
+                ..Default::default()
+            }, |ui| {
+                hover = paint_compact_status(&ui.painter_at(plot), plot, indicator, true, problem);
+            });
+            let shapes: Vec<_> = std::mem::take(&mut output.shapes)
+                .into_iter().map(|clipped| clipped.shape).collect();
+            output.drop_without_applying_deltas();
+            (hover, shapes)
+        };
+        let fill = |shape: &egui::Shape| match shape {
+            egui::Shape::Circle(circle) => Some(circle.fill),
+            egui::Shape::Rect(rect) => Some(rect.fill),
+            _ => None,
+        };
+        let written = |shapes: &[egui::Shape]| shapes.iter().find_map(|shape| match shape {
+            egui::Shape::Text(text) => Some(text.clone()),
+            _ => None,
+        });
+
+        for indicator in [CaptureIndicator::Recording, CaptureIndicator::Waiting, CaptureIndicator::Unavailable] {
+            let (hover, shapes) = paint(indicator, None);
+            assert!(plot.contains_rect(hover) && hover.width() >= 12.0, "{indicator:?} {hover:?}");
+            assert!(shapes.iter().filter_map(fill).any(|color| color == indicator.compact_color(true)));
+            assert!(written(&shapes).is_none());
+        }
+        // Paused is two bars, so it differs from the other states by shape as well as colour.
+        let (_, shapes) = paint(CaptureIndicator::Paused, None);
+        let bars = shapes.iter().filter_map(fill).filter(|color| *color == COMPACT_PAUSED).count();
+        assert_eq!(bars, 2);
+
+        // A source problem turns the mark amber whatever else capture is doing, and its text
+        // stays on one line inside the plot however long the message is.
+        let problem = "Source B: the audio device was unplugged or is in use by another application ".repeat(4);
+        let (hover, shapes) = paint(CaptureIndicator::Recording, Some(&problem));
+        assert!(shapes.iter().filter_map(fill).any(|color| color == ERROR_LED));
+        assert!(!shapes.iter().filter_map(fill).any(|color| color == RECORDING_LIT));
+        let text = written(&shapes).expect("the problem is written on the plot");
+        assert_eq!(text.galley.rows.len(), 1);
+        assert!(text.galley.elided);
+        assert!(text.pos.x + text.galley.size().x <= plot.right());
+        assert!(plot.contains_rect(hover) && hover.width() > 150.0, "{hover:?}");
+
+        let (hover, shapes) = paint(CaptureIndicator::Unavailable, Some("No audio device"));
+        let text = written(&shapes).unwrap();
+        assert_eq!(text.galley.text(), "No audio device");
+        assert!(!text.galley.elided);
+        assert!(hover.right() >= text.pos.x + text.galley.size().x - 0.5);
+    }
+
+    #[test]
+    fn window_keys_run_commands_once_and_leave_other_chords_alone() {
+        let key = |key, modifiers, pressed, repeat| egui::Event::Key {
+            key, physical_key: None, pressed, repeat, modifiers,
+        };
+        let none = egui::Modifiers::NONE;
+        let press = |code, modifiers| window_shortcut(&[key(code, modifiers, true, false)]);
+        assert_eq!(press(egui::Key::Space, none), Some(WindowCommand::ToggleCapture));
+        assert_eq!(press(egui::Key::Delete, none), Some(WindowCommand::Clear));
+        assert_eq!(press(egui::Key::S, egui::Modifiers::COMMAND), Some(WindowCommand::SaveSnapshot));
+        // Windows reports Ctrl as both `ctrl` and `command`.
+        let ctrl = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+        assert_eq!(press(egui::Key::S, ctrl), Some(WindowCommand::SaveSnapshot));
+
+        assert_eq!(press(egui::Key::S, none), None);
+        assert_eq!(press(egui::Key::S, ctrl | egui::Modifiers::SHIFT), None);
+        // Alt+Space belongs to the system menu and Alt is the window-move modifier.
+        assert_eq!(press(egui::Key::Space, egui::Modifiers::ALT), None);
+        assert_eq!(press(egui::Key::Delete, egui::Modifiers::SHIFT), None);
+        // Backspace and Escape keep their existing job of cancelling a selection.
+        assert_eq!(press(egui::Key::Backspace, none), None);
+        assert_eq!(press(egui::Key::Escape, none), None);
+
+        // A held key repeats, and releasing it is not a press: neither toggles capture again.
+        assert_eq!(window_shortcut(&[key(egui::Key::Space, none, true, true)]), None);
+        assert_eq!(window_shortcut(&[key(egui::Key::Space, none, false, false)]), None);
+        assert_eq!(
+            window_shortcut(&[
+                egui::Event::PointerMoved(Pos2::ZERO),
+                key(egui::Key::Space, none, true, true),
+                key(egui::Key::Delete, none, true, false),
+            ]),
+            Some(WindowCommand::Clear)
+        );
+    }
+
+    #[test]
     fn selection_and_unread_snapshot_cleanup_run_off_the_calling_thread() {
         struct ObservedDrop<T> { _value: T, observed: mpsc::Sender<thread::ThreadId> }
         impl<T> Drop for ObservedDrop<T> {
@@ -3541,16 +4185,14 @@ mod tests {
         }
         let retirement = UiRetirement::new().unwrap();
         let caller = thread::current().id();
-        let snapshots: Arc<[Snapshot]> = vec![Snapshot { first_frame: 1, sample_rate: 48000,
-            channels: 1, samples: vec![0.1; 4] }].into();
+        let snapshots: Arc<[FrozenTrack]> = vec![FrozenTrack::from_interleaved(48000, 1, 1, &[0.1; 4]).unwrap()].into();
         let first = Arc::downgrade(&snapshots);
         let (observed, drops) = mpsc::channel();
         assert!(retirement.retire(ObservedDrop { _value: FrozenEdit { snapshots,
             bars: vec![1], retention_seconds: 600 }, observed: observed.clone() }).is_ok());
         assert_ne!(drops.recv_timeout(Duration::from_secs(2)).unwrap(), caller);
 
-        let snapshots: Arc<[Snapshot]> = vec![Snapshot { first_frame: 1, sample_rate: 48000,
-            channels: 1, samples: vec![0.2; 4] }].into();
+        let snapshots: Arc<[FrozenTrack]> = vec![FrozenTrack::from_interleaved(48000, 1, 1, &[0.2; 4]).unwrap()].into();
         let second = Arc::downgrade(&snapshots);
         let (result, unread) = mpsc::channel();
         result.send(Some(snapshots)).unwrap();
@@ -3564,8 +4206,7 @@ mod tests {
 
     #[test]
     fn an_unstarted_wav_job_keeps_its_audio_available_for_background_retirement() {
-        let snapshots: Arc<[Snapshot]> = vec![Snapshot { first_frame: 1, sample_rate: 48000,
-            channels: 1, samples: vec![0.1; 4] }].into();
+        let snapshots: Arc<[FrozenTrack]> = vec![FrozenTrack::from_interleaved(48000, 1, 1, &[0.1; 4]).unwrap()].into();
         let weak = Arc::downgrade(&snapshots);
         let clip = WavClip::new(snapshots, None, PathBuf::new(), WavExportProfile::default(),
             [ChannelRoute::Merged; 2], false, None).unwrap();
@@ -3597,30 +4238,8 @@ mod tests {
     }
 
     #[test]
-    fn shift_pointer_input_selects_and_snaps_while_ctrl_remains_free() {
-        for (ctrl, shift, selecting, snap) in [
-            (false, true, true, true), (true, false, true, false),
-            (true, true, true, true), (false, false, false, false),
-        ] {
-            let context = egui::Context::default();
-            let modifiers = egui::Modifiers { ctrl, shift, ..Default::default() };
-            let point = Pos2::new(17.0, 27.0);
-            context.run_ui(egui::RawInput {
-                events: vec![egui::Event::PointerMoved(point), egui::Event::PointerButton {
-                    pos: point, button: PointerButton::Primary, pressed: true, modifiers,
-                }],
-                ..Default::default()
-            }, |ui| {
-                let press = ui.input(|input| waveform_press(&input.events));
-                assert_eq!(press, Some((point, selecting, snap)));
-            }).drop_without_applying_deltas();
-        }
-    }
-
-    #[test]
     fn pinned_preview_preserves_absolute_frames_and_independent_channels() {
-        let stereo = Snapshot { first_frame: 1000, sample_rate: 48000, channels: 2,
-            samples: vec![0.1, 0.7, 0.2, 0.6, 0.3, 0.5, 0.4, 0.4] };
+        let stereo = FrozenTrack::from_interleaved(48000, 2, 1000, &[0.1, 0.7, 0.2, 0.6, 0.3, 0.5, 0.4, 0.4]).unwrap();
         let key = EditPreviewKey { frames: 1001..1003,
             views: [(0, WaveformView::Left), (0, WaveformView::Right)], rows: 2, bins: 2 };
         let peaks = edit_preview(&[stereo], &key);
@@ -3628,8 +4247,8 @@ mod tests {
         assert_eq!(peaks[0].high, [0.2, 0.3]);
         assert_eq!(peaks[1].low, [0.6, 0.5]);
         let tracks = [
-            Snapshot { first_frame: 1000, sample_rate: 48000, channels: 1, samples: vec![0.1,0.2,0.3,0.4] },
-            Snapshot { first_frame: 1000, sample_rate: 48000, channels: 1, samples: vec![-0.1,-0.2,-0.3,-0.4] },
+            FrozenTrack::from_interleaved(48000, 1, 1000, &[0.1,0.2,0.3,0.4]).unwrap(),
+            FrozenTrack::from_interleaved(48000, 1, 1000, &[-0.1,-0.2,-0.3,-0.4]).unwrap(),
         ];
         let key = EditPreviewKey { views: [(0, WaveformView::Merged), (1, WaveformView::Merged)], ..key };
         let peaks = edit_preview(&tracks, &key);
@@ -3756,15 +4375,6 @@ mod tests {
     }
 
     #[test]
-    fn waveform_pan_clamps_to_retained_frames_and_preserves_view_length() {
-        assert_eq!(fit_frame_range(&(100..500), 170, 120), 170..290);
-        assert_eq!(fit_frame_range(&(100..500), 0, 120), 100..220);
-        assert_eq!(fit_frame_range(&(100..500), 900, 120), 380..500);
-        assert_eq!(fit_frame_range(&(220..270), 200, 120), 220..270);
-        assert_eq!(fit_frame_range(&(220..220), 900, 120), 220..220);
-    }
-
-    #[test]
     fn dual_drag_exports_selected_routes_and_cleans_up_canceled_files() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3774,19 +4384,9 @@ mod tests {
             "Backtracking-dual-drag-{}-{nonce}",
             std::process::id()
         ));
-        let snapshots: Arc<[Snapshot]> = vec![
-            Snapshot {
-                first_frame: 10,
-                sample_rate: 48_000,
-                channels: 1,
-                samples: vec![0.0, 0.5, 1.0],
-            },
-            Snapshot {
-                first_frame: 10,
-                sample_rate: 48_000,
-                channels: 1,
-                samples: vec![0.0, -0.5, -1.0],
-            },
+        let snapshots: Arc<[FrozenTrack]> = vec![
+            FrozenTrack::from_interleaved(48_000, 1, 10, &[0.0, 0.5, 1.0]).unwrap(),
+            FrozenTrack::from_interleaved(48_000, 1, 10, &[0.0, -0.5, -1.0]).unwrap(),
         ]
         .into();
         let prepare = |force_mono| {

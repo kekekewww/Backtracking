@@ -37,6 +37,8 @@ jobs:
         run: rustup toolchain install 1.99.1 --profile minimal
       - name: Test capture core
         run: cargo +1.99.1 test --workspace --locked
+      - name: Test shared interface
+        run: cargo +1.99.1 test --locked --manifest-path crates/backtracking-ui/Cargo.toml
       - name: Test native desktop
         run: cargo +1.99.1 test --locked --manifest-path desktop/windows/Cargo.toml
       - name: Test native plug-in

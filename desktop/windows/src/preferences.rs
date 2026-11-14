@@ -849,6 +849,26 @@ mod tests {
     }
 
     #[test]
+    fn auto_resume_off_is_stored_as_zero_seconds_and_survives_a_restart() {
+        let preferences = workspace_preferences("auto-resume-off");
+        assert_eq!(preferences.load().idle_resume, AutoResumeDelay::Seconds10);
+
+        let writer = PreferenceWriter::new(preferences.clone()).unwrap();
+        writer.save(Key::IdleResume, &AutoResumeDelay::Off.seconds().to_string()).unwrap();
+        writer.flush().unwrap();
+        // The file keeps the value older versions wrote for this choice.
+        assert_eq!(preferences.read(Key::IdleResume).as_deref(), Some("0"));
+        assert_eq!(preferences.load().idle_resume, AutoResumeDelay::Off);
+
+        for choice in AutoResumeDelay::ALL {
+            preferences.save(Key::IdleResume, &choice.seconds().to_string()).unwrap();
+            assert_eq!(preferences.load().idle_resume, choice);
+        }
+        preferences.save(Key::IdleResume, "3").unwrap();
+        assert_eq!(preferences.load().idle_resume, AutoResumeDelay::Seconds10);
+    }
+
+    #[test]
     fn mono_wav_export_defaults_off_and_persists_changes() {
         let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(

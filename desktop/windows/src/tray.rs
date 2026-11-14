@@ -155,6 +155,16 @@ impl Tray {
         self.state.registered.get()
     }
 
+    /// Time until `refresh` should try to add the icon again, while it is missing.
+    pub(crate) fn retry_in(&self) -> Option<Duration> {
+        (self.state.attached.get() && !self.state.registered.get()).then(|| {
+            self.state
+                .next_registration
+                .get()
+                .saturating_duration_since(Instant::now())
+        })
+    }
+
     pub(crate) fn take_taskbar_recheck(&self) -> bool {
         self.state.recheck_taskbar.replace(false)
     }

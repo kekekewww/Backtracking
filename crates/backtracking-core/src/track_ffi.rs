@@ -733,6 +733,8 @@ unsafe fn export_snapshots(
         profile,
         routes,
         force_mono,
+        // The desktop apps capture system audio and have no tempo to report.
+        None,
     )
     .ok()?;
     let result: Option<Vec<CString>> = paths
