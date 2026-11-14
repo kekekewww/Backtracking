@@ -22,19 +22,23 @@ Fonts and licences are in `../fonts/` (`fonts.css` has every `@font-face`).
 
 ## Availability (state it exactly like this)
 
-- **Windows**: a ready-to-run download exists. The latest GitHub release is v0.1.5 and contains the
-  desktop app plus VST3 and CLAP for Windows x64.
-- **macOS desktop, macOS plug-ins, Linux shortcut helper**: built from source following the user
-  guide. There is no packaged download for them. Never show a "Download for macOS" button. Use
-  "Build from source" wording and link to the guide.
-- Requirements that may be shown: Windows 10/11 x64; macOS 14.2 or later.
+Product owner's decision (overrides any earlier wording): availability is one message everywhere.
+
+- The call to action is **"Download from GitHub"** / **「從 GitHub 下載」**, linking to the repository.
+- Next to it, name the editions as plain text: **Windows / macOS / VST3 / CLAP**.
+- Do not split platforms into "download" versus "build from source", do not write "Build from
+  source" anywhere, and do not make per-platform download buttons ("Download for Windows",
+  "Download for macOS"). One button, one destination.
+- Do not quote a version number.
+- Requirements that may be shown as small print: Windows 10/11 x64; macOS 14.2 or later.
+- The Linux shortcut helper is not part of the editions line. Where it has its own poster or card,
+  it also points to GitHub with the same call to action.
 
 ## Links
 
 - Repository: https://github.com/kekekewww/Backtracking
-- Windows download: https://github.com/kekekewww/Backtracking/releases/latest
+- Download (the one call-to-action destination): https://github.com/kekekewww/Backtracking
 - User guide: https://github.com/kekekewww/Backtracking/blob/main/docs/USER_GUIDE.md
-- Build instructions: https://github.com/kekekewww/Backtracking/blob/main/docs/USER_GUIDE.md#安裝與建置--installation-and-build
 - Support: https://buymeacoffee.com/kamelkyp/e/596694
 - Landing page (planned): https://backtracking.kamelkyp.com
 - Short URL to print on posters and end cards: `backtracking.kamelkyp.com`
@@ -50,9 +54,8 @@ Fonts and licences are in `../fonts/` (`fonts.css` has every `@font-face`).
 | History scale | 10 s · 20 s · 30 s · 60 s · 3 min · 5 min · 10 min | 10 秒 · 20 秒 · 30 秒 · 60 秒 · 3 分鐘 · 5 分鐘 · 10 分鐘 |
 | Editions line | Windows / macOS / VST3 / CLAP | Windows / macOS / VST3 / CLAP |
 | Licence line | Open source · Apache-2.0 | 開放原始碼 · Apache-2.0 |
-| Primary CTA | Download for Windows | 下載 Windows 版 |
-| Secondary CTA | View on GitHub | 前往 GitHub |
-| Build CTA | Build from source | 從原始碼建置 |
+| Primary CTA | Download from GitHub | 從 GitHub 下載 |
+| Secondary CTA | Read the user guide | 閱讀使用手冊 |
 | Support CTA | Support on Buy Me a Coffee | 在 Buy Me a Coffee 贊助 |
 
 ### The three beats (used by posters, videos and the landing page in this order)
@@ -84,10 +87,10 @@ mega headline and sub-line. Headlines below are the starting point. Line breaks 
 
 | Edition | Mega headline EN | 繁體中文 | Sub-line EN | 繁體中文 |
 | --- | --- | --- | --- | --- |
-| Windows desktop | FROM ANY / APP. | 任何 App / 都能留。 | System playback, a microphone, or one chosen app. Select it and drag out a WAV. Download for Windows 10/11 x64. | 系統播放、麥克風或指定 App，框選後直接拖出 WAV。提供 Windows 10／11 x64 下載。 |
-| macOS desktop | OFF YOUR / MAC. | Mac 的聲音 / 拿回來。 | System playback, a microphone, or one chosen app, on macOS 14.2 or later. Build from source. | 系統播放、麥克風或指定 App，支援 macOS 14.2 以上。請從原始碼建置。 |
+| Windows desktop | FROM ANY / APP. | 任何 App / 都能留。 | System playback, a microphone, or one chosen app. Select it and drag out a WAV. Download from GitHub. | 系統播放、麥克風或指定 App，框選後直接拖出 WAV。從 GitHub 下載。 |
+| macOS desktop | OFF YOUR / MAC. | Mac 的聲音 / 拿回來。 | System playback, a microphone, or one chosen app, on macOS 14.2 or later. Download from GitHub. | 系統播放、麥克風或指定 App，支援 macOS 14.2 以上。從 GitHub 下載。 |
 | VST3 / CLAP plug-in | ON ANY / TRACK. | 每一軌 / 都留著。 | Insert it on a track, group or master. It keeps what passed through and hands it back as a WAV. | 插在音軌、群組或主輸出上，留住經過的聲音，再拖出成 WAV。 |
-| Linux shortcut helper | ONE KEY. / SAVED. | 一個按鍵 / 存下來。 | A global Super + ` shortcut that tells a Backtracking plug-in instance to save a snapshot. Build from source. | 全域 Super + ` 快捷鍵，讓 Backtracking 插件儲存快照。請從原始碼建置。 |
+| Linux shortcut helper | ONE KEY. / SAVED. | 一個按鍵 / 存下來。 | A global Super + ` shortcut that tells a Backtracking plug-in instance to save a snapshot. Download from GitHub. | 全域 Super + ` 快捷鍵，讓 Backtracking 插件儲存快照。從 GitHub 下載。 |
 
 The Linux item is only a shortcut helper for the plug-in. Do not present it as a Linux recorder app.
 
