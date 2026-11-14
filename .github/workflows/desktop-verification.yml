@@ -126,6 +126,17 @@ jobs:
                   cat "$log"
                 fi
               done
+              if command -v xmodmap >/dev/null 2>&1; then
+                printf '%s\n' 'X11 diagnostic: modifier map'
+                xmodmap -pm || true
+                printf '%s\n' 'X11 diagnostic: relevant key symbols'
+                xmodmap -pke | awk '/grave|asciitilde|Super_L|Super_R/' || true
+              fi
+              if command -v xkbcomp >/dev/null 2>&1; then
+                printf '%s\n' 'X11 diagnostic: physical key names and Super symbols'
+                xkbcomp -w 0 -xkb "$DISPLAY" - |
+                  awk '/xkb_keycodes|minimum|maximum|<TLDE>|<LWIN>|<RWIN>|modifier_map|Super_L|Super_R/' || true
+              fi
             fi
             exit "$result"
           }

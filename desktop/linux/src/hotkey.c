@@ -17,7 +17,10 @@ static int remember_x11_error(Display *display, XErrorEvent *event) {
 
 static int physical_grave_key(Display *display) {
     XkbDescPtr keyboard = XkbGetKeyboard(display, XkbGBN_KeyNamesMask, XkbUseCoreKbd);
-    if (!keyboard) return 0;
+    if (!keyboard) {
+        fputs("XKB did not return a keyboard description.\n", stderr);
+        return 0;
+    }
 
     int result = 0;
     if (keyboard->names && keyboard->names->keys) {
@@ -27,6 +30,12 @@ static int physical_grave_key(Display *display) {
                 break;
             }
         }
+    } else {
+        fputs("XKB did not return physical key names.\n", stderr);
+    }
+    if (!result) {
+        fprintf(stderr, "No TLDE name among XKB keycodes %u through %u.\n",
+            (unsigned int)keyboard->min_key_code, (unsigned int)keyboard->max_key_code);
     }
     XkbFreeKeyboard(keyboard, XkbAllComponentsMask, True);
     return result;
@@ -62,7 +71,8 @@ static int register_x11(Display *display, int previous_key) {
     int key = physical_grave_key(display);
     ModifierMasks masks = modifier_masks(display);
     if (!key || !masks.super) {
-        fputs("No physical TLDE key or Super modifier in the X11 keymap.\n", stderr);
+        fprintf(stderr, "X11 shortcut lookup failed: physical TLDE keycode=%d, Super mask=0x%x.\n",
+            key, masks.super);
         return 0;
     }
 
