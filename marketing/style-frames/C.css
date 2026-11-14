@@ -1,0 +1,84 @@
+/* Direction C — Rewind.
+   Flat ultramarine field, giant ultra-condensed caps, the icon's mint as the only highlight.
+   Record-sleeve / gig-poster attitude: oversized type, layered objects, horizontal motion. */
+@import url("../fonts/fonts.css");
+
+:root {
+  --c-blue: #1e32d2;
+  --c-blue-2: #2a3fe6;     /* tone-on-tone texture */
+  --c-blue-deep: #14229c;
+  --c-ink: #070c3d;
+  --c-paper: #f4f1e8;
+  --c-paper-2: rgba(244, 241, 232, 0.72);
+  --c-mint: #b0fbd3;        /* icon gradient start */
+  --c-mint-2: #55dca7;      /* icon gradient end */
+  --c-sans: "Archivo", sans-serif;
+  --c-mono: "Geist Mono", monospace; /* only inside the app mock-up readouts */
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: var(--c-blue); }
+body { font-family: var(--c-sans); color: var(--c-paper); -webkit-font-smoothing: antialiased; }
+.frame { position: relative; overflow: hidden; background: var(--c-blue); }
+.frame > * { position: absolute; }
+
+.lockup { display: flex; align-items: center; gap: 16px; }
+.lockup img { display: block; }
+.lockup .wm { font-weight: 700; font-stretch: 100%; letter-spacing: -0.01em; }
+
+/* expanded small caps: labels, editions, scale */
+.wide {
+  font-stretch: 125%;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.mega {
+  font-stretch: 62%;
+  font-weight: 900;
+  text-transform: uppercase;
+  line-height: 0.8;
+  letter-spacing: -0.01em;
+  color: var(--c-paper);
+}
+.mega .m { color: var(--c-mint); }
+.sub { font-stretch: 100%; font-weight: 400; color: var(--c-paper-2); line-height: 1.38; }
+.sub b { color: var(--c-paper); font-weight: 600; }
+
+/* history scale: the real History options laid out as a tape counter */
+.scale { text-transform: none; display: flex; justify-content: space-between; align-items: flex-end; border-top: 2px solid var(--c-paper); padding-top: 12px; }
+.scale span { position: relative; color: var(--c-paper-2); }
+.scale span::before { content: ""; position: absolute; left: 0; top: -14px; width: 2px; height: 12px; background: var(--c-paper); }
+.scale span.on { color: var(--c-mint); }
+.scale span.on::before { background: var(--c-mint); height: 22px; top: -24px; width: 4px; }
+
+.bgwave { color: var(--c-blue-2); }
+
+.btp.c {
+  --btp-sel: #c21f6c;
+  --btp-sel-line: #ff4f9a;
+  --btp-sel-band: rgba(255, 79, 154, 0.07);
+  box-shadow: 18px 18px 0 var(--c-ink);
+}
+
+/* dragged WAV: solid mint slab */
+.slab {
+  display: flex; align-items: center; gap: 16px;
+  padding: 14px 24px 14px 16px;
+  background: var(--c-mint);
+  color: var(--c-ink);
+  box-shadow: 10px 10px 0 var(--c-ink);
+}
+.slab .ic {
+  width: 40px; height: 48px; background: var(--c-ink); color: var(--c-mint);
+  display: flex; align-items: flex-end; justify-content: center; padding-bottom: 6px;
+  font-stretch: 125%; font-weight: 800; font-size: 10px; letter-spacing: 0.04em;
+}
+.slab .n { font-weight: 800; font-stretch: 100%; font-size: 21px; letter-spacing: -0.005em; }
+.slab .m { font-weight: 600; font-stretch: 125%; font-size: 12.5px; letter-spacing: 0.04em; margin-top: 3px; opacity: 0.75; }
+.streaks line { stroke: var(--c-mint); stroke-linecap: round; }
+.cursor { filter: drop-shadow(3px 3px 0 var(--c-ink)); }
+
+.editions { display: flex; gap: 0; color: var(--c-paper); text-transform: none; }
+.editions span + span::before { content: "/"; padding: 0 0.7em; color: var(--c-mint); }
+.rule { height: 2px; background: var(--c-paper); }

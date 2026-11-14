@@ -1,0 +1,120 @@
+/* Direction A — Evolved ("Night Session").
+   The existing kit's identity (dark green, mint, pink selection), tightened. */
+@import url("../fonts/fonts.css");
+
+:root {
+  --a-bg-0: #050d0b;
+  --a-bg-1: #0a1814;
+  --a-glow: #11362b;
+  --a-grid: rgba(176, 251, 211, 0.055);
+  --a-rule: #1d332c;
+  --a-mint-hi: #b0fbd3;   /* icon gradient start */
+  --a-mint: #86efbd;
+  --a-mint-deep: #55dca7; /* icon gradient end */
+  --a-pink: #ff6aa8;
+  --a-pink-deep: #e2367f;
+  --a-text: #eef6f2;
+  --a-muted: #93aba1;
+  --a-dim: #58726a;
+  --a-sans: "Geist", sans-serif;
+  --a-mono: "Geist Mono", monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: var(--a-bg-0); }
+body {
+  font-family: var(--a-sans);
+  color: var(--a-text);
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "ss01" 0;
+}
+.frame {
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse 70% 45% at 50% 66%, var(--a-glow) 0%, rgba(17, 54, 43, 0) 70%),
+    linear-gradient(180deg, var(--a-bg-1) 0%, var(--a-bg-0) 100%);
+}
+/* hairline grid that fades out toward the edges */
+.frame::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(var(--a-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--a-grid) 1px, transparent 1px);
+  background-size: 54px 54px;
+  background-position: -1px -1px;
+  -webkit-mask-image: radial-gradient(ellipse 75% 60% at 50% 60%, #000 20%, transparent 80%);
+  mask-image: radial-gradient(ellipse 75% 60% at 50% 60%, #000 20%, transparent 80%);
+  pointer-events: none;
+}
+.frame > * { position: absolute; }
+
+/* lockup: unaltered icon + wordmark */
+.lockup { display: flex; align-items: center; gap: 18px; }
+.lockup img { display: block; }
+.lockup .wm { font-weight: 600; letter-spacing: -0.02em; color: var(--a-text); }
+
+.label {
+  font-family: var(--a-mono);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--a-muted);
+}
+.headline {
+  font-weight: 640;
+  letter-spacing: -0.04em;
+  line-height: 0.96;
+  color: var(--a-text);
+}
+.headline .accent { color: var(--a-mint); }
+.sub { font-weight: 400; color: var(--a-muted); letter-spacing: -0.005em; }
+.sub b { color: var(--a-text); font-weight: 500; }
+
+/* time ruler above the panel (marketing graphic, not app UI) */
+.ruler { display: flex; justify-content: space-between; font-family: var(--a-mono); color: var(--a-dim); }
+.ruler span { position: relative; }
+.ruler .now { color: var(--a-mint); }
+
+/* the panel in A: real app chrome, kit pink for the selection */
+.btp.a {
+  --btp-sel: var(--a-pink-deep);
+  --btp-sel-line: var(--a-pink);
+  --btp-sel-band: rgba(255, 106, 168, 0.06);
+  --btp-mono: var(--a-mono);
+  box-shadow:
+    0 0 0 1px rgba(176, 251, 211, 0.06),
+    0 30px 80px rgba(0, 0, 0, 0.55),
+    0 0 120px rgba(85, 220, 167, 0.10);
+}
+
+/* dragged WAV (drag ghost) */
+.ghost {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 20px 14px 14px;
+  border-radius: 14px;
+  background: rgba(20, 34, 30, 0.92);
+  border: 1px solid rgba(255, 106, 168, 0.55);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.5), 0 0 0 6px rgba(255, 106, 168, 0.06);
+}
+.ghost .file {
+  width: 44px; height: 52px;
+  border-radius: 7px;
+  background: linear-gradient(180deg, var(--a-pink) 0%, var(--a-pink-deep) 100%);
+  display: flex; align-items: flex-end; justify-content: center;
+  padding-bottom: 7px;
+  font-family: var(--a-mono); font-weight: 700; font-size: 11px; letter-spacing: 0.04em; color: #2a0716;
+}
+.ghost .name { font-family: var(--a-mono); font-size: 17px; font-weight: 500; color: var(--a-text); }
+.ghost .meta { font-family: var(--a-mono); font-size: 13px; color: var(--a-muted); margin-top: 4px; letter-spacing: 0.02em; }
+
+.trail { overflow: visible; }
+.cursor { filter: drop-shadow(0 3px 4px rgba(0, 0, 0, 0.5)); }
+
+.editions { font-family: var(--a-mono); color: var(--a-muted); letter-spacing: 0.04em; }
+.editions .sep { color: var(--a-dim); padding: 0 0.55em; }
+.editions .hi { color: var(--a-text); }

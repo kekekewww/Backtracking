@@ -1,0 +1,65 @@
+/* Backtracking campaign fonts: Latin subsets (woff2) from Google Fonts, all SIL OFL 1.1.
+   Licence texts: OFL-*.txt in this folder. Sources: see FONTS.txt.
+   Latin subset covers U+0000-00FF, U+2000-206F (dashes, quotes, bullet), U+2212 (minus), U+2191/2193.
+   It does NOT include U+2190/2192 (left/right arrows): draw arrows as SVG. */
+
+@font-face {
+  font-family: "Geist";
+  src: url("Geist-Variable-latin.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: "Geist Mono";
+  src: url("GeistMono-Variable-latin.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("IBMPlexSans-Variable-latin.woff2") format("woff2");
+  font-weight: 100 700;
+  font-stretch: 85% 100%;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("IBMPlexMono-Regular-latin.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("IBMPlexMono-Medium-latin.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("IBMPlexMono-SemiBold-latin.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: "Archivo";
+  src: url("Archivo-Variable-latin.woff2") format("woff2");
+  font-weight: 100 900;
+  font-stretch: 62% 125%;
+  font-style: normal;
+  font-display: block;
+}
+/* Open Sans is the typeface the real app UI uses; only for the UI mock-up. */
+@font-face {
+  font-family: "Open Sans";
+  src: url("OpenSans-Variable-latin.woff2") format("woff2");
+  font-weight: 300 800;
+  font-stretch: 75% 100%;
+  font-style: normal;
+  font-display: block;
+}
