@@ -4,12 +4,56 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use backtracking_core::{AutoResumeDelay, DurationChoice, WavExportProfile, WavSampleFormat};
+use backtracking_core::{AutoResumeDelay, DurationChoice, WavExportProfile, WavSampleFormat, cleanup};
 use nice_plug::params::persist::{PersistentField, deserialize_field, serialize_field};
 
 pub(crate) const TRANSPARENCY_LEVELS: [u8; 5] = [0, 25, 50, 75, 100];
 pub(crate) const DEFAULT_ACCENT: [u8; 3] = [103, 231, 181];
 const AUTO_RESUME_FIELD: &str = "auto_resume_delay_seconds";
+/// The widths the waveform border can have, in points.
+pub(crate) const BORDER_WIDTHS: [u8; 4] = [1, 2, 3, 4];
+
+/// When the capture status light in the toolbar is shown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum StatusMark {
+    #[default]
+    Always,
+    /// Only while capture is paused.
+    Paused,
+    Never,
+}
+
+impl StatusMark {
+    pub(crate) const ALL: [Self; 3] = [Self::Always, Self::Paused, Self::Never];
+
+    #[cfg(feature = "editor")]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Always => "Always",
+            Self::Paused => "Only when paused",
+            Self::Never => "Never",
+        }
+    }
+
+    /// The value kept in the project.
+    fn stored(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Paused => "paused",
+            Self::Never => "never",
+        }
+    }
+
+    /// Whether the light is drawn while capture is `paused` or not.
+    #[cfg(feature = "editor")]
+    pub(crate) fn shown(self, paused: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Paused => paused,
+            Self::Never => false,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MeterMode {
@@ -83,14 +127,21 @@ pub(crate) struct SessionSettings {
     pub(crate) show_seconds_lines: bool,
     pub(crate) seconds_interval: u32,
     pub(crate) border_enabled: bool,
+    pub(crate) border_width: u8,
     pub(crate) border_color: Option<[u8; 3]>,
     pub(crate) border_follows_background: bool,
+    pub(crate) show_title: bool,
+    pub(crate) show_meter: bool,
+    pub(crate) status_mark: StatusMark,
     pub(crate) capture_input: CaptureInput,
     pub(crate) sender_enabled: bool,
     pub(crate) sender_name: String,
     pub(crate) sender_id: Option<String>,
     pub(crate) output_dir: PathBuf,
     pub(crate) saved_dir: PathBuf,
+    /// The age in days at which the editor deletes its own old files from `output_dir`.
+    /// `None` keeps them all.
+    pub(crate) output_cleanup: Option<u16>,
 }
 
 impl SessionSettings {
@@ -121,14 +172,19 @@ impl Default for SessionSettings {
             show_seconds_lines: false,
             seconds_interval: 5,
             border_enabled: false,
+            border_width: 1,
             border_color: None,
             border_follows_background: true,
+            show_title: true,
+            show_meter: true,
+            status_mark: StatusMark::default(),
             capture_input: CaptureInput::default(),
             sender_enabled: false,
             sender_name: String::new(),
             sender_id: None,
             output_dir: backtracking.join("output"),
             saved_dir: backtracking.join("saved"),
+            output_cleanup: None,
         }
     }
 }
@@ -228,10 +284,22 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                 .filter(|value| [1, 5, 10].contains(value))
                 .unwrap_or(defaults.seconds_interval),
             border_enabled: fields.get("border_enabled").is_some_and(|value| value == "true"),
+            border_width: fields
+                .get("border_width")
+                .and_then(|value| value.parse().ok())
+                .filter(|value| BORDER_WIDTHS.contains(value))
+                .unwrap_or(defaults.border_width),
             border_color: fields.get("border_color").and_then(|value| deserialize_field(value).ok()),
             border_follows_background: fields
                 .get("border_follows_background")
                 .map_or(defaults.border_follows_background, |value| value == "true"),
+            // Projects saved before these choices existed show everything.
+            show_title: fields.get("show_title").is_none_or(|value| value != "false"),
+            show_meter: fields.get("show_meter").is_none_or(|value| value != "false"),
+            status_mark: fields
+                .get("status_mark")
+                .and_then(|value| StatusMark::ALL.into_iter().find(|mark| mark.stored() == value))
+                .unwrap_or_default(),
             capture_input: match fields.get("capture_input").map(String::as_str) {
                 Some("sidechain") => CaptureInput::Sidechain,
                 Some("both") => CaptureInput::Both,
@@ -250,6 +318,11 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                 .or_else(|| current.sender_id.clone()),
             output_dir: read_dir("output_dir").unwrap_or(defaults.output_dir),
             saved_dir: read_dir("saved_dir").unwrap_or(defaults.saved_dir),
+            // Anything but an offered age is Off: deleting files is never a default.
+            output_cleanup: fields
+                .get("output_cleanup_days")
+                .and_then(|value| value.parse().ok())
+                .and_then(cleanup::age_from_days),
         };
         *current = restored;
         self.1.store(current.requires_continuous_processing(), Ordering::Release);
@@ -304,6 +377,11 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
             ("show_seconds_lines".into(), settings.show_seconds_lines.to_string()),
             ("seconds_interval".into(), settings.seconds_interval.to_string()),
             ("border_enabled".into(), settings.border_enabled.to_string()),
+            ("border_width".into(), settings.border_width.to_string()),
+            ("show_title".into(), settings.show_title.to_string()),
+            ("show_meter".into(), settings.show_meter.to_string()),
+            ("status_mark".into(), settings.status_mark.stored().into()),
+            ("output_cleanup_days".into(), settings.output_cleanup.unwrap_or(0).to_string()),
             ("border_follows_background".into(), settings.border_follows_background.to_string()),
             ("capture_input".into(), match settings.capture_input {
                 CaptureInput::Main => "main",
@@ -406,6 +484,37 @@ mod tests {
     }
 
     #[test]
+    fn display_and_cleanup_choices_keep_their_defaults_until_a_valid_value_is_stored() {
+        let settings = SettingsStore::default();
+        // A project saved by an older version has none of these fields.
+        settings.set(BTreeMap::new());
+        let restored = settings.lock().clone();
+        assert!(restored.show_title && restored.show_meter);
+        assert_eq!(restored.status_mark, StatusMark::Always);
+        assert_eq!(restored.border_width, 1);
+        assert_eq!(restored.output_cleanup, None);
+
+        for (days, expected) in [("0", None), ("7", None), ("-10", None), ("soon", None),
+            ("10", Some(10)), ("90", Some(90)), ("91", None)]
+        {
+            settings.set(BTreeMap::from([("output_cleanup_days".into(), days.into())]));
+            assert_eq!(settings.lock().output_cleanup, expected, "{days}");
+        }
+        for (width, expected) in [("0", 1), ("4", 4), ("5", 1), ("wide", 1)] {
+            settings.set(BTreeMap::from([("border_width".into(), width.into())]));
+            assert_eq!(settings.lock().border_width, expected, "{width}");
+        }
+        settings.set(BTreeMap::from([
+            ("show_title".into(), "false".into()),
+            ("show_meter".into(), "nonsense".into()),
+            ("status_mark".into(), "sometimes".into()),
+        ]));
+        let restored = settings.lock().clone();
+        assert!(!restored.show_title && restored.show_meter);
+        assert_eq!(restored.status_mark, StatusMark::Always);
+    }
+
+    #[test]
     fn source_and_waveform_preferences_round_trip() {
         let source = SettingsStore::default();
         {
@@ -421,6 +530,11 @@ mod tests {
             settings.border_enabled = true;
             settings.border_color = Some([210, 180, 50]);
             settings.border_follows_background = false;
+            settings.border_width = 3;
+            settings.show_title = false;
+            settings.show_meter = false;
+            settings.status_mark = StatusMark::Paused;
+            settings.output_cleanup = Some(30);
         }
         let restored = SettingsStore::default();
         restored.set(source.map(Clone::clone));

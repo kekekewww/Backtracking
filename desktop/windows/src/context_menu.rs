@@ -32,8 +32,12 @@ impl WindowCommand {
         match self {
             Self::ToggleCapture => Some("Space"),
             Self::Clear => Some("Delete"),
-            Self::SaveSnapshot => Some("Ctrl+S"),
-            Self::WaveformOnly | Self::KeepOnTop | Self::Options | Self::Quit => None,
+            // Saving has the global shortcut only; the Options window names its key.
+            Self::SaveSnapshot
+            | Self::WaveformOnly
+            | Self::KeepOnTop
+            | Self::Options
+            | Self::Quit => None,
         }
     }
 }
@@ -226,7 +230,7 @@ mod tests {
             [
                 "Pause\tSpace",
                 "Clear\tDelete",
-                "Save snapshot\tCtrl+S",
+                "Save snapshot",
                 "-",
                 "Show waveform only",
                 "Keep on top",

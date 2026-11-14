@@ -14,12 +14,13 @@
 | 麥克風，或系統聲加麥克風 | 開啟桌面版，在 Options 選擇麥克風，或啟用 A／B 分開擷取。 |
 | 某一軌、群組或主輸出的聲音 | 把 VST3 或 CLAP 插入對應的效果鏈。插件接收該位置的 mono 或 stereo 音訊，並將音訊原樣傳給下游。 |
 | 軟體樂器加效果後的聲音 | 把插件放在樂器及要納入取樣的效果後面。若需要乾聲，就放在那些效果前面。 |
+| 在桌面版擷取 DAW 某一軌的聲音 | 在插件 Options 的 Sources 勾選 **Send to Backtracking desktop**，再到桌面版 Options 的 Sources，把音訊來源選為 **【Sender】**加上該軌名稱。Sender 列在系統音訊和預設麥克風之後。 |
 
 Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 ASIO、獨占模式或其他直接輸出路徑，使用音軌插件可直接取得該軌訊號。macOS 桌面版首次啟動時，請依系統提示允許錄製系統音訊。 [Windows WASAPI](https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording) · [Apple Core Audio](https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps)
 
 ### 開啟設定
 
-點擊工具列的齒輪，或在 Backtracking 視窗內按滑鼠右鍵，可開啟 **Options**。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
+點擊工具列的齒輪可開啟 **Options**。在插件視窗內按滑鼠右鍵也會開啟 Options；Windows／macOS 桌面版的右鍵則開啟選單，依序為 **Pause／Resume／Retry capture**、**Clear**、**Save snapshot**、**Show waveform only**、**Keep on top**、**Options…** 與 **Quit**。桌面版視窗有焦點時，按 `Space` 可暫停或恢復擷取，按 `Delete`（Mac 鍵盤為 `Fn` + `Delete`）清除目前錄音；有選區時會先取消選區。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
 
 Options 左側是分類，右側以一列一項的直向清單顯示設定。頁標題使用較大粗體，分組與欄位有明確層級，主要文字至少 15。保留時間、自動續錄、透明度和 WAV 格式使用下拉選單；少於 10 項時依實際項目數決定高度，最多顯示 10 列，超過則在選單內捲動。右側內容較長時向下捲動。桌面設定視窗可調整大小，底部關閉按鈕維持可見。插件會向 DAW 要求放大設定視窗，關閉後恢復原尺寸。
 
@@ -27,7 +28,7 @@ Options 左側是分類，右側以一列一項的直向清單顯示設定。頁
 
 ### 保留安靜片段
 
-在 **Options → Capture／擷取** 勾選 **Keep quiet sections**（macOS：**保留安靜片段**）。預設關閉，舊設定及沒有此欄位的插件專案也使用關閉狀態。
+在 **Options → Capture／擷取** 勾選 **Keep quiet sections**。預設關閉，舊設定及沒有此欄位的插件專案也使用關閉狀態。
 
 - **關閉**：沿用靜音壓縮，低於靜音偵測門檻的長安靜區間不占完整保留時間。
 - **開啟**：保留往後收到的低音量、數位零值，以及由已知來源時鐘確認的安靜區間。安靜本身會占用 History，可能使更早的音訊較快離開保留範圍。
@@ -44,7 +45,7 @@ macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`C
 
 - 在桌面版 Options 選擇系統播放、麥克風或指定 App。Windows 的指定 App 擷取需 OS build 20348 以上。macOS 首次擷取系統聲或麥克風時，請允許對應權限。
 - 每次打開來源下拉選單都會更新清單。Windows 會列出仍有播放串流的 App，包含串流已暫停的情況。macOS 會列出 Core Audio 辨識到有播放輸出的 App。找不到要選的 App 時，先讓它播放一段音訊，再重新打開選單。麥克風來源會列出系統目前可用的輸入裝置。
-- 可同時啟用 A 和 B。兩路各自選擇來源與 Left、Right、Center、Mid、Side 或 Merged。Merged 沿用來源的單聲道或雙聲道輸出。Center 需要來源提供原生中央聲道。
+- 可同時啟用 A 和 B。桌面版的 **Source B** 預設為 **Off**，選擇來源後即啟用。兩路各自選擇來源與 Left、Right、Center、Mid、Side 或 Merged。Merged 沿用來源的單聲道或雙聲道輸出。Center 需要來源提供原生中央聲道。
 - Windows 的 A／B 選用同一來源時，會以裝置的原始取樣率保留兩路音訊，例如 System Side／System Mid。若 WAV 設定使用不同取樣率，會在匯出整段選取時才轉換。暫停後重新開始錄音時，會平滑前後片段的接縫。
 - 單一來源可顯示合併波形或上下兩列 L／R。啟用 A／B 時，上列顯示 A、下列顯示 B，各占波形區的一半，並各自顯示音量。
 - 完成框選或保存整段時，旗標標記範圍頭尾。`Shift` 加左鍵拖曳可直接吸附框選；Windows 的 `Ctrl`／macOS 的 `Option` 保留自由框選，也可再加 `Shift` 吸附。目標依附近可見旗標、已畫小節線、已畫秒數線的順序，同類選最近位置；拖動中的端點不吸附自己。只吸附目前畫出的目標；全透明時參考線隱藏，旗標仍可見、可操作。
@@ -59,7 +60,7 @@ macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`C
 
 開啟 **只顯示波形／Show waveform only** 後，Windows／macOS 原生桌面視窗會縮到波形面板加可見外框的高度，並關閉原生陰影。背景透明度仍依 Options 設定，可保留實色、半透明或全透明；100% 透明時，波形與旗標仍可見、可操作。插件可向 DAW 要求縮小，宿主外框、陰影與底色由 DAW 管理。這個選項預設關閉，並跟著桌面偏好設定或 DAW 專案中的插件設定儲存。
 
-在波形上按右鍵開啟 Options。錄音已暫停時，可選 **開始錄音／Play**。錄音已待命或正在收錄時，可選 **暫停錄音／Pause**。
+桌面版在波形上按右鍵開啟選單：錄音已暫停時可選 **Resume capture**，已待命或正在收錄時可選 **Pause capture**。插件則按右鍵開啟 Options，再選 **Play** 或 **Pause**。
 
 切換時保留波形面板高度，桌面視窗貼合面板，移除上下多餘的透明區。拖曳桌面視窗的左右內緣可調整寬度，拖曳上下內緣可調整高度。視窗變窄時，同樣的錄音保留時間會顯示在更短的距離上，波形每秒移動的像素會減少。可用高度不足時，波形會跟著縮小。取消勾選時，桌面視窗恢復切換前的完整模式尺寸。
 
@@ -68,7 +69,7 @@ macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`C
 | Windows | 240 × 48 邏輯像素 | 510 × 132 邏輯像素 |
 | macOS | 240 × 48 點 | 560 × 100 點 |
 
-要回到完整介面，在波形上按右鍵，再取消勾選 **只顯示波形／Show waveform only**。Windows／macOS 在此模式關閉原生陰影；可見細外框則由 Options 的外觀設定控制。
+要回到完整介面，在波形上按右鍵，再取消勾選 **只顯示波形／Show waveform only**。Windows／macOS 在此模式關閉原生陰影；可見細外框則由 Options 的外觀設定控制。Windows／macOS 桌面版與外掛還可以在 Options 的 Appearance 頁選擇外框寬度（1 至 4 px），並在 **Show** 區決定要顯示哪些項目：工具列上的程式名稱、音量表，以及擷取狀態標記（**Always**、**Only when paused or failing**（外掛為 **Only when paused**）或 **Never**）。選擇 **Never** 後，擷取失敗時視窗上也不會出現標記。
 
 ### 移動與縮放桌面視窗
 
@@ -78,7 +79,7 @@ Windows 桌面版啟用 **置頂／Keep on top** 時，若工作列等同一桌�
 
 Windows 桌面版可從工作列右側的系統匣顯示或隱藏視窗。隱藏視窗後，錄音仍可在背景繼續。要停止程式，可從系統匣或設定選擇 **Quit**。先將 `Backtracking.exe` 放在固定位置，再開啟 **Start with Windows**。Backtracking 會在登入 Windows 時開啟並還原上次的視窗位置。
 
-macOS 桌面版可從選單列顯示、隱藏或結束 Backtracking，也可啟用登入時開啟。系統要求核准時，請在 macOS 系統設定允許 Backtracking 的登入項目。
+macOS 桌面版可從選單列顯示或隱藏視窗、暫停或恢復擷取、開啟 Options 或結束 Backtracking，也可啟用登入時開啟（**Start at login**）。系統要求核准時，請在 macOS 系統設定允許 Backtracking 的登入項目。
 
 | 動作 | Windows 桌面版 | macOS 桌面版 |
 | --- | --- | --- |
@@ -131,7 +132,7 @@ Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift
 
 ### 啟用、暫停與自動續錄
 
-選擇 **Play** 進入錄音待命，或選擇 **Pause** 手動暫停。完整介面可使用工具列，只顯示波形時可從右鍵開啟 Options。Play 保留目前固定的編輯素材與選區；取消、普通點擊或匯出結束才回到即時視野。重新待命後，下一段收錄的音訊會接在即時歷史後方，受保留時間上限約束。
+選擇 **Play** 進入錄音待命，或選擇 **Pause** 手動暫停。完整介面可使用工具列，只顯示波形時，桌面版可用右鍵選單或 `Space`，插件可從右鍵開啟 Options。Play 保留目前固定的編輯素材與選區；取消、普通點擊或匯出結束才回到即時視野。重新待命後，下一段收錄的音訊會接在即時歷史後方，受保留時間上限約束。
 
 **自動續錄／Auto-resume** 的 **0、5、10 秒**選項仍保留，預設 **10 秒**。一般編輯不隱含暫停擷取：框選、旗標、縮放、平移及拖放準備固定的是素材與視野，背景仍按原狀錄音。取消、普通波形點擊或匯出結束會回到即時視野，不因此強制解除手動 Pause。擷取由 **Play** 與既有自動續錄另行控制：0 秒下手動 Pause 維持，5／10 秒依原有計時規則。待命時是否保留低音量／零值，依保留安靜片段設定。
 
@@ -143,7 +144,7 @@ Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift
 
 ### 輸出位置與檔案規格
 
-在 Options 可各自指定並開啟兩個資料夾。成功拖放使用預設輸出資料夾，全域快照快捷鍵和 **Save snapshot** 使用保存資料夾。原先設定的匯出目的地會沿用。
+在 Options 可各自指定並開啟兩個資料夾。成功拖放使用預設輸出資料夾，全域快照快捷鍵和 **Save snapshot** 使用保存資料夾。原先設定的匯出目的地會沿用。Windows／macOS 桌面版與外掛可在 Options 的 Export 頁用 **Delete old drag-and-drop files** 讓 Backtracking 自動刪除預設輸出資料夾裡超過 10、20、30、60 或 90 天的拖放檔，預設為 Off。只會永久刪除 Backtracking 自己命名的 WAV；保存資料夾裡的快照不會被刪除，兩個資料夾相同時也不會刪除任何檔案。仍在專案中直接引用這些檔案的 DAW 會找不到它們。外掛會把這項設定存在專案裡，而且只在外掛視窗開啟時清理。
 
 | 版本 | 預設輸出資料夾 | 保存資料夾的預設位置 |
 | --- | --- | --- |
@@ -151,13 +152,7 @@ Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift
 | Windows 桌面版 | `%USERPROFILE%\Backtracking\output\` | `%USERPROFILE%\Backtracking\saved\` |
 | VST3／CLAP | 使用者家目錄下的 `Backtracking/output/` | 使用者家目錄下的 `Backtracking/saved/` |
 
-取樣率和編碼可在齒輪選單獨立調整。
-
-| 版本 | 取樣率選項的位置 | 編碼選項的位置 |
-| --- | --- | --- |
-| Windows 桌面版 | **WAV rate** | **WAV encoding** |
-| macOS 桌面版 | **WAV 匯出格式 → 取樣率** | **WAV 匯出格式 → 編碼** |
-| VST3／CLAP | **WAV sample rate** | **WAV sample format** |
+取樣率和編碼可在 Options 的 Export 頁獨立調整。三個版本的選項名稱相同：**WAV sample rate** 與 **WAV encoding**。
 
 | WAV 設定 | 選項 | 預設 |
 | --- | --- | --- |
@@ -199,12 +194,13 @@ Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續�
 | A microphone, or system playback plus a microphone | Choose a microphone in desktop Options or enable A/B to capture them separately. |
 | One DAW track, a bus, or the master output | Insert the VST3 or CLAP plug-in on the relevant effects chain. It captures mono or stereo audio at that point and passes the input through unchanged. |
 | A software instrument with effects | Insert Backtracking after the instrument and any effects you want in the sample. Move it ahead of those effects to capture the dry signal. |
+| One DAW track inside the desktop recorder | In the plug-in, open Options → Sources and tick **Send to Backtracking desktop**. Then open desktop Options → Sources and choose **【Sender】** followed by the track name as the audio source. Senders are listed right after system audio and the default microphone. |
 
 On Windows, route the source to the default playback device. If a DAW uses ASIO, exclusive mode, or another direct output path, use the plug-in to sample its track signal. On macOS, grant system audio recording permission when the desktop app first prompts you. [Windows WASAPI](https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording) · [Apple Core Audio](https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps)
 
 ### Open settings
 
-Click the gear in the toolbar or right-click inside the Backtracking window to open **Options**. The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
+Click the gear in the toolbar to open **Options**. Right-clicking inside the plug-in also opens Options. In the Windows and macOS desktop apps, right-clicking opens a menu instead: **Pause / Resume / Retry capture**, **Clear**, **Save snapshot**, **Show waveform only**, **Keep on top**, **Options…**, and **Quit**. With the desktop window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording; if there is a selection, it cancels the selection first. The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
 
 Choose a category on the left, then use the vertical settings list on the right. Larger bold titles, group headings, and body/control text of at least 15 distinguish hierarchy. History, auto-resume, transparency, and WAV format use dropdowns sized to their item count, up to ten rows before scrolling. Scroll the details pane for longer content. Desktop Options can be resized and keeps Close visible. The plug-in requests a larger editor and restores its prior size when closed.
 
@@ -212,7 +208,7 @@ Operating instructions live in this guide; the UI keeps controls, headings, labe
 
 ### Keep quiet sections
 
-Enable **Keep quiet sections** under **Options → Capture** (macOS label: **保留安靜片段**). It defaults to Off, including older settings/projects without this field.
+Enable **Keep quiet sections** under **Options → Capture**. It defaults to Off, including older settings/projects without this field.
 
 - **Off:** existing silence compression omits long below-threshold gaps from the retained duration.
 - **On:** retain subsequent quiet input, digital zeros, and silence established by a known source clock. Quiet sections consume History and can displace older audio sooner.
@@ -229,7 +225,7 @@ The settings menu offers five background transparency levels. Choose 0%, 25%, 50
 
 - Choose system playback, a microphone, or a specific app in desktop Options. App capture requires Windows OS build 20348 or later. On macOS, grant the relevant system audio or microphone permission when prompted.
 - The source list updates each time you open the drop-down. Windows lists apps with an open playback stream, including paused streams. macOS lists apps that Core Audio identifies as playback sources. If an app is missing, play some audio in it and reopen the list. Microphone entries come from the input devices the system currently makes available.
-- Enable A and B to capture two routes. For each, choose a source and Left, Right, Center, Mid, Side, or Merged. Merged uses the source's mono or stereo output format. Center requires a native center channel.
+- Enable A and B to capture two routes. In the desktop apps, **Source B** is **Off** until you choose a source for it. For each, choose a source and Left, Right, Center, Mid, Side, or Merged. Merged uses the source's mono or stereo output format. Center requires a native center channel.
 - On Windows, A/B routes from the same source, such as System Side and System Mid, use the device's native sample rate. Export converts the whole selection if the WAV rate differs. Capture also smooths the splice when you resume after a pause.
 - For one source, choose a merged waveform or two L/R rows. With A/B enabled, A and B each use half the waveform area and have independent meters.
 - Flags mark range boundaries. `Shift`-drag directly creates a snapped selection; `Ctrl` on Windows / `Option` on macOS keeps free selection, with optional Shift for snapping. Targets prioritize visible flags, then painted bars, then painted seconds; the moving handle excludes itself. Only painted targets are eligible. Fully transparent backgrounds hide guides but retain interactive flags.
@@ -244,7 +240,7 @@ The settings menu offers five background transparency levels. Choose 0%, 25%, 50
 
 Turn on **Show waveform only** to shrink the native Windows/macOS desktop window to the waveform panel plus its visible border and disable the native shadow. Background transparency still follows Options: opaque, translucent, or fully transparent. Waveforms and flags remain visible and interactive at 100% transparency. Plug-ins can request a smaller editor; the DAW manages its outer frame, shadow, and background. This setting defaults to Off and is saved with the desktop preferences or the plug-in's DAW project settings.
 
-Right-click the waveform to open Options. Choose **Play** (**開始錄音** in the macOS app) when capture is paused, or **Pause** (**暫停錄音**) when capture is armed or recording.
+In the desktop apps, right-click the waveform to open the menu. Choose **Resume capture** when capture is paused, or **Pause capture** when capture is armed or recording. In the plug-in, right-click to open Options and choose **Play** or **Pause**.
 
 When you switch modes, the desktop window fits the waveform panel's existing height and removes excess transparent space above and below it. Drag either inside side edge to adjust the width or the top and bottom edges to adjust the height. A narrower window shows the same retained duration over a shorter distance, reducing the number of pixels the waveform scrolls per second. The waveform shrinks to fit a shorter window. Turning the mode off restores the previous full-interface window size.
 
@@ -253,7 +249,7 @@ When you switch modes, the desktop window fits the waveform panel's existing hei
 | Windows | 240 × 48 logical pixels | 510 × 132 logical pixels |
 | macOS | 240 × 48 points | 560 × 100 points |
 
-To restore the full interface, right-click the waveform and turn off **Show waveform only**. Windows/macOS native shadows are disabled in this mode; the optional thin border is controlled separately in Appearance Options.
+To restore the full interface, right-click the waveform and turn off **Show waveform only**. Windows/macOS native shadows are disabled in this mode; the optional thin border is controlled separately in Appearance Options. The desktop apps and the plug-in also let you set the border width (1 to 4 px) on the Appearance page of Options, and choose what is shown under **Show**: the app name in the toolbar, the level meters, and the capture status mark (**Always**, **Only when paused or failing** (**Only when paused** in the plug-in), or **Never**). With **Never**, nothing on the window marks a capture failure either.
 
 ### Move and resize the desktop window
 
@@ -263,7 +259,7 @@ With **Keep on top** enabled on Windows, Backtracking reasserts its position whe
 
 Use the Windows system tray icon to show or hide the window. Capture can continue while the window is hidden. Choose **Quit** from the tray or Settings to exit. Place `Backtracking.exe` in a permanent location and enable **Start with Windows** to open Backtracking at its last window position when you sign in.
 
-On macOS, use the menu bar item to show, hide, or quit Backtracking, or enable launch at login. If macOS asks for approval, allow the Backtracking login item in System Settings.
+On macOS, use the menu bar item to show or hide the window, pause or resume capture, open Options, or quit Backtracking, or enable **Start at login**. If macOS asks for approval, allow the Backtracking login item in System Settings.
 
 | Action | Windows desktop | macOS desktop |
 | --- | --- | --- |
@@ -316,7 +312,7 @@ On Windows, press Alt plus the physical key to the left of 1 (the ~ / grave key,
 
 ### Arm, pause, and auto-resume capture
 
-Choose **Play** to arm capture or **Pause** to pause it manually. Use the toolbar in the full interface or right-click to open Options in waveform-only mode. Play preserves fixed editing material/selection; canceling, an ordinary click, or export completion returns to live view. Once re-armed, the next sound appends to live history within the limit.
+Choose **Play** to arm capture or **Pause** to pause it manually. Use the toolbar in the full interface. In waveform-only mode, use the right-click menu or `Space` in the desktop apps, or right-click to open Options in the plug-in. Play preserves fixed editing material/selection; canceling, an ordinary click, or export completion returns to live view. Once re-armed, the next sound appends to live history within the limit.
 
 **Auto-resume** retains **0/5/10 seconds** and its **10-second** default. Editing fixes material/view without implicitly pausing capture. Canceling, an ordinary waveform click, or export completion returns live without forcing manual Pause to resume. **Play** and existing auto-resume control capture separately: manual Pause remains at zero seconds; 5/10 seconds retain their timer rules. Keep quiet sections determines whether quiet/zero input is retained while armed.
 
@@ -324,11 +320,11 @@ Existing **Off**, **20-second**, and **30-second** settings use the **10-second*
 
 ### Clear the current recording
 
-Click the trash icon in the toolbar. It is labeled **Clear capture** on Windows desktop and **Clear captured audio** in the plug-ins. This empties the waveform, selection, and audio held in memory. If capture is armed, incoming sound starts filling the waveform again. You can find previously exported WAVs in the save folder.
+Click the trash icon in the toolbar. It is labeled **Clear capture** in the desktop apps and **Clear captured audio** in the plug-ins. This empties the waveform, selection, and audio held in memory. If capture is armed, incoming sound starts filling the waveform again. You can find previously exported WAVs in the save folder.
 
 ### Output location and file format
 
-You can choose and open both folders from Options. Successful drops use the default export folder. The global snapshot shortcut and **Save snapshot** use the saved snapshots folder. Existing export destinations are carried forward.
+You can choose and open both folders from Options. Successful drops use the default export folder. The global snapshot shortcut and **Save snapshot** use the saved snapshots folder. Existing export destinations are carried forward. In the desktop apps and the plug-in, **Delete old drag-and-drop files** on the Export page of Options lets Backtracking delete dragged files in the default export folder once they are older than 10, 20, 30, 60, or 90 days. It is Off by default. Only WAV files that Backtracking named are deleted, permanently. Snapshots in the saved snapshots folder are never deleted, and nothing is deleted while both settings name the same folder. A DAW project that still reads one of those files in place will lose it. The plug-in keeps this choice with the project and only cleans while its window is open.
 
 | Edition | Default export folder | Default saved snapshots folder |
 | --- | --- | --- |
@@ -336,13 +332,7 @@ You can choose and open both folders from Options. Successful drops use the defa
 | Windows desktop | `%USERPROFILE%\Backtracking\output\` | `%USERPROFILE%\Backtracking\saved\` |
 | VST3 / CLAP | `Backtracking/output/` in your home directory | `Backtracking/saved/` in your home directory |
 
-Choose the sample rate and encoding independently in the gear menu.
-
-| Edition | Sample rate menu | Encoding menu |
-| --- | --- | --- |
-| Windows desktop | **WAV rate** | **WAV encoding** |
-| macOS desktop | **WAV 匯出格式 → 取樣率** | **WAV 匯出格式 → 編碼** |
-| VST3 / CLAP | **WAV sample rate** | **WAV sample format** |
+Choose the sample rate and encoding independently on the Export page of Options. All three editions use the same names: **WAV sample rate** and **WAV encoding**.
 
 | WAV setting | Options | Default |
 | --- | --- | --- |

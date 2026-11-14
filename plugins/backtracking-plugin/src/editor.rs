@@ -9,14 +9,16 @@ use std::time::{Duration, Instant};
 
 use backtracking_core::{
     AutoResumeDelay, ChannelRoute, DurationChoice, FrozenTrack, MeterReadings, WavExportProfile,
-    export_routed_tracks_with_tempo, waveform,
+    cleanup, export_routed_tracks_with_tempo, waveform,
 };
 use backtracking_ui::{
-    CENTER_LINE, FlagReach, LoneSample, PLOT_BACKGROUND, RECORDING_DIM, RECORDING_LIT,
-    TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES, accent_color,
-    combo_popup_height, fit_frame_range, flag_handle_at, icon_button, meter_number, muted_accent,
-    paint_guide_lines, paint_transport_glyph, paint_waveform_trace, selected_waveform_color,
-    status_led, waveform_press,
+    CENTER_LINE, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, PLOT_BACKGROUND, RECORDING_DIM,
+    RECORDING_LIT, TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES,
+    accent_color, configure_options_style, fit_frame_range, flag_handle_at, icon_button,
+    meter_number, muted_accent, options_choice, options_control_width, options_field,
+    options_group_heading, options_heading_text, options_list, options_navigation_item,
+    options_note, options_value, paint_guide_lines, paint_transport_glyph, paint_waveform_trace,
+    selected_waveform_color, status_led, waveform_press,
 };
 use egui::{Color32, CursorIcon, PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use nice_plug::context::gui::GuiContext;
@@ -28,7 +30,8 @@ use nice_plug_egui::{
 
 use crate::session::{EditingSnapshot, Session, WaveformPeaks, WaveformTimeline, waveform_views};
 use crate::settings::{
-    CaptureInput, DEFAULT_ACCENT, MeterMode, SessionSettings, TRANSPARENCY_LEVELS, WaveformLayout,
+    BORDER_WIDTHS, CaptureInput, DEFAULT_ACCENT, MeterMode, SessionSettings, StatusMark,
+    TRANSPARENCY_LEVELS, WaveformLayout,
 };
 
 #[cfg(target_os = "windows")]
@@ -45,7 +48,8 @@ const TRANSPORT_GLYPH: TransportGlyph = TransportGlyph {
     pause_bar: Vec2::new(2.6, 11.0),
 };
 const MIN_WAVEFORM_HEIGHT: f32 = 60.0;
-const OPTIONS_EDITOR_SIZE: Vec2 = Vec2::new(680.0, 480.0);
+/// Room for the Options form with a setting's name beside its control.
+const OPTIONS_EDITOR_SIZE: Vec2 = Vec2::new(760.0, 520.0);
 const FLAG_SNAP_RADIUS: f32 = 8.0;
 const FLAG_REACH: FlagReach = FlagReach { above: 4.0, below: 14.0, radius: FLAG_SNAP_RADIUS };
 /// Alt starts a free selection, as Ctrl does.
@@ -94,6 +98,7 @@ pub struct CaptureUi {
     snapshot_writer: Option<SnapshotWriter>,
     native_dragging: Arc<AtomicBool>,
     drag_results: Option<Receiver<Result<SavedWav, String>>>,
+    output_cleanup: cleanup::Schedule,
     message: String,
 }
 
@@ -172,8 +177,8 @@ enum FolderKind {
 impl FolderKind {
     fn label(self) -> &'static str {
         match self {
-            Self::Export => "Export folder",
-            Self::Saved => "Saved snapshots",
+            Self::Export => "Drag-and-drop folder",
+            Self::Saved => "Saved snapshots folder",
         }
     }
 
@@ -205,10 +210,10 @@ impl OptionsTab {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Actions => "Actions & shortcuts",
+            Self::Actions => "Actions",
             Self::Capture => "Capture",
-            Self::Sources => "Sources & connections",
-            Self::Appearance => "Waveform & appearance",
+            Self::Sources => "Sources",
+            Self::Appearance => "Appearance",
             Self::Export => "Export",
         }
     }
@@ -405,6 +410,24 @@ impl SnapshotWriter {
     }
 }
 
+/// The editor's typefaces: egui's own, the bundled bold face for headings and, on Windows,
+/// the system fonts for text in any other script.
+fn editor_fonts() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    let name = waveform::HINT_BOLD_FAMILY;
+    fonts.font_data.insert(
+        name.to_owned(),
+        Arc::new(egui::FontData::from_static(waveform::HINT_BOLD_FONT)),
+    );
+    fonts
+        .families
+        .insert(egui::FontFamily::Name(name.into()), vec![name.to_owned()]);
+    // Folder paths and track names can be in any language.
+    #[cfg(target_os = "windows")]
+    backtracking_ui::add_system_font_fallbacks(&mut fonts);
+    fonts
+}
+
 fn product_icon(context: &egui::Context) -> Option<TextureHandle> {
     let mut decoder = png::Decoder::new(Cursor::new(PRODUCT_ICON));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
@@ -444,14 +467,9 @@ impl NiceEguiApp for CaptureUi {
             nice_plug_egui::Key::Character("s".into()),
             nice_plug_egui::Key::Character("S".into()),
         ]));
-        context.add_font(egui::FontInsert {
-            name: waveform::HINT_BOLD_FAMILY.to_owned(),
-            data: egui::FontData::from_static(waveform::HINT_BOLD_FONT),
-            families: vec![egui::InsertFontFamily {
-                family: egui::FontFamily::Name(waveform::HINT_BOLD_FAMILY.into()),
-                priority: egui::FontPriority::Highest,
-            }],
-        });
+        context.set_fonts(editor_fonts());
+        // Deleting is permanent, so a pass waits a while after the editor opens.
+        self.output_cleanup.restart(Instant::now());
         Ok(())
     }
 
@@ -496,11 +514,15 @@ impl NiceEguiApp for CaptureUi {
             let output_changed = previous.output_dir != settings.output_dir;
             let format_changed = previous.wav_profile != settings.wav_profile
                 || previous.force_mono != settings.force_mono;
+            let folders_changed = output_changed || previous.saved_dir != settings.saved_dir;
             if retention_changed {
                 self.next_refresh = Instant::now();
             }
             if retention_changed || output_changed || format_changed {
                 self.discard_drag_preparation();
+            }
+            if folders_changed {
+                self.output_cleanup.restart(Instant::now());
             }
             if retention_changed || output_changed || format_changed {
                 self.message.clear();
@@ -511,6 +533,7 @@ impl NiceEguiApp for CaptureUi {
         }
         self.reap_drag_preparation();
         self.collect_saved_snapshots();
+        self.clean_output_folder(&settings);
         let canceled_selection = !self.options_open
             && self.can_cancel_selection()
             && ui.input_mut(|input| {
@@ -565,22 +588,26 @@ impl NiceEguiApp for CaptureUi {
         } else {
             Some(
                 ui.horizontal(|ui| {
-                    if let Some(icon) = &self.product_icon {
-                        ui.image((icon.id(), Vec2::splat(TOOLBAR_CONTROL_HEIGHT)));
+                    if settings.show_title {
+                        if let Some(icon) = &self.product_icon {
+                            ui.image((icon.id(), Vec2::splat(TOOLBAR_CONTROL_HEIGHT)));
+                        }
+                        ui.heading("Backtracking");
+                        ui.separator();
                     }
-                    ui.heading("Backtracking");
-                    ui.separator();
                     if capture_button(ui, paused, controls_enabled).clicked() {
                         self.toggle_capture(ui, paused);
                         paused = self.session.is_paused();
                     }
-                    self.recording_indicator(ui, paused);
+                    self.recording_indicator(ui, paused, settings.status_mark);
                     if clear_button(ui, controls_enabled && self.seconds > 0.0).clicked() {
                         self.clear_capture();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let gear = settings_button(ui);
-                        self.meter_readout(ui, settings.meter_mode);
+                        if settings.show_meter {
+                            self.meter_readout(ui, settings.meter_mode);
+                        }
                         gear
                     })
                     .inner
@@ -706,6 +733,8 @@ impl CaptureUi {
             snapshot_writer: None,
             native_dragging: Arc::new(AtomicBool::new(false)),
             drag_results: None,
+            // The project's choice arrives later, with the rest of the restored settings.
+            output_cleanup: cleanup::Schedule::new(None, Instant::now()),
             message: String::new(),
         }
     }
@@ -719,7 +748,16 @@ impl CaptureUi {
         );
     }
 
-    fn recording_indicator(&mut self, ui: &mut egui::Ui, paused: bool) {
+    fn recording_indicator(&mut self, ui: &mut egui::Ui, paused: bool, mark: StatusMark) {
+        let size = Vec2::splat(16.0);
+        if !mark.shown(paused) {
+            self.recording_since = None;
+            if mark != StatusMark::Never {
+                // The light keeps its place, so the buttons do not move when it comes on.
+                ui.allocate_space(size);
+            }
+            return;
+        }
         let (status, color) = if !paused && self.session.is_recording() {
             let started = self.recording_since.get_or_insert_with(Instant::now);
             let phase = started.elapsed().as_millis() / RECORDING_BLINK.as_millis();
@@ -733,7 +771,35 @@ impl CaptureUi {
                 ("Waiting for sound", Color32::from_rgb(74, 81, 88))
             }
         };
-        status_led(ui, Vec2::splat(16.0), 4.0, color, status);
+        status_led(ui, size, 4.0, color, status);
+    }
+
+    /// Deletes the plug-in's own old WAV files from the drag-and-drop folder when the
+    /// project asks for it. Only an open editor does this.
+    fn clean_output_folder(&mut self, settings: &SessionSettings) {
+        let now = Instant::now();
+        if self.output_cleanup.age() != settings.output_cleanup {
+            self.output_cleanup.set_age(settings.output_cleanup, now);
+        }
+        if self.output_cleanup.age().is_none() {
+            return;
+        }
+        // The folder check reads the disk, so it waits until a pass is due. Saved snapshots
+        // are never deleted, so a folder that also holds them is left alone.
+        let folder = (self.output_cleanup.due(now)
+            && !cleanup::same_folder(&settings.output_dir, &settings.saved_dir))
+        .then(|| settings.output_dir.clone());
+        // A file being offered for a drag was written a moment ago, so no age reaches it.
+        match self.output_cleanup.poll(folder.as_deref(), &[], now) {
+            Some(Ok(0)) | None => {}
+            Some(Ok(1)) => self.message = "Deleted 1 old file from the drag-and-drop folder".into(),
+            Some(Ok(count)) => {
+                self.message = format!("Deleted {count} old files from the drag-and-drop folder");
+            }
+            Some(Err(error)) => {
+                self.message = format!("Could not clean the drag-and-drop folder: {error}");
+            }
+        }
     }
 
     fn show_options(&mut self, ui: &egui::Ui, frame: &mut Frame, settings: &mut SessionSettings) {
@@ -754,7 +820,8 @@ impl CaptureUi {
             .collapsible(false)
             .resizable(false)
             .show(ui.ctx(), |ui| {
-                options_layout(ui, &mut selected_tab, |ui, tab| {
+                let accent = accent_color(edited.accent);
+                options_layout(ui, &mut selected_tab, accent, |ui, tab| {
                     match tab {
                         OptionsTab::Actions => self.capture_actions(ui, settings),
                         OptionsTab::Capture => capture_options(ui, &mut edited),
@@ -785,41 +852,25 @@ impl CaptureUi {
     fn capture_actions(&mut self, ui: &mut egui::Ui, settings: &SessionSettings) {
         let paused = self.session.is_paused();
         let can_toggle = self.can_toggle_capture();
-        ui.vertical(|ui| {
-            if ui
-                .add_enabled(
-                    can_toggle,
-                    egui::Button::new(if paused { "Play" } else { "Pause" }),
-                )
-                .clicked()
-            {
-                self.toggle_capture(ui, paused);
-            }
-            if ui
-                .add_enabled(
-                    can_toggle && self.seconds > 0.0,
-                    egui::Button::new("Clear capture"),
-                )
-                .clicked()
-            {
-                self.clear_capture();
-            }
-            if ui
-                .add_enabled(can_toggle, egui::Button::new("Save snapshot"))
-                .clicked()
-            {
-                self.save_snapshot(settings);
-            }
-            if ui
-                .add_enabled(
-                    self.can_cancel_selection(),
-                    egui::Button::new("Cancel selection"),
-                )
-                .clicked()
-            {
-                self.cancel_selection();
-            }
-        });
+        options_group_heading(ui, "Capture controls");
+        let (toggle, cancel, clear) = ui.horizontal_wrapped(|ui| {
+            (
+                ui.add_enabled(can_toggle, egui::Button::new(if paused { "Play" } else { "Pause" }))
+                    .clicked(),
+                ui.add_enabled(self.can_cancel_selection(), egui::Button::new("Cancel selection"))
+                    .clicked(),
+                ui.add_enabled(can_toggle && self.seconds > 0.0, egui::Button::new("Clear capture"))
+                    .clicked(),
+            )
+        }).inner;
+        if toggle { self.toggle_capture(ui, paused); }
+        if cancel { self.cancel_selection(); }
+        if clear { self.clear_capture(); }
+        ui.separator();
+        options_group_heading(ui, "Snapshots");
+        if ui.add_enabled(can_toggle, egui::Button::new("Save snapshot")).clicked() {
+            self.save_snapshot(settings);
+        }
     }
 
     fn apply_options(&mut self, settings: &mut SessionSettings, edited: SessionSettings) {
@@ -1118,7 +1169,8 @@ impl CaptureUi {
             return;
         }
         let opacity = ((100 - u16::from(settings.panel_transparency)) * 255 / 100) as u8;
-        let panel = if settings.border_enabled { rect.shrink(1.0) } else { rect };
+        let border = f32::from(settings.border_width);
+        let panel = if settings.border_enabled { rect.shrink(border) } else { rect };
         painter.rect_filled(
             panel,
             6.0,
@@ -1131,7 +1183,7 @@ impl CaptureUi {
             painter.rect_stroke(
                 panel,
                 6.0,
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(r, g, b, alpha)),
+                Stroke::new(border, Color32::from_rgba_unmultiplied(r, g, b, alpha)),
                 egui::StrokeKind::Outside,
             );
         }
@@ -1648,52 +1700,44 @@ fn export_frame_range(snapshot: &FrozenTrack, selection: &Range<u64>) -> Option<
     Some((selection.start - bounds.start) as usize..(selection.end - bounds.start) as usize)
 }
 
+/// The Options form: the list of pages on the left and the selected page on the right.
 fn options_layout<R>(
     ui: &mut egui::Ui,
     selected: &mut OptionsTab,
+    accent: Color32,
     content: impl FnOnce(&mut egui::Ui, OptionsTab) -> R,
 ) -> egui::scroll_area::ScrollAreaOutput<R> {
     ui.scope(|ui| {
-        // Options uses a readable type scale without increasing the compact transport.
-        // `RichText::strong` only changes color in egui; use the bundled bold face
-        // for the actual heading weight. Headless contexts can use the default face.
-        let bold_family = egui::FontFamily::Name(waveform::HINT_BOLD_FAMILY.into());
-        let bold_family = if ui.fonts(|fonts| fonts.families().contains(&bold_family)) {
-            bold_family
-        } else {
-            egui::FontFamily::Proportional
-        };
-        let style = ui.style_mut();
-        style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
-        style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
-        style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(13.0));
-        style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::new(21.0, bold_family.clone()));
-        style.text_styles.insert(egui::TextStyle::Name("options-field".into()), egui::FontId::new(16.0, bold_family.clone()));
-        style.spacing.interact_size.y = 28.0;
-        style.spacing.button_padding = Vec2::new(8.0, 4.0);
-        style.spacing.item_spacing.y = 6.0;
+        // Options has its own readable type scale; the compact toolbar keeps its own.
+        configure_options_style(ui);
         let size = ui.available_size();
-        let navigation_width = (size.x * 0.3).clamp(104.0, 170.0).min(size.x * 0.42);
+        // A host can keep the editor small, so the list and the margins give way first.
+        let navigation_width =
+            (size.x * 0.3).clamp(104.0, OPTIONS_NAVIGATION_WIDTH).min(size.x * 0.42);
+        let roomy = size.x >= 560.0;
+        let title = |ui: &mut egui::Ui, label: &str| {
+            let text = options_heading_text(ui, label, 20.0);
+            ui.add(egui::Label::new(text).wrap());
+            ui.add_space(2.0);
+            ui.separator();
+            ui.add_space(6.0);
+        };
         ui.horizontal_top(|ui| {
         ui.allocate_ui_with_layout(
             Vec2::new(navigation_width, size.y),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 ui.set_width(navigation_width);
+                ui.spacing_mut().item_spacing.y = 4.0;
                 egui::ScrollArea::vertical()
                     .id_salt("options-navigation")
                     .auto_shrink([false, false])
                     .max_height(size.y)
                     .show(ui, |ui| {
                         for tab in OptionsTab::ALL {
-                            if ui.add_sized(
-                                [ui.available_width(), 34.0],
-                                egui::Button::new(egui::RichText::new(tab.label())
-                                    .font(egui::FontId::new(16.0, bold_family.clone())))
-                                    .selected(*selected == tab)
-                                    .frame(false)
-                                    .wrap(),
-                            ).on_hover_text(tab.label()).clicked() {
+                            if options_navigation_item(ui, tab.label(), *selected == tab, accent)
+                                .clicked()
+                            {
                                 *selected = tab;
                             }
                         }
@@ -1701,26 +1745,41 @@ fn options_layout<R>(
             },
         );
         ui.separator();
+        // The page keeps clear of the list beside it, and its right edge is left to the
+        // scroll handle, which would otherwise sit on top of the controls.
+        ui.add_space(if roomy { 12.0 } else { 0.0 });
+        let gutter: i8 = if roomy { 16 } else { 10 };
         let width = ui.available_width();
         ui.allocate_ui_with_layout(
             Vec2::new(width, size.y),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 ui.set_width(width);
+                // The title stays in place above a tall form. A short editor scrolls it away
+                // with the page, to keep what room there is for the settings.
+                let fixed_title = size.y >= 280.0;
+                if fixed_title {
+                    ui.add_space(4.0);
+                    ui.allocate_ui(Vec2::new(width - f32::from(gutter), 0.0), |ui| {
+                        title(ui, selected.label());
+                    });
+                }
                 egui::ScrollArea::vertical()
                     .id_salt(("options-content", *selected as u8))
                     .auto_shrink([false, false])
                     .max_width(width)
-                    .max_height(size.y)
+                    .max_height(ui.available_height())
                     .show(ui, |ui| {
-                        // A ScrollArea inherits its parent's layout. Keep the form explicitly
-                        // vertical so each setting advances down, including narrow host editors.
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                            ui.add(egui::Label::new(egui::RichText::new(selected.label()).heading().strong()).wrap());
-                            ui.separator();
-                            content(ui, *selected)
+                        // A ScrollArea inherits its parent's layout. The form is explicitly
+                        // vertical so each setting advances down, including narrow editors.
+                        let page = egui::Margin { left: 0, right: gutter, top: 0, bottom: 0 };
+                        egui::Frame::NONE.inner_margin(page).show(ui, |ui| {
+                            options_list(ui, |ui| {
+                                if !fixed_title {
+                                    title(ui, selected.label());
+                                }
+                                content(ui, *selected)
+                            })
                         }).inner
                     })
             },
@@ -1729,62 +1788,39 @@ fn options_layout<R>(
     }).inner
 }
 
-fn option_row(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut egui::Ui)) {
-    ui.vertical(|ui| {
-        ui.label(egui::RichText::new(label)
-            .text_style(egui::TextStyle::Name("options-field".into()))
-            .strong());
-        content(ui);
-    });
-    ui.add_space(10.0);
-}
-
+/// A named drop-down, one row of the form.
 fn option_combo<T: Copy + PartialEq>(
     ui: &mut egui::Ui,
     label: &str,
     value: &mut T,
     choices: impl IntoIterator<Item = (T, String)>,
 ) {
-    let choices: Vec<_> = choices.into_iter().collect();
-    let selected = choices.iter().find(|(choice, _)| choice == value)
-        .map_or("", |(_, label)| label.as_str());
-    option_row(ui, label, |ui| {
-        let height = combo_popup_height(ui, choices.len(), ui.spacing().item_spacing.y);
-        egui::ComboBox::from_id_salt(label)
-            .selected_text(selected)
-            .width(ui.available_width())
-            .height(height)
-            .popup_style(ui.style().as_ref().clone().into())
-            .truncate()
-            .show_ui(ui, |ui| {
-                for (choice, label) in &choices {
-                    ui.selectable_value(value, *choice, label.as_str());
-                }
-            });
+    options_field(ui, label, |ui| {
+        options_choice(ui, label, value, choices);
     });
 }
 
 fn capture_options(ui: &mut egui::Ui, settings: &mut SessionSettings) {
-    option_combo(ui, "History", &mut settings.retention,
+    option_combo(ui, "Retain the latest audio", &mut settings.retention,
         DurationChoice::ALL.map(|duration| (duration, duration_label(duration.seconds()))));
-    option_combo(ui, "Auto-resume", &mut settings.idle_resume,
-        AutoResumeDelay::ALL.map(|delay| (delay, auto_resume_label(delay))));
     ui.checkbox(&mut settings.retain_silence, "Keep quiet sections");
+    option_combo(ui, "Auto-resume delay", &mut settings.idle_resume,
+        AutoResumeDelay::ALL.map(|delay| (delay, auto_resume_label(delay))));
 }
 
 /// "Off" leaves a paused capture paused. It is stored as 0 seconds, which never meant "at once".
 fn auto_resume_label(delay: AutoResumeDelay) -> String {
     match delay.delay() {
-        Some(delay) => format!("{} s", delay.as_secs()),
+        Some(delay) => format!("{} seconds", delay.as_secs()),
         None => "Off".into(),
     }
 }
 
 fn duration_label(seconds: u32) -> String {
-    if seconds >= 60 {
-        format!("{} min", seconds / 60)
+    if seconds <= 60 {
+        format!("{seconds} seconds")
     } else {
-        format!("{seconds} s")
+        format!("{} minutes", seconds / 60)
     }
 }
 
@@ -1805,87 +1841,124 @@ fn source_options(
     }
     ui.checkbox(&mut settings.sender_enabled, "Send to Backtracking desktop");
     if settings.sender_enabled {
-        if let Some(name) = host_track_name {
-            option_row(ui, "Sender name", |ui| {
-                ui.add(egui::Label::new(name).truncate()).on_hover_text(name);
-            });
-        } else {
-            option_row(ui, "Sender name", |ui| {
+        options_field(ui, "Sender name", |ui| {
+            if let Some(name) = host_track_name {
+                options_value(ui, name);
+            } else {
                 ui.add(egui::TextEdit::singleline(&mut settings.sender_name)
-                    .desired_width(ui.available_width())
+                    .desired_width(options_control_width(ui))
                     .char_limit(80)
                     .hint_text("Sender name"));
-            });
-        }
+            }
+        });
     }
 }
 
 fn export_options(ui: &mut egui::Ui, settings: &mut SessionSettings) -> Option<FolderAction> {
     wav_format_controls(ui, &mut settings.wav_profile);
-    option_combo(ui, "WAV channels", &mut settings.force_mono,
-        [(false, "Original channels".to_owned()), (true, "Mono".to_owned())]);
+    ui.checkbox(&mut settings.force_mono, "Export every file as mono");
     ui.separator();
     folder_options(ui, settings)
 }
 
 fn appearance_options(ui: &mut egui::Ui, settings: &mut SessionSettings) {
+    options_group_heading(ui, "Window");
     ui.checkbox(&mut settings.show_waveform_only, "Show waveform only");
-    ui.checkbox(&mut settings.show_bar_lines, "Bar lines");
-    ui.checkbox(&mut settings.show_seconds_lines, "Seconds lines");
-    if settings.show_seconds_lines {
-        option_combo(ui, "Seconds interval", &mut settings.seconds_interval,
-            [1, 5, 10].map(|seconds| (seconds, format!("{seconds} s"))));
-    }
-    ui.checkbox(&mut settings.border_enabled, "Waveform border");
-    if settings.border_enabled {
-        ui.checkbox(&mut settings.border_follows_background, "Fade with background");
-        let mut custom = settings.border_color.is_some();
-        if ui.checkbox(&mut custom, "Custom border color").changed() {
-            settings.border_color = custom.then_some(settings.accent);
-        }
-        if let Some(color) = &mut settings.border_color {
-            option_row(ui, "Border color", |ui| { ui.color_edit_button_srgb(color); });
-        }
-    }
-    option_combo(ui, "Waveform display", &mut settings.waveform_layout,
-        WaveformLayout::ALL.map(|layout| (layout, layout.label().to_owned())));
-    option_combo(ui, "Panel transparency", &mut settings.panel_transparency,
+    option_combo(ui, "Background transparency", &mut settings.panel_transparency,
         TRANSPARENCY_LEVELS.map(|percent| (percent, format!("{percent}%"))));
-    option_combo(ui, "Meter", &mut settings.meter_mode,
-        MeterMode::ALL.map(|mode| (mode, mode.label().to_owned())));
-    option_row(ui, "Theme color", |ui| {
-        ui.horizontal_wrapped(|ui| {
+    options_field(ui, "Theme color", |ui| {
+        ui.horizontal(|ui| {
             ui.color_edit_button_srgb(&mut settings.accent);
-            if ui.button("Reset color").clicked() {
+            if ui.button("Reset").clicked() {
                 settings.accent = DEFAULT_ACCENT;
             }
         });
     });
+    ui.separator();
+    options_group_heading(ui, "Show");
+    ui.checkbox(&mut settings.show_title, "App name in the toolbar");
+    ui.checkbox(&mut settings.show_meter, "Level meter");
+    option_combo(ui, "Capture status mark", &mut settings.status_mark,
+        StatusMark::ALL.map(|mark| (mark, mark.label().to_owned())));
+    ui.separator();
+    options_group_heading(ui, "Timeline guides");
+    ui.checkbox(&mut settings.show_bar_lines, "Show bar lines");
+    ui.checkbox(&mut settings.show_seconds_lines, "Show seconds lines");
+    ui.add_enabled_ui(settings.show_seconds_lines, |ui| {
+        option_combo(ui, "Seconds interval", &mut settings.seconds_interval,
+            [1, 5, 10].map(|seconds| {
+                (seconds, if seconds == 1 { "1 second".to_owned() } else { format!("{seconds} seconds") })
+            }));
+    });
+    ui.separator();
+    options_group_heading(ui, "Waveform border");
+    ui.checkbox(&mut settings.border_enabled, "Show a border");
+    ui.add_enabled_ui(settings.border_enabled, |ui| {
+        option_combo(ui, "Border width", &mut settings.border_width,
+            BORDER_WIDTHS.map(|width| (width, format!("{width} px"))));
+        let mut theme = settings.border_color.is_none();
+        let theme_changed = ui.checkbox(&mut theme, "Use theme color").changed();
+        let mut color = settings.border_color.unwrap_or(settings.accent);
+        let color_changed = options_field(ui, "Custom border color", |ui| {
+            ui.add_enabled_ui(!theme, |ui| ui.color_edit_button_srgb(&mut color)).inner.changed()
+        });
+        if theme_changed || color_changed {
+            settings.border_color = (!theme).then_some(color);
+        }
+        ui.checkbox(&mut settings.border_follows_background, "Follow background opacity");
+    });
+    ui.separator();
+    options_group_heading(ui, "Display");
+    option_combo(ui, "Waveform", &mut settings.waveform_layout,
+        WaveformLayout::ALL.map(|layout| (layout, layout.label().to_owned())));
+    option_combo(ui, "Meter", &mut settings.meter_mode,
+        MeterMode::ALL.map(|mode| (mode, mode.label().to_owned())));
 }
 
-fn folder_options(ui: &mut egui::Ui, settings: &SessionSettings) -> Option<FolderAction> {
+fn folder_options(ui: &mut egui::Ui, settings: &mut SessionSettings) -> Option<FolderAction> {
     let mut action = None;
-    for kind in [FolderKind::Export, FolderKind::Saved] {
-        let folder = kind.path(settings).display().to_string();
-        option_row(ui, kind.label(), |ui| {
-            ui.add(egui::Label::new(&folder).truncate()).on_hover_text(&folder);
+    let mut folder = |ui: &mut egui::Ui, kind: FolderKind, settings: &SessionSettings| {
+        options_field(ui, kind.label(), |ui| {
+            options_value(ui, &kind.path(settings).display().to_string());
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Select folder").on_hover_text(&folder).clicked() {
+                if ui.button("Choose folder…").clicked() {
                     action = Some(FolderAction::Select(kind));
                 }
-                if ui.button("Open folder").on_hover_text(&folder).clicked() {
+                if ui.button("Open folder").clicked() {
                     action = Some(FolderAction::Open(kind));
                 }
             });
         });
-    }
+    };
+    folder(ui, FolderKind::Export, settings);
+    output_cleanup_options(ui, settings);
+    folder(ui, FolderKind::Saved, settings);
     action
+}
+
+fn output_cleanup_options(ui: &mut egui::Ui, settings: &mut SessionSettings) {
+    let note = match settings.output_cleanup {
+        None => "Files you drag into other programs stay in this folder.".to_owned(),
+        Some(_) if cleanup::same_folder(&settings.output_dir, &settings.saved_dir) => {
+            "Not active while this is also the saved snapshots folder.".to_owned()
+        }
+        Some(days) => format!(
+            "Backtracking's WAV files in this folder are permanently deleted {days} days \
+             after they were written. A project that still uses one loses it."
+        ),
+    };
+    options_field(ui, "Delete old drag-and-drop files", |ui| {
+        let choices = std::iter::once(None).chain(cleanup::AGE_CHOICES.map(Some));
+        options_choice(ui, "output-cleanup", &mut settings.output_cleanup,
+            choices.map(|age| (age, cleanup::age_label(age))));
+        options_note(ui, note);
+    });
 }
 
 fn wav_format_controls(ui: &mut egui::Ui, profile: &mut WavExportProfile) {
     option_combo(ui, "WAV sample rate", &mut profile.sample_rate,
         WAV_SAMPLE_RATES.map(|(rate, label)| (rate, label.to_owned())));
-    option_combo(ui, "WAV sample format", &mut profile.sample_format,
+    option_combo(ui, "WAV encoding", &mut profile.sample_format,
         WAV_SAMPLE_FORMATS.map(|(format, label)| (format, label.to_owned())));
 }
 
@@ -2061,7 +2134,7 @@ mod tests {
     #[test]
     fn auto_resume_choices_are_labelled_by_what_they_do() {
         let labels = AutoResumeDelay::ALL.map(auto_resume_label);
-        assert_eq!(labels, ["Off", "5 s", "10 s"]);
+        assert_eq!(labels, ["Off", "5 seconds", "10 seconds"]);
     }
 
     fn rendered_waveform(
@@ -2283,9 +2356,10 @@ mod tests {
             ..Default::default()
         }, |ui| {
             let toolbar_body = ui.style().text_styles[&egui::TextStyle::Body].size;
-            options_layout(ui, &mut tab, |ui, _| {
+            options_layout(ui, &mut tab, Color32::WHITE, |ui, _| {
                 assert!(ui.style().text_styles[&egui::TextStyle::Body].size >= 15.0);
-                option_row(ui, "Readable field", |ui| { ui.label("Readable body"); });
+                options_group_heading(ui, "Readable group");
+                ui.label("Readable body");
             });
             assert_eq!(ui.style().text_styles[&egui::TextStyle::Body].size, toolbar_body);
         });
@@ -2296,11 +2370,15 @@ mod tests {
             _ => None,
         }).max_by(f32::total_cmp).unwrap();
         assert!(font_size("Capture") >= 20.0);
-        assert!(font_size("Readable field") > font_size("Readable body"));
-        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
-            egui::Shape::Text(shape) if shape.galley.job.text == "Readable field"
-                && shape.galley.job.sections[0].format.font_id.family
-                    == egui::FontFamily::Name(waveform::HINT_BOLD_FAMILY.into()))));
+        assert!(font_size("Readable body") >= 15.0);
+        // The page title and a group heading are set in the bold face, not just brightened.
+        for (heading, size) in [("Capture", 20.0), ("Readable group", 15.0)] {
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(shape) if shape.galley.job.text == heading
+                    && shape.galley.job.sections[0].format.font_id
+                        == egui::FontId::new(size, egui::FontFamily::Name(waveform::HINT_BOLD_FAMILY.into())))),
+                "{heading}");
+        }
         output.drop_without_applying_deltas();
     }
 
@@ -2316,7 +2394,7 @@ mod tests {
                 ..Default::default()
             }, |ui| {
                 let mut tab = OptionsTab::Capture;
-                options_layout(ui, &mut tab, |ui, _| {
+                options_layout(ui, &mut tab, Color32::WHITE, |ui, _| {
                     option_combo(ui, "Menu under test", &mut selected,
                         (0..count).map(|index| (index, format!("Entry {index:02}"))));
                 });
@@ -2385,6 +2463,7 @@ mod tests {
                         show_seconds_lines: true,
                         border_enabled: true,
                         border_color: Some(DEFAULT_ACCENT),
+                        output_cleanup: Some(30),
                         output_dir: PathBuf::from("A very long export directory name ".repeat(8)),
                         saved_dir: PathBuf::from("A very long saved snapshot directory ".repeat(8)),
                         ..SessionSettings::default()
@@ -2395,7 +2474,7 @@ mod tests {
                             ..Default::default()
                         }, |ui| {
                             let available = ui.max_rect();
-                            let output = options_layout(ui, &mut tab, |ui, tab| match tab {
+                            let output = options_layout(ui, &mut tab, Color32::WHITE, |ui, tab| match tab {
                                 OptionsTab::Capture => capture_options(ui, &mut settings),
                                 OptionsTab::Sources => source_options(ui, &mut settings, true, host_name),
                                 OptionsTab::Appearance => appearance_options(ui, &mut settings),

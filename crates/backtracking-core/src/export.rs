@@ -565,6 +565,61 @@ fn take_name_at(time: TakeTime, seconds: f64, tempo_bpm: Option<f64>) -> String 
     name
 }
 
+/// Whether `name` is a file name this module's WAV exports produce, in the current form or the
+/// earlier `Backtracking-<milliseconds>-<process>-<serial>` one. Housekeeping asks before it
+/// removes anything, so a file the user put in an export folder is never touched.
+pub fn is_export_file_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".wav") else {
+        return false;
+    };
+    let stem = stem.strip_suffix("-A").or_else(|| stem.strip_suffix("-B")).unwrap_or(stem);
+    if let Some(take) = stem.strip_prefix("Backtracking_") {
+        is_dated_take(take)
+    } else if let Some(take) = stem.strip_prefix("Backtracking-") {
+        let mut numbers = take.split('-');
+        (0..3).all(|_| numbers.next().is_some_and(is_digits)) && numbers.next().is_none()
+    } else {
+        false
+    }
+}
+
+fn is_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_decimal(text: &str) -> bool {
+    let mut parts = text.split('.');
+    parts.next().is_some_and(is_digits) && parts.next().is_none_or(is_digits) && parts.next().is_none()
+}
+
+/// The part of a take name after `Backtracking_`: date, time, length, then optionally a tempo
+/// and a collision number, as `take_name_at` and `numbered_take` write them.
+fn is_dated_take(take: &str) -> bool {
+    let dashed = |text: Option<&str>, widths: [usize; 3]| {
+        text.is_some_and(|text| {
+            let mut parts = text.split('-');
+            widths.iter().all(|&width| {
+                parts.next().is_some_and(|part| part.len() == width && is_digits(part))
+            }) && parts.next().is_none()
+        })
+    };
+    let mut fields = take.split('_');
+    if !dashed(fields.next(), [4, 2, 2]) || !dashed(fields.next(), [2, 2, 2]) {
+        return false;
+    }
+    if !fields.next().and_then(|length| length.strip_suffix('s')).is_some_and(is_decimal) {
+        return false;
+    }
+    let mut next = fields.next();
+    if next.and_then(|tempo| tempo.strip_suffix("bpm")).is_some_and(is_decimal) {
+        next = fields.next();
+    }
+    if next.is_some_and(is_digits) {
+        next = fields.next();
+    }
+    next.is_none()
+}
+
 /// The first export keeps the plain take name. Later ones that would collide get `_2`, `_3`, …
 fn numbered_take(take: &str, attempt: u32) -> String {
     if attempt <= 1 {
@@ -1098,6 +1153,54 @@ mod tests {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')),
             "{name}"
         );
+    }
+
+    #[test]
+    fn export_file_names_are_recognised_and_other_files_are_not() {
+        let time = TakeTime {
+            year: 2026,
+            month: 11,
+            day: 14,
+            hour: 15,
+            minute: 32,
+            second: 7,
+        };
+        // Every name the exporter can write: with and without tempo, a collision number and
+        // a lane suffix.
+        for tempo in [None, Some(120.0), Some(98.46)] {
+            let take = take_name_at(time, 12.44, tempo);
+            for attempt in [1, 2, 37] {
+                let numbered = numbered_take(&take, attempt);
+                for lane in ["", "-A", "-B"] {
+                    let name = format!("{numbered}{lane}.wav");
+                    assert!(is_export_file_name(&name), "{name}");
+                }
+            }
+        }
+        // The names used before takes were dated.
+        assert!(is_export_file_name("Backtracking-1763100000000-4242-7.wav"));
+        assert!(is_export_file_name("Backtracking-1763100000000-4242-7-B.wav"));
+
+        for other in [
+            "Backtracking.wav",
+            "Backtracking_notes.wav",
+            "Backtracking_2026-11-14_15-32-07_12.4s.mp3",
+            "Backtracking_2026-11-14_15-32-07_12.4s",
+            "Backtracking_2026-11-14_15-32-07_12.4s-C.wav",
+            "Backtracking_2026-11-14_15-32-07_12.4s_final.wav",
+            "Backtracking_2026-11-14_15-32-07_12.4s_120bpm_2_3.wav",
+            "Backtracking_2026-11-14_15-32_12.4s.wav",
+            "Backtracking_2026-11-14_15-32-07_long.wav",
+            "Backtracking-1763100000000-4242.wav",
+            "Backtracking-1763100000000-4242-7-8.wav",
+            "Backtracking-take-1-2.wav",
+            "My Backtracking_2026-11-14_15-32-07_12.4s.wav",
+            "Kick_2026-11-14_15-32-07_12.4s.wav",
+            "song.wav",
+            "",
+        ] {
+            assert!(!is_export_file_name(other), "{other}");
+        }
     }
 
     #[test]

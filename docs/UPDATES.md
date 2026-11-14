@@ -2,7 +2,7 @@
 
 ## 使用方式
 
-桌面版可在 **Options → 更新** 查看目前版本、開啟自動更新、手動檢查，以及重看上次更新內容。第一次遇到已簽署的新版會顯示 GitHub Release 說明。**下個版本再提示**只跳過當前版本，**不再顯示更新提示**則改為手動檢查。啟用後，手動開啟和登入啟動都會先處理更新，再開始錄音。離線、檢查逾時或更新失敗時會啟動目前版本。
+桌面版可在 **Options → Updates** 查看目前版本、選擇更新方式（**Ask before installing**、**Automatically update at startup** 或 **Check manually**）、手動檢查，以及重看上次更新內容。第一次遇到已簽署的新版會顯示 GitHub Release 說明。**Ask again for the next version** 只跳過當前版本，**Stop asking** 則改為手動檢查。啟用後，手動開啟和登入啟動都會先處理更新，再開始錄音。離線、檢查逾時或更新失敗時會啟動目前版本。
 
 第一次使用需手動安裝已內建發行公鑰的版本。後續可由更新器從 GitHub Release 下載並驗證對應平台的更新檔。
 
@@ -19,9 +19,9 @@ openssl genpkey -algorithm ED25519 -out /private/path/backtracking-update-key.pe
 python3 tools/sign_backtracking_update.py public-key /private/path/backtracking-update-key.pem
 ```
 
-Backtracking's release public key is stored in [`desktop/update-public-key.hex`](../desktop/update-public-key.hex). CI in the official repository supplies it to both desktop release builds. For a local release build, set `BACKTRACKING_UPDATE_PUBLIC_KEY` to the contents of that file before running the Windows or macOS build command. Keep the matching private key in the maintainer's signing environment. Windows builds without an embedded key show the GitHub download link in Options. On macOS, the manual check reports that the key is unconfigured.
+Backtracking's release public key is stored in [`desktop/update-public-key.hex`](../desktop/update-public-key.hex). CI in the official repository supplies it to both desktop release builds. For a local release build, set `BACKTRACKING_UPDATE_PUBLIC_KEY` to the contents of that file before running the Windows or macOS build command. `tools/build_windows_setup.ps1` sets it from that file by itself and refuses to package a `Backtracking.exe` that lacks the key. Pass `-NoUpdateKey` for a fork or a test build that should not update itself. Keep the matching private key in the maintainer's signing environment. Windows and macOS builds without an embedded key say so in Options and show the GitHub Releases link in place of the update controls.
 
-正式版公鑰已收錄在 [`desktop/update-public-key.hex`](../desktop/update-public-key.hex)，官方 CI 會將它提供給 Windows 與 macOS 桌面版建置。本機建置正式版前，請將檔案中的公鑰設為 `BACKTRACKING_UPDATE_PUBLIC_KEY`。每次發布仍須使用對應的私鑰簽署各平台更新檔。
+正式版公鑰已收錄在 [`desktop/update-public-key.hex`](../desktop/update-public-key.hex)，官方 CI 會將它提供給 Windows 與 macOS 桌面版建置。本機建置正式版前，請將檔案中的公鑰設為 `BACKTRACKING_UPDATE_PUBLIC_KEY`。`tools/build_windows_setup.ps1` 會自動從該檔案帶入公鑰，若 `Backtracking.exe` 未內建公鑰則拒絕打包。分支或測試用、不需自我更新的版本可加上 `-NoUpdateKey`。每次發布仍須使用對應的私鑰簽署各平台更新檔。
 
 ## Build and sign
 
@@ -38,7 +38,7 @@ Use these exact artifact names. Each platform adds a matching `.json` and `.json
 For example, sign a Windows release payload using its compiled version.
 
 ```sh
-python3 tools/sign_backtracking_update.py sign windows-x64 0.1.5 \
+python3 tools/sign_backtracking_update.py sign windows-x64 0.2.0 \
   Backtracking-update-windows-x64.exe /private/path/backtracking-update-key.pem
 ```
 
@@ -47,7 +47,7 @@ On macOS, build on the intended architecture. Set `BACKTRACKING_MAC_CODESIGN_IDE
 ```sh
 BACKTRACKING_UPDATE_PUBLIC_KEY="$UPDATE_PUBLIC_KEY" bash desktop/macos/build.sh
 ditto -c -k --keepParent target/bundled/Backtracking.app Backtracking-update-macos-arm64.zip
-python3 tools/sign_backtracking_update.py sign macos-arm64 0.1.5 \
+python3 tools/sign_backtracking_update.py sign macos-arm64 0.2.0 \
   Backtracking-update-macos-arm64.zip /private/path/backtracking-update-key.pem
 ```
 

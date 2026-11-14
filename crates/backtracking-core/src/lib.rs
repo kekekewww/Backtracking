@@ -1,4 +1,5 @@
 mod capture;
+pub mod cleanup;
 mod export;
 mod ffi;
 mod meter;
@@ -14,7 +15,7 @@ pub use capture::{
 pub use export::{
     export_routed_tracks_with_profile, export_routed_tracks_with_tempo,
     export_routed_wav_with_profile, export_tracks_with_profile, export_wav,
-    export_wav_with_profile, write_wav, write_wav_with_profile, TrackAudio, WavExportProfile,
+    export_wav_with_profile, is_export_file_name, write_wav, write_wav_with_profile, TrackAudio, WavExportProfile,
     WavSampleFormat,
 };
 pub use meter::MeterReadings;

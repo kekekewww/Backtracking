@@ -165,4 +165,18 @@ char *bt_senders_string(const BtSenders *senders, size_t index, int32_t name);
 uint32_t bt_senders_format(const BtSenders *senders, size_t index, uint32_t *channels);
 int32_t bt_sender_request_snapshot(const char *id);
 
+// Optional housekeeping for the drag-and-drop folder. days is 0 for Off, otherwise 10, 20, 30,
+// 60 or 90. bt_cleanup_poll starts a pass when one is due (a null folder means "do not clean
+// now") and returns the number of files a finished pass deleted, -1 when it failed and -2 when
+// no pass has finished. Only WAV files Backtracking named are ever deleted.
+typedef struct BtCleanup BtCleanup;
+BtCleanup *bt_cleanup_new(uint32_t days);
+void bt_cleanup_free(BtCleanup *cleanup);
+uint32_t bt_cleanup_days(const BtCleanup *cleanup);
+void bt_cleanup_set_days(BtCleanup *cleanup, uint32_t days);
+void bt_cleanup_restart(BtCleanup *cleanup);
+int32_t bt_cleanup_due(const BtCleanup *cleanup);
+int64_t bt_cleanup_poll(BtCleanup *cleanup, const char *folder, const char *const *keep, size_t keep_count);
+int32_t bt_same_folder(const char *a, const char *b);
+
 #endif
