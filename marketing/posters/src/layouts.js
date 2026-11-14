@@ -54,12 +54,12 @@
       '" alt=""><span class="wm"' + S({ fs: o.fs }) + ">Backtracking</span></div>";
   }
   function tag(o) { return '<div class="tag wide"' + S(o) + ">" + esc(C.tag) + "</div>"; }
-  /* fit: {w,h,max,mode:"one"|"each"}; mint: indexes of mint lines (default last); inline: one row */
+  /* fit: {w,h,max,mode:"one"(default: all lines one size, short lines sit flush left)|"each"}; mint: indexes of mint lines (default last); inline: one row */
   function mega(lines, o) {
     var mint = o.mint || [lines.length - 1];
     /* Chinese blocks read heavier than the condensed caps: default to a smaller cap and a little more air */
     var max = ZH ? (o.zmax || Math.round(o.max * 0.82)) : o.max;
-    var fit = { w: o.w, h: o.h, max: max, mode: o.mode || (ZH ? "each" : "one"), inline: !!o.inline, align: o.align || "left" };
+    var fit = { w: o.w, h: o.h, max: max, mode: o.mode || "one", inline: !!o.inline, align: o.align || "left" };
     var inner = lines.map(function (ln, i) {
       return '<span class="ln' + (mint.indexOf(i) >= 0 ? " m" : "") + '">' + lat(ln) + "</span>";
     }).join(o.inline ? '<span class="sp"> </span>' : "");
@@ -215,7 +215,7 @@
         '<svg' + S({ l: 64, t: L(299, 300) }) + ' width="22" height="22" viewBox="0 0 12 12" fill="none" stroke="#b0fbd3" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M3.6 1.8h4.8M4.4 1.8v3.4L2.8 7.2h6.4L7.6 5.2V1.8M6 7.2v3.4"/></svg>' +
         label(C.ui.waveOnly, { l: 96, t: L(301, 300), fs: L(14, 16), color: "var(--c-paper)" }) +
         chip(e.label, { r: 64, t: 292, fs: L(14, 17) }, "ink") +
-        mega(e.mega, { l: 56, t: L(352, 364), w: 950, h: 440, max: 290 }) +
+        mega(e.mega, { l: 56, t: L(352, 364), w: 950, h: 440, max: 290, mode: "each" }) +
         sub(e.sub, { l: 64, t: L(832, 844), w: 900, fs: L(24, 24) }) +
         label(C.ui.source, { l: 64, t: 962, fs: L(13, 15) }) +
         srcChips({ l: 64, t: 992, fs: L(15, 18), gap: 12 }, 2) +
