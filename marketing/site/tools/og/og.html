@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Backtracking OG image</title>
+<!-- Template for img/og-en.png and img/og-zh-TW.png (1200x630). Render with tools/render-og.cjs.
+     og.html?lang=en | og.html?lang=zh -->
+<link rel="stylesheet" href="../../css/site.css">
+<link rel="stylesheet" href="bt-panel.css">
+<style>
+  html, body { width: 1200px; height: 630px; overflow: hidden; }
+  .frame { position: relative; width: 1200px; height: 630px; overflow: hidden; background: var(--blue); }
+  .frame > * { position: absolute; }
+  .bgw { left: -20px; top: 330px; color: var(--blue-2); }
+  .lockup { left: 56px; top: 42px; }
+  .lockup img { width: 52px; height: 52px; }
+  .lockup .wm { font-size: 27px; }
+  .tag { right: 56px; top: 60px; font-size: 13px; }
+  .mega { left: 50px; top: 136px; font-size: 212px; }
+  .mega:lang(zh) { top: 134px; font-size: 118px; left: 56px; }
+  .panel { left: 640px; top: 132px; }
+  .panel .btp { zoom: 0.93; box-shadow: 14px 14px 0 var(--ink); --btp-sel: #c21f6c; --btp-sel-line: #ff4f9a; --btp-sel-band: rgba(255,79,154,.07); }
+  .streaks { left: 0; top: 0; }
+  .streaks line { stroke: var(--mint); stroke-linecap: round; }
+  .slab { left: 760px; top: 318px; display: flex; align-items: center; gap: 14px; padding: 12px 22px 12px 12px; background: var(--mint); color: var(--ink); box-shadow: 9px 9px 0 var(--ink); }
+  .slab .ic { width: 34px; height: 42px; background: var(--ink); color: var(--mint); display: flex; align-items: flex-end; justify-content: center; padding-bottom: 5px; font-stretch: 125%; font-weight: 800; font-size: 9px; letter-spacing: .04em; }
+  .slab .n { font-weight: 800; font-size: 18px; }
+  .slab .m { font-weight: 600; font-stretch: 125%; font-size: 11px; letter-spacing: .04em; opacity: .75; margin-top: 2px; }
+  .cursor { left: 748px; top: 306px; filter: drop-shadow(3px 3px 0 var(--ink)); }
+  .scale2 { text-transform: none; left: 56px; right: 56px; top: 488px; display: flex; justify-content: space-between; border-top: 2px solid var(--paper); padding-top: 10px; font-size: 13px; color: var(--paper-2); }
+  .scale2 span { position: relative; }
+  .scale2 span::before { content: ""; position: absolute; left: 0; top: -12px; width: 2px; height: 10px; background: var(--paper); }
+  .scale2 span:last-child::before { left: auto; right: 0; }
+  .scale2 .on { color: var(--mint); }
+  .scale2 .on::before { background: var(--mint) !important; width: 4px !important; height: 20px !important; top: -22px !important; }
+  .rule { left: 56px; right: 56px; top: 556px; height: 2px; background: var(--paper); }
+  .eds { left: 56px; top: 578px; font-size: 14px; }
+  .url { right: 56px; top: 578px; font-size: 14px; color: var(--paper); text-transform: none; letter-spacing: .04em; }
+</style>
+</head>
+<body>
+<div class="frame">
+  <div class="bgw" id="bgw"></div>
+  <div class="lockup"><img src="../../img/icon.svg" alt=""><span class="wm">Backtracking</span></div>
+  <div class="tag wide" id="tag">Retrospective audio sampler</div>
+  <h1 class="mega" id="mega"><span>Take it</span><span class="m">back.</span></h1>
+  <div class="panel"><div class="btp" id="panel"></div></div>
+  <svg class="streaks" width="1200" height="630" viewBox="0 0 1200 630">
+    <line x1="560" y1="334" x2="736" y2="334" stroke-width="4"/>
+    <line x1="620" y1="354" x2="736" y2="354" stroke-width="4" opacity=".7"/>
+    <line x1="672" y1="374" x2="736" y2="374" stroke-width="4" opacity=".45"/>
+  </svg>
+  <div class="slab"><div class="ic">WAV</div><div><div class="n">Backtracking-1794…-13.wav</div><div class="m">7.40 s · 48 kHz · 32-bit float</div></div></div>
+  <svg class="cursor" width="26" height="37" viewBox="0 0 14 20"><path d="M1 1v15.5l3.8-3.6 2.6 6 2.4-1-2.5-5.9h5.3Z" fill="#fff" stroke="#070c3d" stroke-width="1.1" stroke-linejoin="round"/></svg>
+  <div class="scale2 wide" id="scale"></div>
+  <div class="rule"></div>
+  <div class="editions eds wide"><span>Windows</span><span>macOS</span><span>VST3</span><span>CLAP</span></div>
+  <div class="url wide">backtracking.kamelkyp.com</div>
+</div>
+<script src="bt-panel.js"></script>
+<script>
+  var zh = /lang=zh/.test(location.search);
+  var scale = zh ? ["10 秒", "20 秒", "30 秒", "60 秒", "3 分鐘", "5 分鐘", "10 分鐘"] : ["10 s", "20 s", "30 s", "60 s", "3 min", "5 min", "10 min"];
+  document.getElementById("scale").innerHTML = scale.map(function (s, i) { return "<span" + (i === 6 ? ' class="on"' : "") + ">" + s + "</span>"; }).join("");
+  if (zh) {
+    document.documentElement.lang = "zh-Hant-TW";
+    document.getElementById("tag").textContent = "回溯錄音取樣器";
+    document.getElementById("mega").innerHTML = "<span>剛剛那段</span><span class=\"m\">拿回來</span>";
+  }
+  BTPanel.render(document.getElementById("panel"), { width: 548, waveHeight: 78, seed: 19, style: "mixed", selection: [0.36, 0.6], duration: "7.40 s", tooltip: zh ? null : { text: "Drag and Drop", at: 0.48, y: 58 }, meter: "−14.1", meterUnit: "dBFS" });
+  BTPanel.wave(document.getElementById("bgw"), { width: 1240, height: 320, seed: 23, style: "mixed", step: 3 });
+</script>
+</body>
+</html>

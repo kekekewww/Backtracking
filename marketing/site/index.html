@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backtracking: Retrospective audio sampler</title>
+<meta name="description" content="Select what you just heard and drag it out as a WAV. Backtracking keeps up to 10 minutes of audio in memory. Windows / macOS / VST3 / CLAP.">
+<meta name="theme-color" content="#1e32d2">
+<link rel="canonical" href="https://backtracking.kamelkyp.com/">
+<link rel="alternate" hreflang="en" href="https://backtracking.kamelkyp.com/">
+<link rel="alternate" hreflang="zh-Hant-TW" href="https://backtracking.kamelkyp.com/zh-tw/">
+<link rel="alternate" hreflang="x-default" href="https://backtracking.kamelkyp.com/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Backtracking">
+<meta property="og:title" content="Backtracking: Take it back.">
+<meta property="og:description" content="Select what you just heard and drag it out as a WAV. Backtracking keeps up to 10 minutes of audio in memory.">
+<meta property="og:url" content="https://backtracking.kamelkyp.com/">
+<meta property="og:image" content="https://backtracking.kamelkyp.com/img/og-en.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Backtracking. Take it back. A waveform panel with a selected range dragged out as a WAV file.">
+<meta property="og:locale" content="en_US">
+<meta property="og:locale:alternate" content="zh_TW">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Backtracking: Take it back.">
+<meta name="twitter:description" content="Select what you just heard and drag it out as a WAV. Backtracking keeps up to 10 minutes of audio in memory.">
+<meta name="twitter:image" content="https://backtracking.kamelkyp.com/img/og-en.png">
+<link rel="icon" href="img/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="img/apple-touch-icon.png">
+<link rel="preload" href="fonts/Archivo-Variable-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="css/site.css">
+<script src="js/demo.js" defer></script>
+<script src="js/media.js" defer></script>
+</head>
+<body>
+<header class="top wrap">
+  <a class="lockup" href="./"><img src="img/icon.svg" width="44" height="44" alt=""><span class="wm">Backtracking</span></a>
+  <p class="tag wide">Retrospective audio sampler</p>
+  <nav class="lang wide" aria-label="Language">
+    <span aria-current="page">EN</span>
+    <a class="sys-cjk" href="zh-tw/" hreflang="zh-Hant-TW" lang="zh-Hant-TW">中文</a>
+  </nav>
+</header>
+
+<main>
+<section class="hero" aria-labelledby="hero-title">
+  <div class="bgwave" data-bgwave aria-hidden="true"></div>
+  <div class="wrap hero-grid">
+    <div class="hero-copy">
+      <h1 class="mega" id="hero-title"><span>Take it</span> <span class="m">back.</span></h1>
+      <p class="sub">Select what you just heard and drag it out as a WAV. Backtracking keeps up to <b>10&nbsp;minutes</b> of audio in memory.</p>
+      <div class="ctas">
+        <a class="btn btn-primary" href="https://github.com/kekekewww/Backtracking"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8M4.5 6.8 8 10.3l3.5-3.5M2.5 13.5h11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"/></svg>Download from GitHub</a>
+        <a class="btn btn-ghost" href="guide/">Read the user guide</a>
+        <a class="btn btn-quiet" href="https://buymeacoffee.com/kamelkyp/e/596694" target="_blank" rel="noopener">Support developer</a>
+      </div>
+      <p class="editions wide" aria-label="Editions"><span>Windows</span><span>macOS</span><span>VST3</span><span>CLAP</span></p>
+      <p class="small">Windows 10/11 x64 · macOS 14.2 or later</p>
+    </div>
+
+    <section class="demo" id="demo" aria-labelledby="demo-title">
+      <div class="demo-head">
+        <h2 class="demo-label wide" id="demo-title">Live demo</h2>
+        <ol class="steps" aria-label="Three steps">
+          <li data-step="1" class="now"><span class="n" aria-hidden="true">1</span><span>Play something</span><span class="sr-only step-state"></span></li>
+          <li data-step="2"><span class="n" aria-hidden="true">2</span><span>Select the part you want</span><span class="sr-only step-state"></span></li>
+          <li data-step="3"><span class="n" aria-hidden="true">3</span><span>Drag it out</span><span class="sr-only step-state"></span></li>
+        </ol>
+      </div>
+
+      <div class="btp" id="bt-panel">
+        <div class="btp-bar">
+          <span class="btp-title">Backtracking</span>
+          <button type="button" class="btp-btn" id="bt-arm" aria-label="Pause capture" title="Pause capture"></button>
+          <span class="btp-dot" id="bt-dot"></span>
+          <button type="button" class="btp-btn" id="bt-clear" aria-label="Clear capture" title="Clear capture"></button>
+          <span class="btp-spacer"></span>
+          <span class="btp-meter" id="bt-meter" role="status" aria-label="Live level"><b>—</b> dBFS</span>
+        </div>
+        <div class="btp-wave" id="bt-wave" tabindex="0" role="application" aria-roledescription="waveform" aria-label="Waveform. Newest audio on the right." aria-describedby="bt-wave-help">
+          <canvas id="bt-canvas" aria-hidden="true"></canvas>
+          <span class="btp-dur" id="bt-dur" hidden></span>
+          <span class="btp-tip" id="bt-tip" hidden>Drag and Drop</span>
+          <button type="button" class="play-prompt" id="bt-prompt"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 1.5v9l7.5-4.5Z" fill="currentColor"/></svg>Play something</button>
+        </div>
+      </div>
+      <p class="sr-only" id="bt-wave-help">Drag across the waveform to select. Hold Shift to snap to whole seconds. Drag the selection onto the track below. With the waveform focused: Enter selects the last 4 seconds, arrow keys move the selection, Shift with arrow keys changes its start, Enter again sends it to the track, Escape or Backspace cancels.</p>
+      <p class="demo-msg" id="bt-msg" role="alert" hidden></p>
+
+      <div class="dc-row">
+        <button type="button" class="dc go" id="bt-music" aria-pressed="false"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 1.5v9l7.5-4.5Z" fill="currentColor"/></svg><span>Play something</span></button>
+        <div class="vol">
+          <button type="button" class="dc" id="bt-mute" aria-pressed="false" aria-label="Mute"></button>
+          <input type="range" id="bt-vol" min="0" max="100" value="70" aria-label="Volume">
+        </div>
+        <span class="dc-spacer"></span>
+        <button type="button" class="dc" id="bt-strip" aria-pressed="false">Waveform only</button>
+      </div>
+
+      <div class="history">
+        <div class="history-head"><span class="wide" id="bt-hist-label">History</span><span>3 min · 5 min · 10 min in the app</span></div>
+        <div class="scale" role="radiogroup" aria-labelledby="bt-hist-label" id="bt-hist">
+          <button type="button" role="radio" aria-checked="false" data-sec="10">10 s</button>
+          <button type="button" role="radio" aria-checked="true" data-sec="20">20 s</button>
+          <button type="button" role="radio" aria-checked="false" data-sec="30">30 s</button>
+          <button type="button" role="radio" aria-checked="false" data-sec="60">60 s</button>
+          <span class="app-only">3 min</span>
+          <span class="app-only">5 min</span>
+          <span class="app-only">10 min</span>
+        </div>
+      </div>
+
+      <div class="dc-row">
+        <button type="button" class="dc" id="bt-last4" disabled>Select last 4 s</button>
+        <button type="button" class="dc" id="bt-send" disabled>Send to track</button>
+        <button type="button" class="dc" id="bt-save" disabled>Save WAV</button>
+        <span class="dc-note" id="bt-fmt">48 kHz · 32-bit float · stereo</span>
+      </div>
+      <p class="demo-note" id="bt-save-note" hidden>Saving is off in this demo because the music is licensed. The app saves real WAV files.</p>
+
+      <div class="daw" id="bt-daw">
+        <div class="daw-bar">
+          <button type="button" class="daw-btn" id="bt-tplay" disabled></button>
+          <span class="daw-time" id="bt-ttime">0:00.0</span>
+          <span class="dc-spacer"></span>
+          <button type="button" class="daw-btn" id="bt-tclear" disabled>Clear track</button>
+        </div>
+        <div class="daw-grid">
+          <div class="daw-corner"></div>
+          <div class="daw-ruler" id="bt-ruler" aria-hidden="true"></div>
+          <div class="daw-head">Audio 1<small>DAW track</small></div>
+          <div class="daw-lane-wrap">
+            <div class="daw-lane" id="bt-lane" role="list" aria-label="Audio 1 clips">
+              <p class="daw-empty" id="bt-empty">Drag the selection here</p>
+            </div>
+            <div class="daw-playhead" id="bt-playhead"></div>
+          </div>
+        </div>
+      </div>
+
+      <p class="demo-honest"><b>A browser demo.</b> The sound plays on this page. The real app captures your system playback, a microphone, a chosen app, or a DAW track.</p>
+      <p class="demo-credit" id="bt-credit" hidden>Music: “Fun Vibe” by Dyalla, YouTube Audio Library.</p>
+      <p class="sr-only" aria-live="polite" id="bt-live"></p>
+    </section>
+  </div>
+</section>
+
+<section class="section wrap" aria-labelledby="beats-title">
+  <h2 class="sr-only" id="beats-title">How it works</h2>
+  <div class="big-scale wide" aria-label="History: 10 s, 20 s, 30 s, 60 s, 3 min, 5 min, 10 min">
+    <span>10 s</span><span>20 s</span><span>30 s</span><span>60 s</span><span>3 min</span><span>5 min</span><span class="on">10 min</span>
+  </div>
+  <ol class="beat-list">
+    <li class="beat"><span class="beat-n" aria-hidden="true">1</span><h3>It's already listening.</h3><p>Backtracking keeps the last 10 seconds to 10 minutes of audio in memory.</p></li>
+    <li class="beat"><span class="beat-n" aria-hidden="true">2</span><h3>Select the part you want.</h3><p>Drag across the waveform. Hold Shift to snap to flags, bars or seconds.</p><figure class="loop" data-src="media/loops/loop-select"><div class="loop-box"></div></figure></li>
+    <li class="beat"><span class="beat-n" aria-hidden="true">3</span><h3>Drag it out as a WAV.</h3><p>Drop it on a DAW track or into a folder. Recording keeps running in the background.</p><figure class="loop" data-src="media/loops/loop-drag-out"><div class="loop-box"></div></figure></li>
+  </ol>
+</section>
+
+<section class="section wrap" aria-labelledby="features-title">
+  <h2 class="kicker wide" id="features-title">Features</h2>
+  <ul class="cards">
+    <li class="card card-loop"><figure class="loop" data-src="media/loops/loop-ab-sources"><div class="loop-box"></div></figure><h3 class="wide">A/B</h3><p>Record two sources at once and save two aligned WAVs.</p></li>
+    <li class="card card-loop"><figure class="loop" data-src="media/loops/loop-snapshot-shortcut"><div class="loop-box"></div></figure><h3 class="wide">Snapshot shortcut</h3><p>Save from the background: <kbd>Alt</kbd> + <kbd>`</kbd> on Windows, <kbd>Fn/Globe</kbd> + <kbd>`</kbd> on macOS.</p></li>
+    <li class="card card-loop"><figure class="loop" data-src="media/loops/loop-waveform-only"><div class="loop-box"></div></figure><h3 class="wide">Waveform only</h3><p>Shrink the window to a thin waveform strip, with adjustable transparency, kept on top.</p></li>
+    <li class="card"><h3 class="wide">Sources</h3><p>Capture system playback, a microphone, or one chosen app.</p></li>
+    <li class="card"><h3 class="wide">Plug-in</h3><p>Insert it on any DAW track to capture audio at that point in the chain.</p></li>
+    <li class="card"><h3 class="wide">Meter</h3><p>Live level in dBFS, VU or momentary LUFS.</p></li>
+    <li class="card"><h3 class="wide">WAV export</h3><p>44.1, 48 or 96 kHz; 16-bit, 24-bit PCM or 32-bit float.</p></li>
+    <li class="card"><h3 class="wide">Keep quiet sections</h3><p>Optionally keep silence instead of compressing it.</p></li>
+    <li class="card"><h3 class="wide">Sender</h3><p>A plug-in instance can send its audio to the desktop recorder on the same computer.</p></li>
+  </ul>
+</section>
+
+<section class="section wrap" aria-labelledby="editions-title">
+  <h2 class="kicker wide" id="editions-title">Editions</h2>
+  <div class="editions-grid">
+    <article class="edition">
+      <h3 class="wide">Windows desktop</h3>
+      <p class="mega" aria-hidden="true"><span>From any</span><span class="m">app.</span></p>
+      <p>System playback, a microphone, or one chosen app. Select it and drag out a WAV. <a href="https://github.com/kekekewww/Backtracking">Download from GitHub.</a></p>
+      <p class="req wide">Windows 10/11 x64</p>
+    </article>
+    <article class="edition">
+      <h3 class="wide"><span class="kc">macOS</span> desktop</h3>
+      <p class="mega" aria-hidden="true"><span>Off your</span><span class="m">Mac.</span></p>
+      <p>System playback, a microphone, or one chosen app, on macOS 14.2 or later. <a href="https://github.com/kekekewww/Backtracking">Download from GitHub.</a></p>
+      <p class="req wide">macOS 14.2 or later</p>
+    </article>
+    <article class="edition">
+      <h3 class="wide">VST3 / CLAP plug-in</h3>
+      <p class="mega" aria-hidden="true"><span>On any</span><span class="m">track.</span></p>
+      <p>Insert it on a track, group or master. It keeps what passed through and hands it back as a WAV.</p>
+      <p class="req wide">VST3 / CLAP</p>
+    </article>
+  </div>
+  <div class="extra">
+    <p class="mega" aria-hidden="true"><span>One key.</span><span class="m">Saved.</span></p>
+    <div>
+      <h3 class="wide">Linux shortcut helper</h3>
+      <p>A global <kbd>Super</kbd> + <kbd>`</kbd> shortcut that tells a Backtracking plug-in instance to save a snapshot. <a href="https://github.com/kekekewww/Backtracking">Download from GitHub.</a></p>
+    </div>
+  </div>
+  <div class="get">
+    <a class="btn btn-primary" href="https://github.com/kekekewww/Backtracking"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8M4.5 6.8 8 10.3l3.5-3.5M2.5 13.5h11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"/></svg>Download from GitHub</a>
+    <p class="editions wide" aria-label="Editions"><span>Windows</span><span>macOS</span><span>VST3</span><span>CLAP</span></p>
+  </div>
+</section>
+
+<section class="section wrap" aria-labelledby="watch-title">
+  <h2 class="kicker wide">Watch it</h2>
+  <div class="watch-grid">
+    <p class="mega" id="watch-title"><span>It was already</span> <span class="m">listening.</span></p>
+<!-- watch:start (generated by tools/sync-media.py) -->
+<div class="players players-2">
+<figure class="player player-wide"><div class="video-frame frame-wide"><video controls preload="none" playsinline data-poster="media/overview-poster-en.jpg" aria-label="Backtracking overview video"><source src="media/overview-en.mp4" type="video/mp4"></video></div><p class="video-note" hidden>The video could not be loaded.</p><figcaption class="video-cap wide">Overview</figcaption></figure>
+<figure class="player player-tall"><div class="video-frame frame-tall"><video controls preload="none" playsinline data-poster="media/short-poster-en.jpg" aria-label="Backtracking short vertical video"><source src="media/short-en.mp4" type="video/mp4"></video></div><p class="video-note" hidden>The video could not be loaded.</p><figcaption class="video-cap wide">Short, 9:16</figcaption></figure>
+</div>
+<!-- watch:end -->
+  </div>
+</section>
+
+<section class="section wrap" aria-labelledby="posters-title">
+  <h2 class="kicker wide" id="posters-title">Posters</h2>
+<!-- posters:start (generated by tools/sync-media.py; edit the script, not this block) -->
+<h3 class="gallery-title wide">Edition posters</h3>
+<ul class="gallery gallery-edition">
+<li class="poster"><a class="poster-img" href="media/posters/Backtracking-edition-master-en.png" target="_blank" rel="noopener"><img src="media/posters/thumbs/Backtracking-edition-master-en.webp" width="640" height="800" loading="lazy" decoding="async" alt="Master poster, 1080 × 1350"><span class="sr-only"> (opens the full-size PNG in a new tab)</span></a><p class="poster-cap"><span class="poster-name">Master poster</span> <span class="poster-size">1080 × 1350</span></p><a class="poster-dl" href="media/posters/Backtracking-edition-master-en.png" download>Download PNG</a></li>
+<li class="poster"><a class="poster-img" href="media/posters/Backtracking-edition-windows-en.png" target="_blank" rel="noopener"><img src="media/posters/thumbs/Backtracking-edition-windows-en.webp" width="640" height="800" loading="lazy" decoding="async" alt="Windows desktop, 1080 × 1350"><span class="sr-only"> (opens the full-size PNG in a new tab)</span></a><p class="poster-cap"><span class="poster-name">Windows desktop</span> <span class="poster-size">1080 × 1350</span></p><a class="poster-dl" href="media/posters/Backtracking-edition-windows-en.png" download>Download PNG</a></li>
+<li class="poster"><a class="poster-img" href="media/posters/Backtracking-edition-macos-en.png" target="_blank" rel="noopener"><img src="media/posters/thumbs/Backtracking-edition-macos-en.webp" width="640" height="800" loading="lazy" decoding="async" alt="macOS desktop, 1080 × 1350"><span class="sr-only"> (opens the full-size PNG in a new tab)</span></a><p class="poster-cap"><span class="poster-name">macOS desktop</span> <span class="poster-size">1080 × 1350</span></p><a class="poster-dl" href="media/posters/Backtracking-edition-macos-en.png" download>Download PNG</a></li>
+<li class="poster"><a class="poster-img" href="media/posters/Backtracking-edition-plugin-en.png" target="_blank" rel="noopener"><img src="media/posters/thumbs/Backtracking-edition-plugin-en.webp" width="640" height="800" loading="lazy" decoding="async" alt="VST3 / CLAP plug-in, 1080 × 1350"><span class="sr-only"> (opens the full-size PNG in a new tab)</span></a><p class="poster-cap"><span class="poster-name">VST3 / CLAP plug-in</span> <span class="poster-size">1080 × 1350</span></p><a class="poster-dl" href="media/posters/Backtracking-edition-plugin-en.png" download>Download PNG</a></li>
+<li class="poster"><a class="poster-img" href="media/posters/Backtracking-edition-linux-en.png" target="_blank" rel="noopener"><img src="media/posters/thumbs/Backtracking-edition-linux-en.webp" width="640" height="800" loading="lazy" decoding="async" alt="Linux shortcut helper, 1080 × 1350"><span class="sr-only"> (opens the full-size PNG in a new tab)</span></a><p class="poster-cap"><span class="poster-name">Linux shortcut helper</span> <span class="poster-size">1080 × 1350</span></p><a class="poster-dl" href="media/posters/Backtracking-edition-linux-en.png" download>Download PNG</a></li>
+</ul>
+<h3 class="gallery-title wide">Social formats</h3>
+<ul class="gallery gallery-social">
+<li class="poster"><a class="poster-img" href="media/posters/Backtracking-github-social-en.png" target="_blank" rel="noopener"><img src="media/posters/thumbs/Backtracking-github-social-en.webp" width="640" height="320" loading="lazy" decoding="async" alt="GitHub social preview, 1280 × 640"><span class="sr-only"> (opens the full-size PNG in a new tab)</span></a><p class="poster-cap"><span class="poster-name">GitHub social preview</span> <span class="poster-size">1280 × 640</span></p><a class="poster-dl" href="media/posters/Backtracking-github-social-en.png" download>Download PNG</a></li>
+<li class="poster"><a class="poster-img" href="media/posters/Backtracking-instagram-feed-en.png" target="_blank" rel="noopener"><img src="media/posters/thumbs/Backtracking-instagram-feed-en.webp" width="640" height="853" loading="lazy" decoding="async" alt="Instagram feed post, 1080 × 1440"><span class="sr-only"> (opens the full-size PNG in a new tab)</span></a><p class="poster-cap"><span class="poster-name">Instagram feed post</span> <span class="poster-size">1080 × 1440</span></p><a class="poster-dl" href="media/posters/Backtracking-instagram-feed-en.png" download>Download PNG</a></li>
+<li class="poster"><a class="poster-img" href="media/posters/Backtracking-instagram-story-en.png" target="_blank" rel="noopener"><img src="media/posters/thumbs/Backtracking-instagram-story-en.webp" width="640" height="1138" loading="lazy" decoding="async" alt="Instagram story, 1080 × 1920"><span class="sr-only"> (opens the full-size PNG in a new tab)</span></a><p class="poster-cap"><span class="poster-name">Instagram story</span> <span class="poster-size">1080 × 1920</span></p><a class="poster-dl" href="media/posters/Backtracking-instagram-story-en.png" download>Download PNG</a></li>
+<li class="poster"><a class="poster-img" href="media/posters/Backtracking-facebook-cover-en.png" target="_blank" rel="noopener"><img src="media/posters/thumbs/Backtracking-facebook-cover-en.webp" width="640" height="281" loading="lazy" decoding="async" alt="Facebook cover, 1640 × 720"><span class="sr-only"> (opens the full-size PNG in a new tab)</span></a><p class="poster-cap"><span class="poster-name">Facebook cover</span> <span class="poster-size">1640 × 720</span></p><a class="poster-dl" href="media/posters/Backtracking-facebook-cover-en.png" download>Download PNG</a></li>
+<li class="poster"><a class="poster-img" href="media/posters/Backtracking-facebook-feed-en.png" target="_blank" rel="noopener"><img src="media/posters/thumbs/Backtracking-facebook-feed-en.webp" width="640" height="800" loading="lazy" decoding="async" alt="Facebook feed post, 1080 × 1350"><span class="sr-only"> (opens the full-size PNG in a new tab)</span></a><p class="poster-cap"><span class="poster-name">Facebook feed post</span> <span class="poster-size">1080 × 1350</span></p><a class="poster-dl" href="media/posters/Backtracking-facebook-feed-en.png" download>Download PNG</a></li>
+<li class="poster"><a class="poster-img" href="media/posters/Backtracking-threads-post-en.png" target="_blank" rel="noopener"><img src="media/posters/thumbs/Backtracking-threads-post-en.webp" width="640" height="640" loading="lazy" decoding="async" alt="Threads post, 1080 × 1080"><span class="sr-only"> (opens the full-size PNG in a new tab)</span></a><p class="poster-cap"><span class="poster-name">Threads post</span> <span class="poster-size">1080 × 1080</span></p><a class="poster-dl" href="media/posters/Backtracking-threads-post-en.png" download>Download PNG</a></li>
+<li class="poster"><a class="poster-img" href="media/posters/Backtracking-buymeacoffee-cover-en.png" target="_blank" rel="noopener"><img src="media/posters/thumbs/Backtracking-buymeacoffee-cover-en.webp" width="640" height="160" loading="lazy" decoding="async" alt="Buy Me a Coffee cover, 1600 × 400"><span class="sr-only"> (opens the full-size PNG in a new tab)</span></a><p class="poster-cap"><span class="poster-name">Buy Me a Coffee cover</span> <span class="poster-size">1600 × 400</span></p><a class="poster-dl" href="media/posters/Backtracking-buymeacoffee-cover-en.png" download>Download PNG</a></li>
+<li class="poster"><a class="poster-img" href="media/posters/Backtracking-youtube-channel-en.png" target="_blank" rel="noopener"><img src="media/posters/thumbs/Backtracking-youtube-channel-en.webp" width="640" height="360" loading="lazy" decoding="async" alt="YouTube channel banner, 2560 × 1440"><span class="sr-only"> (opens the full-size PNG in a new tab)</span></a><p class="poster-cap"><span class="poster-name">YouTube channel banner</span> <span class="poster-size">2560 × 1440</span></p><a class="poster-dl" href="media/posters/Backtracking-youtube-channel-en.png" download>Download PNG</a></li>
+<li class="poster"><a class="poster-img" href="media/posters/Backtracking-youtube-thumbnail-en.png" target="_blank" rel="noopener"><img src="media/posters/thumbs/Backtracking-youtube-thumbnail-en.webp" width="640" height="360" loading="lazy" decoding="async" alt="YouTube thumbnail, 1920 × 1080"><span class="sr-only"> (opens the full-size PNG in a new tab)</span></a><p class="poster-cap"><span class="poster-name">YouTube thumbnail</span> <span class="poster-size">1920 × 1080</span></p><a class="poster-dl" href="media/posters/Backtracking-youtube-thumbnail-en.png" download>Download PNG</a></li>
+</ul>
+<!-- posters:end -->
+</section>
+</main>
+
+<footer class="foot wrap">
+  <div class="support">
+    <h2 class="support-title wide">Open source · <span class="nw">Apache-2.0</span></h2>
+    <a class="btn btn-paper" href="https://buymeacoffee.com/kamelkyp/e/596694" target="_blank" rel="noopener">Support developer</a>
+  </div>
+  <div class="foot-rule"></div>
+  <div class="foot-row">
+    <a class="lockup" href="./"><img src="img/icon.svg" width="44" height="44" alt=""><span class="wm">Backtracking</span></a>
+    <p class="editions wide" aria-label="Editions"><span>Windows</span><span>macOS</span><span>VST3</span><span>CLAP</span></p>
+  </div>
+  <nav class="foot-links" aria-label="Project links">
+    <a href="https://github.com/kekekewww/Backtracking">GitHub repository</a>
+    <a href="guide/">Read the user guide</a>
+    <a href="https://github.com/kekekewww/Backtracking/blob/main/LICENSE">Apache-2.0 licence</a>
+  </nav>
+  <p class="fine">No cookies, no analytics. The demo runs entirely in your browser.</p>
+</footer>
+
+<script type="application/json" id="bt-demo-strings">
+{
+  "play": "Play something",
+  "stop": "Stop sound",
+  "mute": "Mute",
+  "unmute": "Unmute",
+  "pause": "Pause capture",
+  "start": "Start capture",
+  "clear": "Clear capture",
+  "rec": "Recording",
+  "wait": "Waiting for sound",
+  "paused": "Paused",
+  "idle": "Not started",
+  "tip": "Drag and Drop",
+  "sec": "s",
+  "playTrack": "Play track",
+  "stopTrack": "Stop",
+  "playClip": "Play clip",
+  "stopClip": "Stop clip",
+  "removeClip": "Remove clip",
+  "clip": "Clip",
+  "selected": "Selected {s} seconds.",
+  "cancelled": "Selection cancelled. Back to live view.",
+  "cleared": "Capture cleared.",
+  "added": "Clip added to the track at {t}.",
+  "rejected": "Dropped outside the track. Nothing was exported.",
+  "saved": "Saved {name}.",
+  "noAudio": "This browser does not support the Web Audio API, so the demo cannot run here.",
+  "blocked": "The browser did not allow sound to start. Click Play something again.",
+  "fmt": "{k} kHz · 32-bit float · stereo",
+  "done": "done",
+  "videoMissing": "The video could not be loaded."
+}
+</script>
+</body>
+</html>

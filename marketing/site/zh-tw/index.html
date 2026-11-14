@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backtracking：回溯錄音取樣器</title>
+<meta name="description" content="框選剛剛聽到的聲音，直接拖出成 WAV。Backtracking 會在記憶體中保留最近最長 10 分鐘的音訊。Windows / macOS / VST3 / CLAP。">
+<meta name="theme-color" content="#1e32d2">
+<link rel="canonical" href="https://backtracking.kamelkyp.com/zh-tw/">
+<link rel="alternate" hreflang="en" href="https://backtracking.kamelkyp.com/">
+<link rel="alternate" hreflang="zh-Hant-TW" href="https://backtracking.kamelkyp.com/zh-tw/">
+<link rel="alternate" hreflang="x-default" href="https://backtracking.kamelkyp.com/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Backtracking">
+<meta property="og:title" content="Backtracking：剛剛那段拿回來">
+<meta property="og:description" content="框選剛剛聽到的聲音，直接拖出成 WAV。Backtracking 會在記憶體中保留最近最長 10 分鐘的音訊。">
+<meta property="og:url" content="https://backtracking.kamelkyp.com/zh-tw/">
+<meta property="og:image" content="https://backtracking.kamelkyp.com/img/og-zh-TW.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Backtracking：剛剛那段拿回來。波形面板上的選區被拖出成 WAV 檔。">
+<meta property="og:locale" content="zh_TW">
+<meta property="og:locale:alternate" content="en_US">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Backtracking：剛剛那段拿回來">
+<meta name="twitter:description" content="框選剛剛聽到的聲音，直接拖出成 WAV。Backtracking 會在記憶體中保留最近最長 10 分鐘的音訊。">
+<meta name="twitter:image" content="https://backtracking.kamelkyp.com/img/og-zh-TW.png">
+<link rel="icon" href="../img/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="../img/apple-touch-icon.png">
+<link rel="preload" href="../fonts/Archivo-Variable-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../fonts/NotoSansTC-subset.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../css/site.css">
+<script src="../js/demo.js" defer></script>
+<script src="../js/media.js" defer></script>
+</head>
+<body>
+<header class="top wrap">
+  <a class="lockup" href="./"><img src="../img/icon.svg" width="44" height="44" alt=""><span class="wm">Backtracking</span></a>
+  <p class="tag wide">回溯錄音取樣器</p>
+  <nav class="lang wide" aria-label="語言">
+    <a href="../" hreflang="en" lang="en">EN</a>
+    <span aria-current="page">中文</span>
+  </nav>
+</header>
+
+<main>
+<section class="hero" aria-labelledby="hero-title">
+  <div class="bgwave" data-bgwave aria-hidden="true"></div>
+  <div class="wrap hero-grid">
+    <div class="hero-copy">
+      <h1 class="mega" id="hero-title"><span>剛剛那段</span><span class="m">拿回來</span></h1>
+      <p class="sub">框選剛剛聽到的聲音，直接拖出成 WAV。Backtracking 會在記憶體中保留最近最長 <b>10&nbsp;分鐘</b>的音訊。</p>
+      <div class="ctas">
+        <a class="btn btn-primary" href="https://github.com/kekekewww/Backtracking"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8M4.5 6.8 8 10.3l3.5-3.5M2.5 13.5h11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"/></svg>從 GitHub 下載</a>
+        <a class="btn btn-ghost" href="guide/">閱讀使用手冊</a>
+        <a class="btn btn-quiet" href="https://buymeacoffee.com/kamelkyp/e/596694" target="_blank" rel="noopener">贊助開發者</a>
+      </div>
+      <p class="editions wide" aria-label="版本"><span>Windows</span><span>macOS</span><span>VST3</span><span>CLAP</span></p>
+      <p class="small">Windows 10／11 x64 · macOS 14.2 以上</p>
+    </div>
+
+    <section class="demo" id="demo" aria-labelledby="demo-title">
+      <div class="demo-head">
+        <h2 class="demo-label wide" id="demo-title">即時示範</h2>
+        <ol class="steps" aria-label="三個步驟">
+          <li data-step="1" class="now"><span class="n" aria-hidden="true">1</span><span>播放聲音</span><span class="sr-only step-state"></span></li>
+          <li data-step="2"><span class="n" aria-hidden="true">2</span><span>框選想要的那一段</span><span class="sr-only step-state"></span></li>
+          <li data-step="3"><span class="n" aria-hidden="true">3</span><span>拖到音軌</span><span class="sr-only step-state"></span></li>
+        </ol>
+      </div>
+
+      <div class="btp" id="bt-panel">
+        <div class="btp-bar">
+          <span class="btp-title">Backtracking</span>
+          <button type="button" class="btp-btn" id="bt-arm" aria-label="暫停錄音" title="暫停錄音"></button>
+          <span class="btp-dot" id="bt-dot"></span>
+          <button type="button" class="btp-btn" id="bt-clear" aria-label="清除錄音" title="清除錄音"></button>
+          <span class="btp-spacer"></span>
+          <span class="btp-meter" id="bt-meter" role="status" aria-label="即時音量"><b>—</b> dBFS</span>
+        </div>
+        <div class="btp-wave" id="bt-wave" tabindex="0" role="application" aria-roledescription="波形" aria-label="波形，最新的聲音在右側。" aria-describedby="bt-wave-help">
+          <canvas id="bt-canvas" aria-hidden="true"></canvas>
+          <span class="btp-dur" id="bt-dur" hidden></span>
+          <span class="btp-tip" id="bt-tip" hidden>拖出</span>
+          <button type="button" class="play-prompt" id="bt-prompt"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 1.5v9l7.5-4.5Z" fill="currentColor"/></svg>播放一段聲音</button>
+        </div>
+      </div>
+      <p class="sr-only" id="bt-wave-help">在波形上拖曳框選，按住 Shift 可吸附整秒。把選區拖到下方音軌。聚焦波形時：按 Enter 框選最後 4 秒，方向鍵移動選區，Shift 加方向鍵調整起點，再按一次 Enter 送到音軌，按 Esc 或 Backspace 取消。</p>
+      <p class="demo-msg" id="bt-msg" role="alert" hidden></p>
+
+      <div class="dc-row">
+        <button type="button" class="dc go" id="bt-music" aria-pressed="false"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 1.5v9l7.5-4.5Z" fill="currentColor"/></svg><span>播放一段聲音</span></button>
+        <div class="vol">
+          <button type="button" class="dc" id="bt-mute" aria-pressed="false" aria-label="靜音"></button>
+          <input type="range" id="bt-vol" min="0" max="100" value="70" aria-label="音量">
+        </div>
+        <span class="dc-spacer"></span>
+        <button type="button" class="dc" id="bt-strip" aria-pressed="false">只顯示波形</button>
+      </div>
+
+      <div class="history">
+        <div class="history-head"><span class="wide" id="bt-hist-label">保留時間</span><span>3 分鐘 · 5 分鐘 · 10 分鐘請用 App</span></div>
+        <div class="scale" role="radiogroup" aria-labelledby="bt-hist-label" id="bt-hist">
+          <button type="button" role="radio" aria-checked="false" data-sec="10">10 秒</button>
+          <button type="button" role="radio" aria-checked="true" data-sec="20">20 秒</button>
+          <button type="button" role="radio" aria-checked="false" data-sec="30">30 秒</button>
+          <button type="button" role="radio" aria-checked="false" data-sec="60">60 秒</button>
+          <span class="app-only">3 分鐘</span>
+          <span class="app-only">5 分鐘</span>
+          <span class="app-only">10 分鐘</span>
+        </div>
+      </div>
+
+      <div class="dc-row">
+        <button type="button" class="dc" id="bt-last4" disabled>框選最後 4 秒</button>
+        <button type="button" class="dc" id="bt-send" disabled>送到音軌</button>
+        <button type="button" class="dc" id="bt-save" disabled>儲存 WAV</button>
+        <span class="dc-note" id="bt-fmt">48 kHz · 32-bit float · 立體聲</span>
+      </div>
+      <p class="demo-note" id="bt-save-note" hidden>示範音樂有授權限制，這裡不提供存檔。實際 App 會存成 WAV 檔。</p>
+
+      <div class="daw" id="bt-daw">
+        <div class="daw-bar">
+          <button type="button" class="daw-btn" id="bt-tplay" disabled></button>
+          <span class="daw-time" id="bt-ttime">0:00.0</span>
+          <span class="dc-spacer"></span>
+          <button type="button" class="daw-btn" id="bt-tclear" disabled>清空音軌</button>
+        </div>
+        <div class="daw-grid">
+          <div class="daw-corner"></div>
+          <div class="daw-ruler" id="bt-ruler" aria-hidden="true"></div>
+          <div class="daw-head">音軌 1<small>DAW 音軌</small></div>
+          <div class="daw-lane-wrap">
+            <div class="daw-lane" id="bt-lane" role="list" aria-label="音軌 1 的片段">
+              <p class="daw-empty" id="bt-empty">把選區拖到這裡</p>
+            </div>
+            <div class="daw-playhead" id="bt-playhead"></div>
+          </div>
+        </div>
+      </div>
+
+      <p class="demo-honest"><b>這是瀏覽器示範。</b>聲音在這個頁面播放。實際的 App 擷取的是系統播放、麥克風、指定 App 或 DAW 音軌。</p>
+      <p class="demo-credit" id="bt-credit" hidden>音樂：Dyalla〈Fun Vibe〉，YouTube 音效庫。</p>
+      <p class="sr-only" aria-live="polite" id="bt-live"></p>
+    </section>
+  </div>
+</section>
+
+<section class="section wrap" aria-labelledby="beats-title">
+  <h2 class="sr-only" id="beats-title">使用方式</h2>
+  <div class="big-scale wide" aria-label="保留時間：10 秒、20 秒、30 秒、60 秒、3 分鐘、5 分鐘、10 分鐘">
+    <span>10 秒</span><span>20 秒</span><span>30 秒</span><span>60 秒</span><span>3 分鐘</span><span>5 分鐘</span><span class="on">10 分鐘</span>
+  </div>
+  <ol class="beat-list">
+    <li class="beat"><span class="beat-n" aria-hidden="true">1</span><h3>它一直都在聽</h3><p>Backtracking 在記憶體中保留最近 10 秒到 10 分鐘的音訊。</p></li>
+    <li class="beat"><span class="beat-n" aria-hidden="true">2</span><h3>框選想要的那一段</h3><p>在波形上拖曳框選，按住 Shift 可吸附旗標、小節線或秒數線。</p><figure class="loop" data-src="../media/loops/loop-select"><div class="loop-box"></div></figure></li>
+    <li class="beat"><span class="beat-n" aria-hidden="true">3</span><h3>直接拖出成 WAV</h3><p>放到 DAW 音軌或資料夾，背景會繼續錄音。</p><figure class="loop" data-src="../media/loops/loop-drag-out"><div class="loop-box"></div></figure></li>
+  </ol>
+</section>
+
+<section class="section wrap" aria-labelledby="features-title">
+  <h2 class="kicker wide" id="features-title">功能</h2>
+  <ul class="cards">
+    <li class="card card-loop"><figure class="loop" data-src="../media/loops/loop-ab-sources"><div class="loop-box"></div></figure><h3 class="wide">A/B</h3><p>同時擷取 A／B 兩路，匯出兩個起訖對齊的 WAV。</p></li>
+    <li class="card card-loop"><figure class="loop" data-src="../media/loops/loop-snapshot-shortcut"><div class="loop-box"></div></figure><h3 class="wide">快照快捷鍵</h3><p>背景儲存快照：Windows 按 <kbd>Alt</kbd> + <kbd>`</kbd>，macOS 按 <kbd>Fn／Globe</kbd> + <kbd>`</kbd>。</p></li>
+    <li class="card card-loop"><figure class="loop" data-src="../media/loops/loop-waveform-only"><div class="loop-box"></div></figure><h3 class="wide">只顯示波形</h3><p>把視窗縮成細長波形條，可調透明度並置頂。</p></li>
+    <li class="card"><h3 class="wide">擷取來源</h3><p>擷取系統播放、麥克風或指定 App。</p></li>
+    <li class="card"><h3 class="wide">插件</h3><p>插入任一 DAW 音軌，擷取效果鏈該位置的音訊。</p></li>
+    <li class="card"><h3 class="wide">音量表</h3><p>即時音量：dBFS、VU 或瞬時 LUFS。</p></li>
+    <li class="card"><h3 class="wide">WAV 匯出</h3><p>44.1、48 或 96 kHz；16-bit、24-bit PCM 或 32-bit float。</p></li>
+    <li class="card"><h3 class="wide">保留安靜片段</h3><p>可選擇保留安靜片段，不壓縮靜音。</p></li>
+    <li class="card"><h3 class="wide">Sender</h3><p>插件可將音訊送到同一台電腦上的桌面版錄音器。</p></li>
+  </ul>
+</section>
+
+<section class="section wrap" aria-labelledby="editions-title">
+  <h2 class="kicker wide" id="editions-title">版本</h2>
+  <div class="editions-grid">
+    <article class="edition">
+      <h3 class="wide">Windows 桌面版</h3>
+      <p class="mega" aria-hidden="true"><span>任何 App</span><span class="m">都能留</span></p>
+      <p>系統播放、麥克風或指定 App，框選後直接拖出 WAV。<a href="https://github.com/kekekewww/Backtracking">從 GitHub 下載。</a></p>
+      <p class="req wide">Windows 10／11 x64</p>
+    </article>
+    <article class="edition">
+      <h3 class="wide"><span class="kc">macOS</span> 桌面版</h3>
+      <p class="mega" aria-hidden="true"><span>Mac 的聲音</span><span class="m">拿回來</span></p>
+      <p>系統播放、麥克風或指定 App，支援 macOS 14.2 以上。<a href="https://github.com/kekekewww/Backtracking">從 GitHub 下載。</a></p>
+      <p class="req wide">macOS 14.2 以上</p>
+    </article>
+    <article class="edition">
+      <h3 class="wide">VST3／CLAP 插件</h3>
+      <p class="mega" aria-hidden="true"><span>每一軌</span><span class="m">都留著</span></p>
+      <p>插在音軌、群組或主輸出上，留住經過的聲音，再拖出成 WAV。</p>
+      <p class="req wide">VST3 / CLAP</p>
+    </article>
+  </div>
+  <div class="extra">
+    <p class="mega" aria-hidden="true"><span>一個按鍵</span><span class="m">存下來</span></p>
+    <div>
+      <h3 class="wide">Linux 快捷鍵輔助工具</h3>
+      <p>全域 <kbd>Super</kbd> + <kbd>`</kbd> 快捷鍵，讓 Backtracking 插件儲存快照。<a href="https://github.com/kekekewww/Backtracking">從 GitHub 下載。</a></p>
+    </div>
+  </div>
+  <div class="get">
+    <a class="btn btn-primary" href="https://github.com/kekekewww/Backtracking"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8M4.5 6.8 8 10.3l3.5-3.5M2.5 13.5h11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"/></svg>從 GitHub 下載</a>
+    <p class="editions wide" aria-label="版本"><span>Windows</span><span>macOS</span><span>VST3</span><span>CLAP</span></p>
+  </div>
+</section>
+
+<section class="section wrap" aria-labelledby="watch-title">
+  <h2 class="kicker wide">觀看影片</h2>
+  <div class="watch-grid">
+    <p class="mega" id="watch-title"><span>它一直</span><span class="m">都在聽</span></p>
+<!-- watch:start (generated by tools/sync-media.py) -->
+<div class="players players-2">
+<figure class="player player-wide"><div class="video-frame frame-wide"><video controls preload="none" playsinline data-poster="../media/overview-poster-zh-TW.jpg" aria-label="Backtracking 介紹影片"><source src="../media/overview-zh-TW.mp4" type="video/mp4"></video></div><p class="video-note" hidden>影片無法載入。</p><figcaption class="video-cap wide">完整介紹</figcaption></figure>
+<figure class="player player-tall"><div class="video-frame frame-tall"><video controls preload="none" playsinline data-poster="../media/short-poster-zh-TW.jpg" aria-label="Backtracking 直式短片"><source src="../media/short-zh-TW.mp4" type="video/mp4"></video></div><p class="video-note" hidden>影片無法載入。</p><figcaption class="video-cap wide">直式短片 9:16</figcaption></figure>
+</div>
+<!-- watch:end -->
+  </div>
+</section>
+
+<section class="section wrap" aria-labelledby="posters-title">
+  <h2 class="kicker wide" id="posters-title">海報</h2>
+<!-- posters:start (generated by tools/sync-media.py; edit the script, not this block) -->
+<h3 class="gallery-title wide">版本海報</h3>
+<ul class="gallery gallery-edition">
+<li class="poster"><a class="poster-img" href="../media/posters/Backtracking-edition-master-zh-TW.png" target="_blank" rel="noopener"><img src="../media/posters/thumbs/Backtracking-edition-master-zh-TW.webp" width="640" height="800" loading="lazy" decoding="async" alt="主視覺海報, 1080 × 1350"><span class="sr-only"> （在新分頁開啟原尺寸 PNG）</span></a><p class="poster-cap"><span class="poster-name">主視覺海報</span> <span class="poster-size">1080 × 1350</span></p><a class="poster-dl" href="../media/posters/Backtracking-edition-master-zh-TW.png" download>下載 PNG</a></li>
+<li class="poster"><a class="poster-img" href="../media/posters/Backtracking-edition-windows-zh-TW.png" target="_blank" rel="noopener"><img src="../media/posters/thumbs/Backtracking-edition-windows-zh-TW.webp" width="640" height="800" loading="lazy" decoding="async" alt="Windows 桌面版, 1080 × 1350"><span class="sr-only"> （在新分頁開啟原尺寸 PNG）</span></a><p class="poster-cap"><span class="poster-name">Windows 桌面版</span> <span class="poster-size">1080 × 1350</span></p><a class="poster-dl" href="../media/posters/Backtracking-edition-windows-zh-TW.png" download>下載 PNG</a></li>
+<li class="poster"><a class="poster-img" href="../media/posters/Backtracking-edition-macos-zh-TW.png" target="_blank" rel="noopener"><img src="../media/posters/thumbs/Backtracking-edition-macos-zh-TW.webp" width="640" height="800" loading="lazy" decoding="async" alt="macOS 桌面版, 1080 × 1350"><span class="sr-only"> （在新分頁開啟原尺寸 PNG）</span></a><p class="poster-cap"><span class="poster-name">macOS 桌面版</span> <span class="poster-size">1080 × 1350</span></p><a class="poster-dl" href="../media/posters/Backtracking-edition-macos-zh-TW.png" download>下載 PNG</a></li>
+<li class="poster"><a class="poster-img" href="../media/posters/Backtracking-edition-plugin-zh-TW.png" target="_blank" rel="noopener"><img src="../media/posters/thumbs/Backtracking-edition-plugin-zh-TW.webp" width="640" height="800" loading="lazy" decoding="async" alt="VST3／CLAP 插件, 1080 × 1350"><span class="sr-only"> （在新分頁開啟原尺寸 PNG）</span></a><p class="poster-cap"><span class="poster-name">VST3／CLAP 插件</span> <span class="poster-size">1080 × 1350</span></p><a class="poster-dl" href="../media/posters/Backtracking-edition-plugin-zh-TW.png" download>下載 PNG</a></li>
+<li class="poster"><a class="poster-img" href="../media/posters/Backtracking-edition-linux-zh-TW.png" target="_blank" rel="noopener"><img src="../media/posters/thumbs/Backtracking-edition-linux-zh-TW.webp" width="640" height="800" loading="lazy" decoding="async" alt="Linux 快捷鍵輔助工具, 1080 × 1350"><span class="sr-only"> （在新分頁開啟原尺寸 PNG）</span></a><p class="poster-cap"><span class="poster-name">Linux 快捷鍵輔助工具</span> <span class="poster-size">1080 × 1350</span></p><a class="poster-dl" href="../media/posters/Backtracking-edition-linux-zh-TW.png" download>下載 PNG</a></li>
+</ul>
+<h3 class="gallery-title wide">社群尺寸</h3>
+<ul class="gallery gallery-social">
+<li class="poster"><a class="poster-img" href="../media/posters/Backtracking-github-social-zh-TW.png" target="_blank" rel="noopener"><img src="../media/posters/thumbs/Backtracking-github-social-zh-TW.webp" width="640" height="320" loading="lazy" decoding="async" alt="GitHub 社群預覽圖, 1280 × 640"><span class="sr-only"> （在新分頁開啟原尺寸 PNG）</span></a><p class="poster-cap"><span class="poster-name">GitHub 社群預覽圖</span> <span class="poster-size">1280 × 640</span></p><a class="poster-dl" href="../media/posters/Backtracking-github-social-zh-TW.png" download>下載 PNG</a></li>
+<li class="poster"><a class="poster-img" href="../media/posters/Backtracking-instagram-feed-zh-TW.png" target="_blank" rel="noopener"><img src="../media/posters/thumbs/Backtracking-instagram-feed-zh-TW.webp" width="640" height="853" loading="lazy" decoding="async" alt="Instagram 貼文, 1080 × 1440"><span class="sr-only"> （在新分頁開啟原尺寸 PNG）</span></a><p class="poster-cap"><span class="poster-name">Instagram 貼文</span> <span class="poster-size">1080 × 1440</span></p><a class="poster-dl" href="../media/posters/Backtracking-instagram-feed-zh-TW.png" download>下載 PNG</a></li>
+<li class="poster"><a class="poster-img" href="../media/posters/Backtracking-instagram-story-zh-TW.png" target="_blank" rel="noopener"><img src="../media/posters/thumbs/Backtracking-instagram-story-zh-TW.webp" width="640" height="1138" loading="lazy" decoding="async" alt="Instagram 限時動態, 1080 × 1920"><span class="sr-only"> （在新分頁開啟原尺寸 PNG）</span></a><p class="poster-cap"><span class="poster-name">Instagram 限時動態</span> <span class="poster-size">1080 × 1920</span></p><a class="poster-dl" href="../media/posters/Backtracking-instagram-story-zh-TW.png" download>下載 PNG</a></li>
+<li class="poster"><a class="poster-img" href="../media/posters/Backtracking-facebook-cover-zh-TW.png" target="_blank" rel="noopener"><img src="../media/posters/thumbs/Backtracking-facebook-cover-zh-TW.webp" width="640" height="281" loading="lazy" decoding="async" alt="Facebook 封面, 1640 × 720"><span class="sr-only"> （在新分頁開啟原尺寸 PNG）</span></a><p class="poster-cap"><span class="poster-name">Facebook 封面</span> <span class="poster-size">1640 × 720</span></p><a class="poster-dl" href="../media/posters/Backtracking-facebook-cover-zh-TW.png" download>下載 PNG</a></li>
+<li class="poster"><a class="poster-img" href="../media/posters/Backtracking-facebook-feed-zh-TW.png" target="_blank" rel="noopener"><img src="../media/posters/thumbs/Backtracking-facebook-feed-zh-TW.webp" width="640" height="800" loading="lazy" decoding="async" alt="Facebook 貼文, 1080 × 1350"><span class="sr-only"> （在新分頁開啟原尺寸 PNG）</span></a><p class="poster-cap"><span class="poster-name">Facebook 貼文</span> <span class="poster-size">1080 × 1350</span></p><a class="poster-dl" href="../media/posters/Backtracking-facebook-feed-zh-TW.png" download>下載 PNG</a></li>
+<li class="poster"><a class="poster-img" href="../media/posters/Backtracking-threads-post-zh-TW.png" target="_blank" rel="noopener"><img src="../media/posters/thumbs/Backtracking-threads-post-zh-TW.webp" width="640" height="640" loading="lazy" decoding="async" alt="Threads 貼文, 1080 × 1080"><span class="sr-only"> （在新分頁開啟原尺寸 PNG）</span></a><p class="poster-cap"><span class="poster-name">Threads 貼文</span> <span class="poster-size">1080 × 1080</span></p><a class="poster-dl" href="../media/posters/Backtracking-threads-post-zh-TW.png" download>下載 PNG</a></li>
+<li class="poster"><a class="poster-img" href="../media/posters/Backtracking-buymeacoffee-cover-zh-TW.png" target="_blank" rel="noopener"><img src="../media/posters/thumbs/Backtracking-buymeacoffee-cover-zh-TW.webp" width="640" height="160" loading="lazy" decoding="async" alt="Buy Me a Coffee 封面, 1600 × 400"><span class="sr-only"> （在新分頁開啟原尺寸 PNG）</span></a><p class="poster-cap"><span class="poster-name">Buy Me a Coffee 封面</span> <span class="poster-size">1600 × 400</span></p><a class="poster-dl" href="../media/posters/Backtracking-buymeacoffee-cover-zh-TW.png" download>下載 PNG</a></li>
+<li class="poster"><a class="poster-img" href="../media/posters/Backtracking-youtube-channel-zh-TW.png" target="_blank" rel="noopener"><img src="../media/posters/thumbs/Backtracking-youtube-channel-zh-TW.webp" width="640" height="360" loading="lazy" decoding="async" alt="YouTube 頻道橫幅, 2560 × 1440"><span class="sr-only"> （在新分頁開啟原尺寸 PNG）</span></a><p class="poster-cap"><span class="poster-name">YouTube 頻道橫幅</span> <span class="poster-size">2560 × 1440</span></p><a class="poster-dl" href="../media/posters/Backtracking-youtube-channel-zh-TW.png" download>下載 PNG</a></li>
+<li class="poster"><a class="poster-img" href="../media/posters/Backtracking-youtube-thumbnail-zh-TW.png" target="_blank" rel="noopener"><img src="../media/posters/thumbs/Backtracking-youtube-thumbnail-zh-TW.webp" width="640" height="360" loading="lazy" decoding="async" alt="YouTube 縮圖, 1920 × 1080"><span class="sr-only"> （在新分頁開啟原尺寸 PNG）</span></a><p class="poster-cap"><span class="poster-name">YouTube 縮圖</span> <span class="poster-size">1920 × 1080</span></p><a class="poster-dl" href="../media/posters/Backtracking-youtube-thumbnail-zh-TW.png" download>下載 PNG</a></li>
+</ul>
+<!-- posters:end -->
+</section>
+</main>
+
+<footer class="foot wrap">
+  <div class="support">
+    <h2 class="support-title wide">開放原始碼 · <span class="nw">Apache-2.0</span></h2>
+    <a class="btn btn-paper" href="https://buymeacoffee.com/kamelkyp/e/596694" target="_blank" rel="noopener">贊助開發者</a>
+  </div>
+  <div class="foot-rule"></div>
+  <div class="foot-row">
+    <a class="lockup" href="./"><img src="../img/icon.svg" width="44" height="44" alt=""><span class="wm">Backtracking</span></a>
+    <p class="editions wide" aria-label="版本"><span>Windows</span><span>macOS</span><span>VST3</span><span>CLAP</span></p>
+  </div>
+  <nav class="foot-links" aria-label="專案連結">
+    <a href="https://github.com/kekekewww/Backtracking">GitHub 儲存庫</a>
+    <a href="guide/">閱讀使用手冊</a>
+    <a href="https://github.com/kekekewww/Backtracking/blob/main/LICENSE">Apache-2.0 授權</a>
+  </nav>
+  <p class="fine">本站不使用 Cookie，也不做分析追蹤。示範完全在你的瀏覽器中執行。</p>
+</footer>
+
+<script type="application/json" id="bt-demo-strings">
+{
+  "play": "播放一段聲音",
+  "stop": "停止聲音",
+  "mute": "靜音",
+  "unmute": "取消靜音",
+  "pause": "暫停錄音",
+  "start": "開始錄音",
+  "clear": "清除錄音",
+  "rec": "錄音中",
+  "wait": "等待聲音",
+  "paused": "已暫停",
+  "idle": "尚未開始",
+  "tip": "拖出",
+  "sec": "s",
+  "playTrack": "播放音軌",
+  "stopTrack": "停止",
+  "playClip": "播放片段",
+  "stopClip": "停止片段",
+  "removeClip": "移除片段",
+  "clip": "片段",
+  "selected": "已框選 {s} 秒。",
+  "cancelled": "已取消框選，回到即時畫面。",
+  "cleared": "已清除錄音。",
+  "added": "片段已放到音軌的 {t} 處。",
+  "rejected": "沒有放到音軌上，未匯出任何檔案。",
+  "saved": "已儲存 {name}。",
+  "noAudio": "這個瀏覽器不支援 Web Audio API，無法執行示範。",
+  "blocked": "瀏覽器沒有允許播放聲音，請再按一次「播放一段聲音」。",
+  "fmt": "{k} kHz · 32-bit float · 立體聲",
+  "done": "完成",
+  "videoMissing": "影片無法載入。"
+}
+</script>
+</body>
+</html>
