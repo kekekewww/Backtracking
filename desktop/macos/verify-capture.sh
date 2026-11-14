@@ -24,7 +24,7 @@ cat > "$scratch/Verify.swift" <<'SWIFT'
 enum Verify {
     static func main() throws {
         try verifyMacCaptureRouting()
-        print("macOS Swift capture routing, alignment and A/B WAV export passed.")
+        print("macOS Swift waveform geometry, capture routing, quiet retention, alignment and A/B WAV export passed.")
     }
 }
 SWIFT

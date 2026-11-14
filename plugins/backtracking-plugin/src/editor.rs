@@ -1177,7 +1177,8 @@ impl CaptureUi {
         };
         let row_height = inner.height() / rows as f32;
         let extent = row_height * 0.47;
-        let frames = self.peak_frames.end - self.peak_frames.start;
+        let selection_clip = explicit_range.as_ref().and_then(|range|
+            waveform_selection_clip(audio_rect, &self.peak_frames, range));
         for (row, peaks) in self.peaks[..rows].iter().enumerate() {
             let middle = inner.top() + (row as f32 + 0.5) * row_height;
             if !waveform_only {
@@ -1190,27 +1191,13 @@ impl CaptureUi {
             if width <= 0.0 {
                 continue;
             }
-            for (bin, (&low, &high)) in peaks.minimum.iter().zip(&peaks.maximum).enumerate() {
-                let fraction = (bin as f32 + 0.5) / peaks.minimum.len().max(1) as f32;
-                let frame =
-                    self.peak_frames.start + (frames as f64 * f64::from(fraction)) as u64;
-                let x = audio_rect.left() + width * fraction;
-                let top = middle - high.clamp(-1.0, 1.0) * extent;
-                let bottom = middle - low.clamp(-1.0, 1.0) * extent;
-                let color = if explicit_range
-                    .as_ref()
-                    .is_some_and(|range| range.contains(&frame))
-                {
-                    selected_color
-                } else {
-                    color
-                };
-                let half_width = (width / peaks.minimum.len().max(1) as f32 * 0.48)
-                    .max(policy.waveform_stroke * 0.5);
-                painter.rect_filled(Rect::from_min_max(
-                    Pos2::new(x - half_width, top),
-                    Pos2::new(x + half_width, bottom.max(top + policy.waveform_stroke * 0.6)),
-                ), 0.0, color);
+            let geometry = waveform::waveform_geometry(
+                &peaks.minimum, &peaks.maximum, self.peak_frames.clone());
+            paint_waveform_geometry(&painter, &geometry, audio_rect, middle, extent,
+                policy.waveform_stroke, color);
+            if let Some(clip) = selection_clip {
+                paint_waveform_geometry(&painter.with_clip_rect(clip), &geometry, audio_rect,
+                    middle, extent, policy.waveform_stroke, selected_color);
             }
         }
         if width > 0.0 {
@@ -1320,17 +1307,9 @@ impl CaptureUi {
         }
         let current = clamped_view(self.view.clone(), &full);
         let current_len = current.end - current.start;
-        let minimum = u64::from(self.timeline.sample_rate / 10).max(1).min(count);
         let next = if let Some(pointer) = pointer.filter(|pointer| rect.contains(*pointer)) && wheel != 0.0 {
             let audio_rect = self.audio_rect(rect, settings.retention.seconds() as f32);
-            let anchor = f64::from(((pointer.x - audio_rect.left()) / audio_rect.width().max(1.0)).clamp(0.0, 1.0));
-            let factor = 2.0_f64.powf(-f64::from(wheel.clamp(-250.0, 250.0)) / 100.0);
-            let length = ((current_len as f64 * factor).round() as u64).clamp(minimum, count);
-            let anchor_frame = current.start.saturating_add((current_len as f64 * anchor).round() as u64);
-            let inner = rect.shrink(8.0);
-            let next_anchor = f64::from(((pointer.x - inner.left()) / inner.width().max(1.0)).clamp(0.0, 1.0));
-            let start = anchor_frame.saturating_sub((length as f64 * next_anchor).round() as u64);
-            Some(view_at(&full, start, length))
+            Some(wheel_zoom_view(&full, &current, wheel, pointer.x, audio_rect, rect.shrink(8.0)))
         } else if self.view.is_some() && pan != 0.0 {
             let delta = (-f64::from(pan) / f64::from(rect.width().max(1.0)) * current_len as f64).round() as i64;
             Some(view_at(&full, current.start.saturating_add_signed(delta), current_len))
@@ -1827,6 +1806,7 @@ fn capture_options(ui: &mut egui::Ui, settings: &mut SessionSettings) {
         DurationChoice::ALL.map(|duration| (duration, duration_label(duration.seconds()))));
     option_combo(ui, "Auto-resume", &mut settings.idle_resume,
         AutoResumeDelay::ALL.map(|duration| (duration, format!("{} s", duration.seconds()))));
+    ui.checkbox(&mut settings.retain_silence, "Keep quiet sections");
 }
 
 fn duration_label(seconds: u32) -> String {
@@ -2035,6 +2015,87 @@ fn view_at(full: &Range<u64>, start: u64, length: u64) -> Range<u64> {
     start..start + length
 }
 
+fn wheel_zoom_view(
+    full: &Range<u64>, current: &Range<u64>, wheel: f32, pointer_x: f32,
+    audio_rect: Rect, viewport_rect: Rect,
+) -> Range<u64> {
+    let count = full.end.saturating_sub(full.start);
+    let current_len = current.end.saturating_sub(current.start);
+    if count <= 1 || current_len == 0 {
+        return current.clone();
+    }
+    // A wider editor must not make an already finer view zoom out on wheel-in.
+    let minimum = waveform::minimum_zoom_frames(audio_rect.width(), count).min(current_len).max(1);
+    let anchor = f64::from(((pointer_x - audio_rect.left()) / audio_rect.width().max(1.0)).clamp(0.0, 1.0));
+    let factor = 2.0_f64.powf(-f64::from(wheel.clamp(-250.0, 250.0)) / 100.0);
+    let length = ((current_len as f64 * factor).round() as u64).clamp(minimum, count);
+    let anchor_frame = current.start.saturating_add((current_len as f64 * anchor).round() as u64);
+    let next_anchor = f64::from(((pointer_x - viewport_rect.left()) / viewport_rect.width().max(1.0)).clamp(0.0, 1.0));
+    let start = anchor_frame.saturating_sub((length as f64 * next_anchor).round() as u64);
+    view_at(full, start, length)
+}
+
+fn waveform_selection_clip(rect: Rect, visible: &Range<u64>, selection: &Range<u64>) -> Option<Rect> {
+    let frames = visible.end.saturating_sub(visible.start);
+    let start = selection.start.max(visible.start);
+    let end = selection.end.min(visible.end);
+    if frames == 0 || start >= end || rect.width() <= 0.0 {
+        return None;
+    }
+    let x = |frame: u64| rect.left() + rect.width()
+        * ((frame - visible.start) as f64 / frames as f64) as f32;
+    Some(Rect::from_min_max(Pos2::new(x(start), rect.top()), Pos2::new(x(end), rect.bottom())))
+}
+
+fn paint_waveform_geometry(
+    painter: &egui::Painter, geometry: &waveform::WaveformGeometry, rect: Rect,
+    middle: f32, extent: f32, stroke_width: f32, color: Color32,
+) {
+    let position = |x: f32, value: f32| Pos2::new(rect.left() + rect.width() * x, middle - value * extent);
+    let stroke = Stroke::new(stroke_width, color);
+    match geometry {
+        waveform::WaveformGeometry::Empty => {}
+        waveform::WaveformGeometry::Envelope(runs) => {
+            let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 96);
+            for run in runs {
+                let mut mesh = egui::Mesh::default();
+                let mut upper = Vec::with_capacity(run.len());
+                let mut lower = Vec::with_capacity(run.len());
+                for (index, column) in run.iter().enumerate() {
+                    let top = position(column.x, column.maximum);
+                    let bottom = position(column.x, column.minimum);
+                    mesh.colored_vertex(top, fill);
+                    mesh.colored_vertex(bottom, fill);
+                    upper.push(top);
+                    lower.push(bottom);
+                    if index > 0 {
+                        let vertex = (index * 2) as u32;
+                        mesh.add_triangle(vertex - 2, vertex - 1, vertex);
+                        mesh.add_triangle(vertex, vertex - 1, vertex + 1);
+                    }
+                }
+                if !mesh.indices.is_empty() {
+                    painter.add(egui::Shape::mesh(mesh));
+                }
+                if upper.len() > 1 {
+                    painter.add(egui::Shape::line(upper, stroke));
+                    painter.add(egui::Shape::line(lower, stroke));
+                }
+            }
+        }
+        waveform::WaveformGeometry::Samples(runs) => {
+            for run in runs {
+                let points: Vec<_> = run.iter().map(|point| position(point.x, point.value)).collect();
+                if points.len() > 1 {
+                    painter.add(egui::Shape::line(points, stroke));
+                } else if let Some(&point) = points.first() {
+                    painter.line_segment([point, point + Vec2::new(stroke_width.max(1.0), 0.0)], stroke);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 fn frame_at_pointer(rect: Rect, x: f32, visible: Range<u64>, flags: Option<&Range<u64>>) -> u64 {
     frame_at_pointer_with_bars(rect, x, visible, flags, [])
@@ -2098,6 +2159,126 @@ fn paint_flag(painter: &egui::Painter, rect: Rect, fraction: f32, direction: f32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rendered_waveform(
+        minimum: &[f32], maximum: &[f32], visible: Range<u64>, selection: Option<Range<u64>>,
+    ) -> egui::FullOutput {
+        let session = Arc::new(Session::new(crate::settings::SettingsStore::default()));
+        let editor = EguiEditorState::from_size(LogicalSize::new(640.0, 212.0), 1.0);
+        let mut capture = CaptureUi::new(session, editor);
+        capture.timeline = WaveformTimeline { frames: visible.clone(), sample_rate: 48_000,
+            channels: 1, ..WaveformTimeline::default() };
+        capture.peak_frames = visible;
+        capture.displayed_zoomed = true;
+        capture.peaks[0] = WaveformPeaks { minimum: minimum.to_vec(), maximum: maximum.to_vec() };
+        capture.selection = selection;
+        let settings = SessionSettings { show_waveform_only: true, ..SessionSettings::default() };
+        let context = egui::Context::default();
+        let mut output = context.run_ui(egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 200.0))),
+            ..Default::default()
+        }, |ui| capture.draw_waveform(ui,
+            Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(240.0, 100.0)), 1.0, false, &settings));
+        output.textures_delta.clear();
+        output
+    }
+
+    #[test]
+    fn rendered_waveform_overview_has_a_filled_continuous_strip_and_two_outlines() {
+        let output = rendered_waveform(&[-0.8, -0.2, -0.5], &[0.4, 0.9, 0.6], 100..1_100, None);
+        let mesh = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Mesh(mesh) => Some(mesh), _ => None,
+        }).expect("an overview must fill a connected envelope instead of isolated bars");
+        assert!(mesh.indices.len() >= 12);
+        assert_eq!(mesh.vertices.first().unwrap().pos.x, 18.0);
+        assert_eq!(mesh.vertices.last().unwrap().pos.x, 242.0);
+        let paths: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Path(path) if !path.closed => Some(path), _ => None,
+        }).collect();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|path| path.points.first().unwrap().x == 18.0
+            && path.points.last().unwrap().x == 242.0));
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn rendered_waveform_samples_form_a_path_at_original_frame_positions() {
+        let samples = [-0.25, 0.5, -0.75, 1.0];
+        let output = rendered_waveform(&samples, &samples, 1_000_000..1_000_004, None);
+        let paths: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Path(path) if !path.closed => Some(path), _ => None,
+        }).collect();
+        assert_eq!(paths.len(), 1, "individual sample dots must become one connected trace");
+        assert_eq!(paths[0].points.iter().map(|point| point.x).collect::<Vec<_>>(),
+            [18.0, 74.0, 130.0, 186.0]);
+        assert!(paths[0].points[0].y > paths[0].points[1].y);
+        assert!(paths[0].points[2].y > paths[0].points[3].y);
+        assert!(!output.shapes.iter().any(|shape| matches!(shape.shape, egui::Shape::Circle(_))));
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn rendered_waveform_selection_recolors_the_same_trace_at_exact_frame_boundaries() {
+        let output = rendered_waveform(&[-0.8, -0.2, -0.5], &[0.4, 0.9, 0.6],
+            100..1_100, Some(350..850));
+        let meshes: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Mesh(mesh) => Some((shape.clip_rect, mesh)), _ => None,
+        }).collect();
+        assert_eq!(meshes.len(), 2, "selection should clip a recolored copy of the whole envelope");
+        assert_eq!(meshes[0].1.indices, meshes[1].1.indices);
+        assert_eq!(meshes[0].1.vertices.iter().map(|vertex| vertex.pos).collect::<Vec<_>>(),
+            meshes[1].1.vertices.iter().map(|vertex| vertex.pos).collect::<Vec<_>>());
+        assert_ne!(meshes[0].1.vertices[0].color, meshes[1].1.vertices[0].color);
+        assert_eq!(meshes[1].0.left(), 74.0);
+        assert_eq!(meshes[1].0.right(), 186.0);
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn rendered_waveform_never_connects_across_unknown_samples_or_envelope_bins() {
+        for (minimum, maximum, frames) in [
+            (vec![0.0, 0.5, f32::NAN, -0.5, 0.25], vec![0.0, 0.5, f32::NAN, -0.5, 0.25], 5),
+            (vec![-0.4, -0.1, f32::NAN, -0.5, -0.2], vec![0.1, 0.5, f32::NAN, 0.2, 0.4], 100),
+        ] {
+            let output = rendered_waveform(&minimum, &maximum, 0..frames, None);
+            let paths: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Path(path) if !path.closed => Some(path), _ => None,
+            }).collect();
+            assert!(!paths.is_empty());
+            for path in paths {
+                assert!(path.points.last().unwrap().x <= 107.6 || path.points.first().unwrap().x >= 152.4,
+                    "a finite path must stay on one side of the missing third bin: {:?}", path.points);
+            }
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn wheel_zoom_reaches_original_samples_and_keeps_the_pointer_anchor() {
+        let full = 100..48_100;
+        let rect = Rect::from_min_size(Pos2::new(18.0, 28.0), Vec2::new(224.0, 84.0));
+        let mut current = full.clone();
+        for _ in 0..20 {
+            current = wheel_zoom_view(&full, &current, 100.0, rect.center().x, rect, rect);
+        }
+        assert_eq!(current.end - current.start, 56,
+            "the view should reach four logical pixels per real sample, rather than a 100ms floor");
+        assert_eq!((current.start + current.end) / 2, (full.start + full.end) / 2);
+        let policy = waveform::DisplayPolicy::for_view(rect.width(), rect.height(), 56, 48_000, false);
+        assert_eq!(policy.bins, 56, "idle must keep the true sample trace at this zoom");
+    }
+
+    #[test]
+    fn wheel_in_after_a_resize_never_expands_an_existing_finer_view() {
+        let full = 100..48_100;
+        let current = 20_000..20_008;
+        let wider = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_600.0, 200.0));
+        let next = wheel_zoom_view(&full, &current, 100.0, wider.center().x, wider, wider);
+        assert_eq!(next, current);
+        let out = wheel_zoom_view(&full, &current, -100.0, wider.center().x, wider, wider);
+        assert_eq!(out.end - out.start, 16);
+        assert_eq!(out.start + 8, current.start + 4);
+    }
 
     #[test]
     fn shift_alone_starts_a_snapped_selection_and_other_selection_modifiers_remain_free() {

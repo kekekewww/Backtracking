@@ -1,5 +1,8 @@
 use std::ops::Range;
 
+mod geometry;
+pub use geometry::{EnvelopeColumn, SamplePoint, WaveformGeometry, minimum_zoom_frames, waveform_geometry};
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u32)]
 pub enum WaveformView {
@@ -132,16 +135,23 @@ impl DisplayPolicy {
             1.0
         };
         let bins = if valid_geometry && visible_frames != 0 && sample_rate != 0 {
-            let seconds_per_pixel = visible_frames as f64 / f64::from(sample_rate) / f64::from(width);
-            let overview_spacing = 1.25 + (seconds_per_pixel / 0.01).log2().max(0.0) * 0.55;
-            let column_spacing = if interactive { overview_spacing / 2.5 } else { overview_spacing };
-            let desired = (f64::from(width) / column_spacing.max(0.5)).ceil() as usize;
-            // Quantization avoids reallocating/rebuilding peaks for each pixel of a resize.
-            let quantized = desired.div_ceil(32).saturating_mul(32);
-            let pixel_limit = (width * if interactive { 2.0 } else { 1.0 }).ceil() as usize;
-            quantized.clamp(1, MAX_WAVEFORM_BINS)
-                .min(pixel_limit.max(1))
-                .min(usize::try_from(visible_frames).unwrap_or(usize::MAX))
+            if visible_frames <= MAX_WAVEFORM_BINS as u64
+                && visible_frames as f64 <= f64::from(width) {
+                // Once each sample fits on screen, keep its exact frame instead
+                // of aggregating it away through overview quantization.
+                visible_frames as usize
+            } else {
+                let seconds_per_pixel = visible_frames as f64 / f64::from(sample_rate) / f64::from(width);
+                let overview_spacing = 1.25 + (seconds_per_pixel / 0.01).log2().max(0.0) * 0.55;
+                let column_spacing = if interactive { overview_spacing / 2.5 } else { overview_spacing };
+                let desired = (f64::from(width) / column_spacing.max(0.5)).ceil() as usize;
+                // Quantization avoids reallocating/rebuilding peaks for each pixel of a resize.
+                let quantized = desired.div_ceil(32).saturating_mul(32);
+                let pixel_limit = (width * if interactive { 2.0 } else { 1.0 }).ceil() as usize;
+                quantized.clamp(1, MAX_WAVEFORM_BINS)
+                    .min(pixel_limit.max(1))
+                    .min(usize::try_from(visible_frames).unwrap_or(usize::MAX))
+            }
         } else {
             0
         };

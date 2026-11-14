@@ -66,6 +66,8 @@ void bt_clear(const BtCore *core);
 // Unavailable readings (including pause) are negative infinity.
 BtMeterReadings bt_meter_readings(const BtCore *core);
 int32_t bt_set_history(const BtCore *core, uint32_t seconds);
+// Nonzero keeps future quiet input. Default off; preserve retained audio and pause.
+void bt_set_retain_silence(const BtCore *core, uint32_t enabled);
 uint32_t bt_state(const BtCore *core);
 uint64_t bt_revision(const BtCore *core);
 // The two output arrays must be disjoint and each contain at least bins floats.
@@ -139,6 +141,7 @@ void bt_tracks_clear(const BtTracks *core);
 uint32_t bt_tracks_state(const BtTracks *core);
 uint64_t bt_tracks_revision(const BtTracks *core);
 int32_t bt_tracks_set_history(const BtTracks *core, uint32_t seconds);
+void bt_tracks_set_retain_silence(const BtTracks *core, uint32_t enabled);
 BtMeterReadings bt_tracks_meter_readings(const BtTracks *core, uint32_t lane);
 uint64_t bt_tracks_waveform(const BtTracks *core, uint32_t lane, uint32_t view,
                             float *minimum, float *maximum, uint32_t bins);

@@ -25,6 +25,17 @@ Options 左側是分類，右側以一列一項的直向清單顯示設定。頁
 
 操作說明集中於本文；UI 保留控制、標題、欄位名稱、值與必要的狀態／錯誤／路徑。
 
+### 保留安靜片段
+
+在 **Options → Capture／擷取** 勾選 **Keep quiet sections**（macOS：**保留安靜片段**）。預設關閉，舊設定及沒有此欄位的插件專案也使用關閉狀態。
+
+- **關閉**：沿用靜音壓縮，低於靜音偵測門檻的長安靜區間不占完整保留時間。
+- **開啟**：保留往後收到的低音量、數位零值，以及由已知來源時鐘確認的安靜區間。安靜本身會占用 History，可能使更早的音訊較快離開保留範圍。
+- 切換只影響後續擷取，不清空已保留歷史、不重切固定編輯素材／A/B 選區，也不暫停、恢復或重啟錄音。關閉時不回溯壓縮已保留片段，開啟時不補回以前已丟棄的安靜音訊。
+- 手動 Pause、來源不可用及 Sender 斷線仍各自處理；沒有有效來源／時鐘時，不會只因勾選就憑空補出未知音訊或 DAW 時間資訊。
+
+Windows 的正常連線來源可針對無封包的安靜時段作週期性 padding；macOS 若完全沒有 callback，只能等待後續真實 timestamp 才確認相應區間，不能先保證尾端即時補齊。這些平台情境仍依[本輪驗證計畫](superpowers/plans/2026-11-14-retain-quiet-sections.md)確認，不把舊版硬體／互動測試當作新選項已通過的證據。桌面偏好及各插件實例會保存此選項。
+
 macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`Control` 搭配波形上的點擊與拖曳用於框選。
 
 設定選單的背景透明度可選 0%、25%、50%、75% 或 100%。0% 為不透明，100% 為透明。桌面版在 100% 時仍可開啟設定選單調整透明度。VST3／CLAP 的 **Panel transparency** 調整插件內的波形面板背景，實際看到的底色取決於 DAW 的視窗背景。
@@ -39,6 +50,7 @@ macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`C
 - 完成框選或保存整段時，旗標標記範圍頭尾。`Shift` 加左鍵拖曳可直接吸附框選；Windows 的 `Ctrl`／macOS 的 `Option` 保留自由框選，也可再加 `Shift` 吸附。目標依附近可見旗標、已畫小節線、已畫秒數線的順序，同類選最近位置；拖動中的端點不吸附自己。只吸附目前畫出的目標；全透明時參考線隱藏，旗標仍可見、可操作。
 - 框選、調整旗標、縮放或平移會固定原編輯素材與視野，背景照常擷取。即時歷史循環覆寫或縮短保留時間，不會改變固定選區的原始取樣；A／B 共用起訖。完成或取消編輯後回到即時視野，手動 Pause 狀態獨立。
 - 波形區間數、筆畫和參考線密度依實際音訊區域、可見時間跨度及互動狀態調整。
+- 遠／中倍率以連續 min/max 填色與輪廓顯示峰值範圍，放大到個別取樣時改為連接原始 samples 的折線。最小縮放範圍依波形實際寬度決定，約讓一個 sample 占四個邏輯像素；調整視窗尺寸保留原視野，後續縮放遵守有效上下限。這些畫法不改變選區或匯出取樣；[本輪驗證紀錄](QUIET_CAPTURE_AND_WAVEFORM_2026-11-14.md)另列測試狀態。
 - **Save snapshot**、全域快照快捷鍵與成功拖放會同時匯出 A／B。兩個 WAV 使用同一起訖和取樣率。若 DAW 要求指定匯入位置，可選擇分開音軌並使用相同開始位置。
 
 [桌面版更新設定](UPDATES.md)
@@ -78,12 +90,12 @@ macOS 桌面版可從選單列顯示、隱藏或結束 Backtracking，也可啟�
 
 在完整介面中，工具列的 **Play／Pause** 圖示顯示可執行的動作：**開始錄音／Start capture** 或 **暫停錄音／Pause capture**。
 
-- **等待聲音／Waiting for sound**。錄音已待命，聲音超過靜音偵測門檻時便開始收錄。
+- **等待聲音／Waiting for sound**。錄音已待命；保留安靜片段關閉時，聲音超過靜音偵測門檻才開始收錄。開啟時可保留有效來源的已知安靜區間，來源尚不可用則另行處理。
 - **錄音中／Recording**。紅色狀態燈閃爍。波形右側是最新收錄的音訊，達到保留上限後，新的音訊會逐步取代最舊的音訊。
 - **已暫停／Paused**。按 **Pause** 暫停背景擷取，期間聲音略過。擷取由 **Play** 與既有自動續錄另行控制；0 秒設定下手動 Pause 維持。框選、旗標、縮放及匯出準備只固定編輯視野，不會隱含暫停或強制恢復擷取。
 - **未連線／Capture unavailable**。桌面版無法擷取時，可用 **Play** 重新連線。
 
-**保留／History／Buffer** 可選 10、20、30、60 秒或 3、5、10 分鐘，預設為 20 秒。這是即時歷史的音訊長度。假設兩段各 5 秒的聲音相隔一分鐘，兩段會接在一起，中間只保留靜音偵測需要的短緩衝。非常小聲的內容可能低於門檻。縮短會裁掉即時歷史最舊的部分，事後加長只增加接下來可保留的長度；已固定的編輯素材與原選區不因此重切。
+**保留／History／Buffer** 可選 10、20、30、60 秒或 3、5、10 分鐘，預設為 20 秒。這是即時歷史的音訊長度。預設壓縮靜音時，兩段各 5 秒、相隔一分鐘的聲音會接在一起，中間只保留偵測需要的短緩衝；開啟保留安靜片段後，已知安靜時間也占用 History。非常小聲的內容在預設模式可能低於門檻。縮短會裁掉即時歷史最舊的部分，事後加長只增加接下來可保留的長度；固定編輯素材不因此重切。
 
 ### 即時音量表
 
@@ -121,7 +133,7 @@ Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift
 
 選擇 **Play** 進入錄音待命，或選擇 **Pause** 手動暫停。完整介面可使用工具列，只顯示波形時可從右鍵開啟 Options。Play 保留目前固定的編輯素材與選區；取消、普通點擊或匯出結束才回到即時視野。重新待命後，下一段收錄的音訊會接在即時歷史後方，受保留時間上限約束。
 
-**自動續錄／Auto-resume** 的 **0、5、10 秒**選項仍保留，預設 **10 秒**。本輪一般編輯不再隱含暫停擷取：框選、旗標、縮放、平移及拖放準備固定的是素材與視野，背景仍按原狀錄音。取消選取（`Esc`／`Backspace`）、普通波形點擊或匯出結束會回到即時視野，不會因這些操作強制解除手動 Pause。擷取由 **Play** 與既有自動續錄另行控制：0 秒設定下手動 Pause 維持，5／10 秒仍依原有計時規則。待命時仍須聲音超過靜音偵測門檻才收錄。
+**自動續錄／Auto-resume** 的 **0、5、10 秒**選項仍保留，預設 **10 秒**。一般編輯不隱含暫停擷取：框選、旗標、縮放、平移及拖放準備固定的是素材與視野，背景仍按原狀錄音。取消、普通波形點擊或匯出結束會回到即時視野，不因此強制解除手動 Pause。擷取由 **Play** 與既有自動續錄另行控制：0 秒下手動 Pause 維持，5／10 秒依原有計時規則。待命時是否保留低音量／零值，依保留安靜片段設定。
 
 舊版儲存的 **Off、20 秒、30 秒**會改用 **10 秒**。
 
@@ -198,6 +210,17 @@ Choose a category on the left, then use the vertical settings list on the right.
 
 Operating instructions live in this guide; the UI keeps controls, headings, labels, values, and necessary status/error/path information.
 
+### Keep quiet sections
+
+Enable **Keep quiet sections** under **Options → Capture** (macOS label: **保留安靜片段**). It defaults to Off, including older settings/projects without this field.
+
+- **Off:** existing silence compression omits long below-threshold gaps from the retained duration.
+- **On:** retain subsequent quiet input, digital zeros, and silence established by a known source clock. Quiet sections consume History and can displace older audio sooner.
+- Toggling changes future capture only. It preserves retained history, fixed editing material/aligned A/B ranges, and capture state. It neither retroactively compresses existing material nor restores discarded quiet audio.
+- Manual Pause, unavailable sources, and disconnected Senders retain their own behavior. Enabling the option does not invent unknown audio or DAW timing without a valid source/clock.
+
+Windows handles eligible no-packet silence with periodic padding. With no callback on macOS, a real subsequent timestamp is needed to establish the interval; immediate trailing padding is not promised. Platform validation is tracked in the [current plan](superpowers/plans/2026-11-14-retain-quiet-sections.md), separately from older benchmarks. Desktop preferences and individual plug-in instances store the option.
+
 In the macOS desktop app, use a mouse right-click or the trackpad's secondary click to open the menu. Use `Control` with a click and drag over the waveform to select audio.
 
 The settings menu offers five background transparency levels. Choose 0%, 25%, 50%, 75%, or 100%, where 0% is opaque and 100% is clear. On the desktop apps, you can open Settings and adjust the value even at 100%. In VST3 and CLAP, **Panel transparency** fades the waveform panel's fill. The DAW provides the background behind it.
@@ -212,6 +235,7 @@ The settings menu offers five background transparency levels. Choose 0%, 25%, 50
 - Flags mark range boundaries. `Shift`-drag directly creates a snapped selection; `Ctrl` on Windows / `Option` on macOS keeps free selection, with optional Shift for snapping. Targets prioritize visible flags, then painted bars, then painted seconds; the moving handle excludes itself. Only painted targets are eligible. Fully transparent backgrounds hide guides but retain interactive flags.
 - Selecting, adjusting flags, zooming, or panning fixes the original editing material/view while background capture continues. The selected samples and aligned A/B boundaries survive live rollover or a shorter history limit. Finishing/canceling returns to live view without changing manual Pause.
 - Waveform bins, strokes, and guide density adapt to the actual audio rectangle, visible duration, and interaction state.
+- Wider views use a continuous filled min/max envelope and outline; close views connect the original samples with a polyline. The width-based zoom limit allows about four logical pixels per sample. Resizing preserves the view; subsequent zooming follows valid limits. Drawing does not change selected or exported samples; see the [current-round record](QUIET_CAPTURE_AND_WAVEFORM_2026-11-14.md) for validation status.
 - **Save snapshot**, the global snapshot shortcut, and accepted drops export both tracks with the same boundaries and sample rate. If your DAW prompts for placement, choose separate tracks at the same start position.
 
 [Desktop update settings](UPDATES.md)
@@ -251,12 +275,12 @@ On macOS, use the menu bar item to show, hide, or quit Backtracking, or enable l
 
 In the full interface, the toolbar's **Play/Pause** icon shows the available action: **Start capture** or **Pause capture**.
 
-- **Waiting for sound**. Capture is armed and starts when the incoming signal crosses the silence threshold.
+- **Waiting for sound**. Armed capture waits for the silence threshold when Keep quiet sections is Off. With it On, known silence from a valid source can be retained; unavailable sources are handled separately.
 - **Recording**. The red indicator blinks. The newest audio appears on the right. Once the buffer fills, new audio gradually replaces the oldest samples.
 - **Paused**. **Pause** stops background capture and skips incoming audio. **Play** and existing auto-resume control capture separately; manual Pause remains at the zero-second setting. Selection, flags, zoom, and export preparation fix the editing view without implicitly pausing or forcing capture to resume.
 - **Capture unavailable**. If the desktop recorder loses its connection, press **Play** to retry.
 
-**History / Buffer** offers 10, 20, 30, or 60 seconds, or 3, 5, or 10 minutes, and defaults to 20 seconds. It limits live history. Two five-second sounds a minute apart are joined with only a little silence at the join. Very quiet material may fall below the capture threshold. Shortening trims the oldest live audio; lengthening gives future audio more room. Fixed editing material and the original selection are not recut by these changes.
+**History / Buffer** offers 10/20/30/60 seconds or 3/5/10 minutes and defaults to 20 seconds. With default silence compression, two five-second sounds a minute apart join with only a short gap; Keep quiet sections also counts known silence against History. Very quiet input may fall below the default gate. Shortening trims the oldest live audio; lengthening gives future audio more room. Fixed editing material is not recut.
 
 ### Live audio meter
 
@@ -294,7 +318,7 @@ On Windows, press Alt plus the physical key to the left of 1 (the ~ / grave key,
 
 Choose **Play** to arm capture or **Pause** to pause it manually. Use the toolbar in the full interface or right-click to open Options in waveform-only mode. Play preserves fixed editing material/selection; canceling, an ordinary click, or export completion returns to live view. Once re-armed, the next sound appends to live history within the limit.
 
-**Auto-resume** retains its **0, 5, or 10 seconds** options and **10-second** default. Ordinary editing no longer implicitly pauses capture: selection, flags, zoom, pan, and export preparation fix material/view while background capture keeps its prior state. Canceling (`Esc`/`Backspace`), an ordinary waveform click, or export completion returns to live view without forcing manual Pause to resume. **Play** and existing auto-resume control capture separately: manual Pause remains at zero seconds; 5/10 seconds retain their existing timer rules. Armed capture still waits for the silence threshold to be crossed.
+**Auto-resume** retains **0/5/10 seconds** and its **10-second** default. Editing fixes material/view without implicitly pausing capture. Canceling, an ordinary waveform click, or export completion returns live without forcing manual Pause to resume. **Play** and existing auto-resume control capture separately: manual Pause remains at zero seconds; 5/10 seconds retain their timer rules. Keep quiet sections determines whether quiet/zero input is retained while armed.
 
 Existing **Off**, **20-second**, and **30-second** settings use the **10-second** default.
 
@@ -430,9 +454,9 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 
 ### 裝好後做一次快速測試 / Check the installation
 
-1. 播放兩小段聲音，中間留一段長靜音。確認波形留下兩段有效音訊。
+1. 先確認 **Keep quiet sections／保留安靜片段** 關閉，播放兩小段聲音，中間留長靜音，確認預設靜音壓縮。再開啟選項，用有效來源重試，History 設得比整段更長，確認已知安靜區間也保留。切換不應清歷史、取消固定選區或改變手動 Pause。
 
-   Play two short sounds with a long pause between them and check that both remain in the waveform.
+   With **Keep quiet sections** Off, play two short sounds separated by silence and check default compression. Turn it On and repeat with a valid source and History longer than the full interval; known silence should remain. Toggling must not clear history/fixed selections or change manual Pause.
 2. 將自動續錄設為 **0 秒**，播放聲音確認紅燈閃爍。按 **Pause**，確認背景擷取停止，取消選取不應解除手動 Pause。按 **Play**，接著自由框選、`Shift` 吸附框選、拖旗標和縮放，確認編輯素材與視野固定，背景仍持續收錄。以 **5／10 秒**設定重試，分開確認既有自動續錄規則；取消編輯後應回到最新錄音。
 
    At **0-second** auto-resume, play audio and check the red indicator. Press **Pause** and verify capture stops; canceling must not clear manual Pause. Press **Play**, then test free selection, Shift-snapped selection, flags, and zoom while background capture continues. Repeat at **5/10 seconds**, checking existing auto-resume separately. Canceling editing should return to the latest recording.

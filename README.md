@@ -17,7 +17,7 @@ Backtracking 是給作曲與混音用的回溯錄音取樣器。聽到想留下�
 ### 快速開始
 
 1. 開啟桌面版，或把 **Backtracking** 插入 DAW 音軌的效果鏈。
-2. 播放聲音。波形可保留最近 10、20、30、60 秒或 3、5、10 分鐘的有效音訊，長靜音期間會停在原處。
+2. 播放聲音。波形可保留最近 10、20、30、60 秒或 3、5、10 分鐘；預設壓縮長靜音，可在 Options 的 Capture 開啟 **Keep quiet sections／保留安靜片段**，保留往後的安靜音訊。
 3. 按住波形拖出 Backtracking 視窗，放到接受 WAV 的位置，即可匯出整段保留音訊。只需其中一段時，Windows 用 `Ctrl`、macOS 用 `Option` 自由框選，或直接用 `Shift` 加拖曳吸附框選，再拖出變色區間。
 4. 在完整介面用工具列的 **Play／Pause** 啟用或暫停錄音。紅燈閃爍時正在收錄。框選、拖曳旗標、縮放及準備匯出會固定編輯素材與視野，背景繼續擷取；取消選取或匯出結束回到即時視野，不會強制解除手動 Pause；Play 與既有自動續錄另行控制擷取。
 
@@ -33,6 +33,8 @@ Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift
 
 
 在 Options 可選擇 WAV 取樣率 **44.1、48 或 96 kHz**，以及 **16-bit PCM、24-bit PCM 或 32-bit IEEE float** 編碼。預設為 **48 kHz、32-bit float**。
+
+**Keep quiet sections／保留安靜片段** 預設關閉。開啟後保留往後的低音量、零值與來源時鐘可確認的安靜區間；關閉後沿用靜音壓縮。切換不清空歷史、不改固定選區或手動暫停，也不補回先前已丟棄的安靜內容；來源未連線或 Sender 中斷時，不憑空建立未知音訊。新選項的實作與驗證進度見[本輪計畫](docs/superpowers/plans/2026-11-14-retain-quiet-sections.md)。
 
 旗標標記範圍。按住 `Shift` 依可見旗標、小節線、秒數線的順序吸附，拖動端點時排除自己；全透明背景隱藏參考線，但旗標仍可操作。Options 可選擇合併或 L/R 波形；桌面版可獨立擷取 A／B 來源及聲道路由，再匯出兩個起訖對齊的 WAV。更新設定支援啟動時安裝與手動檢查。[來源與波形](docs/USER_GUIDE.md#來源波形與旗標) · [啟動更新](docs/UPDATES.md)
 
@@ -52,7 +54,7 @@ Backtracking is a retrospective audio sampler for music production and mixing. W
 ### Quick start
 
 1. Open the desktop app or insert **Backtracking** in a DAW track's effects chain.
-2. Play some audio. The waveform can keep the last 10, 20, 30, or 60 seconds, or 3, 5, or 10 minutes of captured sound and holds its position through long gaps.
+2. Play audio. History offers 10/20/30/60 seconds or 3/5/10 minutes. Long silence is compressed by default; enable **Keep quiet sections** in Capture Options to retain subsequent quiet audio.
 3. Drag the waveform outside Backtracking onto a WAV target to export retained audio. For a shorter clip, use `Ctrl` on Windows / `Option` on macOS for free selection, or `Shift`-drag directly for snapped selection, then drag out the highlighted range.
 4. In the full interface, use **Play/Pause** to arm or pause capture. A blinking red indicator means audio is being recorded. Selecting, adjusting flags, zooming, or preparing export fixes the editing material/view while background capture continues. Canceling or finishing export returns to live view without forcing manual Pause to resume; Play and existing auto-resume control capture separately.
 
@@ -69,6 +71,8 @@ Use Alt plus the physical key to the left of 1 (the ~ / grave key, without Shift
 
 Choose a WAV sample rate of **44.1, 48, or 96 kHz** and **16-bit PCM, 24-bit PCM, or 32-bit IEEE float** encoding in Options. The default is **48 kHz, 32-bit float**.
 
+**Keep quiet sections** defaults to Off. On retains future quiet/zero input and silence established by a known source clock; Off keeps silence compression. Toggling preserves history, fixed editing material, and capture state. It neither restores previously discarded quiet audio nor invents unknown audio for a disconnected source/Sender. See the [implementation/validation plan](docs/superpowers/plans/2026-11-14-retain-quiet-sections.md) for this new option's status.
+
 Flags mark a range. Hold `Shift` to snap to visible flags first, then painted bars, then painted seconds; a moving endpoint excludes itself. Fully transparent backgrounds hide guides but keep flags interactive. Choose merged or L/R waveforms in Options. The desktop app can capture independent A/B sources and routes, then save two aligned WAVs. Update settings support installation at launch and manual checks. [Capture and waveform](docs/USER_GUIDE.md#sources-waveforms-and-flags) · [Startup updates](docs/UPDATES.md)
 
 [Full user guide](docs/USER_GUIDE.md#english) · [Desktop window controls](docs/USER_GUIDE.md#move-and-resize-the-desktop-window) · [Installation and build](docs/USER_GUIDE.md#安裝與建置--installation-and-build)
@@ -79,7 +83,9 @@ Flags mark a range. Hold `Shift` to snap to visible flags first, then painted ba
 
 Selection, flags, and zoom use fixed editing material while background capture continues. The original samples and A/B boundaries survive live rollover or a shorter history limit. Scroll around the pointer to zoom and middle-drag to pan. Shift prioritizes visible flags, then painted bars, then painted seconds. Waveform density/strokes adapt to the actual audio area, duration, and interaction. Options toggles guides and a 1/5/10-second grid. History offers 10/20/30/60 seconds or 3/5/10 minutes; shortening trims only the oldest live-history frames.
 
-本輪程式檢查、Windows 指定原生操作及 Release 建置結果已記錄；方法、版本雜湊與未測範圍見[波形編輯與介面回應](docs/RESPONSIVE_EDITING_2026-11-14.md)。 / Code checks, specified Windows native observations, and Release builds are recorded in the [report with build hashes and validation limits](docs/RESPONSIVE_EDITING_2026-11-14.md).
+先前固定素材互動版本的程式檢查、Windows 指定操作及建置結果，保留於[波形編輯與介面回應](docs/RESPONSIVE_EDITING_2026-11-14.md)，不作為新增安靜片段選項的驗證結果。 / The [responsive-editing report](docs/RESPONSIVE_EDITING_2026-11-14.md) preserves the earlier version's checks, native observations, and build hashes; it does not validate the newly added quiet-section option.
+
+本輪採用遠／中倍率的連續 min/max 填色與輪廓、近倍率的原始 sample 折線，並統一依實際波形寬度決定最小縮放範圍；實作與驗證進行中。原先點狀／柱狀問題與方案見[波形顯示研究](docs/WAVEFORM_DISPLAY_RESEARCH_2026-11-14.md)，新結果另記於[本輪功能與驗證紀錄](docs/QUIET_CAPTURE_AND_WAVEFORM_2026-11-14.md)。 / This round adopts a continuous filled min/max envelope with an outline at wider views and an original-sample polyline close up, with a shared width-based zoom limit. Implementation/validation is in progress; see the [display research](docs/WAVEFORM_DISPLAY_RESEARCH_2026-11-14.md) and [current-round record](docs/QUIET_CAPTURE_AND_WAVEFORM_2026-11-14.md).
 
 Windows 功能測試版的原生端點編輯可在 Play 後保持約 19.77 秒選區，超過 10 秒即時保留時間後仍保存為 19.768083 秒的 stereo float32 WAV；最終清理文案版另確認 Options 與原生縮窗可操作。 / A Windows functional test build retained an approximately 19.77-second selection beyond ten-second live rollover and saved a 19.768083-second stereo float32 WAV; the final copy-cleanup build separately passed the observed Options/native-resize checks.
 

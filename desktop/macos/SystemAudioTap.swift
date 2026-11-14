@@ -104,6 +104,120 @@ struct CaptureLane: Equatable {
     var route: CaptureRoute = .merged
 }
 
+struct WaveformEnvelopeColumn: Equatable, Sendable {
+    let x: Double
+    let minimum: Float
+    let maximum: Float
+}
+
+struct WaveformSamplePoint: Equatable, Sendable {
+    let x: Double
+    let value: Float
+}
+
+enum WaveformDisplayGeometry: Equatable, Sendable {
+    case empty
+    case envelope([[WaveformEnvelopeColumn]])
+    case samples([[WaveformSamplePoint]])
+}
+
+struct WaveformRenderGate {
+    private(set) var inFlight = false
+    private var refreshPending = false
+
+    mutating func request() -> Bool {
+        if inFlight {
+            refreshPending = true
+            return false
+        }
+        inFlight = true
+        refreshPending = false
+        return true
+    }
+
+    mutating func complete(stale: Bool) -> Bool {
+        guard inFlight else { return false }
+        inFlight = false
+        let retry = stale || refreshPending
+        refreshPending = false
+        return retry
+    }
+}
+
+func waveformDisplayGeometry(
+    minimum: [Float], maximum: [Float], visibleFrames: Range<UInt64>
+) -> WaveformDisplayGeometry {
+    let count = min(minimum.count, maximum.count)
+    guard count > 0, count <= 4_096, !visibleFrames.isEmpty else { return .empty }
+    var sampleMode = UInt64(count) == visibleFrames.upperBound - visibleFrames.lowerBound
+    var spans: [Range<Int>] = []
+    var first: Int?
+    for index in 0...count {
+        let valid = index < count && minimum[index].isFinite && maximum[index].isFinite
+        if valid {
+            if first == nil { first = index }
+            if minimum[index] != maximum[index] { sampleMode = false }
+        } else if let start = first {
+            spans.append(start..<index)
+            first = nil
+        }
+    }
+    guard !spans.isEmpty else { return .empty }
+    let scale = Double(count)
+    func bounded(_ value: Float) -> Float { max(-1, min(1, value)) }
+    if sampleMode {
+        return .samples(spans.map { span in
+            span.map { WaveformSamplePoint(x: Double($0) / scale, value: bounded(minimum[$0])) }
+        })
+    }
+    func column(_ index: Int, at x: Double) -> WaveformEnvelopeColumn {
+        WaveformEnvelopeColumn(x: x, minimum: bounded(min(minimum[index], maximum[index])),
+                               maximum: bounded(max(minimum[index], maximum[index])))
+    }
+    return .envelope(spans.map { span in
+        var columns: [WaveformEnvelopeColumn] = []
+        columns.reserveCapacity(span.count + 2)
+        columns.append(column(span.lowerBound, at: Double(span.lowerBound) / scale))
+        for index in span { columns.append(column(index, at: (Double(index) + 0.5) / scale)) }
+        columns.append(column(span.upperBound - 1, at: Double(span.upperBound) / scale))
+        return columns
+    })
+}
+
+func minimumWaveformZoomFrames(width: Double, retainedFrames: UInt64) -> UInt64 {
+    guard retainedFrames > 0 else { return 0 }
+    guard retainedFrames > 1 else { return 1 }
+    let desired = width.isFinite && width > 0 ? UInt64((min(width, 16_384) / 4).rounded(.down)) : 2
+    return min(retainedFrames, max(2, min(4_096, desired)))
+}
+
+func zoomedWaveformRange(
+    _ view: Range<UInt64>, in available: Range<UInt64>, width: Double,
+    cursorFraction: Double, delta: Double
+) -> Range<UInt64> {
+    guard !available.isEmpty, !view.isEmpty else { return available }
+    let maximum = available.upperBound - available.lowerBound
+    let current = min(view.upperBound - view.lowerBound, maximum)
+    let first = min(max(view.lowerBound, available.lowerBound), available.upperBound - current)
+    guard delta.isFinite else { return first..<(first + current) }
+    let fraction = cursorFraction.isFinite ? min(1, max(0, cursorFraction)) : 0.5
+    let minimum = min(current, minimumWaveformZoomFrames(width: width, retainedFrames: maximum))
+    let proposed = (Double(current) * exp(-delta)).rounded()
+    let next: UInt64
+    if proposed <= Double(minimum) { next = minimum }
+    else if proposed >= Double(maximum) { next = maximum }
+    else { next = UInt64(proposed) }
+    let pivot = Double(first - available.lowerBound) + Double(current) * fraction
+    let proposedOffset = (pivot - Double(next) * fraction).rounded()
+    let maximumOffset = maximum - next
+    let offset: UInt64
+    if proposedOffset <= 0 { offset = 0 }
+    else if proposedOffset >= Double(maximumOffset) { offset = maximumOffset }
+    else { offset = UInt64(proposedOffset) }
+    let start = available.lowerBound + offset
+    return start..<(start + next)
+}
+
 private struct SenderDescriptor {
     let id: String
     let name: String
@@ -464,11 +578,16 @@ private struct InputFormat {
 private final class TimelineHandle: @unchecked Sendable {
     let core: OpaquePointer
 
-    init(history: UInt32, a: UInt32, b: UInt32) throws {
+    init(history: UInt32, a: UInt32, b: UInt32, retainSilence: Bool = false) throws {
         guard let core = bt_tracks_new(SystemAudioTap.timelineRate, a, b, history) else {
             throw CaptureError("無法配置錄音緩衝區")
         }
         self.core = core
+        setRetainSilence(retainSilence)
+    }
+
+    func setRetainSilence(_ enabled: Bool) {
+        bt_tracks_set_retain_silence(core, enabled ? 1 : 0)
     }
 
     deinit { bt_tracks_free(core) }
@@ -771,7 +890,7 @@ final class SystemAudioTap {
         Set(slots.compactMap { ($0.input as? PlaybackTap)?.aggregateID })
     }
 
-    init(history: UInt32, lanes: [CaptureLane]) throws {
+    init(history: UInt32, lanes: [CaptureLane], retainSilence: Bool = false) throws {
         guard (1...2).contains(lanes.count) else { throw CaptureError("可擷取一或兩路來源") }
         self.lanes = lanes
         var slots: [Slot] = []
@@ -800,7 +919,8 @@ final class SystemAudioTap {
                 ?? (lane.source.isMicrophone ? 1 : 2)
         }
         self.widths = widths
-        self.timeline = try TimelineHandle(history: history, a: widths[0], b: widths.count == 2 ? widths[1] : 0)
+        self.timeline = try TimelineHandle(history: history, a: widths[0], b: widths.count == 2 ? widths[1] : 0,
+                                           retainSilence: retainSilence)
         self.slots = slots
         for index in self.slots.indices { bind(index) }
     }
@@ -938,6 +1058,11 @@ final class SystemAudioTap {
         }
     }
 
+    func setRetainSilence(_ enabled: Bool) {
+        let timeline = self.timeline
+        captureQueue.async { timeline.setRetainSilence(enabled) }
+    }
+
     func resume() throws {
         if running { try pause() }
         telemetryVersion &+= 1
@@ -1015,7 +1140,193 @@ final class SystemAudioTap {
 }
 
 #if BACKTRACKING_CAPTURE_VERIFY
+private func verifyMacWaveformGeometry() throws {
+    func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
+        if !condition() { throw CaptureError(message) }
+    }
+    var gate = WaveformRenderGate()
+    try expect(gate.request(), "The initial waveform request was not started")
+    try expect(!gate.request() && !gate.request(), "Concurrent waveform requests were started")
+    try expect(gate.complete(stale: true) && !gate.inFlight,
+               "A stale paused-view result did not request the latest view")
+    try expect(gate.request() && !gate.complete(stale: false),
+               "Waveform retries did not coalesce or spun after a valid result")
+    try expect(gate.request() && !gate.request() && gate.complete(stale: false),
+               "A pending refresh was lost when its request parameters stayed equal")
+    try expect(gate.request() && !gate.complete(stale: false), "A paused refresh did not finish")
+    try expect(gate.request() && gate.complete(stale: true),
+               "A changed view was lost without a timer-driven refresh")
+    try expect(gate.request() && !gate.complete(stale: false) && !gate.complete(stale: true),
+               "Duplicate completion restarted an idle waveform renderer")
+    let samples: [Float] = [0.25, -0.5, 2, -2]
+    let expected = WaveformDisplayGeometry.samples([[
+        WaveformSamplePoint(x: 0, value: 0.25), WaveformSamplePoint(x: 0.25, value: -0.5),
+        WaveformSamplePoint(x: 0.5, value: 1), WaveformSamplePoint(x: 0.75, value: -1)
+    ]])
+    try expect(waveformDisplayGeometry(minimum: samples, maximum: samples, visibleFrames: 100..<104) == expected,
+               "Sample geometry lost the original frame positions")
+    try expect(waveformDisplayGeometry(minimum: samples, maximum: samples,
+               visibleFrames: (UInt64.max - 4)..<UInt64.max) == expected,
+               "Sample geometry changed with a large absolute frame origin")
+    let missing: [Float] = [0.25, .nan, -0.5]
+    try expect(waveformDisplayGeometry(minimum: missing, maximum: missing, visibleFrames: 0..<3) == .samples([
+        [WaveformSamplePoint(x: 0, value: 0.25)], [WaveformSamplePoint(x: 2.0 / 3, value: -0.5)]
+    ]), "Sample geometry connected across unknown audio")
+    guard case .envelope(let runs) = waveformDisplayGeometry(
+        minimum: [0.1, .nan, 0.8], maximum: [0.4, .nan, -0.3], visibleFrames: 10..<110
+    ) else { throw CaptureError("Aggregated peaks were rendered as raw samples") }
+    try expect(runs.count == 2 && runs[0].count == 3 && runs[1].count == 3,
+               "Envelope geometry did not separate finite runs")
+    try expect(runs[0].first?.x == 0 && runs[0].last?.x == 1.0 / 3
+               && runs[1].first?.x == 2.0 / 3 && runs[1].last?.x == 1,
+               "Envelope geometry omitted bin edges or crossed unknown audio")
+    try expect(runs[1].allSatisfy { $0.minimum == -0.3 && $0.maximum == 0.8 },
+               "Envelope geometry did not sort the supplied extrema")
+    try expect(waveformDisplayGeometry(minimum: [-2], maximum: [2], visibleFrames: 0..<100) == .envelope([[
+        WaveformEnvelopeColumn(x: 0, minimum: -1, maximum: 1),
+        WaveformEnvelopeColumn(x: 0.5, minimum: -1, maximum: 1),
+        WaveformEnvelopeColumn(x: 1, minimum: -1, maximum: 1)
+    ]]), "A single envelope bin did not fill its time interval")
+    try expect(waveformDisplayGeometry(minimum: [0.25], maximum: [0.25], visibleFrames: 0..<1)
+               == .samples([[WaveformSamplePoint(x: 0, value: 0.25)]]),
+               "A single sample was shifted to a bin center")
+    guard case .envelope = waveformDisplayGeometry(
+        minimum: [0.25, 0.25], maximum: [0.25, 0.25], visibleFrames: 0..<1
+    ) else { throw CaptureError("Repeated bins were misclassified as raw samples") }
+    guard case .envelope = waveformDisplayGeometry(
+        minimum: [-0.2, 0.1], maximum: [0.3, 0.2], visibleFrames: 0..<2
+    ) else { throw CaptureError("Unequal peak pairs were misclassified as raw samples") }
+    try expect(waveformDisplayGeometry(minimum: [0, 0], maximum: [0, 0], visibleFrames: 0..<96_000)
+               == .envelope([[
+                   WaveformEnvelopeColumn(x: 0, minimum: 0, maximum: 0),
+                   WaveformEnvelopeColumn(x: 0.25, minimum: 0, maximum: 0),
+                   WaveformEnvelopeColumn(x: 0.75, minimum: 0, maximum: 0),
+                   WaveformEnvelopeColumn(x: 1, minimum: 0, maximum: 0)
+               ]]), "Quiet envelope geometry did not cover the continuous visible interval")
+    try expect(waveformDisplayGeometry(minimum: [.nan], maximum: [.infinity], visibleFrames: 0..<10) == .empty,
+               "Invalid peak data produced geometry")
+    try expect(waveformDisplayGeometry(minimum: [], maximum: [], visibleFrames: 0..<10) == .empty,
+               "Empty peak data produced geometry")
+    try expect(waveformDisplayGeometry(minimum: [0], maximum: [0], visibleFrames: 3..<3) == .empty,
+               "An empty frame range produced geometry")
+    let excessive = [Float](repeating: 0, count: 4_097)
+    try expect(waveformDisplayGeometry(minimum: excessive, maximum: excessive, visibleFrames: 0..<10_000) == .empty,
+               "Geometry exceeded the bounded bin capacity")
+    try expect(minimumWaveformZoomFrames(width: 800, retainedFrames: 10_000) == 200
+               && minimumWaveformZoomFrames(width: 800, retainedFrames: 100) == 100,
+               "Sample zoom did not follow the occupied audio width")
+    try expect(minimumWaveformZoomFrames(width: .nan, retainedFrames: 100) == 2
+               && minimumWaveformZoomFrames(width: .infinity, retainedFrames: 100) == 2
+               && minimumWaveformZoomFrames(width: 1, retainedFrames: 1) == 1
+               && minimumWaveformZoomFrames(width: 1, retainedFrames: 0) == 0
+               && minimumWaveformZoomFrames(width: .greatestFiniteMagnitude, retainedFrames: 10_000) == 4_096,
+               "Invalid or extreme zoom geometry was not bounded")
+    try expect(zoomedWaveformRange(1_000..<1_100, in: 0..<10_000, width: 800,
+                                  cursorFraction: 0.5, delta: 1) == 1_000..<1_100,
+               "Zooming in after a resize made the view wider")
+    let zoomed = zoomedWaveformRange(1_000..<2_000, in: 0..<10_000, width: 800,
+                                    cursorFraction: 0.25, delta: log(2))
+    try expect(zoomed == 1_125..<1_625, "Zoom did not preserve the cursor's sample position")
+    let origin = UInt64.max - 10_000
+    try expect(zoomedWaveformRange((origin + 1_000)..<(origin + 2_000), in: origin..<UInt64.max,
+                                  width: 800, cursorFraction: 0.25, delta: log(2))
+               == (origin + 1_125)..<(origin + 1_625), "Zoom lost precision at a large frame origin")
+}
+
+private func verifyMacRetainSilenceOption() throws {
+    let blockFrames = 4_096
+    func push(_ timeline: TimelineHandle, a: Float, b: Float, sequence: UInt64) {
+        let time = 1_000_000_000 + sequence * UInt64(blockFrames) * 1_000_000_000 / 48_000
+        let left = [Float](repeating: a, count: blockFrames)
+        let right = [Float](repeating: b, count: blockFrames)
+        left.withUnsafeBufferPointer {
+            _ = bt_tracks_push_interleaved(timeline.core, 0, $0.baseAddress, UInt32(blockFrames),
+                                           time, SystemAudioTap.timelineRate)
+        }
+        right.withUnsafeBufferPointer {
+            _ = bt_tracks_push_interleaved(timeline.core, 1, $0.baseAddress, UInt32(blockFrames),
+                                           time, SystemAudioTap.timelineRate)
+        }
+    }
+
+    let disabled = try TimelineHandle(history: 10, a: 1, b: 0, retainSilence: true)
+    let disabledProducer = LaneProducer(timeline: disabled, lane: 0, route: .merged, outputChannels: 1)
+    let disabledFormat = InputFormat(senderChannels: 1, sampleRate: 48_000)
+    var disabledBuffers = AudioBufferList(
+        mNumberBuffers: 1,
+        mBuffers: AudioBuffer(mNumberChannels: 1, mDataByteSize: UInt32(blockFrames * 4), mData: nil)
+    )
+    withUnsafeMutablePointer(to: &disabledBuffers) {
+        disabledProducer.push(UnsafeMutableAudioBufferListPointer($0), format: disabledFormat,
+                              frameLimit: blockFrames, time: 1_000_000_000)
+    }
+    bt_tracks_pause(disabled.core)
+    guard bt_tracks_end_frame(disabled.core) == bt_tracks_first_frame(disabled.core) else {
+        throw CaptureError("A disabled stream was converted into silent audio")
+    }
+
+    let compressed = try TimelineHandle(history: 10, a: 1, b: 1)
+    push(compressed, a: 0.00001, b: -0.00001, sequence: 0)
+    bt_tracks_pause(compressed.core)
+    guard bt_tracks_end_frame(compressed.core) == bt_tracks_first_frame(compressed.core) else {
+        throw CaptureError("Quiet sections were retained by default")
+    }
+
+    let retained = try TimelineHandle(history: 10, a: 1, b: 1, retainSilence: true)
+    push(retained, a: 0, b: 0, sequence: 0)
+    retained.setRetainSilence(false)
+    guard bt_tracks_end_frame(retained.core) - bt_tracks_first_frame(retained.core) == UInt64(blockFrames),
+          bt_tracks_state(retained.core) != 2 else {
+        throw CaptureError("Changing quiet retention cleared audio or paused capture")
+    }
+    push(retained, a: 0.00001, b: -0.00001, sequence: 1)
+    retained.setRetainSilence(true)
+    guard bt_tracks_end_frame(retained.core) - bt_tracks_first_frame(retained.core) == UInt64(blockFrames),
+          bt_tracks_state(retained.core) != 2 else {
+        throw CaptureError("Enabling quiet retention restored discarded audio or paused capture")
+    }
+    push(retained, a: 0.00002, b: -0.00003, sequence: 2)
+    bt_tracks_pause(retained.core)
+    var sharedFirst: UInt64? = nil
+    let expectedLanes: [(UInt32, Float)] = [(0, 0.00002), (1, -0.00003)]
+    for (lane, value) in expectedLanes {
+        guard let snapshot = bt_tracks_snapshot(retained.core, lane) else {
+            throw CaptureError("Quiet-retained track has no snapshot")
+        }
+        defer { bt_snapshot_free(snapshot) }
+        let first = bt_snapshot_first_frame(snapshot)
+        guard bt_snapshot_frame_count(snapshot) == UInt64(blockFrames * 2),
+              sharedFirst == nil || sharedFirst == first else {
+            throw CaptureError("Quiet retention changed the A/B frame boundaries")
+        }
+        sharedFirst = first
+        let sections: [(UInt64, Float)] = [(0, 0), (UInt64(blockFrames), value)]
+        for (offset, expected) in sections {
+            let count = 64
+            var minimum = [Float](repeating: 0, count: count)
+            var maximum = [Float](repeating: 0, count: count)
+            let start = first + offset
+            let frames = minimum.withUnsafeMutableBufferPointer { low in
+                maximum.withUnsafeMutableBufferPointer { high in
+                    bt_snapshot_waveform_range(snapshot, 0, start, start + UInt64(count),
+                                               low.baseAddress, high.baseAddress, UInt32(count))
+                }
+            }
+            guard frames == UInt64(count), minimum.allSatisfy({ abs($0 - expected) < 0.000000001 }),
+                  maximum.allSatisfy({ abs($0 - expected) < 0.000000001 }) else {
+                throw CaptureError("Quiet retention changed the original sample values")
+            }
+        }
+    }
+    retained.setRetainSilence(false)
+    guard bt_tracks_state(retained.core) == 2 else {
+        throw CaptureError("Quiet retention released a manual pause")
+    }
+}
+
 func verifyMacCaptureRouting() throws {
+    try verifyMacWaveformGeometry()
+    try verifyMacRetainSilenceOption()
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }

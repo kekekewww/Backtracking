@@ -37,6 +37,7 @@ impl MeterMode {
 pub(crate) enum Key {
     History,
     IdleResume,
+    RetainSilence,
     Transparency,
     Accent,
     Meter,
@@ -66,6 +67,7 @@ impl Key {
             Self::History => "history-seconds",
             // The old preference used 0 for Off.
             Self::IdleResume => "idle-resume-delay-seconds",
+            Self::RetainSilence => "retain-silence",
             Self::Transparency => "transparency-percent",
             Self::Accent => "theme-color",
             Self::Meter => "meter-unit",
@@ -94,6 +96,7 @@ impl Key {
 pub(crate) struct Settings {
     pub(crate) history: DurationChoice,
     pub(crate) idle_resume: AutoResumeDelay,
+    pub(crate) retain_silence: bool,
     pub(crate) transparency: u8,
     pub(crate) accent: [u8; 3],
     pub(crate) meter_mode: MeterMode,
@@ -125,6 +128,7 @@ impl Default for Settings {
         Self {
             history: DurationChoice::Seconds20,
             idle_resume: AutoResumeDelay::default(),
+            retain_silence: false,
             transparency: 0,
             accent: DEFAULT_ACCENT,
             meter_mode: MeterMode::Dbfs,
@@ -186,6 +190,7 @@ impl Preferences {
         {
             settings.idle_resume = delay;
         }
+        settings.retain_silence = self.read_number::<u8>(Key::RetainSilence) == Some(1);
         if let Some(percent @ (0 | 25 | 50 | 75 | 100)) = self.read_number(Key::Transparency) {
             settings.transparency = percent;
         }
@@ -821,6 +826,26 @@ mod tests {
         });
         fs::write(run.join("synchronous-save-results.json"), serde_json::to_vec_pretty(&result).unwrap()).unwrap();
         println!("{result}");
+    }
+
+    #[test]
+    fn quiet_sections_default_off_and_persist_through_the_background_writer() {
+        let preferences = workspace_preferences("retain-silence");
+        assert!(!Settings::default().retain_silence);
+        assert!(!preferences.load().retain_silence);
+
+        let writer = PreferenceWriter::new(preferences.clone()).unwrap();
+        writer.save(Key::RetainSilence, "1").unwrap();
+        writer.flush().unwrap();
+        assert!(preferences.load().retain_silence);
+        assert_eq!(preferences.read(Key::RetainSilence).as_deref(), Some("1"));
+        assert!(preferences.directory.as_ref().unwrap().join("retain-silence").is_file());
+
+        writer.save(Key::RetainSilence, "0").unwrap();
+        writer.flush().unwrap();
+        assert!(!preferences.load().retain_silence);
+        preferences.save(Key::RetainSilence, "invalid").unwrap();
+        assert!(!preferences.load().retain_silence);
     }
 
     #[test]

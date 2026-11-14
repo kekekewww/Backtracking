@@ -178,6 +178,49 @@ impl History {
         }
     }
 
+    /// Preserve a known zero interval, materializing only the retained suffix.
+    pub(super) fn append_silence(
+        &mut self,
+        frames: u64,
+        retained_frames: usize,
+    ) -> Result<(), CaptureError> {
+        self.end.checked_add(frames).ok_or(CaptureError::BufferTooLarge)?;
+        let skipped = frames.saturating_sub(retained_frames as u64);
+        if skipped != 0 {
+            // The retained zero suffix will immediately reuse these pages;
+            // do not release and reallocate a previously grown history.
+            self.free.extend(self.active.drain(..));
+            self.end += skipped;
+            self.start = self.end;
+        }
+        let mut remaining = frames - skipped;
+        let zero = Bounds { min: 0.0, max: 0.0 };
+        let mut zero_peaks = [Bounds::EMPTY; TRACES];
+        let traces = if self.a_channels < self.channels { TRACES } else { 4 };
+        zero_peaks[..traces].fill(zero);
+        while remaining != 0 {
+            self.ensure_append_capacity()?;
+            let page = self.active.back_mut().expect("capacity was reserved");
+            let previous_frames = page.samples.len() / self.channels;
+            let count = remaining.min((self.page_frames - previous_frames) as u64) as usize;
+            page.samples.resize((previous_frames + count) * self.channels, 0.0);
+            let completed_blocks = (previous_frames + count) / PEAK_FRAMES;
+            while page.peaks.len() < completed_blocks {
+                let block = page.peaks.len();
+                let bounds = if block * PEAK_FRAMES < previous_frames {
+                    page.summarize(block, self.channels, self.a_channels)
+                } else {
+                    zero_peaks
+                };
+                page.peaks.push(bounds);
+            }
+            self.end += count as u64;
+            remaining -= count as u64;
+            self.truncate_to(retained_frames);
+        }
+        Ok(())
+    }
+
     pub(super) fn truncate_to(&mut self, frames: usize) {
         self.start = self.start.max(self.end.saturating_sub(frames as u64));
         while self

@@ -872,6 +872,7 @@ impl Recorder {
         primary: bool,
     ) -> Self {
         controller.set_retention(settings.history);
+        controller.set_retain_silence(settings.retain_silence);
         controller.set_sources(settings.sources);
         controller.resume();
         let generation = controller.generation();
@@ -1738,7 +1739,7 @@ impl Recorder {
         let title = if self.primary {
             tray::OPTIONS_TITLE.to_owned()
         } else {
-            format!("Backtracking Capture Options ({})", std::process::id())
+            "Backtracking Capture Options".to_owned()
         };
         let builder = egui::ViewportBuilder::default()
             .with_title(&title)
@@ -1947,6 +1948,11 @@ impl Recorder {
                 self.save_preference(Key::History, retention.seconds().to_string());
             }
         });
+        let mut retain_silence = self.controller.retain_silence();
+        if ui.checkbox(&mut retain_silence, "Keep quiet sections").changed() {
+            self.controller.set_retain_silence(retain_silence);
+            self.save_preference(Key::RetainSilence, u8::from(retain_silence).to_string());
+        }
         options_field(ui, "Auto-resume delay", |ui| {
             if options_choice(ui, "auto-resume", &mut self.idle_resume,
                 AutoResumeDelay::ALL.into_iter().map(|value| (value, format!("{} seconds", value.seconds())))) {
@@ -2681,7 +2687,7 @@ impl Recorder {
             let requested = self.zoom_frames.as_ref().unwrap_or(&self.history_frames);
             let count = requested.end - requested.start;
             let total = self.history_frames.end - self.history_frames.start;
-            let minimum = u64::from((self.sample_rate / 100).max(1)).min(total);
+            let minimum = waveform::minimum_zoom_frames(audio.width(), total).min(count);
             let new_count = ((count as f64 * 1.22f64.powf(f64::from(-steps.clamp(-12.0, 12.0))))
                 .round() as u64).clamp(minimum, total);
             let fraction_at = |bounds: Rect| {
@@ -2926,9 +2932,8 @@ impl Recorder {
         peaks: &WaveformPeaks,
         selection: Option<&Range<f32>>,
     ) {
-        let middle = audio.center().y;
         let policy = self.display_policy(audio, self.visible_frames.clone());
-        let extent = audio.height() * 0.47;
+        let geometry = waveform::waveform_geometry(&peaks.low, &peaks.high, self.visible_frames.clone());
         let [r, g, b, _] = self.accent.to_array();
         let selected = if [r, g, b]
             .into_iter()
@@ -2938,27 +2943,76 @@ impl Recorder {
         } else {
             Color32::WHITE
         };
-        for (bin, (&low, &high)) in peaks.low.iter().zip(&peaks.high).enumerate() {
-            let fraction = (bin as f32 + 0.5) / peaks.low.len().min(peaks.high.len()).max(1) as f32;
-            let position = audio.left() + fraction * audio.width();
-            let color = if selection.is_some_and(|range| range.contains(&fraction)) {
-                selected
-            } else {
-                self.accent
-            };
-            let top = middle - high.clamp(-1.0, 1.0) * extent;
-            let bottom = middle - low.clamp(-1.0, 1.0) * extent;
-            painter.line_segment(
-                [
-                    Pos2::new(position, top),
-                    Pos2::new(position, bottom.max(top + policy.waveform_stroke * 0.45)),
-                ],
-                Stroke::new(policy.waveform_stroke, color),
+        let painter = painter.with_clip_rect(audio);
+        let paint_range = |range: Range<f32>, color| {
+            if range.is_empty() { return; }
+            let clip = Rect::from_x_y_ranges(
+                audio.left() + range.start * audio.width()..=audio.left() + range.end * audio.width(),
+                audio.y_range(),
             );
+            paint_waveform_geometry(&painter.with_clip_rect(clip), audio,
+                &geometry, policy.waveform_stroke, color);
+        };
+        if let Some(range) = selection.filter(|range| range.start < range.end) {
+            paint_range(0.0..range.start, self.accent);
+            paint_range(range.clone(), selected);
+            paint_range(range.end..1.0, self.accent);
+        } else {
+            paint_range(0.0..1.0, self.accent);
         }
     }
 
 
+}
+
+fn paint_waveform_geometry(
+    painter: &egui::Painter,
+    audio: Rect,
+    geometry: &waveform::WaveformGeometry,
+    stroke: f32,
+    color: Color32,
+) {
+    let position = |x, value| Pos2::new(
+        audio.left() + x * audio.width(),
+        audio.center().y - value * audio.height() * 0.47,
+    );
+    match geometry {
+        waveform::WaveformGeometry::Empty => {}
+        waveform::WaveformGeometry::Samples(runs) => {
+            for run in runs {
+                let points: Vec<_> = run.iter().map(|point| position(point.x, point.value)).collect();
+                if let [point] = points.as_slice() {
+                    painter.circle_filled(*point, stroke * 0.55, color);
+                } else if !points.is_empty() {
+                    painter.add(egui::Shape::line(points, Stroke::new(stroke, color)));
+                }
+            }
+        }
+        waveform::WaveformGeometry::Envelope(runs) => {
+            for run in runs {
+                let mut mesh = egui::Mesh::default();
+                let mut upper = Vec::with_capacity(run.len());
+                let mut lower = Vec::with_capacity(run.len());
+                let fill = color.linear_multiply(0.4);
+                for (index, column) in run.iter().enumerate() {
+                    let top = position(column.x, column.maximum);
+                    let bottom = position(column.x, column.minimum);
+                    mesh.colored_vertex(top, fill);
+                    mesh.colored_vertex(bottom, fill);
+                    upper.push(top);
+                    lower.push(bottom);
+                    if index > 0 {
+                        let vertex = index as u32 * 2;
+                        mesh.add_triangle(vertex - 2, vertex - 1, vertex);
+                        mesh.add_triangle(vertex, vertex - 1, vertex + 1);
+                    }
+                }
+                painter.add(egui::Shape::mesh(mesh));
+                painter.add(egui::Shape::line(upper, Stroke::new(stroke, color)));
+                painter.add(egui::Shape::line(lower, Stroke::new(stroke, color)));
+            }
+        }
+    }
 }
 
 impl eframe::App for Recorder {
@@ -3349,6 +3403,72 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    fn painted_waveform(
+        minimum: &[f32], maximum: &[f32], visible: Range<u64>, audio: Rect,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let context = egui::Context::default();
+        let geometry = waveform::waveform_geometry(minimum, maximum, visible);
+        let mut output = context.run_ui(egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0))),
+            ..Default::default()
+        }, |ui| {
+            paint_waveform_geometry(&ui.painter().with_clip_rect(audio), audio,
+                &geometry, 1.5, Color32::GREEN);
+        });
+        let shapes = std::mem::take(&mut output.shapes);
+        output.drop_without_applying_deltas();
+        shapes
+    }
+
+    #[test]
+    fn sample_waveform_connects_signed_samples_without_stretching_the_last_frame() {
+        let audio = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(120.0, 100.0));
+        let shapes = painted_waveform(&[0.75, -0.5, 0.25], &[0.75, -0.5, 0.25], 100..103, audio);
+        let paths: Vec<_> = shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Path(path) => Some(path),
+            _ => None,
+        }).collect();
+        assert_eq!(paths.len(), 1, "Sample zoom must connect the actual signed sample sequence");
+        let points = &paths[0].points;
+        assert_eq!(points.len(), 3);
+        for (point, (x, sample)) in points.iter().zip([(10.0, 0.75), (50.0, -0.5), (90.0, 0.25)]) {
+            assert!((point.x - x).abs() < 0.001);
+            assert!((point.y - (audio.center().y - sample * audio.height() * 0.47)).abs() < 0.001);
+        }
+        assert!(points[2].x < audio.right(), "The exclusive frame boundary has no invented sample");
+        assert!(!shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Mesh(_))));
+    }
+
+    #[test]
+    fn overview_envelope_fills_between_columns_without_comb_gaps() {
+        let audio = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(120.0, 100.0));
+        let shapes = painted_waveform(&[-0.6; 3], &[0.8; 3], 100..400, audio);
+        let meshes: Vec<_> = shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Mesh(mesh) => Some(mesh),
+            _ => None,
+        }).collect();
+        assert_eq!(meshes.len(), 1);
+        let mesh = meshes[0];
+        let inside = |point: Pos2, triangle: &[u32]| {
+            let [a, b, c] = std::array::from_fn(|index| mesh.vertices[triangle[index] as usize].pos);
+            let cross = |a: Vec2, b: Vec2| a.x * b.y - a.y * b.x;
+            let sides = [cross(b - a, point - a), cross(c - b, point - b), cross(a - c, point - c)];
+            sides.iter().all(|side| *side >= -0.001) || sides.iter().all(|side| *side <= 0.001)
+        };
+        for pixel in 0..120 {
+            let point = Pos2::new(audio.left() + pixel as f32 + 0.5, audio.center().y);
+            assert!(mesh.indices.chunks_exact(3).any(|triangle| inside(point, triangle)),
+                "An overview must retain a continuous filled envelope at x={}", point.x);
+        }
+        let outlines: Vec<_> = shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Path(path) => Some(path),
+            _ => None,
+        }).collect();
+        assert_eq!(outlines.len(), 2);
+        assert!(outlines.iter().all(|path| path.points.first().unwrap().x == audio.left()
+            && path.points.last().unwrap().x == audio.right()));
+    }
 
     #[test]
     fn editing_snapshot_remains_the_source_after_live_audio_has_rolled_out() {

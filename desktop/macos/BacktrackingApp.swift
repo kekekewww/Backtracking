@@ -864,6 +864,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var fullPanelSize: NSSize?
     private var history: UInt32 = 20
     private var historyChangePending = false
+    private var retainSilence = false
     private var idleSeconds: UInt32 = 10
     private var transparency: UInt32 = 0
     private var accentRGB = defaultAccentRGB
@@ -899,6 +900,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if let saved = unsignedSetting("history"), timeChoices.contains(saved) {
             history = saved
         }
+        retainSilence = defaults.bool(forKey: "retainSilence")
         // The old idleSeconds key stored 0 for manual mode.
         if let seconds = unsignedSetting(autoResumePreferenceKey), autoResumeChoices.contains(seconds) {
             idleSeconds = seconds
@@ -1419,14 +1421,19 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func makeCaptureTab() -> NSTabViewItem {
-        optionsTab("擷取", rows: [
+        let quietSections = NSButton(
+            checkboxWithTitle: "保留安靜片段", target: self, action: #selector(retainSilenceChanged(_:))
+        )
+        quietSections.state = retainSilence ? .on : .off
+        return optionsTab("擷取", rows: [
             optionGroup("錄音緩衝", rows: [
                 optionChoice(
                     "保留時間", choices: timeChoices, selected: history, action: #selector(historyChanged(_:))
                 ) { $0 > 60 ? "\($0 / 60) 分鐘" : "\($0) 秒" },
                 optionChoice(
                     "自動續錄", choices: autoResumeChoices, selected: idleSeconds, action: #selector(idleChanged(_:))
-                ) { "\($0) 秒" }
+                ) { "\($0) 秒" },
+                quietSections
             ])
         ])
     }
@@ -1597,7 +1604,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if wasRunning {
             resume()
         } else {
-            do { tap = try SystemAudioTap(history: history, lanes: captureLanes) }
+            do { tap = try SystemAudioTap(history: history, lanes: captureLanes, retainSilence: retainSilence) }
             catch { captureError = error.localizedDescription }
         }
         refreshWaveform()
@@ -2033,6 +2040,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         registerClick()
     }
 
+    @objc private func retainSilenceChanged(_ sender: NSButton) {
+        retainSilence = sender.state == .on
+        defaults.set(retainSilence, forKey: "retainSilence")
+        tap?.setRetainSilence(retainSilence)
+        registerClick()
+    }
+
     @objc private func transparencyChanged(_ sender: NSPopUpButton) {
         guard let selected = selectedValue(sender), transparencyChoices.contains(selected) else { return }
         transparency = selected
@@ -2323,7 +2337,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard paused, !editing else { return }
         do {
             if tap == nil {
-                tap = try SystemAudioTap(history: history, lanes: captureLanes)
+                tap = try SystemAudioTap(history: history, lanes: captureLanes, retainSilence: retainSilence)
             }
             requestMicrophonePermissionIfNeeded()
             try tap?.resume()
@@ -2543,6 +2557,8 @@ private final class WaveformView: NSView, NSDraggingSource {
     private var traceCount = 1
     private var retainedFrames: Range<UInt64> = 0..<0
     private var visibleFrames: Range<UInt64> = 0..<0
+    private var renderedFrames: Range<UInt64> = 0..<0
+    private var requestedView: Range<UInt64>?
     private var zoomed = false
     private var panStart: (x: CGFloat, range: Range<UInt64>)?
     private var revision: UInt64?
@@ -2567,7 +2583,7 @@ private final class WaveformView: NSView, NSDraggingSource {
     private var editMaterial: WAVExport?
     private var materialPending = false
     private var materialVersion: UInt64 = 0
-    private var renderInFlight = false
+    private var renderGate = WaveformRenderGate()
     private var lastRenderedRequest: WaveformReadRequest?
     private var displayPolicy = bt_waveform_display_policy(0, 0, 0, 0, 0)
     private var guideBars: [UInt64] = []
@@ -2599,28 +2615,34 @@ private final class WaveformView: NSView, NSDraggingSource {
     }
 
     private func readRequest() -> WaveformReadRequest {
-        WaveformReadRequest(view: zoomed || editMaterial != nil ? visibleFrames : nil,
+        WaveformReadRequest(view: requestedView ?? (zoomed || editMaterial != nil ? visibleFrames : nil),
             width: Float(bounds.width), height: Float(bounds.height), stereo: stereo,
             interactive: anchor != nil || mouseDownEvent != nil || dragging || panStart != nil)
     }
 
     func refresh(tap: SystemAudioTap, worker: DispatchQueue) {
-        guard !materialPending, !renderInFlight else { return }
+        guard !materialPending else { return }
         let request = readRequest()
         let material = editMaterial
         if material != nil && revision != nil && request == lastRenderedRequest { return }
+        guard renderGate.request() else { return }
         let unchangedRevision = request == lastRenderedRequest ? revision : nil
         let version = materialVersion
-        renderInFlight = true
         let receive: (WaveformFrame?) -> Void = { [weak self] frame in
             guard let self else { return }
-            self.renderInFlight = false
-            guard self.materialVersion == version, !self.materialPending,
-                  self.editMaterial === material, self.readRequest() == request, let frame else { return }
+            let stale = self.materialVersion != version || self.materialPending
+                || self.editMaterial !== material || self.readRequest() != request
+            let retry = self.renderGate.complete(stale: stale)
+            defer {
+                if retry && !self.materialPending { self.controller?.refreshWaveform() }
+            }
+            guard !stale, let frame else { return }
             self.revision = frame.revision
             self.sampleRate = frame.sampleRate
             self.retainedFrames = frame.retained
             self.visibleFrames = frame.visible
+            self.renderedFrames = frame.visible
+            self.requestedView = nil
             self.zoomed = frame.visible != frame.retained
             self.traceCount = frame.traces.count
             self.traces = frame.traces + Array(repeating: WaveformTrace(), count: max(0, 2 - frame.traces.count))
@@ -2660,7 +2682,7 @@ private final class WaveformView: NSView, NSDraggingSource {
             }
             self.editMaterial = material
             self.retainedFrames = material.span
-            self.visibleFrames = fittedWaveformRange(self.visibleFrames, in: material.span)
+            self.requestedView = fittedWaveformRange(self.requestedView ?? self.visibleFrames, in: material.span)
             if let anchor = self.anchor {
                 self.anchor = min(max(anchor, material.span.lowerBound), material.span.upperBound)
             }
@@ -2698,28 +2720,23 @@ private final class WaveformView: NSView, NSDraggingSource {
     }
 
     private func changeView(to range: Range<UInt64>) {
-        guard range != visibleFrames else { return }
-        visibleFrames = range
-        zoomed = range != retainedFrames
+        guard range != (requestedView ?? visibleFrames) else { return }
+        requestedView = range
         revision = nil
         controller?.refreshWaveform()
     }
 
     override func scrollWheel(with event: NSEvent) {
         guard !dragging, !visibleFrames.isEmpty, event.scrollingDeltaY != 0 else { return }
-        let current = visibleFrames.upperBound - visibleFrames.lowerBound
-        let minimum = min(UInt64(max(1, sampleRate / 20)), retainedFrames.upperBound - retainedFrames.lowerBound)
-        let maximum = retainedFrames.upperBound - retainedFrames.lowerBound
         let fraction = Double(fraction(at: convert(event.locationInWindow, from: nil).x))
         let delta = Double(event.scrollingDeltaY) * (event.hasPreciseScrollingDeltas ? 0.014 : 0.12)
-        let next = UInt64(max(Double(minimum), min(Double(maximum), (Double(current) * exp(-delta)).rounded())))
-        let pivot = Double(visibleFrames.lowerBound) + Double(current) * fraction
-        changeView(to: fittedRange(start: pivot - Double(next) * fraction, span: next))
+        changeView(to: zoomedWaveformRange(requestedView ?? visibleFrames, in: retainedFrames,
+                                          width: Double(bounds.width), cursorFraction: fraction, delta: delta))
     }
 
     override func otherMouseDown(with event: NSEvent) {
         guard event.buttonNumber == 2, zoomed, !dragging else { return }
-        panStart = (convert(event.locationInWindow, from: nil).x, visibleFrames)
+        panStart = (convert(event.locationInWindow, from: nil).x, requestedView ?? visibleFrames)
     }
 
     override func otherMouseDragged(with event: NSEvent) {
@@ -2735,6 +2752,7 @@ private final class WaveformView: NSView, NSDraggingSource {
 
     func clearSelection() {
         selection = nil
+        requestedView = nil
         materialVersion &+= 1
         materialPending = false
         let previous = editMaterial
@@ -2751,6 +2769,7 @@ private final class WaveformView: NSView, NSDraggingSource {
         mouseDownEvent = nil
         retainedFrames = 0..<0
         visibleFrames = 0..<0
+        renderedFrames = 0..<0
         zoomed = false
         panStart = nil
         revision = nil
@@ -2914,6 +2933,10 @@ private final class WaveformView: NSView, NSDraggingSource {
 
     override func mouseDown(with event: NSEvent) {
         guard !dragging, let controller else { return }
+        if requestedView != nil {
+            requestedView = nil
+            revision = nil
+        }
         trackPointer(event)
         let flag = draggableFlag(at: convert(event.locationInWindow, from: nil))
         if let flag, let flags = selection ?? marker {
@@ -3107,12 +3130,18 @@ private final class WaveformView: NSView, NSDraggingSource {
         flag.fill()
     }
 
-    private func tracePath() -> NSBezierPath {
-        let trace = NSBezierPath()
+    private func tracePaths() -> (fill: NSBezierPath, outline: NSBezierPath, coverage: NSBezierPath) {
+        let fill = NSBezierPath()
+        let outline = NSBezierPath()
+        let coverage = NSBezierPath()
+        outline.lineWidth = CGFloat(displayPolicy.waveform_stroke)
+        outline.lineCapStyle = .round
+        outline.lineJoinStyle = .round
+        let rows = min(traceCount, traces.count)
+        guard rows > 0 else { return (fill, outline, coverage) }
         let totalHeight = bounds.height
-        let rowHeight = totalHeight / CGFloat(traceCount)
-        let step = bounds.width / CGFloat(max(1, traces[0].low.count))
-        for lane in 0..<traceCount {
+        let rowHeight = totalHeight / CGFloat(rows)
+        for lane in 0..<rows {
             let middle = bounds.midY + totalHeight / 2 - (CGFloat(lane) + 0.5) * rowHeight
             if showsOverlay {
                 NSColor.white.withAlphaComponent(0.17).setStroke()
@@ -3120,18 +3149,68 @@ private final class WaveformView: NSView, NSDraggingSource {
                     from: NSPoint(x: bounds.minX, y: middle), to: NSPoint(x: bounds.maxX, y: middle)
                 )
             }
-            if visibleFrames.isEmpty { continue }
+            if renderedFrames.isEmpty { continue }
             let bins = traces[lane]
-            for index in bins.low.indices {
-                let x = bounds.minX + (CGFloat(index) + 0.5) * step
-                let bottom = middle + CGFloat(max(-1, min(1, bins.low[index]))) * rowHeight * 0.46
-                let top = middle + CGFloat(max(-1, min(1, bins.high[index]))) * rowHeight * 0.46
-                trace.move(to: NSPoint(x: x, y: bottom))
-                trace.line(to: NSPoint(x: x, y: max(top, bottom + CGFloat(displayPolicy.waveform_stroke) * 0.65)))
+            func point(_ x: Double, _ value: Float) -> NSPoint {
+                NSPoint(x: bounds.minX + CGFloat(x) * bounds.width,
+                        y: middle + CGFloat(value) * rowHeight * 0.46)
+            }
+            func cover(_ first: Double, _ end: Double) {
+                coverage.append(NSBezierPath(rect: NSRect(
+                    x: bounds.minX + CGFloat(first) * bounds.width, y: middle - rowHeight / 2,
+                    width: CGFloat(max(0, end - first)) * bounds.width, height: rowHeight
+                )))
+            }
+            switch waveformDisplayGeometry(minimum: bins.low, maximum: bins.high, visibleFrames: renderedFrames) {
+            case .empty:
+                continue
+            case .envelope(let runs):
+                for columns in runs {
+                    guard let first = columns.first, let last = columns.last else { continue }
+                    cover(first.x, last.x)
+                    outline.move(to: point(first.x, first.maximum))
+                    for column in columns.dropFirst() { outline.line(to: point(column.x, column.maximum)) }
+                    if columns.allSatisfy({ $0.minimum == $0.maximum }) { continue }
+                    outline.move(to: point(first.x, first.minimum))
+                    for column in columns.dropFirst() { outline.line(to: point(column.x, column.minimum)) }
+                    let polygon = NSBezierPath()
+                    polygon.move(to: point(first.x, first.maximum))
+                    for column in columns.dropFirst() { polygon.line(to: point(column.x, column.maximum)) }
+                    for column in columns.reversed() { polygon.line(to: point(column.x, column.minimum)) }
+                    polygon.close()
+                    fill.append(polygon)
+                }
+            case .samples(let runs):
+                let count = Double(min(bins.low.count, bins.high.count))
+                for samples in runs {
+                    guard let first = samples.first, let last = samples.last else { continue }
+                    cover(first.x, min(1, last.x + 1 / count))
+                    let start = point(first.x, first.value)
+                    if samples.count == 1 {
+                        let half = max(0.4, outline.lineWidth / 4)
+                        outline.move(to: NSPoint(x: start.x - half, y: start.y))
+                        outline.line(to: NSPoint(x: start.x + half, y: start.y))
+                    } else {
+                        outline.move(to: start)
+                        for sample in samples.dropFirst() { outline.line(to: point(sample.x, sample.value)) }
+                    }
+                }
             }
         }
-        trace.lineWidth = max(CGFloat(displayPolicy.waveform_stroke), step * 0.75)
-        return trace
+        return (fill, outline, coverage)
+    }
+
+    private func paintTrace(
+        _ paths: (fill: NSBezierPath, outline: NSBezierPath, coverage: NSBezierPath), color: NSColor
+    ) {
+        guard !paths.coverage.isEmpty else { return }
+        NSGraphicsContext.saveGraphicsState()
+        paths.coverage.addClip()
+        color.withAlphaComponent(0.72).setFill()
+        paths.fill.fill()
+        color.setStroke()
+        paths.outline.stroke()
+        NSGraphicsContext.restoreGraphicsState()
     }
 
     private func updateDisplayPolicy() {
@@ -3188,24 +3267,22 @@ private final class WaveformView: NSView, NSDraggingSource {
         }
 
         drawTimeGrid()
-        let trace = tracePath()
-        accentColor(accentRGB).setStroke()
+        let trace = tracePaths()
         if let selectedRect = selection.flatMap(waveformRect(for:)) {
             let outside = NSBezierPath(rect: bounds)
             outside.append(NSBezierPath(rect: selectedRect))
             outside.windingRule = .evenOdd
             NSGraphicsContext.saveGraphicsState()
             outside.addClip()
-            trace.stroke()
+            paintTrace(trace, color: accentColor(accentRGB))
             NSGraphicsContext.restoreGraphicsState()
 
             NSGraphicsContext.saveGraphicsState()
             NSBezierPath(rect: selectedRect).addClip()
-            accentColor(accentRGB ^ 0xFFFFFF).setStroke()
-            trace.stroke()
+            paintTrace(trace, color: accentColor(accentRGB ^ 0xFFFFFF))
             NSGraphicsContext.restoreGraphicsState()
         } else {
-            trace.stroke()
+            paintTrace(trace, color: accentColor(accentRGB))
         }
         if let marker, marker != selection {
             drawFlag(marker.lowerBound, pointsRight: true)

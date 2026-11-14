@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "evidence_type": "sanitized native Process Loopback smoke observations; not GUI, DAW, waveform performance, or general audio-quality acceptance",
+  "test_name": "controller::tests::native_quiet_retention_process_loopback_smoke",
+  "reproduction_command": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run_native_quiet_smoke.ps1",
+  "scope": {
+    "operating_system": "Windows",
+    "fixture": "std-only process with no audio stream and no playback",
+    "target_guard": "exact child PID plus workspace target executable named backtracking-quiet*",
+    "capture": "dedicated Process Loopback only; no System Audio fallback",
+    "snapshot_storage": "memory only; On-phase pinned snapshots checked as zero",
+    "writes_audio_preferences_registry_or_ui": false,
+    "runner_writes": "workspace fixture executable, logs and stop marker"
+  },
+  "attempts": [
+    {
+      "attempt": "before_ownership_fix",
+      "tested_utc": "2026-11-14T02:23:28.5322442Z",
+      "build_profile": "debug",
+      "test_exit_code": -1073740940,
+      "result": "failed",
+      "fixture_is_silent": true,
+      "fixture_executable_sha256": "70b87b2a03f140439c8edfd73270142b198e2b16101b484d6290e2d662ab7c56",
+      "recorded_audio_files": false,
+      "raw_input_sha256": {
+        "result.json": "ffce1da516e533d8b4364f6989b8952282281c6dd83cc44033b3fd43e881ca82",
+        "test.stdout.log": "daf071121a9ffe32bbce44190e37a068c96d08bff63fd7b660dd95b77d786dca",
+        "test.stderr.log": "2658ac980f7d89491949188f2131c1555531c12cf2a7f60ccf66ff693380bfa1"
+      },
+      "failure_classification": {
+        "status_hex": "0xc0000374",
+        "symbol": "STATUS_HEAP_CORRUPTION"
+      }
+    },
+    {
+      "attempt": "after_ownership_fix",
+      "tested_utc": "2026-11-14T02:30:00.4864621Z",
+      "build_profile": "debug",
+      "test_exit_code": 0,
+      "result": "passed",
+      "fixture_is_silent": true,
+      "fixture_executable_sha256": "0cce344875c7a9e6621deb3d7bda4a3909fb772399543a99bd7521024f5da14e",
+      "recorded_audio_files": false,
+      "raw_input_sha256": {
+        "result.json": "00b78e91f0c0fd283ca132403c00eb404508db7f07f7097e81ac0e2e8ef9d1e4",
+        "test.stdout.log": "d06e91fde385f6a84eb4de970071524c08562bf6158a6d66c7929d0454b7cc7d",
+        "test.stderr.log": "80313134d9d20bb92a1d8b006a933e9c4471df6ae5ba1042ac1348430db1b27a"
+      },
+      "fixture_source_sha256": "ae09d1b4459cf520cba5917d60742cd6ff1ed2d00fe1ead716f0856362c8175e",
+      "observations": {
+        "sample_rate": 48000,
+        "quiet_on_frames": 28800,
+        "quiet_on_seconds_observed": 0.5932481,
+        "quiet_off_end": 29760,
+        "paused_end": 29760,
+        "resumed_frames": 12435,
+        "resume_seconds_observed": 0.3066807
+      },
+      "test_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "filtered_out": 75,
+        "elapsed_seconds": 3.27
+      },
+      "observed_assertion_stages": [
+        "fixture identity verified",
+        "dedicated Process Loopback activation requested",
+        "dedicated Process Loopback activated",
+        "default OFF stable",
+        "quiet ON advances",
+        "quiet OFF stable",
+        "manual Pause stable with quiet ON",
+        "Resume advances without paused backfill"
+      ]
+    }
+  ],
+  "ownership_findings": {
+    "basis": "source analysis and independent review reported by implementation owner",
+    "existing_in_baseline_commit": "d321bd310f284b9df5e807ada4c13ec6a7f741b7",
+    "dependency": "windows 0.62.2",
+    "cause": "PROPVARIANT owning Drop calls PropVariantClear for a VT_BLOB whose pointer borrows params inside a Rust Box",
+    "fix": "outer ManuallyDrop<PROPVARIANT>; property borrows &*variant; completion callback retains the Box until the last COM reference drops, preserving Box as sole owner",
+    "regression_test": "loopback::tests::activation_blob_borrows_boxed_params_until_the_last_completion_reference_drops",
+    "construct_clone_drop_iterations": 64,
+    "regression_result": "passed, reported by implementation owner; current final local Windows suite reported separately in local-validation.json",
+    "independent_source_review": "passed, reported by implementation owner"
+  },
+  "sanitization": {
+    "published": "whitelisted timestamps, classifications, scalar observations, assertion names and hashes",
+    "removed": [
+      "process IDs",
+      "local absolute paths",
+      "user names",
+      "raw error text",
+      "raw stderr/stdout"
+    ],
+    "raw_input_hashes": "hashes identify private local logs without publishing their content"
+  },
+  "limitations": [
+    "The first attempt failed and remains part of the record; only the fixed version completed this native case.",
+    "Fixture executable hashes differ between attempts; no source hash was recorded for the failed attempt.",
+    "Observed intervals and frame counts are case measurements, not a zero-latency guarantee.",
+    "This ownership fix is not evidence of the cause of earlier multi-second UI freezes, paging, or startup behavior.",
+    "No WAV is written; this case does not verify WAV duration, selected export, audible artifacts, or universal no-dropout behavior.",
+    "No macOS, Fn shortcut, DAW host, physical device range, native waveform GUI or broad system-source acceptance is established.",
+    "Local suite reports are separate in local-validation.json; final CI, Release, Setup and installed binary verification remain pending."
+  ]
+}

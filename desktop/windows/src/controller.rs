@@ -10,7 +10,7 @@ use backtracking_core::{
 };
 
 pub(crate) use crate::loopback::CaptureSource;
-use crate::loopback::{Format, Loopback, PACKET_QUEUE_CAPACITY, now_ns};
+use crate::loopback::{Format, Loopback, PACKET_QUEUE_CAPACITY, QuietModeBarrier, now_ns};
 
 const COMMON_RATE: u32 = 48_000;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -146,6 +146,23 @@ impl Stream {
             Self::Sender { error, .. } => error.take(),
         }
     }
+
+    fn set_retain_silence(&mut self, retain_silence: bool) -> Result<(), String> {
+        match self {
+            Self::Wasapi(stream) => stream.set_retain_silence(retain_silence),
+            Self::Sender { .. } => Ok(()),
+        }
+    }
+
+    fn prepare_retain_silence(
+        &mut self,
+        retain_silence: bool,
+    ) -> Result<Option<QuietModeBarrier>, String> {
+        match self {
+            Self::Wasapi(stream) => stream.prepare_retain_silence(retain_silence).map(Some),
+            Self::Sender { .. } => Ok(None),
+        }
+    }
 }
 
 type Sources = [Option<SourceSettings>; 2];
@@ -160,6 +177,7 @@ pub(crate) struct EditSnapshot {
 enum CaptureCommand {
     SetSources(Sources),
     SetRetention(DurationChoice),
+    SetRetainSilence(bool),
     Pause,
     Resume,
     Clear,
@@ -197,7 +215,7 @@ impl SourceStatus {
         Self {
             formats: state.formats.clone(),
             statuses: state.statuses.clone(),
-            error: state.error.clone(),
+            error: state.error.clone().or_else(|| state.mode_error.clone()),
             paused: state.is_paused(),
             recording: state.is_recording(),
             generation: state.generation,
@@ -215,6 +233,7 @@ impl SourceStatus {
 pub(crate) struct Controller {
     sources: Sources,
     retention: DurationChoice,
+    retain_silence: bool,
     source_status: SourceStatus,
     state: Arc<Mutex<CaptureSession>>,
     commands: mpsc::Sender<Request>,
@@ -232,6 +251,7 @@ impl Controller {
         Ok(Self {
             sources: [Some(SourceSettings::default()), None],
             retention: DurationChoice::Seconds20,
+            retain_silence: false,
             source_status: SourceStatus {
                 paused: true,
                 ..SourceStatus::default()
@@ -253,6 +273,11 @@ impl Controller {
         if self.sources != sources {
             self.sources = sources.clone();
             self.request(CaptureCommand::SetSources(sources));
+            // A new source can recover from an earlier policy-control failure.
+            let _ = self.commands.send(Request {
+                command: CaptureCommand::SetRetainSilence(self.retain_silence),
+                complete: None,
+            });
         }
     }
 
@@ -419,6 +444,21 @@ impl Controller {
         });
     }
 
+    pub(crate) fn retain_silence(&self) -> bool {
+        self.retain_silence
+    }
+
+    pub(crate) fn set_retain_silence(&mut self, retain_silence: bool) {
+        if self.retain_silence == retain_silence {
+            return;
+        }
+        self.retain_silence = retain_silence;
+        let _ = self.commands.send(Request {
+            command: CaptureCommand::SetRetainSilence(retain_silence),
+            complete: None,
+        });
+    }
+
     pub(crate) fn error(&self) -> Option<&str> {
         self.source_status.error.as_deref()
     }
@@ -476,12 +516,16 @@ struct CaptureSession {
     bars: Vec<usize>,
     discard_before_ns: u64,
     retention: DurationChoice,
+    retain_silence: bool,
+    requested_retain_silence: bool,
     shape: Option<(u32, usize, Option<usize>)>,
     generation: u64,
     revision: u64,
     paused: bool,
     next_retry: Instant,
     error: Option<String>,
+    mode_error: Option<String>,
+    next_mode_retry: Instant,
 }
 
 impl CaptureSession {
@@ -499,12 +543,16 @@ impl CaptureSession {
             bars: Vec::new(),
             discard_before_ns: 0,
             retention: DurationChoice::Seconds20,
+            retain_silence: false,
+            requested_retain_silence: false,
             shape: None,
             generation: 0,
             revision: 0,
             paused: true,
             next_retry: Instant::now(),
             error: None,
+            mode_error: None,
+            next_mode_retry: Instant::now(),
         }
     }
 
@@ -524,6 +572,9 @@ impl CaptureSession {
                     match command {
                         CaptureCommand::SetSources(sources) => state.set_sources(sources),
                         CaptureCommand::SetRetention(retention) => state.set_retention(retention),
+                        CaptureCommand::SetRetainSilence(retain_silence) => {
+                            state.set_retain_silence(retain_silence);
+                        }
                         CaptureCommand::Pause => state.pause(),
                         CaptureCommand::Resume => state.resume(),
                         CaptureCommand::Clear => state.clear(),
@@ -606,6 +657,11 @@ impl CaptureSession {
             return;
         }
         self.poll_pending();
+        if self.requested_retain_silence != self.retain_silence
+            && Instant::now() >= self.next_mode_retry
+        {
+            self.set_retain_silence(self.requested_retain_silence);
+        }
         self.drain(false);
         let had_inputs = !self.inputs.is_empty();
         let mut index = 0;
@@ -680,7 +736,11 @@ impl CaptureSession {
             };
             let PendingInput { source, .. } = self.pending.remove(index);
             match result {
-                Ok(stream) => {
+                Ok(mut stream) => {
+                    if let Err(error) = stream.set_retain_silence(self.retain_silence) {
+                        self.set_source_status(&source, error);
+                        continue;
+                    }
                     for (lane, settings) in self.sources.iter().enumerate() {
                         if let Some(settings) = settings
                             && settings.source.same_source(&source)
@@ -691,6 +751,9 @@ impl CaptureSession {
                     }
                     self.inputs.push(Input { source, stream });
                     self.configure_capture();
+                    if self.requested_retain_silence != self.retain_silence {
+                        self.next_mode_retry = Instant::now();
+                    }
                 }
                 Err(error) => self.set_source_status(&source, error),
             }
@@ -776,6 +839,7 @@ impl CaptureSession {
         }
         match capture {
             Ok(mut capture) => {
+                capture.set_retain_silence(self.retain_silence);
                 if self.paused {
                     capture.capture_mut().pause();
                 }
@@ -1013,6 +1077,41 @@ impl CaptureSession {
             }
         }
     }
+
+    fn set_retain_silence(&mut self, retain_silence: bool) {
+        self.requested_retain_silence = retain_silence;
+        if self.retain_silence == retain_silence {
+            self.mode_error = None;
+            return;
+        }
+        // Freeze native synthetic padding before draining. Real packets keep
+        // flowing, but no old idle tail can cross the capture-policy boundary.
+        let mut barriers = Vec::new();
+        let mut failures = Vec::new();
+        for input in &mut self.inputs {
+            match input.stream.prepare_retain_silence(retain_silence) {
+                Ok(Some(barrier)) => barriers.push(barrier),
+                Ok(None) => {}
+                Err(error) => failures.push((input.source.clone(), error)),
+            }
+        }
+        if !failures.is_empty() {
+            for barrier in barriers {
+                barrier.cancel();
+            }
+            self.mode_error = failures.into_iter().next()
+                .map(|(_, error)| format!("Could not change quiet-section capture: {error}"));
+            self.next_mode_retry = Instant::now() + RETRY_DELAY;
+            return;
+        }
+        self.drain(true);
+        self.retain_silence = retain_silence;
+        if let Some(capture) = &mut self.capture {
+            capture.set_retain_silence(retain_silence);
+        }
+        drop(barriers);
+        self.mode_error = None;
+    }
 }
 
 fn missing_channel(format: &Format, route: ChannelRoute) -> Option<String> {
@@ -1025,6 +1124,270 @@ fn missing_channel(format: &Format, route: ChannelRoute) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_native_condition(
+        controller: &mut Controller,
+        timeout: Duration,
+        mut ready: impl FnMut(&Controller) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            controller.poll();
+            if ready(controller) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn native_recorded_end(controller: &Controller) -> u64 {
+        lock(&controller.state).capture.as_ref()
+            .map_or(0, |capture| capture.capture().frame_range().end)
+    }
+
+    #[test]
+    #[ignore = "native Process Loopback smoke; requires an isolated silent backtracking-quiet fixture PID"]
+    fn native_quiet_retention_process_loopback_smoke() {
+        use std::path::PathBuf;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, WaitForSingleObject,
+        };
+        use windows::core::PWSTR;
+
+        struct FixtureHandle(HANDLE);
+        impl Drop for FixtureHandle {
+            fn drop(&mut self) { let _ = unsafe { CloseHandle(self.0) }; }
+        }
+
+        let pid: u32 = std::env::var("BACKTRACKING_QUIET_TEST_PROCESS_ID")
+            .expect("set BACKTRACKING_QUIET_TEST_PROCESS_ID to the isolated silent fixture")
+            .parse().expect("fixture PID must be an integer");
+        assert!(pid != 0 && pid != std::process::id());
+        assert!(CaptureSource::supports_app_capture(), "Process Loopback is unsupported");
+        let handle = FixtureHandle(unsafe {
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, false, pid)
+        }.expect("cannot query the exact fixture process"));
+        assert_eq!(unsafe { WaitForSingleObject(handle.0, 0) }, WAIT_TIMEOUT);
+        let mut name = vec![0u16; 32_768];
+        let mut length = name.len() as u32;
+        unsafe {
+            QueryFullProcessImageNameW(handle.0, PROCESS_NAME_WIN32, PWSTR(name.as_mut_ptr()), &mut length)
+        }.expect("cannot resolve the exact fixture executable");
+        let path = PathBuf::from(String::from_utf16(&name[..length as usize]).unwrap());
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap().to_path_buf();
+        assert!(path.canonicalize().unwrap().starts_with(workspace.join("target").canonicalize().unwrap()),
+            "the native test may only capture a fixture under the workspace target directory");
+        assert!(path.file_name().unwrap().to_string_lossy().to_ascii_lowercase()
+            .starts_with("backtracking-quiet"), "unexpected fixture executable");
+        let path = path.to_string_lossy().into_owned();
+        assert_eq!(crate::loopback::resolved_process_id_for_test(&path).unwrap(), pid,
+            "Application source resolution selected a different process");
+        eprintln!("native quiet smoke: fixture identity verified");
+
+        let source = CaptureSource::Application { path, name: "Quiet native fixture".into() };
+        let mut controller = Controller::new().unwrap();
+        controller.set_sources([Some(SourceSettings { source: source.clone(), route: ChannelRoute::Merged }), None]);
+        controller.resume();
+        eprintln!("native quiet smoke: dedicated Process Loopback activation requested");
+        assert!(wait_native_condition(&mut controller, Duration::from_secs(8), |controller| {
+            let state = lock(&controller.state);
+            state.capture.is_some() && state.inputs.len() == 1
+                && state.inputs[0].source.same_source(&source)
+                && matches!(state.inputs[0].stream, Stream::Wasapi(_))
+        }), "could not activate the isolated fixture: {:?}", controller.error());
+        eprintln!("native quiet smoke: dedicated Process Loopback activated");
+        assert!(controller.sources()[0].as_ref().unwrap().source.same_source(&source));
+        let rate = lock(&controller.state).shape.unwrap().0;
+
+        thread::sleep(Duration::from_millis(900));
+        assert_eq!(native_recorded_end(&controller), 0, "default OFF retained idle audio");
+        eprintln!("native quiet smoke: default OFF stable");
+        controller.set_retain_silence(true);
+        assert!(wait_native_condition(&mut controller, Duration::from_secs(2), |controller|
+            lock(&controller.state).retain_silence));
+        let on_start = native_recorded_end(&controller);
+        let on_clock = Instant::now();
+        assert!(wait_native_condition(&mut controller, Duration::from_secs(6), |controller|
+            native_recorded_end(controller) >= on_start + u64::from(rate) * 3 / 5),
+            "quiet ON did not advance the connected, silent Process Loopback stream");
+        let on_elapsed = on_clock.elapsed().as_secs_f64();
+        let on_end = native_recorded_end(&controller);
+        eprintln!("native quiet smoke: quiet ON advances");
+        assert!((on_end - on_start) as f64 <= (on_elapsed + 0.3) * f64::from(rate),
+            "quiet ON retroactively retained the earlier OFF idle interval");
+        let pinned = controller.request_edit_snapshot().recv().unwrap().unwrap();
+        let pinned_range = pinned.snapshots[0].frame_range();
+        assert!(pinned_range.end >= on_end);
+        assert!(pinned.snapshots.iter().flat_map(|snapshot| snapshot.samples.iter()).all(|&sample| sample == 0.0),
+            "the isolated silent fixture unexpectedly produced nonzero audio");
+
+        controller.set_retain_silence(false);
+        assert!(wait_native_condition(&mut controller, Duration::from_secs(2), |controller|
+            !lock(&controller.state).retain_silence));
+        let off_end = native_recorded_end(&controller);
+        thread::sleep(Duration::from_millis(700));
+        assert_eq!(native_recorded_end(&controller), off_end, "quiet OFF kept advancing");
+        eprintln!("native quiet smoke: quiet OFF stable");
+
+        controller.pause();
+        controller.set_retain_silence(true);
+        assert!(wait_native_condition(&mut controller, Duration::from_secs(2), |controller|
+            lock(&controller.state).retain_silence));
+        let paused_end = native_recorded_end(&controller);
+        thread::sleep(Duration::from_millis(650));
+        assert_eq!(native_recorded_end(&controller), paused_end, "manual Pause recorded quiet audio");
+        assert!(controller.is_paused());
+        eprintln!("native quiet smoke: manual Pause stable with quiet ON");
+        controller.resume();
+        let resume_clock = Instant::now();
+        assert!(wait_native_condition(&mut controller, Duration::from_secs(6), |controller|
+            native_recorded_end(controller) >= paused_end + u64::from(rate) / 4),
+            "quiet recording did not continue after Resume");
+        let resumed_frames = native_recorded_end(&controller) - paused_end;
+        let resume_elapsed = resume_clock.elapsed().as_secs_f64();
+        assert!(resumed_frames as f64 <= (resume_elapsed + 0.3) * f64::from(rate),
+            "Resume backfilled the manually paused interval");
+        assert_eq!(pinned.snapshots[0].frame_range(), pinned_range);
+        assert_eq!(unsafe { WaitForSingleObject(handle.0, 0) }, WAIT_TIMEOUT);
+        eprintln!("native quiet smoke: Resume advances without paused backfill");
+        println!("{}", serde_json::json!({
+            "scope": "isolated silent Process Loopback; memory snapshots only",
+            "sample_rate": rate, "quiet_on_frames": on_end - on_start,
+            "quiet_on_seconds_observed": on_elapsed, "quiet_off_end": off_end,
+            "paused_end": paused_end, "resumed_frames": resumed_frames,
+            "resume_seconds_observed": resume_elapsed,
+        }));
+    }
+
+    #[test]
+    fn quiet_retention_command_returns_while_capture_work_is_busy() {
+        let controller = Controller::new().unwrap();
+        assert!(!controller.retain_silence());
+        let state = Arc::clone(&controller.state);
+        let busy = lock(&state);
+        let (posted, result) = mpsc::sync_channel(1);
+        let ui = thread::spawn(move || {
+            let mut controller = controller;
+            controller.set_retain_silence(true);
+            assert!(controller.retain_silence());
+            posted.send(controller).unwrap();
+        });
+        let response = result.recv_timeout(Duration::from_millis(100));
+        let returned_while_busy = response.is_ok();
+        drop(busy);
+        ui.join().unwrap();
+        assert!(returned_while_busy, "quiet retention waited for the capture mutex");
+        let controller = response.unwrap();
+        assert!(controller.request_snapshots(None).recv().unwrap().is_none());
+        assert!(lock(&state).retain_silence);
+    }
+
+    #[test]
+    fn quiet_retention_switch_preserves_a_b_audio_and_an_existing_edit() {
+        let mut controller = Controller::new().unwrap();
+        {
+            let mut session = lock(&controller.state);
+            session.sources[1] = Some(SourceSettings::default());
+            session.shape = Some((10, 1, Some(1)));
+            session.generation = 7;
+            session.paused = false;
+            session.next_retry = Instant::now() + Duration::from_secs(3600);
+            let mut capture =
+                SynchronizedCapture::new(10, 1, Some(1), DurationChoice::Seconds20).unwrap();
+            capture.push_native_interleaved_with_markers(
+                0, &vec![0.25, -0.5].repeat(6), false, &[1],
+            ).unwrap();
+            session.capture = Some(capture);
+        }
+        let edit = controller.request_edit_snapshot().recv().unwrap().unwrap();
+        assert_eq!(edit.snapshots[0].frame_range(), 0..6);
+        controller.set_retain_silence(true);
+        controller.request_snapshots(None).recv().unwrap();
+        {
+            let mut session = lock(&controller.state);
+            assert!(session.retain_silence);
+            assert!(!session.paused);
+            assert_eq!(session.generation, 7);
+            let capture = session.capture.as_mut().unwrap();
+            assert!(capture.retain_silence());
+            assert_eq!(capture.capture().state(), CaptureState::Recording);
+            capture.push_native_interleaved_with_markers(
+                600_000_000, &[0.0; 20], false, &[2, 7],
+            ).unwrap();
+        }
+        let live = controller.snapshots(None).unwrap();
+        assert!(live.iter().all(|snapshot| snapshot.frame_range() == (0..16)));
+        assert_eq!(&live[0].samples[..6], &[0.25; 6]);
+        assert_eq!(&live[1].samples[..6], &[-0.5; 6]);
+        assert_eq!(&live[0].samples[6..], &[0.0; 10]);
+        assert_eq!(&live[1].samples[6..], &[0.0; 10]);
+        assert_eq!(edit.generation, 7);
+        assert_eq!(edit.bar_markers, [1]);
+        assert_eq!(edit.snapshots[0].samples, [0.25; 6]);
+        assert_eq!(edit.snapshots[1].samples, [-0.5; 6]);
+
+        controller.set_retain_silence(false);
+        controller.request_snapshots(None).recv().unwrap();
+        {
+            let mut session = lock(&controller.state);
+            assert!(!session.retain_silence);
+            assert_eq!(session.generation, 7);
+            session.capture.as_mut().unwrap().push_native_interleaved_with_markers(
+                1_600_000_000, &[0.0; 200], false, &[],
+            ).unwrap();
+        }
+        let after = controller.snapshots(None).unwrap();
+        assert!(after[0].frame_range().end < 116);
+        assert!(after[0].frame_range().end >= 16);
+        assert_eq!(after[0].frame_range(), after[1].frame_range());
+        assert_eq!(&after[0].samples[..16], &live[0].samples);
+        assert_eq!(&after[1].samples[..16], &live[1].samples);
+    }
+
+    #[test]
+    fn quiet_retention_retries_a_failed_requested_policy_without_another_ui_change() {
+        let mut session = CaptureSession::new();
+        session.paused = false;
+        session.next_retry = Instant::now() + Duration::from_secs(3600);
+        session.requested_retain_silence = true;
+        session.mode_error = Some("temporary source-control timeout".into());
+        session.next_mode_retry = Instant::now();
+        let mut capture =
+            SynchronizedCapture::new(10, 1, None, DurationChoice::Seconds20).unwrap();
+        capture.push_native_interleaved(0, &[0.25; 4], false).unwrap();
+        session.capture = Some(capture);
+
+        session.poll();
+
+        assert!(session.retain_silence);
+        assert!(session.requested_retain_silence);
+        assert!(session.mode_error.is_none());
+        assert!(!session.paused);
+        let capture = session.capture.as_ref().unwrap();
+        assert!(capture.retain_silence());
+        assert_eq!(capture.capture().frame_range(), 0..4);
+        assert_eq!(capture.capture().track_snapshot_range(0, 0..4).unwrap().samples, [0.25; 4]);
+    }
+
+    #[test]
+    fn quiet_retention_is_applied_when_the_source_format_is_created_or_changes() {
+        let mut session = CaptureSession::new();
+        session.set_retain_silence(true);
+        session.formats[0] = Some(Arc::new(Format::sender(10, 2)));
+        session.configure_capture();
+        assert!(session.capture.as_ref().unwrap().retain_silence());
+        assert_eq!(session.shape, Some((10, 2, None)));
+        session.formats[0] = Some(Arc::new(Format::sender(20, 1)));
+        session.configure_capture();
+        assert!(session.capture.as_ref().unwrap().retain_silence());
+        assert_eq!(session.shape, Some((20, 1, None)));
+    }
 
     #[test]
     fn paint_metadata_never_waits_for_busy_capture_work() {

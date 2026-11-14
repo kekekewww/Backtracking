@@ -270,6 +270,15 @@ unsafe extern "C" fn bt_tracks_set_history(core: *const BtTracks, seconds: u32) 
 }
 
 #[no_mangle]
+unsafe extern "C" fn bt_tracks_set_retain_silence(core: *const BtTracks, enabled: u32) {
+    let Some(core) = core.as_ref() else { return };
+    let Ok(mut reader) = core.reader.lock() else { return };
+    if reader.synchronized.retain_silence() == (enabled != 0) { return; }
+    core.drain(&mut reader, core.enabled.load(Ordering::Acquire), true);
+    reader.synchronized.set_retain_silence(enabled != 0);
+}
+
+#[no_mangle]
 unsafe extern "C" fn bt_tracks_meter_readings(core: *const BtTracks, lane: u32) -> MeterReadings {
     core.as_ref()
         .and_then(|core| core.reader.lock().ok())
@@ -741,6 +750,65 @@ unsafe fn export_snapshots(
 #[cfg(test)]
 mod display_tests {
     use super::*;
+
+    #[test]
+    fn tracks_silence_mode_ffi_flushes_old_policy_and_keeps_aligned_quiet_samples() {
+        unsafe {
+            bt_tracks_set_retain_silence(ptr::null(), 1);
+            let core = bt_tracks_new(1_000., 1, 1, 10);
+            assert!(!core.is_null());
+            let a = [0.000_1; 100];
+            let b = [-0.000_2; 100];
+            assert_eq!(bt_tracks_push_interleaved(core, 0, a.as_ptr(), 100, 0, 1_000.), 100);
+            assert_eq!(bt_tracks_push_interleaved(core, 1, b.as_ptr(), 100, 0, 1_000.), 100);
+            bt_tracks_set_retain_silence(core, 1);
+            assert_eq!(bt_tracks_end_frame(core), 0);
+            assert_eq!(bt_tracks_push_interleaved(core, 0, a.as_ptr(), 100, 10_000_000_000, 1_000.), 100);
+            assert_eq!(bt_tracks_push_interleaved(core, 1, b.as_ptr(), 100, 10_000_000_000, 1_000.), 100);
+            bt_tracks_set_retain_silence(core, 0);
+            let first = bt_tracks_snapshot(core, 0);
+            let second = bt_tracks_snapshot(core, 1);
+            assert_eq!((*first).samples, a);
+            assert_eq!((*second).samples, b);
+            assert_eq!((*first).frame_range(), (*second).frame_range());
+            drop(Box::from_raw(first));
+            drop(Box::from_raw(second));
+            assert_eq!(bt_tracks_state(core), 0);
+            assert_eq!(bt_tracks_push_interleaved(core, 0, a.as_ptr(), 100, 10_100_000_000, 1_000.), 100);
+            assert_eq!(bt_tracks_push_interleaved(core, 1, b.as_ptr(), 100, 10_100_000_000, 1_000.), 100);
+            bt_tracks_set_retain_silence(core, 1);
+            assert_eq!(bt_tracks_end_frame(core), 100);
+            bt_tracks_pause(core);
+            bt_tracks_set_retain_silence(core, 0);
+            assert_eq!(bt_tracks_state(core), 2);
+            assert_eq!(bt_tracks_end_frame(core), 100);
+            bt_tracks_free(core);
+        }
+    }
+
+    #[test]
+    fn setting_the_same_silence_mode_does_not_force_flush_a_late_lane() {
+        unsafe {
+            let core = bt_tracks_new(1_000., 1, 1, 10);
+            bt_tracks_set_retain_silence(core, 1);
+            let a = [0.000_1; 10];
+            let b = [-0.000_2; 10];
+            assert_eq!(bt_tracks_push_interleaved(core, 0, a.as_ptr(), 10, 0, 1_000.), 10);
+            bt_tracks_poll(core);
+            assert_eq!(bt_tracks_end_frame(core), 0);
+            bt_tracks_set_retain_silence(core, 1);
+            assert_eq!(bt_tracks_end_frame(core), 0);
+            assert_eq!(bt_tracks_push_interleaved(core, 1, b.as_ptr(), 10, 0, 1_000.), 10);
+            bt_tracks_pause(core);
+            let first = bt_tracks_snapshot(core, 0);
+            let second = bt_tracks_snapshot(core, 1);
+            assert_eq!((*first).samples, a);
+            assert_eq!((*second).samples, b);
+            drop(Box::from_raw(first));
+            drop(Box::from_raw(second));
+            bt_tracks_free(core);
+        }
+    }
 
     #[test]
     fn frozen_both_lanes_remain_renderable_while_capture_wraps_and_shrinks() {

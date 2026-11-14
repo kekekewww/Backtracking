@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-11-14T02:36:08.566345Z",
+  "status": "local suites and scoped native observations recorded; final CI, GUI, rebuilt and installed artifacts pending",
+  "evidence_type": "sanitized scoped native Process Loopback observations and source-review findings",
+  "historical_evidence_policy": "earlier Windows hardware and responsive-editing reports, traces and build hashes remain unchanged",
+  "files": [
+    {
+      "name": "local-validation.json",
+      "size_bytes": 2839,
+      "sha256": "12f28ec5f327c684adea38d0970682b730cb652b143bca29b6e9e8bb026e936b"
+    },
+    {
+      "name": "native-quiet-smoke.json",
+      "size_bytes": 5474,
+      "sha256": "06c70322ec7f0996b7f94da8aa3e1631f897350bf5aa70512a444d68c7e9ee30"
+    },
+    {
+      "name": "README.md",
+      "size_bytes": 3037,
+      "sha256": "ffeacfcf75e1cf7ad0c0905475b7a687f5aa7247609f217a7056d0382ebce5b7"
+    }
+  ],
+  "tool_sources": [
+    {
+      "path": "tools/quiet_process_fixture.rs",
+      "size_bytes": 576,
+      "sha256": "ae09d1b4459cf520cba5917d60742cd6ff1ed2d00fe1ead716f0856362c8175e",
+      "provenance": "matches successful fixture source hash"
+    },
+    {
+      "path": "tools/run_native_quiet_smoke.ps1",
+      "size_bytes": 3930,
+      "sha256": "a544e409ef754d1d2988aa3f32c61eea1b114f2e60130c4292b291ea120ce99c",
+      "provenance": "reproduction runner source at publication; historical runs did not record a runner hash"
+    }
+  ],
+  "limitations": [
+    "No private logs, process IDs, screenshots or audio are published.",
+    "Recorded debug native smoke is not a Release/Setup/DAW/GUI or general latency result.",
+    "Local suites and GUI observations are integration-owner reports, separately scoped from parsed native smoke output; final CI and artifacts pending."
+  ],
+  "updated_utc": "2026-11-14T03:00:48.939075Z"
+}

@@ -253,6 +253,7 @@ struct State {
 
 pub(crate) struct Session {
     settings: SettingsStore,
+    continuous_processing_requested: Arc<AtomicBool>,
     state: Mutex<State>,
     published: Mutex<PublishedState>,
     editor_commands: mpsc::Sender<EditorCommand>,
@@ -271,14 +272,17 @@ type SnapshotResult = (u64, Range<u64>, Result<Vec<PathBuf>, String>);
 
 impl Session {
     pub(crate) fn new(settings: SettingsStore) -> Self {
+        let continuous_processing_requested = settings.continuous_processing_signal();
         let (retention, idle_resume) = {
             let settings = settings.lock();
+            continuous_processing_requested.store(settings.requires_continuous_processing(), Ordering::Release);
             (settings.retention, settings.idle_resume)
         };
         let (editor_commands, editor_requests) = mpsc::channel();
         let (snapshot_commands, snapshot_requests) = mpsc::channel();
         Self {
             settings,
+            continuous_processing_requested,
             state: Mutex::new(State {
                 retention,
                 idle_resume,
@@ -352,6 +356,11 @@ impl Session {
         self.settings.lock().clone()
     }
 
+    /// Host continuation request; the local capture gate uses its own setting.
+    pub(crate) fn continuous_processing_requested(&self) -> bool {
+        self.continuous_processing_requested.load(Ordering::Acquire)
+    }
+
     pub(crate) fn set_output_dir(&self, output_dir: PathBuf) {
         self.settings.lock().output_dir = output_dir;
     }
@@ -390,6 +399,7 @@ impl Session {
         let mut current = self.settings.lock();
         settings.sender_id = current.sender_id.clone();
         *current = settings;
+        self.continuous_processing_requested.store(current.requires_continuous_processing(), Ordering::Release);
     }
 
     pub(crate) fn sidechain_available(&self) -> bool {
@@ -416,9 +426,15 @@ impl Session {
     }
 
     fn apply_capture_settings(&self, state: &mut State) {
-        let (retention, idle_resume, capture_input) = {
+        let (retention, idle_resume, capture_input, retain_silence) = {
             let settings = self.settings.lock();
-            (settings.retention, settings.idle_resume, settings.capture_input)
+            self.continuous_processing_requested.store(settings.requires_continuous_processing(), Ordering::Release);
+            (
+                settings.retention,
+                settings.idle_resume,
+                settings.capture_input,
+                settings.retain_silence,
+            )
         };
         if let Some(consumer) = &mut state.consumer {
             let input = if consumer.sidechain_channels == 0 {
@@ -449,6 +465,20 @@ impl Session {
             if let Some(consumer) = &mut state.consumer {
                 consumer.capture.set_retention(retention);
             }
+        }
+        if state.consumer.as_ref()
+            .is_some_and(|consumer| consumer.capture.retain_silence() != retain_silence)
+        {
+            // Pin pending edits before draining queued audio under the old mode.
+            self.apply_editor_commands(state);
+            self.pin_editing_material(state);
+            let consumer = state.consumer.as_mut().unwrap();
+            if !state.paused && self.accepting.load(Ordering::SeqCst) {
+                consumer.drain(usize::MAX);
+            } else {
+                consumer.discard();
+            }
+            consumer.capture.set_retain_silence(retain_silence);
         }
         if idle_resume != state.idle_resume {
             state.idle_resume = idle_resume;
@@ -916,6 +946,15 @@ pub(crate) struct Worker {
 
 impl Worker {
     #[cfg(test)]
+    pub(crate) fn stop_background_for_test(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            thread.join().unwrap();
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         session: Arc<Session>,
         rate: u32,
@@ -938,10 +977,13 @@ impl Worker {
         let (queue, capacity_frames, metadata_slots) = {
             let mut state = session.lock();
             session.apply_capture_settings(&mut state);
-            let input = if sidechain == 0 {
-                CaptureInput::Main
-            } else {
-                session.settings.lock().capture_input
+            let (input, retain_silence) = {
+                let settings = session.settings.lock();
+                session.continuous_processing_requested.store(settings.requires_continuous_processing(), Ordering::Release);
+                (
+                    if sidechain == 0 { CaptureInput::Main } else { settings.capture_input },
+                    settings.retain_silence,
+                )
             };
             let (a, b) = match input {
                 CaptureInput::Main => (channels, None),
@@ -949,6 +991,7 @@ impl Worker {
                 CaptureInput::Both => (channels, Some(sidechain)),
             };
             let mut capture = Capture::new_tracks(rate, a, b, state.retention).ok()?;
+            capture.set_retain_silence(retain_silence);
             if state.paused {
                 capture.pause();
             }
@@ -1340,6 +1383,192 @@ mod tests {
     }
 
     #[test]
+    fn quiet_sections_toggle_only_future_capture_and_keep_pins_and_sender_audio() {
+        let settings = SettingsStore::default();
+        settings.lock().capture_input = CaptureInput::Both;
+        settings.lock().idle_resume = AutoResumeDelay::Immediate;
+        let set_keep = |enabled: bool| {
+            let mut fields = settings.map(Clone::clone);
+            fields.insert("retain_silence".into(), enabled.to_string());
+            settings.set(fields);
+        };
+        set_keep(true);
+        let session = Arc::new(Session::new(settings.clone()));
+        let mut worker = Worker::with_sidechain(session.clone(), 1_000, 1, 1, 256).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+        worker.sender_active.store(true, Ordering::Relaxed);
+
+        let mut main: Vec<_> = (0..400).map(|frame| [0.0, 0.00001, -0.00001][frame % 3]).collect();
+        let mut side: Vec<_> = (0..400).map(|frame| [0.0, -0.00002][frame % 2]).collect();
+        let initial_main = main.clone();
+        let initial_side = side.clone();
+        worker.push_block(&[&mut main], &[&mut side], Some((3.0, 50.0)));
+        session.consume();
+        let (epoch, captured) = session.positioned_snapshots(true).unwrap();
+        assert_eq!(captured[0].frame_count(), 400);
+        assert_eq!(captured[0].samples, initial_main);
+        assert_eq!(captured[1].samples, initial_side);
+        assert!(session.is_recording());
+        let mut sent = Vec::new();
+        let (packet, _) = worker.sender_queue.pop_tagged(&mut sent).unwrap();
+        assert_eq!(packet.frames, 400);
+        assert_eq!(sent, initial_main.iter().zip(&initial_side).flat_map(|(&a, &b)| [a, b]).collect::<Vec<_>>());
+
+        session.begin_waveform_gesture();
+        session.set_snapshot_selection(Some(40..120));
+        session.end_waveform_gesture(true);
+        worker.push_block(&[&mut [0.00002; 80]], &[&mut [-0.00001; 80]], Some((17.0, 50.0)));
+        set_keep(false);
+        session.consume();
+        let pinned = session.editing_snapshot().unwrap();
+        assert_eq!(pinned.timeline.frames, 0..400, "pending editing material must be pinned before queued input is drained");
+
+        worker.push_block(&[&mut [0.0; 1200]], &[&mut [0.0; 1200]], Some((7.0, 50.0)));
+        session.consume();
+        let (after_off_epoch, after_off) = session.positioned_snapshots(true).unwrap();
+        assert_eq!(after_off_epoch, epoch);
+        assert_eq!(&after_off[0].samples[..400], initial_main);
+        assert_eq!(&after_off[1].samples[..400], initial_side);
+        assert_eq!(&after_off[0].samples[400..], [0.00002; 80]);
+        assert_eq!(&after_off[1].samples[400..], [-0.00001; 80]);
+        let (packet, _) = worker.sender_queue.pop_tagged(&mut sent).unwrap();
+        assert_eq!(packet.frames, 80);
+        assert_eq!(sent, [0.00002, -0.00001].repeat(80));
+        let (packet, _) = worker.sender_queue.pop_tagged(&mut sent).unwrap();
+        assert_eq!(packet.frames, 1200);
+        assert_eq!(sent, [0.0; 2400]);
+
+        worker.push_block(&[&mut [0.0; 70]], &[&mut [0.0; 70]], Some((5.0, 50.0)));
+        set_keep(true);
+        session.consume();
+        worker.push_block(&[&mut [0.00001; 600]], &[&mut [0.0; 600]], Some((13.0, 100.0)));
+        session.consume();
+        let (after_on_epoch, after_on) = session.positioned_snapshots(true).unwrap();
+        assert_eq!(after_on_epoch, epoch);
+        assert_eq!(after_on[0].frame_range(), 0..1080);
+        assert_eq!(after_on[1].frame_range(), 0..1080);
+        assert_eq!(&after_on[0].samples[..400], initial_main);
+        assert_eq!(&after_on[1].samples[..400], initial_side);
+        assert_eq!(&after_on[0].samples[400..480], [0.00002; 80]);
+        assert_eq!(&after_on[1].samples[400..480], [-0.00001; 80]);
+        assert_eq!(&after_on[0].samples[480..], [0.00001; 600]);
+        assert_eq!(&after_on[1].samples[480..], [0.0; 600]);
+        assert_eq!(session.lock().selection, Some(40..120));
+        assert!(Arc::ptr_eq(&pinned.snapshots, &session.editing_snapshot().unwrap().snapshots));
+        assert!(!session.is_paused());
+        assert_eq!(session.lock().consumer.as_ref().unwrap().capture.bar_markers(0..1080),
+            [3, 53, 103, 153, 203, 253, 303, 353, 417, 467, 493, 593, 693, 793, 893, 993]);
+        session.pause();
+        set_keep(false);
+        session.consume();
+        assert!(session.is_paused());
+    }
+
+    #[test]
+    fn continuous_processing_mirror_follows_initial_editor_and_restored_settings() {
+        assert!(!Session::new(SettingsStore::default()).continuous_processing_requested());
+        let sender_settings = SettingsStore::default();
+        sender_settings.lock().sender_enabled = true;
+        let sender_only = Session::new(sender_settings);
+        assert!(sender_only.continuous_processing_requested());
+        assert!(!sender_only.settings().retain_silence);
+        let settings = SettingsStore::default();
+        settings.lock().retain_silence = true;
+        let session = Arc::new(Session::new(settings.clone()));
+        assert!(session.continuous_processing_requested());
+        let mut worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+
+        let mut restored = settings.map(Clone::clone);
+        restored.insert("retain_silence".into(), "false".into());
+        settings.set(restored);
+        assert!(!session.continuous_processing_requested(), "restored settings must be visible before the next capture worker tick");
+        session.consume();
+        assert!(!session.continuous_processing_requested());
+
+        let mut edited = session.settings();
+        edited.retain_silence = true;
+        session.update_editor_settings(edited);
+        assert!(session.continuous_processing_requested(), "audio processing must observe the editor request without waiting for the capture mutex");
+        let mut edited = session.settings();
+        edited.retain_silence = false;
+        edited.sender_enabled = true;
+        session.update_editor_settings(edited);
+        assert!(session.continuous_processing_requested());
+        let mut edited = session.settings();
+        edited.sender_enabled = false;
+        session.update_editor_settings(edited);
+        assert!(!session.continuous_processing_requested());
+    }
+
+    #[test]
+    fn retained_quiet_mode_is_applied_when_the_capture_input_is_replaced() {
+        let settings = SettingsStore::default();
+        settings.lock().retain_silence = true;
+        let session = Arc::new(Session::new(settings.clone()));
+        let mut worker = Worker::with_sidechain(session.clone(), 1_000, 1, 1, 256).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+        worker.push_block(&[&mut [0.00001; 64]], &[&mut [-0.00002; 64]], None);
+        session.consume();
+        assert_eq!(session.snapshot_live().unwrap().samples, [0.00001; 64]);
+        let epoch = session.timeline_epoch();
+
+        settings.lock().capture_input = CaptureInput::Sidechain;
+        session.consume();
+        assert_ne!(session.timeline_epoch(), epoch);
+        worker.push_block(&[&mut [0.00001; 96]], &[&mut [-0.00002; 96]], None);
+        session.consume();
+        assert_eq!(session.snapshot_live().unwrap().samples, [-0.00002; 96]);
+        assert!(!session.is_paused());
+    }
+
+    #[test]
+    fn sender_only_processing_does_not_enable_the_local_quiet_gate() {
+        let settings = SettingsStore::default();
+        settings.lock().capture_input = CaptureInput::Both;
+        let session = Arc::new(Session::new(settings));
+        let mut worker = Worker::with_sidechain(session.clone(), 1_000, 1, 1, 256).unwrap();
+        worker.stop_background_for_test();
+        let mut edited = session.settings();
+        edited.sender_enabled = true;
+        session.update_editor_settings(edited);
+        assert!(session.continuous_processing_requested());
+        session.consume();
+        worker.sender_active.store(true, Ordering::Relaxed);
+        worker.push_block(&[&mut [0.0; 512]], &[&mut [0.00001; 512]], None);
+        session.consume();
+        let (_, live) = session.positioned_snapshots(true).unwrap();
+        assert!(live[0].samples.is_empty());
+        assert!(live[1].samples.is_empty());
+        assert!(!session.lock().consumer.as_ref().unwrap().capture.retain_silence());
+        let mut sent = Vec::new();
+        let (packet, _) = worker.sender_queue.pop_tagged(&mut sent).unwrap();
+        assert_eq!(packet.frames, 512);
+        assert_eq!(sent, [0.0, 0.00001].repeat(512));
+        session.pause();
+        worker.push_block(&[&mut [0.0; 128]], &[&mut [0.00001; 128]], None);
+        let (packet, _) = worker.sender_queue.pop_tagged(&mut sent).unwrap();
+        assert_eq!(packet.frames, 128);
+        assert_eq!(sent, [0.0, 0.00001].repeat(128));
+        assert!(session.snapshot_live().unwrap().samples.is_empty());
+        assert!(session.continuous_processing_requested());
+        let mut edited = session.settings();
+        edited.sender_enabled = false;
+        session.update_editor_settings(edited);
+        assert!(!session.continuous_processing_requested());
+        assert!(!session.settings().retain_silence);
+    }
+
+    #[test]
     fn clear_discards_pending_and_retained_audio_without_changing_pause_state() {
         let session = Arc::new(Session::new(SettingsStore::default()));
         let worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
@@ -1531,6 +1760,17 @@ mod tests {
         ready.recv().unwrap();
         let started = Instant::now();
         session.mark_interaction();
+        let mut settings = session.settings();
+        settings.retain_silence = true;
+        session.update_editor_settings(settings);
+        assert!(session.settings().retain_silence);
+        assert!(session.continuous_processing_requested());
+        let mut settings = session.settings();
+        settings.retain_silence = false;
+        settings.sender_enabled = true;
+        session.update_editor_settings(settings);
+        assert!(!session.settings().retain_silence);
+        assert!(session.continuous_processing_requested());
         session.begin_waveform_gesture();
         assert!(session.editing_pending());
         assert!(session.positioned_snapshots(false).is_none());

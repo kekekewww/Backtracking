@@ -261,6 +261,15 @@ unsafe extern "C" fn bt_set_history(core: *const BtCore, seconds: u32) -> i32 {
 }
 
 #[no_mangle]
+unsafe extern "C" fn bt_set_retain_silence(core: *const BtCore, enabled: u32) {
+    let Some(core) = core.as_ref() else { return };
+    let Ok(mut reader) = core.reader.lock() else { return };
+    if reader.capture.retain_silence() == (enabled != 0) { return; }
+    core.drain(&mut reader, core.enabled.load(Ordering::Acquire), 64);
+    reader.capture.set_retain_silence(enabled != 0);
+}
+
+#[no_mangle]
 unsafe extern "C" fn bt_state(core: *const BtCore) -> u32 {
     let Some(core) = core.as_ref() else { return 2 };
     let Ok(reader) = core.reader.lock() else {
@@ -442,6 +451,32 @@ unsafe extern "C" fn bt_string_free(string: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silence_mode_ffi_drains_prior_input_under_its_previous_policy() {
+        unsafe {
+            bt_set_retain_silence(ptr::null(), 1);
+            let core = bt_new(1_000., 1, 10);
+            assert!(!core.is_null());
+            let quiet = [0.000_1; 100];
+            assert_eq!(bt_push_interleaved(core, quiet.as_ptr(), 100), 100);
+            bt_set_retain_silence(core, 1);
+            assert_eq!(bt_end_frame(core), 0);
+            assert_eq!(bt_push_interleaved(core, quiet.as_ptr(), 100), 100);
+            bt_set_retain_silence(core, 0);
+            assert_eq!((*core).reader.lock().unwrap().capture.snapshot().samples, quiet);
+            assert_eq!(bt_state(core), 0);
+            assert_eq!(bt_push_interleaved(core, quiet.as_ptr(), 100), 100);
+            bt_set_retain_silence(core, 2);
+            assert_eq!(bt_end_frame(core), 100);
+            assert_eq!(bt_push_interleaved(core, quiet.as_ptr(), 100), 100);
+            bt_pause(core);
+            assert_eq!(bt_end_frame(core), 200);
+            bt_set_retain_silence(core, 0);
+            assert_eq!(bt_state(core), 2);
+            bt_free(core);
+        }
+    }
 
     #[test]
     fn display_policy_ffi_copies_exact_guides_and_reports_required_capacity() {

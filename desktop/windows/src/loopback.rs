@@ -39,6 +39,8 @@ use timing::PacketClock;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(4);
 const IDLE_PACKET_GAP: Duration = Duration::from_millis(200);
+const RETAINED_IDLE_INTERVAL: Duration = Duration::from_millis(20);
+const QUIET_MODE_TIMEOUT: Duration = Duration::from_millis(250);
 const ENDPOINT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(3);
 pub(crate) const PACKET_QUEUE_CAPACITY: usize = 1024;
@@ -53,7 +55,105 @@ type Reply = mpsc::SyncSender<Result<(), String>>;
 enum Command {
     Pause(Reply),
     Resume(Reply),
+    PrepareRetainSilence(bool, Reply, mpsc::Receiver<u64>),
     Shutdown,
+}
+
+pub(crate) struct QuietModeBarrier {
+    release: Option<mpsc::SyncSender<u64>>,
+}
+
+impl QuietModeBarrier {
+    pub(crate) fn cancel(mut self) {
+        drop(self.release.take());
+    }
+}
+
+impl Drop for QuietModeBarrier {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(now_ns());
+        }
+    }
+}
+
+struct PendingQuietMode {
+    enabled: bool,
+    release: mpsc::Receiver<u64>,
+}
+
+#[derive(Default)]
+struct QuietModeState {
+    retain_silence: bool,
+    idle_reported: bool,
+    pending: Option<PendingQuietMode>,
+}
+
+impl QuietModeState {
+    fn prepare(&mut self, enabled: bool, reply: Reply, release: mpsc::Receiver<u64>) {
+        if self.pending.is_some() {
+            let _ = reply.send(Err("音訊來源設定仍在更新".into()));
+            return;
+        }
+        // Freeze only synthetic packets. Real device packets keep draining
+        // while the controller commits all old synthetic data before changing gates.
+        self.pending = Some(PendingQuietMode { enabled, release });
+        if reply.send(Ok(())).is_err() {
+            self.pending = None;
+        }
+    }
+
+    fn poll_release(&mut self) -> Option<(bool, u64)> {
+        let pending = self.pending.as_ref()?;
+        let result = match pending.release.try_recv() {
+            Ok(since_ns) => Some((pending.enabled, since_ns)),
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.pending = None;
+        if let Some((enabled, _)) = result {
+            self.retain_silence = enabled;
+        }
+        // Keep idle_reported across policy changes. An already-padded idle
+        // episode must not append another legacy 200ms tail after switching off.
+        result
+    }
+
+    fn note_real_packet(&mut self) {
+        self.idle_reported = false;
+    }
+
+    fn note_synthetic_packet(&mut self) {
+        self.idle_reported = true;
+    }
+
+    fn restore_after_resume(&mut self, clock: &mut PacketClock, resume_ns: u64) {
+        let _ = self.poll_release();
+        self.note_real_packet();
+        clock.set_retain_silence(self.retain_silence, resume_ns);
+    }
+
+    fn should_emit_tail(&self, idle_for: Duration) -> bool {
+        !self.retain_silence && !self.idle_reported && self.pending.is_none()
+            && idle_for >= IDLE_PACKET_GAP
+    }
+
+    fn should_emit_retained(&self, idle_for: Duration, since_attempt: Duration) -> bool {
+        self.retain_silence && self.pending.is_none() && idle_for >= IDLE_PACKET_GAP
+            && since_attempt >= RETAINED_IDLE_INTERVAL
+    }
+}
+
+fn next_command(
+    commands: &mpsc::Receiver<Command>,
+    running: bool,
+    pending_quiet_mode: bool,
+) -> Result<Command, mpsc::RecvTimeoutError> {
+    if running || pending_quiet_mode {
+        commands.recv_timeout(POLL_INTERVAL)
+    } else {
+        commands.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+    }
 }
 
 struct Started {
@@ -105,6 +205,25 @@ impl Loopback {
         self.request(Command::Resume)
     }
 
+    /// Call from the capture worker; the UI only queues its controller command.
+    pub(crate) fn prepare_retain_silence(&mut self, enabled: bool) -> Result<QuietModeBarrier, String> {
+        let (reply, ready) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        self.commands.send(Command::PrepareRetainSilence(enabled, reply, released))
+            .map_err(|_| "WASAPI 連線已中斷".to_string())?;
+        match ready.recv_timeout(QUIET_MODE_TIMEOUT) {
+            Ok(Ok(())) => Ok(QuietModeBarrier { release: Some(release) }),
+            Ok(Err(error)) => Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err("WASAPI 音訊來源設定更新逾時".into()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err("WASAPI 連線已中斷".into()),
+        }
+    }
+
+    pub(crate) fn set_retain_silence(&mut self, enabled: bool) -> Result<(), String> {
+        drop(self.prepare_retain_silence(enabled)?);
+        Ok(())
+    }
+
     pub(crate) fn packet(&self, scratch: &mut Vec<f32>) -> Option<TimedPacket> {
         self.packets.pop(scratch)
     }
@@ -145,6 +264,11 @@ impl Drop for Loopback {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn resolved_process_id_for_test(path: &str) -> Result<u32, String> {
+    Ok(target_process(path)?.id)
+}
+
 fn capture_thread(
     source: CaptureSource,
     commands: mpsc::Receiver<Command>,
@@ -169,17 +293,23 @@ fn capture_thread(
     let mut running = true;
     let mut last_packet = Instant::now();
     let mut last_source_check = last_packet;
-    let mut idle_reported = false;
+    let mut quiet_mode = QuietModeState::default();
+    let mut last_padding_attempt = last_packet;
     loop {
-        let command = if running {
-            commands.recv_timeout(POLL_INTERVAL)
-        } else {
-            commands
-                .recv()
-                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
-        };
+        if let Some((enabled, since_ns)) = quiet_mode.poll_release() {
+            stream.clock.set_retain_silence(enabled, since_ns);
+            last_padding_attempt = Instant::now();
+        }
+        let command = next_command(&commands, running, quiet_mode.pending.is_some());
+        if let Some((enabled, since_ns)) = quiet_mode.poll_release() {
+            stream.clock.set_retain_silence(enabled, since_ns);
+            last_padding_attempt = Instant::now();
+        }
         match command {
             Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(Command::PrepareRetainSilence(enabled, reply, release)) => {
+                quiet_mode.prepare(enabled, reply, release);
+            }
             Ok(Command::Pause(reply)) => {
                 let result = if running { stream.pause() } else { Ok(()) };
                 let failed = result.is_err();
@@ -203,8 +333,10 @@ fn capture_thread(
                 running = true;
                 last_packet = Instant::now();
                 last_source_check = last_packet;
-                idle_reported = false;
+                last_padding_attempt = last_packet;
+                quiet_mode.restore_after_resume(&mut stream.clock, now_ns());
             }
+            Err(mpsc::RecvTimeoutError::Timeout) if !running => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if last_source_check.elapsed() >= ENDPOINT_CHECK_INTERVAL {
                     last_source_check = Instant::now();
@@ -216,11 +348,17 @@ fn capture_thread(
                 match stream.read_packets() {
                     Ok(true) => {
                         last_packet = Instant::now();
-                        idle_reported = false;
+                        quiet_mode.note_real_packet();
                     }
-                    Ok(false) if !idle_reported && last_packet.elapsed() >= IDLE_PACKET_GAP => {
+                    Ok(false) if quiet_mode.should_emit_retained(last_packet.elapsed(), last_padding_attempt.elapsed()) => {
+                        last_padding_attempt = Instant::now();
+                        if stream.push_retained_idle_silence() {
+                            quiet_mode.note_synthetic_packet();
+                        }
+                    }
+                    Ok(false) if quiet_mode.should_emit_tail(last_packet.elapsed()) => {
                         stream.push_idle_silence();
-                        idle_reported = true;
+                        quiet_mode.note_synthetic_packet();
                     }
                     Ok(false) => {}
                     Err(error) => {
@@ -540,6 +678,27 @@ impl WasapiStream {
             self.queue_loss = false;
         }
     }
+
+    fn push_retained_idle_silence(&mut self) -> bool {
+        let max_frames = self.format.sample_rate.div_ceil(5) as usize;
+        // GetBuffer timestamps refer to each packet's first frame. Leave a
+        // complete device buffer plus one poll in flight rather than replacing
+        // samples that the engine has not made available yet with virtual zeroes.
+        let until_ns = self.clock.idle_cutoff_ns(now_ns(), self.packet_capacity,
+            POLL_INTERVAL.as_nanos() as u64);
+        let Some((stamp, frames)) = self.clock.retained_idle_stamp(until_ns, max_frames) else {
+            return false;
+        };
+        let samples = &mut self.scratch[..frames * self.format.channels];
+        samples.fill(0.0);
+        self.queue_loss = self.packets.push_interleaved_with_discontinuity(
+            stamp.timestamp_ns,
+            self.format.sample_rate,
+            samples,
+            stamp.discontinuity || self.queue_loss,
+        ) != frames;
+        true
+    }
 }
 
 impl Drop for WasapiStream {
@@ -563,7 +722,47 @@ struct ActivationComplete {
 
 struct ActivationArguments {
     params: AUDIOCLIENT_ACTIVATION_PARAMS,
-    variant: PROPVARIANT,
+    // This BLOB borrows params in the same Box. PROPVARIANT's owning Drop
+    // would call PropVariantClear and free that borrowed Rust allocation.
+    variant: ManuallyDrop<PROPVARIANT>,
+}
+
+impl ActivationArguments {
+    fn new(pid: u32) -> Box<Self> {
+        let mut arguments = Box::new(Self {
+            params: AUDIOCLIENT_ACTIVATION_PARAMS {
+                ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+                Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+                    ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                        TargetProcessId: pid,
+                        ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                    },
+                },
+            },
+            variant: ManuallyDrop::new(PROPVARIANT::default()),
+        });
+        arguments.variant = ManuallyDrop::new(PROPVARIANT {
+            Anonymous: PROPVARIANT_0 {
+                Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
+                    vt: VT_BLOB,
+                    wReserved1: 0,
+                    wReserved2: 0,
+                    wReserved3: 0,
+                    Anonymous: PROPVARIANT_0_0_0 {
+                        blob: BLOB {
+                            cbSize: size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+                            pBlobData: ptr::from_mut(&mut arguments.params).cast(),
+                        },
+                    },
+                }),
+            },
+        });
+        arguments
+    }
+
+    fn property(&self) -> *const PROPVARIANT {
+        ptr::from_ref(&*self.variant)
+    }
 }
 
 impl IAgileObject_Impl for ActivationComplete_Impl {}
@@ -579,36 +778,8 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationComplete_Impl {
 }
 
 fn activate_process(pid: u32) -> Result<IAudioClient, String> {
-    let mut arguments = Box::new(ActivationArguments {
-        params: AUDIOCLIENT_ACTIVATION_PARAMS {
-            ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
-            Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
-                ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
-                    TargetProcessId: pid,
-                    ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
-                },
-            },
-        },
-        variant: PROPVARIANT::default(),
-    });
-    // The BLOB points at activation parameters, rather than owning a COM allocation.
-    arguments.variant = PROPVARIANT {
-        Anonymous: PROPVARIANT_0 {
-            Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
-                vt: VT_BLOB,
-                wReserved1: 0,
-                wReserved2: 0,
-                wReserved3: 0,
-                Anonymous: PROPVARIANT_0_0_0 {
-                    blob: BLOB {
-                        cbSize: size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-                        pBlobData: ptr::from_mut(&mut arguments.params).cast(),
-                    },
-                },
-            }),
-        },
-    };
-    let property = ptr::from_ref(&arguments.variant);
+    let arguments = ActivationArguments::new(pid);
+    let property = arguments.property();
     let (complete, result) = mpsc::sync_channel(1);
     let handler: IActivateAudioInterfaceCompletionHandler = ActivationComplete {
         sender: complete,
@@ -947,6 +1118,229 @@ fn endpoint_id(device: &IMMDevice) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_blob_borrows_boxed_params_until_the_last_completion_reference_drops() {
+        for pid in 1..65 {
+            let arguments = ActivationArguments::new(pid);
+            let property = arguments.property();
+            let property_ref = unsafe { &*property };
+            let contents = unsafe { &property_ref.Anonymous.Anonymous };
+            assert_eq!(contents.vt, VT_BLOB);
+            let blob = unsafe { &contents.Anonymous.blob };
+            assert_eq!(blob.cbSize as usize, size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>());
+            assert_eq!(blob.pBlobData.cast_const(), ptr::from_ref(&arguments.params).cast());
+            assert_eq!(unsafe { arguments.params.Anonymous.ProcessLoopbackParams.TargetProcessId }, pid);
+
+            let (sender, _result) = mpsc::sync_channel(1);
+            let handler: IActivateAudioInterfaceCompletionHandler = ActivationComplete {
+                sender, _arguments: arguments,
+            }.into();
+            let callback_reference = handler.clone();
+            drop(handler);
+            let retained_blob = unsafe { &contents.Anonymous.blob };
+            let params = unsafe { &*retained_blob.pBlobData.cast::<AUDIOCLIENT_ACTIVATION_PARAMS>() };
+            assert_eq!(unsafe { params.Anonymous.ProcessLoopbackParams.TargetProcessId }, pid);
+            drop(callback_reference);
+        }
+    }
+
+    fn prepared_mode(state: &mut QuietModeState, enabled: bool) -> QuietModeBarrier {
+        let (reply, ready) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        state.prepare(enabled, reply, released);
+        assert!(matches!(ready.try_recv(), Ok(Ok(()))));
+        QuietModeBarrier { release: Some(release) }
+    }
+
+    fn commit_mode_at(mut barrier: QuietModeBarrier, since_ns: u64) {
+        assert!(barrier.release.take().unwrap().send(since_ns).is_ok());
+    }
+
+    #[test]
+    fn default_idle_policy_emits_one_tail_per_real_packet_episode() {
+        let mut state = QuietModeState::default();
+        assert!(!state.should_emit_tail(Duration::from_millis(199)));
+        assert!(state.should_emit_tail(IDLE_PACKET_GAP));
+        assert!(!state.should_emit_retained(Duration::from_secs(60), Duration::from_secs(60)));
+        state.note_synthetic_packet();
+        assert!(!state.should_emit_tail(Duration::from_secs(60)));
+        state.note_real_packet();
+        assert!(state.should_emit_tail(IDLE_PACKET_GAP));
+    }
+
+    #[test]
+    fn canceling_a_prepared_quiet_change_restores_each_previous_policy() {
+        for previous in [false, true] {
+            let mut state = QuietModeState { retain_silence: previous, ..Default::default() };
+            let barrier = prepared_mode(&mut state, !previous);
+            assert!(!state.should_emit_tail(Duration::from_secs(60)));
+            assert!(!state.should_emit_retained(Duration::from_secs(60), Duration::from_secs(60)));
+            barrier.cancel();
+            assert!(state.poll_release().is_none());
+            assert!(state.pending.is_none());
+            assert_eq!(state.retain_silence, previous);
+        }
+    }
+
+    #[test]
+    fn an_abandoned_prepare_ack_does_not_leave_synthetic_padding_frozen() {
+        let mut state = QuietModeState::default();
+        let (reply, ready) = mpsc::sync_channel(1);
+        let (_release, released) = mpsc::sync_channel(1);
+        drop(ready);
+        state.prepare(true, reply, released);
+        assert!(state.pending.is_none());
+        assert!(!state.retain_silence);
+        assert!(state.should_emit_tail(IDLE_PACKET_GAP));
+    }
+
+    #[test]
+    fn a_paused_worker_observes_guard_release_without_another_control_command() {
+        let (commands, receiver) = mpsc::channel();
+        let (reply, ready) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let (done, finished) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut state = QuietModeState::default();
+            state.prepare(true, reply, released);
+            loop {
+                if matches!(next_command(&receiver, false, state.pending.is_some()),
+                    Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected)) {
+                    break;
+                }
+                if let Some((enabled, _)) = state.poll_release() {
+                    let _ = done.send(enabled && state.pending.is_none());
+                    break;
+                }
+            }
+        });
+        assert!(matches!(ready.recv(), Ok(Ok(()))));
+        drop(QuietModeBarrier { release: Some(release) });
+        let completed_without_wake = finished.recv_timeout(Duration::from_millis(100));
+        let _ = commands.send(Command::Shutdown);
+        worker.join().unwrap();
+        assert!(matches!(completed_without_wake, Ok(true)));
+    }
+
+    #[test]
+    fn a_quiet_prepare_timeout_can_be_consumed_later_without_stranding_the_old_mode() {
+        let (commands, receiver) = mpsc::channel();
+        let (_errors, errors) = mpsc::channel();
+        let mut stream = Loopback {
+            format: Arc::new(native_format(2, 1 | 2)),
+            packets: TimedAudioQueue::new(48_000, PACKET_QUEUE_CAPACITY, 2),
+            commands,
+            errors,
+            worker: None,
+        };
+        let result = stream.prepare_retain_silence(true);
+        assert!(matches!(result, Err(error) if error.contains("逾時")));
+        let Ok(Command::PrepareRetainSilence(enabled, reply, release)) = receiver.try_recv() else {
+            panic!("expected the timed-out request to remain queued");
+        };
+        let mut state = QuietModeState::default();
+        state.prepare(enabled, reply, release);
+        assert!(state.pending.is_none());
+        assert!(!state.retain_silence);
+        assert!(state.should_emit_tail(IDLE_PACKET_GAP));
+    }
+
+    #[test]
+    fn turning_off_after_retained_padding_does_not_append_another_legacy_tail() {
+        let mut state = QuietModeState::default();
+        let mut clock = PacketClock::new(48_000);
+        let start = 1_000_000_000;
+        let barrier = prepared_mode(&mut state, true);
+        commit_mode_at(barrier, start);
+        let (enabled, since_ns) = state.poll_release().unwrap();
+        clock.set_retain_silence(enabled, since_ns);
+        clock.timestamp(0, 480, Some(start), false, || unreachable!());
+        let now = start + 1_000_000_000;
+        let cutoff = clock.idle_cutoff_ns(now, 4_800, POLL_INTERVAL.as_nanos() as u64);
+        while clock.retained_idle_stamp(cutoff, 9_600).is_some() {
+            state.note_synthetic_packet();
+        }
+        let barrier = prepared_mode(&mut state, false);
+        commit_mode_at(barrier, now);
+        let (enabled, since_ns) = state.poll_release().unwrap();
+        clock.set_retain_silence(enabled, since_ns);
+        assert!(!state.should_emit_tail(Duration::from_secs(2)));
+        let measured = now + 50_000_000;
+        let packet = clock.timestamp(480, 480, Some(measured), false, || unreachable!());
+        assert_eq!(packet.timestamp_ns, measured);
+    }
+
+    #[test]
+    fn a_queued_quiet_commit_followed_by_resume_uses_resume_as_the_new_floor() {
+        let mut state = QuietModeState::default();
+        let barrier = prepared_mode(&mut state, true);
+        let switched_while_paused = 5_000_000_000;
+        commit_mode_at(barrier, switched_while_paused);
+        let resumed = 30_000_000_000;
+        let mut recreated_clock = PacketClock::new(48_000);
+        state.restore_after_resume(&mut recreated_clock, resumed);
+        assert!(state.pending.is_none());
+        assert!(state.retain_silence);
+        let (stamp, _) = recreated_clock.retained_idle_stamp(resumed + 1_000_000_000, 9_600).unwrap();
+        assert_eq!(stamp.timestamp_ns, resumed);
+    }
+
+    #[test]
+    fn retained_padding_and_real_return_keep_the_exact_gap_and_original_samples() {
+        let rate = 48_000;
+        let start = 1_000_000_000;
+        let mut clock = PacketClock::new(rate);
+        clock.set_retain_silence(true, start);
+        let mut capture = backtracking_core::SynchronizedCapture::new(
+            rate, 1, None, backtracking_core::DurationChoice::Seconds10,
+        ).unwrap();
+        capture.set_retain_silence(true);
+        let first = clock.timestamp(0, 480, Some(start), false, || unreachable!());
+        capture.push_native_interleaved(first.timestamp_ns, &[0.5; 480], first.discontinuity).unwrap();
+        let now = start + 1_000_000_000;
+        let cutoff = clock.idle_cutoff_ns(now, 4_800, POLL_INTERVAL.as_nanos() as u64);
+        while let Some((stamp, frames)) = clock.retained_idle_stamp(cutoff, 9_600) {
+            assert!(!stamp.discontinuity);
+            capture.push_native_interleaved(stamp.timestamp_ns, &vec![0.; frames], stamp.discontinuity).unwrap();
+        }
+        let real = clock.timestamp(480, 480, Some(now - 10_000_000), false, || unreachable!());
+        capture.push_native_interleaved(real.timestamp_ns, &[0.25; 480], real.discontinuity).unwrap();
+        assert_eq!(capture.capture().frame_range(), 0..48_000);
+        let snapshot = capture.capture().track_snapshot_range(0, 0..48_000).unwrap();
+        let samples = snapshot.frames(0..48_000).unwrap();
+        assert_eq!(&samples[..480], &[0.5; 480]);
+        assert!(samples[480..47_520].iter().all(|&sample| sample == 0.));
+        assert_eq!(&samples[47_520..], &[0.25; 480]);
+    }
+
+    #[test]
+    fn a_long_known_idle_jump_keeps_the_latest_retention_with_two_bounded_packets() {
+        let rate = 1_000;
+        let start = 1_000_000_000;
+        let until = start + 3_600_000_000_000;
+        let mut clock = PacketClock::new(rate);
+        clock.set_retain_silence(true, start);
+        let mut capture = backtracking_core::SynchronizedCapture::new(
+            rate, 1, None, backtracking_core::DurationChoice::Seconds10,
+        ).unwrap();
+        capture.set_retain_silence(true);
+        let first = clock.timestamp(0, 10, Some(start), false, || unreachable!());
+        capture.push_native_interleaved(first.timestamp_ns, &[0.5; 10], first.discontinuity).unwrap();
+        for _ in 0..2 {
+            let (stamp, frames) = clock.retained_idle_stamp(until, 200).unwrap();
+            assert!(frames <= 200);
+            assert!(!stamp.discontinuity);
+            capture.push_native_interleaved(stamp.timestamp_ns, &vec![0.; frames], stamp.discontinuity).unwrap();
+        }
+        assert!(clock.retained_idle_stamp(until, 200).is_none());
+        let last = clock.timestamp(10, 10, Some(until), false, || unreachable!());
+        capture.push_native_interleaved(last.timestamp_ns, &[0.25; 10], last.discontinuity).unwrap();
+        let snapshot = capture.capture().snapshot();
+        assert_eq!(snapshot.frame_range(), 3_590_010..3_600_010);
+        assert!(snapshot.samples[..9_990].iter().all(|&sample| sample == 0.));
+        assert_eq!(&snapshot.samples[9_990..], &[0.25; 10]);
+    }
 
     fn native_format(channels: u16, mask: u32) -> Format {
         let mut native = WAVEFORMATEXTENSIBLE {

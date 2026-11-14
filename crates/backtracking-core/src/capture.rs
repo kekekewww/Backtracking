@@ -134,6 +134,8 @@ pub struct Capture {
     quiet_frames: usize,
     join_fade_frames: usize,
     join_fade: JoinFade,
+    retain_silence: bool,
+    gate_recording: bool,
     state: CaptureState,
     revision: u64,
     meter: Meter,
@@ -250,6 +252,8 @@ impl Capture {
             quiet_frames: 0,
             join_fade_frames: frames_for_ms(JOIN_FADE_MS),
             join_fade: JoinFade::None,
+            retain_silence: false,
+            gate_recording: false,
             state: CaptureState::Waiting,
             revision: 0,
             meter: Meter::new(sample_rate, a_channels)?,
@@ -261,6 +265,84 @@ impl Capture {
 
     pub fn push_interleaved(&mut self, samples: &[f32]) -> Result<(), CaptureError> {
         self.push_interleaved_with_markers(samples, &[])
+    }
+
+    pub fn retain_silence(&self) -> bool {
+        self.retain_silence
+    }
+
+    /// Applies to future input without restoring discarded pre-roll or changing pause.
+    pub fn set_retain_silence(&mut self, enabled: bool) {
+        if self.retain_silence == enabled {
+            return;
+        }
+        if enabled {
+            self.gate_recording = self.state == CaptureState::Recording;
+        } else if self.state != CaptureState::Paused {
+            self.state = if self.gate_recording {
+                CaptureState::Recording
+            } else {
+                CaptureState::Waiting
+            };
+        }
+        self.retain_silence = enabled;
+        self.pre_roll.clear();
+        self.pending_bars.clear();
+    }
+
+    pub(crate) fn append_known_silence(&mut self, frames: u64) -> Result<(), CaptureError> {
+        if !self.retain_silence || self.state == CaptureState::Paused || frames == 0 {
+            return Ok(());
+        }
+        let previous_end = self.history.total_frames();
+        previous_end.checked_add(frames).ok_or(CaptureError::BufferTooLarge)?;
+        let mut zero = Vec::new();
+        zero.try_reserve_exact(self.channels).map_err(|_| CaptureError::AllocationFailed)?;
+        zero.resize(self.channels, 0.0);
+        let now = Instant::now();
+        self.meter.begin_block(now);
+        if let Some(meter) = &mut self.meter_b { meter.begin_block(now); }
+        let prefix = if matches!(self.join_fade, JoinFade::None) { 0 }
+            else { frames.min(self.join_fade_frames as u64) };
+        let result = self.retain_frames(std::iter::repeat(zero.as_slice()).take(prefix as usize), &[])
+            .and_then(|()| self.history.append_silence(frames - prefix, self.retention_frames));
+        let retained = self.history.total_frames() - previous_end;
+        let bulk = retained.saturating_sub(prefix);
+        if bulk != 0 {
+            self.advance_quiet_gate(bulk);
+            self.state = CaptureState::Recording;
+            // An input gap this long is already stale to the meters. Short gaps
+            // still replay every frame, preserving their release/window behavior.
+            if bulk >= u64::from(self.sample_rate) {
+                self.meter.reset();
+                if let Some(meter) = &mut self.meter_b { meter.reset(); }
+            } else {
+                let (a, b) = zero.split_at(self.a_channels);
+                for _ in 0..bulk {
+                    self.meter.push_frame(a);
+                    if let Some(meter) = &mut self.meter_b { meter.push_frame(b); }
+                }
+            }
+        }
+        let now = Instant::now();
+        self.meter.end_block(now);
+        if let Some(meter) = &mut self.meter_b { meter.end_block(now); }
+        if retained != 0 {
+            self.revision = self.revision.wrapping_add(1);
+            self.prune_bars();
+        }
+        result
+    }
+
+    fn advance_quiet_gate(&mut self, frames: u64) {
+        if self.gate_recording {
+            if frames >= self.tail_frames.saturating_sub(self.quiet_frames) as u64 {
+                self.gate_recording = false;
+                self.quiet_frames = 0;
+            } else {
+                self.quiet_frames += frames as usize;
+            }
+        }
     }
 
     /// Bar offsets are sorted positions within this block, before silence is removed.
@@ -312,6 +394,21 @@ impl Capture {
             let mut peak = self.meter.push_frame(a);
             if let Some(meter) = &mut self.meter_b {
                 peak = peak.max(meter.push_frame(b));
+            }
+
+            if self.retain_silence {
+                let retained_frame = self.history.total_frames();
+                self.join_fade.push(&mut self.history, frame, self.join_fade_frames)?;
+                if bar_here { self.bar_markers.push_back(retained_frame); }
+                self.history.truncate_to(self.retention_frames);
+                if !self.gate_recording && peak >= OPEN_LEVEL {
+                    self.gate_recording = true;
+                    self.quiet_frames = 0;
+                }
+                if peak < CLOSE_LEVEL { self.advance_quiet_gate(1); }
+                else { self.quiet_frames = 0; }
+                self.state = CaptureState::Recording;
+                continue;
             }
 
             if self.state == CaptureState::Waiting {
@@ -403,6 +500,7 @@ impl Capture {
 
     pub fn pause(&mut self) {
         self.state = CaptureState::Paused;
+        self.gate_recording = false;
         self.quiet_frames = 0;
         self.join_fade = JoinFade::None;
         self.pre_roll.clear();
@@ -616,6 +714,7 @@ impl Capture {
         self.bar_markers.clear();
         self.pending_bars.clear();
         self.quiet_frames = 0;
+        self.gate_recording = false;
         self.join_fade = JoinFade::None;
         self.meter.reset();
         if let Some(meter) = &mut self.meter_b {
@@ -701,6 +800,83 @@ impl FrameRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_silence_is_opt_in_and_does_not_restore_discarded_pre_roll() {
+        let mut capture = Capture::new(1_000, 1, DurationChoice::Seconds10).unwrap();
+        assert!(!capture.retain_silence());
+        capture.push_interleaved_with_markers(&[0.; 100], &[20]).unwrap();
+        assert!(capture.snapshot().samples.is_empty());
+
+        capture.set_retain_silence(true);
+        assert_eq!(capture.state(), CaptureState::Waiting);
+        let quiet: Vec<_> = [0., 0.000_01, -0.000_4, 0., 0.000_2].repeat(20);
+        capture.push_interleaved_with_markers(&quiet, &[0, 50, 99]).unwrap();
+        assert_eq!(capture.snapshot().samples, quiet);
+        assert_eq!(capture.frame_range(), 0..100);
+        assert_eq!(capture.bar_markers(0..100), [0, 50, 99]);
+        assert_eq!(capture.state(), CaptureState::Recording);
+
+        let previous = capture.snapshot();
+        capture.set_retain_silence(false);
+        assert_eq!(capture.snapshot(), previous);
+        capture.push_interleaved(&[0.; 1_000]).unwrap();
+        let later = capture.snapshot();
+        assert_eq!(&later.samples[..100], previous.samples);
+        assert!(later.frame_count() < 1_100);
+        assert_eq!(capture.state(), CaptureState::Waiting);
+    }
+
+    #[test]
+    fn silence_mode_preserves_manual_pause_clear_and_existing_dual_track_samples() {
+        let mut capture = Capture::new_tracks(1_000, 1, Some(1), DurationChoice::Seconds10).unwrap();
+        capture.set_retain_silence(true);
+        capture.push_interleaved(&[0.000_1, -0.000_2, 0., 0.]).unwrap();
+        let fixed = capture.snapshot();
+        capture.pause();
+        capture.set_retain_silence(false);
+        capture.set_retain_silence(true);
+        capture.push_interleaved(&[0.; 20]).unwrap();
+        capture.append_known_silence(1_000).unwrap();
+        assert_eq!(capture.state(), CaptureState::Paused);
+        assert_eq!(capture.snapshot(), fixed);
+        capture.resume();
+        capture.push_interleaved(&[0.000_3, -0.000_4]).unwrap();
+        assert_eq!(capture.snapshot().samples, [0.000_1, -0.000_2, 0., 0., 0.000_3, -0.000_4]);
+        assert_eq!(capture.track_snapshot(0).unwrap().frame_range(), capture.track_snapshot(1).unwrap().frame_range());
+        capture.clear();
+        assert!(capture.retain_silence());
+        capture.push_interleaved(&[0., 0.]).unwrap();
+        assert_eq!(capture.snapshot().samples, [0., 0.]);
+        capture.push_interleaved(&[0.5, -0.5]).unwrap();
+        capture.clear();
+        capture.push_interleaved(&[0., 0.]).unwrap();
+        capture.set_retain_silence(false);
+        capture.push_interleaved(&[0.; 20]).unwrap();
+        assert_eq!(capture.snapshot().samples, [0., 0.]);
+    }
+
+    #[test]
+    fn long_retained_quiet_gap_advances_the_clock_with_bounded_history() {
+        let mut capture = Capture::new_tracks(1_000, 1, Some(1), DurationChoice::Seconds10).unwrap();
+        capture.set_retain_silence(true);
+        capture.push_interleaved_with_markers(&[0.2, -0.3, 0.4, -0.5], &[0]).unwrap();
+        let fixed = capture.snapshot();
+        capture.append_known_silence(1_000_000).unwrap();
+        assert_eq!(capture.frame_range(), 990_002..1_000_002);
+        assert_eq!(capture.snapshot().samples, vec![0.; 20_000]);
+        assert!(capture.bar_markers(0..u64::MAX).is_empty());
+        assert_eq!(capture.state(), CaptureState::Recording);
+        assert!(capture.history.allocated_frames() <= 60_000);
+        assert_eq!(fixed.samples, [0.2, -0.3, 0.4, -0.5]);
+        capture.push_interleaved(&[0.000_1, -0.000_2]).unwrap();
+        assert_eq!(capture.frame_range(), 990_003..1_000_003);
+        assert_eq!(capture.track_snapshot(0).unwrap().samples.last(), Some(&0.000_1));
+        assert_eq!(capture.track_snapshot(1).unwrap().samples.last(), Some(&-0.000_2));
+        let previous = capture.snapshot();
+        assert_eq!(capture.append_known_silence(u64::MAX), Err(CaptureError::BufferTooLarge));
+        assert_eq!(capture.snapshot(), previous);
+    }
 
     #[test]
     fn grows_only_as_audio_is_kept_and_shrinks_without_moving_the_recording_boundary() {

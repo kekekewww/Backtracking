@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use backtracking_core::{AutoResumeDelay, DurationChoice, WavExportProfile, WavSampleFormat};
 use nice_plug::params::persist::{PersistentField, deserialize_field, serialize_field};
@@ -69,6 +70,7 @@ impl CaptureInput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionSettings {
     pub(crate) retention: DurationChoice,
+    pub(crate) retain_silence: bool,
     pub(crate) idle_resume: AutoResumeDelay,
     pub(crate) panel_transparency: u8,
     pub(crate) accent: [u8; 3],
@@ -91,6 +93,12 @@ pub(crate) struct SessionSettings {
     pub(crate) saved_dir: PathBuf,
 }
 
+impl SessionSettings {
+    pub(crate) fn requires_continuous_processing(&self) -> bool {
+        self.retain_silence || self.sender_enabled
+    }
+}
+
 impl Default for SessionSettings {
     fn default() -> Self {
         let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
@@ -100,6 +108,7 @@ impl Default for SessionSettings {
         let backtracking = home.join("Backtracking");
         Self {
             retention: DurationChoice::Seconds20,
+            retain_silence: false,
             idle_resume: AutoResumeDelay::default(),
             panel_transparency: 0,
             accent: DEFAULT_ACCENT,
@@ -126,7 +135,7 @@ impl Default for SessionSettings {
 
 /// The DAW and editor share settings without locking or serializing capture data.
 #[derive(Clone, Default)]
-pub(crate) struct SettingsStore(Arc<Mutex<SessionSettings>>);
+pub(crate) struct SettingsStore(Arc<Mutex<SessionSettings>>, Arc<AtomicBool>);
 
 type PersistedFields = BTreeMap<String, String>;
 
@@ -135,6 +144,10 @@ impl SettingsStore {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn continuous_processing_signal(&self) -> Arc<AtomicBool> {
+        self.1.clone()
     }
 }
 
@@ -157,6 +170,7 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                 .and_then(|value| value.parse().ok())
                 .and_then(DurationChoice::from_seconds)
                 .unwrap_or(defaults.retention),
+            retain_silence: fields.get("retain_silence").is_some_and(|value| value == "true"),
             // Older projects used idle_resume_seconds=0 for Off.
             idle_resume: fields
                 .get(AUTO_RESUME_FIELD)
@@ -238,6 +252,7 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
             saved_dir: read_dir("saved_dir").unwrap_or(defaults.saved_dir),
         };
         *current = restored;
+        self.1.store(current.requires_continuous_processing(), Ordering::Release);
     }
 
     fn map<F, R>(&self, f: F) -> R
@@ -250,6 +265,7 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                 "history_seconds".into(),
                 settings.retention.seconds().to_string(),
             ),
+            ("retain_silence".into(), settings.retain_silence.to_string()),
             (
                 AUTO_RESUME_FIELD.into(),
                 settings.idle_resume.seconds().to_string(),
@@ -324,10 +340,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn continuous_processing_signal_follows_restore_without_worker_and_stays_instance_local() {
+        let settings = SettingsStore::default();
+        let signal = settings.continuous_processing_signal();
+        let shared = settings.clone();
+        let independent = SettingsStore::default();
+        assert!(Arc::ptr_eq(&signal, &shared.continuous_processing_signal()));
+        assert!(!Arc::ptr_eq(&signal, &independent.continuous_processing_signal()));
+        assert!(!signal.load(Ordering::Acquire));
+
+        settings.set(BTreeMap::from([("retain_silence".into(), "true".into())]));
+        assert!(signal.load(Ordering::Acquire));
+        assert!(!independent.continuous_processing_signal().load(Ordering::Acquire));
+        settings.set(BTreeMap::new());
+        assert!(!signal.load(Ordering::Acquire));
+        shared.set(BTreeMap::from([("retain_silence".into(), "true".into())]));
+        assert!(signal.load(Ordering::Acquire));
+        shared.set(BTreeMap::from([("retain_silence".into(), "invalid".into())]));
+        assert!(!signal.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn continuous_processing_signal_combines_sender_and_quiet_settings_atomically() {
+        let settings = SettingsStore::default();
+        let signal = settings.continuous_processing_signal();
+        for (quiet, sender, expected) in [(false, false, false), (false, true, true), (true, true, true),
+            (true, false, true), (false, false, false)]
+        {
+            settings.set(BTreeMap::from([
+                ("retain_silence".into(), quiet.to_string()),
+                ("sender_enabled".into(), sender.to_string()),
+            ]));
+            assert_eq!(signal.load(Ordering::Acquire), expected);
+            assert_eq!(settings.lock().retain_silence, quiet);
+        }
+        settings.set(BTreeMap::from([("sender_enabled".into(), "true".into())]));
+        assert!(!settings.lock().retain_silence);
+        assert!(signal.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn quiet_sections_default_off_and_legacy_or_invalid_state_restores_off() {
+        let settings = SettingsStore::default();
+        assert_eq!(settings.map(|fields| fields.get("retain_silence").cloned()), Some("false".into()));
+
+        settings.set(BTreeMap::from([("retain_silence".into(), "true".into())]));
+        assert_eq!(settings.map(|fields| fields.get("retain_silence").cloned()), Some("true".into()));
+
+        settings.set(BTreeMap::from([("history_seconds".into(), "30".into())]));
+        assert_eq!(settings.lock().retention, DurationChoice::Seconds30);
+        assert_eq!(settings.map(|fields| fields.get("retain_silence").cloned()), Some("false".into()));
+
+        settings.set(BTreeMap::from([("retain_silence".into(), "invalid".into())]));
+        assert_eq!(settings.map(|fields| fields.get("retain_silence").cloned()), Some("false".into()));
+    }
+
+    #[test]
+    fn quiet_sections_round_trips_when_enabled() {
+        let original = SettingsStore::default();
+        original.set(BTreeMap::from([("retain_silence".into(), "true".into())]));
+        let fields = original.map(Clone::clone);
+        let restored = SettingsStore::default();
+        restored.set(fields);
+        assert_eq!(restored.map(|fields| fields.get("retain_silence").cloned()), Some("true".into()));
+    }
+
+    #[test]
     fn source_and_waveform_preferences_round_trip() {
         let source = SettingsStore::default();
         {
             let mut settings = source.lock();
+            settings.retain_silence = true;
             settings.capture_input = CaptureInput::Both;
             settings.sender_enabled = true;
             settings.sender_name = "Rhythm".into();

@@ -318,6 +318,21 @@ impl SynchronizedCapture {
         &mut self.capture
     }
 
+    pub fn retain_silence(&self) -> bool {
+        self.capture.retain_silence()
+    }
+
+    pub fn set_retain_silence(&mut self, retain_silence: bool) {
+        if retain_silence == self.retain_silence() {
+            return;
+        }
+        // Commit already received packets using the previous policy. Re-anchor
+        // future input so an earlier unobserved quiet gap is not restored.
+        self.drain(true);
+        self.reset_input();
+        self.capture.set_retain_silence(retain_silence);
+    }
+
     /// Returns the last history allocation failure from asynchronous lane draining.
     pub fn take_capture_error(&mut self) -> Option<CaptureError> {
         self.capture_error.take()
@@ -361,25 +376,44 @@ impl SynchronizedCapture {
         if let Some(end_ns) = self.native_end_ns {
             let gap_ns = timestamp_ns.saturating_sub(end_ns);
             if discontinuity || gap_ns > NATIVE_TIMESTAMP_JITTER_NS {
-                self.capture.smooth_next_join();
-                // Long interruptions still close the gate and retain the normal pre-roll,
-                // without feeding an unbounded amount of artificial silence.
-                let mut gap_frames = ((u128::from(gap_ns) * u128::from(self.sample_rate)
+                let gap_frames = ((u128::from(gap_ns) * u128::from(self.sample_rate)
                     + NANOS_PER_SECOND / 2)
                     / NANOS_PER_SECOND)
-                    .min(u128::from(frames_for_ms(self.sample_rate, GAP_TAIL_MS)))
+                    .min(u128::from(u64::MAX))
                     as u64;
-                let have_gap = gap_frames != 0;
-                self.scratch.clear();
-                self.scratch.resize(DRAIN_FRAMES * channels, 0.);
-                while gap_frames > 0 {
-                    let count = gap_frames.min(DRAIN_FRAMES as u64) as usize;
-                    self.capture
-                        .push_interleaved(&self.scratch[..count * channels])?;
-                    gap_frames -= count as u64;
-                }
-                if have_gap {
-                    self.capture.smooth_next_start();
+                if self.retain_silence() {
+                    // Known quiet time remains on the timeline. A timestamp gap
+                    // alone is not a compressed edit seam; real discontinuities
+                    // keep the existing protection against abrupt joins.
+                    if discontinuity {
+                        self.capture.smooth_next_join();
+                        let prefix = gap_frames.min(frames_for_ms(self.sample_rate, GAP_FADE_MS));
+                        self.scratch.clear();
+                        self.scratch.resize(prefix as usize * channels, 0.);
+                        self.capture.push_interleaved(&self.scratch)?;
+                        self.capture.append_known_silence(gap_frames - prefix)?;
+                    } else {
+                        self.capture.append_known_silence(gap_frames)?;
+                    }
+                    if discontinuity && gap_frames != 0 {
+                        self.capture.smooth_next_start();
+                    }
+                } else {
+                    self.capture.smooth_next_join();
+                    // Compression needs only enough silence to close the gate
+                    // and fill pre-roll, independent of the interruption length.
+                    let mut remaining = gap_frames.min(frames_for_ms(self.sample_rate, GAP_TAIL_MS));
+                    let have_gap = remaining != 0;
+                    self.scratch.clear();
+                    self.scratch.resize(DRAIN_FRAMES * channels, 0.);
+                    while remaining > 0 {
+                        let count = remaining.min(DRAIN_FRAMES as u64) as usize;
+                        self.capture.push_interleaved(&self.scratch[..count * channels])?;
+                        remaining -= count as u64;
+                    }
+                    if have_gap {
+                        self.capture.smooth_next_start();
+                    }
                 }
             }
         }
@@ -639,7 +673,13 @@ impl SynchronizedCapture {
                 .unwrap_or(target);
             let gap_end = target.min(next_packet);
             if gap_end.saturating_sub(cursor) > gap_tail {
-                self.push_block(cursor, cursor + gap_tail, fade_frames);
+                if self.retain_silence() {
+                    if let Err(error) = self.capture.append_known_silence(gap_end - cursor) {
+                        self.capture_error = Some(error);
+                    }
+                } else {
+                    self.push_block(cursor, cursor + gap_tail, fade_frames);
+                }
                 cursor = gap_end;
             } else {
                 let end = target.min(cursor + DRAIN_FRAMES as u64);
@@ -690,6 +730,118 @@ fn ceil_grid(position: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retain_silence_keeps_native_quiet_gaps_and_bar_positions_on_both_lanes() {
+        let mut capture =
+            SynchronizedCapture::new(1000, 1, Some(1), DurationChoice::Seconds10).unwrap();
+        assert!(!capture.retain_silence());
+        capture.set_retain_silence(true);
+        let first = [0.0001, -0.0002, 0., 0., -0.0001, 0.0002, 0., 0.];
+        let last = [0.0003, -0.0004, 0., 0., 0.0002, -0.0001, 0., 0.];
+        capture.push_native_interleaved_with_markers(0, &first, false, &[0, 3]).unwrap();
+        capture.push_native_interleaved_with_markers(2_000_000_000, &last, false, &[1]).unwrap();
+        let a = capture.capture().track_snapshot(0).unwrap();
+        let b = capture.capture().track_snapshot(1).unwrap();
+        assert_eq!(a.frame_range(), 0..2004);
+        assert_eq!(a.frame_range(), b.frame_range());
+        assert_eq!(&a.samples[..4], &[0.0001, 0., -0.0001, 0.]);
+        assert_eq!(&b.samples[..4], &[-0.0002, 0., 0.0002, 0.]);
+        assert!(a.samples[4..2000].iter().all(|&sample| sample == 0.));
+        assert!(b.samples[4..2000].iter().all(|&sample| sample == 0.));
+        assert_eq!(&a.samples[2000..], &[0.0003, 0., 0.0002, 0.]);
+        assert_eq!(&b.samples[2000..], &[-0.0004, 0., -0.0001, 0.]);
+        assert_eq!(capture.capture().bar_markers(0..2004), vec![0, 3, 2001]);
+    }
+
+    #[test]
+    fn retain_silence_keeps_async_quiet_gaps_and_aligned_markers() {
+        let mut capture =
+            SynchronizedCapture::new(1000, 1, Some(1), DurationChoice::Seconds10).unwrap();
+        capture.set_retain_silence(true);
+        for lane in 0..2 {
+            capture.push_with_markers(lane, 0, 1000, &[0.; 10], false, &[2]).unwrap();
+        }
+        capture.drain(true);
+        for lane in 0..2 {
+            capture.push_with_markers(lane, 2_000_000_000, 1000, &[0.; 10], false, &[5]).unwrap();
+        }
+        capture.drain(true);
+        let a = capture.capture().track_snapshot(0).unwrap();
+        let b = capture.capture().track_snapshot(1).unwrap();
+        assert_eq!(a.frame_range(), 0..2010);
+        assert_eq!(a.frame_range(), b.frame_range());
+        assert!(a.samples.iter().chain(&b.samples).all(|&sample| sample == 0.));
+        assert_eq!(capture.capture().bar_markers(0..2010), vec![2, 2005]);
+    }
+
+    #[test]
+    fn retain_silence_switch_does_not_restore_pending_or_earlier_unobserved_quiet() {
+        let mut capture =
+            SynchronizedCapture::new(1000, 1, None, DurationChoice::Seconds10).unwrap();
+        capture.push_with_markers(0, 0, 1000, &[0.; 100], false, &[10]).unwrap();
+        capture.set_retain_silence(true);
+        assert!(capture.capture().frame_range().is_empty());
+        capture.push_with_markers(0, 5_000_000_000, 1000, &[0.; 10], false, &[2]).unwrap();
+        capture.drain(true);
+        assert_eq!(capture.capture().frame_range(), 0..10);
+        assert_eq!(capture.capture().bar_markers(0..10), vec![2]);
+
+        let before = capture.capture().snapshot();
+        capture.set_retain_silence(false);
+        assert_eq!(capture.capture().snapshot(), before);
+        capture.set_retain_silence(true);
+        assert_eq!(capture.capture().snapshot(), before);
+        capture.push_native_interleaved(10_000_000_000, &[0.; 5], false).unwrap();
+        capture.set_retain_silence(true);
+        capture.push_native_interleaved(11_000_000_000, &[0.; 5], false).unwrap();
+        assert_eq!(capture.capture().frame_range(), 0..1015);
+    }
+
+    #[test]
+    fn retained_native_long_gap_rolls_history_without_losing_absolute_time() {
+        let mut capture =
+            SynchronizedCapture::new(10, 1, None, DurationChoice::Seconds10).unwrap();
+        capture.set_retain_silence(true);
+        capture.push_native_interleaved(0, &[0.125; 2], false).unwrap();
+        capture.push_native_interleaved_with_markers(1_000_000_000_000, &[0.25; 2], false, &[1]).unwrap();
+        let snapshot = capture.capture().snapshot();
+        assert_eq!(snapshot.frame_range(), 9902..10002);
+        assert!(snapshot.samples[..98].iter().all(|&sample| sample == 0.));
+        assert_eq!(&snapshot.samples[98..], &[0.25; 2]);
+        assert_eq!(capture.capture().bar_markers(snapshot.frame_range()), vec![10001]);
+    }
+
+    #[test]
+    fn retain_silence_preserves_explicit_native_discontinuity_fades() {
+        let mut capture =
+            SynchronizedCapture::new(1000, 1, None, DurationChoice::Seconds10).unwrap();
+        capture.set_retain_silence(true);
+        capture.push_native_interleaved(0, &[0.25; 8], false).unwrap();
+        capture.push_native_interleaved(9_000_000, &[0.75; 8], true).unwrap();
+        let snapshot = capture.capture().snapshot();
+        assert_eq!(snapshot.frame_range(), 0..17);
+        assert_eq!(&snapshot.samples[..7], &[0.25; 7]);
+        assert_eq!(&snapshot.samples[7..10], &[0.; 3]);
+        assert_eq!(&snapshot.samples[10..], &[0.75; 7]);
+    }
+
+    #[test]
+    fn retain_silence_switch_preserves_an_explicit_pause_and_existing_audio() {
+        let mut capture =
+            SynchronizedCapture::new(1000, 1, None, DurationChoice::Seconds10).unwrap();
+        capture.push_native_interleaved(0, &[0.25; 4], false).unwrap();
+        let before = capture.capture().snapshot();
+        capture.capture_mut().pause();
+        capture.set_retain_silence(true);
+        assert_eq!(capture.capture().state(), crate::CaptureState::Paused);
+        assert_eq!(capture.capture().snapshot(), before);
+        capture.push_native_interleaved(10_000_000_000, &[0.; 4], false).unwrap();
+        capture.push_native_interleaved(12_000_000_000, &[0.; 4], false).unwrap();
+        capture.set_retain_silence(false);
+        assert_eq!(capture.capture().state(), crate::CaptureState::Paused);
+        assert_eq!(capture.capture().snapshot(), before);
+    }
 
     #[test]
     fn sender_bars_use_the_shared_grid_and_survive_only_with_retained_audio() {
