@@ -187,6 +187,15 @@ body { font-family: var(--c-sans); color: var(--c-paper); -webkit-font-smoothing
 .cmd { background: var(--c-ink); color: var(--c-paper); font-family: "Geist Mono", monospace; font-weight: 500; white-space: nowrap; padding: 16px 22px; box-shadow: 10px 10px 0 rgba(7, 12, 61, 0.55); }
 .cmd .p { color: var(--c-mint); margin-right: 0.6em; }
 
+/* plug-in panel: Keep on top is a desktop-only feature, so hide the pin (5th item in bt-panel's toolbar) */
+.nopin .btp-bar > span:nth-child(5) { display: none; }
+
+/* keycaps inside running text (sub-lines) */
+.ikeys { display: inline-flex; align-items: center; gap: 0.2em; white-space: nowrap; vertical-align: middle; margin: -0.2em 0.06em 0; }
+.ikeys .key { font-size: 0.8em; height: 1.4em; min-width: 1.4em; padding: 0 0.34em; box-shadow: 0.12em 0.12em 0 var(--c-ink); }
+.ikeys .key.tick { font-size: 1.15em; height: 0.98em; min-width: 1.15em; padding: 0.3em 0.18em 0; }
+.ikeys .plus { font-weight: 900; color: var(--c-mint); }
+
 .label { font-stretch: 125%; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; color: var(--c-paper-2); }
 .zh .label { letter-spacing: 0.1em; }
 .mintline { background: var(--c-mint); }

@@ -17,7 +17,7 @@
   },
   url: "backtracking.kamelkyp.com",
   /* 換行時不可拆開的詞組 */
-  nobreak: ["框選後直接拖出 WAV。", "從 GitHub 下載。", "10 秒", "10 分鐘", "秒數線", "小節線", "記憶體中", "指定 App", "Super + `", "Backtracking 插件", "macOS 14.2 以上", "WAV。", "繼續錄音。", "資料夾"],
+  nobreak: ["框選後直接拖出 WAV。", "從 GitHub 下載。", "10 秒", "10 分鐘", "秒數線", "小節線", "記憶體中", "指定 App", "Backtracking 插件", "macOS 14.2 以上", "WAV。", "繼續錄音。", "資料夾"],
   repo: "github.com/kekekewww/Backtracking",
 
   beats: [
@@ -43,7 +43,7 @@
       sub: "插在音軌、群組或主輸出上，留住經過的聲音，再拖出成 WAV。"
     },
     linux: {
-      label: "Linux 快照快捷鍵",
+      label: "Linux 快捷鍵輔助工具",
       mega: ["一個按鍵", "存下來"],
       sub: "全域 Super + ` 快捷鍵，讓 Backtracking 插件儲存快照。從 GitHub 下載。"
     }
@@ -55,6 +55,7 @@
     abNote: "同時擷取 A／B 兩路，匯出兩個起訖對齊的 WAV",
     shortcutNote: "背景儲存快照",
     winReq: "Windows 10／11 x64",
+    winAppReq: "擷取指定 App 需 Windows 11。",
     waveOnly: "只顯示波形，置頂",
     plugin: "插件",
     formats: "VST3 · CLAP",
@@ -65,7 +66,7 @@
     inserts: ["EQ", "Comp", "Backtracking", "Limiter"],
     instance: "插件實例",
     request: "送出一次快照請求",
-    helper: "Linux 快照快捷鍵常駐程式",
+    helper: "Linux 快捷鍵輔助工具",
     command: "backtracking-shortcut --target INSTANCE_ID",
     snapshot: "快照已儲存"
   }

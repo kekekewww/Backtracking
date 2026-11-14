@@ -16,7 +16,7 @@
   },
   url: "backtracking.kamelkyp.com",
   /* phrases kept on one line when text wraps */
-  nobreak: ["plug-in", "Super + `", "Download from GitHub", "10 minutes", "10 seconds"],
+  nobreak: ["plug-in", "Download from GitHub", "10 minutes", "10 seconds"],
   repo: "github.com/kekekewww/Backtracking",
 
   beats: [
@@ -55,6 +55,7 @@
     abNote: "Record two sources at once and save two aligned WAVs.",
     shortcutNote: "Save from the background",
     winReq: "Windows 10/11 x64",
+    winAppReq: "Capturing one chosen app needs Windows 11.",
     waveOnly: "Waveform only, kept on top",
     plugin: "Plug-in",
     formats: "VST3 · CLAP",

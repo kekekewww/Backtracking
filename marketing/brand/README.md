@@ -43,6 +43,10 @@ Product owner's decision (overrides any earlier wording): availability is one me
   "Download for macOS"). One button, one destination.
 - Do not quote a version number.
 - Requirements that may be shown as small print: Windows 10/11 x64; macOS 14.2 or later.
+- Capturing one chosen app on Windows needs OS build 20348 or later (`docs/USER_GUIDE.md`), which in
+  practice is Windows 11. Wherever Windows-specific copy offers "one chosen app" next to "Windows 10/11",
+  add: **"Capturing one chosen app needs Windows 11."** / **「擷取指定 App 需 Windows 11。」**
+  General copy that is not about Windows (the Sources feature line) stays as it is.
 - The Linux shortcut helper is not part of the editions line. Where it has its own poster or card,
   it also points to GitHub with the same call to action.
 
@@ -105,6 +109,13 @@ mega headline and sub-line. Headlines below are the starting point. Line breaks 
 | Linux shortcut helper | ONE KEY. / SAVED. | 一個按鍵 / 存下來 | A global Super + ` shortcut that tells a Backtracking plug-in instance to save a snapshot. Download from GitHub. | 全域 Super + ` 快捷鍵，讓 Backtracking 插件儲存快照。從 GitHub 下載。 |
 
 The Linux item is only a shortcut helper for the plug-in. Do not present it as a Linux recorder app.
+Its name is "Linux shortcut helper" / 「Linux 快捷鍵輔助工具」 everywhere.
+
+The backtick key is too small to read as a bare character in running text. In posters and videos draw
+it as a keycap (like the Shift keycap); on the site use `<kbd>`.
+
+Chinese copy must not break inside a term: keep 瞬時, 指定 App, 起訖, 透明度, 快照, 24-bit and whole key
+combinations (Alt + `) together on one line.
 
 ## Glossary (zh-TW)
 

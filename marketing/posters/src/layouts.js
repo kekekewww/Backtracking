@@ -66,7 +66,14 @@
     return '<h1 class="mega' + (o.inline ? " inline" : "") + '" data-fit=\'' + JSON.stringify(fit) + "'" +
       S({ l: o.l, t: o.t + (ZH && !o.inline ? (o.zdy == null ? 10 : o.zdy) : 0), w: o.w, "text-align": o.align }) + ">" + inner + "</h1>";
   }
-  function sub(text, o) { return '<p class="sub"' + S(o) + ">" + nb(text) + "</p>"; }
+  /* key combinations in running text ("Super + `") are drawn as small inline keycaps:
+     a bare backtick is too small to read (brand README, Edition posters notes) */
+  function inlineKeys(h) {
+    return h.replace(/\b(Super|Alt|fn) \+ `/g, function (m, k) {
+      return '<span class="ikeys"><span class="key">' + k + '</span><span class="plus">+</span><span class="key tick">`</span></span>';
+    });
+  }
+  function sub(text, o) { return '<p class="sub"' + S(o) + ">" + nb(inlineKeys(text)) + "</p>"; }
   function scale(o, bare) {
     return '<div class="scale wide' + (bare ? " bare" : "") + '"' + S(o) + ">" + C.scale.map(function (s, i) {
       return "<span" + (i === C.scale.length - 1 ? ' class="on"' : "") + ">" + esc(s) + "</span>";
@@ -93,7 +100,7 @@
     return '<div class="btn"' + S(o) + ">" + DL + esc(C.cta.download) + "</div>";
   }
   function panel(opts, o) {
-    return '<div class="panel"' + S({ l: o.l, t: o.t }) + '><div class="btp c' + (o.s10 ? " s10" : "") + '"' + S({ z: o.z }) +
+    return '<div class="panel' + (o.nopin ? " nopin" : "") + '"' + S({ l: o.l, t: o.t }) + '><div class="btp c' + (o.s10 ? " s10" : "") + '"' + S({ z: o.z }) +
       " data-btp='" + JSON.stringify(opts) + "'></div></div>";
   }
   function slab(o) {
@@ -195,6 +202,8 @@
         chip(e.label, { l: 64, t: 146, fs: L(15, 18) }, "ink") +
         mega(e.mega, { l: 56, t: 214, w: 948, h: 380, max: 280 }) +
         sub(e.sub, { l: 64, t: 632, w: L(600, 620), fs: L(24, 24) }) +
+        // app capture needs OS build 20348+, i.e. Windows 11 (docs/USER_GUIDE.md)
+        '<p class="sub"' + S({ l: 64, t: L(714, 728), w: 640, fs: L(19, 19), color: "var(--c-paper)" }) + ">" + esc(C.ui.winAppReq) + "</p>" +
         srcCard({ l: 736, t: L(586, 572), w: 280, fs: L(19, 21), z: 3 }, 2) +
         panel(P({ width: 580, waveHeight: 92, rows: 2, seed: 7, selection: [0.36, 0.62], tooltip: null, duration: null, meter: "&minus;12.6", meterUnit: "dBFS" }), { l: 64, t: 792, z: 1.32 }) +
         '<div class="ab"' + S({ l: 28, t: 792 + 38 * 1.32 + 6, h: 92 * 1.32 - 12 }) + ">" +
@@ -248,7 +257,7 @@
         '<div class="inserts"' + S({ l: 716, t: 168, w: 270 }) + '><div class="ttl">' + esc(u.tracks[3]) + " · " + esc(u.formats) + "</div>" +
           u.inserts.map(function (s, i) { return '<div class="slot' + (i === 2 ? " on" : "") + '"><i></i>' + esc(s) + "</div>"; }).join("") +
           '<div class="slot empty"></div></div>' +
-        panel(P({ width: 470, waveHeight: 64, seed: 5, selection: [0.5, 0.74], tooltip: { text: "Drag and Drop", at: 0.62, y: 46 }, meter: "&minus;9.8", meterUnit: "dBFS" }), { l: 230, t: 446, z: 1.34 }) +
+        panel(P({ width: 470, waveHeight: 64, seed: 5, selection: [0.5, 0.74], tooltip: { text: "Drag and Drop", at: 0.62, y: 46 }, meter: "&minus;9.8", meterUnit: "dBFS" }), { l: 230, t: 446, z: 1.34, nopin: true }) +
         label(u.pluginNote, { l: 64, t: 656, fs: L(14, 16), color: "var(--c-paper)", "text-transform": "none", "letter-spacing": "0.02em" }) +
         mega(e.mega, { l: 56, t: 700, w: 950, h: 330, max: 230 }) +
         chip(e.label, { r: 64, t: L(930, 884), fs: L(15, 17) }, "ink") +

@@ -29,8 +29,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-edition-windows-en.png",
   "w": 1080,
   "h": 1350,
-  "bytes": 172000,
-  "mtime": "2026-11-14T04:34:46.899Z"
+  "bytes": 178136,
+  "mtime": "2026-11-14T06:01:51.125Z"
  },
  {
   "name": "edition-windows",
@@ -40,8 +40,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-edition-windows-zh-TW.png",
   "w": 1080,
   "h": 1350,
-  "bytes": 182165,
-  "mtime": "2026-11-14T04:41:07.780Z"
+  "bytes": 187051,
+  "mtime": "2026-11-14T06:01:51.333Z"
  },
  {
   "name": "edition-macos",
@@ -73,8 +73,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-edition-plugin-en.png",
   "w": 1080,
   "h": 1350,
-  "bytes": 185579,
-  "mtime": "2026-11-14T04:34:48.438Z"
+  "bytes": 185278,
+  "mtime": "2026-11-14T06:01:51.162Z"
  },
  {
   "name": "edition-plugin",
@@ -84,8 +84,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-edition-plugin-zh-TW.png",
   "w": 1080,
   "h": 1350,
-  "bytes": 183743,
-  "mtime": "2026-11-14T04:41:07.872Z"
+  "bytes": 183402,
+  "mtime": "2026-11-14T06:01:51.319Z"
  },
  {
   "name": "edition-linux",
@@ -95,8 +95,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-edition-linux-en.png",
   "w": 1080,
   "h": 1350,
-  "bytes": 150003,
-  "mtime": "2026-11-14T04:34:49.416Z"
+  "bytes": 151011,
+  "mtime": "2026-11-14T06:02:08.519Z"
  },
  {
   "name": "edition-linux",
@@ -106,8 +106,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-edition-linux-zh-TW.png",
   "w": 1080,
   "h": 1350,
-  "bytes": 154873,
-  "mtime": "2026-11-14T04:41:11.376Z"
+  "bytes": 156078,
+  "mtime": "2026-11-14T06:02:08.633Z"
  },
  {
   "name": "github-social",
