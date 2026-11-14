@@ -270,6 +270,11 @@ fn same_path(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b) || a.to_lowercase() == b.to_lowercase()
 }
 
+/// Loopback streams only signal their notification event from Windows 10 1703.
+pub(super) fn supports_event_loopback() -> bool {
+    windows_build() >= 15_063
+}
+
 fn windows_build() -> u32 {
     use std::sync::OnceLock;
     static BUILD: OnceLock<u32> = OnceLock::new();

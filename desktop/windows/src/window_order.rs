@@ -7,11 +7,96 @@ use windows::Win32::{
         SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SetWindowPos, WS_EX_TOPMOST,
     },
 };
+use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer, WM_NCDESTROY, WM_TIMER};
 use winit::{
     dpi::PhysicalPosition,
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::Window,
 };
+
+/// "BTPI". Identifies both the subclass and its timer on the capture window.
+const PIN_WATCH_ID: usize = 0x4254_5049;
+/// Windows does not tell a window that another topmost window was placed above
+/// it, so a pinned window looks for itself. This costs no repaint.
+const PIN_CHECK_MS: u32 = 250;
+/// After a raise, give the other window time to settle before trying again.
+const PIN_RETRY_MS: u32 = 320;
+
+/// Keeps a pinned window above other topmost windows from a native timer on
+/// its own message queue, so the check never needs a UI pass.
+pub(crate) struct PinWatch {
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    active: bool,
+}
+
+impl PinWatch {
+    pub(crate) fn attach(window: &Window) -> Option<Self> {
+        let hwnd = window_hwnd(window)?.0;
+        // The subclass removes itself when the window is destroyed.
+        (unsafe { SetWindowSubclass(hwnd, Some(pin_watch_message), PIN_WATCH_ID, 0) } != 0)
+            .then_some(Self { hwnd, active: false })
+    }
+
+    pub(crate) fn set_active(&mut self, active: bool) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
+        if active {
+            // Check at once, as a newly pinned window should rise immediately.
+            unsafe { check_pinned(self.hwnd) };
+        } else {
+            unsafe { KillTimer(self.hwnd, PIN_WATCH_ID) };
+        }
+    }
+}
+
+impl Drop for PinWatch {
+    fn drop(&mut self) {
+        unsafe {
+            KillTimer(self.hwnd, PIN_WATCH_ID);
+            RemoveWindowSubclass(self.hwnd, Some(pin_watch_message), PIN_WATCH_ID);
+        }
+    }
+}
+
+/// Raises the window if it is covered and arms the timer for the next check.
+unsafe fn check_pinned(hwnd: windows_sys::Win32::Foundation::HWND) {
+    let attempted = raise_hwnd_if_covered(HWND(hwnd));
+    let delay = if attempted { PIN_RETRY_MS } else { PIN_CHECK_MS };
+    // Setting a timer that already exists replaces its period.
+    unsafe { SetTimer(hwnd, PIN_WATCH_ID, delay, None) };
+}
+
+unsafe extern "system" fn pin_watch_message(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    message: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+    id: usize,
+    _data: usize,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    if message == WM_TIMER && wparam == PIN_WATCH_ID {
+        unsafe { check_pinned(hwnd) };
+        return 0;
+    }
+    if message == WM_NCDESTROY {
+        unsafe {
+            KillTimer(hwnd, PIN_WATCH_ID);
+            RemoveWindowSubclass(hwnd, Some(pin_watch_message), id);
+        }
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+fn window_hwnd(window: &Window) -> Option<HWND> {
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return None;
+    };
+    Some(HWND(handle.hwnd.get() as *mut _))
+}
 
 /// Restore a physical desktop coordinate only when a usable portion of the window is visible.
 /// Otherwise, keep the OS placement, for example when a display has been unplugged.
@@ -37,14 +122,11 @@ pub(crate) fn restore_position(window: &Window, [x, y]: [i32; 2]) {
 /// Reassert the app's topmost order when another visible window covers it.
 /// Returns whether a raise was attempted, so callers can throttle retries.
 pub(crate) fn raise_if_covered(window: &Window) -> bool {
-    let Ok(handle) = window.window_handle() else {
-        return false;
-    };
-    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-        return false;
-    };
-    let hwnd = HWND(handle.hwnd.get() as *mut _);
-    // The handle is borrowed from the live window on its event-loop thread.
+    window_hwnd(window).is_some_and(raise_hwnd_if_covered)
+}
+
+fn raise_hwnd_if_covered(hwnd: HWND) -> bool {
+    // The handle belongs to the live window and is used on its event-loop thread.
     unsafe {
         if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() || is_cloaked(hwnd) {
             return false;

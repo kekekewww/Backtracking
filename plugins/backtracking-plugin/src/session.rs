@@ -7,14 +7,66 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{
-    AutoResumeDelay, Capture, CaptureState, ChannelRoute, DurationChoice, MeterReadings,
-    SenderEndpoint, Snapshot, TimedAudioQueue, WavExportProfile, WaveformView, capture_clock_ns,
-    export_routed_tracks_with_profile,
+    AutoResumeDelay, Capture, CaptureState, ChannelRoute, DurationChoice, FrozenTrack,
+    MeterReadings, SenderEndpoint, TimedAudioQueue, WavExportProfile, WaveformView,
+    capture_clock_ns, export_routed_tracks_with_tempo,
 };
+#[cfg(test)]
+use backtracking_core::Snapshot;
 
 use crate::settings::{CaptureInput, MeterMode, SessionSettings, SettingsStore, WaveformLayout};
 
 pub(crate) const WAVEFORM_BINS: usize = 512;
+
+/// The capture thread's wait between passes while audio or commands keep arriving.
+const ACTIVE_WAIT: Duration = Duration::from_millis(4);
+/// Its wait while the host is not processing and nothing else is pending. The
+/// editor wakes it directly; a Sender connection or a snapshot request from the
+/// desktop app is noticed within this time.
+const IDLE_WAIT: Duration = Duration::from_millis(50);
+/// Stay on the short wait this long after the last work. Host blocks can be
+/// nearly 200 ms apart (8192 frames at 44.1 kHz) without the host having stopped.
+const ACTIVE_HOLD: Duration = Duration::from_millis(250);
+
+/// Chooses how long the capture thread waits before it looks for work again.
+struct Pace {
+    last_work: Option<Instant>,
+}
+
+impl Pace {
+    fn starting_at(now: Instant) -> Self {
+        // A new worker usually means the host is about to process.
+        Self { last_work: Some(now) }
+    }
+
+    fn wait(&mut self, had_work: bool, now: Instant) -> Duration {
+        if had_work {
+            self.last_work = Some(now);
+        }
+        if self
+            .last_work
+            .is_some_and(|last| now.saturating_duration_since(last) < ACTIVE_HOLD)
+        {
+            ACTIVE_WAIT
+        } else {
+            IDLE_WAIT
+        }
+    }
+}
+
+/// Frames and packet slots of the queue between the audio callback and the
+/// capture thread. Two seconds of audio absorb cold allocation and snapshot work,
+/// and the slots cover an eighth of a second of single-frame blocks, which is more
+/// than twice `IDLE_WAIT`.
+fn queue_capacity(rate: u32, max_buffer: u32) -> (usize, usize) {
+    let block_capacity = (max_buffer as usize).saturating_mul(2).min(rate as usize);
+    let frames = (rate as usize)
+        .saturating_mul(2)
+        .max(block_capacity)
+        .max(4096)
+        .next_power_of_two();
+    (frames, frames.div_ceil(16).clamp(4096, 65_536))
+}
 
 #[derive(Clone)]
 pub(crate) struct WaveformPeaks {
@@ -53,7 +105,8 @@ pub(crate) struct WaveformTimeline {
 pub(crate) struct EditingSnapshot {
     pub(crate) token: u64,
     pub(crate) timeline: Arc<WaveformTimeline>,
-    pub(crate) snapshots: Arc<[Snapshot]>,
+    /// The lanes of one frozen view. They share the capture's pages.
+    pub(crate) snapshots: Arc<[FrozenTrack]>,
 }
 
 #[derive(Default)]
@@ -266,6 +319,11 @@ pub(crate) struct Session {
     writer_active: AtomicBool,
     dropped_frames: AtomicUsize,
     snapshot_result: Arc<Mutex<Option<SnapshotResult>>>,
+    /// Bits of the tempo the host last reported, or zero while it has reported none.
+    host_tempo: AtomicU64,
+    /// The running capture thread, so the editor can end its wait early. Never
+    /// touched from the audio callback.
+    consumer_thread: Mutex<Option<thread::Thread>>,
 }
 
 type SnapshotResult = (u64, Range<u64>, Result<Vec<PathBuf>, String>);
@@ -308,6 +366,43 @@ impl Session {
             writer_active: AtomicBool::new(false),
             dropped_frames: AtomicUsize::new(0),
             snapshot_result: Arc::new(Mutex::new(None)),
+            host_tempo: AtomicU64::new(0),
+            consumer_thread: Mutex::new(None),
+        }
+    }
+
+    /// Ends the capture thread's wait so it acts on a command now. For the
+    /// editor and other non-realtime callers only: it takes a lock and may make
+    /// a system call.
+    fn wake_consumer(&self) {
+        if let Some(thread) = &*self.consumer_thread.lock().unwrap_or_else(|error| error.into_inner()) {
+            thread.unpark();
+        }
+    }
+
+    fn set_consumer_thread(&self, thread: thread::Thread) {
+        *self.consumer_thread.lock().unwrap_or_else(|error| error.into_inner()) = Some(thread);
+    }
+
+    /// Forgets `thread` unless a newer worker has already replaced it.
+    fn clear_consumer_thread(&self, thread: &thread::Thread) {
+        let mut current = self.consumer_thread.lock().unwrap_or_else(|error| error.into_inner());
+        if current.as_ref().is_some_and(|current| current.id() == thread.id()) {
+            *current = None;
+        }
+    }
+
+    /// Called from the audio callback: one atomic store, no lock and no allocation.
+    pub(crate) fn set_host_tempo(&self, tempo: Option<f64>) {
+        let tempo = tempo.filter(|tempo| tempo.is_finite() && *tempo > 0.0);
+        self.host_tempo.store(tempo.map_or(0, f64::to_bits), Ordering::Relaxed);
+    }
+
+    /// The tempo the host is playing at, in beats per minute. Exported files are named after it.
+    pub(crate) fn host_tempo(&self) -> Option<f64> {
+        match self.host_tempo.load(Ordering::Relaxed) {
+            0 => None,
+            bits => Some(f64::from_bits(bits)),
         }
     }
 
@@ -396,10 +491,13 @@ impl Session {
     }
 
     pub(crate) fn update_editor_settings(&self, mut settings: SessionSettings) {
-        let mut current = self.settings.lock();
-        settings.sender_id = current.sender_id.clone();
-        *current = settings;
-        self.continuous_processing_requested.store(current.requires_continuous_processing(), Ordering::Release);
+        {
+            let mut current = self.settings.lock();
+            settings.sender_id = current.sender_id.clone();
+            *current = settings;
+            self.continuous_processing_requested.store(current.requires_continuous_processing(), Ordering::Release);
+        }
+        self.wake_consumer();
     }
 
     pub(crate) fn sidechain_available(&self) -> bool {
@@ -418,6 +516,7 @@ impl Session {
 
     pub(crate) fn set_retention(&self, retention: DurationChoice) {
         self.settings.lock().retention = retention;
+        self.wake_consumer();
     }
 
     pub(crate) fn set_idle_resume(&self, idle_resume: AutoResumeDelay) {
@@ -511,9 +610,13 @@ impl Session {
     }
 
     pub(crate) fn resume(&self) {
-        let mut state = self.lock();
-        Self::resume_locked(&mut state);
-        self.publish(&state);
+        {
+            let mut state = self.lock();
+            Self::resume_locked(&mut state);
+            self.publish(&state);
+        }
+        // The capture thread re-arms the audio callback.
+        self.wake_consumer();
     }
 
     pub(crate) fn clear(&self) {
@@ -534,6 +637,9 @@ impl Session {
         state.editing = None;
         state.editing_pending = false;
         self.publish(&state);
+        drop(state);
+        // The capture thread re-arms the audio callback.
+        self.wake_consumer();
     }
 
     fn resume_locked(state: &mut State) {
@@ -583,6 +689,7 @@ impl Session {
             token: self.edit_token.load(Ordering::Acquire),
             action,
         });
+        self.wake_consumer();
     }
 
     fn apply_editor_commands(&self, state: &mut State) {
@@ -626,7 +733,7 @@ impl Session {
         self.published().epoch
     }
 
-    pub(crate) fn positioned_snapshots(&self, live: bool) -> Option<(u64, Arc<[Snapshot]>)> {
+    pub(crate) fn positioned_snapshots(&self, live: bool) -> Option<(u64, Arc<[FrozenTrack]>)> {
         if !live && self.edit_requested.load(Ordering::Acquire) {
             let editing = self.editing_snapshot()?;
             return Some((editing.timeline.epoch, editing.snapshots));
@@ -644,7 +751,7 @@ impl Session {
     #[cfg(test)]
     fn positioned_snapshot(&self, live: bool) -> Option<(u64, Snapshot)> {
         let (epoch, snapshots) = self.positioned_snapshots(live)?;
-        snapshots.first().cloned().map(|snapshot| (epoch, snapshot))
+        snapshots.first().map(|track| (epoch, track.snapshot()))
     }
 
     #[cfg(test)]
@@ -759,6 +866,7 @@ impl Session {
 
     pub(crate) fn request_snapshot(&self) {
         let _ = self.snapshot_commands.send(self.timeline_epoch());
+        self.wake_consumer();
     }
 
     fn try_snapshot_for_shortcut(&self, expected_epoch: Option<u64>) -> SnapshotAttempt {
@@ -794,7 +902,7 @@ impl Session {
         let settings = self.settings();
         let selected = if full_history { None } else { state.selection.clone() };
         let epoch = state.timeline_epoch;
-        let snapshots: Arc<[Snapshot]> = if selected.is_some() {
+        let snapshots: Arc<[FrozenTrack]> = if selected.is_some() {
             if state.editing_pending { return None; }
             state.editing.as_ref()?.snapshots.clone()
         } else {
@@ -825,6 +933,7 @@ impl Session {
         }
         self.publish(&state);
         Some(SnapshotJob {
+            tempo: self.host_tempo(),
             settings,
             snapshots,
             epoch,
@@ -833,7 +942,9 @@ impl Session {
         })
     }
 
-    fn consume(&self) {
+    /// Returns whether more work is already known to be waiting: input that
+    /// could not be re-armed yet, or packets left in the queue.
+    fn consume(&self) -> bool {
         let mut state = self.lock();
         self.apply_capture_settings(&mut state);
         self.apply_editor_commands(&mut state);
@@ -842,16 +953,15 @@ impl Session {
         if state.paused
             && !state.gesture_active
             && state.selection.is_none()
-            && state.idle_resume != AutoResumeDelay::Immediate
-            && state.last_interaction.elapsed()
-                >= Duration::from_secs(u64::from(state.idle_resume.seconds()))
+            && state.idle_resume.remaining(state.last_interaction.elapsed())
+                .is_some_and(|remaining| remaining.is_zero())
         {
             Self::resume_locked(&mut state);
         }
 
         let paused = state.paused;
         let Some(consumer) = &mut state.consumer else {
-            return;
+            return false;
         };
         let accepting = self.accepting.load(Ordering::SeqCst);
         if accepting && !paused {
@@ -863,7 +973,10 @@ impl Session {
         if !accepting && !paused {
             self.accept_input_when_safe(consumer);
         }
+        let pending = consumer.queue.pending_packets() != 0
+            || (!paused && !self.accepting.load(Ordering::SeqCst));
         self.publish(&state);
+        pending
     }
 
     fn pin_editing_material(&self, state: &mut State) {
@@ -898,16 +1011,20 @@ impl Session {
     }
 }
 
-fn track_snapshots(capture: &Capture) -> Vec<Snapshot> {
-    (0..2).filter_map(|lane| capture.track_snapshot(lane)).collect()
+/// Pins every lane of the retained audio. The lanes share the capture's one-second
+/// pages, so under the session lock this clones one pointer per retained second and
+/// copies only the page still being written.
+fn track_snapshots(capture: &Capture) -> Vec<FrozenTrack> {
+    capture.freeze().tracks()
 }
 
 struct SnapshotJob {
     settings: SessionSettings,
-    snapshots: Arc<[Snapshot]>,
+    snapshots: Arc<[FrozenTrack]>,
     epoch: u64,
     range: Range<u64>,
     relative: Range<usize>,
+    tempo: Option<f64>,
 }
 
 enum SnapshotAttempt {
@@ -918,13 +1035,14 @@ enum SnapshotAttempt {
 
 impl SnapshotJob {
     fn write(self) -> SnapshotResult {
-        let result = export_routed_tracks_with_profile(
+        let result = export_routed_tracks_with_tempo(
             &self.settings.saved_dir,
             &self.snapshots,
             self.relative,
             self.settings.wav_profile,
             &[ChannelRoute::Merged; 2][..self.snapshots.len()],
             self.settings.force_mono,
+            self.tempo,
         ).map_err(|error| error.to_string());
         (self.epoch, self.range, result)
     }
@@ -949,6 +1067,7 @@ impl Worker {
     pub(crate) fn stop_background_for_test(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
+            self.session.clear_consumer_thread(thread.thread());
             thread.thread().unpark();
             thread.join().unwrap();
         }
@@ -995,14 +1114,9 @@ impl Worker {
             if state.paused {
                 capture.pause();
             }
-            let block_capacity = (max_buffer as usize).saturating_mul(2).min(rate as usize);
             // A bounded two-second backlog absorbs cold allocation/snapshot work
             // while the realtime callback keeps publishing without taking locks.
-            let capacity_frames = (rate as usize).saturating_mul(2)
-                .max(block_capacity)
-                .max(4096)
-                .next_power_of_two();
-            let metadata_slots = capacity_frames.div_ceil(16).clamp(4096, 65_536);
+            let (capacity_frames, metadata_slots) = queue_capacity(rate, max_buffer);
             let queue = TimedAudioQueue::new(capacity_frames, metadata_slots, channels + sidechain);
             state.timeline_epoch = state.timeline_epoch.wrapping_add(1);
             state.gesture_active = false;
@@ -1039,6 +1153,7 @@ impl Worker {
         let worker_sender_queue = sender_queue.clone();
         let sender_active = Arc::new(AtomicBool::new(false));
         let worker_sender_active = sender_active.clone();
+        let worker_queue = queue.clone();
         let thread = match thread::Builder::new()
             .name("backtracking-capture".to_owned())
             .spawn(move || {
@@ -1049,10 +1164,16 @@ impl Worker {
                     channels,
                     sidechain,
                 );
+                let mut pace = Pace::starting_at(Instant::now());
                 while !worker_stop.load(Ordering::Relaxed) {
-                    worker_session.consume();
+                    // Blocks the host delivered since the last pass show that it is
+                    // processing. Reading the queue costs the audio callback nothing.
+                    let arrived = worker_queue.pending_packets() != 0
+                        || sender.queue.pending_packets() != 0;
+                    let pending = worker_session.consume();
                     sender.update(&worker_session);
-                    thread::park_timeout(Duration::from_millis(4));
+                    let had_work = arrived || pending || sender.pending_snapshots != 0;
+                    thread::park_timeout(pace.wait(had_work, Instant::now()));
                 }
             }) {
             Ok(thread) => thread,
@@ -1062,6 +1183,7 @@ impl Worker {
                 return None;
             }
         };
+        session.set_consumer_thread(thread.thread().clone());
         Some(Self {
             session,
             queue,
@@ -1310,6 +1432,7 @@ impl Drop for Worker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
+            self.session.clear_consumer_thread(thread.thread());
             thread.thread().unpark();
             let _ = thread.join();
         }
@@ -1360,6 +1483,19 @@ mod tests {
     }
 
     #[test]
+    fn host_tempo_is_kept_for_file_names_only_while_the_host_reports_a_usable_one() {
+        let session = Session::new(SettingsStore::default());
+        assert_eq!(session.host_tempo(), None);
+        session.set_host_tempo(Some(128.5));
+        assert_eq!(session.host_tempo(), Some(128.5));
+        for unusable in [None, Some(0.0), Some(-90.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            session.set_host_tempo(Some(140.0));
+            session.set_host_tempo(unusable);
+            assert_eq!(session.host_tempo(), None);
+        }
+    }
+
+    #[test]
     fn host_settings_restore_updates_running_capture_without_reactivating() {
         let settings = SettingsStore::default();
         let session = Arc::new(Session::new(settings.clone()));
@@ -1386,7 +1522,7 @@ mod tests {
     fn quiet_sections_toggle_only_future_capture_and_keep_pins_and_sender_audio() {
         let settings = SettingsStore::default();
         settings.lock().capture_input = CaptureInput::Both;
-        settings.lock().idle_resume = AutoResumeDelay::Immediate;
+        settings.lock().idle_resume = AutoResumeDelay::Off;
         let set_keep = |enabled: bool| {
             let mut fields = settings.map(Clone::clone);
             fields.insert("retain_silence".into(), enabled.to_string());
@@ -1409,8 +1545,8 @@ mod tests {
         session.consume();
         let (epoch, captured) = session.positioned_snapshots(true).unwrap();
         assert_eq!(captured[0].frame_count(), 400);
-        assert_eq!(captured[0].samples, initial_main);
-        assert_eq!(captured[1].samples, initial_side);
+        assert_eq!(captured[0].snapshot().samples, initial_main);
+        assert_eq!(captured[1].snapshot().samples, initial_side);
         assert!(session.is_recording());
         let mut sent = Vec::new();
         let (packet, _) = worker.sender_queue.pop_tagged(&mut sent).unwrap();
@@ -1430,10 +1566,10 @@ mod tests {
         session.consume();
         let (after_off_epoch, after_off) = session.positioned_snapshots(true).unwrap();
         assert_eq!(after_off_epoch, epoch);
-        assert_eq!(&after_off[0].samples[..400], initial_main);
-        assert_eq!(&after_off[1].samples[..400], initial_side);
-        assert_eq!(&after_off[0].samples[400..], [0.00002; 80]);
-        assert_eq!(&after_off[1].samples[400..], [-0.00001; 80]);
+        assert_eq!(&after_off[0].snapshot().samples[..400], initial_main);
+        assert_eq!(&after_off[1].snapshot().samples[..400], initial_side);
+        assert_eq!(&after_off[0].snapshot().samples[400..], [0.00002; 80]);
+        assert_eq!(&after_off[1].snapshot().samples[400..], [-0.00001; 80]);
         let (packet, _) = worker.sender_queue.pop_tagged(&mut sent).unwrap();
         assert_eq!(packet.frames, 80);
         assert_eq!(sent, [0.00002, -0.00001].repeat(80));
@@ -1450,12 +1586,12 @@ mod tests {
         assert_eq!(after_on_epoch, epoch);
         assert_eq!(after_on[0].frame_range(), 0..1080);
         assert_eq!(after_on[1].frame_range(), 0..1080);
-        assert_eq!(&after_on[0].samples[..400], initial_main);
-        assert_eq!(&after_on[1].samples[..400], initial_side);
-        assert_eq!(&after_on[0].samples[400..480], [0.00002; 80]);
-        assert_eq!(&after_on[1].samples[400..480], [-0.00001; 80]);
-        assert_eq!(&after_on[0].samples[480..], [0.00001; 600]);
-        assert_eq!(&after_on[1].samples[480..], [0.0; 600]);
+        assert_eq!(&after_on[0].snapshot().samples[..400], initial_main);
+        assert_eq!(&after_on[1].snapshot().samples[..400], initial_side);
+        assert_eq!(&after_on[0].snapshot().samples[400..480], [0.00002; 80]);
+        assert_eq!(&after_on[1].snapshot().samples[400..480], [-0.00001; 80]);
+        assert_eq!(&after_on[0].snapshot().samples[480..], [0.00001; 600]);
+        assert_eq!(&after_on[1].snapshot().samples[480..], [0.0; 600]);
         assert_eq!(session.lock().selection, Some(40..120));
         assert!(Arc::ptr_eq(&pinned.snapshots, &session.editing_snapshot().unwrap().snapshots));
         assert!(!session.is_paused());
@@ -1547,8 +1683,8 @@ mod tests {
         worker.push_block(&[&mut [0.0; 512]], &[&mut [0.00001; 512]], None);
         session.consume();
         let (_, live) = session.positioned_snapshots(true).unwrap();
-        assert!(live[0].samples.is_empty());
-        assert!(live[1].samples.is_empty());
+        assert!(live[0].snapshot().samples.is_empty());
+        assert!(live[1].snapshot().samples.is_empty());
         assert!(!session.lock().consumer.as_ref().unwrap().capture.retain_silence());
         let mut sent = Vec::new();
         let (packet, _) = worker.sender_queue.pop_tagged(&mut sent).unwrap();
@@ -1695,6 +1831,34 @@ mod tests {
     }
 
     #[test]
+    fn pinned_editing_material_shares_the_capture_pages_instead_of_copying_them() {
+        let settings = SettingsStore::default();
+        settings.lock().capture_input = CaptureInput::Both;
+        settings.lock().retention = DurationChoice::Seconds10;
+        let session = Arc::new(Session::new(settings));
+        let mut worker = Worker::with_sidechain(session.clone(), 10, 2, 1, 256).unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let thread = worker.thread.take().unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
+        worker.push_block(&[&mut [0.25; 64], &mut [-0.25; 64]], &[&mut [0.75; 64]], None);
+        session.consume();
+        session.begin_waveform_gesture();
+        session.consume();
+        let editing = session.editing_snapshot().unwrap();
+        assert_eq!(editing.snapshots.len(), 2);
+        assert_eq!(editing.snapshots[0].frame_range(), 0..64);
+        // 64 frames at 10 Hz are six complete one-second pages and one still open.
+        let pinned = editing.snapshots[0].capture();
+        assert_eq!(pinned.page_count(), 7);
+        assert_eq!(pinned.shared_pages(editing.snapshots[1].capture()), 7);
+        let live = session.lock().consumer.as_ref().unwrap().capture.freeze();
+        assert_eq!(pinned.shared_pages(&live), 6, "pinning copied the capture's pages");
+        assert_eq!(editing.snapshots[0].snapshot().samples, [0.25, -0.25].repeat(64));
+        assert_eq!(editing.snapshots[1].snapshot().samples, [0.75; 64]);
+    }
+
+    #[test]
     fn waveform_gesture_keeps_recording_and_pins_both_original_tracks() {
         let settings = SettingsStore::default();
         settings.lock().capture_input = CaptureInput::Both;
@@ -1718,11 +1882,11 @@ mod tests {
         session.consume();
         assert!(!session.is_paused());
         let live = session.positioned_snapshots(true).unwrap().1;
-        assert!(live[0].first_frame > 24, "the live ring must continue past the old selection");
+        assert!(live[0].first_frame() > 24, "the live ring must continue past the old selection");
         let job = session.snapshot_for_shortcut().unwrap();
         assert_eq!(job.range, 8..24);
-        assert_eq!(job.snapshots[0].frames(job.relative.clone()).unwrap(), [0.25, -0.25].repeat(16));
-        assert_eq!(job.snapshots[1].frames(job.relative.clone()).unwrap(), [0.75; 16]);
+        assert_eq!(job.snapshots[0].snapshot().frames(job.relative.clone()).unwrap(), [0.25, -0.25].repeat(16));
+        assert_eq!(job.snapshots[1].snapshot().frames(job.relative.clone()).unwrap(), [0.75; 16]);
         assert!(!session.is_paused());
     }
 
@@ -1823,10 +1987,10 @@ mod tests {
         assert_eq!(session.lock().selection, Some(8..24));
         session.set_retention(DurationChoice::Seconds10);
         session.consume();
-        assert_eq!(session.positioned_snapshots(true).unwrap().1[0].first_frame, 1000);
+        assert_eq!(session.positioned_snapshots(true).unwrap().1[0].first_frame(), 1000);
         let job = session.snapshot_for_shortcut().unwrap();
         assert_eq!(job.range, 8..24);
-        assert_eq!(job.snapshots[0].frames(job.relative).unwrap(), [0.25; 16]);
+        assert_eq!(job.snapshots[0].snapshot().frames(job.relative).unwrap(), [0.25; 16]);
     }
 
     #[test]
@@ -1914,7 +2078,7 @@ mod tests {
     }
 
     #[test]
-    fn immediate_resume_keeps_gesture_audio_and_respects_manual_pause() {
+    fn auto_resume_off_keeps_gesture_audio_and_respects_manual_pause() {
         let session = Arc::new(Session::new(SettingsStore::default()));
         let mut worker = Worker::new(session.clone(), 1_000, 1, 256).unwrap();
         // Verify the first block after release without relying on the periodic worker.
@@ -1922,7 +2086,7 @@ mod tests {
         let thread = worker.thread.take().unwrap();
         thread.thread().unpark();
         thread.join().unwrap();
-        session.set_idle_resume(AutoResumeDelay::Immediate);
+        session.set_idle_resume(AutoResumeDelay::Off);
         session.begin_waveform_gesture();
         session.consume();
         assert!(!session.is_paused());
@@ -1969,9 +2133,9 @@ mod tests {
         let (_, snapshots) = session.positioned_snapshots(false).unwrap();
         assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[0].frame_range(), snapshots[1].frame_range());
-        assert_eq!(snapshots[0].samples, [0.25, -0.25].repeat(64));
-        assert_eq!(&snapshots[1].samples[..32], &[0.75; 32]);
-        assert_eq!(&snapshots[1].samples[32..], &[0.; 32]);
+        assert_eq!(snapshots[0].snapshot().samples, [0.25, -0.25].repeat(64));
+        assert_eq!(&snapshots[1].snapshot().samples[..32], &[0.75; 32]);
+        assert_eq!(&snapshots[1].snapshot().samples[32..], &[0.; 32]);
         assert_eq!(left, [0.25; 32]);
         assert_eq!(right, [-0.25; 32]);
         let mut peaks = std::array::from_fn(|_| WaveformPeaks::default());
@@ -2101,7 +2265,7 @@ mod tests {
         session.end_waveform_gesture(true);
         let job = session.snapshot_for_shortcut().unwrap();
         assert_eq!(job.range, 8..20);
-        assert_eq!(job.snapshots[0].frames(job.relative).unwrap(), [0.25; 12]);
+        assert_eq!(job.snapshots[0].snapshot().frames(job.relative).unwrap(), [0.25; 12]);
 
         session.begin_waveform_gesture();
         session.consume();
@@ -2114,7 +2278,7 @@ mod tests {
         worker.push(&[&mut [0.75; 32]]);
         let job = session.snapshot_for_shortcut().unwrap();
         assert_eq!(job.range, 0..64);
-        assert_eq!(job.snapshots[0].frames(32..64).unwrap(), [0.75; 32]);
+        assert_eq!(job.snapshots[0].snapshot().frames(32..64).unwrap(), [0.75; 32]);
     }
 
     #[test]
@@ -2143,7 +2307,7 @@ mod tests {
         session.end_waveform_gesture(true);
         let job = sender.take_ready_snapshot(&session).unwrap();
         assert_eq!(job.range, 8..20);
-        assert_eq!(job.snapshots[0].frames(job.relative).unwrap(), [0.25; 12]);
+        assert_eq!(job.snapshots[0].snapshot().frames(job.relative).unwrap(), [0.25; 12]);
         assert_eq!(sender.pending_snapshots, 0);
         assert!(sender.take_ready_snapshot(&session).is_none());
         assert!(!session.is_paused());
@@ -2167,5 +2331,87 @@ mod tests {
         sender.pending_snapshot_epoch = Some(session.timeline_epoch());
         assert!(sender.take_ready_snapshot(&session).is_none());
         assert_eq!(sender.pending_snapshots, 0);
+    }
+
+    #[test]
+    fn the_capture_thread_backs_off_only_after_the_host_has_been_quiet_for_a_while() {
+        let start = Instant::now();
+        let at = |milliseconds| start + Duration::from_millis(milliseconds);
+        let mut pace = Pace::starting_at(start);
+        assert_eq!(pace.wait(false, at(0)), ACTIVE_WAIT);
+        // Blocks of 8192 frames at 44.1 kHz arrive 186 ms apart and keep the short wait.
+        for block in 1..=10 {
+            assert_eq!(pace.wait(true, at(block * 186)), ACTIVE_WAIT);
+            assert_eq!(pace.wait(false, at(block * 186 + 180)), ACTIVE_WAIT);
+        }
+        let last = 1_860;
+        assert_eq!(pace.wait(false, at(last + 249)), ACTIVE_WAIT);
+        assert_eq!(pace.wait(false, at(last + 250)), IDLE_WAIT);
+        assert_eq!(pace.wait(false, at(last + 60_000)), IDLE_WAIT);
+        // The first block after a stop returns to the short wait at once.
+        assert_eq!(pace.wait(true, at(last + 60_050)), ACTIVE_WAIT);
+    }
+
+    #[test]
+    fn the_queue_holds_far_more_than_the_longest_wait_at_every_sample_rate() {
+        // Twice the idle wait leaves room for a late wake-up of the capture thread.
+        let wait = (2 * IDLE_WAIT).as_secs_f64();
+        for rate in [8_000u32, 44_100, 48_000, 96_000, 192_000, 384_000, 768_000] {
+            for max_buffer in [1u32, 16, 64, 512, 8_192, 65_536] {
+                let (frames, slots) = queue_capacity(rate, max_buffer);
+                let backlog = (f64::from(rate) * wait).ceil() as usize;
+                assert!(frames >= 8 * backlog, "{rate} Hz: {frames} frames");
+                // Even a host that delivered single-frame blocks would fit, up to
+                // 384 kHz. Above that the slot count is capped and two frames do.
+                let smallest_block = if rate <= 384_000 { 1 } else { 2 };
+                assert!(slots >= backlog.div_ceil(smallest_block), "{rate} Hz: {slots} slots");
+            }
+        }
+        assert_eq!(queue_capacity(48_000, 512), (131_072, 8_192));
+    }
+
+    #[test]
+    fn editor_commands_end_the_capture_threads_wait_and_the_audio_callback_never_does() {
+        let session = Session::new(SettingsStore::default());
+        // Stand in for the capture thread: a wake-up makes the next park return at once.
+        session.set_consumer_thread(thread::current());
+        let woken = || {
+            let started = Instant::now();
+            thread::park_timeout(Duration::from_secs(5));
+            started.elapsed() < Duration::from_secs(2)
+        };
+        let commands: [(&str, &dyn Fn()); 7] = [
+            ("snapshot", &|| session.request_snapshot()),
+            ("resume", &|| session.resume()),
+            ("clear", &|| session.clear()),
+            ("gesture", &|| session.begin_waveform_gesture()),
+            ("selection", &|| session.set_snapshot_selection(None)),
+            ("retention", &|| session.set_retention(DurationChoice::Seconds60)),
+            ("settings", &|| session.update_editor_settings(session.settings())),
+        ];
+        for (name, command) in commands {
+            command();
+            assert!(woken(), "{name} left the capture thread waiting");
+        }
+
+        // What the audio callback calls only stores atomics.
+        session.set_host_tempo(Some(120.0));
+        let _ = session.continuous_processing_requested();
+        let started = Instant::now();
+        thread::park_timeout(Duration::from_millis(150));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn a_replaced_worker_does_not_take_the_new_workers_wake_handle_with_it() {
+        let session = Arc::new(Session::new(SettingsStore::default()));
+        let old = Worker::new(session.clone(), 48_000, 2, 256).unwrap();
+        let new = Worker::new(session.clone(), 48_000, 2, 256).unwrap();
+        let new_thread = new.thread.as_ref().unwrap().thread().id();
+        drop(old);
+        let registered = session.consumer_thread.lock().unwrap().as_ref().map(thread::Thread::id);
+        assert_eq!(registered, Some(new_thread));
+        drop(new);
+        assert!(session.consumer_thread.lock().unwrap().is_none());
     }
 }

@@ -132,6 +132,8 @@ impl Plugin for Backtracking {
         auxiliary: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        // Exported clips are named after the tempo they were played at.
+        self.session.set_host_tempo(context.transport().tempo);
         // Nice-plug already copies the input to output when the host does not use in-place buffers.
         if self.capture_enabled
             && let Some(worker) = &self.worker
@@ -429,7 +431,7 @@ mod tests {
     fn plugin_state_round_trips_instance_settings_without_audio_or_pause() {
         let original = Backtracking::default();
         original.session.set_retention(DurationChoice::Seconds60);
-        original.session.set_idle_resume(AutoResumeDelay::Immediate);
+        original.session.set_idle_resume(AutoResumeDelay::Off);
         let mut capture_settings = original.session.settings();
         capture_settings.retain_silence = true;
         original.session.update_editor_settings(capture_settings);

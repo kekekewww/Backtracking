@@ -81,6 +81,7 @@ name = "backtracking-desktop"
 version = "0.1.5"
 dependencies = [
  "backtracking-core",
+ "backtracking-ui",
  "dunce",
  "ed25519-dalek",
  "eframe",
@@ -93,6 +94,14 @@ dependencies = [
  "windows-core",
  "windows-sys 0.61.2",
  "winit",
+]
+
+[[package]]
+name = "backtracking-ui"
+version = "0.1.0"
+dependencies = [
+ "backtracking-core",
+ "egui",
 ]
 
 [[package]]

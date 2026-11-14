@@ -8,8 +8,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{
-    AutoResumeDelay, ChannelRoute, DurationChoice, MeterReadings, Snapshot, WavExportProfile,
-    WavSampleFormat, export_routed_tracks_with_profile, waveform,
+    AutoResumeDelay, ChannelRoute, DurationChoice, FrozenTrack, MeterReadings, WavExportProfile,
+    export_routed_tracks_with_tempo, waveform,
+};
+use backtracking_ui::{
+    CENTER_LINE, FlagReach, LoneSample, PLOT_BACKGROUND, RECORDING_DIM, RECORDING_LIT,
+    TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES, accent_color,
+    combo_popup_height, fit_frame_range, flag_handle_at, icon_button, meter_number, muted_accent,
+    paint_guide_lines, paint_transport_glyph, paint_waveform_trace, selected_waveform_color,
+    status_led, waveform_press,
 };
 use egui::{Color32, CursorIcon, PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use nice_plug::context::gui::GuiContext;
@@ -32,9 +39,19 @@ use preview::{PreviewKey, PreviewRequest, PreviewResult, PreviewWorker};
 const REFRESH: Duration = Duration::from_millis(80);
 const RECORDING_BLINK: Duration = Duration::from_millis(500);
 const TOOLBAR_CONTROL_HEIGHT: f32 = 25.0;
+const TRANSPORT_GLYPH: TransportGlyph = TransportGlyph {
+    play: [Vec2::new(-4.0, -6.0), Vec2::new(6.0, 0.0), Vec2::new(-4.0, 6.0)],
+    pause_offset: 2.7,
+    pause_bar: Vec2::new(2.6, 11.0),
+};
 const MIN_WAVEFORM_HEIGHT: f32 = 60.0;
 const OPTIONS_EDITOR_SIZE: Vec2 = Vec2::new(680.0, 480.0);
 const FLAG_SNAP_RADIUS: f32 = 8.0;
+const FLAG_REACH: FlagReach = FlagReach { above: 4.0, below: 14.0, radius: FLAG_SNAP_RADIUS };
+/// Alt starts a free selection, as Ctrl does.
+const ALT_SELECTS: bool = true;
+/// The selected waveform takes the accent's complement when it differs by at least this much.
+const SELECTION_CONTRAST: u8 = 64;
 const PRODUCT_ICON: &[u8] = include_bytes!("../../../assets/backtracking-icon.png");
 
 pub type CaptureEditor = EguiEditor<CaptureUi>;
@@ -314,9 +331,11 @@ struct WavClip {
     profile: WavExportProfile,
     force_mono: bool,
     output: PathBuf,
-    snapshots: Arc<[Snapshot]>,
+    snapshots: Arc<[FrozenTrack]>,
     range: Range<usize>,
     marker: MarkerUpdate,
+    /// The host tempo when the clip was taken, if the host reports one. Shown in the file name.
+    tempo: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -337,13 +356,14 @@ impl SavedWav {
 
 impl WavClip {
     fn write(self) -> io::Result<SavedWav> {
-        let paths = export_routed_tracks_with_profile(
+        let paths = export_routed_tracks_with_tempo(
             &self.output,
             &self.snapshots,
             self.range,
             self.profile,
             &[ChannelRoute::Merged; 2][..self.snapshots.len()],
             self.force_mono,
+            self.tempo,
         )?;
         Ok(SavedWav {
             paths: paths
@@ -512,7 +532,7 @@ impl NiceEguiApp for CaptureUi {
         }
         let mut paused = self.session.is_paused();
         self.refresh_waveform(paused, settings.waveform_layout);
-        ui.visuals_mut().selection.bg_fill = muted_accent(settings.accent);
+        ui.visuals_mut().selection.bg_fill = muted_accent(accent_color(settings.accent));
 
         if ui.input(|input| input.pointer.any_pressed()) {
             self.session.mark_interaction();
@@ -692,11 +712,7 @@ impl CaptureUi {
 
     fn meter_readout(&self, ui: &mut egui::Ui, mode: MeterMode) {
         let value = mode.reading(self.session.meter_readings());
-        let text = if value.is_finite() {
-            format!("{value:.1} {}", mode.label())
-        } else {
-            format!("— {}", mode.label())
-        };
+        let text = format!("{} {}", meter_number(Some(value), false), mode.label());
         ui.add_sized(
             [90.0, TOOLBAR_CONTROL_HEIGHT],
             egui::Label::new(egui::RichText::new(text).monospace()).truncate(),
@@ -707,11 +723,7 @@ impl CaptureUi {
         let (status, color) = if !paused && self.session.is_recording() {
             let started = self.recording_since.get_or_insert_with(Instant::now);
             let phase = started.elapsed().as_millis() / RECORDING_BLINK.as_millis();
-            let color = if phase.is_multiple_of(2) {
-                Color32::from_rgb(249, 78, 88)
-            } else {
-                Color32::from_rgb(103, 44, 48)
-            };
+            let color = if phase.is_multiple_of(2) { RECORDING_LIT } else { RECORDING_DIM };
             ("Recording", color)
         } else {
             self.recording_since = None;
@@ -721,10 +733,7 @@ impl CaptureUi {
                 ("Waiting for sound", Color32::from_rgb(74, 81, 88))
             }
         };
-        let (rect, response) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-        ui.painter().circle_filled(rect.center(), 4.0, color);
-        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Status, true, status));
-        response.on_hover_text(status);
+        status_led(ui, Vec2::splat(16.0), 4.0, color, status);
     }
 
     fn show_options(&mut self, ui: &egui::Ui, frame: &mut Frame, settings: &mut SessionSettings) {
@@ -1113,7 +1122,8 @@ impl CaptureUi {
         painter.rect_filled(
             panel,
             6.0,
-            Color32::from_rgba_unmultiplied(22, 26, 29, opacity),
+            Color32::from_rgba_unmultiplied(
+                PLOT_BACKGROUND.r(), PLOT_BACKGROUND.g(), PLOT_BACKGROUND.b(), opacity),
         );
         if settings.border_enabled {
             let [r, g, b] = settings.border_color.unwrap_or(settings.accent);
@@ -1150,23 +1160,12 @@ impl CaptureUi {
                         })
                 }
             };
+        let color = accent_color(settings.accent);
         if hover_preview && width > 0.0 {
-            painter.rect_filled(audio_rect, 2.0, muted_accent(settings.accent));
+            painter.rect_filled(audio_rect, 2.0, muted_accent(color));
         }
 
-        let [r, g, b] = settings.accent;
-        let color = Color32::from_rgb(r, g, b);
-        let complement = [255 - r, 255 - g, 255 - b];
-        let selected_color = if settings
-            .accent
-            .into_iter()
-            .zip(complement)
-            .all(|(a, b)| a.abs_diff(b) < 64)
-        {
-            Color32::WHITE
-        } else {
-            Color32::from_rgb(complement[0], complement[1], complement[2])
-        };
+        let selected_color = selected_waveform_color(color, SELECTION_CONTRAST);
         if width > 0.0 && opacity > 0 {
             self.draw_reference_lines(&painter, audio_rect, settings, opacity);
         }
@@ -1185,7 +1184,7 @@ impl CaptureUi {
                 painter.hline(
                     inner.x_range(),
                     middle,
-                    Stroke::new(policy.seconds_stroke, Color32::from_rgb(47, 60, 64)),
+                    Stroke::new(policy.seconds_stroke, CENTER_LINE),
                 );
             }
             if width <= 0.0 {
@@ -1227,20 +1226,14 @@ impl CaptureUi {
     ) {
         let policy = self.display_policy(rect);
         let guides = self.visible_guides(rect, settings);
-        let draw = |frame, color, alpha: u8, stroke: f32| {
-            if let Some(fraction) = waveform::flag_fraction(frame, self.peak_frames.clone()) {
-                let x = rect.left() + rect.width() * fraction as f32;
-                let [r, g, b] = color;
-                let alpha = (u16::from(alpha) * u16::from(opacity) / 255) as u8;
-                painter.vline(x, rect.y_range(), Stroke::new(stroke, Color32::from_rgba_unmultiplied(r, g, b, alpha)));
-            }
+        let draw = |frames: &[u64], color, alpha: u8, stroke: f32| {
+            let [r, g, b] = color;
+            let alpha = (u16::from(alpha) * u16::from(opacity) / 255) as u8;
+            paint_guide_lines(painter, rect, &self.peak_frames, frames,
+                Stroke::new(stroke, Color32::from_rgba_unmultiplied(r, g, b, alpha)));
         };
-        for frame in guides.seconds {
-            draw(frame, [158, 170, 175], 76, policy.seconds_stroke);
-        }
-        for frame in guides.bars {
-            draw(frame, settings.accent, 144, policy.bar_stroke);
-        }
+        draw(&guides.seconds, [158, 170, 175], 76, policy.seconds_stroke);
+        draw(&guides.bars, settings.accent, 144, policy.bar_stroke);
     }
 
     fn display_policy(&self, rect: Rect) -> waveform::DisplayPolicy {
@@ -1261,19 +1254,8 @@ impl CaptureUi {
     }
 
     fn selection_handle(&self, rect: Rect, position: Pos2) -> Option<u64> {
-        if position.y > rect.top() + 14.0 || position.y < rect.top() - 4.0 {
-            return None;
-        }
         let flags = self.selection.as_ref().or_else(|| self.markers.range())?;
-        [(flags.start, flags.end), (flags.end, flags.start)]
-            .into_iter()
-            .filter_map(|(moving, fixed)| {
-                let fraction = waveform::flag_fraction(moving, self.peak_frames.clone())?;
-                let x = rect.left() + rect.width() * fraction as f32;
-                Some((fixed, (x - position.x).abs()))
-            })
-            .filter(|&(_, distance)| distance <= FLAG_SNAP_RADIUS)
-            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        flag_handle_at(rect, self.peak_frames.clone(), flags, position, FLAG_REACH)
             .map(|(fixed, _)| fixed)
     }
 
@@ -1312,7 +1294,7 @@ impl CaptureUi {
             Some(wheel_zoom_view(&full, &current, wheel, pointer.x, audio_rect, rect.shrink(8.0)))
         } else if self.view.is_some() && pan != 0.0 {
             let delta = (-f64::from(pan) / f64::from(rect.width().max(1.0)) * current_len as f64).round() as i64;
-            Some(view_at(&full, current.start.saturating_add_signed(delta), current_len))
+            Some(fit_frame_range(&full, current.start.saturating_add_signed(delta), current_len))
         } else {
             None
         };
@@ -1333,18 +1315,7 @@ impl CaptureUi {
     ) {
         let rect = waveform.rect;
         let (position, press, down, shift) = ui.input(|input| {
-            let press = input.events.iter().rev().find_map(|event| match event {
-                egui::Event::PointerButton {
-                    pos,
-                    button: PointerButton::Primary,
-                    pressed: true,
-                    modifiers,
-                } => {
-                    let (selecting, snap) = selection_modifiers(*modifiers);
-                    Some((*pos, selecting, snap))
-                },
-                _ => None,
-            });
+            let press = waveform_press(&input.events, ALT_SELECTS);
             (
                 input.pointer.interact_pos(),
                 press,
@@ -1579,7 +1550,7 @@ impl CaptureUi {
 
     fn wav_clip(
         &mut self,
-        snapshots: Arc<[Snapshot]>,
+        snapshots: Arc<[FrozenTrack]>,
         output: PathBuf,
         profile: WavExportProfile,
         force_mono: bool,
@@ -1594,6 +1565,7 @@ impl CaptureUi {
             snapshots,
             range,
             marker: self.markers.issue(selected),
+            tempo: self.session.host_tempo(),
         })
     }
 
@@ -1668,11 +1640,7 @@ fn primary_button_pressed() -> bool {
     false
 }
 
-fn muted_accent([r, g, b]: [u8; 3]) -> Color32 {
-    Color32::from_rgb(r / 3, g / 3, b / 3)
-}
-
-fn export_frame_range(snapshot: &Snapshot, selection: &Range<u64>) -> Option<Range<usize>> {
+fn export_frame_range(snapshot: &FrozenTrack, selection: &Range<u64>) -> Option<Range<usize>> {
     let bounds = snapshot.frame_range();
     if selection.is_empty() || selection.start < bounds.start || selection.end > bounds.end {
         return None;
@@ -1781,12 +1749,7 @@ fn option_combo<T: Copy + PartialEq>(
     let selected = choices.iter().find(|(choice, _)| choice == value)
         .map_or("", |(_, label)| label.as_str());
     option_row(ui, label, |ui| {
-        let rows = choices.len().clamp(1, 10);
-        let row_height = ui.text_style_height(&egui::TextStyle::Button)
-            + 2.0 * ui.spacing().button_padding.y;
-        let row_height = row_height.max(ui.spacing().interact_size.y);
-        let height = row_height * rows as f32
-            + ui.spacing().item_spacing.y * rows.saturating_sub(1) as f32;
+        let height = combo_popup_height(ui, choices.len(), ui.spacing().item_spacing.y);
         egui::ComboBox::from_id_salt(label)
             .selected_text(selected)
             .width(ui.available_width())
@@ -1805,8 +1768,16 @@ fn capture_options(ui: &mut egui::Ui, settings: &mut SessionSettings) {
     option_combo(ui, "History", &mut settings.retention,
         DurationChoice::ALL.map(|duration| (duration, duration_label(duration.seconds()))));
     option_combo(ui, "Auto-resume", &mut settings.idle_resume,
-        AutoResumeDelay::ALL.map(|duration| (duration, format!("{} s", duration.seconds()))));
+        AutoResumeDelay::ALL.map(|delay| (delay, auto_resume_label(delay))));
     ui.checkbox(&mut settings.retain_silence, "Keep quiet sections");
+}
+
+/// "Off" leaves a paused capture paused. It is stored as 0 seconds, which never meant "at once".
+fn auto_resume_label(delay: AutoResumeDelay) -> String {
+    match delay.delay() {
+        Some(delay) => format!("{} s", delay.as_secs()),
+        None => "Off".into(),
+    }
 }
 
 fn duration_label(seconds: u32) -> String {
@@ -1913,21 +1884,13 @@ fn folder_options(ui: &mut egui::Ui, settings: &SessionSettings) -> Option<Folde
 
 fn wav_format_controls(ui: &mut egui::Ui, profile: &mut WavExportProfile) {
     option_combo(ui, "WAV sample rate", &mut profile.sample_rate,
-        WavExportProfile::SAMPLE_RATES
-            .into_iter()
-            .zip(["44.1 kHz", "48 kHz", "96 kHz"])
-            .map(|(rate, label)| (rate, label.to_owned())));
+        WAV_SAMPLE_RATES.map(|(rate, label)| (rate, label.to_owned())));
     option_combo(ui, "WAV sample format", &mut profile.sample_format,
-        [
-            (WavSampleFormat::Pcm16, "16-bit PCM"),
-            (WavSampleFormat::Pcm24, "24-bit PCM"),
-            (WavSampleFormat::Float32, "32-bit float"),
-        ].map(|(format, label)| (format, label.to_owned())));
+        WAV_SAMPLE_FORMATS.map(|(format, label)| (format, label.to_owned())));
 }
 
 fn capture_button(ui: &mut egui::Ui, paused: bool, enabled: bool) -> egui::Response {
-    let button = egui::Button::new("").min_size(Vec2::splat(TOOLBAR_CONTROL_HEIGHT));
-    let response = ui.add_enabled(enabled, button);
+    let response = ui.add_enabled(enabled, icon_button(TOOLBAR_CONTROL_HEIGHT));
     let label = if paused {
         "Start capture"
     } else {
@@ -1936,30 +1899,12 @@ fn capture_button(ui: &mut egui::Ui, paused: bool, enabled: bool) -> egui::Respo
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
     let center = response.rect.center();
     let color = ui.style().interact(&response).fg_stroke.color;
-    if paused {
-        ui.painter().add(egui::Shape::convex_polygon(
-            vec![
-                center + Vec2::new(-4.0, -6.0),
-                center + Vec2::new(6.0, 0.0),
-                center + Vec2::new(-4.0, 6.0),
-            ],
-            color,
-            Stroke::NONE,
-        ));
-    } else {
-        for offset in [-2.7, 2.7] {
-            ui.painter().rect_filled(
-                Rect::from_center_size(center + Vec2::new(offset, 0.0), Vec2::new(2.6, 11.0)),
-                0.5,
-                color,
-            );
-        }
-    }
+    paint_transport_glyph(ui.painter(), center, paused, color, &TRANSPORT_GLYPH);
     response.on_hover_text(label)
 }
 
 fn settings_button(ui: &mut egui::Ui) -> egui::Response {
-    let response = ui.add(egui::Button::new("").min_size(Vec2::splat(TOOLBAR_CONTROL_HEIGHT)));
+    let response = ui.add(icon_button(TOOLBAR_CONTROL_HEIGHT));
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Options"));
     let center = response.rect.center();
     let stroke = ui.style().interact(&response).fg_stroke;
@@ -1976,8 +1921,7 @@ fn settings_button(ui: &mut egui::Ui) -> egui::Response {
 }
 
 fn clear_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
-    let button = egui::Button::new("").min_size(Vec2::splat(TOOLBAR_CONTROL_HEIGHT));
-    let response = ui.add_enabled(enabled, button);
+    let response = ui.add_enabled(enabled, icon_button(TOOLBAR_CONTROL_HEIGHT));
     let label = "Clear captured audio";
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
     let center = response.rect.center();
@@ -2006,15 +1950,6 @@ fn clamped_view(view: Option<Range<u64>>, full: &Range<u64>) -> Range<u64> {
         .unwrap_or_else(|| full.clone())
 }
 
-fn selection_modifiers(modifiers: egui::Modifiers) -> (bool, bool) {
-    (modifiers.alt || modifiers.ctrl || modifiers.shift, modifiers.shift)
-}
-
-fn view_at(full: &Range<u64>, start: u64, length: u64) -> Range<u64> {
-    let start = start.clamp(full.start, full.end - length);
-    start..start + length
-}
-
 fn wheel_zoom_view(
     full: &Range<u64>, current: &Range<u64>, wheel: f32, pointer_x: f32,
     audio_rect: Rect, viewport_rect: Rect,
@@ -2032,7 +1967,7 @@ fn wheel_zoom_view(
     let anchor_frame = current.start.saturating_add((current_len as f64 * anchor).round() as u64);
     let next_anchor = f64::from(((pointer_x - viewport_rect.left()) / viewport_rect.width().max(1.0)).clamp(0.0, 1.0));
     let start = anchor_frame.saturating_sub((length as f64 * next_anchor).round() as u64);
-    view_at(full, start, length)
+    fit_frame_range(full, start, length)
 }
 
 fn waveform_selection_clip(rect: Rect, visible: &Range<u64>, selection: &Range<u64>) -> Option<Rect> {
@@ -2052,48 +1987,11 @@ fn paint_waveform_geometry(
     middle: f32, extent: f32, stroke_width: f32, color: Color32,
 ) {
     let position = |x: f32, value: f32| Pos2::new(rect.left() + rect.width() * x, middle - value * extent);
-    let stroke = Stroke::new(stroke_width, color);
-    match geometry {
-        waveform::WaveformGeometry::Empty => {}
-        waveform::WaveformGeometry::Envelope(runs) => {
-            let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 96);
-            for run in runs {
-                let mut mesh = egui::Mesh::default();
-                let mut upper = Vec::with_capacity(run.len());
-                let mut lower = Vec::with_capacity(run.len());
-                for (index, column) in run.iter().enumerate() {
-                    let top = position(column.x, column.maximum);
-                    let bottom = position(column.x, column.minimum);
-                    mesh.colored_vertex(top, fill);
-                    mesh.colored_vertex(bottom, fill);
-                    upper.push(top);
-                    lower.push(bottom);
-                    if index > 0 {
-                        let vertex = (index * 2) as u32;
-                        mesh.add_triangle(vertex - 2, vertex - 1, vertex);
-                        mesh.add_triangle(vertex, vertex - 1, vertex + 1);
-                    }
-                }
-                if !mesh.indices.is_empty() {
-                    painter.add(egui::Shape::mesh(mesh));
-                }
-                if upper.len() > 1 {
-                    painter.add(egui::Shape::line(upper, stroke));
-                    painter.add(egui::Shape::line(lower, stroke));
-                }
-            }
-        }
-        waveform::WaveformGeometry::Samples(runs) => {
-            for run in runs {
-                let points: Vec<_> = run.iter().map(|point| position(point.x, point.value)).collect();
-                if points.len() > 1 {
-                    painter.add(egui::Shape::line(points, stroke));
-                } else if let Some(&point) = points.first() {
-                    painter.line_segment([point, point + Vec2::new(stroke_width.max(1.0), 0.0)], stroke);
-                }
-            }
-        }
-    }
+    paint_waveform_trace(painter, geometry, position, &TraceStyle {
+        stroke: Stroke::new(stroke_width, color),
+        fill: Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 96),
+        lone_sample: LoneSample::Dash(stroke_width.max(1.0)),
+    });
 }
 
 #[cfg(test)]
@@ -2159,6 +2057,12 @@ fn paint_flag(painter: &egui::Painter, rect: Rect, fraction: f32, direction: f32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_resume_choices_are_labelled_by_what_they_do() {
+        let labels = AutoResumeDelay::ALL.map(auto_resume_label);
+        assert_eq!(labels, ["Off", "5 s", "10 s"]);
+    }
 
     fn rendered_waveform(
         minimum: &[f32], maximum: &[f32], visible: Range<u64>, selection: Option<Range<u64>>,
@@ -2281,15 +2185,6 @@ mod tests {
     }
 
     #[test]
-    fn shift_alone_starts_a_snapped_selection_and_other_selection_modifiers_remain_free() {
-        assert_eq!(selection_modifiers(egui::Modifiers::SHIFT), (true, true));
-        assert_eq!(selection_modifiers(egui::Modifiers::CTRL), (true, false));
-        assert_eq!(selection_modifiers(egui::Modifiers::ALT), (true, false));
-        assert_eq!(selection_modifiers(egui::Modifiers::CTRL | egui::Modifiers::SHIFT), (true, true));
-        assert_eq!(selection_modifiers(egui::Modifiers::NONE), (false, false));
-    }
-
-    #[test]
     fn saving_unselected_audio_dispatches_to_the_capture_worker() {
         let session = Arc::new(Session::new(crate::settings::SettingsStore::default()));
         let editor = EguiEditorState::from_size(LogicalSize::new(640.0, 212.0), 1.0);
@@ -2322,8 +2217,7 @@ mod tests {
             token: 1,
             timeline: Arc::new(WaveformTimeline { epoch: 7, frames: 5..105, sample_rate: 100,
                 channels: 1, ..WaveformTimeline::default() }),
-            snapshots: vec![Snapshot { first_frame: 5, sample_rate: 100, channels: 1,
-                samples: vec![0.5; 100] }].into(),
+            snapshots: vec![FrozenTrack::from_interleaved(100, 1, 5, &[0.5; 100]).unwrap()].into(),
         };
         let key = PreviewKey { epoch: 7, editing_token: 1, range: 25..75,
             layout: WaveformLayout::Merged, bins: 2 };
@@ -2530,17 +2424,9 @@ mod tests {
             "backtracking-plugin-drag-test-{}",
             std::process::id()
         ));
-        let main = Snapshot {
-            first_frame: 0,
-            sample_rate: 48_000,
-            channels: 1,
-            samples: vec![0.25; 32],
-        };
-        let sidechain = Snapshot {
-            samples: vec![-0.25; 32],
-            ..main.clone()
-        };
-        let snapshots: Arc<[Snapshot]> = vec![main, sidechain].into();
+        let main = FrozenTrack::from_interleaved(48_000, 1, 0, &[0.25; 32]).unwrap();
+        let sidechain = FrozenTrack::from_interleaved(48_000, 1, 0, &[-0.25; 32]).unwrap();
+        let snapshots: Arc<[FrozenTrack]> = vec![main, sidechain].into();
         let prepare_file = || {
             WavClip {
                 profile: WavExportProfile::default(),
@@ -2549,6 +2435,7 @@ mod tests {
                 snapshots: snapshots.clone(),
                 range: 0..32,
                 marker: MarkerHistory::default().issue(0..32),
+                tempo: None,
             }
             .write()
             .unwrap()
@@ -2578,12 +2465,9 @@ mod tests {
         ));
         let writer = SnapshotWriter::start().unwrap();
         let mut markers = MarkerHistory::default();
-        let snapshots: Arc<[Snapshot]> = vec![Snapshot {
-            first_frame: 0,
-            sample_rate: 48_000,
-            channels: 2,
-            samples: [0.75, -0.25].repeat(32),
-        }].into();
+        let snapshots: Arc<[FrozenTrack]> = vec![
+            FrozenTrack::from_interleaved(48_000, 2, 0, &[0.75, -0.25].repeat(32)).unwrap(),
+        ].into();
         for (range, force_mono) in [(0..16, true), (0..32, false)] {
             writer
                 .requests
@@ -2594,6 +2478,7 @@ mod tests {
                     snapshots: snapshots.clone(),
                     marker: markers.issue(range.start as u64..range.end as u64),
                     range,
+                    tempo: Some(120.0),
                 })
                 .unwrap();
         }
@@ -2615,6 +2500,9 @@ mod tests {
             (first, 1, vec![0.25; 16]),
             (second, 2, [0.75, -0.25].repeat(32)),
         ] {
+            // The clip name a DAW shows carries the host tempo the clip was taken at.
+            let name = saved.paths[0].file_name().unwrap().to_string_lossy().into_owned();
+            assert!(name.starts_with("Backtracking_") && name.contains("s_120bpm"), "{name}");
             let wav = std::fs::read(&saved.paths[0]).unwrap();
             assert_eq!(
                 u16::from_le_bytes(wav[22..24].try_into().unwrap()),
@@ -2652,12 +2540,8 @@ mod tests {
     #[test]
     fn snapped_frame_boundaries_export_exact_snapshot_samples() {
         let start = u64::from(u32::MAX) + 123;
-        let snapshot = Snapshot {
-            first_frame: start,
-            sample_rate: 48_000,
-            channels: 1,
-            samples: (0..128).map(|sample| sample as f32).collect(),
-        };
+        let samples: Vec<f32> = (0..128).map(|sample| sample as f32).collect();
+        let snapshot = FrozenTrack::from_interleaved(48_000, 1, start, &samples).unwrap();
         let marked = start + 25..start + 109;
         let rect = Rect::from_min_size(Pos2::new(10.0, 0.0), Vec2::new(256.0, 80.0));
         let visible = snapshot.frame_range();
@@ -2669,7 +2553,7 @@ mod tests {
         let to = frame_at_pointer(rect, 224.0, visible, Some(&marked));
         let frames = export_frame_range(&snapshot, &(from..to)).unwrap();
         assert_eq!(frames, 25..109);
-        assert_eq!(snapshot.frames(frames).unwrap(), &snapshot.samples[25..109]);
+        assert_eq!(snapshot.snapshot().frames(frames).unwrap(), &samples[25..109]);
         assert!(export_frame_range(&snapshot, &(start - 1..start + 20)).is_none());
         let after_scroll = start + 32..start + 160;
         assert_eq!(

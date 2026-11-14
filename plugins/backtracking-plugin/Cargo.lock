@@ -135,6 +135,7 @@ name = "backtracking-plugin"
 version = "0.1.5"
 dependencies = [
  "backtracking-core",
+ "backtracking-ui",
  "dunce",
  "egui",
  "nice-plug",
@@ -148,6 +149,14 @@ dependencies = [
  "rfd",
  "windows",
  "windows-core",
+]
+
+[[package]]
+name = "backtracking-ui"
+version = "0.1.0"
+dependencies = [
+ "backtracking-core",
+ "egui",
 ]
 
 [[package]]
