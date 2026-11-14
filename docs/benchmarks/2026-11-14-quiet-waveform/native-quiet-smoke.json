@@ -104,6 +104,6 @@
     "This ownership fix is not evidence of the cause of earlier multi-second UI freezes, paging, or startup behavior.",
     "No WAV is written; this case does not verify WAV duration, selected export, audible artifacts, or universal no-dropout behavior.",
     "No macOS, Fn shortcut, DAW host, physical device range, native waveform GUI or broad system-source acceptance is established.",
-    "Local suite reports are separate in local-validation.json; final CI, Release, Setup and installed binary verification remain pending."
+    "Current local suites, final local package/desktop refresh and completed cross-platform CI are recorded separately; this scoped native smoke does not expand their runtime coverage."
   ]
 }

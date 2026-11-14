@@ -37,7 +37,8 @@
       "Capture quiet checkbox defaults unchecked",
       "checkbox changed On then Off",
       "no helper paragraphs",
-      "Clear followed by a full 10.00-second visible span showed a continuous envelope"
+      "Clear followed by a full 10.00-second visible span showed a continuous envelope",
+      "manual Pause followed by wheel zoom through 10.00, 4.51, 0.42, 0.04 and 0.01 seconds remained continuous, without comb or scattered-point appearance"
     ],
     "visible_history_seconds": 10.0,
     "short_span_interpretation": "earlier 0.02-second view reflected manual zoom/short-history state, not demonstrated capture loss",
@@ -45,7 +46,19 @@
       "GUI frame time or latency",
       "CPU/RAM performance",
       "exported audio integrity"
-    ]
+    ],
+    "observed_zoom_seconds": [
+      10.0,
+      4.51,
+      0.42,
+      0.04,
+      0.01
+    ],
+    "not_newly_verified": [
+      "physical Shift-drag",
+      "native resize"
+    ],
+    "session_ended": true
   },
   "plugin_processing_contract": {
     "CLAP_live_keep_alive": "retain_silence || sender_enabled",
@@ -63,16 +76,16 @@
     ],
     "DAW_runtime_verified": false
   },
-  "pending": [
-    "deep sample-mode native GUI observation",
-    "final Windows rebuild after Options title cleanup",
-    "final Release and Setup hashes",
-    "actual installed payload verification",
-    "current-round native CI"
-  ],
+  "pending": [],
   "limitations": [
     "Local suites are not full-platform runtime acceptance.",
     "Existing historical hardware/responsive evidence and artifact hashes are not reused for this round.",
-    "No private screenshots or audio are published."
-  ]
+    "No private screenshots or audio are published.",
+    "Final built/packaged/desktop-refresh metadata is separate in package-validation.json; GUI feature observations still belong to the intermediate build.",
+    "Final normal tray/toolwindow could not be selected by the computer-use inventory; no fresh final-binary GUI interaction is claimed.",
+    "New packaged plug-ins were not installed by the desktop-only refresh; pre-existing installed plug-ins remain unchanged.",
+    "No new physical Shift-drag or native resize observation was added in this round."
+  ],
+  "source_commit_for_final_build": "5fe9224c3dc54d0a2a655ec6b66522c43bd7a238",
+  "ci_reference": "cross-platform-ci.json: completed success for Windows, macOS and Linux on the same source commit"
 }

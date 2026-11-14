@@ -1,19 +1,19 @@
 # 安靜片段與連續波形：本輪驗證紀錄 / Quiet capture and continuous waveform
 
-**狀態：本機套件與指定原生檢查已有結果，整合驗證進行中。** 本頁只記錄 2026-11-14 新增的 quiet retention 與混合 renderer；本機 core／Windows／plug-in 套件及下列 Windows quiet smoke 已通過。較早 Windows GUI 觀察屬中間 Release，深度 sample zoom、CI、最終重建／Setup 與 installed payload 驗證尚待結果。既有[硬體用量](HARDWARE_USAGE.md)與[固定素材互動報告](RESPONSIVE_EDITING_2026-11-14.md)及其 evidence、build hashes 保留原測試版本，不改寫成新功能的證據。
+**狀態：實作、本機套件、指定 Windows GUI、本機打包核對及同 source 三平台 CI 完成。** 本頁記錄 source commit `5fe9224c3dc54d0a2a655ec6b66522c43bd7a238` 的 quiet retention 與混合 renderer。本機套件及下列 native quiet smoke 已通過；深度 zoom 的 Windows GUI 觀察屬中間 Release，最終成品、payload 與正常啟動分開核對。已完成檢查不代表所有平台 GUI／DAW runtime 驗收。既有[硬體用量](HARDWARE_USAGE.md)與[固定素材互動報告](RESPONSIVE_EDITING_2026-11-14.md)及其 evidence、build hashes 保留原測試版本，不改寫成新功能的證據。
 
 ## 本輪範圍
 
 | 項目 | 採用規則 | 驗證狀態 |
 | --- | --- | --- |
-| 保留安靜片段 | Windows／macOS／VST3／CLAP 增加預設 Off 的 Keep quiet sections；macOS 標籤為「保留安靜片段」 | 本機套件通過；Windows GUI 預設 Off／切換已觀察，macOS／DAW 原生操作待驗 |
-| 擷取內容 | On 保留往後送達的 quiet／zero 及已知來源時鐘可確認的安靜；Off 沿用靜音壓縮 | 等待樣本、時鐘、A/B 與切換回歸結果 |
-| 狀態與素材 | 切換不清 history、不重切固定素材／A/B、不改手動 Pause；不補回先前丟掉的 quiet，也不回溯壓縮已保留片段 | 等待整合結果 |
-| 混合 renderer | 遠／中倍率連續 filled min/max envelope＋outline；近倍率連接原始 samples | 本機套件通過；Windows full 10.00 秒 envelope 已觀察，sample zoom 原生檢查待結果 |
+| 保留安靜片段 | Windows／macOS／VST3／CLAP 增加預設 Off 的 Keep quiet sections；macOS 標籤為「保留安靜片段」 | 本機套件通過；Windows GUI 預設 Off／切換已觀察，macOS GUI／DAW 互動未驗 |
+| 擷取內容 | On 保留往後送達的 quiet／zero 及已知來源時鐘可確認的安靜；Off 沿用靜音壓縮 | 程式回歸通過，Windows 隔離來源與 Mac native harness 另有結果；真實 DAW／各種裝置未普遍驗證 |
+| 狀態與素材 | 切換不清 history、不重切固定素材／A/B、不改手動 Pause；不補回先前丟掉的 quiet，也不回溯壓縮已保留片段 | 本機整合回歸通過；Windows native quiet case 檢查 Pause 與固定 snapshot range |
+| 混合 renderer | 遠／中倍率連續 filled min/max envelope＋outline；近倍率連接原始 samples | 本機套件通過；Windows 10.00→4.51→0.42→0.04→0.01 秒 zoom 已觀察連續畫法 |
 | 共用幾何 | Empty／Envelope／Samples；Envelope 保留 bin 邊界與中心的 min/max；Samples 要求一對一原始 frames，使用 `x = i / N`，無 half-bin offset；helper 接收的非有限值分 runs | 本機 core／平台套件已通過；不等同所有平台原生畫面驗收 |
-| 縮放與視窗 | 最小範圍依實際 occupied width，最深約四個邏輯像素／sample；輸入有界，resize 保留視野，後續 wheel zoom 遵守有效上下限 | 等待跨平台測試與原生觀察 |
+| 縮放與視窗 | 最小範圍依實際 occupied width，最深約四個邏輯像素／sample；輸入有界，resize 保留視野，後續 wheel zoom 遵守有效上下限 | 自動化回歸通過，Windows wheel zoom 已觀察；本輪未新增 native resize、Mac／DAW GUI 實測 |
 | Windows 原生 quiet smoke | 隔離的無聲 Process Loopback 來源；檢查 Off／On／Pause／Resume 與固定記憶體 snapshot | 首次 crash 保留；ownership 修復後同 case 通過，見下節 |
-| UI | 說明放文件；UI 保持控制、標題、值及必要的狀態／錯誤／路徑 | 等待最終原生介面觀察 |
+| UI | 說明放文件；UI 保持控制、標題、值及必要的狀態／錯誤／路徑 | 中間 Release 已觀察無 helper；最終僅移除次要 Options 標題 PID，沒有冒稱重做 final GUI |
 
 方案與更新前的點狀／綠色密集柱狀分析見[波形顯示研究](WAVEFORM_DISPLAY_RESEARCH_2026-11-14.md)；工作項目見[本輪計畫](superpowers/plans/2026-11-14-retain-quiet-sections.md)。不複製使用者私人圖片、音訊或其本機路徑。
 
@@ -58,6 +58,27 @@
 | Windows native quiet smoke | **1 passed**，另外 opt-in 執行，詳見上節 |
 | VST3／CLAP plug-in | **64 passed／0 ignored** |
 
-Windows 中間 Release SHA256 為 `5B95B567EB5858447C0EAD266CB1C31136CD3C032767CC03C914FAB6BD2E0C7A`。該 GUI 已觀察 Capture checkbox 預設未勾選，On→Off 可切換，沒有 helper 段落；Clear 後填滿的 **10.00 秒**波形呈連續 envelope。視野上的短跨度受手動 zoom／history 狀態影響，不能單憑顯示時間推斷擷取缺幀。這些是指定功能觀察，沒有量測 frame time、CPU 或匯出音訊品質。
+Windows 中間 Release SHA256 為 `5B95B567EB5858447C0EAD266CB1C31136CD3C032767CC03C914FAB6BD2E0C7A`。該 GUI 已觀察 Capture checkbox 預設未勾選，On→Off 可切換，沒有 helper 段落；Clear 後填滿的 **10.00 秒**波形呈連續 envelope。其後手動 Pause，以 wheel 逐步 zoom 至 **4.51／0.42／0.04／0.01 秒**，畫面均保持連續，沒有 comb 或散點外觀。視野上的短跨度受手動 zoom／history 狀態影響，不能單憑顯示時間推斷擷取缺幀。這些是指定功能觀察，沒有量測 frame time、CPU 或匯出音訊品質，也沒有新增實體 Shift-drag 或 native resize 實測。
 
-此 SHA 是移除 Options 次要標題 PID 之前的受測建置，**不是最終重建或 Setup payload hash**。深度 sample zoom、macOS 原生 build／CI、Windows 最終 GUI／Release／Setup 及實際 installed binary 尚待最後 metadata。不覆寫先前報告的 runtime hash，也不把 build 成功當成 DAW 或全平台操作已驗收。
+此 SHA 是移除 Options 次要標題 PID 之前的受測建置，**不是最終重建或 Setup payload hash**。原生 GUI 隔離測試已結束。最終正常 tray／toolwindow 無法由 computer-use inventory 選定，因此沒有冒稱在最終執行檔重新操作 GUI。不覆寫先前報告的 runtime hash，也不把 build 成功當成 DAW 或全平台操作已驗收。
+
+### 最終本機成品與已安裝桌面版
+
+[package-validation.json](benchmarks/2026-11-14-quiet-waveform/package-validation.json)保留本機成品與去識別 refresh metadata。Setup 的 desktop、VST3、CLAP 及固定 Guide 四個 payload 已逐一與來源 bytes 比對一致，hash／size 也另行重核。
+
+| 成品 | Bytes | SHA256 |
+| --- | ---: | --- |
+| Windows desktop Release | 8,248,320 | `0F22316808DD6001C03633B711546890D4DE20B7AFEC45B9EB696E94DD4F588C` |
+| Windows VST3／CLAP DLL payload | 7,362,048 | `B241A8497AF2DE172919C50724919D372CA4F6FEFFD92B1266C4F94F6B689766` |
+| Windows Setup | 3,503,467 | `48BF289A04AF0B71A09EAEBC899BEA65AA3CED79EB887B5931A69C9F2BA7B3D8` |
+| 隨附 USER_GUIDE.md | 52,648 | `3B0123DB559B67A492D1CB3E239137EA477677B3749DA33AD26A7E7710D88767` |
+
+實際已安裝桌面版於 **2026-11-14 03:02:57 UTC** 以備份後的 desktop-only refresh 更新 `Backtracking.exe`、`USER_GUIDE.md`、`BUILD-INFO.txt`，正常無參數啟動，執行檔 hash 與最終 desktop `0F2231…F588C` 一致。這次沒有更新已安裝插件；其既有 DLL hash 為 `5C24211C6755D4C5A3F9CE20BF3FE8D878B95F688D0650CAB18610B7B6A6877F`，不可把它寫成新版 `B241…9766` 的 DAW 載入驗證。Installer 邏輯未改，本輪核對新 payload，**沒有重跑新版 Setup 的 install／uninstall**。
+
+### 本輪遠端 CI：同一 source 三平台通過
+
+同一 source commit 的 [run 43549431632](https://github.com/kekekewww/Backtracking/actions/runs/43549431632) 已完成，**整輪 SUCCESS，Windows／macOS／Linux 三個 jobs 全部成功**。最後 Windows job 於 **03:07:32 UTC** 完成，包含 capture core、native desktop、native plug-in 三個 test steps 及 Windows Release build；各步驟時間與結論保留於 [cross-platform-ci.json](benchmarks/2026-11-14-quiet-waveform/cross-platform-ci.json)。
+
+macOS 完成 app build／驗證、signed update／rollback 及 native Swift harness。在 **03:02:43 UTC** 的 harness 輸出確認 waveform geometry、capture routing、quiet retention、alignment 與 A/B WAV export 通過；routing entry 實際呼叫 geometry／RenderGate assertions，不只是編譯未執行。macOS core 為 **82 passed／1 ignored**，plugin 為 **64 passed／0 ignored**。Linux job 完成快捷鍵 helper、獨立 Sender connections 與 X11 activation／duplicate registration 驗證。
+
+Mac GUI、Fn、DAW、實體 Shift-drag、本輪新增 native resize 與 Linux Wayland／實體 compositor 操作仍未驗證，也沒有新版 renderer 的 CPU／RAM／frame-time 量測。CI 成功不替代這些互動／裝置條件，遠端產物也不改寫上表本機成品與中間 GUI build 的來源。

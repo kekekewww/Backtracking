@@ -1,6 +1,6 @@
 # 波形顯示研究：2026-11-14 / Waveform display research
 
-**狀態：更新前問題分析與本輪採用方案；實作／驗證進行中。** 本輪同時實裝「保留安靜片段／Keep quiet sections」與混合 renderer。前者控制往後保留的擷取內容，後者控制既有素材的畫法；兩者各自驗證。新測試、原生操作與建置結果記於[本輪功能與驗證紀錄](QUIET_CAPTURE_AND_WAVEFORM_2026-11-14.md)，不沿用舊報告作為通過證據。
+**狀態：更新前問題分析與本輪採用方案；實作完成，驗證範圍另列。** 本輪在 source commit `5fe9224c3dc54d0a2a655ec6b66522c43bd7a238` 同時實裝「保留安靜片段／Keep quiet sections」與混合 renderer。前者控制往後保留的擷取內容，後者控制既有素材的畫法；兩者各自驗證。本機套件與 Windows 指定 GUI 已有結果，完整 CI／平台限制、新成品 hashes 記於[本輪功能與驗證紀錄](QUIET_CAPTURE_AND_WAVEFORM_2026-11-14.md)，不沿用舊報告作為通過證據。
 
 ## 已確認的觀察與判讀
 
@@ -36,7 +36,7 @@
 
 ## 本輪採用的混合 renderer
 
-以實際 audio rect 的寬度 `W` 和可見 frames `F` 決定顯示解析度；所有模式共用相同的原始 frame → x 座標、選區起訖與聲道路由。共用 `waveform_geometry` 產生 `Empty`、`Envelope` 或 `Samples`，平台 renderer 消費幾何後繪製。這是本輪採用的實裝契約，仍須以下列測試與原生操作驗證，不能先視為效能結論。
+以實際 audio rect 的寬度 `W` 和可見 frames `F` 決定顯示解析度；所有模式共用相同的原始 frame → x 座標、選區起訖與聲道路由。共用 `waveform_geometry` 產生 `Empty`、`Envelope` 或 `Samples`，平台 renderer 消費幾何後繪製。下列契約由本輪自動化與指定原生操作分別驗證，不能把功能結果視為尚未量測的效能結論。
 
 | 倍率 | 採用的幾何 | 資料來源／限制 |
 | --- | --- | --- |
@@ -52,7 +52,7 @@ flowchart LR
     D --> E[可選深度插值研究]
 ```
 
-自動切換使用實際音訊區域與資料量，不新增 renderer 操作教學或內部技術說明到 UI。操作說明放文件，UI 保持控制與必要狀態。模式邊界、有限值 runs、峰值覆蓋、座標與成本仍須驗證。更深放大的插值及 RMS 內層留作後續研究；不能把現有只存 min/max 的 peak cache 說成已提供 RMS 區間統計，也不承諾本輪插值曲線。
+自動切換使用實際音訊區域與資料量，不新增 renderer 操作教學或內部技術說明到 UI。操作說明放文件，UI 保持控制與必要狀態。模式邊界、有限值 runs、峰值覆蓋與座標有自動化檢查；繪製成本未作本輪新硬體量測。更深放大的插值及 RMS 內層留作後續研究；不能把現有只存 min/max 的 peak cache 說成已提供 RMS 區間統計，也不承諾本輪插值曲線。
 
 Samples 模式要求資料與原始 frames 一對一，且每對有效的原始 min/max 相同；不是對重複 bin 作平滑重建。合法的 bins 多於 frames 時仍使用 Envelope，不宣稱有額外 samples。輸入 bin 數超過 4096 時回傳 Empty，不截取前段再拉伸成整個範圍。實際 audio width 足以分辨原始 samples 時，顯示政策使用一 frame 一 bin，並有 4096 的解析度上限。
 
@@ -60,10 +60,10 @@ Samples 模式要求資料與原始 frames 一對一，且每對有效的原始 
 
 ## 本輪整合與驗證項目
 
-1. **統一最小縮放範圍。**更新前 Windows 下限約為 sample rate／100（10 ms）、macOS 約／20（50 ms）、插件約／10（100 ms），進入 sample 模式的能力不同。本輪採共用的實際 occupied width 政策，最深約四個邏輯像素／sample，helper 以 `floor(width / 4)` 為基礎、界於 2–4096 frames，另處理 0／1 frame 與無效寬度。resize 保留原視野；後續 wheel zoom 使用有效上下限，避免因新尺寸而突變目前範圍。新政策與跨平台行為仍待本輪結果確認。
+1. **統一最小縮放範圍。**更新前 Windows 下限約為 sample rate／100（10 ms）、macOS 約／20（50 ms）、插件約／10（100 ms），進入 sample 模式的能力不同。本輪採共用的實際 occupied width 政策，最深約四個邏輯像素／sample，helper 以 `floor(width / 4)` 為基礎、界於 2–4096 frames，另處理 0／1 frame 與無效寬度。resize 保留原視野；後續 wheel zoom 使用有效上下限，避免因新尺寸而突變目前範圍。Windows 中間建置已觀察 10.00→4.51→0.42→0.04→0.01 秒連續畫法；本輪沒有新增原生 resize 或實體 Shift-drag 驗證，也未做 macOS／DAW GUI 驗收。
 2. **保留資料與視野契約。**沿用固定編輯素材、原始取樣位置及 A/B 同一起訖；換畫法不應重切選區、改匯出取樣或暫停背景擷取。
 3. **繪圖分工。**沿用 128-frame peak cache 與現有背景準備／快取流程；不同解析度的 envelope／sample window 以來源 generation、frame range、layout 作有效性邊界。UI 不因新幾何而同步等待整段資料。
-4. **處理安靜與極端值。**零值應形成可辨的零線；DC offset、常數、脈衝、正負峰、超過顯示範圍及非有限值要有明確規則。這些是待驗證案例，不從使用者兩張圖片推斷音訊原因。
+4. **處理安靜與極端值。**零值形成可辨的零線；DC offset、常數、脈衝、正負峰、超過顯示範圍及非有限值有明確幾何規則。這些由幾何回歸覆蓋，不從使用者兩張圖片推斷音訊原因；helper 的非有限值契約仍受前述 upstream NaN→0 限制。
 5. **驗證連續感與成本。**至少檢查不同 DPI／視窗寬度、相同 sample window 的跨平台畫法、模式邊界、pan／zoom 的穩定性及 peak preservation。再以可重現的實裝量測報 CPU／記憶體與繪製時間，不沿用舊硬體數字為新版 renderer 背書。
 
 ## 與保留安靜片段的範圍區分
