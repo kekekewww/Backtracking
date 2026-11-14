@@ -20,6 +20,18 @@ Fonts and licences are in `../fonts/` (`fonts.css` has every `@font-face`).
 - Chinese mega headlines are set in Noto Sans TC weight 900, square (never horizontally squeezed),
   3–5 characters per line, with their own line breaks and sizes.
 
+## Punctuation in headlines (product owner's rule)
+
+Short headline-style lines drop punctuation that does not change the meaning.
+
+- Chinese: no trailing 「。」 on mega headlines, the one-liner, beat headings, card titles, buttons or
+  labels. Body sentences and sub-lines keep normal punctuation.
+- English: the mega headlines keep their full stop, because it is part of the approved direction C
+  design ("TAKE IT / BACK.") and "ONE KEY. / SAVED." needs both. Other short English headings
+  (beat headings, card titles, the one-liner when used as a heading) may drop the final full stop.
+- Never drop punctuation that carries meaning (a question mark, a slash between formats, the
+  backtick key in a shortcut).
+
 ## Availability (state it exactly like this)
 
 Product owner's decision (overrides any earlier wording): availability is one message everywhere.
@@ -47,10 +59,10 @@ Product owner's decision (overrides any earlier wording): availability is one me
 
 | Slot | English | 繁體中文 |
 | --- | --- | --- |
-| Mega headline | TAKE IT / BACK. | 剛剛那段 / 拿回來。 |
+| Mega headline | TAKE IT / BACK. | 剛剛那段 / 拿回來 |
 | Tag | Retrospective audio sampler | 回溯錄音取樣器 |
 | Sub-line | Select what you just heard and drag it out as a WAV. Backtracking keeps up to 10 minutes of audio in memory. | 框選剛剛聽到的聲音，直接拖出成 WAV。Backtracking 會在記憶體中保留最近最長 10 分鐘的音訊。 |
-| One-liner | It was already listening. | 它一直都在聽。 |
+| One-liner | It was already listening. | 它一直都在聽 |
 | History scale | 10 s · 20 s · 30 s · 60 s · 3 min · 5 min · 10 min | 10 秒 · 20 秒 · 30 秒 · 60 秒 · 3 分鐘 · 5 分鐘 · 10 分鐘 |
 | Editions line | Windows / macOS / VST3 / CLAP | Windows / macOS / VST3 / CLAP |
 | Licence line | Open source · Apache-2.0 | 開放原始碼 · Apache-2.0 |
@@ -62,9 +74,9 @@ Product owner's decision (overrides any earlier wording): availability is one me
 
 | # | English | 繁體中文 |
 | --- | --- | --- |
-| 1 | **It's already listening.** Backtracking keeps the last 10 seconds to 10 minutes of audio in memory. | **它一直都在聽。** Backtracking 在記憶體中保留最近 10 秒到 10 分鐘的音訊。 |
-| 2 | **Select the part you want.** Drag across the waveform. Hold Shift to snap to flags, bars or seconds. | **框選想要的那一段。** 在波形上拖曳框選，按住 Shift 可吸附旗標、小節線或秒數線。 |
-| 3 | **Drag it out as a WAV.** Drop it on a DAW track or into a folder. Recording keeps running in the background. | **直接拖出成 WAV。** 放到 DAW 音軌或資料夾，背景會繼續錄音。 |
+| 1 | **It's already listening.** Backtracking keeps the last 10 seconds to 10 minutes of audio in memory. | **它一直都在聽** Backtracking 在記憶體中保留最近 10 秒到 10 分鐘的音訊。 |
+| 2 | **Select the part you want.** Drag across the waveform. Hold Shift to snap to flags, bars or seconds. | **框選想要的那一段** 在波形上拖曳框選，按住 Shift 可吸附旗標、小節線或秒數線。 |
+| 3 | **Drag it out as a WAV.** Drop it on a DAW track or into a folder. Recording keeps running in the background. | **直接拖出成 WAV** 放到 DAW 音軌或資料夾，背景會繼續錄音。 |
 
 ### Features (names are fixed; one-line descriptions may be shortened, not embellished)
 
@@ -87,10 +99,10 @@ mega headline and sub-line. Headlines below are the starting point. Line breaks 
 
 | Edition | Mega headline EN | 繁體中文 | Sub-line EN | 繁體中文 |
 | --- | --- | --- | --- | --- |
-| Windows desktop | FROM ANY / APP. | 任何 App / 都能留。 | System playback, a microphone, or one chosen app. Select it and drag out a WAV. Download from GitHub. | 系統播放、麥克風或指定 App，框選後直接拖出 WAV。從 GitHub 下載。 |
-| macOS desktop | OFF YOUR / MAC. | Mac 的聲音 / 拿回來。 | System playback, a microphone, or one chosen app, on macOS 14.2 or later. Download from GitHub. | 系統播放、麥克風或指定 App，支援 macOS 14.2 以上。從 GitHub 下載。 |
-| VST3 / CLAP plug-in | ON ANY / TRACK. | 每一軌 / 都留著。 | Insert it on a track, group or master. It keeps what passed through and hands it back as a WAV. | 插在音軌、群組或主輸出上，留住經過的聲音，再拖出成 WAV。 |
-| Linux shortcut helper | ONE KEY. / SAVED. | 一個按鍵 / 存下來。 | A global Super + ` shortcut that tells a Backtracking plug-in instance to save a snapshot. Download from GitHub. | 全域 Super + ` 快捷鍵，讓 Backtracking 插件儲存快照。從 GitHub 下載。 |
+| Windows desktop | FROM ANY / APP. | 任何 App / 都能留 | System playback, a microphone, or one chosen app. Select it and drag out a WAV. Download from GitHub. | 系統播放、麥克風或指定 App，框選後直接拖出 WAV。從 GitHub 下載。 |
+| macOS desktop | OFF YOUR / MAC. | Mac 的聲音 / 拿回來 | System playback, a microphone, or one chosen app, on macOS 14.2 or later. Download from GitHub. | 系統播放、麥克風或指定 App，支援 macOS 14.2 以上。從 GitHub 下載。 |
+| VST3 / CLAP plug-in | ON ANY / TRACK. | 每一軌 / 都留著 | Insert it on a track, group or master. It keeps what passed through and hands it back as a WAV. | 插在音軌、群組或主輸出上，留住經過的聲音，再拖出成 WAV。 |
+| Linux shortcut helper | ONE KEY. / SAVED. | 一個按鍵 / 存下來 | A global Super + ` shortcut that tells a Backtracking plug-in instance to save a snapshot. Download from GitHub. | 全域 Super + ` 快捷鍵，讓 Backtracking 插件儲存快照。從 GitHub 下載。 |
 
 The Linux item is only a shortcut helper for the plug-in. Do not present it as a Linux recorder app.
 
