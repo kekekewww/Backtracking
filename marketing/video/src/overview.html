@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Backtracking overview</title>
+<link rel="stylesheet" href="video.css">
+<script src="engine.js"></script>
+<script>document.write('<script src="strings/' + E.lang + '.js"><\/script>');</script>
+</head>
+<body>
+<div id="stage"></div>
+<script src="scenes.js"></script>
+<script>
+/* Overview, 1920x1080, 57.5 s. Storyboard (seconds):
+   0.0  problem: the great part (mint) scrolls past; record is hit too late, counter starts at 0:00
+   5.6  "It was already listening." + History scale scrubs back from 10 min
+   10.4 beat 1: panel drops in, live capture, newest audio at the right
+   16.0 beat 2: Shift + drag selects (snaps to painted seconds), view fixed, capture continues
+   23.6 beat 3: drag the selection out as a WAV onto a generic DAW track; panel returns live
+   33.0 features, 2.6 s each: sources, A/B, plug-in, snapshot shortcut, waveform only, meter, WAV export
+   51.2 end card */
+(function () {
+  var S = STR, ZH = E.lang === "zh-TW", W = 1920, H = 1080;
+  var st = SC.stage(W, H);
+  var scenes = [];
+
+  scenes.push(SC.problem(st, 0, 5.6, { W: W, waveY: 250, waveH: 470, pps: W / 5, recX: 1640, recY: 880, recD: 120,
+    cntX: 1300, cntY: 852, cntSize: 52, click: 3.55, curFrom: { x: 1180, y: 1000 }, curScale: 1.6 }));
+
+  scenes.push(SC.oneLiner(st, 5.6, 10.4, { W: W, bgY: 470, bgH: 520, x: 86, y: 118, size: 262, zhSize: 270,
+    sx: 96, sy: 900, sw: 1728, sf: 20, beats: ZH ? [0.35, 0.85] : [0.3, 0.75, 1.2] }));
+  if (ZH) scenes[1].beatsZh = true;
+
+  scenes.push(SC.beats(st, 10.4, 33.0, {
+    // caption row on top, the panel as the hero across the frame, scale / keycap / DAW below
+    panel: { x: 96, y: 282, z: 2.26, width: 762, waveH: 100 }, N0: 40.1,
+    caps: [{ at: 0, beat: 0, body: true }, { at: 5.6, beat: 1, body: true }, { at: 13.2, beat: 2, body: true }],
+    cap: { x: 96, y: 64, w: 1728, row: true, num: 200, title: 62, zhTitle: 62, body: 34 },
+    keys: { x: 96, y: 770 },
+    hscale: { x: 96, y: 930, w: 1728, font: 20 },
+    band: { y: 720, h: 360 },
+    daw: { x: 96, y: 738, w: 1728, h: 34 + 3 * 86, rowH: 86 },
+    T: { enter: [5.85, 6.6], press: 6.9, dragEnd: 8.9, release: 8.95, keysUp: 9.15, mid: 9.4, mid2: 9.9,
+      dawIn: 13.2, press2: 13.9, drag2: 15.3, drop: 15.55, play: [16.3] },
+    curFrom: { x: 1500, y: 1150 }, curScale: 1.6, slabScale: 1.5
+  }));
+
+  /* ---------------- feature run ---------------- */
+  /* caption column on the left, centred on the frame's middle; the visual fills the right
+     column (X0..1824) between y 150 and 930; the tone-on-tone band runs across the lower third */
+  var F0 = 33.0, FD = 2.6, X0 = 800, XW = 1024;
+  function featScene(i, build) {
+    var sc = SC.scene(st, F0 + i * FD, F0 + (i + 1) * FD);
+    var band = SC.band(sc.el, W, 740, 340, 40 + i);
+    var f = S.features[i];
+    var col = SC.txt(sc.el, "", 96, 540, ""); col.style.width = "640px"; col.style.transform = "translateY(-50%)";
+    var nm = E.el("div", "feat-name", col); nm.textContent = f.name; nm.style.fontSize = (ZH ? 112 : 150) + "px"; nm.style.whiteSpace = "normal";
+    var bd = E.el("div", "sub", col); bd.textContent = f.body; bd.style.fontSize = (ZH ? 40 : 40) + "px"; bd.style.marginTop = "40px"; bd.style.color = "var(--c-paper)";
+    nm.style.transformOrigin = bd.style.transformOrigin = "0 100%";
+    var vis = build(sc.el);
+    sc.render = function (u) { band(F0 + i * FD + u); E.slam(nm, u, 0); E.slam(bd, u, 0.14); vis(u); };
+    return sc;
+  }
+  var base = E.Audio({ seed: 7 });
+  var voice = E.Audio({ seed: 5, kind: "voice" });
+
+  var FZ = XW / 560;   // panels span the whole right column
+  // 1 Sources
+  scenes.push(featScene(0, function (el) {
+    var icons = ["speaker", "mic", "app"].map(function (n, i) {
+      var t = SC.txt(el, "tile", X0 + i * 250, 190, E.ICON[n], "width:190px;height:190px"); return t;
+    });
+    var P = E.Panel(el, { x: X0, y: 450, z: FZ, waveH: 140, audio: base, history: 10, status: false });
+    return function (u) {
+      icons.forEach(function (t, i) {
+        E.slam(t, u, 0.1 + 0.22 * i, { dy: 36 });
+        var a = 0.9 + i * 0.55; t.classList.toggle("on", u >= a && u < a + 0.55);
+      });
+      P.draw({ now: 70 + u });
+    };
+  }));
+  // 2 A/B
+  scenes.push(featScene(1, function (el) {
+    var P = E.Panel(el, { x: X0, y: 150, z: FZ, audio: base, audioB: voice, history: 10, waveH: 130 });
+    var s1 = E.Slab(el, "Backtracking-1794…-13-A.wav", SC.META("4.00 s"), 1.55);
+    var s2 = E.Slab(el, "Backtracking-1794…-13-B.wav", SC.META("4.00 s"), 1.55);
+    return function (u) {
+      P.draw({ now: 80 + u, rows: 2 });
+      if (u >= 0.55) s1.set(X0, 600, { k: E.lerp(0.7, 1, E.outBack(E.prog(u, 0.55, 0.67))) }); else s1.set(0, 0, { hide: true });
+      if (u >= 0.75) s2.set(X0, 775, { k: E.lerp(0.7, 1, E.outBack(E.prog(u, 0.75, 0.87))) }); else s2.set(0, 0, { hide: true });
+    };
+  }));
+  // 3 Plug-in
+  scenes.push(featScene(2, function (el) {
+    var D = E.DAW(el, { x: X0, y: 150, w: XW, h: 34 + 120, tracks: 1, bars: 8, rowH: 120 });
+    var fx = SC.txt(el, "fxwin", X0, 360, ""); fx.style.width = XW + "px"; fx.style.height = "350px";
+    var sl = [0, 1, 2].map(function (i) {
+      var s = SC.txt(fx, "fx-slot" + (i === 1 ? " on" : ""), 18, 24 + i * 56, i === 1 ? "Backtracking" : "");
+      s.style.width = "240px"; return s;
+    });
+    var insertAt = 0.55;
+    var au = E.Audio({ seed: 9, since: 90 + insertAt });
+    var P = E.Panel(fx, { x: 284, y: 24, z: 1.36, width: 520, waveH: 150, audio: au, history: 10, plugin: true });
+    P.box.style.boxShadow = "none";
+    return function (u) {
+      E.slam(D.box, u, 0.05, { dy: 30 });
+      E.slam(fx, u, 0.2, { dy: 30 });
+      E.slam(sl[1], u, insertAt, { dx: -40, dy: 0, s: 0 });
+      P.wrap.style.visibility = u >= insertAt ? "visible" : "hidden";
+      P.draw({ now: 90 + u });
+    };
+  }));
+  // 4 Snapshot shortcut
+  scenes.push(featScene(3, function (el) {
+    var K = E.Keys(el, ["Alt", "+", "`"]); K.el.classList.add("big"); E.pos(K.el, X0, 150);
+    var P = E.Panel(el, { x: X0, y: 330, z: FZ, waveH: 120, audio: base, history: 10 });
+    var s = E.Slab(el, "Backtracking-1794…-14.wav", SC.META("10.00 s"), 1.55);
+    return function (u) {
+      E.slam(K.el, u, 0.1, { dy: 30 });
+      K.press(u >= 0.7 && u < 1.05);
+      P.draw({ now: 100 + u, status: u >= 0.8 ? SC.SNAP : "" });
+      if (u >= 0.85) s.set(X0, 760, { k: E.lerp(0.7, 1, E.outBack(E.prog(u, 0.85, 0.97))) }); else s.set(0, 0, { hide: true });
+    };
+  }));
+  // 5 Waveform only
+  scenes.push(featScene(4, function (el) {
+    var win = SC.txt(el, "win", X0 + 60, 300, '<div class="tb"></div>'); win.style.width = (XW - 60) + "px"; win.style.height = "610px";
+    [[40, 90, 620], [40, 130, 440], [40, 200, 820], [40, 240, 700], [40, 280, 760], [40, 350, 360], [40, 390, 640], [40, 460, 720], [40, 500, 480]].forEach(function (l) {
+      var d = E.el("div", "ln", win); d.style.left = l[0] + "px"; d.style.top = l[1] + "px"; d.style.width = l[2] + "px";
+    });
+    [18, 38, 58].forEach(function (x) { var i = E.el("i", "", win.firstChild); i.style.left = x + "px"; });
+    var P = E.Panel(el, { x: X0, y: 170, z: FZ, waveH: 110, audio: base, history: 10 });
+    var cutAt = 0.75, steps = [1.15, 1.45, 1.75, 2.05];
+    return function (u) {
+      win.style.visibility = "visible";
+      var strip = u >= cutAt;
+      var alpha = 1;
+      steps.forEach(function (s) { if (u >= s) alpha -= 0.25; });
+      // waveform stays put while the window collapses around it
+      P.wrap.style.top = (strip ? 170 + FZ * 28 : 170) + "px";
+      P.draw({ now: 110 + u, strip: strip, alpha: Math.max(0, alpha), border: alpha > 0.01 });
+    };
+  }));
+  // 6 Meter
+  scenes.push(featScene(5, function (el) {
+    var P = E.Panel(el, { x: X0, y: 150, z: FZ, waveH: 120, audio: base, history: 10 });
+    var big = SC.txt(el, "", X0, 580, '<span class="v"></span><span class="u"></span>',
+      "width:" + XW + "px;height:300px;box-sizing:border-box;background:#f4f1e8;color:#070c3d;box-shadow:12px 12px 0 #070c3d;display:flex;align-items:center;justify-content:flex-end;gap:32px;padding:0 60px");
+    var v = big.querySelector(".v"), un = big.querySelector(".u");
+    v.style.cssText = "font-family:'Geist Mono',monospace;font-weight:600;font-size:170px;letter-spacing:-0.02em";
+    un.style.cssText = "font-stretch:125%;font-weight:800;font-size:66px;letter-spacing:0.04em;min-width:230px";
+    var modes = ["dBFS", "VU", "LUFS"];
+    return function (u) {
+      var m = modes[Math.min(2, Math.floor(E.clamp(u - 0.15, 0, 9) / 0.82))];
+      var now = 120 + u;
+      E.slam(big, u, 0.12, { dy: 30 });
+      v.textContent = E.meterValue(base, now, m); un.textContent = m;
+      P.draw({ now: now, mode: m });
+    };
+  }));
+  // 7 WAV export
+  scenes.push(featScene(6, function (el) {
+    var fm = [["44.1 kHz", "16-bit PCM"], ["48 kHz", "24-bit PCM"], ["96 kHz", "32-bit float"]];
+    var sl = fm.map(function (f) { return E.Slab(el, SC.NAME, SC.META("4.00 s", f[0], f[1]), 1.85); });
+    return function (u) {
+      sl.forEach(function (s, i) {
+        var t0 = 0.12 + 0.3 * i;
+        if (u >= t0) s.set(X0 + 50 * i, 170 + 250 * i, { k: E.lerp(0.7, 1, E.outBack(E.prog(u, t0, t0 + 0.12))) });
+        else s.set(0, 0, { hide: true });
+      });
+    };
+  }));
+
+  /* ---------------- end card ---------------- */
+  scenes.push(SC.endCard(st, 51.2, 57.5, {
+    lock: { x: 96, y: 64, icon: 64, font: 32 },
+    tag: { x: 0, y: ZH ? 82 : 86, right: 96, font: ZH ? 24 : 18 },
+    mega: { x: 86, y: 196, size: 316, zhSize: 236 },
+    cta: { x: ZH ? 1100 : 1150, y: 520, font: 40 },
+    url: { x: ZH ? 1100 : 1150, y: 660, font: 44 },
+    footer: { x: 96, y: 952, w: 1728, font: 20 },
+    beats: [0.15, 0.6, 1.05]
+  }));
+
+  SC.run(scenes, 57.5);
+  window.__ready = E.ready(ZH ? ["900 100px 'Noto Sans TC'", "400 40px 'Noto Sans TC'", "700 40px 'Noto Sans TC'"] : []);
+})();
+</script>
+</body>
+</html>

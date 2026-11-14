@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Backtracking short</title>
+<link rel="stylesheet" href="video.css">
+<script src="engine.js"></script>
+<script>document.write('<script src="strings/' + E.lang + '.js"><\/script>');</script>
+</head>
+<body>
+<div id="stage"></div>
+<script src="scenes.js"></script>
+<script>
+/* Vertical short, 1080x1920, 21 s. Text stays between y = 250 and y = 1580 (platform UI zones).
+   0.0  heard it: the great part (mint) scrolls past, record is hit too late
+   3.6  "It was already listening." + History scale
+   7.0  it's already there: panel; Shift + drag selects the part ("Select the part you want.")
+   11.9 drag it out onto a generic DAW track ("Drag it out as a WAV.")
+   16.4 end card */
+(function () {
+  var S = STR, ZH = E.lang === "zh-TW", W = 1080, H = 1920;
+  var st = SC.stage(W, H);
+  var scenes = [];
+  scenes.push(SC.problem(st, 0, 3.6, { W: W, waveY: 520, waveH: 520, pps: W / 3.2, t0: 9.6, recX: 820, recY: 1330, recD: 150,
+    cntX: 300, cntY: 1296, cntSize: 64, click: 2.5, momLen: 1.7, curFrom: { x: 620, y: 1520 }, curScale: 1.7 }));
+  scenes.push(SC.oneLiner(st, 3.6, 7.0, { W: W, bgY: 1100, bgH: 420, x: 58, y: 330, size: 212, zhSize: 228,
+    sx: 64, sy: 1080, sw: 952, sf: 19, beats: ZH ? [0.3, 0.75] : [0.25, 0.65, 1.05] }));
+  scenes.push(SC.beats(st, 7.0, 16.4, {
+    // panel near the full safe width; keycap and History scale (then the DAW) fill the space below
+    panel: { x: 54, y: 600, z: 1.86, width: 520, waveH: 150 }, N0: 45.4,
+    caps: [{ at: 0.15, beat: 1, body: false }, { at: 4.9, beat: 2, body: false }],
+    cap: { x: 64, y: 330, w: 952, title: 92, zhTitle: 96, body: 34 },
+    keys: { x: 64, y: 1110, big: true },
+    hscale: { x: 64, y: 1400, w: 952, font: 22 },
+    band: { y: 1180, h: 740 },
+    daw: { x: 54, y: 1110, w: 966, h: 34 + 3 * 120, rowH: 120 },
+    T: { enter: [0.45, 1.2], press: 1.5, dragEnd: 3.1, release: 3.15, keysUp: 3.35, mid: 3.55, mid2: 4.0,
+      dawIn: 4.9, press2: 5.45, drag2: 6.65, drop: 6.9, play: [7.5] },
+    curFrom: { x: 900, y: 1700 }, curScale: 1.7, slabScale: 1.2
+  }));
+  scenes.push(SC.endCard(st, 16.4, 21.0, {
+    lock: { x: 64, y: 280, icon: 72, font: 38 },
+    tag: { x: 64, y: 1030, font: ZH ? 28 : 21 },
+    mega: { x: 54, y: 420, size: 300, zhSize: 220 },
+    cta: { x: 64, y: 1110, font: 44 },
+    url: { x: 64, y: 1256, font: 48 },
+    footer: { x: 64, y: 1420, w: 952, font: 21, stack: true },
+    beats: [0.15, 0.55, 0.95]
+  }));
+  SC.run(scenes, 21.0);
+  window.__ready = E.ready(ZH ? ["900 100px 'Noto Sans TC'", "400 40px 'Noto Sans TC'", "700 40px 'Noto Sans TC'"] : []);
+})();
+</script>
+</body>
+</html>

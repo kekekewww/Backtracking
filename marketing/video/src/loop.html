@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Backtracking loop</title>
+<link rel="stylesheet" href="video.css">
+<script src="engine.js"></script>
+<script>window.STR = { htmlLang: "en" };</script>
+</head>
+<body>
+<div id="stage"></div>
+<script src="scenes.js"></script>
+<script>
+/* Feature loops, 1280x720, language-neutral (app UI, keycaps and icons only).
+   ?id=select | drag-out | ab-sources | waveform-only | snapshot-shortcut
+   Seamless: the audio model repeats with period = loop length, the record light blinks at 1 Hz
+   and the meter refreshes at 10 Hz, so frame N equals frame 0 and the loop wraps cleanly. */
+(function () {
+  var id = new URLSearchParams(location.search).get("id") || "select";
+  var W = 1280, H = 720;
+  var st = SC.stage(W, H);
+  var root = SC.scene(st, 0, 1e9).el;
+  var LOOP = { "select": 6, "drag-out": 7, "ab-sources": 6, "waveform-only": 7, "snapshot-shortcut": 7 }[id];
+  var N0 = 120;
+  var audio = E.Audio({ seed: 7, period: LOOP });
+  var render;
+  /* camera: scale the composition's bounding box (bx, by, bw, bh, in layout px) to fill the frame
+     with normal margins and centre it; canvases are supersampled by K so they stay sharp */
+  var K = 1, visRight = W;   // visRight: right edge of the frame in layout px
+  function cam(bx, by, bw, bh) {
+    K = Math.min((W - 2 * 64) / bw, (H - 2 * 48) / bh);
+    var tx = (W - bw * K) / 2 - bx * K, ty = (H - bh * K) / 2 - by * K;
+    visRight = (W - tx) / K;
+    root.style.transformOrigin = "0 0";
+    root.style.transform = "translate(" + tx.toFixed(2) + "px," + ty.toFixed(2) + "px) scale(" + K.toFixed(4) + ")";
+  }
+
+  function selectGesture(P, keys, T, view0, yPress) {
+    // a 4-second selection that starts on the painted second line nearest local x = 190
+    var SEL0 = Math.round(P.xt(190, view0)), SEL1 = SEL0 + 4;
+    return {
+      SEL0: SEL0, SEL1: SEL1,
+      P1: { x: P.sx(P.tx(SEL0, view0)) + 1, y: P.sy(yPress) },
+      P2: { x: P.sx(P.tx(SEL1, view0)) + 7, y: P.sy(yPress + 4) },
+      Pm: { x: P.sx(P.tx(SEL0 + 2, view0)), y: P.sy(22) }
+    };
+  }
+
+  if (id === "select") {
+    cam(210, 160, 700, 385);
+    var P = E.Panel(root, { x: 220, y: 170, z: 1.5, width: 440, audio: audio, history: 10, ss: K });
+    var shift = E.Keys(root, ["Shift"]); E.pos(shift.el, 220, 440);
+    var esc = E.Keys(root, ["Esc"]); E.pos(esc.el, 220, 440);
+    var cur = E.Cursor(root, 1.4);
+    var T = { press: 1.55, dragEnd: 3.0, esc: 4.3 };
+    var view0 = N0 + T.press;
+    var g = selectGesture(P, shift, T, view0, 34);
+    var R = { x: 760, y: 470 };
+    var path = [{ t: 0, x: R.x, y: R.y }, { t: 0.6, x: R.x, y: R.y }, { t: 1.3, x: g.P1.x, y: g.P1.y }, { t: T.press, x: g.P1.x, y: g.P1.y },
+      { t: T.dragEnd, x: g.P2.x, y: g.P2.y }, { t: 4.7, x: g.P2.x, y: g.P2.y }, { t: 5.6, x: R.x, y: R.y }];
+    render = function (t) {
+      var now = N0 + t, c = E.path(path, t);
+      var editing = t >= T.press && t < T.esc + 0.08;
+      var sel = null, dur = null;
+      if (editing) {
+        var e1 = Math.max(g.SEL0, Math.min(g.SEL1, Math.round(P.xt((c.x - P.o.x) / P.z - 11, view0))));
+        if (e1 > g.SEL0) { sel = [g.SEL0, e1]; dur = (e1 - g.SEL0).toFixed(2) + " s"; }
+      }
+      P.draw({ now: now, view: editing ? view0 : now, sel: sel, dur: dur, status: editing ? "Selection" : "" });
+      var kOn = t >= 1.25 && t < 3.45;
+      E.show(shift.el, kOn); if (kOn) { E.slam(shift.el, t, 1.25, { dy: 26 }); shift.press(t >= 1.35 && t < 3.2); }
+      var eOn = t >= 4.05 && t < 4.9;
+      E.show(esc.el, eOn); if (eOn) { E.slam(esc.el, t, 4.05, { dy: 26 }); esc.press(t >= T.esc && t < T.esc + 0.3); }
+      cur.set(c.x, c.y, { pressT: t - T.press });
+    };
+  }
+
+  if (id === "drag-out") {
+    cam(40, 40, 890, 560);
+    var P = E.Panel(root, { x: 240, y: 50, z: 1.5, width: 440, audio: audio, history: 10, ss: K });
+    var D = E.DAW(root, { x: 240, y: 316, w: 660, h: 34 + 3 * 80, tracks: 4, bars: 8, rowH: 80, ss: K });
+    var shift = E.Keys(root, ["Shift"]); E.pos(shift.el, 48, 96);
+    var T = { press2: 0.5, drag2: 1.75, drop: 2.0, scroll: [2.55, 2.95], enter: [3.0, 3.7], press: 4.0, dragEnd: 5.2, mid: [5.45, 5.95] };
+    var view0 = N0 + T.press;            // fixed view of the selection made at the end of the loop
+    var viewPrev = view0 - LOOP;         // ... which is the one on screen at the start
+    var g = selectGesture(P, shift, T, view0, 34);
+    var dropLx = 2 * D.pxBar;
+    var clipA = E.Clip(D, 0, dropLx, audio, g.SEL0, g.SEL1, SC.NAME);   // from the previous pass
+    var clipB = E.Clip(D, 1, dropLx, audio, g.SEL0, g.SEL1, SC.NAME);
+    var prev = E.el("div", "daw-prev", D.tracks[1].lane);
+    prev.style.width = (4 * D.pps) + "px"; prev.style.left = dropLx + "px";
+    var slab = E.Slab(root, SC.NAME, SC.META("4.00 s"), 1.1);
+    var cur = E.Cursor(root, 1.4);
+    var Pd = { x: D.sx(dropLx) + 24, y: D.sy(1) + D.rowH / 2 };
+    var path = [{ t: 0, x: g.Pm.x, y: g.Pm.y }, { t: T.press2, x: g.Pm.x, y: g.Pm.y }, { t: T.drag2, x: Pd.x, y: Pd.y },
+      { t: T.enter[0], x: Pd.x, y: Pd.y }, { t: T.enter[1], x: g.P1.x, y: g.P1.y }, { t: T.press, x: g.P1.x, y: g.P1.y },
+      { t: T.dragEnd, x: g.P2.x, y: g.P2.y }, { t: T.mid[0], x: g.P2.x, y: g.P2.y }, { t: T.mid[1], x: g.Pm.x, y: g.Pm.y }];
+    render = function (t) {
+      var now = N0 + t, c = E.path(path, t);
+      var held = t < T.drop, editing2 = t >= T.press;
+      var sel = null, dur = null, view = now, status = SC.SAVED;
+      if (held) { sel = [g.SEL0 - LOOP, g.SEL1 - LOOP]; view = viewPrev; status = "Selection"; dur = "4.00 s"; }
+      if (editing2) {
+        view = view0; status = "Selection";
+        var e1 = t < T.dragEnd + 0.05 ? Math.max(g.SEL0, Math.min(g.SEL1, Math.round(P.xt((c.x - P.o.x) / P.z - 11, view0)))) : g.SEL1;
+        if (e1 > g.SEL0) { sel = [g.SEL0, e1]; dur = (e1 - g.SEL0).toFixed(2) + " s"; }
+      }
+      var tipOn = t < T.press2 || t >= T.mid[1];
+      var tipView = t < T.press2 ? viewPrev : view0, tipSel = t < T.press2 ? g.SEL0 - LOOP : g.SEL0;
+      P.draw({ now: now, view: view, sel: sel, dur: dur, status: status,
+        tip: tipOn ? { text: "Drag and Drop", x: P.tx(tipSel + 2, tipView) + 72, y: 44 } : null });
+      var dragging = t >= T.press2 && t < T.drop;
+      cur.set(c.x, c.y, { pressT: t >= T.press ? t - T.press : t - T.press2 });
+      if (dragging) {
+        var c0 = E.path(path, t - 1 / 60), c1 = E.path(path, t + 1 / 60);
+        // the crop leaves no room on the right of the panel, so here the slab hangs to the left of the cursor
+        // for the whole drag (a side switch mid-drag would read as a jump)
+        var sw = slab.el.offsetWidth * slab.scale, sxp = c.x - sw - 10;
+        slab.set(sxp, c.y + 16, { k: 0.55 + 0.45 * E.outBack(E.prog(t, T.press2, T.press2 + 0.12), 2.4), vx: (c1.x - c0.x) * 30, vy: (c1.y - c0.y) * 30 });
+      } else slab.set(0, 0, { hide: true });
+      E.show(prev, dragging && D.trackAt(c.y) === 1 && c.x > D.sx(0));
+      E.show(clipB, t >= T.drop);
+      clipA.redraw();
+      if (t >= T.drop) { clipB.redraw(); clipB.style.transform = "translateY(" + (-12 * (1 - E.outBack(E.prog(t, T.drop, T.drop + 0.12), 2))).toFixed(2) + "px)"; }
+      D.setVScroll(D.rowH * E.inOut(E.prog(t, T.scroll[0], T.scroll[1])));
+      var kOn = t >= T.enter[1] - 0.05 && t < T.dragEnd + 0.45;
+      E.show(shift.el, kOn); if (kOn) { E.slam(shift.el, t, T.enter[1] - 0.05, { dy: 26 }); shift.press(t >= T.enter[1] + 0.05 && t < T.dragEnd + 0.2); }
+    };
+  }
+
+  if (id === "ab-sources") {
+    var voice = E.Audio({ seed: 5, kind: "voice", period: LOOP });
+    cam(30, 140, 1020, 425);
+    var P = E.Panel(root, { x: 300, y: 190, z: 1.5, width: 460, audio: audio, audioB: voice, history: 10, waveH: 150, status: false, ss: K });
+    var tA = SC.txt(root, "tile", 80, 150, E.ICON.speaker), tB = SC.txt(root, "tile", 80, 400, E.ICON.mic);
+    var lA = SC.txt(root, "wide", 34, 200, "A", "font-size:38px;color:#b0fbd3"), lB = SC.txt(root, "wide", 34, 450, "B", "font-size:38px;color:#b0fbd3");
+    var ns = "http://www.w3.org/2000/svg", sv = document.createElementNS(ns, "svg");
+    sv.setAttribute("class", "abs"); sv.setAttribute("width", W); sv.setAttribute("height", H); sv.style.left = "0"; sv.style.top = "0";
+    root.insertBefore(sv, root.firstChild);
+    function seg() { var p = document.createElementNS(ns, "polyline"); p.setAttribute("fill", "none"); p.setAttribute("stroke", "#f4f1e8"); p.setAttribute("stroke-width", "4"); sv.appendChild(p); return p; }
+    var cA = seg(), cB = seg();
+    var AB = 1.0, AB_OFF = 4.6;   // both state changes sit inside the loop, so the wrap is continuous
+    // B is enabled at AB: its lane starts empty and fills from the right
+    var bCache = E.Audio({ seed: 5, kind: "voice", period: LOOP, since: N0 + AB });
+    render = function (t) {
+      var ab = t >= AB && t < AB_OFF;
+      var yA = P.sy(ab ? 24 : 48), yB = P.sy(72);
+      cA.setAttribute("points", "230,225 262," + yA + " " + (P.sx(0) - 14) + "," + yA);
+      E.show(cB, ab); E.show(lB, ab);
+      cB.setAttribute("points", "230,475 262," + yB + " " + (P.sx(0) - 14) + "," + yB);
+      tA.classList.add("on"); tB.classList.toggle("on", ab);
+      if (ab) E.slam(tB, t, AB, { dy: 0, s: 0.12 }); else { tB.style.visibility = "visible"; tB.style.transform = ""; }
+      P.draw({ now: N0 + t, rows: ab ? 2 : 1, sinceB: ab ? N0 + AB : null, audioBSince: bCache });
+    };
+  }
+
+  if (id === "waveform-only") {
+    cam(210, 90, 870, 515);
+    var win = SC.txt(root, "win", 300, 220, '<div class="tb"></div>'); win.style.width = "760px"; win.style.height = "300px";
+    [[40, 70, 460], [40, 104, 320], [40, 160, 600], [40, 194, 520], [40, 228, 560], [40, 284, 300]].forEach(function (l) {
+      var d = E.el("div", "ln", win); d.style.left = l[0] + "px"; d.style.top = l[1] + "px"; d.style.width = l[2] + "px";
+    });
+    [18, 38, 58].forEach(function (x) { var i = E.el("i", "", win.firstChild); i.style.left = x + "px"; });
+    var P = E.Panel(root, { x: 220, y: 100, z: 1.5, audio: audio, history: 10, ss: K });
+    // transparency scale: the five real Background transparency options
+    var sca = SC.txt(root, "scale wide", 220, 568,"<span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>");
+    sca.style.width = "840px"; sca.style.fontSize = "17px";
+    var spans = sca.querySelectorAll("span");
+    var CUT = 1.4, STEPS = [1.4, 2.0, 2.5, 3.0, 3.5], BACK = 5.6, FULL = 6.2;
+    render = function (t) {
+      var strip = t >= CUT && t < FULL;
+      var lvl = 0;
+      if (strip && t < BACK) STEPS.forEach(function (s, i) { if (t >= s) lvl = i; });
+      var alpha = 1 - lvl * 0.25;
+      spans.forEach(function (s, i) { s.classList.toggle("on", i === lvl); });
+      P.wrap.style.top = (strip ? P.o.y + P.z * 28 : P.o.y) + "px";
+      P.draw({ now: N0 + t, strip: strip, alpha: alpha, border: alpha > 0.01 });
+    };
+  }
+
+  if (id === "snapshot-shortcut") {
+    cam(210, 60, 850, 520);
+    var P = E.Panel(root, { x: 220, y: 70, z: 1.5, width: 460, audio: audio, history: 10, ss: K });
+    var folder = SC.txt(root, "tile", 900, 330, E.ICON.folder);
+    var kW = E.Keys(root, ["Alt", "+", "`"]); E.pos(kW.el, 220, 470);
+    var kM = E.Keys(root, ["fn", "+", "`"]); E.pos(kM.el, 220, 470);
+    var slab = E.Slab(root, "Backtracking-1794…-14.wav", SC.META("10.00 s"), 1.0);
+    var shots = [{ k: kW, in: 0.6, down: 1.0, up: 1.35, out: 2.9 }, { k: kM, in: 3.6, down: 4.0, up: 4.35, out: 5.9 }];
+    render = function (t) {
+      var now = N0 + t, slabOn = false, fOn = false;
+      shots.forEach(function (s) {
+        var on = t >= s.in && t < s.out;
+        E.show(s.k.el, on);
+        if (on) { E.slam(s.k.el, t, s.in, { dy: 26 }); s.k.press(t >= s.down && t < s.up); }
+        var a = s.down + 0.12; // file written; slab shoots sideways to the folder
+        if (t >= a && t < a + 1.25) {
+          slabOn = true;
+          var u = E.prog(t, a, a + 0.14), e = E.outBack(u, 1.8);
+          var x0 = 220, x1 = 530, y = 367;
+          var sink = E.prog(t, a + 1.0, a + 1.25);
+          var x = E.lerp(x0, x1, e) + 340 * E.inOut(sink);
+          var vx = u < 1 ? (x1 - x0) / 0.14 * (1 - u) * 2 : 0;
+          slab.set(x, y + 20 * sink, { k: 1 - 0.65 * E.inOut(sink), vx: vx, vy: 0 });
+        }
+        if (t >= a + 1.2 && t < a + 1.55) fOn = true;
+      });
+      if (!slabOn) slab.set(0, 0, { hide: true });
+      folder.classList.toggle("on", fOn);
+      P.draw({ now: now, status: SC.SNAP });
+    };
+  }
+
+  window.DURATION = LOOP;
+  window.seek = function (t) { root.style.display = "block"; render(((t % LOOP) + LOOP) % LOOP); };
+  window.__ready = E.ready([]);
+})();
+</script>
+</body>
+</html>
