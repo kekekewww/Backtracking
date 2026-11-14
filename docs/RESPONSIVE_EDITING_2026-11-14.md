@@ -1,8 +1,8 @@
 # 波形編輯與介面回應：2026-11-14 / Responsive editing
 
-**狀態：本輪程式檢查、Windows 指定原生操作、最終 Release 與 Setup payload 打包核對已完成。**本頁區分功能測試版與清理文案後版本，保留實際觀察、產物雜湊與未測範圍；不宣稱 macOS、DAW 或新版完整安裝流程均已驗收。
+**狀態：本機檢查與指定 Windows 操作已完成；遠端指定平台 jobs 已分別通過。**Windows／macOS 在產品 commit `55baeac` 通過，Linux X11 在修正後 `52af947` 的 Linux-only 執行通過。原完整執行與前兩次重跑仍保留 failure，沒有改寫為同一完整矩陣全綠；Mac GUI／Fn／DAW、Wayland 及新版完整安裝流程仍未驗收。
 
-**Status: code checks, specified Windows native interactions, final Release builds, and Setup payload-integrity checks are complete.** Functional and copy-cleanup test builds are distinguished below. macOS, DAW hosts, unexercised interactions, and a full new-payload installation run are not claimed as verified.
+**Status: local checks and specified Windows interactions are complete; the named platform CI jobs passed across separate runs.** Windows/macOS passed on product `55baeac`, and Linux X11 passed in the Linux-only `52af947` follow-up. The original failed full run remains a failure; GUI/Fn/DAW, Wayland, and new-payload installation coverage is not implied.
 
 本輪更新與[較早的 Windows 硬體監測](HARDWARE_USAGE.md)分開記錄。`benchmarks/2026-11-14-windows/` 的歷史追蹤、摘要與雜湊不因這次互動規則改變而重寫；它不能代表新版的 CPU、記憶體或延遲結果。
 
@@ -149,9 +149,32 @@ A successful enqueue validates and queues work; it is not a durable write. The s
 | Shared core | 61 passed / 1 ignored；另 2 個 example 檢查通過 | 核心與範例檢查，不是 GUI／宿主／裝置音訊量測 |
 | Windows desktop | 47 passed / 2 ignored | 程式測試及下方指定原生操作；不是未執行手勢的驗收 |
 | Plug-in | 46 passed / 0 ignored | 含全段 Save 背景準備等回歸；不等於各 DAW 的 VST3／CLAP 全流程驗證 |
-| macOS | 尚無 native build / runtime 驗證 | 原始碼更新不等於 Mac 實機通過 |
+| macOS | 遠端 native app build／codesign 及指定 CI 測試通過（`55baeac`） | GUI 編輯、實體 Fn／Globe 與權限、DAW runtime 未驗證 |
 
-These fresh code checks are distinct from broad platform acceptance. The final Windows copy-cleanup build was rebuilt and checked natively as described below. No native macOS result is claimed.
+These checks are distinct from broad platform acceptance. Local Windows observations are recorded below; remote macOS native build/test outcomes are recorded separately in the CI section.
+
+## 遠端跨平台 CI / Remote cross-platform CI
+
+[產品 commit `55baeac` 的執行結果](https://github.com/kekekewww/Backtracking/actions/runs/43537657689)已完成：Windows 與 macOS jobs 全部指定步驟成功，但 Linux 的 X11 快捷鍵驗證失敗，**整體結果為 failure**。其後 [workflow-only commit `f3d9b0a` 的 Linux 重跑](https://github.com/kekekewww/Backtracking/actions/runs/43538353959)也在同一步驟失敗；該輪 Windows／macOS 為 skipped，不能視為重新通過。
+
+| Run / commit | Windows | macOS | Linux | 整體 / Overall |
+| --- | --- | --- | --- | --- |
+| `43537657689` / `55baeac` | success（含 Release） | success | failure：X11 shortcut activation / duplicate registration | failure |
+| `43538353959` / workflow-only `f3d9b0a` | skipped | skipped | failure：同一 X11 步驟 | failure |
+| `43539038043` / Linux diagnostic `8b2e68b` | skipped | skipped | failure：同一 X11 步驟，取得下方診斷 | failure |
+| `43539505931` / Linux fix `52af947` | skipped | skipped | success：helper／Sender／原 X11 assertions | success（Linux-only） |
+
+macOS 已通過原生 App 建置／驗證（包含 codesign）、signed update／rollback、Swift capture routes 與 paired WAV export、core／plugin tests。這是遠端 macOS runner 執行的建置及指定測試，**不是互動 GUI、實體 Fn／Globe 事件／輸入權限或 DAW 宿主操作的驗收，也不代表 notarization**。
+
+Linux 前三輪的 shortcut-helper 與 independent Sender steps 通過，失敗的是 `Verify X11 shortcut activation and duplicate registration`。第二輪 stderr 前綴為 `No physical TLDE key or Super modifier ...`。第三輪[診斷執行](https://github.com/kekekewww/Backtracking/actions/runs/43539038043)確認同一個 Xvfb keymap 有 physical TLDE（49）、LWIN（133）、RWIN（134）及 Mod4，Super mask 正常為 `0x40`，但 `XkbGetKeyboard(...GBN_KeyNamesMask)` 回傳 NULL，TLDE 查詢因此為 0。這排除了「fixture 缺少實體鍵或 Super」的說法，也不把合法 ByName mask／limits 的用法說成錯誤。
+
+這是額外找到的既有 Linux keyboard query-path 相容性問題。修正改用 active `XkbGetMap(AllClientInfoMask)` 再 `XkbGetNames(KeyNamesMask)`，保留 physical TLDE 查找，沒有硬編碼 keycode 或 symbol fallback，並清理錯誤路徑資源。第四輪 [Linux-only 驗證](https://github.com/kekekewww/Backtracking/actions/runs/43539505931)於 `52af947` 成功：helper、Sender、原 X11 registration、duplicate-client rejection 及 held-key 單次啟動的 `count -eq 1` assertions 都保留並通過，沒有弱化測試。
+
+第四輪 Windows／macOS 為 skipped，不能記成在 `52af947` 重新驗證它們；兩者成功來源仍是 `55baeac`。Windows／macOS 產品程式與本機 Setup 雜湊未因這條 Linux 修正改變。X11 fixture 成功也不驗證 Wayland portal 或實體鍵盤／桌面 compositor 行為。
+
+[公開 CI metadata](benchmarks/2026-11-14-responsive-editing/cross-platform-ci.json)保存 run／job／step 結果與 commit。下方 Windows 原生 GUI hash、本機插件與 Setup hash 仍是本機觀察／產物來源，**沒有改寫為 CI binary 的雜湊，也不宣稱 CI binary 與本機檔案相同**。
+
+The original product run passed Windows/macOS but failed Linux X11; two retries also failed. Active-map/name querying fixed the recorded X11 fixture, and the fourth Linux-only run passed the unchanged registration/duplicate/held-key assertions. Windows/macOS were skipped in that run, so their successful source remains `55baeac`. Local artifact hashes remain separate from CI binaries. X11 CI does not establish Wayland or physical-keyboard/compositor acceptance; macOS build/tests do not establish GUI/Fn/DAW acceptance.
 
 ## Windows 原生操作實測 / Native Windows observations
 
@@ -199,10 +222,10 @@ The final Setup was rebuilt after freezing the guide. Its desktop, VST3, CLAP, a
 ## 限制與待驗證項目 / Limits and pending validation
 
 - 尚未在現機重現使用者描述的秒級卡死；沒有證據可宣稱記憶體置換、冷開機或重新啟動初始化是原因。新程序、第一次配置與真正重新開機是不同條件。
-- 上述 Windows 原生操作只涵蓋指定的測試版本與步驟；清理文案後版本的縮窗與啟動已觀察，但原生實體 Shift-drag、各 DAW／Mac 及新版 payload 的完整安裝流程仍未驗證。
+- 上述 Windows 原生操作只涵蓋指定版本與步驟；macOS 原生 build／指定 CI tests 與 Linux X11 原 assertions 已於所列 commits 通過。Mac GUI／實體 Fn、各 DAW、原生實體 Shift-drag、Wayland／實體 Linux 桌面及新版 payload 完整安裝仍未驗證。
 - 編輯／取消不強制解除手動 Pause、0 秒手動暫停維持、5／10 秒既有自動續錄、跨 rollover 的選段保存及 A/B 原始取樣對齊，須分清程式回歸與原生實測範圍；本次原生觀察不是全部情境的證明。
 - 吸附優先序、可見目標及 modifier 規則有 RawInput／共享測試覆蓋，但本輪未執行原生實體 Shift-drag；macOS／各 DAW 的實體手勢仍需相應環境驗證。
-- Windows 的指定字級／選單／捲動程式檢查與原生 7 項 History、縮窗已記錄；macOS 及不同 DAW 的選單、鍵盤、最小尺寸與外框仍需相應環境檢查。
+- Windows 的指定字級／選單／捲動程式檢查與原生 7 項 History、縮窗已記錄；macOS 原生 build 與 CLI／Swift 路由／成對 WAV 檢查不包含互動 Options，macOS 及 DAW 的鍵盤、捲動、最小尺寸與外框仍需相應環境檢查。
 - 核心探針沒有同時量測 GUI、DAW、GPU、背景錄音延遲、缺幀或可聽爆音；不能用它取代新的硬體監測或音訊品質驗收。
 
 The reported code checks, builds, and specified Windows observations are complete. The remaining platform/gesture/installer scopes above are explicitly unverified, and this bounded investigation does not claim to have reproduced or completely explained the reported multi-second freeze.

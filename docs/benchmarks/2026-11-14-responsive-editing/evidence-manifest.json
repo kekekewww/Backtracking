@@ -19,7 +19,8 @@
     "No GUI/DAW/GPU/device audio or audible-artifact validation is performed by these probes.",
     "Historical 2026-11-14-windows traces and hashes remain separate and unchanged.",
     "Asynchronous writer measurement predates later queue-drain/coalescing and review changes; recorded historical production source hash is not a final-binary latency guarantee.",
-    "Native functional observations refer to an intermediate build; final copy-cleanup/resize and payload-integrity observations are recorded separately in final-builds.json. Neither establishes broad macOS/DAW/physical Shift-drag or new-payload installation acceptance."
+    "Native functional observations refer to an intermediate build; final copy-cleanup/resize and payload-integrity observations are recorded separately in final-builds.json. Neither establishes broad macOS/DAW/physical Shift-drag or new-payload installation acceptance.",
+    "Remote platform coverage comes from separate runs: Windows/macOS jobs succeeded on product 55baeac and Linux X11 succeeded in the Linux-only 52af947 follow-up. Three prior failed runs remain recorded; skipped Windows/macOS jobs were not rerun. Local artifact provenance is unchanged. Mac GUI/Fn/DAW and Linux Wayland/hardware-compositor behavior remain unverified."
   ],
   "source_files": [
     {
@@ -34,9 +35,14 @@
       "sha256": "f42ed7561570b0e9bf5b242c83527f91859c38c6ae6f0966f85e139ac8aa7bb5"
     },
     {
+      "name": "cross-platform-ci.json",
+      "size_bytes": 17811,
+      "sha256": "f8aca0804384ba6bfb61f5827f724be2aa8f40eb701ab8c28736ba02eb7614bb"
+    },
+    {
       "name": "final-builds.json",
-      "size_bytes": 3512,
-      "sha256": "c62fe19018321ee86a6a29fd81e10b1da7932e6066894f16f83c3cd49298767d"
+      "size_bytes": 4675,
+      "sha256": "f0556853589d66ea2152bbc6f1cbf0fb589b48d91dc3437a9ccca8f98fc11bc4"
     },
     {
       "name": "native-editing-observations.json",
@@ -70,8 +76,8 @@
     },
     {
       "name": "README.md",
-      "size_bytes": 6631,
-      "sha256": "27ea9109fb29ee5b2bd1df0327d9cfb16fcfa0535ae919a54edadbd8b479d564"
+      "size_bytes": 7614,
+      "sha256": "10c1a458c8312addff7033c4df51f22f04823daa96a1708a495129c17ea902d5"
     },
     {
       "name": "retention-example-rerun.jsonl",
@@ -94,5 +100,5 @@
       "sha256": "0234004e2814e57f237f6b0e849cf5635f29332746c259b53c552a558b352f6a"
     }
   ],
-  "updated_utc": "2026-11-14T00:56:19.995337Z"
+  "updated_utc": "2026-11-14T01:20:04.959693Z"
 }

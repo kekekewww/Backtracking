@@ -1,7 +1,8 @@
 # Responsive-editing diagnostic evidence
 
-These files are a separate diagnostic dataset based on `58dee34` and a modified
-working tree. They do not replace the earlier Windows hardware-monitoring traces.
+The core/preference timing baselines use `58dee34` and a modified working tree;
+later native observations and CI runs retain their own build/commit provenance.
+These files do not replace the earlier Windows hardware-monitoring traces.
 See [the report](../../RESPONSIVE_EDITING_2026-11-14.md) for interpretation and
 integration status.
 
@@ -107,6 +108,19 @@ copy-cleanup/native-resize observations, and payload byte comparisons after the
 guide was frozen. The earlier functional cases are not claimed to have all been
 repeated on that final build. Setup packaging integrity is not a fresh
 install/uninstall acceptance test.
+
+`cross-platform-ci.json` separately records the product run at `55baeac`, a
+workflow-only Linux retry at `f3d9b0a`, and a diagnostic retry at `8b2e68b`.
+Windows/macOS jobs passed in the product run; Linux X11 verification failed in
+those three recorded runs. The third confirmed that the fixture contains physical
+TLDE/Super while the keyboard-description query returned NULL. macOS native
+build/codesign and named CI tests are distinct from
+interactive GUI/Fn/permission/DAW validation. CI binaries are not claimed to have
+the local GUI/Setup hashes above. A fourth Linux-only run at `52af947` succeeded
+after active-map/name querying, preserving the original registration, duplicate
+rejection and held-key single-event assertions. It skipped Windows/macOS rather
+than rerunning them. The earlier failures remain recorded. Wayland portal and
+interactive hardware-keyboard/compositor behavior are unverified.
 
 `evidence-manifest.json` records file hashes and the example source hash. The
 diagnostics include no captured audio, user preference values, local absolute

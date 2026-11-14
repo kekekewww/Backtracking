@@ -83,6 +83,8 @@ Selection, flags, and zoom use fixed editing material while background capture c
 
 Windows 功能測試版的原生端點編輯可在 Play 後保持約 19.77 秒選區，超過 10 秒即時保留時間後仍保存為 19.768083 秒的 stereo float32 WAV；最終清理文案版另確認 Options 與原生縮窗可操作。 / A Windows functional test build retained an approximately 19.77-second selection beyond ten-second live rollover and saved a 19.768083-second stereo float32 WAV; the final copy-cleanup build separately passed the observed Options/native-resize checks.
 
+遠端 CI：Windows tests／Release 與 macOS 原生建置／codesign、更新回復、Swift 路由及成對 WAV／core／plugin tests 於 `55baeac` 通過；Linux X11 helper／Sender／原 registration、duplicate、held-key assertions 於修正後 `52af947` 通過。這是不同執行的成功結果，原失敗紀錄保留；Mac GUI／Fn／DAW、Wayland 未驗證。[CI 結果與限制](docs/RESPONSIVE_EDITING_2026-11-14.md) / Windows/macOS CI passed on `55baeac`; Linux X11 passed unchanged assertions in the Linux-only `52af947` follow-up. Prior failures remain recorded; skipped jobs are not retests, and GUI/Fn/DAW/Wayland acceptance is not implied.
+
 操作說明放在文件，UI 保持控制與必要狀態。 / Instructions live in documentation; the UI keeps controls and necessary state.
 
 每個插件可個別啟用 Sender。桌面 Options 的 A／B 來源可選擇同一台電腦上的 Sender，也可另外開啟擷取視窗。Audacity 若用 loopback 錄製系統播放，在 Backtracking 選擇 System Audio。若只要擷取 Audacity 的播放輸出，請選擇 Audacity 應用程式來源。

@@ -1,0 +1,478 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-11-14T01:19:16.266832Z",
+  "evidence_type": "GitHub Actions run/job/step outcomes, distinct from local GUI and packaged artifact provenance",
+  "runs": [
+    {
+      "run_id": 43537657689,
+      "url": "https://github.com/kekekewww/Backtracking/actions/runs/43537657689",
+      "head_sha": "55baeacd07a26b4358475609eeb3ccdbc51e3469",
+      "status": "completed",
+      "conclusion": "failure",
+      "jobs": [
+        {
+          "name": "windows",
+          "status": "completed",
+          "conclusion": "success",
+          "started_utc": "2026-11-14T00:58:40Z",
+          "completed_utc": "2026-11-14T01:08:38Z",
+          "steps": [
+            {
+              "name": "Set up job",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:58:41Z",
+              "completed_utc": "2026-11-14T00:58:41Z"
+            },
+            {
+              "name": "Run actions/checkout@v4",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:58:41Z",
+              "completed_utc": "2026-11-14T00:58:48Z"
+            },
+            {
+              "name": "Install Rust",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:58:48Z",
+              "completed_utc": "2026-11-14T00:58:58Z"
+            },
+            {
+              "name": "Test capture core",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:58:58Z",
+              "completed_utc": "2026-11-14T00:59:03Z"
+            },
+            {
+              "name": "Test native desktop",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:59:03Z",
+              "completed_utc": "2026-11-14T01:00:53Z"
+            },
+            {
+              "name": "Test native plug-in",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T01:00:53Z",
+              "completed_utc": "2026-11-14T01:02:21Z"
+            },
+            {
+              "name": "Build Windows releases",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T01:02:21Z",
+              "completed_utc": "2026-11-14T01:08:35Z"
+            },
+            {
+              "name": "Post Run actions/checkout@v4",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T01:08:35Z",
+              "completed_utc": "2026-11-14T01:08:37Z"
+            },
+            {
+              "name": "Complete job",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T01:08:37Z",
+              "completed_utc": "2026-11-14T01:08:37Z"
+            }
+          ]
+        },
+        {
+          "name": "linux",
+          "status": "completed",
+          "conclusion": "failure",
+          "started_utc": "2026-11-14T00:58:40Z",
+          "completed_utc": "2026-11-14T00:59:07Z",
+          "steps": [
+            {
+              "name": "Set up job",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:58:41Z",
+              "completed_utc": "2026-11-14T00:58:41Z"
+            },
+            {
+              "name": "Run actions/checkout@v4",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:58:41Z",
+              "completed_utc": "2026-11-14T00:58:42Z"
+            },
+            {
+              "name": "Install Rust",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:58:42Z",
+              "completed_utc": "2026-11-14T00:58:50Z"
+            },
+            {
+              "name": "Install Linux shortcut build dependencies",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:58:50Z",
+              "completed_utc": "2026-11-14T00:58:59Z"
+            },
+            {
+              "name": "Test Linux shortcut helper",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:58:59Z",
+              "completed_utc": "2026-11-14T00:59:01Z"
+            },
+            {
+              "name": "Verify independent plug-in Sender connections",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:59:01Z",
+              "completed_utc": "2026-11-14T00:59:02Z"
+            },
+            {
+              "name": "Verify X11 shortcut activation and duplicate registration",
+              "conclusion": "failure",
+              "started_utc": "2026-11-14T00:59:02Z",
+              "completed_utc": "2026-11-14T00:59:05Z"
+            },
+            {
+              "name": "Post Run actions/checkout@v4",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:59:05Z",
+              "completed_utc": "2026-11-14T00:59:05Z"
+            },
+            {
+              "name": "Complete job",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:59:05Z",
+              "completed_utc": "2026-11-14T00:59:05Z"
+            }
+          ]
+        },
+        {
+          "name": "macos",
+          "status": "completed",
+          "conclusion": "success",
+          "started_utc": "2026-11-14T00:58:41Z",
+          "completed_utc": "2026-11-14T01:00:58Z",
+          "steps": [
+            {
+              "name": "Set up job",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:58:42Z",
+              "completed_utc": "2026-11-14T00:58:43Z"
+            },
+            {
+              "name": "Run actions/checkout@v4",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:58:43Z",
+              "completed_utc": "2026-11-14T00:58:44Z"
+            },
+            {
+              "name": "Install Rust",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:58:44Z",
+              "completed_utc": "2026-11-14T00:58:50Z"
+            },
+            {
+              "name": "Build and verify macOS app",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:58:50Z",
+              "completed_utc": "2026-11-14T00:59:24Z"
+            },
+            {
+              "name": "Test signed update and rollback on macOS",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:59:24Z",
+              "completed_utc": "2026-11-14T00:59:34Z"
+            },
+            {
+              "name": "Verify Swift capture routes and paired WAV export",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:59:34Z",
+              "completed_utc": "2026-11-14T00:59:43Z"
+            },
+            {
+              "name": "Test capture core and plug-in",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T00:59:43Z",
+              "completed_utc": "2026-11-14T01:00:55Z"
+            },
+            {
+              "name": "Post Run actions/checkout@v4",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T01:00:55Z",
+              "completed_utc": "2026-11-14T01:00:56Z"
+            },
+            {
+              "name": "Complete job",
+              "conclusion": "success",
+              "started_utc": "2026-11-14T01:00:56Z",
+              "completed_utc": "2026-11-14T01:00:56Z"
+            }
+          ]
+        }
+      ],
+      "scope": "product cross-platform run"
+    },
+    {
+      "run_id": 43538353959,
+      "url": "https://github.com/kekekewww/Backtracking/actions/runs/43538353959",
+      "head_sha": "f3d9b0a6bee284ce33cf4d9bbc0b27ab8cfa1658",
+      "status": "completed",
+      "conclusion": "failure",
+      "jobs": [
+        {
+          "name": "linux",
+          "status": "completed",
+          "conclusion": "failure",
+          "steps": [
+            {
+              "name": "Set up job",
+              "conclusion": "success"
+            },
+            {
+              "name": "Run actions/checkout@v4",
+              "conclusion": "success"
+            },
+            {
+              "name": "Install Rust",
+              "conclusion": "success"
+            },
+            {
+              "name": "Install Linux shortcut build dependencies",
+              "conclusion": "success"
+            },
+            {
+              "name": "Test Linux shortcut helper",
+              "conclusion": "success"
+            },
+            {
+              "name": "Verify independent plug-in Sender connections",
+              "conclusion": "success"
+            },
+            {
+              "name": "Verify X11 shortcut activation and duplicate registration",
+              "conclusion": "failure"
+            },
+            {
+              "name": "Post Run actions/checkout@v4",
+              "conclusion": "success"
+            },
+            {
+              "name": "Complete job",
+              "conclusion": "success"
+            }
+          ]
+        },
+        {
+          "name": "macos",
+          "status": "completed",
+          "conclusion": "skipped",
+          "steps": []
+        },
+        {
+          "name": "windows",
+          "status": "completed",
+          "conclusion": "skipped",
+          "steps": []
+        }
+      ],
+      "scope": "workflow-only Linux retry"
+    },
+    {
+      "run_id": 43539038043,
+      "url": "https://github.com/kekekewww/Backtracking/actions/runs/43539038043",
+      "head_sha": "8b2e68b5c0d028fa2b7fccc4c8b16a954923202c",
+      "status": "completed",
+      "conclusion": "failure",
+      "jobs": [
+        {
+          "name": "linux",
+          "status": "completed",
+          "conclusion": "failure",
+          "steps": [
+            {
+              "name": "Set up job",
+              "conclusion": "success"
+            },
+            {
+              "name": "Run actions/checkout@v4",
+              "conclusion": "success"
+            },
+            {
+              "name": "Install Rust",
+              "conclusion": "success"
+            },
+            {
+              "name": "Install Linux shortcut build dependencies",
+              "conclusion": "success"
+            },
+            {
+              "name": "Test Linux shortcut helper",
+              "conclusion": "success"
+            },
+            {
+              "name": "Verify independent plug-in Sender connections",
+              "conclusion": "success"
+            },
+            {
+              "name": "Verify X11 shortcut activation and duplicate registration",
+              "conclusion": "failure"
+            },
+            {
+              "name": "Post Run actions/checkout@v4",
+              "conclusion": "success"
+            },
+            {
+              "name": "Complete job",
+              "conclusion": "success"
+            }
+          ]
+        },
+        {
+          "name": "macos",
+          "status": "completed",
+          "conclusion": "skipped",
+          "steps": []
+        },
+        {
+          "name": "windows",
+          "status": "completed",
+          "conclusion": "skipped",
+          "steps": []
+        }
+      ],
+      "failure_diagnostics": {
+        "source": "public failed X11 workflow step",
+        "keyboard_description_returned": false,
+        "physical_tlde_lookup_result": 0,
+        "super_modifier_mask": "0x40",
+        "fixture_keymap": {
+          "keycodes_name": "evdev+aliases(qwerty)",
+          "minimum": 8,
+          "maximum": 255,
+          "tlde": 49,
+          "lwin": 133,
+          "rwin": 134,
+          "tlde_symbols": [
+            "grave",
+            "asciitilde"
+          ],
+          "mod4_contains": [
+            "LWIN",
+            "RWIN",
+            "SUPR"
+          ]
+        },
+        "interpretation": "TLDE and Super exist in the same Xvfb keymap; the XkbGetKeyboard lookup returned no description."
+      },
+      "scope": "Linux X11 diagnostic retry"
+    },
+    {
+      "run_id": 43539505931,
+      "url": "https://github.com/kekekewww/Backtracking/actions/runs/43539505931",
+      "head_sha": "52af947930585169ea539d8a274bf10d5f23bf60",
+      "status": "completed",
+      "conclusion": "success",
+      "jobs": [
+        {
+          "name": "linux",
+          "status": "completed",
+          "conclusion": "success",
+          "steps": [
+            {
+              "name": "Set up job",
+              "conclusion": "success"
+            },
+            {
+              "name": "Run actions/checkout@v4",
+              "conclusion": "success"
+            },
+            {
+              "name": "Install Rust",
+              "conclusion": "success"
+            },
+            {
+              "name": "Install Linux shortcut build dependencies",
+              "conclusion": "success"
+            },
+            {
+              "name": "Test Linux shortcut helper",
+              "conclusion": "success"
+            },
+            {
+              "name": "Verify independent plug-in Sender connections",
+              "conclusion": "success"
+            },
+            {
+              "name": "Verify X11 shortcut activation and duplicate registration",
+              "conclusion": "success"
+            },
+            {
+              "name": "Post Run actions/checkout@v4",
+              "conclusion": "success"
+            },
+            {
+              "name": "Complete job",
+              "conclusion": "success"
+            }
+          ]
+        },
+        {
+          "name": "macos",
+          "status": "completed",
+          "conclusion": "skipped",
+          "steps": []
+        },
+        {
+          "name": "windows",
+          "status": "completed",
+          "conclusion": "skipped",
+          "steps": []
+        }
+      ],
+      "verification_scope": [
+        "Linux-only workflow input; Windows and macOS jobs skipped.",
+        "Original X11 registration, duplicate-client rejection and held-key single-activation assertions passed.",
+        "Independent Sender connections passed."
+      ],
+      "not_verified": [
+        "Wayland portal behavior",
+        "Interactive hardware keyboard or desktop compositor"
+      ],
+      "scope": "Linux-only active-map/name-query fix verification"
+    }
+  ],
+  "current_overall_status": "Specified platform jobs succeeded across separate runs: Windows/macOS on product 55baeac and Linux X11 on 52af947. The original full run and two retries remain recorded failures; the Linux-only success is not a rerun of Windows/macOS.",
+  "linux_failure": {
+    "step": "Verify X11 shortcut activation and duplicate registration",
+    "observed_retry_stderr_prefix": "No physical TLDE key or Super modifier",
+    "status": "Resolved for the recorded X11 CI fixture by the active-map/name-query follow-up; prior failures retained.",
+    "diagnostic_run_id": 43539038043,
+    "verified_findings": "The same Xvfb fixture contains physical TLDE/LWIN/RWIN and Mod4/Super; Super mask is 0x40, but XkbGetKeyboard returned no keyboard description and TLDE lookup returned zero.",
+    "query_path_followup": "Use active XkbGetMap(AllClientInfoMask), then XkbGetNames(KeyNamesMask), preserving physical TLDE lookup without a hardcoded keycode or symbol fallback.",
+    "interpretation_limit": "The fixture is not missing TLDE or Super. This evidence does not claim that the legal ByName mask/limits were used incorrectly."
+  },
+  "coverage": {
+    "windows_ci": "Core/desktop/plug-in test steps and Release build succeeded on product commit 55baeac.",
+    "macos_ci": "Native app build/verification including codesign, signed-update/rollback, Swift capture-route/paired-WAV verification, and core/plug-in test steps succeeded on product commit 55baeac.",
+    "macos_unverified": [
+      "Interactive native GUI editing",
+      "Physical Fn/Globe shortcut events and permissions",
+      "DAW-host VST3/CLAP runtime"
+    ],
+    "local_artifacts": "The local desktop/plug-in/Setup hashes and local GUI observations remain those separately recorded in final-builds.json/native-editing-observations.json. CI binaries are not claimed byte-identical.",
+    "linux_ci": "Linux-only run 43539505931 at 52af947 succeeded, including original registration/duplicate/held-key assertions and independent Sender verification. Wayland and an interactive hardware keyboard/compositor are unverified."
+  },
+  "limits": [
+    "A successful build/codesign step does not establish notarization, manual GUI acceptance or end-user shortcut permission behavior.",
+    "The workflow-only retry skipped Windows/macOS and is not a new passing run of those platforms.",
+    "No private captured audio or screenshots are included; historical hardware evidence is not rewritten.",
+    "The initial full run and two Linux retry/diagnostic runs remain failures. The successful fourth run is Linux-only and does not retroactively turn the product run green or rerun Windows/macOS.",
+    "Linux X11 CI success does not verify Wayland portal behavior or interactive hardware-keyboard/compositor behavior."
+  ],
+  "linux_followup": {
+    "run_id": 43539505931,
+    "commit": "52af947930585169ea539d8a274bf10d5f23bf60",
+    "conclusion": "success",
+    "original_assertions_preserved": true,
+    "checks": [
+      "Shortcut helper tests",
+      "Independent Sender connections",
+      "Original X11 registration and duplicate-client rejection",
+      "Original held-key single-activation assertion (count -eq 1)"
+    ],
+    "not_verified": [
+      "Wayland portal behavior",
+      "Interactive hardware keyboard or desktop compositor"
+    ]
+  }
+}
