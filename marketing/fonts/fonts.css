@@ -54,6 +54,15 @@
   font-style: normal;
   font-display: block;
 }
+/* Traditional Chinese. Full variable font (about 12 MB): for local poster/video renders only.
+   Do not ship this file on the website; the landing page loads Noto Sans TC another way. */
+@font-face {
+  font-family: "Noto Sans TC";
+  src: url("NotoSansTC-Variable.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: block;
+}
 /* Open Sans is the typeface the real app UI uses; only for the UI mock-up. */
 @font-face {
   font-family: "Open Sans";
