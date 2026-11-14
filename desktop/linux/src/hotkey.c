@@ -16,9 +16,16 @@ static int remember_x11_error(Display *display, XErrorEvent *event) {
 }
 
 static int physical_grave_key(Display *display) {
-    XkbDescPtr keyboard = XkbGetKeyboard(display, XkbGBN_KeyNamesMask, XkbUseCoreKbd);
+    XkbDescPtr keyboard = XkbGetMap(display, XkbAllClientInfoMask, XkbUseCoreKbd);
     if (!keyboard) {
-        fputs("XKB did not return a keyboard description.\n", stderr);
+        fputs("Could not read the current XKB keyboard map.\n", stderr);
+        return 0;
+    }
+    Status names_status = XkbGetNames(display, XkbKeyNamesMask, keyboard);
+    if (names_status != Success) {
+        fprintf(stderr, "Could not read current XKB physical key names (status %d).\n",
+            names_status);
+        XkbFreeKeyboard(keyboard, XkbAllComponentsMask, True);
         return 0;
     }
 
