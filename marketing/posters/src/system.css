@@ -1,0 +1,192 @@
+/* Direction C "Rewind" poster system. Adapted from ../../style-frames/C.css (tokens unchanged),
+   plus the components the edition and social layouts need. Per-design positions live in layouts.css. */
+@import url("../../fonts/fonts.css");
+
+:root {
+  --c-blue: #1e32d2;
+  --c-blue-2: #2a3fe6;     /* tone-on-tone texture */
+  --c-blue-deep: #14229c;
+  --c-ink: #070c3d;
+  --c-paper: #f4f1e8;
+  --c-paper-2: rgba(244, 241, 232, 0.72);
+  --c-mint: #b0fbd3;        /* icon gradient start */
+  --c-mint-2: #55dca7;      /* icon gradient end */
+  --c-sans: "Archivo", "Noto Sans TC", sans-serif;
+  --c-cjk: "Noto Sans TC", sans-serif;
+  --c-mono: "Geist Mono", monospace; /* only inside mock-up readouts and the command line */
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: var(--c-blue); overflow: hidden; }
+body { font-family: var(--c-sans); color: var(--c-paper); -webkit-font-smoothing: antialiased; line-height: 1.25; }
+.frame { position: relative; overflow: hidden; background: var(--c-blue); }
+.frame > * { position: absolute; }
+
+/* Chinese text: Latin runs fall through to Archivo first (it has no CJK), CJK to Noto Sans TC. */
+:lang(zh) body, .zh { line-break: strict; word-break: normal; }
+.tw { text-wrap: pretty; }
+.nb { white-space: nowrap; }
+
+.lockup { display: flex; align-items: center; gap: 16px; }
+.lockup img { display: block; }
+.lockup .wm { font-weight: 700; font-stretch: 100%; letter-spacing: -0.01em; white-space: nowrap; }
+
+/* expanded small caps: labels, editions, scale */
+.wide {
+  font-stretch: 125%;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+.zh .wide { letter-spacing: 0.1em; }
+
+/* mega headline: lines are blocks so each can take its own size (layouts.js fits them) */
+.mega {
+  font-stretch: 62%;
+  font-weight: 900;
+  text-transform: uppercase;
+  line-height: 0.8;
+  letter-spacing: -0.01em;
+  color: var(--c-paper);
+  white-space: nowrap;
+}
+.mega .ln { display: block; }
+.mega .ln.m { color: var(--c-mint); }
+/* Chinese mega: Noto Sans TC 900, set square, its own leading. Latin runs inside stay Archivo. */
+.zh .mega { text-transform: none; line-height: 1.0; letter-spacing: 0; }
+.zh .mega .lat { font-stretch: 75%; letter-spacing: -0.01em; }
+.zh .mega .ln + .ln { margin-top: 0.06em; }
+
+.sub { font-stretch: 100%; font-weight: 400; color: var(--c-paper-2); line-height: 1.38; text-wrap: balance; }
+.sub b { color: var(--c-paper); font-weight: 600; }
+.zh .sub { line-height: 1.6; font-weight: 400; }
+.zh .sub b { font-weight: 700; }
+
+/* history scale: the real History options laid out as a tape counter */
+.scale { text-transform: none; display: flex; justify-content: space-between; align-items: flex-end; border-top: 2px solid var(--c-paper); padding-top: 12px; }
+.scale span { position: relative; color: var(--c-paper-2); }
+.scale span::before { content: ""; position: absolute; left: 0; top: -14px; width: 2px; height: 12px; background: var(--c-paper); }
+.scale span.on { color: var(--c-mint); }
+.scale span.on::before { background: var(--c-mint); height: 22px; top: -24px; width: 4px; }
+.scale.bare span { width: 0; overflow: visible; color: transparent; }
+
+.bgwave { color: var(--c-blue-2); }
+
+.btp.c {
+  --btp-sel: #c21f6c;
+  --btp-sel-line: #ff4f9a;
+  --btp-sel-band: rgba(255, 79, 154, 0.07);
+  box-shadow: 18px 18px 0 var(--c-ink);
+}
+.btp.c.s10 { box-shadow: 10px 10px 0 var(--c-ink); }
+
+/* dragged WAV: solid mint slab */
+.slab {
+  display: flex; align-items: center; gap: 16px;
+  padding: 14px 24px 14px 16px;
+  background: var(--c-mint);
+  color: var(--c-ink);
+  box-shadow: 10px 10px 0 var(--c-ink);
+  white-space: nowrap;
+}
+.slab .ic {
+  width: 40px; height: 48px; background: var(--c-ink); color: var(--c-mint); flex: none;
+  display: flex; align-items: flex-end; justify-content: center; padding-bottom: 6px;
+  font-family: "Archivo", sans-serif;
+  font-stretch: 125%; font-weight: 800; font-size: 10px; letter-spacing: 0.04em;
+}
+.slab .n { font-weight: 800; font-stretch: 100%; font-size: 21px; letter-spacing: -0.005em; }
+.slab .m { font-weight: 600; font-stretch: 125%; font-size: 12.5px; letter-spacing: 0.04em; margin-top: 3px; opacity: 0.75; }
+.streaks line { stroke: var(--c-mint); stroke-linecap: round; }
+.cursor { filter: drop-shadow(3px 3px 0 var(--c-ink)); }
+
+.editions { display: flex; gap: 0; color: var(--c-paper); text-transform: none; }
+.editions span + span::before { content: "/"; padding: 0 0.7em; color: var(--c-mint); }
+.rule { height: 2px; background: var(--c-paper); }
+.license { color: var(--c-paper-2); }
+.url { font-stretch: 125%; font-weight: 700; letter-spacing: 0.04em; color: var(--c-mint); white-space: nowrap; }
+
+/* ---------- components added for the poster set ---------- */
+
+/* keycap: paper key, ink offset shadow */
+.keys { display: flex; align-items: center; gap: 0.32em; }
+.key {
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.18em;
+  min-width: 1.6em; height: 1.6em; padding: 0 0.42em;
+  background: var(--c-paper); color: var(--c-ink);
+  border: 0.06em solid var(--c-ink);
+  box-shadow: 0.16em 0.16em 0 var(--c-ink);
+  border-radius: 0.14em;
+  font-family: "Archivo", sans-serif; font-stretch: 100%; font-weight: 800; letter-spacing: -0.01em;
+  line-height: 1;
+}
+.key.tick { font-family: "Geist Mono", monospace; font-weight: 700; font-size: 1.25em; min-width: 1.3em; height: 1.28em; padding-top: 0.3em; }
+.key svg { width: 0.62em; height: 0.62em; display: block; }
+.keys .plus { font-stretch: 100%; font-weight: 900; color: var(--c-mint); padding: 0 0.04em; }
+
+/* chips / labels */
+.chip {
+  display: inline-flex; align-items: center; gap: 10px;
+  padding: 10px 16px; white-space: nowrap;
+  border: 2px solid var(--c-paper); color: var(--c-paper);
+  font-stretch: 125%; font-weight: 700; letter-spacing: 0.04em;
+}
+.chip.on { background: var(--c-mint); border-color: var(--c-mint); color: var(--c-ink); box-shadow: 8px 8px 0 var(--c-ink); }
+.chip.ink { background: var(--c-ink); border-color: var(--c-ink); color: var(--c-mint); }
+
+/* buttons */
+.btn {
+  display: inline-flex; align-items: center; gap: 14px; white-space: nowrap;
+  padding: 16px 26px; font-stretch: 100%; font-weight: 800; letter-spacing: -0.005em;
+  background: var(--c-mint); color: var(--c-ink); box-shadow: 10px 10px 0 var(--c-ink);
+}
+.btn.ghost { background: transparent; color: var(--c-paper); border: 3px solid var(--c-paper); box-shadow: none; }
+.btn svg { display: block; flex: none; }
+
+/* source picker card (poster typography, not app UI) */
+.srcs { background: var(--c-paper); color: var(--c-ink); box-shadow: 14px 14px 0 var(--c-ink); padding: 18px 0 0; }
+.srcs .hd { padding: 0 22px 12px; font-stretch: 125%; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; font-size: 14px; opacity: 0.7; }
+.srcs .it { display: flex; align-items: center; gap: 14px; padding: 12px 22px; font-weight: 700; font-stretch: 100%; white-space: nowrap; }
+.srcs .it.on { background: var(--c-ink); color: var(--c-mint); }
+.srcs .it svg { flex: none; display: block; }
+
+/* A / B row badges */
+.ab { display: flex; flex-direction: column; justify-content: space-around; }
+.ab span {
+  display: flex; align-items: center; justify-content: center;
+  font-stretch: 100%; font-weight: 900; color: var(--c-ink); background: var(--c-mint);
+  box-shadow: 6px 6px 0 var(--c-ink);
+}
+
+/* number tag for beats */
+.num { font-stretch: 62%; font-weight: 900; line-height: 0.8; color: var(--c-mint); font-family: "Archivo", sans-serif; }
+.beat .h { font-weight: 800; font-stretch: 100%; color: var(--c-paper); letter-spacing: -0.01em; }
+.beat .b { font-weight: 400; color: var(--c-paper-2); line-height: 1.38; text-wrap: pretty; }
+.zh .beat .h { font-weight: 900; letter-spacing: 0.01em; }
+.zh .beat .b { line-height: 1.6; }
+
+/* generic, unbranded DAW (flat, poster-drawn) */
+.daw { background: var(--c-blue-deep); box-shadow: 18px 18px 0 var(--c-ink); }
+.daw .lane { position: absolute; left: 0; right: 0; border-top: 2px solid rgba(244, 241, 232, 0.14); }
+.daw .th { position: absolute; left: 0; top: 0; bottom: 0; display: flex; align-items: center; padding-left: 18px; font-weight: 700; font-stretch: 100%; color: var(--c-paper); background: rgba(7, 12, 61, 0.45); border-right: 2px solid rgba(244, 241, 232, 0.14); white-space: nowrap; }
+.daw .clip { position: absolute; background: var(--c-blue-2); border-top: 6px solid rgba(244, 241, 232, 0.55); color: rgba(244, 241, 232, 0.5); overflow: hidden; }
+.daw .clip svg { display: block; }
+.daw .ruler { position: absolute; left: 0; right: 0; top: 0; border-bottom: 2px solid rgba(244, 241, 232, 0.14); }
+.daw .ruler i { position: absolute; bottom: 0; width: 2px; background: rgba(244, 241, 232, 0.35); }
+.daw .playhead { position: absolute; width: 3px; background: var(--c-paper); }
+.inserts { background: var(--c-ink); padding: 12px; box-shadow: 12px 12px 0 rgba(7, 12, 61, 0.9); }
+.inserts .ttl { font-stretch: 125%; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--c-paper-2); font-size: 12px; padding: 0 4px 10px; white-space: nowrap; }
+.inserts .slot { display: flex; align-items: center; gap: 10px; padding: 0 12px; height: 38px; margin-top: 6px; background: #1a2160; color: var(--c-paper); font-weight: 600; font-stretch: 100%; font-size: 16px; white-space: nowrap; }
+.inserts .slot i { width: 8px; height: 8px; border-radius: 50%; background: rgba(244, 241, 232, 0.4); flex: none; }
+.inserts .slot.on { background: var(--c-mint); color: var(--c-ink); font-weight: 800; }
+.inserts .slot.on i { background: var(--c-ink); }
+.inserts .slot.empty { background: transparent; border: 2px dashed rgba(244, 241, 232, 0.18); }
+
+/* command line */
+.cmd { background: var(--c-ink); color: var(--c-paper); font-family: "Geist Mono", monospace; font-weight: 500; white-space: nowrap; padding: 16px 22px; box-shadow: 10px 10px 0 rgba(7, 12, 61, 0.55); }
+.cmd .p { color: var(--c-mint); margin-right: 0.6em; }
+
+.label { font-stretch: 125%; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; color: var(--c-paper-2); }
+.zh .label { letter-spacing: 0.1em; }
+.mintline { background: var(--c-mint); }

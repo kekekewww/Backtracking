@@ -56,7 +56,7 @@ Product owner's decision (overrides any earlier wording): availability is one me
 | Licence line | Open source · Apache-2.0 | 開放原始碼 · Apache-2.0 |
 | Primary CTA | Download from GitHub | 從 GitHub 下載 |
 | Secondary CTA | Read the user guide | 閱讀使用手冊 |
-| Support CTA | Support on Buy Me a Coffee | 在 Buy Me a Coffee 贊助 |
+| Support CTA (button) | Support developer | 贊助開發者 |
 
 ### The three beats (used by posters, videos and the landing page in this order)
 
