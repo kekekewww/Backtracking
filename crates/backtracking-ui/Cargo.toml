@@ -10,6 +10,15 @@ publish = false
 backtracking-core = { path = "../backtracking-core" }
 egui = { version = "0.37", default-features = false }
 
+# The fonts Windows ships draw the text the bundled typeface has no glyphs for.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_System_Memory",
+] }
+
 [dev-dependencies]
 # Headless frames lay out text, which needs a font.
 egui = { version = "0.37", default-features = false, features = ["default_fonts"] }

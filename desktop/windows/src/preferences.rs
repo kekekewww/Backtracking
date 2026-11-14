@@ -16,6 +16,45 @@ const MAX_VALUE_BYTES: u64 = 128 * 1024;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 pub(crate) const DEFAULT_ACCENT: [u8; 3] = [103, 231, 181];
 
+/// When the capture status mark is shown: the light in the toolbar and the mark on a bare
+/// waveform.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum StatusMark {
+    #[default]
+    Always,
+    /// Only when capture is paused or a source has a problem.
+    Attention,
+    Never,
+}
+
+impl StatusMark {
+    pub(crate) const ALL: [Self; 3] = [Self::Always, Self::Attention, Self::Never];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Always => "Always",
+            Self::Attention => "Only when paused or failing",
+            Self::Never => "Never",
+        }
+    }
+
+    /// The value written to preferences.
+    pub(crate) fn preference(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Attention => "attention",
+            Self::Never => "never",
+        }
+    }
+
+    fn from_preference(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mark| mark.preference() == text)
+    }
+}
+
+/// The widths the waveform border can have, in points.
+pub(crate) const BORDER_WIDTHS: [u8; 4] = [1, 2, 3, 4];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MeterMode {
     Dbfs,
@@ -48,12 +87,17 @@ pub(crate) enum Key {
     WavSampleFormat,
     WavForceMono,
     Output,
+    OutputCleanup,
     SavedSnapshots,
     AlwaysOnTop,
     WaveformOnly,
     WaveformBorder,
+    WaveformBorderWidth,
     WaveformBorderColor,
     WaveformBorderFollowsBackground,
+    StatusMark,
+    ShowTitle,
+    ShowMeters,
     BarLines,
     SecondsLines,
     SecondsInterval,
@@ -78,11 +122,18 @@ impl Key {
             Self::WavSampleFormat => "wav-sample-format",
             Self::WavForceMono => "wav-force-mono",
             Self::Output => "output-folder",
+            // Absent or 0 keeps every file.
+            Self::OutputCleanup => "output-folder-cleanup-days",
             Self::SavedSnapshots => "saved-snapshots-folder",
             Self::AlwaysOnTop => "always-on-top",
             Self::WaveformOnly => "waveform-only",
             Self::WaveformBorder => "waveform-border",
+            Self::WaveformBorderWidth => "waveform-border-width",
             Self::WaveformBorderColor => "waveform-border-color",
+            Self::StatusMark => "capture-status-mark",
+            // Both are shown unless the file says 0.
+            Self::ShowTitle => "show-app-name",
+            Self::ShowMeters => "show-level-meters",
             Self::WaveformBorderFollowsBackground => "waveform-border-follows-background",
             Self::BarLines => "show-bar-lines",
             Self::SecondsLines => "show-second-lines",
@@ -106,11 +157,17 @@ pub(crate) struct Settings {
     pub(crate) wav_profile: WavExportProfile,
     pub(crate) wav_force_mono: bool,
     pub(crate) output: PathBuf,
+    /// Days after which old exports in `output` are deleted; `None` keeps them.
+    pub(crate) output_cleanup: Option<u16>,
     pub(crate) saved_output: PathBuf,
     pub(crate) pinned: bool,
     pub(crate) waveform_only: bool,
     pub(crate) waveform_border: bool,
+    pub(crate) waveform_border_width: u8,
     pub(crate) waveform_border_color: Option<[u8; 3]>,
+    pub(crate) status_mark: StatusMark,
+    pub(crate) show_title: bool,
+    pub(crate) show_meters: bool,
     pub(crate) waveform_border_follows_background: bool,
     pub(crate) bar_lines: bool,
     pub(crate) second_lines: bool,
@@ -144,11 +201,16 @@ impl Default for Settings {
             wav_profile: WavExportProfile::default(),
             wav_force_mono: false,
             output: directory.join("output"),
+            output_cleanup: None,
             saved_output: directory.join("saved"),
             pinned: true,
             waveform_only: false,
             waveform_border: false,
+            waveform_border_width: 1,
             waveform_border_color: None,
+            status_mark: StatusMark::Always,
+            show_title: true,
+            show_meters: true,
             waveform_border_follows_background: false,
             bar_lines: false,
             second_lines: false,
@@ -220,6 +282,9 @@ impl Preferences {
         if let Some(path) = self.read_absolute_path(Key::Output) {
             settings.output = path;
         }
+        settings.output_cleanup = self
+            .read_number(Key::OutputCleanup)
+            .and_then(backtracking_core::cleanup::age_from_days);
         if let Some(path) = self.read_absolute_path(Key::SavedSnapshots) {
             settings.saved_output = path;
         }
@@ -230,6 +295,20 @@ impl Preferences {
         }
         settings.waveform_only = self.read_number::<u8>(Key::WaveformOnly) == Some(1);
         settings.waveform_border = self.read_number::<u8>(Key::WaveformBorder) == Some(1);
+        if let Some(width) = self
+            .read_number::<u8>(Key::WaveformBorderWidth)
+            .filter(|width| BORDER_WIDTHS.contains(width))
+        {
+            settings.waveform_border_width = width;
+        }
+        if let Some(mark) = self
+            .read(Key::StatusMark)
+            .and_then(|text| StatusMark::from_preference(text.trim()))
+        {
+            settings.status_mark = mark;
+        }
+        settings.show_title = self.read_number::<u8>(Key::ShowTitle) != Some(0);
+        settings.show_meters = self.read_number::<u8>(Key::ShowMeters) != Some(0);
         settings.waveform_border_color = self
             .read(Key::WaveformBorderColor)
             .as_deref()
@@ -866,6 +945,59 @@ mod tests {
         }
         preferences.save(Key::IdleResume, "3").unwrap();
         assert_eq!(preferences.load().idle_resume, AutoResumeDelay::Seconds10);
+    }
+
+    #[test]
+    fn display_choices_keep_their_defaults_until_a_valid_value_is_stored() {
+        let preferences = workspace_preferences("display-choices");
+        let settings = preferences.load();
+        assert_eq!(settings.status_mark, StatusMark::Always);
+        assert!(settings.show_title && settings.show_meters);
+        assert_eq!(settings.waveform_border_width, 1);
+
+        for mark in StatusMark::ALL {
+            preferences.save(Key::StatusMark, mark.preference()).unwrap();
+            assert_eq!(preferences.load().status_mark, mark);
+        }
+        preferences.save(Key::StatusMark, "sometimes").unwrap();
+        assert_eq!(preferences.load().status_mark, StatusMark::Always);
+
+        for (key, shown) in [(Key::ShowTitle, false), (Key::ShowMeters, false)] {
+            preferences.save(key, "0").unwrap();
+            let settings = preferences.load();
+            assert_eq!(
+                if key == Key::ShowTitle { settings.show_title } else { settings.show_meters },
+                shown
+            );
+            preferences.save(key, "1").unwrap();
+        }
+        let settings = preferences.load();
+        assert!(settings.show_title && settings.show_meters);
+
+        for width in BORDER_WIDTHS {
+            preferences.save(Key::WaveformBorderWidth, &width.to_string()).unwrap();
+            assert_eq!(preferences.load().waveform_border_width, width);
+        }
+        for stored in ["0", "5", "wide"] {
+            preferences.save(Key::WaveformBorderWidth, stored).unwrap();
+            assert_eq!(preferences.load().waveform_border_width, 1, "{stored:?}");
+        }
+    }
+
+    #[test]
+    fn drag_folder_cleanup_is_off_until_an_offered_age_is_stored() {
+        let preferences = workspace_preferences("output-cleanup");
+        assert_eq!(preferences.load().output_cleanup, None);
+
+        for days in backtracking_core::cleanup::AGE_CHOICES {
+            preferences.save(Key::OutputCleanup, &days.to_string()).unwrap();
+            assert_eq!(preferences.load().output_cleanup, Some(days));
+        }
+        // Off is stored as 0. Anything else unexpected must never start deleting files.
+        for stored in ["0", "7", "-30", "30 days", ""] {
+            preferences.save(Key::OutputCleanup, stored).unwrap();
+            assert_eq!(preferences.load().output_cleanup, None, "{stored:?}");
+        }
     }
 
     #[test]

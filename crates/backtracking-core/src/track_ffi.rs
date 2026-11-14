@@ -1,6 +1,6 @@
 use std::ffi::{c_char, CStr, CString};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::export::export_routed_track_refs;
 use crate::{
-    discover_senders, discover_snapshot_targets, request_sender_snapshot, ChannelRoute,
+    cleanup, discover_senders, discover_snapshot_targets, request_sender_snapshot, ChannelRoute,
     DurationChoice, MeterReadings, SenderInfo, SenderReceiver, Snapshot, SynchronizedCapture,
     TimedAudioQueue, WavExportProfile, WavSampleFormat, WaveformView,
 };
@@ -412,6 +412,74 @@ unsafe extern "C" fn bt_sender_request_snapshot(id: *const c_char) -> i32 {
     i32::from(CStr::from_ptr(id).to_str().is_ok_and(|id| request_sender_snapshot(id).is_ok()))
 }
 
+/// The housekeeping schedule for the drag-and-drop folder. `days` is 0 for Off; a number the
+/// Options form does not offer also means Off.
+#[no_mangle]
+extern "C" fn bt_cleanup_new(days: u32) -> *mut cleanup::Schedule {
+    Box::into_raw(Box::new(cleanup::Schedule::new(cleanup_age(days), Instant::now())))
+}
+
+fn cleanup_age(days: u32) -> Option<u16> {
+    u16::try_from(days).ok().and_then(cleanup::age_from_days)
+}
+
+/// Waits for a pass that is still running.
+#[no_mangle]
+unsafe extern "C" fn bt_cleanup_free(schedule: *mut cleanup::Schedule) {
+    if !schedule.is_null() { drop(Box::from_raw(schedule)); }
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_cleanup_days(schedule: *const cleanup::Schedule) -> u32 {
+    schedule.as_ref().and_then(cleanup::Schedule::age).map_or(0, u32::from)
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_cleanup_set_days(schedule: *mut cleanup::Schedule, days: u32) {
+    if let Some(schedule) = schedule.as_mut() { schedule.set_age(cleanup_age(days), Instant::now()); }
+}
+
+/// Puts the next pass off. Call it when either folder setting changes.
+#[no_mangle]
+unsafe extern "C" fn bt_cleanup_restart(schedule: *mut cleanup::Schedule) {
+    if let Some(schedule) = schedule.as_mut() { schedule.restart(Instant::now()); }
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_cleanup_due(schedule: *const cleanup::Schedule) -> i32 {
+    i32::from(schedule.as_ref().is_some_and(|schedule| schedule.due(Instant::now())))
+}
+
+/// Starts a pass over `folder` when one is due. A null `folder` means it must not be cleaned
+/// now. `keep` lists files that stay whatever their age. Returns the number of files a
+/// finished pass deleted, -1 when that pass failed and -2 when no pass has finished.
+#[no_mangle]
+unsafe extern "C" fn bt_cleanup_poll(
+    schedule: *mut cleanup::Schedule, folder: *const c_char, keep: *const *const c_char, keep_count: usize,
+) -> i64 {
+    let Some(schedule) = schedule.as_mut() else { return -2 };
+    let path = |text: *const c_char| -> Option<PathBuf> {
+        if text.is_null() { return None; }
+        CStr::from_ptr(text).to_str().ok().map(PathBuf::from)
+    };
+    let keep: Vec<PathBuf> = if keep.is_null() { Vec::new() } else {
+        slice::from_raw_parts(keep, keep_count).iter().filter_map(|&file| path(file)).collect()
+    };
+    match schedule.poll(path(folder).as_deref(), &keep, Instant::now()) {
+        None => -2,
+        Some(Ok(removed)) => i64::try_from(removed).unwrap_or(i64::MAX),
+        Some(Err(_)) => -1,
+    }
+}
+
+/// Whether two folder settings name the same folder on disk.
+#[no_mangle]
+unsafe extern "C" fn bt_same_folder(a: *const c_char, b: *const c_char) -> i32 {
+    if a.is_null() || b.is_null() { return 0; }
+    let (Ok(a), Ok(b)) = (CStr::from_ptr(a).to_str(), CStr::from_ptr(b).to_str()) else { return 0 };
+    i32::from(cleanup::same_folder(Path::new(a), Path::new(b)))
+}
+
 #[no_mangle]
 unsafe extern "C" fn bt_tracks_first_frame(core: *const BtTracks) -> u64 {
     core.as_ref()
@@ -752,6 +820,31 @@ unsafe fn export_snapshots(
 #[cfg(test)]
 mod display_tests {
     use super::*;
+
+    #[test]
+    fn cleanup_ffi_is_off_unless_an_offered_age_is_chosen_and_never_cleans_a_withheld_folder() {
+        unsafe {
+            let schedule = bt_cleanup_new(15);
+            assert_eq!(bt_cleanup_days(schedule), 0);
+            assert_eq!(bt_cleanup_due(schedule), 0);
+            assert_eq!(bt_cleanup_poll(schedule, ptr::null(), ptr::null(), 0), -2);
+
+            bt_cleanup_set_days(schedule, 30);
+            assert_eq!(bt_cleanup_days(schedule), 30);
+            // A new choice waits before its first pass, so nothing is due or running yet.
+            assert_eq!(bt_cleanup_due(schedule), 0);
+            let folder = CString::new(std::env::temp_dir().to_str().unwrap()).unwrap();
+            assert_eq!(bt_cleanup_poll(schedule, folder.as_ptr(), ptr::null(), 0), -2);
+            bt_cleanup_set_days(schedule, 0);
+            assert_eq!(bt_cleanup_days(schedule), 0);
+            bt_cleanup_free(schedule);
+
+            assert_eq!(bt_same_folder(folder.as_ptr(), folder.as_ptr()), 1);
+            let other = CString::new(std::env::temp_dir().join("bt-other").to_str().unwrap()).unwrap();
+            assert_eq!(bt_same_folder(folder.as_ptr(), other.as_ptr()), 0);
+            assert_eq!(bt_same_folder(ptr::null(), folder.as_ptr()), 0);
+        }
+    }
 
     #[test]
     fn tracks_silence_mode_ffi_flushes_old_policy_and_keeps_aligned_quiet_samples() {

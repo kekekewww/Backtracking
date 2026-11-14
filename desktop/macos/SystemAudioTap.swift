@@ -53,10 +53,10 @@ enum CaptureSource: Hashable {
 
     var label: String {
         switch self {
-        case .system: "系統播放"
+        case .system: "System audio"
         case .microphone(let uid):
-            if uid.isEmpty { "預設麥克風" } else { "麥克風 · \(uid)" }
-        case .application(let identifier): "應用程式 · \(identifier)"
+            if uid.isEmpty { "Default microphone" } else { "Microphone · \(uid)" }
+        case .application(let identifier): "Application · \(identifier)"
         case .sender: "【Sender】"
         }
     }
@@ -266,10 +266,13 @@ func availableCaptureSources(excluding privateDevices: Set<AudioObjectID>) -> [(
     if let device = defaultDevice(kAudioHardwarePropertyDefaultInputDevice), inputDevices.contains(device) {
         choices.append((.microphone(""), CaptureSource.microphone("").label))
     }
+    // Plug-in senders come right after the two fixed entries, as on Windows, so they are not
+    // lost below a long list of devices and apps.
+    let fixedChoices = choices.count
     for device in inputDevices {
         guard let uid = audioString(device, kAudioDevicePropertyDeviceUID), !uid.isEmpty,
               let name = audioString(device, kAudioObjectPropertyName) else { continue }
-        choices.append((.microphone(uid), "麥克風 · \(name)"))
+        choices.append((.microphone(uid), name))
     }
 
     // Workspace metadata names HAL playback clients and associates helper processes with their app.
@@ -302,8 +305,10 @@ func availableCaptureSources(excluding privateDevices: Set<AudioObjectID>) -> [(
         let order = $0.value.localizedStandardCompare($1.value)
         return order == .orderedSame ? $0.key < $1.key : order == .orderedAscending
     }
-    choices += sortedApps.map { (.application($0.key), "應用程式 · \($0.value)") }
-    choices += availableSenders().map { (.sender($0.id), "【Sender】\($0.name)") }
+    choices += sortedApps.map { (.application($0.key), $0.value) }
+    choices.insert(
+        contentsOf: availableSenders().map { (.sender($0.id), "【Sender】\($0.name)") }, at: fixedChoices
+    )
     return choices
 }
 
@@ -518,7 +523,7 @@ private struct InputFormat {
               stream.mBitsPerChannel == 32, (1...64).contains(count),
               (1...384_000).contains(stream.mSampleRate),
               stream.mBytesPerFrame == sampleBytes * (separate ? 1 : stream.mChannelsPerFrame) else {
-            throw CaptureError("此來源的音訊格式不受支援")
+            throw CaptureError("This source's audio format is not supported")
         }
         channels = count
         sampleRate = stream.mSampleRate
@@ -580,7 +585,7 @@ private final class TimelineHandle: @unchecked Sendable {
 
     init(history: UInt32, a: UInt32, b: UInt32, retainSilence: Bool = false) throws {
         guard let core = bt_tracks_new(SystemAudioTap.timelineRate, a, b, history) else {
-            throw CaptureError("無法配置錄音緩衝區")
+            throw CaptureError("Could not allocate the capture buffer")
         }
         self.core = core
         setRetainSilence(retainSilence)
@@ -701,7 +706,7 @@ private final class SenderInput: NativeInput {
         for producer in producers {
             guard producer.attachSender(id) else {
                 try stop()
-                throw CaptureError("Sender 無法連線")
+                throw CaptureError("Could not connect to the sender")
             }
         }
     }
@@ -748,7 +753,7 @@ private final class PlaybackTap: NativeInput {
         tap.uuid = UUID()
         tap.isPrivate = true
         tap.muteBehavior = .unmuted
-        try checkAudio(AudioHardwareCreateProcessTap(tap, &tapID), "無法建立系統或應用程式音訊擷取")
+        try checkAudio(AudioHardwareCreateProcessTap(tap, &tapID), "Could not create the system or application audio capture")
         let aggregate: [String: Any] = [
             kAudioAggregateDeviceNameKey: "Backtracking Capture",
             kAudioAggregateDeviceUIDKey: UUID().uuidString,
@@ -758,11 +763,11 @@ private final class PlaybackTap: NativeInput {
                 [kAudioSubTapUIDKey: tap.uuid.uuidString, kAudioSubTapDriftCompensationKey: true]
             ]
         ]
-        try checkAudio(AudioHardwareCreateAggregateDevice(aggregate as CFDictionary, &aggregateID), "無法建立音訊擷取裝置")
+        try checkAudio(AudioHardwareCreateAggregateDevice(aggregate as CFDictionary, &aggregateID), "Could not create the audio capture device")
         var address = property(kAudioTapPropertyFormat)
         var stream = AudioStreamBasicDescription()
         var size = UInt32(MemoryLayout.size(ofValue: stream))
-        try checkAudio(AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &stream), "無法讀取來源格式")
+        try checkAudio(AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &stream), "Could not read the source format")
         streamFormat = try InputFormat(stream, labels: labels)
     }
 
@@ -775,7 +780,7 @@ private final class PlaybackTap: NativeInput {
                 let timestamp = packetTime(hostTime: stamp.pointee.mHostTime, frames: frames, sampleRate: format.sampleRate)
                 for producer in producers { producer.push(buffers, format: format, frameLimit: frames, time: timestamp) }
             },
-            "無法安裝音訊擷取回呼"
+            "Could not install the audio capture callback"
         )
     }
 
@@ -783,14 +788,14 @@ private final class PlaybackTap: NativeInput {
         guard let ioProc, !running else { return }
         try checkAudio(
             AudioDeviceStart(aggregateID, ioProc),
-            "無法開始系統音訊擷取，請檢查螢幕與系統音訊錄製授權"
+            "Could not start system audio capture. Check the Screen & System Audio Recording permission"
         )
         running = true
     }
 
     func stop() throws {
         guard let ioProc, running else { return }
-        try checkAudio(AudioDeviceStop(aggregateID, ioProc), "無法暫停音訊擷取裝置")
+        try checkAudio(AudioDeviceStop(aggregateID, ioProc), "Could not pause the audio capture device")
         running = false
     }
 
@@ -816,13 +821,13 @@ private final class MicrophoneInput: NativeInput {
         let engine = AVAudioEngine()
         let node = engine.inputNode
         if device != defaultDevice(kAudioHardwarePropertyDefaultInputDevice) {
-            guard let unit = node.audioUnit else { throw CaptureError("無法取得麥克風輸入裝置") }
+            guard let unit = node.audioUnit else { throw CaptureError("Could not open the microphone input") }
             var selected = device
             try checkAudio(
                 AudioUnitSetProperty(
                     unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
                     &selected, UInt32(MemoryLayout.size(ofValue: selected))
-                ), "無法切換麥克風裝置"
+                ), "Could not switch the microphone device"
             )
         }
         let audioFormat = node.outputFormat(forBus: 0)
@@ -891,7 +896,7 @@ final class SystemAudioTap {
     }
 
     init(history: UInt32, lanes: [CaptureLane], retainSilence: Bool = false) throws {
-        guard (1...2).contains(lanes.count) else { throw CaptureError("可擷取一或兩路來源") }
+        guard (1...2).contains(lanes.count) else { throw CaptureError("Capture takes one or two sources") }
         self.lanes = lanes
         var slots: [Slot] = []
         for (index, lane) in lanes.enumerated() {
@@ -976,12 +981,12 @@ final class SystemAudioTap {
             if let error = slot.error { return "\(slot.source.label) · \(error)" }
             if slot.input == nil {
                 if slot.source.isMicrophone, AVCaptureDevice.authorizationStatus(for: .audio) != .authorized {
-                    return "\(slot.source.label) · 需要麥克風授權"
+                    return "\(slot.source.label) · needs microphone permission"
                 }
-                return "\(slot.source.label) · 等待來源"
+                return "\(slot.source.label) · waiting for the source"
             }
             if let input = slot.input, let index = slot.indexes.first(where: { !input.format.supports(lanes[$0].route) }) {
-                return "\(index == 0 ? "A" : "B") · 此來源未提供 \(lanes[index].route.label)"
+                return "Source \(index == 0 ? "A" : "B") · this source has no \(lanes[index].route.label) channel"
             }
         }
         return nil

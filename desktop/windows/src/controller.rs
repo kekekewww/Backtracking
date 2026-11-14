@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use backtracking_core::{
     CaptureError, CaptureState, ChannelRoute, DurationChoice, FrozenTrack, MeterReadings,
-    SenderReceiver, SynchronizedCapture, TimedPacket, WaveformView, discover_senders,
+    SenderInfo, SenderReceiver, SynchronizedCapture, TimedPacket, WaveformView, discover_senders,
 };
 
 pub(crate) use crate::loopback::CaptureSource;
@@ -307,6 +307,20 @@ impl Stream {
 }
 
 type Sources = [Option<SourceSettings>; 2];
+
+/// The entries every source list starts with: system audio and the default microphone.
+const FIXED_SOURCES: usize = 2;
+
+/// Lists plug-in senders right after the fixed entries. Someone switched each one on, and a
+/// long list of devices and applications would otherwise push them out of the visible rows.
+fn with_senders(mut sources: Vec<CaptureSource>, senders: Vec<SenderInfo>) -> Vec<CaptureSource> {
+    let at = sources.len().min(FIXED_SOURCES);
+    sources.splice(at..at, senders.into_iter().map(|sender| CaptureSource::Sender {
+        id: sender.id,
+        name: format!("【Sender】{}", sender.name),
+    }));
+    sources
+}
 type WaveformBuffers<'a> = (&'a mut [f32], &'a mut [f32]);
 
 pub(crate) struct EditSnapshot {
@@ -461,12 +475,7 @@ impl Controller {
     }
 
     pub(crate) fn available_sources() -> Vec<CaptureSource> {
-        let mut sources = Loopback::available_sources();
-        sources.extend(discover_senders().into_iter().map(|sender| CaptureSource::Sender {
-            id: sender.id,
-            name: format!("【Sender】{}", sender.name),
-        }));
-        sources
+        with_senders(Loopback::available_sources(), discover_senders())
     }
 
     pub(crate) fn route_available(&self, lane: usize, route: ChannelRoute) -> bool {
@@ -1384,6 +1393,32 @@ fn missing_channel(format: &Format, route: ChannelRoute) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn senders_are_listed_right_after_the_fixed_sources() {
+        let sender = |id: &str, name: &str| SenderInfo {
+            id: id.into(),
+            name: name.into(),
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let microphone = |name: &str| CaptureSource::Microphone { id: name.into(), name: name.into() };
+        let devices = vec![
+            CaptureSource::System,
+            CaptureSource::DefaultMicrophone,
+            microphone("Input 1"),
+            microphone("Input 2"),
+        ];
+        let listed = with_senders(devices.clone(), vec![sender("a-1", "Drums"), sender("b-2", "Bass")]);
+        assert_eq!(listed.len(), 6);
+        assert_eq!(listed[..2], devices[..2]);
+        assert_eq!(listed[2], CaptureSource::Sender { id: "a-1".into(), name: "【Sender】Drums".into() });
+        assert_eq!(listed[3], CaptureSource::Sender { id: "b-2".into(), name: "【Sender】Bass".into() });
+        assert_eq!(listed[4..], devices[2..]);
+        // Without senders the list is unchanged, and a short list still takes them.
+        assert_eq!(with_senders(devices.clone(), Vec::new()), devices);
+        assert_eq!(with_senders(Vec::new(), vec![sender("a-1", "Drums")]).len(), 1);
+    }
 
     fn wait_native_condition(
         controller: &mut Controller,

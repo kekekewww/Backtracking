@@ -132,7 +132,7 @@ version = "0.1.0"
 
 [[package]]
 name = "backtracking-plugin"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "backtracking-core",
  "backtracking-ui",
@@ -157,6 +157,7 @@ version = "0.1.0"
 dependencies = [
  "backtracking-core",
  "egui",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

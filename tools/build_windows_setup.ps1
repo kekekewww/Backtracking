@@ -2,6 +2,8 @@
 param(
     [switch]$DesktopOnly,
     [switch]$SkipBuild,
+    # Package a build that cannot update itself, for a fork or a throwaway test.
+    [switch]$NoUpdateKey,
     [string]$NsisPath,
     [string]$RuntimeDirectory
 )
@@ -82,8 +84,22 @@ function Get-RuntimeDirectory {
 }
 
 Push-Location $repositoryRoot
+$callerUpdateKey = $env:BACKTRACKING_UPDATE_PUBLIC_KEY
 try {
+    # The desktop build embeds this key, and only a build that has it can verify and
+    # install a later release. The caller's own value wins over the repository's.
+    $updateKey = ''
+    if (-not $NoUpdateKey) {
+        $updateKey = if ($callerUpdateKey) { $callerUpdateKey.Trim() } else {
+            (Get-Content -LiteralPath 'desktop\update-public-key.hex' -Raw).Trim()
+        }
+        if ($updateKey -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'The update public key must be 64 lowercase hexadecimal characters.'
+        }
+    }
     if (-not $SkipBuild) {
+        if ($updateKey) { $env:BACKTRACKING_UPDATE_PUBLIC_KEY = $updateKey }
+        else { Remove-Item Env:BACKTRACKING_UPDATE_PUBLIC_KEY -ErrorAction SilentlyContinue }
         & cargo build --locked --release --manifest-path desktop/windows/Cargo.toml
         if ($LASTEXITCODE -ne 0) { throw 'Windows desktop build failed.' }
         if (-not $DesktopOnly) {
@@ -96,6 +112,16 @@ try {
     $pluginBinary = Join-Path $repositoryRoot 'plugins\backtracking-plugin\target\release\backtracking_plugin.dll'
     if (-not (Test-Path -LiteralPath $desktopBinary)) { throw 'Build the Windows desktop release before packaging.' }
     if (-not $DesktopOnly -and -not (Test-Path -LiteralPath $pluginBinary)) { throw 'Build the Windows plug-in release before packaging.' }
+    # The key is compiled in as text. Checking the packaged file also covers -SkipBuild,
+    # where the executable came from an earlier build.
+    $expectedKey = if ($updateKey) { $updateKey } else { (Get-Content -LiteralPath 'desktop\update-public-key.hex' -Raw).Trim() }
+    $hasUpdateKey = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($desktopBinary)).Contains($expectedKey)
+    if ($updateKey -and -not $hasUpdateKey) {
+        throw 'Backtracking.exe does not contain the update public key. Build it again without -SkipBuild, or pass -NoUpdateKey to package a build that cannot update itself.'
+    }
+    if ($NoUpdateKey -and $hasUpdateKey) {
+        throw 'Backtracking.exe contains the update public key. Build it again without -SkipBuild to package a build that cannot update itself.'
+    }
     $manifest = Get-Content -LiteralPath 'desktop\windows\Cargo.toml' -Raw
     $version = [regex]::Match($manifest, '(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"').Groups[1].Value
     if (-not $version) { throw 'The desktop package version could not be read.' }
@@ -139,7 +165,8 @@ try {
         ('Built UTC: ' + [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')),
         'Global snapshot: Alt + physical key left of 1, without Shift',
         'Installation scope: current Windows user',
-        "Backtracking.exe SHA256: $desktopHash"
+        "Backtracking.exe SHA256: $desktopHash",
+        ('Automatic updates: ' + $(if ($updateKey) { "signed releases, public key $updateKey" } else { 'not available in this build' }))
     )
     if (-not $DesktopOnly) {
         $buildInfo += 'Components: Desktop, optional VST3, optional CLAP'
@@ -166,5 +193,7 @@ try {
     Write-Output "Setup created: $setupPath"
     Write-Output "SHA256: $setupHash"
 } finally {
+    if ($null -eq $callerUpdateKey) { Remove-Item Env:BACKTRACKING_UPDATE_PUBLIC_KEY -ErrorAction SilentlyContinue }
+    else { $env:BACKTRACKING_UPDATE_PUBLIC_KEY = $callerUpdateKey }
     Pop-Location
 }

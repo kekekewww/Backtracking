@@ -16,11 +16,11 @@ private enum UpdateFailure: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidRelease: "GitHub 的更新資料不完整或版本不符。"
-        case .invalidSignature: "更新簽章無法驗證。"
-        case .invalidPackage: "更新檔案不完整或不適用於這部 Mac。"
-        case .unconfigured: "此版本尚未配置更新驗證公鑰。"
-        case .installation: "無法安裝新版，請確認 Backtracking 所在資料夾可寫入。"
+        case .invalidRelease: "The GitHub Release is incomplete or does not match its version."
+        case .invalidSignature: "The update's signature could not be verified."
+        case .invalidPackage: "The update package is incomplete or is not for this Mac."
+        case .unconfigured: "This build does not have a trusted update signing key."
+        case .installation: "Could not install the update. Check that the folder Backtracking is in can be written to."
         }
     }
 }
@@ -157,7 +157,7 @@ final class StartupUpdater: NSObject {
     private enum Choice { case update, later, never }
     private let defaults = UserDefaults.standard
     private var busy = false
-    private weak var automaticButton: NSButton?
+    private weak var modePopup: NSPopUpButton?
     private weak var checkButton: NSButton?
     private weak var status: NSTextField?
 
@@ -173,31 +173,46 @@ final class StartupUpdater: NSObject {
         get { Preference(rawValue: defaults.string(forKey: "updatePreference") ?? "") ?? .ask }
         set {
             defaults.set(newValue.rawValue, forKey: "updatePreference")
-            automaticButton?.state = newValue == .automatic ? .on : .off
+            modePopup?.selectItem(at: Self.modes.firstIndex(of: newValue) ?? 0)
         }
     }
 
+    // The same three choices, in the same words, as the Windows app.
+    private static let modes: [Preference] = [.ask, .automatic, .manual]
+    private static let modeLabels = ["Ask before installing", "Automatically update at startup", "Check manually"]
+
     func makeOptionsTab() -> NSTabViewItem {
-        let versionLabel = NSTextField(labelWithString: "目前版本 \(version)")
-        let automatic = NSButton(checkboxWithTitle: "啟動時自動安裝更新", target: self, action: #selector(toggleAutomatic(_:)))
-        automatic.state = preference == .automatic ? .on : .off
-        automaticButton = automatic
-        let check = NSButton(title: "檢查更新", target: self, action: #selector(checkManually))
-        check.isEnabled = !busy
-        checkButton = check
-        let open = NSButton(title: "GitHub Releases", target: self, action: #selector(openReleases))
-        let notes = NSButton(title: "上次更新內容", target: self, action: #selector(showPreviousNotes))
+        let versionLabel = NSTextField(labelWithString: "Installed version  v\(version)")
+        let open = NSButton(title: "Open GitHub Releases", target: self, action: #selector(openReleases))
         let status = NSTextField(wrappingLabelWithString: "")
         self.status = status
-        let buttons = NSStackView(views: [check, open, notes])
-        buttons.spacing = 8
-        let stack = NSStackView(views: [versionLabel, automatic, buttons, status])
+        var rows: [NSView] = [versionLabel]
+        if publicKey == nil {
+            status.stringValue =
+                "Automatic updates are unavailable for this build. Install a signed release to enable them."
+            rows += [status, open]
+        } else {
+            let mode = NSPopUpButton(frame: .zero, pullsDown: false)
+            mode.addItems(withTitles: Self.modeLabels)
+            mode.selectItem(at: Self.modes.firstIndex(of: preference) ?? 0)
+            mode.target = self
+            mode.action = #selector(modeChanged(_:))
+            modePopup = mode
+            let check = NSButton(title: "Check for updates", target: self, action: #selector(checkManually))
+            check.isEnabled = !busy
+            checkButton = check
+            let notes = NSButton(title: "Last update", target: self, action: #selector(showPreviousNotes))
+            let buttons = NSStackView(views: [check, notes, open])
+            buttons.spacing = 8
+            rows += [mode, buttons, status]
+        }
+        let stack = NSStackView(views: rows)
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
         stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         let tab = NSTabViewItem(identifier: "update")
-        tab.label = "更新"
+        tab.label = "Updates"
         tab.view = stack
         return tab
     }
@@ -217,7 +232,7 @@ final class StartupUpdater: NSObject {
                 ready()
                 defaults.set(receipt.notes, forKey: "lastUpdateNotes")
                 defaults.set(receipt.nextVersion, forKey: "lastUpdateVersion")
-                showNotes(title: "已更新至 \(receipt.nextVersion)", notes: receipt.notes, buttons: ["好"])
+                showNotes(title: "Updated to v\(receipt.nextVersion)", notes: receipt.notes, buttons: ["OK"])
             } else {
                 ready()
             }
@@ -232,9 +247,11 @@ final class StartupUpdater: NSObject {
         }
     }
 
-    @objc private func toggleAutomatic(_ button: NSButton) {
-        preference = button.state == .on ? .automatic : .manual
-        if preference == .automatic { defaults.removeObject(forKey: "skippedUpdateVersion") }
+    @objc private func modeChanged(_ popup: NSPopUpButton) {
+        guard Self.modes.indices.contains(popup.indexOfSelectedItem) else { return }
+        preference = Self.modes[popup.indexOfSelectedItem]
+        // A new choice forgets the version that was skipped, as on Windows.
+        defaults.removeObject(forKey: "skippedUpdateVersion")
     }
 
     @objc private func checkManually() {
@@ -247,14 +264,14 @@ final class StartupUpdater: NSObject {
 
     @objc private func showPreviousNotes() {
         let version = defaults.string(forKey: "lastUpdateVersion") ?? self.version
-        showNotes(title: "更新內容 \(version)", notes: defaults.string(forKey: "lastUpdateNotes") ?? "", buttons: ["好"])
+        showNotes(title: "Last update  v\(version)", notes: defaults.string(forKey: "lastUpdateNotes") ?? "", buttons: ["OK"])
     }
 
     private func check(startup: Bool) async -> Bool {
         guard !busy else { return false }
         busy = true
         checkButton?.isEnabled = false
-        status?.stringValue = "正在檢查更新…"
+        status?.stringValue = "Checking GitHub Releases…"
         defer { busy = false; checkButton?.isEnabled = true }
         do {
             guard let publicKey else { throw UpdateFailure.unconfigured }
@@ -263,7 +280,7 @@ final class StartupUpdater: NSObject {
             guard let newVersion = release.version, let candidate = UpdateVersion(newVersion),
                   let current = UpdateVersion(version), candidate > current,
                   !(startup && defaults.string(forKey: "skippedUpdateVersion") == newVersion) else {
-                status?.stringValue = "目前沒有可安裝的新版。"
+                status?.stringValue = "There is no newer stable update."
                 return false
             }
             let manifestAsset = try release.asset(UpdateManifest.name)
@@ -277,9 +294,9 @@ final class StartupUpdater: NSObject {
             let notes = String((release.body ?? "").prefix(65_536))
             if !startup || preference == .ask {
                 let buttons = startup
-                    ? ["更新並啟用自動更新", "下個版本再提示", "不再顯示更新提示"]
-                    : ["更新並重新啟動", "稍後"]
-                switch showNotes(title: "Backtracking \(newVersion) 已推出", notes: notes, buttons: buttons) {
+                    ? ["Update and turn on automatic updates", "Ask again for the next version", "Stop asking"]
+                    : ["Install and restart", "Cancel"]
+                switch showNotes(title: "Backtracking v\(newVersion) is available", notes: notes, buttons: buttons) {
                 case .alertFirstButtonReturn:
                     if startup { preference = .automatic }
                 case .alertThirdButtonReturn:
@@ -292,14 +309,14 @@ final class StartupUpdater: NSObject {
                     return false
                 }
             }
-            status?.stringValue = "正在下載及驗證更新…"
+            status?.stringValue = "Downloading and verifying the update…"
             try await prepare(asset: asset, manifest: manifest, manifestBytes: manifestBytes, signature: signature, notes: notes)
             NSApp.terminate(nil)
             return true
         } catch {
             status?.stringValue = error.localizedDescription
             if !startup {
-                showNotes(title: "無法更新 Backtracking", notes: error.localizedDescription, buttons: ["好"])
+                showNotes(title: "Could not update Backtracking", notes: error.localizedDescription, buttons: ["OK"])
             }
             return false
         }

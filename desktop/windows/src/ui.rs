@@ -11,8 +11,8 @@ use crate::context_menu::{self, WindowCommand};
 use crate::controller::{CaptureSource, Controller, EditSnapshot, SourceSettings};
 use crate::file_drag;
 use crate::preferences::{
-    DEFAULT_ACCENT, Key, MeterMode, PreferenceWriter, Preferences, Settings, serialize_sources,
-    wav_sample_format_preference,
+    BORDER_WIDTHS, DEFAULT_ACCENT, Key, MeterMode, PreferenceWriter, Preferences, Settings,
+    StatusMark, serialize_sources, wav_sample_format_preference,
 };
 use crate::snapshot_hotkey::{self, SnapshotHotkey};
 use crate::startup;
@@ -21,14 +21,17 @@ use crate::updater::UpdateOptions;
 use crate::window_order;
 use backtracking_core::{
     AutoResumeDelay, ChannelRoute, DurationChoice, FrozenTrack, MeterReadings, WavExportProfile,
-    WaveformView, export_routed_tracks_with_profile, waveform,
+    WaveformView, cleanup, export_routed_tracks_with_profile, waveform,
 };
 use backtracking_ui::{
-    CENTER_LINE, FlagReach, LoneSample, PLOT_BACKGROUND, RECORDING_DIM, RECORDING_LIT,
-    TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES, accent_color,
-    combo_popup_height, fit_frame_range, flag_handle_at, icon_button, meter_number, muted_accent,
-    paint_guide_lines, paint_transport_glyph, paint_waveform_trace, selected_waveform_color,
-    status_led, waveform_press,
+    CENTER_LINE, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, PLOT_BACKGROUND, RECORDING_DIM,
+    RECORDING_LIT, TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES,
+    accent_color, add_system_font_fallbacks, configure_options_menu, configure_options_style,
+    fit_frame_range, flag_handle_at, icon_button, meter_number, muted_accent, options_choice,
+    options_control_width, options_field, options_group_heading, options_heading_text,
+    options_list, options_menu_height, options_navigation_item, options_note, options_value,
+    paint_guide_lines, paint_transport_glyph, paint_waveform_trace, remeasure_options_menu,
+    selected_waveform_color, status_led, waveform_press,
 };
 use eframe::egui::{
     self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection, Stroke, Vec2,
@@ -144,7 +147,6 @@ fn next_wake(waits: &Waits) -> Duration {
 }
 const TRANSPARENCIES: [u8; 5] = [0, 25, 50, 75, 100];
 /// The space between two rows of an open Options drop-down.
-const OPTIONS_MENU_ROW_GAP: f32 = 4.0;
 const WAITING_LED: Color32 = Color32::from_rgb(76, 86, 88);
 const PAUSED_LED: Color32 = Color32::from_rgb(54, 57, 60);
 const ERROR_LED: Color32 = Color32::from_rgb(246, 196, 118);
@@ -325,6 +327,8 @@ fn configure_style(ctx: &egui::Context, accent: Color32) {
     fonts
         .families
         .insert(egui::FontFamily::Name(name.into()), vec![name.to_owned()]);
+    // Names, paths and Windows messages can be in any language.
+    add_system_font_fallbacks(&mut fonts);
     ctx.set_fonts(fonts);
 }
 
@@ -348,6 +352,8 @@ struct Recorder {
     launch_at_login: bool,
     quitting: bool,
     output: PathBuf,
+    /// Deletes old exports from `output` when the user asks for it.
+    output_cleanup: cleanup::Schedule,
     saved_output: PathBuf,
     pinned: bool,
     pin_watch: Option<window_order::PinWatch>,
@@ -358,7 +364,11 @@ struct Recorder {
     full_waveform_height: f32,
     full_window_size: Vec2,
     waveform_border: bool,
+    waveform_border_width: u8,
     waveform_border_color: Option<Color32>,
+    status_mark: StatusMark,
+    show_title: bool,
+    show_meters: bool,
     waveform_border_follows_background: bool,
     bar_lines: bool,
     second_lines: bool,
@@ -370,6 +380,10 @@ struct Recorder {
     available_sources: Vec<CaptureSource>,
     source_list_worker: Option<JoinHandle<Vec<CaptureSource>>>,
     source_list_refresh_pending: bool,
+    /// The audio source list that is open in Options, and whether a scan has replaced its
+    /// rows since it was last measured.
+    source_menu: Option<egui::LayerId>,
+    source_menu_outdated: bool,
     updates: UpdateOptions,
     window_position: Option<[i32; 2]>,
     window_position_changed: Option<Instant>,
@@ -439,10 +453,11 @@ enum OptionsSection {
 
 impl OptionsSection {
     const ALL: [(Self, &'static str); 6] = [
-        (Self::Actions, "Actions & shortcuts"),
+        // One short word each, so the list never wraps and a page is easy to name.
+        (Self::Actions, "Actions"),
         (Self::Capture, "Capture"),
-        (Self::Sources, "Sources & connections"),
-        (Self::Appearance, "Waveform & appearance"),
+        (Self::Sources, "Sources"),
+        (Self::Appearance, "Appearance"),
         (Self::Export, "Export"),
         (Self::Updates, "Updates"),
     ];
@@ -450,83 +465,6 @@ impl OptionsSection {
     fn title(self) -> &'static str {
         Self::ALL.iter().find(|(section, _)| *section == self).unwrap().1
     }
-}
-
-fn configure_options_style(ui: &mut egui::Ui) {
-    let style = ui.style_mut();
-    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
-    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
-    style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(13.0));
-    style.text_styles.insert(egui::TextStyle::Heading,
-        egui::FontId::new(22.0, egui::FontFamily::Name(waveform::HINT_BOLD_FAMILY.into())));
-    style.spacing.interact_size.y = 32.0;
-    style.spacing.button_padding = Vec2::new(10.0, 6.0);
-    style.spacing.item_spacing.y = 12.0;
-}
-
-fn options_heading_text(label: impl Into<String>, size: f32) -> egui::RichText {
-    egui::RichText::new(label).font(egui::FontId::new(
-        size, egui::FontFamily::Name(waveform::HINT_BOLD_FAMILY.into()),
-    ))
-}
-
-fn options_group_heading(ui: &mut egui::Ui, label: &str) {
-    ui.add_space(4.0);
-    ui.label(options_heading_text(label, 18.0));
-}
-
-fn options_list<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-        configure_options_style(ui);
-        ui.set_width(ui.available_width());
-        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-        contents(ui)
-    }).inner
-}
-
-fn options_menu_height(ui: &egui::Ui, item_count: usize) -> f32 {
-    combo_popup_height(ui, item_count, OPTIONS_MENU_ROW_GAP)
-}
-
-fn configure_options_menu(ui: &mut egui::Ui, width: f32) {
-    configure_options_style(ui);
-    ui.set_max_width(width);
-    ui.spacing_mut().item_spacing.y = OPTIONS_MENU_ROW_GAP;
-    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-}
-
-fn options_field<R>(ui: &mut egui::Ui, label: &str, control: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    ui.vertical(|ui| {
-        ui.label(options_heading_text(label, 16.0));
-        let result = control(ui);
-        ui.add_space(9.0);
-        result
-    }).inner
-}
-
-fn options_choice<T: Copy + PartialEq>(
-    ui: &mut egui::Ui,
-    id: &str,
-    selected: &mut T,
-    choices: impl IntoIterator<Item = (T, String)>,
-) -> bool {
-    let choices: Vec<_> = choices.into_iter().collect();
-    let text = choices.iter().find(|(value, _)| value == selected)
-        .map_or_else(String::new, |(_, text)| text.clone());
-    let before = *selected;
-    let width = ui.available_width().min(680.0);
-    egui::ComboBox::from_id_salt(id)
-        .width(width)
-        .height(options_menu_height(ui, choices.len()))
-        .selected_text(&text)
-        .truncate()
-        .show_ui(ui, |ui| {
-            configure_options_menu(ui, width);
-            for (value, label) in choices {
-                ui.selectable_value(selected, value, label);
-            }
-        }).response.on_hover_text(text);
-    *selected != before
 }
 
 /// "Off" leaves a paused capture paused. It is stored as 0 seconds, which never meant "at once".
@@ -644,7 +582,6 @@ fn window_shortcut(events: &[egui::Event]) -> Option<WindowCommand> {
         match key {
             egui::Key::Space if modifiers.is_none() => Some(WindowCommand::ToggleCapture),
             egui::Key::Delete if modifiers.is_none() => Some(WindowCommand::Clear),
-            egui::Key::S if modifiers.command_only() => Some(WindowCommand::SaveSnapshot),
             _ => None,
         }
     })
@@ -1111,6 +1048,7 @@ impl Recorder {
             launch_at_login: false,
             quitting: false,
             output: settings.output,
+            output_cleanup: cleanup::Schedule::new(settings.output_cleanup, Instant::now()),
             saved_output: settings.saved_output,
             pinned: settings.pinned,
             pin_watch: None,
@@ -1120,6 +1058,10 @@ impl Recorder {
             full_waveform_height: DEFAULT_WAVEFORM_HEIGHT,
             full_window_size: Vec2::new(610.0, 144.0),
             waveform_border: settings.waveform_border,
+            waveform_border_width: settings.waveform_border_width,
+            status_mark: settings.status_mark,
+            show_title: settings.show_title,
+            show_meters: settings.show_meters,
             waveform_border_color: settings.waveform_border_color.map(accent_color),
             waveform_border_follows_background: settings.waveform_border_follows_background,
             bar_lines: settings.bar_lines,
@@ -1132,6 +1074,8 @@ impl Recorder {
             available_sources: vec![CaptureSource::System, CaptureSource::DefaultMicrophone],
             source_list_worker: None,
             source_list_refresh_pending: false,
+            source_menu: None,
+            source_menu_outdated: false,
             updates: UpdateOptions::default(),
             window_position: settings.window_position,
             window_position_changed: None,
@@ -1536,7 +1480,7 @@ impl Recorder {
     }
 
     fn border_inset(&self) -> f32 {
-        if self.waveform_border { 1.0 } else { 0.0 }
+        if self.waveform_border { f32::from(self.waveform_border_width) } else { 0.0 }
     }
 
     fn invalidate_export(&mut self) {
@@ -1670,11 +1614,13 @@ impl Recorder {
             auto_resume: self.auto_resume_remaining(),
             // Waveform-only mode shows the countdown in a tooltip.
             countdown_shown: !self.waveform_only || ctx.input(|input| input.pointer.has_pointer()),
+            // Nothing blinks unless the mark is shown while recording.
             blink: self
                 .recording_started
-                .filter(|_| self.controller.is_recording())
+                .filter(|_| self.status_mark == StatusMark::Always && self.controller.is_recording())
                 .map(|started| ctx.input(|input| input.time) - started),
             meters_live: !self.waveform_only
+                && self.show_meters
                 && (meter_shown(0) || (self.dual_source() && meter_shown(1))),
             fine_edit: Some(now.saturating_duration_since(self.last_interaction))
                 .filter(|&since| since < FINE_EDIT_SETTLE),
@@ -1760,17 +1706,21 @@ impl Recorder {
 
     fn controls(&mut self, ui: &mut egui::Ui, interaction_blocked: bool) {
         ui.horizontal(|ui| {
-            ui.heading("Backtracking");
+            if self.show_title {
+                ui.heading("Backtracking");
+            }
             self.transport_button(ui, interaction_blocked);
             self.recording_indicator(ui);
             self.clear_button(ui, interaction_blocked);
             self.pin_button(ui, interaction_blocked);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.options_button(ui, !interaction_blocked && self.gesture.is_none());
-                if self.dual_source() {
-                    self.meter_readout(ui, 1);
+                if self.show_meters {
+                    if self.dual_source() {
+                        self.meter_readout(ui, 1);
+                    }
+                    self.meter_readout(ui, 0);
                 }
-                self.meter_readout(ui, 0);
             });
         });
     }
@@ -1823,11 +1773,20 @@ impl Recorder {
     }
 
     fn recording_indicator(&mut self, ui: &mut egui::Ui) {
+        if self.status_mark == StatusMark::Never {
+            return;
+        }
+        let size = Vec2::new(15.0, 24.0);
         let indicator = self.capture_indicator();
+        if !status_mark_shown(self.status_mark, indicator, self.controller.error().is_some()) {
+            // The light keeps its place, so the buttons do not move when it comes on.
+            ui.allocate_space(size);
+            return;
+        }
         let status = indicator.label();
         let color = indicator.led_color(self.recording_lit(ui.input(|input| input.time)));
 
-        status_led(ui, Vec2::new(15.0, 24.0), 4.5, color, status);
+        status_led(ui, size, 4.5, color, status);
     }
 
     /// Time left before a paused capture resumes by itself, if it is going to.
@@ -1872,6 +1831,9 @@ impl Recorder {
         let rect = rect.shrink(self.border_inset());
         let indicator = self.capture_indicator();
         let problem = self.capture_problem();
+        if !status_mark_shown(self.status_mark, indicator, problem.is_some()) {
+            return;
+        }
         let lit = self.recording_lit(ui.input(|input| input.time));
         let hover = paint_compact_status(
             &ui.painter_at(rect), rect, indicator, lit, problem.as_deref(),
@@ -2149,6 +2111,12 @@ impl Recorder {
             if ui.input(|input| input.viewport().close_requested()) {
                 return Some(OptionsAction::Close);
             }
+            // Escape closes the window unless it is closing a drop-down or a colour picker.
+            if !egui::Popup::is_any_open(ui.ctx())
+                && ui.input(|input| input.key_pressed(egui::Key::Escape))
+            {
+                return Some(OptionsAction::Close);
+            }
             if std::mem::take(&mut self.options_focus_requested)
                 && class == egui::ViewportClass::Immediate
             {
@@ -2202,42 +2170,38 @@ impl Recorder {
         frame: &eframe::Frame,
     ) -> Option<OptionsAction> {
         configure_options_style(ui);
-        let close = egui::Panel::bottom("options-footer")
-            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(12))
-            .show(ui, |ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let close = ui.add_sized([96.0, 36.0], egui::Button::new("Close")).clicked();
-                    if !self.message.is_empty() {
-                        ui.add(egui::Label::new(&self.message).truncate()).on_hover_text(&self.message);
-                    }
-                    close
-                }).inner
-            }).inner;
         egui::Panel::left("options-navigation")
-            .exact_size(190.0)
+            .exact_size(OPTIONS_NAVIGATION_WIDTH)
             .resizable(false)
-            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(12))
+            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(10))
             .show(ui, |ui| {
-                ui.label(options_heading_text("Backtracking", 18.0));
-                ui.add_space(14.0);
+                ui.spacing_mut().item_spacing.y = 4.0;
+                ui.add_space(6.0);
                 for (section, label) in OptionsSection::ALL {
                     if !self.primary && section == OptionsSection::Updates { continue; }
-                    if ui.add_sized(
-                        [ui.available_width(), 46.0],
-                        egui::Button::new(if self.options_section == section {
-                            options_heading_text(label, 15.0)
-                        } else { egui::RichText::new(label).size(15.0) })
-                            .selected(self.options_section == section).wrap(),
-                    ).clicked() { self.options_section = section; }
+                    let selected = self.options_section == section;
+                    if options_navigation_item(ui, label, selected, self.accent).clicked() {
+                        self.options_section = section;
+                    }
                 }
             });
+        // Changes apply at once and the window closes from its title bar or with Escape, so
+        // the only thing left for a footer is a message, when there is one.
+        if !self.message.is_empty() {
+            egui::Panel::bottom("options-message")
+                .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(22, 8)))
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(&self.message).truncate()).on_hover_text(&self.message);
+                });
+        }
         let action = egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(22))
             .show(ui, |ui| {
-                ui.label(options_heading_text(self.options_section.title(), 22.0));
-                ui.add_space(8.0);
+                let title = options_heading_text(ui, self.options_section.title(), 20.0);
+                ui.label(title);
+                ui.add_space(2.0);
                 ui.separator();
-                ui.add_space(14.0);
+                ui.add_space(6.0);
                 egui::ScrollArea::vertical()
                     .id_salt(self.options_section)
                     .auto_shrink([false, false])
@@ -2262,13 +2226,16 @@ impl Recorder {
                         }
                     })).inner
             }).inner;
-        if close { Some(OptionsAction::Close) } else { action }
+        action
     }
 
     fn snapshot_options(&mut self, ui: &mut egui::Ui) {
         options_group_heading(ui, "Snapshots");
-        if ui.button("Save snapshot").clicked() { self.save_snapshot(); }
-        if ui.button("New capture window").clicked() {
+        let (save, new_window) = ui.horizontal_wrapped(|ui| {
+            (ui.button("Save snapshot").clicked(), ui.button("New capture window").clicked())
+        }).inner;
+        if save { self.save_snapshot(); }
+        if new_window {
             let launched = std::env::current_exe().and_then(|exe| {
                 Command::new(exe).arg("--new-capture-window").spawn()
             });
@@ -2277,11 +2244,10 @@ impl Recorder {
             }
         }
         if !self.primary { return; }
-        ui.add_space(6.0);
         options_field(ui, "Global shortcut", |ui| {
-            ui.label("Alt + the key left of 1");
+            options_value(ui, "Alt + the key left of 1");
             if let Some(error) = &self.hotkey_error {
-                ui.add(egui::Label::new(format!("Could not register the shortcut: {error}")).wrap());
+                options_note(ui, format!("Could not register the shortcut: {error}"));
             }
         });
         if Instant::now() >= self.snapshot_target_scan {
@@ -2294,7 +2260,7 @@ impl Recorder {
         }).to_owned();
         let mut target = self.snapshot_target.clone();
         options_field(ui, "Shortcut target", |ui| {
-            let width = ui.available_width().min(680.0);
+            let width = options_control_width(ui);
             egui::ComboBox::from_id_salt("snapshot-target")
                 .width(width)
                 .height(options_menu_height(ui, self.snapshot_targets.len() + 1))
@@ -2319,12 +2285,17 @@ impl Recorder {
         let can_toggle = self.gesture.is_none();
         let transport = if self.controller.error().is_some() { "Retry capture" }
             else if self.controller.is_paused() { "Play" } else { "Pause" };
-        if ui.add_enabled(can_toggle, egui::Button::new(transport)).clicked() { self.toggle_capture(); }
-        if ui.add_enabled(self.selection.is_some(), egui::Button::new("Cancel selection")).clicked() {
-            self.cancel_selection();
-        }
-        if ui.add_enabled(can_toggle, egui::Button::new("Clear capture")).clicked() { self.clear_capture(); }
-        ui.add_space(6.0);
+        let has_selection = self.selection.is_some();
+        let (toggle, cancel, clear) = ui.horizontal_wrapped(|ui| {
+            (
+                ui.add_enabled(can_toggle, egui::Button::new(transport)).clicked(),
+                ui.add_enabled(has_selection, egui::Button::new("Cancel selection")).clicked(),
+                ui.add_enabled(can_toggle, egui::Button::new("Clear capture")).clicked(),
+            )
+        }).inner;
+        if toggle { self.toggle_capture(); }
+        if cancel { self.cancel_selection(); }
+        if clear { self.clear_capture(); }
     }
 
     fn capture_options(&mut self, ui: &mut egui::Ui) {
@@ -2364,6 +2335,20 @@ impl Recorder {
         });
         self.accent_settings(ui);
         ui.separator();
+        options_group_heading(ui, "Show");
+        if ui.checkbox(&mut self.show_title, "App name in the toolbar").changed() {
+            self.save_preference(Key::ShowTitle, u8::from(self.show_title).to_string());
+        }
+        if ui.checkbox(&mut self.show_meters, "Level meters").changed() {
+            self.save_preference(Key::ShowMeters, u8::from(self.show_meters).to_string());
+        }
+        options_field(ui, "Capture status mark", |ui| {
+            if options_choice(ui, "status-mark", &mut self.status_mark,
+                StatusMark::ALL.into_iter().map(|mark| (mark, mark.label().to_owned()))) {
+                self.save_preference(Key::StatusMark, self.status_mark.preference());
+            }
+        });
+        ui.separator();
         options_group_heading(ui, "Timeline guides");
         if ui.checkbox(&mut self.bar_lines, "Show bar lines").changed() {
             self.save_preference(Key::BarLines, u8::from(self.bar_lines).to_string());
@@ -2374,17 +2359,25 @@ impl Recorder {
         options_field(ui, "Seconds interval", |ui| {
             ui.add_enabled_ui(self.second_lines, |ui| {
                 if options_choice(ui, "seconds-interval", &mut self.second_interval,
-                    [1, 5, 10].into_iter().map(|value| (value, format!("{value} seconds")))) {
+                    [1, 5, 10].into_iter().map(|value| {
+                        (value, if value == 1 { "1 second".to_owned() } else { format!("{value} seconds") })
+                    })) {
                     self.save_preference(Key::SecondsInterval, self.second_interval.to_string());
                 }
             });
         });
         ui.separator();
         options_group_heading(ui, "Waveform border");
-        if ui.checkbox(&mut self.waveform_border, "Show a thin border").changed() {
+        if ui.checkbox(&mut self.waveform_border, "Show a border").changed() {
             self.save_preference(Key::WaveformBorder, u8::from(self.waveform_border).to_string());
         }
         ui.add_enabled_ui(self.waveform_border, |ui| {
+            options_field(ui, "Border width", |ui| {
+                if options_choice(ui, "border-width", &mut self.waveform_border_width,
+                    BORDER_WIDTHS.into_iter().map(|width| (width, format!("{width} px")))) {
+                    self.save_preference(Key::WaveformBorderWidth, self.waveform_border_width.to_string());
+                }
+            });
             let mut theme = self.waveform_border_color.is_none();
             let theme_changed = ui.checkbox(&mut theme, "Use theme color").changed();
             let [r, g, b, _] = self.waveform_border_color.unwrap_or(self.accent).to_array();
@@ -2428,9 +2421,14 @@ impl Recorder {
     }
 
     fn source_options(&mut self, ui: &mut egui::Ui) {
+        // The list opened on a spinner and was measured for that; give the scanned rows room.
+        if std::mem::take(&mut self.source_menu_outdated) && let Some(menu) = self.source_menu {
+            remeasure_options_menu(ui.ctx(), menu);
+        }
         let choices = self.available_sources.as_slice();
         let scanning = self.source_list_worker.is_some();
         let mut source_menu_opened = false;
+        let mut open_menu = None;
         let mut sources = self.controller.sources().clone();
         ui.add_enabled_ui(self.gesture.is_none(), |ui| {
             for (lane, settings) in sources.iter_mut().enumerate() {
@@ -2445,12 +2443,13 @@ impl Recorder {
                             || std::borrow::Cow::Borrowed("Off"),
                             |source| source_picker_label(choices.iter().find(|choice| choice.same_source(source)).unwrap_or(source), choices),
                         ).into_owned();
-                        let width = ui.available_width().min(680.0);
+                        let width = options_control_width(ui);
                         egui::ComboBox::from_id_salt(source_menu)
                             .selected_text(&label).width(width)
                             .height(options_menu_height(ui, choices.len() + usize::from(lane == 1)))
                             .truncate().show_ui(ui, |ui| {
                                 configure_options_menu(ui, width);
+                                open_menu = Some(ui.layer_id());
                                 if lane == 1 { ui.selectable_value(&mut source, None, "Off"); }
                                 source_menu_opened |= !was_open;
                                 if !was_open || scanning { ui.spinner(); return; }
@@ -2475,7 +2474,7 @@ impl Recorder {
                     });
                     if let Some(settings) = settings {
                         options_field(ui, "Channel route", |ui| {
-                            let width = ui.available_width().min(680.0);
+                            let width = options_control_width(ui);
                             egui::ComboBox::from_id_salt("route")
                                 .selected_text(settings.route.label()).width(width)
                                 .height(options_menu_height(ui, ChannelRoute::ALL.len()))
@@ -2488,12 +2487,12 @@ impl Recorder {
                                 });
                         });
                     }
-                    if let Some(status) = self.controller.source_status(lane) { ui.small(status); }
-                    ui.add_space(8.0);
+                    if let Some(status) = self.controller.source_status(lane) { options_note(ui, status); }
                     if lane == 0 { ui.separator(); }
                 });
             }
         });
+        self.source_menu = open_menu;
         if source_menu_opened { self.refresh_source_list(); }
         if sources != *self.controller.sources() {
             self.save_preference(Key::CaptureSources, serialize_sources(&sources));
@@ -2524,7 +2523,10 @@ impl Recorder {
             && let Some(worker) = self.source_list_worker.take()
         {
             match worker.join() {
-                Ok(sources) => self.available_sources = sources,
+                Ok(sources) => {
+                    self.available_sources = sources;
+                    self.source_menu_outdated = self.source_menu.is_some();
+                }
                 Err(_) => self.message = "Source list worker stopped unexpectedly.".into(),
             }
             if std::mem::take(&mut self.source_list_refresh_pending) {
@@ -2533,19 +2535,89 @@ impl Recorder {
         }
     }
 
-    fn folder_options(&self, ui: &mut egui::Ui) -> Option<OptionsAction> {
+    /// The drag-and-drop folder when old exports may be deleted from it. Saved snapshots are
+    /// never deleted, so a folder that also holds them is left alone.
+    fn output_cleanup_folder(&self) -> Option<&std::path::Path> {
+        (self.primary && !cleanup::same_folder(&self.output, &self.saved_output))
+            .then_some(self.output.as_path())
+    }
+
+    fn clean_output_folder(&mut self) {
+        // Only one window cleans, and only when the user chose an age: the common case costs
+        // nothing here.
+        if !self.primary || self.output_cleanup.age().is_none() {
+            return;
+        }
+        let now = Instant::now();
+        // The folder check reads the disk, so it waits until a pass is due.
+        let (folder, keep) = if self.output_cleanup.due(now) {
+            (
+                self.output_cleanup_folder().map(std::path::Path::to_owned),
+                // A file still on offer for a drag stays, however long it has waited.
+                self.exported.as_ref().map_or_else(Vec::new, |file| file.paths.clone()),
+            )
+        } else {
+            (None, Vec::new())
+        };
+        match self.output_cleanup.poll(folder.as_deref(), &keep, now) {
+            Some(Ok(0)) | None => {}
+            Some(Ok(1)) => self.message = "Deleted 1 old file from the drag-and-drop folder".into(),
+            Some(Ok(count)) => {
+                self.message = format!("Deleted {count} old files from the drag-and-drop folder");
+            }
+            Some(Err(error)) => {
+                self.message = format!("Could not clean the drag-and-drop folder: {error}");
+            }
+        }
+    }
+
+    fn output_cleanup_options(&mut self, ui: &mut egui::Ui) {
+        let mut age = self.output_cleanup.age();
+        let note = match age {
+            None => "Files you drag into other programs stay in this folder.".to_owned(),
+            Some(_) if self.output_cleanup_folder().is_none() => {
+                "Not active while this is also the saved snapshots folder.".to_owned()
+            }
+            Some(days) => format!(
+                "Backtracking's WAV files in this folder are permanently deleted {days} days \
+                 after they were written. A project that still uses one loses it."
+            ),
+        };
+        let changed = options_field(ui, "Delete old drag-and-drop files", |ui| {
+            let choices = std::iter::once(None).chain(cleanup::AGE_CHOICES.map(Some));
+            let changed = options_choice(
+                ui,
+                "output-cleanup",
+                &mut age,
+                choices.map(|age| (age, cleanup::age_label(age))),
+            );
+            options_note(ui, note);
+            changed
+        });
+        if changed {
+            self.output_cleanup.set_age(age, Instant::now());
+            // Off is stored as 0, like the other timed choices.
+            self.save_preference(Key::OutputCleanup, age.unwrap_or(0).to_string());
+        }
+    }
+
+    fn folder_options(&mut self, ui: &mut egui::Ui) -> Option<OptionsAction> {
         let waveform = options_field(ui, "Drag-and-drop folder", |ui| {
-            ui.add(egui::Label::new(self.output.display().to_string()).truncate()).on_hover_text(self.output.display().to_string());
+            options_value(ui, &self.output.display().to_string());
             ui.horizontal_wrapped(|ui| {
-                let select = ui.button("Choose folder...").clicked();
+                let select = ui.button("Choose folder…").clicked();
                 let open = ui.button("Open folder").clicked();
                 if select { Some(OptionsAction::SelectSaveFolder) } else { open.then_some(OptionsAction::GoToSaveFolder) }
             }).inner
         });
+        // Other capture windows share the folder but leave its housekeeping to the main one.
+        if self.primary {
+            self.output_cleanup_options(ui);
+        }
         let snapshot = options_field(ui, "Saved snapshots folder", |ui| {
-            ui.add(egui::Label::new(self.saved_output.display().to_string()).truncate()).on_hover_text(self.saved_output.display().to_string());
+            options_value(ui, &self.saved_output.display().to_string());
             ui.horizontal_wrapped(|ui| {
-                let select = ui.button("Choose folder...").clicked();
+                let select = ui.button("Choose folder…").clicked();
                 let open = ui.button("Open folder").clicked();
                 if select { Some(OptionsAction::SelectSnapshotFolder) } else { open.then_some(OptionsAction::OpenSnapshotFolder) }
             }).inner
@@ -2560,11 +2632,14 @@ impl Recorder {
             self.set_launch_at_login(enabled, frame);
         }
         let visible = frame.winit_window().is_none_or(|window| !window_is_hidden(window));
-        let visibility = if visible {
-            ui.add_enabled(self.tray_available, egui::Button::new("Hide waveform")).clicked().then_some(OptionsAction::Hide)
-        } else { ui.button("Show waveform").clicked().then_some(OptionsAction::Show) };
-        let quit = ui.button("Quit Backtracking").clicked();
-        visibility.or_else(|| quit.then_some(OptionsAction::Quit))
+        let tray_available = self.tray_available;
+        ui.horizontal_wrapped(|ui| {
+            let visibility = if visible {
+                ui.add_enabled(tray_available, egui::Button::new("Hide waveform")).clicked().then_some(OptionsAction::Hide)
+            } else { ui.button("Show waveform").clicked().then_some(OptionsAction::Show) };
+            let quit = ui.button("Quit Backtracking").clicked();
+            visibility.or_else(|| quit.then_some(OptionsAction::Quit))
+        }).inner
     }
 
     fn select_save_folder(&mut self, frame: &eframe::Frame) {
@@ -2576,6 +2651,7 @@ impl Recorder {
             if folder != self.output {
                 self.output = folder;
                 self.invalidate_export();
+                self.output_cleanup.restart(Instant::now());
             }
             let saved = self
                 .output
@@ -2609,6 +2685,7 @@ impl Recorder {
             .ok_or_else(|| io::Error::other("snapshot folder path is not valid UTF-8"))
             .and_then(|path| self.write_preference(Key::SavedSnapshots, path));
         self.saved_output = folder;
+        self.output_cleanup.restart(Instant::now());
         self.message = match saved {
             Ok(()) => format!("Snapshot folder: {}", self.saved_output.display()),
             Err(error) => format!("Could not save settings: {error}"),
@@ -2651,16 +2728,16 @@ impl Recorder {
                 self.save_preference(Key::WavSampleFormat, wav_sample_format_preference(self.wav_profile.sample_format));
             }
         }
-        ui.add_space(8.0);
     }
 
     fn accent_settings(&mut self, ui: &mut egui::Ui) {
         options_field(ui, "Theme color", |ui| {
             let [r, g, b, _] = self.accent.to_array();
             let mut color = [r, g, b];
-            let changed = ui.color_edit_button_srgb(&mut color).changed();
+            let (changed, reset) = ui.horizontal(|ui| {
+                (ui.color_edit_button_srgb(&mut color).changed(), ui.button("Reset").clicked())
+            }).inner;
             let mut accent = accent_color(color);
-            let reset = ui.button("Reset theme color").clicked();
             if reset { accent = accent_color(DEFAULT_ACCENT); }
             if (changed || reset) && accent != self.accent {
                 self.accent = accent;
@@ -3137,7 +3214,7 @@ impl Recorder {
             };
             ui.painter_at(rect).rect_stroke(
                 rect, if self.waveform_only { 0.0 } else { 6.0 },
-                Stroke::new(1.0, color), egui::StrokeKind::Inside
+                Stroke::new(self.border_inset(), color), egui::StrokeKind::Inside
             );
         }
         let rect = rect.shrink(self.border_inset());
@@ -3339,6 +3416,17 @@ impl Recorder {
 
 }
 
+/// Whether the capture status mark is drawn for this state under the user's choice.
+fn status_mark_shown(mark: StatusMark, indicator: CaptureIndicator, problem: bool) -> bool {
+    match mark {
+        StatusMark::Always => true,
+        StatusMark::Attention => {
+            problem || matches!(indicator, CaptureIndicator::Paused | CaptureIndicator::Unavailable)
+        }
+        StatusMark::Never => false,
+    }
+}
+
 /// Paints the waveform-only status mark in the top-left corner of the plot: a dot coloured by
 /// state, or pause bars, with the source problem written beside it when there is one.
 /// Returns the area whose tooltip explains the mark.
@@ -3523,6 +3611,7 @@ impl eframe::App for Recorder {
         }
         self.collect_export();
         self.collect_snapshot_saves();
+        self.clean_output_folder();
         if self.auto_resume_remaining().is_some_and(|remaining| remaining.is_zero()) {
             self.resume();
         }
@@ -4025,6 +4114,23 @@ mod tests {
     }
 
     #[test]
+    fn the_status_mark_follows_the_users_choice() {
+        use CaptureIndicator::{Paused, Recording, Unavailable, Waiting};
+        for indicator in [Paused, Recording, Unavailable, Waiting] {
+            for problem in [false, true] {
+                assert!(status_mark_shown(StatusMark::Always, indicator, problem));
+                assert!(!status_mark_shown(StatusMark::Never, indicator, problem));
+            }
+        }
+        // The quiet choice hides the mark while all is well and brings it back for the rest.
+        assert!(!status_mark_shown(StatusMark::Attention, Recording, false));
+        assert!(!status_mark_shown(StatusMark::Attention, Waiting, false));
+        assert!(status_mark_shown(StatusMark::Attention, Paused, false));
+        assert!(status_mark_shown(StatusMark::Attention, Unavailable, false));
+        assert!(status_mark_shown(StatusMark::Attention, Recording, true));
+    }
+
+    #[test]
     fn capture_indicator_ranks_failure_over_pause_over_recording_over_waiting() {
         use CaptureIndicator::{Paused, Recording, Unavailable, Waiting};
         assert_eq!(CaptureIndicator::new(true, true, true), Unavailable);
@@ -4150,13 +4256,12 @@ mod tests {
         let press = |code, modifiers| window_shortcut(&[key(code, modifiers, true, false)]);
         assert_eq!(press(egui::Key::Space, none), Some(WindowCommand::ToggleCapture));
         assert_eq!(press(egui::Key::Delete, none), Some(WindowCommand::Clear));
-        assert_eq!(press(egui::Key::S, egui::Modifiers::COMMAND), Some(WindowCommand::SaveSnapshot));
-        // Windows reports Ctrl as both `ctrl` and `command`.
+        // Ctrl+S stays free: snapshots have the global shortcut, and a second key for the same
+        // save only invites duplicate files. Windows reports Ctrl as both `ctrl` and `command`.
         let ctrl = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
-        assert_eq!(press(egui::Key::S, ctrl), Some(WindowCommand::SaveSnapshot));
-
+        assert_eq!(press(egui::Key::S, egui::Modifiers::COMMAND), None);
+        assert_eq!(press(egui::Key::S, ctrl), None);
         assert_eq!(press(egui::Key::S, none), None);
-        assert_eq!(press(egui::Key::S, ctrl | egui::Modifiers::SHIFT), None);
         // Alt+Space belongs to the system menu and Alt is the window-move modifier.
         assert_eq!(press(egui::Key::Space, egui::Modifiers::ALT), None);
         assert_eq!(press(egui::Key::Delete, egui::Modifiers::SHIFT), None);
