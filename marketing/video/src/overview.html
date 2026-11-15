@@ -82,8 +82,8 @@
   // 2 A/B
   scenes.push(featScene(1, function (el) {
     var P = E.Panel(el, { x: X0, y: 150, z: FZ, audio: base, audioB: voice, history: 10, waveH: 130 });
-    var s1 = E.Slab(el, "Backtracking-1794…-13-A.wav", SC.META("4.00 s"), 1.55);
-    var s2 = E.Slab(el, "Backtracking-1794…-13-B.wav", SC.META("4.00 s"), 1.55);
+    var s1 = E.Slab(el, "Backtracking_2026…_4.0s-A.wav", SC.META("4.00 s"), 1.55);
+    var s2 = E.Slab(el, "Backtracking_2026…_4.0s-B.wav", SC.META("4.00 s"), 1.55);
     return function (u) {
       P.draw({ now: 80 + u, rows: 2 });
       if (u >= 0.55) s1.set(X0, 600, { k: E.lerp(0.7, 1, E.outBack(E.prog(u, 0.55, 0.67))) }); else s1.set(0, 0, { hide: true });
@@ -114,7 +114,7 @@
   scenes.push(featScene(3, function (el) {
     var K = E.Keys(el, ["Alt", "+", "`"]); K.el.classList.add("big"); E.pos(K.el, X0, 150);
     var P = E.Panel(el, { x: X0, y: 330, z: FZ, waveH: 120, audio: base, history: 10 });
-    var s = E.Slab(el, "Backtracking-1794…-14.wav", SC.META("10.00 s"), 1.55);
+    var s = E.Slab(el, "Backtracking_2026…_10.0s.wav", SC.META("10.00 s"), 1.55);
     return function (u) {
       E.slam(K.el, u, 0.1, { dy: 30 });
       K.press(u >= 0.7 && u < 1.05);

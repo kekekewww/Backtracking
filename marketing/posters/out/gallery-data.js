@@ -7,8 +7,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-edition-master-en.png",
   "w": 1080,
   "h": 1350,
-  "bytes": 136483,
-  "mtime": "2026-11-14T04:34:46.932Z"
+  "bytes": 136677,
+  "mtime": "2026-11-15T16:00:35.759Z"
  },
  {
   "name": "edition-master",
@@ -18,8 +18,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-edition-master-zh-TW.png",
   "w": 1080,
   "h": 1350,
-  "bytes": 154220,
-  "mtime": "2026-11-14T04:41:07.865Z"
+  "bytes": 154410,
+  "mtime": "2026-11-15T16:00:35.945Z"
  },
  {
   "name": "edition-windows",
@@ -30,7 +30,7 @@ window.BT_GALLERY = [
   "w": 1080,
   "h": 1350,
   "bytes": 178136,
-  "mtime": "2026-11-14T06:01:51.125Z"
+  "mtime": "2026-11-15T16:00:35.535Z"
  },
  {
   "name": "edition-windows",
@@ -41,7 +41,7 @@ window.BT_GALLERY = [
   "w": 1080,
   "h": 1350,
   "bytes": 187051,
-  "mtime": "2026-11-14T06:01:51.333Z"
+  "mtime": "2026-11-15T16:00:35.944Z"
  },
  {
   "name": "edition-macos",
@@ -51,8 +51,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-edition-macos-en.png",
   "w": 1080,
   "h": 1350,
-  "bytes": 153906,
-  "mtime": "2026-11-14T04:34:48.127Z"
+  "bytes": 153690,
+  "mtime": "2026-11-15T16:00:35.462Z"
  },
  {
   "name": "edition-macos",
@@ -63,7 +63,7 @@ window.BT_GALLERY = [
   "w": 1080,
   "h": 1350,
   "bytes": 162239,
-  "mtime": "2026-11-14T04:41:07.762Z"
+  "mtime": "2026-11-15T16:00:35.953Z"
  },
  {
   "name": "edition-plugin",
@@ -74,7 +74,7 @@ window.BT_GALLERY = [
   "w": 1080,
   "h": 1350,
   "bytes": 185278,
-  "mtime": "2026-11-14T06:01:51.162Z"
+  "mtime": "2026-11-15T16:00:39.549Z"
  },
  {
   "name": "edition-plugin",
@@ -85,7 +85,7 @@ window.BT_GALLERY = [
   "w": 1080,
   "h": 1350,
   "bytes": 183402,
-  "mtime": "2026-11-14T06:01:51.319Z"
+  "mtime": "2026-11-15T16:00:40.100Z"
  },
  {
   "name": "edition-linux",
@@ -95,8 +95,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-edition-linux-en.png",
   "w": 1080,
   "h": 1350,
-  "bytes": 151011,
-  "mtime": "2026-11-14T06:02:08.519Z"
+  "bytes": 151341,
+  "mtime": "2026-11-15T16:00:40.029Z"
  },
  {
   "name": "edition-linux",
@@ -106,8 +106,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-edition-linux-zh-TW.png",
   "w": 1080,
   "h": 1350,
-  "bytes": 156078,
-  "mtime": "2026-11-14T06:02:08.633Z"
+  "bytes": 156427,
+  "mtime": "2026-11-15T16:00:40.424Z"
  },
  {
   "name": "github-social",
@@ -117,8 +117,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-github-social-en.png",
   "w": 1280,
   "h": 640,
-  "bytes": 112545,
-  "mtime": "2026-11-14T04:34:49.579Z"
+  "bytes": 113282,
+  "mtime": "2026-11-15T16:00:40.376Z"
  },
  {
   "name": "github-social",
@@ -128,8 +128,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-github-social-zh-TW.png",
   "w": 1280,
   "h": 640,
-  "bytes": 123175,
-  "mtime": "2026-11-14T04:41:12.428Z"
+  "bytes": 123928,
+  "mtime": "2026-11-15T16:00:41.076Z"
  },
  {
   "name": "instagram-feed",
@@ -139,8 +139,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-instagram-feed-en.png",
   "w": 1080,
   "h": 1440,
-  "bytes": 149917,
-  "mtime": "2026-11-14T04:34:50.564Z"
+  "bytes": 150344,
+  "mtime": "2026-11-15T16:00:44.095Z"
  },
  {
   "name": "instagram-feed",
@@ -150,8 +150,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-instagram-feed-zh-TW.png",
   "w": 1080,
   "h": 1440,
-  "bytes": 164507,
-  "mtime": "2026-11-14T04:41:12.554Z"
+  "bytes": 164911,
+  "mtime": "2026-11-15T16:00:44.748Z"
  },
  {
   "name": "instagram-story",
@@ -162,7 +162,7 @@ window.BT_GALLERY = [
   "w": 1080,
   "h": 1920,
   "bytes": 162095,
-  "mtime": "2026-11-14T04:34:51.012Z"
+  "mtime": "2026-11-15T16:00:44.759Z"
  },
  {
   "name": "instagram-story",
@@ -173,7 +173,7 @@ window.BT_GALLERY = [
   "w": 1080,
   "h": 1920,
   "bytes": 176113,
-  "mtime": "2026-11-14T04:41:12.813Z"
+  "mtime": "2026-11-15T16:00:45.543Z"
  },
  {
   "name": "facebook-cover",
@@ -183,8 +183,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-facebook-cover-en.png",
   "w": 1640,
   "h": 720,
-  "bytes": 127490,
-  "mtime": "2026-11-14T04:34:51.851Z"
+  "bytes": 128019,
+  "mtime": "2026-11-15T16:00:45.491Z"
  },
  {
   "name": "facebook-cover",
@@ -194,8 +194,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-facebook-cover-zh-TW.png",
   "w": 1640,
   "h": 720,
-  "bytes": 140360,
-  "mtime": "2026-11-14T04:41:16.223Z"
+  "bytes": 140923,
+  "mtime": "2026-11-15T16:00:47.178Z"
  },
  {
   "name": "facebook-feed",
@@ -205,8 +205,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-facebook-feed-en.png",
   "w": 1080,
   "h": 1350,
-  "bytes": 145189,
-  "mtime": "2026-11-14T04:34:52.533Z"
+  "bytes": 145566,
+  "mtime": "2026-11-15T16:00:48.951Z"
  },
  {
   "name": "facebook-feed",
@@ -216,8 +216,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-facebook-feed-zh-TW.png",
   "w": 1080,
   "h": 1350,
-  "bytes": 160700,
-  "mtime": "2026-11-14T04:41:16.855Z"
+  "bytes": 161008,
+  "mtime": "2026-11-15T16:00:49.513Z"
  },
  {
   "name": "threads-post",
@@ -227,8 +227,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-threads-post-en.png",
   "w": 1080,
   "h": 1080,
-  "bytes": 94719,
-  "mtime": "2026-11-14T04:34:53.403Z"
+  "bytes": 94953,
+  "mtime": "2026-11-15T16:00:49.499Z"
  },
  {
   "name": "threads-post",
@@ -238,8 +238,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-threads-post-zh-TW.png",
   "w": 1080,
   "h": 1080,
-  "bytes": 103917,
-  "mtime": "2026-11-14T04:41:17.116Z"
+  "bytes": 104043,
+  "mtime": "2026-11-15T16:00:51.921Z"
  },
  {
   "name": "buymeacoffee-cover",
@@ -250,7 +250,7 @@ window.BT_GALLERY = [
   "w": 1600,
   "h": 400,
   "bytes": 62588,
-  "mtime": "2026-11-14T04:34:54.021Z"
+  "mtime": "2026-11-15T16:00:51.991Z"
  },
  {
   "name": "buymeacoffee-cover",
@@ -261,7 +261,7 @@ window.BT_GALLERY = [
   "w": 1600,
   "h": 400,
   "bytes": 66955,
-  "mtime": "2026-11-14T04:41:17.506Z"
+  "mtime": "2026-11-15T16:00:52.618Z"
  },
  {
   "name": "youtube-channel",
@@ -272,7 +272,7 @@ window.BT_GALLERY = [
   "w": 2560,
   "h": 1440,
   "bytes": 173596,
-  "mtime": "2026-11-14T04:34:55.057Z"
+  "mtime": "2026-11-15T16:00:54.330Z"
  },
  {
   "name": "youtube-channel",
@@ -283,7 +283,7 @@ window.BT_GALLERY = [
   "w": 2560,
   "h": 1440,
   "bytes": 184565,
-  "mtime": "2026-11-14T04:41:21.739Z"
+  "mtime": "2026-11-15T16:00:54.985Z"
  },
  {
   "name": "youtube-thumbnail",
@@ -293,8 +293,8 @@ window.BT_GALLERY = [
   "file": "Backtracking-youtube-thumbnail-en.png",
   "w": 1920,
   "h": 1080,
-  "bytes": 147005,
-  "mtime": "2026-11-14T04:34:55.632Z"
+  "bytes": 147944,
+  "mtime": "2026-11-15T16:00:54.962Z"
  },
  {
   "name": "youtube-thumbnail",
@@ -304,7 +304,7 @@ window.BT_GALLERY = [
   "file": "Backtracking-youtube-thumbnail-zh-TW.png",
   "w": 1920,
   "h": 1080,
-  "bytes": 151731,
-  "mtime": "2026-11-14T04:41:21.880Z"
+  "bytes": 152740,
+  "mtime": "2026-11-15T16:00:57.000Z"
  }
 ];
