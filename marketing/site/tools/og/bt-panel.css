@@ -1,0 +1,121 @@
+/* Backtracking UI mock-up: the desktop/plug-in waveform panel.
+   Modelled on screen recordings of the Windows app (misc/BT.mp4, BT YT.mp4) and the plug-in in REAPER.
+   Logical sizes match the real app at 100 % scale; enlarge with `zoom` on .btp, not by editing sizes.
+   Directions may override the --btp-* tokens, but the defaults are the real app's look. */
+
+.btp {
+  --btp-bg: #1f2225;
+  --btp-border: #373b3f;
+  --btp-btn: #2d3135;
+  --btp-btn-border: #3c4146;
+  --btp-icon: #c9cdd1;
+  --btp-text: #8e949a;
+  --btp-meter-bg: #2a2d31;
+  --btp-wave: #6fe8b0;          /* app accent (user-changeable via the accent colour picker) */
+  --btp-wave-line: #9af2c9;
+  --btp-sel: #a3195b;           /* app inverts the waveform colour inside a selection */
+  --btp-sel-line: #c22a73;
+  --btp-sel-band: rgba(255, 255, 255, 0.035);
+  --btp-axis: #3d4247;
+  --btp-guide: rgba(255, 255, 255, 0.045);
+  --btp-rec: #e5484d;
+  --btp-font: "Open Sans", sans-serif;
+  --btp-mono: "Geist Mono", ui-monospace, monospace;
+  --btp-radius: 9px;
+
+  position: relative;
+  box-sizing: border-box;
+  background: var(--btp-bg);
+  border: 1px solid var(--btp-border);
+  border-radius: var(--btp-radius);
+  font-family: var(--btp-font);
+  color: var(--btp-text);
+  padding: 0 10px 10px;
+}
+.btp * { box-sizing: border-box; }
+
+.btp-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 38px;
+}
+.btp-title {
+  font-size: 16px;
+  font-weight: 500;
+  letter-spacing: 0.005em;
+  color: var(--btp-text);
+  margin-right: 4px;
+  white-space: nowrap;
+}
+.btp-btn {
+  width: 23px;
+  height: 23px;
+  border-radius: 5px;
+  background: var(--btp-btn);
+  border: 1px solid var(--btp-btn-border);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--btp-icon);
+  flex: none;
+}
+.btp-btn svg { width: 13px; height: 13px; display: block; }
+.btp-btn.on { color: var(--btp-wave); }
+.btp-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #5b6066;
+  flex: none;
+}
+.btp-dot.rec { background: var(--btp-rec); box-shadow: 0 0 6px rgba(229, 72, 77, 0.55); }
+.btp-spacer { flex: 1; }
+.btp-meter {
+  height: 23px;
+  min-width: 102px;
+  padding: 0 9px;
+  border-radius: 5px;
+  background: var(--btp-meter-bg);
+  border: 1px solid var(--btp-btn-border);
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--btp-text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.btp-meter b { color: #d9dde0; font-weight: 600; }
+
+.btp-wave {
+  position: relative;
+  border-radius: 4px;
+  overflow: visible;
+}
+.btp-wave svg { display: block; }
+.btp-dur {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  font-family: var(--btp-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: #eef1f3;
+  text-shadow: 0 0 3px #000;
+}
+.btp-tip {
+  position: absolute;
+  transform: translate(-50%, 0);
+  padding: 3px 8px 4px;
+  border-radius: 5px;
+  background: #24282b;
+  border: 1px solid #4a5055;
+  color: #f1f3f4;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+}

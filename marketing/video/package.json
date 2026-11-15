@@ -1,0 +1,12 @@
+{
+  "name": "backtracking-campaign-video",
+  "private": true,
+  "description": "Renders the Backtracking campaign videos from deterministic HTML timelines.",
+  "type": "module",
+  "scripts": {
+    "render": "node src/render.mjs"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^23.11.1"
+  }
+}

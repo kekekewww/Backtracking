@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Backtracking — B hero</title>
+<link rel="stylesheet" href="shared/bt-panel.css">
+<link rel="stylesheet" href="B.css">
+<style>
+  body { width: 1920px; height: 1080px; }
+  .frame { width: 1920px; height: 1080px; }
+  .header { left: 96px; top: 52px; width: 1728px; height: 76px; }
+  .header .cell { font-size: 14px; }
+  .lockup .wm { font-size: 27px; }
+  .headline { left: 90px; top: 176px; font-size: 170px; }
+  .sub { left: 1376px; top: 186px; width: 448px; font-size: 23px; }
+  .kv { left: 1376px; top: 350px; width: 448px; }
+  .kv dl + dl { margin-top: 18px; }
+  .figlabel { left: 96px; top: 532px; width: 1728px; }
+  .panel { left: 96px; top: 578px; }
+  .panel .btp { zoom: 2.2; }
+  .tagfile { left: 878px; top: 866px; }
+  .cursor { left: 864px; top: 854px; }
+  .trail { left: 0; top: 0; }
+  .legend { left: 1376px; top: 584px; width: 448px; grid-template-columns: 1fr; row-gap: 20px; }
+  .editions { left: 96px; top: 950px; width: 1728px; grid-template-columns: 1fr 1fr 1fr 1fr; }
+  .editions .v { font-size: 16px; }
+</style>
+</head>
+<body>
+<div class="frame">
+  <div class="header">
+    <div class="cell lockup"><img src="../../assets/backtracking-icon.svg" width="46" height="46" alt=""><span class="wm">Backtracking</span></div>
+    <div class="cell grow">Retrospective audio sampler</div>
+    <div class="cell">github.com/kekekewww/Backtracking</div>
+    <div class="cell">Open source · Apache-2.0</div>
+  </div>
+
+  <h1 class="headline">Hit record<br>after the fact<span class="dot">.</span></h1>
+
+  <p class="sub">Backtracking holds the last <b>10 seconds to 10 minutes</b> of audio in memory. Select the range you want and drag it out as a WAV, onto a DAW timeline or into any folder.</p>
+
+  <div class="kv">
+    <dl><dt>History</dt><dd>10 s · <span class="on">20 s</span> · 30 s · 60 s<br>3 min · 5 min · 10 min</dd></dl>
+    <dl><dt>WAV export</dt><dd>44.1 / 48 / 96 kHz<br>16/24-bit PCM · 32-bit float</dd></dl>
+  </div>
+
+  <div class="figlabel"><span>Fig. 1 — Select and drag out</span><span>Desktop window, full interface</span></div>
+
+  <div class="panel"><div class="btp b" data-btp='{"width":560,"waveHeight":70,"seed":4,"style":"beat","selection":[0.42,0.66],"duration":"4.88 s","meter":"&minus;12.6"}'></div></div>
+
+  <svg class="trail" width="1920" height="1080" viewBox="0 0 1920 1080">
+    <path d="M846 824 L 864 854" fill="none" stroke="#151513" stroke-width="1.5" stroke-dasharray="3 4"/>
+  </svg>
+
+  <div class="tagfile">
+    <div class="ic">WAV</div>
+    <div><div class="n">Backtracking-1794…-12.wav</div><div class="m">4.88 s · 48 kHz · 32-bit float</div></div>
+  </div>
+  <svg class="cursor" width="24" height="35" viewBox="0 0 14 20"><path d="M1 1v15.5l3.8-3.6 2.6 6 2.4-1-2.5-5.9h5.3Z" fill="#fff" stroke="#000" stroke-width="1.1" stroke-linejoin="round"/></svg>
+
+  <div class="mk" style="left:886px;top:652px">1</div>
+  <div class="mk" style="left:826px;top:878px">2</div>
+  <div class="mk" style="left:996px;top:609px">3</div>
+  <div class="mk" style="left:566px;top:563px">4</div>
+
+  <div class="legend">
+    <div class="it"><div class="mk">1</div><div><h4>Select</h4><p>Ctrl- or Option-drag for a free range. Shift snaps to flags, then bars, then seconds.</p></div></div>
+    <div class="it"><div class="mk">2</div><div><h4>Drag out</h4><p>Drop the WAV on a DAW timeline or a folder. Capture keeps running behind you.</p></div></div>
+    <div class="it"><div class="mk">3</div><div><h4>Meter</h4><p>Live level in dBFS, VU or momentary LUFS.</p></div></div>
+    <div class="it"><div class="mk">4</div><div><h4>Keep on top</h4><p>Pin it above your DAW or shrink it to a waveform strip.</p></div></div>
+  </div>
+
+  <div class="editions">
+    <div><div class="k">Windows desktop</div><div class="v">System playback, a mic or one app; optional A/B</div></div>
+    <div><div class="k">macOS desktop</div><div class="v">System playback, a mic or one app; optional A/B</div></div>
+    <div><div class="k">VST3 / CLAP</div><div class="v">Captures audio at its insert point in your DAW</div></div>
+    <div><div class="k">Linux</div><div class="v">Global snapshot-shortcut helper for the plug-in</div></div>
+  </div>
+</div>
+<script src="shared/bt-panel.js"></script>
+</body>
+</html>

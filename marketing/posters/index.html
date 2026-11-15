@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backtracking posters</title>
+<link rel="stylesheet" href="../fonts/fonts.css">
+<style>
+  :root { --blue: #1e32d2; --ink: #070c3d; --paper: #f4f1e8; --paper-2: rgba(244,241,232,.72); --mint: #b0fbd3; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--blue); color: var(--paper); font-family: "Archivo", "Noto Sans TC", sans-serif; padding: 48px 16px 80px; }
+  .wrap { max-width: 1400px; margin: 0 auto; }
+  header { display: flex; align-items: center; gap: 16px; margin-bottom: 8px; }
+  header img { width: 48px; height: 48px; }
+  h1 { font-stretch: 62%; font-weight: 900; text-transform: uppercase; font-size: clamp(56px, 9vw, 120px); line-height: .85; }
+  h1 span { color: var(--mint); }
+  .intro { color: var(--paper-2); max-width: 760px; margin: 18px 0 40px; line-height: 1.45; }
+  .intro code { font-family: "Geist Mono", monospace; color: var(--paper); }
+  h2 { font-stretch: 125%; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; font-size: 15px; border-top: 2px solid var(--paper); padding-top: 12px; margin: 48px 0 20px; display: flex; justify-content: space-between; gap: 16px; }
+  h2 small { color: var(--mint); font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 28px 24px; align-items: start; }
+  figure { background: var(--ink); padding: 10px; box-shadow: 8px 8px 0 rgba(7,12,61,.6); }
+  figure a { display: block; }
+  figure img { display: block; width: 100%; height: auto; background: #14229c; }
+  figcaption { padding: 10px 2px 2px; font-size: 13px; line-height: 1.4; }
+  figcaption b { display: block; font-weight: 700; word-break: break-all; }
+  figcaption .sz { font-family: "Geist Mono", monospace; color: var(--mint); }
+  figcaption .use { color: var(--paper-2); }
+  .wide-set .grid { grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); }
+  .empty { color: var(--paper-2); }
+  @media (max-width: 480px) { .wide-set .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header><img src="../../assets/backtracking-icon.svg" alt=""><span style="font-weight:700;font-size:22px">Backtracking</span></header>
+  <h1>Poster <span>set.</span></h1>
+  <p class="intro">Direction C "Rewind". Every PNG in <code>out/</code>, grouped by set and language, with its measured pixel size and file size.
+    Regenerate with <code>node marketing/posters/render.mjs</code>; that also refreshes <code>out/gallery-data.js</code>, which this page reads.</p>
+  <div id="sets"><p class="empty">No renders yet: run render.mjs.</p></div>
+</div>
+<script src="src/manifest.js"></script>
+<script src="out/gallery-data.js"></script>
+<script>
+(function () {
+  var data = window.BT_GALLERY || [];
+  if (!data.length) return;
+  var groups = [
+    { set: "edition", title: "A. Product-edition posters" },
+    { set: "social", title: "B. Social set" }
+  ];
+  var langs = { "en": "English", "zh-TW": "繁體中文 (Taiwan)" };
+  var html = "";
+  groups.forEach(function (g) {
+    Object.keys(langs).forEach(function (lang) {
+      var items = data.filter(function (d) { return d.set === g.set && d.lang === lang; });
+      if (!items.length) return;
+      html += '<section class="' + (g.set === "social" ? "wide-set" : "") + '"><h2>' + g.title + " <small>" + langs[lang] + " · " + items.length + " PNG</small></h2><div class=\"grid\">";
+      items.forEach(function (d) {
+        html += '<figure><a href="out/' + d.file + '" target="_blank"><img loading="lazy" src="out/' + d.file + '" width="' + d.w + '" height="' + d.h + '" alt="' + d.file + '"></a>' +
+          "<figcaption><b>" + d.file + '</b><span class="sz">' + d.w + " × " + d.h + " px · " + Math.round(d.bytes / 1024) + " KB</span><br><span class=\"use\">" + d.use + "</span></figcaption></figure>";
+      });
+      html += "</div></section>";
+    });
+  });
+  document.getElementById("sets").innerHTML = html;
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,134 @@
+# Backtracking campaign guide — direction C "Rewind"
+
+Binding for every campaign asset (posters, videos, landing page). The visual system is defined by
+`../style-frames/C-notes.md`, `../style-frames/C.css`, `../style-frames/C-poster.html`,
+`../style-frames/C-hero.html` and the app-panel mock-up builder `../style-frames/shared/bt-panel.js|css`.
+Fonts and licences are in `../fonts/` (`fonts.css` has every `@font-face`).
+
+## Ground rules
+
+- Product truth comes from the repository `README.md`, `docs/USER_GUIDE.md`, `docs/UPDATES.md` and
+  `desktop/linux/README.md`. If a claim is not there, it does not go in an asset.
+- Never invent: user counts, testimonials, ratings, awards, press quotes, prices, "free", "#1",
+  comparisons with named competitors, latency/CPU promises, or features.
+- No third-party logos (Windows, Apple, Linux/Tux, DAW brands, social networks). Platform and
+  format names as plain text are fine. A DAW in a mock-up is a generic, unbranded timeline.
+- The app icon (`assets/backtracking-icon.svg`) is used unaltered.
+- The background is flat ultramarine. No gradients, no blur, no glow. Depth is hard ink offset shadows.
+- Every asset exists in English (`en`) and Traditional Chinese (`zh-TW`, Taiwan usage). Chinese is
+  written for Taiwan readers, not translated word for word. Use the terms in the glossary below.
+- Chinese mega headlines are set in Noto Sans TC weight 900, square (never horizontally squeezed),
+  3–5 characters per line, with their own line breaks and sizes.
+
+## Punctuation in headlines (product owner's rule)
+
+Short headline-style lines drop punctuation that does not change the meaning.
+
+- Chinese: no trailing 「。」 on mega headlines, the one-liner, beat headings, card titles, buttons or
+  labels. Body sentences and sub-lines keep normal punctuation.
+- English: the mega headlines keep their full stop, because it is part of the approved direction C
+  design ("TAKE IT / BACK.") and "ONE KEY. / SAVED." needs both. Other short English headings
+  (beat headings, card titles, the one-liner when used as a heading) may drop the final full stop.
+- Never drop punctuation that carries meaning (a question mark, a slash between formats, the
+  backtick key in a shortcut).
+
+## Availability (state it exactly like this)
+
+Product owner's decision (overrides any earlier wording): availability is one message everywhere.
+
+- The call to action is **"Download from GitHub"** / **「從 GitHub 下載」**, linking to the repository.
+- Next to it, name the editions as plain text: **Windows / macOS / VST3 / CLAP**.
+- Do not split platforms into "download" versus "build from source", do not write "Build from
+  source" anywhere, and do not make per-platform download buttons ("Download for Windows",
+  "Download for macOS"). One button, one destination.
+- Do not quote a version number.
+- Requirements that may be shown as small print: Windows 10/11 x64; macOS 14.2 or later.
+- Capturing one chosen app on Windows needs OS build 20348 or later (`docs/USER_GUIDE.md`), which in
+  practice is Windows 11. Wherever Windows-specific copy offers "one chosen app" next to "Windows 10/11",
+  add: **"Capturing one chosen app needs Windows 11."** / **「擷取指定 App 需 Windows 11。」**
+  General copy that is not about Windows (the Sources feature line) stays as it is.
+- The Linux shortcut helper is not part of the editions line. Where it has its own poster or card,
+  it also points to GitHub with the same call to action.
+
+## Links
+
+- Repository: https://github.com/kekekewww/Backtracking
+- Download (the one call-to-action destination): https://github.com/kekekewww/Backtracking
+- User guide: https://github.com/kekekewww/Backtracking/blob/main/docs/USER_GUIDE.md
+- Support: https://buymeacoffee.com/kamelkyp/e/596694
+- Landing page (planned): https://backtracking.kamelkyp.com
+- Short URL to print on posters and end cards: `backtracking.kamelkyp.com`
+
+## Master copy
+
+| Slot | English | 繁體中文 |
+| --- | --- | --- |
+| Mega headline | TAKE IT / BACK. | 剛剛那段 / 拿回來 |
+| Tag | Retrospective audio sampler | 回溯錄音取樣器 |
+| Sub-line | Select what you just heard and drag it out as a WAV. Backtracking keeps up to 10 minutes of audio in memory. | 框選剛剛聽到的聲音，直接拖出成 WAV。Backtracking 會在記憶體中保留最近最長 10 分鐘的音訊。 |
+| One-liner | It was already listening. | 它一直都在聽 |
+| History scale | 10 s · 20 s · 30 s · 60 s · 3 min · 5 min · 10 min | 10 秒 · 20 秒 · 30 秒 · 60 秒 · 3 分鐘 · 5 分鐘 · 10 分鐘 |
+| Editions line | Windows / macOS / VST3 / CLAP | Windows / macOS / VST3 / CLAP |
+| Licence line | Open source · Apache-2.0 | 開放原始碼 · Apache-2.0 |
+| Primary CTA | Download from GitHub | 從 GitHub 下載 |
+| Secondary CTA | Read the user guide | 閱讀使用手冊 |
+| Support CTA (button) | Support developer | 贊助開發者 |
+
+### The three beats (used by posters, videos and the landing page in this order)
+
+| # | English | 繁體中文 |
+| --- | --- | --- |
+| 1 | **It's already listening.** Backtracking keeps the last 10 seconds to 10 minutes of audio in memory. | **它一直都在聽** Backtracking 在記憶體中保留最近 10 秒到 10 分鐘的音訊。 |
+| 2 | **Select the part you want.** Drag across the waveform. Hold Shift to snap to flags, bars or seconds. | **框選想要的那一段** 在波形上拖曳框選，按住 Shift 可吸附旗標、小節線或秒數線。 |
+| 3 | **Drag it out as a WAV.** Drop it on a DAW track or into a folder. Recording keeps running in the background. | **直接拖出成 WAV** 放到 DAW 音軌或資料夾，背景會繼續錄音。 |
+
+### Features (names are fixed; one-line descriptions may be shortened, not embellished)
+
+| Feature | English | 繁體中文 |
+| --- | --- | --- |
+| Sources | Capture system playback, a microphone, or one chosen app. | 擷取系統播放、麥克風或指定 App。 |
+| A/B | Record two sources at once and save two aligned WAVs. | 同時擷取 A／B 兩路，匯出兩個起訖對齊的 WAV。 |
+| Plug-in | Insert it on any DAW track to capture audio at that point in the chain. | 插入任一 DAW 音軌，擷取效果鏈該位置的音訊。 |
+| Snapshot shortcut | Save from the background: Alt + ` on Windows, Fn/Globe + ` on macOS. | 背景儲存快照：Windows 按 Alt + `，macOS 按 Fn／Globe + `。 |
+| Waveform only | Shrink the window to a thin waveform strip, with adjustable transparency, kept on top. | 把視窗縮成細長波形條，可調透明度並置頂。 |
+| Meter | Live level in dBFS, VU or momentary LUFS. | 即時音量：dBFS、VU 或瞬時 LUFS。 |
+| WAV export | 44.1, 48 or 96 kHz; 16-bit, 24-bit PCM or 32-bit float. | 44.1、48 或 96 kHz；16-bit、24-bit PCM 或 32-bit float。 |
+| Keep quiet sections | Optionally keep silence instead of compressing it. | 可選擇保留安靜片段，不壓縮靜音。 |
+| Sender | A plug-in instance can send its audio to the desktop recorder on the same computer. | 插件可將音訊送到同一台電腦上的桌面版錄音器。 |
+
+### Edition posters
+
+Each edition poster keeps the tag, icon lock-up, History scale and footer of the master, and swaps the
+mega headline and sub-line. Headlines below are the starting point. Line breaks may change; meaning may not.
+
+| Edition | Mega headline EN | 繁體中文 | Sub-line EN | 繁體中文 |
+| --- | --- | --- | --- | --- |
+| Windows desktop | FROM ANY / APP. | 任何 App / 都能留 | System playback, a microphone, or one chosen app. Select it and drag out a WAV. Download from GitHub. | 系統播放、麥克風或指定 App，框選後直接拖出 WAV。從 GitHub 下載。 |
+| macOS desktop | OFF YOUR / MAC. | Mac 的聲音 / 拿回來 | System playback, a microphone, or one chosen app, on macOS 14.2 or later. Download from GitHub. | 系統播放、麥克風或指定 App，支援 macOS 14.2 以上。從 GitHub 下載。 |
+| VST3 / CLAP plug-in | ON ANY / TRACK. | 每一軌 / 都留著 | Insert it on a track, group or master. It keeps what passed through and hands it back as a WAV. | 插在音軌、群組或主輸出上，留住經過的聲音，再拖出成 WAV。 |
+| Linux shortcut helper | ONE KEY. / SAVED. | 一個按鍵 / 存下來 | A global Super + ` shortcut that tells a Backtracking plug-in instance to save a snapshot. Download from GitHub. | 全域 Super + ` 快捷鍵，讓 Backtracking 插件儲存快照。從 GitHub 下載。 |
+
+The Linux item is only a shortcut helper for the plug-in. Do not present it as a Linux recorder app.
+Its name is "Linux shortcut helper" / 「Linux 快捷鍵輔助工具」 everywhere.
+
+The backtick key is too small to read as a bare character in running text. In posters and videos draw
+it as a keycap (like the Shift keycap); on the site use `<kbd>`.
+
+Chinese copy must not break inside a term: keep 瞬時, 指定 App, 起訖, 透明度, 快照, 24-bit and whole key
+combinations (Alt + `) together on one line.
+
+## Glossary (zh-TW)
+
+retrospective audio sampler 回溯錄音取樣器 · waveform 波形 · select 框選 · selection 選區 · drag out 拖出 ·
+flag 旗標 · snapshot 快照 · system playback 系統播放 · microphone 麥克風 · chosen app 指定 App ·
+plug-in 插件 · track 音軌 · history 保留時間 · keep on top 置頂 · show waveform only 只顯示波形 ·
+keep quiet sections 保留安靜片段 · open source 開放原始碼 · build from source 從原始碼建置
+
+## Folder ownership (parallel work; stay in your own folder)
+
+- `marketing/brand/`, `marketing/fonts/`, `marketing/style-frames/`: shared and read-only. Copy what
+  you need into your own folder instead of editing these.
+- `marketing/posters/`: poster agent.
+- `marketing/video/`: video agent.
+- `marketing/site/`: landing-page agent. This folder must be deployable on its own, so it carries
+  its own copies of fonts, CSS, JS and the icon.
