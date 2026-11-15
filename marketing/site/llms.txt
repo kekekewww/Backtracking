@@ -1,0 +1,40 @@
+# Backtracking
+
+> Backtracking is an open-source retrospective audio sampler for music production and mixing. It keeps the last 10 seconds to 10 minutes of audio in memory, so you can select what you just heard on the waveform and drag it out as a WAV, onto a DAW track or into a folder. Editions: Windows desktop, macOS desktop, and a VST3 / CLAP plug-in. Licence: Apache-2.0.
+
+Facts that answer most questions:
+
+- **What it captures.** The desktop apps capture system playback, a microphone, or one chosen app, on up to two sources at once (A/B, saved as two aligned WAVs). The plug-in captures the audio passing its insert point on a DAW track, group or master.
+- **Requirements.** Windows 10 or 11, x64 (capturing one chosen app needs Windows 11). macOS 14.2 or later on Apple silicon. The plug-in runs in VST3 and CLAP hosts on those systems.
+- **History.** 10, 20, 30 or 60 seconds, or 3, 5 or 10 minutes, held in memory. Long silence is left out unless "Keep quiet sections" is on.
+- **Getting audio out.** Drag the waveform, or a selected range, out of the window as a WAV. Hold Shift while selecting to snap to flags, bar lines or seconds lines. A global shortcut saves a snapshot from the background: Alt + ` on Windows, Fn/Globe + ` on macOS.
+- **WAV format.** 44.1, 48 or 96 kHz; 16-bit PCM, 24-bit PCM or 32-bit float. The default is 48 kHz, 32-bit float.
+- **Linux.** There is no Linux recorder app. A shortcut helper sends a snapshot request to a Backtracking plug-in instance with Super + `.
+- **Download.** Installers are on GitHub Releases: a Windows Setup program and a macOS disk image, each including the plug-ins. The macOS build is not notarized by Apple.
+- **Updates.** The desktop apps can install later signed releases from Options. The plug-ins are updated by installing again.
+
+## Documentation
+
+- [User guide](https://backtracking.kamelkyp.com/guide/): how to capture, select, export and troubleshoot, as a web page
+- [User guide, Markdown source](https://raw.githubusercontent.com/kekekewww/Backtracking/main/docs/USER_GUIDE.md): the same guide in both languages, plus installation and build steps
+- [README](https://raw.githubusercontent.com/kekekewww/Backtracking/main/README.md): overview, editions, features, install steps and quick start
+- [Updates](https://raw.githubusercontent.com/kekekewww/Backtracking/main/docs/UPDATES.md): how releases are signed and how the desktop apps update
+- [Linux shortcut helper](https://raw.githubusercontent.com/kekekewww/Backtracking/main/desktop/linux/README.md): building and running the helper on X11 and Wayland
+
+## Download and source
+
+- [Latest release](https://github.com/kekekewww/Backtracking/releases/latest): installers, release notes and SHA-256 checksums
+- [Source repository](https://github.com/kekekewww/Backtracking): Rust core, Windows and macOS apps, plug-in
+- [Licence](https://github.com/kekekewww/Backtracking/blob/main/LICENSE): Apache License 2.0
+
+## 繁體中文
+
+- [首頁](https://backtracking.kamelkyp.com/zh-tw/): Backtracking 回溯錄音取樣器的介紹與線上試用
+- [操作手冊](https://backtracking.kamelkyp.com/zh-tw/guide/): 擷取、框選、匯出與排除問題
+- [README（繁體中文）](https://raw.githubusercontent.com/kekekewww/Backtracking/main/README.zh-TW.md): 版本、功能、安裝步驟與快速開始
+
+## Optional
+
+- [Hardware usage](https://raw.githubusercontent.com/kekekewww/Backtracking/main/docs/HARDWARE_USAGE.md): measured CPU and memory use of the Windows desktop app
+- [Live demo](https://backtracking.kamelkyp.com/#demo): a browser demo of selecting and dragging out audio; it needs JavaScript and a user gesture
+- [Support the developer](https://buymeacoffee.com/kamelkyp/e/596694): Buy Me a Coffee page
