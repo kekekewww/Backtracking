@@ -469,7 +469,12 @@
     }
     return { l: l, r: r, n: n };
   }
-  function fileName() { return "Backtracking-" + Date.now() + ".wav"; }
+  /* Same pattern as the app: Backtracking_date_time_length. */
+  function fileName(frames) {
+    var d = new Date(), p = function (v) { return (v < 10 ? "0" : "") + v; };
+    return "Backtracking_" + d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + "_" +
+      p(d.getHours()) + "-" + p(d.getMinutes()) + "-" + p(d.getSeconds()) + "_" + (frames / sr).toFixed(1) + "s.wav";
+  }
 
   /* ---------- pointer interaction on the waveform ---------- */
   var ghost = null;
@@ -541,7 +546,7 @@
     ghost.setAttribute("aria-hidden", "true");
     ghost.innerHTML = '<svg class="streaks" viewBox="0 0 120 34"><line x1="4" y1="4" x2="116" y2="4"/><line x1="44" y1="17" x2="116" y2="17" opacity=".7"/><line x1="78" y1="30" x2="116" y2="30" opacity=".45"/></svg>' +
       '<div class="ic">WAV</div><div><div class="n"></div><div class="m"></div></div>';
-    ghost.querySelector(".n").textContent = fileName();
+    ghost.querySelector(".n").textContent = fileName(n);
     ghost.querySelector(".m").textContent = secs(n) + " · " + kHz(sr) + " kHz · 32-bit float";
     if (reduceMotion.matches) ghost.querySelector(".streaks").style.display = "none";
     ghost._x0 = x; ghost._y0 = y;
@@ -829,7 +834,7 @@
     if (!started || musicSrc !== "synth") return; // never hand out the licensed music as a file
     var a = exportAudio();
     if (!a.n) return;
-    var name = fileName(), blob = encodeWav(a.l, a.r, sr), url = URL.createObjectURL(blob);
+    var name = fileName(a.n), blob = encodeWav(a.l, a.r, sr), url = URL.createObjectURL(blob);
     var link = document.createElement("a");
     link.href = url; link.download = name; link.style.display = "none";
     document.body.appendChild(link); link.click(); link.remove();
@@ -851,7 +856,7 @@
     if (!a.n || !ctx) return;
     var buf = ctx.createBuffer(2, a.n, sr);
     buf.getChannelData(0).set(a.l); buf.getChannelData(1).set(a.r);
-    var c = { id: ++clipSeq, buf: buf, l: a.l, r: a.r, start: startSec, dur: a.n / sr, name: fileName() };
+    var c = { id: ++clipSeq, buf: buf, l: a.l, r: a.r, start: startSec, dur: a.n / sr, name: fileName(a.n) };
     var node = document.createElement("div");
     node.className = "clip" + (reduceMotion.matches ? "" : " landed");
     node.setAttribute("role", "listitem");
