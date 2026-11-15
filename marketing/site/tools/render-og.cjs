@@ -23,9 +23,9 @@ const server = http.createServer((req, res) => {
 
 server.listen(0, "127.0.0.1", async () => {
   const base = "http://127.0.0.1:" + server.address().port;
-  const browser = await chromium.launch({ executablePath: CHROME });
+  const browser = await chromium.launch({ executablePath: CHROME, args: ["--disable-lcd-text"] });
   try {
-    const page = await browser.newPage({ viewport: { width: 1200, height: 630 }, deviceScaleFactor: 1 });
+    const page = await browser.newPage({ viewport: { width: 1200, height: 630 }, deviceScaleFactor: 1, reducedMotion: "reduce" });
     for (const [lang, file] of [["en", "og-en.png"], ["zh", "og-zh-TW.png"]]) {
       await page.goto(base + "/tools/og/og.html?lang=" + lang);
       await page.evaluate(() => document.fonts.ready);

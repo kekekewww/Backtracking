@@ -7,11 +7,11 @@
   var SC = {};
   window.SC = SC;
 
-  SC.SAVED = "Saved C:\\Users\\you\\Backtracking\\output\\Backtracking-1794\u2026-13.wav";
-  SC.SNAP = "Saved snapshot C:\\Users\\you\\Backtracking\\saved\\Backtracking-1794\u2026-14.wav";
+  SC.SAVED = "Saved C:\\Users\\you\\Backtracking\\output\\Backtracking_2026\u2026_4.0s.wav";
+  SC.SNAP = "Saved snapshot C:\\Users\\you\\Backtracking\\saved\\Backtracking_2026\u2026_10.0s.wav";
   // macOS default saved snapshots folder per docs/USER_GUIDE.md: ~/Backtracking/saved/
-  SC.SNAP_MAC = "Saved snapshot /Users/you/Backtracking/saved/Backtracking-1794…-14.wav";
-  SC.NAME ="Backtracking-1794\u2026-13.wav";
+  SC.SNAP_MAC = "Saved snapshot /Users/you/Backtracking/saved/Backtracking_2026…_10.0s.wav";
+  SC.NAME ="Backtracking_2026\u2026_4.0s.wav";
   SC.META = function (d, rate, enc) { return d + " \u00b7 " + (rate || "48 kHz") + " \u00b7 " + (enc || "32-bit float"); };
 
   SC.stage = function (W, H) {
