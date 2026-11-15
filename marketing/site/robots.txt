@@ -1,0 +1,12 @@
+# Backtracking landing page. Every page here is public and may be indexed.
+# Search engines and AI assistants may read the pages and use them to answer
+# questions (content signals: https://contentsignals.org/). A short summary for
+# language models is at /llms.txt.
+
+User-agent: *
+Content-Signal: search=yes, ai-input=yes
+Allow: /
+# The demo's music is licensed and is not content to collect.
+Disallow: /media/demo-loop.bin
+
+Sitemap: https://backtracking.kamelkyp.com/sitemap.xml

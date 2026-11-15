@@ -23,6 +23,7 @@ so running the script twice gives identical files. Re-run tools/subset-zh.py aft
 Chinese headings change (the zh page sets headings in the subset font).
 """
 import html
+import json
 import os
 import posixpath
 import re
@@ -580,6 +581,34 @@ DL_ICON = ('<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8M4.5 6.8 
            'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"/></svg>')
 
 
+def structured_data(lang, date):
+    """JSON-LD for search engines: the guide as an article of the site, and its breadcrumb."""
+    P = PAGES[lang]
+    url = ORIGIN + P["url"]
+    home = ORIGIN + ("/" if lang == "en" else "/zh-tw/")
+    data = {
+        "@context": "https://schema.org",
+        "@graph": [
+            {
+                "@type": "TechArticle", "@id": url + "#article", "url": url, "headline": P["title"],
+                "description": P["desc"], "inLanguage": P["html_lang"], "dateModified": date,
+                "image": "%s/img/og-%s.png" % (ORIGIN, "en" if lang == "en" else "zh-TW"),
+                "isPartOf": {"@type": "WebSite", "@id": ORIGIN + "/#website", "url": ORIGIN + "/", "name": "Backtracking"},
+                "about": {"@type": "SoftwareApplication", "@id": ORIGIN + "/#software", "name": "Backtracking", "url": home},
+                "author": {"@type": "Organization", "@id": ORIGIN + "/#publisher", "name": "Backtracking contributors", "url": GH},
+            },
+            {
+                "@type": "BreadcrumbList",
+                "itemListElement": [
+                    {"@type": "ListItem", "position": 1, "name": "Backtracking", "item": home},
+                    {"@type": "ListItem", "position": 2, "name": P["title"].split(" · ")[0], "item": url},
+                ],
+            },
+        ],
+    }
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+
+
 def build_page(lang, h1, pre, sections, commit, ctx):
     P = PAGES[lang]
     root = P["root"]
@@ -615,7 +644,15 @@ def build_page(lang, h1, pre, sections, commit, ctx):
         '<meta property="og:description" content="%s">' % html.escape(P["desc"]),
         '<meta property="og:url" content="%s%s">' % (ORIGIN, P["url"]),
         '<meta property="og:image" content="%s/img/og-%s.png">' % (ORIGIN, "en" if lang == "en" else "zh-TW"),
+        '<meta property="og:image:width" content="1200">',
+        '<meta property="og:image:height" content="630">',
+        '<meta property="og:locale" content="%s">' % ("en_US" if lang == "en" else "zh_TW"),
         '<meta name="twitter:card" content="summary_large_image">',
+        '<meta name="twitter:title" content="%s">' % html.escape(P["title"]),
+        '<meta name="twitter:description" content="%s">' % html.escape(P["desc"]),
+        '<meta name="twitter:image" content="%s/img/og-%s.png">' % (ORIGIN, "en" if lang == "en" else "zh-TW"),
+        '<meta name="robots" content="max-image-preview:large, max-snippet:-1, max-video-preview:-1">',
+        '<script type="application/ld+json">%s</script>' % structured_data(lang, date),
         '<link rel="icon" href="%simg/icon.svg" type="image/svg+xml">' % root,
         '<link rel="apple-touch-icon" href="%simg/apple-touch-icon.png">' % root,
         '<link rel="preload" href="%sfonts/Archivo-Variable-latin.woff2" as="font" type="font/woff2" crossorigin>' % root,

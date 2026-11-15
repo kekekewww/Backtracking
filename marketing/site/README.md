@@ -36,6 +36,19 @@ tools/og/                OG image template (og.html) and copies of the style-fra
 All page URLs are relative, except the canonical, `hreflang` and Open Graph URLs, which must be absolute
 and point at `https://backtracking.kamelkyp.com/`.
 
+## Search engines and AI crawlers
+
+- `robots.txt` allows every crawler, states the content signals `search=yes, ai-input=yes` (indexing, and
+  use by AI assistants to answer questions; training is left unstated), keeps crawlers off the licensed demo
+  music and names the sitemap. Cloudflare may put its own comment block above it.
+- `sitemap.xml` lists the four pages with their `hreflang` alternates. Add a `<url>` when a page is added.
+- `llms.txt` is a short Markdown summary for language models, with links to the Markdown sources on GitHub.
+  Update its facts when the editions, requirements or download method change.
+- Each landing page carries one JSON-LD block in its `<head>` (WebSite, Organization, WebPage,
+  SoftwareApplication with the feature list, and the overview VideoObject). Keep its feature list in step
+  with the cards. The guide pages get theirs (TechArticle, BreadcrumbList) from `tools/build-guide.py`.
+- No price, rating or version number is stated anywhere, in line with `../brand/README.md`.
+
 ## Run locally
 
 ```sh
