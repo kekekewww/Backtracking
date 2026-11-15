@@ -48,6 +48,9 @@ and point at `https://backtracking.kamelkyp.com/`.
   SoftwareApplication with the feature list, and the overview VideoObject). Keep its feature list in step
   with the cards. The guide pages get theirs (TechArticle, BreadcrumbList) from `tools/build-guide.py`.
 - No price, rating or version number is stated anywhere, in line with `../brand/README.md`.
+- Google Search Console covers the site through the Domain property for `kamelkyp.com`, so no verification
+  file or tag lives here. `sitemap.xml` is submitted there; after adding a page, request indexing for it
+  with URL inspection.
 
 ## Run locally
 
