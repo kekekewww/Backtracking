@@ -95,6 +95,9 @@ Product owner's decision (overrides any earlier wording): availability is one me
 | WAV export | 44.1, 48 or 96 kHz; 16-bit, 24-bit PCM or 32-bit float. | 44.1、48 或 96 kHz；16-bit、24-bit PCM 或 32-bit float。 |
 | Keep quiet sections | Optionally keep silence instead of compressing it. | 可選擇保留安靜片段，不壓縮靜音。 |
 | Sender | A plug-in instance can send its audio to the desktop recorder on the same computer. | 插件可將音訊送到同一台電腦上的桌面版錄音器。 |
+| Capture windows | Open extra recorder windows on the desktop, each with its own source. | 桌面版可開啟額外的擷取視窗，各自選擇來源。 |
+| Appearance | Set the accent colour, border width and background transparency, and choose what the window shows. | 可調主題色、外框寬度與背景透明度，並選擇視窗要顯示的項目。 |
+| Updates | The desktop apps can install later releases from Options. | 桌面版可在 Options 安裝之後的版本。 |
 
 ### Edition posters
 

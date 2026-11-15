@@ -60,7 +60,7 @@
   </nav>
 </details>
 <main class="sheet">
-<p class="g-gen">Generated from <code>docs/USER_GUIDE.md</code> · <a href="https://github.com/kekekewww/Backtracking/commit/5fe9224"><code>5fe9224</code></a> · <time datetime="2026-11-14">2026-11-14</time> · <a href="https://github.com/kekekewww/Backtracking/blob/main/docs/USER_GUIDE.md#english">View on GitHub</a></p>
+<p class="g-gen">Generated from <code>docs/USER_GUIDE.md</code> · <a href="https://github.com/kekekewww/Backtracking/commit/5fc73b6"><code>5fc73b6</code></a> · <time datetime="2026-11-15">2026-11-15</time> · <a href="https://github.com/kekekewww/Backtracking/blob/main/docs/USER_GUIDE.md#english">View on GitHub</a></p>
 <div class="doc-body">
 <p><a href="../zh-tw/guide/#繁體中文">繁體中文</a> · <a href="#english">English</a> · <a href="#安裝與建置--installation-and-build">Installation and build</a> · <a href="https://github.com/kekekewww/Backtracking/blob/main/docs/HARDWARE_USAGE.md">Hardware usage</a></p>
 <p>Editing and background capture are separated in this update; see <a href="https://github.com/kekekewww/Backtracking/blob/main/docs/RESPONSIVE_EDITING_2026-11-14.md">integration status and limits</a>.</p>
@@ -73,15 +73,16 @@
 <tr><td>A microphone, or system playback plus a microphone</td><td>Choose a microphone in desktop Options or enable A/B to capture them separately.</td></tr>
 <tr><td>One DAW track, a bus, or the master output</td><td>Insert the VST3 or CLAP plug-in on the relevant effects chain. It captures mono or stereo audio at that point and passes the input through unchanged.</td></tr>
 <tr><td>A software instrument with effects</td><td>Insert Backtracking after the instrument and any effects you want in the sample. Move it ahead of those effects to capture the dry signal.</td></tr>
+<tr><td>One DAW track inside the desktop recorder</td><td>In the plug-in, open Options → Sources and tick <strong>Send to Backtracking desktop</strong>. Then open desktop Options → Sources and choose <strong>【Sender】</strong> followed by the track name as the audio source. Senders are listed right after system audio and the default microphone.</td></tr>
 </tbody>
 </table></div></div>
 <p>On Windows, route the source to the default playback device. If a DAW uses ASIO, exclusive mode, or another direct output path, use the plug-in to sample its track signal. On macOS, grant system audio recording permission when the desktop app first prompts you. <a href="https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording">Windows WASAPI</a> · <a href="https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps">Apple Core Audio</a></p>
 <h3 id="open-settings">Open settings</h3>
-<p>Click the gear in the toolbar or right-click inside the Backtracking window to open <strong>Options</strong>. The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle <strong>Keep on top</strong> from the toolbar.</p>
+<p>Click the gear in the toolbar to open <strong>Options</strong>. Right-clicking inside the plug-in also opens Options. In the Windows and macOS desktop apps, right-clicking opens a menu instead: <strong>Pause / Resume / Retry capture</strong>, <strong>Clear</strong>, <strong>Save snapshot</strong>, <strong>Show waveform only</strong>, <strong>Keep on top</strong>, <strong>Options…</strong>, and <strong>Quit</strong>. With the desktop window focused, <code>Space</code> pauses or resumes capture and <code>Delete</code> (<code>Fn</code> + <code>Delete</code> on a Mac keyboard) clears the current recording; if there is a selection, it cancels the selection first. The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle <strong>Keep on top</strong> from the toolbar.</p>
 <p>Choose a category on the left, then use the vertical settings list on the right. Larger bold titles, group headings, and body/control text of at least 15 distinguish hierarchy. History, auto-resume, transparency, and WAV format use dropdowns sized to their item count, up to ten rows before scrolling. Scroll the details pane for longer content. Desktop Options can be resized and keeps Close visible. The plug-in requests a larger editor and restores its prior size when closed.</p>
 <p>Operating instructions live in this guide; the UI keeps controls, headings, labels, values, and necessary status/error/path information.</p>
 <h3 id="keep-quiet-sections">Keep quiet sections</h3>
-<p>Enable <strong>Keep quiet sections</strong> under <strong>Options → Capture</strong> (macOS label: <strong>保留安靜片段</strong>). It defaults to Off, including older settings/projects without this field.</p>
+<p>Enable <strong>Keep quiet sections</strong> under <strong>Options → Capture</strong>. It defaults to Off, including older settings/projects without this field.</p>
 <ul>
 <li><strong>Off:</strong> existing silence compression omits long below-threshold gaps from the retained duration.</li>
 <li><strong>On:</strong> retain subsequent quiet input, digital zeros, and silence established by a known source clock. Quiet sections consume History and can displace older audio sooner.</li>
@@ -95,7 +96,7 @@
 <ul>
 <li>Choose system playback, a microphone, or a specific app in desktop Options. App capture requires Windows OS build 20348 or later. On macOS, grant the relevant system audio or microphone permission when prompted.</li>
 <li>The source list updates each time you open the drop-down. Windows lists apps with an open playback stream, including paused streams. macOS lists apps that Core Audio identifies as playback sources. If an app is missing, play some audio in it and reopen the list. Microphone entries come from the input devices the system currently makes available.</li>
-<li>Enable A and B to capture two routes. For each, choose a source and Left, Right, Center, Mid, Side, or Merged. Merged uses the source's mono or stereo output format. Center requires a native center channel.</li>
+<li>Enable A and B to capture two routes. In the desktop apps, <strong>Source B</strong> is <strong>Off</strong> until you choose a source for it. For each, choose a source and Left, Right, Center, Mid, Side, or Merged. Merged uses the source's mono or stereo output format. Center requires a native center channel.</li>
 <li>On Windows, A/B routes from the same source, such as System Side and System Mid, use the device's native sample rate. Export converts the whole selection if the WAV rate differs. Capture also smooths the splice when you resume after a pause.</li>
 <li>For one source, choose a merged waveform or two L/R rows. With A/B enabled, A and B each use half the waveform area and have independent meters.</li>
 <li>Flags mark range boundaries. <code>Shift</code>-drag directly creates a snapped selection; <code>Ctrl</code> on Windows / <code>Option</code> on macOS keeps free selection, with optional Shift for snapping. Targets prioritize visible flags, then painted bars, then painted seconds; the moving handle excludes itself. Only painted targets are eligible. Fully transparent backgrounds hide guides but retain interactive flags.</li>
@@ -107,7 +108,7 @@
 <p><a href="https://github.com/kekekewww/Backtracking/blob/main/docs/UPDATES.md">Desktop update settings</a></p>
 <h3 id="show-waveform-only">Show waveform only</h3>
 <p>Turn on <strong>Show waveform only</strong> to shrink the native Windows/macOS desktop window to the waveform panel plus its visible border and disable the native shadow. Background transparency still follows Options: opaque, translucent, or fully transparent. Waveforms and flags remain visible and interactive at 100% transparency. Plug-ins can request a smaller editor; the DAW manages its outer frame, shadow, and background. This setting defaults to Off and is saved with the desktop preferences or the plug-in's DAW project settings.</p>
-<p>Right-click the waveform to open Options. Choose <strong>Play</strong> (<strong>開始錄音</strong> in the macOS app) when capture is paused, or <strong>Pause</strong> (<strong>暫停錄音</strong>) when capture is armed or recording.</p>
+<p>In the desktop apps, right-click the waveform to open the menu. Choose <strong>Resume capture</strong> when capture is paused, or <strong>Pause capture</strong> when capture is armed or recording. In the plug-in, right-click to open Options and choose <strong>Play</strong> or <strong>Pause</strong>.</p>
 <p>When you switch modes, the desktop window fits the waveform panel's existing height and removes excess transparent space above and below it. Drag either inside side edge to adjust the width or the top and bottom edges to adjust the height. A narrower window shows the same retained duration over a shorter distance, reducing the number of pixels the waveform scrolls per second. The waveform shrinks to fit a shorter window. Turning the mode off restores the previous full-interface window size.</p>
 <div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
 <thead><tr><th>Desktop app</th><th>Waveform-only minimum size</th><th>Full interface minimum size</th></tr></thead>
@@ -116,12 +117,12 @@
 <tr><td>macOS</td><td>240 × 48 points</td><td>560 × 100 points</td></tr>
 </tbody>
 </table></div></div>
-<p>To restore the full interface, right-click the waveform and turn off <strong>Show waveform only</strong>. Windows/macOS native shadows are disabled in this mode; the optional thin border is controlled separately in Appearance Options.</p>
+<p>To restore the full interface, right-click the waveform and turn off <strong>Show waveform only</strong>. Windows/macOS native shadows are disabled in this mode; the optional thin border is controlled separately in Appearance Options. The desktop apps and the plug-in also let you set the border width (1 to 4 px) on the Appearance page of Options, and choose what is shown under <strong>Show</strong>: the app name in the toolbar, the level meters, and the capture status mark (<strong>Always</strong>, <strong>Only when paused or failing</strong> (<strong>Only when paused</strong> in the plug-in), or <strong>Never</strong>). With <strong>Never</strong>, nothing on the window marks a capture failure either.</p>
 <h3 id="move-and-resize-the-desktop-window">Move and resize the desktop window</h3>
 <p>The Windows and macOS desktop apps use a frameless window. The gestures below move and resize it without automatic snapping near screen edges. The DAW manages the outer window for VST3 and CLAP. To close the desktop app, choose <strong>Quit</strong> from Settings.</p>
 <p>With <strong>Keep on top</strong> enabled on Windows, Backtracking reasserts its position when the taskbar or another window on the same desktop covers it, while leaving input focus where it is. Windows manages the secure desktop and protected system surfaces.</p>
 <p>Use the Windows system tray icon to show or hide the window. Capture can continue while the window is hidden. Choose <strong>Quit</strong> from the tray or Settings to exit. Place <code>Backtracking.exe</code> in a permanent location and enable <strong>Start with Windows</strong> to open Backtracking at its last window position when you sign in.</p>
-<p>On macOS, use the menu bar item to show, hide, or quit Backtracking, or enable launch at login. If macOS asks for approval, allow the Backtracking login item in System Settings.</p>
+<p>On macOS, use the menu bar item to show or hide the window, pause or resume capture, open Options, or quit Backtracking, or enable <strong>Start at login</strong>. If macOS asks for approval, allow the Backtracking login item in System Settings.</p>
 <div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
 <thead><tr><th>Action</th><th>Windows desktop</th><th>macOS desktop</th></tr></thead>
 <tbody>
@@ -166,13 +167,13 @@
 <p>Choose <strong>Save snapshot</strong> in Options to save from the current recorder. A selection uses its original fixed samples with the same A/B sample boundaries. With no selection, it saves all audio retained when triggered. Saving neither implicitly pauses capture nor forces manual Pause to resume. Selected-range completion can return to live view; completion of a background full-history save does not cancel a selection created afterward.</p>
 <p>On Windows, press Alt plus the physical key to the left of 1 (the ~ / grave key, without Shift). On macOS, press Fn/Globe plus that same physical key. The global shortcut works from the background, without focusing Backtracking or the plug-in editor. On Linux, use the <a href="https://github.com/kekekewww/Backtracking/blob/main/desktop/linux/README.md">snapshot shortcut helper</a>. Options can select one plug-in instance as the global shortcut target. Backtracking does not bind <code>Ctrl+S</code>; it remains available to save the DAW project.</p>
 <h3 id="arm-pause-and-auto-resume-capture">Arm, pause, and auto-resume capture</h3>
-<p>Choose <strong>Play</strong> to arm capture or <strong>Pause</strong> to pause it manually. Use the toolbar in the full interface or right-click to open Options in waveform-only mode. Play preserves fixed editing material/selection; canceling, an ordinary click, or export completion returns to live view. Once re-armed, the next sound appends to live history within the limit.</p>
+<p>Choose <strong>Play</strong> to arm capture or <strong>Pause</strong> to pause it manually. Use the toolbar in the full interface. In waveform-only mode, use the right-click menu or <code>Space</code> in the desktop apps, or right-click to open Options in the plug-in. Play preserves fixed editing material/selection; canceling, an ordinary click, or export completion returns to live view. Once re-armed, the next sound appends to live history within the limit.</p>
 <p><strong>Auto-resume</strong> retains <strong>0/5/10 seconds</strong> and its <strong>10-second</strong> default. Editing fixes material/view without implicitly pausing capture. Canceling, an ordinary waveform click, or export completion returns live without forcing manual Pause to resume. <strong>Play</strong> and existing auto-resume control capture separately: manual Pause remains at zero seconds; 5/10 seconds retain their timer rules. Keep quiet sections determines whether quiet/zero input is retained while armed.</p>
 <p>Existing <strong>Off</strong>, <strong>20-second</strong>, and <strong>30-second</strong> settings use the <strong>10-second</strong> default.</p>
 <h3 id="clear-the-current-recording">Clear the current recording</h3>
-<p>Click the trash icon in the toolbar. It is labeled <strong>Clear capture</strong> on Windows desktop and <strong>Clear captured audio</strong> in the plug-ins. This empties the waveform, selection, and audio held in memory. If capture is armed, incoming sound starts filling the waveform again. You can find previously exported WAVs in the save folder.</p>
+<p>Click the trash icon in the toolbar. It is labeled <strong>Clear capture</strong> in the desktop apps and <strong>Clear captured audio</strong> in the plug-ins. This empties the waveform, selection, and audio held in memory. If capture is armed, incoming sound starts filling the waveform again. You can find previously exported WAVs in the save folder.</p>
 <h3 id="output-location-and-file-format">Output location and file format</h3>
-<p>You can choose and open both folders from Options. Successful drops use the default export folder. The global snapshot shortcut and <strong>Save snapshot</strong> use the saved snapshots folder. Existing export destinations are carried forward.</p>
+<p>You can choose and open both folders from Options. Successful drops use the default export folder. The global snapshot shortcut and <strong>Save snapshot</strong> use the saved snapshots folder. Existing export destinations are carried forward. In the desktop apps and the plug-in, <strong>Delete old drag-and-drop files</strong> on the Export page of Options lets Backtracking delete dragged files in the default export folder once they are older than 10, 20, 30, 60, or 90 days. It is Off by default. Only WAV files that Backtracking named are deleted, permanently. Snapshots in the saved snapshots folder are never deleted, and nothing is deleted while both settings name the same folder. A DAW project that still reads one of those files in place will lose it. The plug-in keeps this choice with the project and only cleans while its window is open.</p>
 <div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
 <thead><tr><th>Edition</th><th>Default export folder</th><th>Default saved snapshots folder</th></tr></thead>
 <tbody>
@@ -181,15 +182,7 @@
 <tr><td>VST3 / CLAP</td><td><code>Backtracking/output/</code> in your home directory</td><td><code>Backtracking/saved/</code> in your home directory</td></tr>
 </tbody>
 </table></div></div>
-<p>Choose the sample rate and encoding independently in the gear menu.</p>
-<div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
-<thead><tr><th>Edition</th><th>Sample rate menu</th><th>Encoding menu</th></tr></thead>
-<tbody>
-<tr><td>Windows desktop</td><td><strong>WAV rate</strong></td><td><strong>WAV encoding</strong></td></tr>
-<tr><td>macOS desktop</td><td><strong>WAV 匯出格式 → 取樣率</strong></td><td><strong>WAV 匯出格式 → 編碼</strong></td></tr>
-<tr><td>VST3 / CLAP</td><td><strong>WAV sample rate</strong></td><td><strong>WAV sample format</strong></td></tr>
-</tbody>
-</table></div></div>
+<p>Choose the sample rate and encoding independently on the Export page of Options. All three editions use the same names: <strong>WAV sample rate</strong> and <strong>WAV encoding</strong>.</p>
 <div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="Table, scrolls sideways"><table>
 <thead><tr><th>WAV setting</th><th>Options</th><th>Default</th></tr></thead>
 <tbody>

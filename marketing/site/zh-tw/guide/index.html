@@ -60,7 +60,7 @@
   </nav>
 </details>
 <main class="sheet">
-<p class="g-gen">由 <code>docs/USER_GUIDE.md</code> 產生 · <a href="https://github.com/kekekewww/Backtracking/commit/5fe9224"><code>5fe9224</code></a> · <time datetime="2026-11-14">2026-11-14</time> · <a href="https://github.com/kekekewww/Backtracking/blob/main/docs/USER_GUIDE.md#繁體中文">在 GitHub 上檢視</a></p>
+<p class="g-gen">由 <code>docs/USER_GUIDE.md</code> 產生 · <a href="https://github.com/kekekewww/Backtracking/commit/5fc73b6"><code>5fc73b6</code></a> · <time datetime="2026-11-15">2026-11-15</time> · <a href="https://github.com/kekekewww/Backtracking/blob/main/docs/USER_GUIDE.md#繁體中文">在 GitHub 上檢視</a></p>
 <div class="doc-body">
 <p><a href="#繁體中文">繁體中文</a> · <a href="../../guide/#english">English</a> · <a href="#安裝與建置--installation-and-build">安裝與建置</a> · <a href="https://github.com/kekekewww/Backtracking/blob/main/docs/HARDWARE_USAGE.md">硬體使用量</a></p>
 <p>本輪將編輯視野與背景擷取分開；最新規則如下，整合驗證進度見<a href="https://github.com/kekekewww/Backtracking/blob/main/docs/RESPONSIVE_EDITING_2026-11-14.md">波形編輯與介面回應</a>。</p>
@@ -73,15 +73,16 @@
 <tr><td>麥克風，或系統聲加麥克風</td><td>開啟桌面版，在 Options 選擇麥克風，或啟用 A／B 分開擷取。</td></tr>
 <tr><td>某一軌、群組或主輸出的聲音</td><td>把 VST3 或 CLAP 插入對應的效果鏈。插件接收該位置的 mono 或 stereo 音訊，並將音訊原樣傳給下游。</td></tr>
 <tr><td>軟體樂器加效果後的聲音</td><td>把插件放在樂器及要納入取樣的效果後面。若需要乾聲，就放在那些效果前面。</td></tr>
+<tr><td>在桌面版擷取 DAW 某一軌的聲音</td><td>在插件 Options 的 Sources 勾選 <strong>Send to Backtracking desktop</strong>，再到桌面版 Options 的 Sources，把音訊來源選為 <strong>【Sender】</strong>加上該軌名稱。Sender 列在系統音訊和預設麥克風之後。</td></tr>
 </tbody>
 </table></div></div>
 <p>Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 ASIO、獨占模式或其他直接輸出路徑，使用音軌插件可直接取得該軌訊號。macOS 桌面版首次啟動時，請依系統提示允許錄製系統音訊。 <a href="https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording">Windows WASAPI</a> · <a href="https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps">Apple Core Audio</a></p>
 <h3 id="開啟設定">開啟設定</h3>
-<p>點擊工具列的齒輪，或在 Backtracking 視窗內按滑鼠右鍵，可開啟 <strong>Options</strong>。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 <strong>置頂／Keep on top</strong>。</p>
+<p>點擊工具列的齒輪可開啟 <strong>Options</strong>。在插件視窗內按滑鼠右鍵也會開啟 Options；Windows／macOS 桌面版的右鍵則開啟選單，依序為 <strong>Pause／Resume／Retry capture</strong>、<strong>Clear</strong>、<strong>Save snapshot</strong>、<strong>Show waveform only</strong>、<strong>Keep on top</strong>、<strong>Options…</strong> 與 <strong>Quit</strong>。桌面版視窗有焦點時，按 <code>Space</code> 可暫停或恢復擷取，按 <code>Delete</code>（Mac 鍵盤為 <code>Fn</code> + <code>Delete</code>）清除目前錄音；有選區時會先取消選區。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 <strong>置頂／Keep on top</strong>。</p>
 <p>Options 左側是分類，右側以一列一項的直向清單顯示設定。頁標題使用較大粗體，分組與欄位有明確層級，主要文字至少 15。保留時間、自動續錄、透明度和 WAV 格式使用下拉選單；少於 10 項時依實際項目數決定高度，最多顯示 10 列，超過則在選單內捲動。右側內容較長時向下捲動。桌面設定視窗可調整大小，底部關閉按鈕維持可見。插件會向 DAW 要求放大設定視窗，關閉後恢復原尺寸。</p>
 <p>操作說明集中於本文；UI 保留控制、標題、欄位名稱、值與必要的狀態／錯誤／路徑。</p>
 <h3 id="保留安靜片段">保留安靜片段</h3>
-<p>在 <strong>Options → Capture／擷取</strong> 勾選 <strong>Keep quiet sections</strong>（macOS：<strong>保留安靜片段</strong>）。預設關閉，舊設定及沒有此欄位的插件專案也使用關閉狀態。</p>
+<p>在 <strong>Options → Capture／擷取</strong> 勾選 <strong>Keep quiet sections</strong>。預設關閉，舊設定及沒有此欄位的插件專案也使用關閉狀態。</p>
 <ul>
 <li><strong>關閉</strong>：沿用靜音壓縮，低於靜音偵測門檻的長安靜區間不占完整保留時間。</li>
 <li><strong>開啟</strong>：保留往後收到的低音量、數位零值，以及由已知來源時鐘確認的安靜區間。安靜本身會占用 History，可能使更早的音訊較快離開保留範圍。</li>
@@ -95,7 +96,7 @@
 <ul>
 <li>在桌面版 Options 選擇系統播放、麥克風或指定 App。Windows 的指定 App 擷取需 OS build 20348 以上。macOS 首次擷取系統聲或麥克風時，請允許對應權限。</li>
 <li>每次打開來源下拉選單都會更新清單。Windows 會列出仍有播放串流的 App，包含串流已暫停的情況。macOS 會列出 Core Audio 辨識到有播放輸出的 App。找不到要選的 App 時，先讓它播放一段音訊，再重新打開選單。麥克風來源會列出系統目前可用的輸入裝置。</li>
-<li>可同時啟用 A 和 B。兩路各自選擇來源與 Left、Right、Center、Mid、Side 或 Merged。Merged 沿用來源的單聲道或雙聲道輸出。Center 需要來源提供原生中央聲道。</li>
+<li>可同時啟用 A 和 B。桌面版的 <strong>Source B</strong> 預設為 <strong>Off</strong>，選擇來源後即啟用。兩路各自選擇來源與 Left、Right、Center、Mid、Side 或 Merged。Merged 沿用來源的單聲道或雙聲道輸出。Center 需要來源提供原生中央聲道。</li>
 <li>Windows 的 A／B 選用同一來源時，會以裝置的原始取樣率保留兩路音訊，例如 System Side／System Mid。若 WAV 設定使用不同取樣率，會在匯出整段選取時才轉換。暫停後重新開始錄音時，會平滑前後片段的接縫。</li>
 <li>單一來源可顯示合併波形或上下兩列 L／R。啟用 A／B 時，上列顯示 A、下列顯示 B，各占波形區的一半，並各自顯示音量。</li>
 <li>完成框選或保存整段時，旗標標記範圍頭尾。<code>Shift</code> 加左鍵拖曳可直接吸附框選；Windows 的 <code>Ctrl</code>／macOS 的 <code>Option</code> 保留自由框選，也可再加 <code>Shift</code> 吸附。目標依附近可見旗標、已畫小節線、已畫秒數線的順序，同類選最近位置；拖動中的端點不吸附自己。只吸附目前畫出的目標；全透明時參考線隱藏，旗標仍可見、可操作。</li>
@@ -107,7 +108,7 @@
 <p><a href="https://github.com/kekekewww/Backtracking/blob/main/docs/UPDATES.md">桌面版更新設定</a></p>
 <h3 id="只顯示波形">只顯示波形</h3>
 <p>開啟 <strong>只顯示波形／Show waveform only</strong> 後，Windows／macOS 原生桌面視窗會縮到波形面板加可見外框的高度，並關閉原生陰影。背景透明度仍依 Options 設定，可保留實色、半透明或全透明；100% 透明時，波形與旗標仍可見、可操作。插件可向 DAW 要求縮小，宿主外框、陰影與底色由 DAW 管理。這個選項預設關閉，並跟著桌面偏好設定或 DAW 專案中的插件設定儲存。</p>
-<p>在波形上按右鍵開啟 Options。錄音已暫停時，可選 <strong>開始錄音／Play</strong>。錄音已待命或正在收錄時，可選 <strong>暫停錄音／Pause</strong>。</p>
+<p>桌面版在波形上按右鍵開啟選單：錄音已暫停時可選 <strong>Resume capture</strong>，已待命或正在收錄時可選 <strong>Pause capture</strong>。插件則按右鍵開啟 Options，再選 <strong>Play</strong> 或 <strong>Pause</strong>。</p>
 <p>切換時保留波形面板高度，桌面視窗貼合面板，移除上下多餘的透明區。拖曳桌面視窗的左右內緣可調整寬度，拖曳上下內緣可調整高度。視窗變窄時，同樣的錄音保留時間會顯示在更短的距離上，波形每秒移動的像素會減少。可用高度不足時，波形會跟著縮小。取消勾選時，桌面視窗恢復切換前的完整模式尺寸。</p>
 <div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
 <thead><tr><th>桌面版</th><th>只顯示波形最小尺寸</th><th>完整介面最小尺寸</th></tr></thead>
@@ -116,12 +117,12 @@
 <tr><td>macOS</td><td>240 × 48 點</td><td>560 × 100 點</td></tr>
 </tbody>
 </table></div></div>
-<p>要回到完整介面，在波形上按右鍵，再取消勾選 <strong>只顯示波形／Show waveform only</strong>。Windows／macOS 在此模式關閉原生陰影；可見細外框則由 Options 的外觀設定控制。</p>
+<p>要回到完整介面，在波形上按右鍵，再取消勾選 <strong>只顯示波形／Show waveform only</strong>。Windows／macOS 在此模式關閉原生陰影；可見細外框則由 Options 的外觀設定控制。Windows／macOS 桌面版與外掛還可以在 Options 的 Appearance 頁選擇外框寬度（1 至 4 px），並在 <strong>Show</strong> 區決定要顯示哪些項目：工具列上的程式名稱、音量表，以及擷取狀態標記（<strong>Always</strong>、<strong>Only when paused or failing</strong>（外掛為 <strong>Only when paused</strong>）或 <strong>Never</strong>）。選擇 <strong>Never</strong> 後，擷取失敗時視窗上也不會出現標記。</p>
 <h3 id="移動與縮放桌面視窗">移動與縮放桌面視窗</h3>
 <p>Windows 和 macOS 桌面版採用無邊框視窗。以下手勢可自由移動或調整大小，靠近螢幕邊緣時不會自動貼齊。VST3／CLAP 的外層視窗由 DAW 管理。要關閉桌面程式，請從設定選單選擇 <strong>結束／Quit</strong>。</p>
 <p>Windows 桌面版啟用 <strong>置頂／Keep on top</strong> 時，若工作列等同一桌面的視窗蓋住 Backtracking，程式會重新提升自身層級，並保留目前的輸入焦點。安全桌面與受保護的系統畫面由 Windows 管理。</p>
 <p>Windows 桌面版可從工作列右側的系統匣顯示或隱藏視窗。隱藏視窗後，錄音仍可在背景繼續。要停止程式，可從系統匣或設定選擇 <strong>Quit</strong>。先將 <code>Backtracking.exe</code> 放在固定位置，再開啟 <strong>Start with Windows</strong>。Backtracking 會在登入 Windows 時開啟並還原上次的視窗位置。</p>
-<p>macOS 桌面版可從選單列顯示、隱藏或結束 Backtracking，也可啟用登入時開啟。系統要求核准時，請在 macOS 系統設定允許 Backtracking 的登入項目。</p>
+<p>macOS 桌面版可從選單列顯示或隱藏視窗、暫停或恢復擷取、開啟 Options 或結束 Backtracking，也可啟用登入時開啟（<strong>Start at login</strong>）。系統要求核准時，請在 macOS 系統設定允許 Backtracking 的登入項目。</p>
 <div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
 <thead><tr><th>動作</th><th>Windows 桌面版</th><th>macOS 桌面版</th></tr></thead>
 <tbody>
@@ -166,13 +167,13 @@
 <p>從 Options 選擇 <strong>Save snapshot</strong>，即可保存目前錄音器的快照。有框選時使用固定素材中的原始選段，A／B 依相同取樣邊界切割；未框選時保存觸發當下保留的整段音訊。準備和保存不隱含暫停背景錄音，也不強制解除手動 Pause。保存選段完成後可回到即時視野；全段保存於背景完成時，不會取消之後才建立的新選區。</p>
 <p>Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift），macOS 使用 Fn／Globe 加同一位置的鍵，可在背景觸發快照，不必讓 Backtracking 或插件視窗取得焦點。Linux 請使用<a href="https://github.com/kekekewww/Backtracking/blob/main/desktop/linux/README.md">快照快捷鍵常駐程式</a>。在 Options 可指定單一插件實例作為全域快照快捷鍵的目標。Backtracking 沒有綁定 <code>Ctrl+S</code>；在 DAW 中仍可用它儲存專案。</p>
 <h3 id="啟用暫停與自動續錄">啟用、暫停與自動續錄</h3>
-<p>選擇 <strong>Play</strong> 進入錄音待命，或選擇 <strong>Pause</strong> 手動暫停。完整介面可使用工具列，只顯示波形時可從右鍵開啟 Options。Play 保留目前固定的編輯素材與選區；取消、普通點擊或匯出結束才回到即時視野。重新待命後，下一段收錄的音訊會接在即時歷史後方，受保留時間上限約束。</p>
+<p>選擇 <strong>Play</strong> 進入錄音待命，或選擇 <strong>Pause</strong> 手動暫停。完整介面可使用工具列，只顯示波形時，桌面版可用右鍵選單或 <code>Space</code>，插件可從右鍵開啟 Options。Play 保留目前固定的編輯素材與選區；取消、普通點擊或匯出結束才回到即時視野。重新待命後，下一段收錄的音訊會接在即時歷史後方，受保留時間上限約束。</p>
 <p><strong>自動續錄／Auto-resume</strong> 的 <strong>0、5、10 秒</strong>選項仍保留，預設 <strong>10 秒</strong>。一般編輯不隱含暫停擷取：框選、旗標、縮放、平移及拖放準備固定的是素材與視野，背景仍按原狀錄音。取消、普通波形點擊或匯出結束會回到即時視野，不因此強制解除手動 Pause。擷取由 <strong>Play</strong> 與既有自動續錄另行控制：0 秒下手動 Pause 維持，5／10 秒依原有計時規則。待命時是否保留低音量／零值，依保留安靜片段設定。</p>
 <p>舊版儲存的 <strong>Off、20 秒、30 秒</strong>會改用 <strong>10 秒</strong>。</p>
 <h3 id="清除目前錄音">清除目前錄音</h3>
 <p>點擊工具列的垃圾桶圖示可執行 <strong>清除目前錄音／Clear capture／Clear captured audio</strong>。這會清空目前的波形、選取區間與記憶體中的錄音。若錄音已待命，接下來收到的聲音會重新填入波形。先前匯出的 WAV 可從存檔資料夾取用。</p>
 <h3 id="輸出位置與檔案規格">輸出位置與檔案規格</h3>
-<p>在 Options 可各自指定並開啟兩個資料夾。成功拖放使用預設輸出資料夾，全域快照快捷鍵和 <strong>Save snapshot</strong> 使用保存資料夾。原先設定的匯出目的地會沿用。</p>
+<p>在 Options 可各自指定並開啟兩個資料夾。成功拖放使用預設輸出資料夾，全域快照快捷鍵和 <strong>Save snapshot</strong> 使用保存資料夾。原先設定的匯出目的地會沿用。Windows／macOS 桌面版與外掛可在 Options 的 Export 頁用 <strong>Delete old drag-and-drop files</strong> 讓 Backtracking 自動刪除預設輸出資料夾裡超過 10、20、30、60 或 90 天的拖放檔，預設為 Off。只會永久刪除 Backtracking 自己命名的 WAV；保存資料夾裡的快照不會被刪除，兩個資料夾相同時也不會刪除任何檔案。仍在專案中直接引用這些檔案的 DAW 會找不到它們。外掛會把這項設定存在專案裡，而且只在外掛視窗開啟時清理。</p>
 <div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
 <thead><tr><th>版本</th><th>預設輸出資料夾</th><th>保存資料夾的預設位置</th></tr></thead>
 <tbody>
@@ -181,15 +182,7 @@
 <tr><td>VST3／CLAP</td><td>使用者家目錄下的 <code>Backtracking/output/</code></td><td>使用者家目錄下的 <code>Backtracking/saved/</code></td></tr>
 </tbody>
 </table></div></div>
-<p>取樣率和編碼可在齒輪選單獨立調整。</p>
-<div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
-<thead><tr><th>版本</th><th>取樣率選項的位置</th><th>編碼選項的位置</th></tr></thead>
-<tbody>
-<tr><td>Windows 桌面版</td><td><strong>WAV rate</strong></td><td><strong>WAV encoding</strong></td></tr>
-<tr><td>macOS 桌面版</td><td><strong>WAV 匯出格式 → 取樣率</strong></td><td><strong>WAV 匯出格式 → 編碼</strong></td></tr>
-<tr><td>VST3／CLAP</td><td><strong>WAV sample rate</strong></td><td><strong>WAV sample format</strong></td></tr>
-</tbody>
-</table></div></div>
+<p>取樣率和編碼可在 Options 的 Export 頁獨立調整。三個版本的選項名稱相同：<strong>WAV sample rate</strong> 與 <strong>WAV encoding</strong>。</p>
 <div class="table-box"><div class="table-wrap cols-3" role="region" tabindex="0" aria-label="表格，可左右捲動"><table>
 <thead><tr><th>WAV 設定</th><th>選項</th><th>預設</th></tr></thead>
 <tbody>
