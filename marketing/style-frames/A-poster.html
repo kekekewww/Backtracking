@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Backtracking — A poster</title>
+<link rel="stylesheet" href="shared/bt-panel.css">
+<link rel="stylesheet" href="A.css">
+<style>
+  body { width: 1080px; height: 1350px; }
+  .frame { width: 1080px; height: 1350px; }
+  .lockup { left: 86px; top: 78px; }
+  .lockup .wm { font-size: 31px; }
+  .tag { right: 86px; top: 102px; font-size: 14px; }
+  .headline { left: 82px; top: 200px; font-size: 112px; }
+  .sub { left: 86px; top: 650px; width: 900px; font-size: 27px; line-height: 1.45; }
+  .ruler { left: 104px; top: 812px; width: 871px; font-size: 14px; }
+  .ruler span::after { content: ""; position: absolute; left: 50%; top: 22px; width: 1px; height: 8px; background: var(--a-dim); }
+  .ruler span:first-child::after { left: 0; }
+  .ruler span:last-child::after { left: auto; right: 0; background: var(--a-mint); }
+  .panel { left: 86px; top: 852px; }
+  .panel .btp { zoom: 1.62; }
+  .trail { left: 0; top: 0; }
+  .ghost { left: 664px; top: 1098px; }
+  .cursor { left: 650px; top: 1084px; }
+  .rule { left: 86px; right: 86px; top: 1232px; height: 1px; background: var(--a-rule); }
+  .editions { left: 86px; top: 1258px; font-size: 18px; }
+  .license { right: 86px; top: 1258px; font-size: 18px; font-family: var(--a-mono); color: var(--a-dim); letter-spacing: 0.04em; }
+</style>
+</head>
+<body>
+<div class="frame">
+  <div class="lockup">
+    <img src="../../assets/backtracking-icon.svg" width="62" height="62" alt="">
+    <span class="wm">Backtracking</span>
+  </div>
+  <div class="tag label">Retrospective audio sampler</div>
+
+  <h1 class="headline">What you<br>just heard,<br><span class="accent">straight into<br>your DAW.</span></h1>
+
+  <p class="sub">Backtracking keeps the last <b>10&nbsp;seconds to 10&nbsp;minutes</b> of audio in memory. Select a range on the waveform and drag it out as a WAV.</p>
+
+  <div class="ruler"><span>&minus;20 s</span><span>&minus;15 s</span><span>&minus;10 s</span><span>&minus;5 s</span><span class="now">now</span></div>
+
+  <div class="panel"><div class="btp a" data-btp='{"width":560,"waveHeight":70,"seed":11,"style":"mixed","selection":[0.5,0.73],"duration":"6.17 s","tooltip":{"text":"Drag and Drop","at":0.615,"y":54},"meter":"&minus;9.8","guides":0}'></div></div>
+
+  <svg class="trail" width="1080" height="1350" viewBox="0 0 1080 1350">
+    <path d="M640 1030 C 640 1070, 652 1080, 660 1092" fill="none" stroke="#ff6aa8" stroke-width="2" stroke-dasharray="2 7" stroke-linecap="round"/>
+  </svg>
+
+  <div class="ghost">
+    <div class="file">WAV</div>
+    <div>
+      <div class="name">Backtracking-1794…-11.wav</div>
+      <div class="meta">6.17 s · 48 kHz · 32-bit float</div>
+    </div>
+  </div>
+  <svg class="cursor" width="26" height="38" viewBox="0 0 14 20"><path d="M1 1v15.5l3.8-3.6 2.6 6 2.4-1-2.5-5.9h5.3Z" fill="#fff" stroke="#000" stroke-width="1.1" stroke-linejoin="round"/></svg>
+
+  <div class="rule"></div>
+  <div class="editions"><span class="hi">Windows</span><span class="sep">·</span><span class="hi">macOS</span><span class="sep">·</span><span class="hi">VST3</span><span class="sep">·</span><span class="hi">CLAP</span></div>
+  <div class="license">Open source · Apache-2.0</div>
+</div>
+<script src="shared/bt-panel.js"></script>
+</body>
+</html>

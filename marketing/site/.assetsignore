@@ -1,0 +1,8 @@
+# Files in this folder that are not part of the public site.
+tools/
+README.md
+wrangler.jsonc
+.wrangler/
+.gitignore
+.assetsignore
+node_modules/

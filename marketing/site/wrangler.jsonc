@@ -1,0 +1,14 @@
+// Cloudflare deploy config for the landing page: a static-assets Worker (no script).
+// Deploy from this folder, after `python tools/sync-media.py`:  npx wrangler deploy
+{
+  "name": "backtracking-site",
+  "compatibility_date": "2026-11-14",
+  "assets": {
+    "directory": "./",
+    "html_handling": "auto-trailing-slash"
+  },
+  // Custom domain: Cloudflare creates the DNS record and certificate for this hostname.
+  "routes": [{ "pattern": "backtracking.kamelkyp.com", "custom_domain": true }],
+  "workers_dev": false,
+  "preview_urls": false
+}

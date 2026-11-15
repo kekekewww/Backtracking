@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <title>Backtracking</title>
+  <defs>
+    <linearGradient id="case" x2="1" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="#152b27"/>
+      <stop offset="1" stop-color="#081311"/>
+    </linearGradient>
+    <linearGradient id="signal" x2="1" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="#b0fbd3"/>
+      <stop offset="1" stop-color="#55dca7"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#case)"/>
+  <rect x="20" y="20" width="472" height="472" rx="108" fill="none" stroke="#33564b" stroke-width="8"/>
+  <path d="M159 199 94 249a9 9 0 0 0 0 14l65 50a9 9 0 0 0 15-7V206a9 9 0 0 0-15-7Z" fill="url(#signal)"/>
+  <path d="M215 213v86m53-130v174m53-145v116m53-78v40m49-32v24" fill="none" stroke="url(#signal)" stroke-linecap="round" stroke-width="23"/>
+</svg>

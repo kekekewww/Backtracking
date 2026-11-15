@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backtracking Style Frames</title>
+<link rel="stylesheet" href="../fonts/fonts.css">
+<style>
+  :root {
+    --bg: #f3f2ee; --fg: #18181a; --muted: #5f5f66; --line: #d9d7d0; --card: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141416; --fg: #ececee; --muted: #9a9aa3; --line: #2c2c31; --card: #1c1c20; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-family: "Geist", system-ui, sans-serif; line-height: 1.5; }
+  main { max-width: 1480px; margin: 0 auto; padding: 48px 32px 80px; }
+  header.top { display: flex; align-items: center; gap: 16px; margin-bottom: 8px; }
+  header.top img { width: 44px; height: 44px; }
+  h1 { font-size: 28px; font-weight: 650; letter-spacing: -0.02em; margin: 0; }
+  .lead { color: var(--muted); max-width: 820px; margin: 4px 0 40px; }
+  section { border-top: 1px solid var(--line); padding: 40px 0 48px; }
+  .head { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 32px; margin-bottom: 28px; }
+  .tag { font-family: "Geist Mono", monospace; font-size: 13px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  h2 { font-size: 34px; font-weight: 650; letter-spacing: -0.025em; margin: 4px 0 10px; }
+  .head p { margin: 0 0 10px; }
+  dl { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 6px 16px; margin: 0; font-size: 15px; }
+  dt { font-family: "Geist Mono", monospace; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); padding-top: 3px; }
+  dd { margin: 0; }
+  .sw { display: inline-flex; align-items: center; gap: 6px; margin: 0 12px 4px 0; font-family: "Geist Mono", monospace; font-size: 12.5px; }
+  .sw i { width: 16px; height: 16px; border-radius: 4px; display: inline-block; border: 1px solid rgba(128, 128, 128, 0.35); }
+  .frames { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.78fr); gap: 20px; align-items: start; }
+  figure { margin: 0; }
+  figure img { display: block; width: 100%; height: auto; border-radius: 6px; border: 1px solid var(--line); background: var(--card); }
+  figcaption { font-family: "Geist Mono", monospace; font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+  a { color: inherit; }
+  @media (max-width: 900px) {
+    main { padding: 32px 16px 64px; }
+    .head, .frames { grid-template-columns: minmax(0, 1fr); }
+    dl { grid-template-columns: 90px minmax(0, 1fr); }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header class="top">
+    <img src="../../assets/backtracking-icon.svg" alt="">
+    <h1>Backtracking: three visual directions</h1>
+  </header>
+  <p class="lead">Style frames for picking one direction before full production. Each direction has a 1080×1350 poster and a 1920×1080 hero/title frame. All three use the same UI mock-up, built from screen recordings of the real app (<code>shared/bt-panel.js</code>), and the unaltered app icon. Full notes are in <code>A-notes.md</code>, <code>B-notes.md</code> and <code>C-notes.md</code>.</p>
+
+  <section>
+    <div class="head">
+      <div>
+        <div class="tag">Direction A</div>
+        <h2>Evolved</h2>
+        <p>The existing kit, tightened. Same dark green, mint and pink, now set in one typeface family, with a real-app panel, a time ruler that ends at "now", and a glow only behind the product.</p>
+        <p><em>Motion:</em> slow and nocturnal. The waveform scrolls in, the selection wipes in pink, and the WAV drifts out with a soft ease.</p>
+      </div>
+      <dl>
+        <dt>Palette</dt><dd>
+          <span class="sw"><i style="background:#050D0B"></i>#050D0B</span><span class="sw"><i style="background:#11362B"></i>#11362B</span><span class="sw"><i style="background:#86EFBD"></i>#86EFBD</span><span class="sw"><i style="background:#FF6AA8"></i>#FF6AA8</span><span class="sw"><i style="background:#EEF6F2"></i>#EEF6F2</span><span class="sw"><i style="background:#93ABA1"></i>#93ABA1</span></dd>
+        <dt>Type</dt><dd>Geist (headline 640, −0.04em) + Geist Mono (labels)</dd>
+        <dt>zh-TW</dt><dd>Noto Sans TC Medium/Bold: workable, neutral match</dd>
+        <dt>Copy</dt><dd>“What you just heard, straight into your DAW.”</dd>
+      </dl>
+    </div>
+    <div class="frames">
+      <figure><img src="A-poster.png" alt="Direction A poster"><figcaption>A-poster.png · 1080×1350</figcaption></figure>
+      <figure><img src="A-hero.png" alt="Direction A hero"><figcaption>A-hero.png · 1920×1080</figcaption></figure>
+    </div>
+  </section>
+
+  <section>
+    <div class="head">
+      <div>
+        <div class="tag">Direction B</div>
+        <h2>Field Manual</h2>
+        <p>A precise instrument on bone paper: ink, rules, a numbered figure with a legend, and spec rows. The only signal colour is the app's own REC red. The dark panel is the one dark object on the page.</p>
+        <p><em>Motion:</em> diagrammatic. Rules draw in, markers pop in on cue with their legend lines, and moves are quick and linear with hard stops.</p>
+      </div>
+      <dl>
+        <dt>Palette</dt><dd>
+          <span class="sw"><i style="background:#ECE7DB"></i>#ECE7DB</span><span class="sw"><i style="background:#151513"></i>#151513</span><span class="sw"><i style="background:#55514A"></i>#55514A</span><span class="sw"><i style="background:#C3BAA5"></i>#C3BAA5</span><span class="sw"><i style="background:#D93A1E"></i>#D93A1E</span></dd>
+        <dt>Type</dt><dd>IBM Plex Sans (condensed 85 %, 600) + IBM Plex Mono</dd>
+        <dt>zh-TW</dt><dd>IBM Plex Sans TC: same family, the strongest bilingual fit</dd>
+        <dt>Copy</dt><dd>“Hit record after the fact.”</dd>
+      </dl>
+    </div>
+    <div class="frames">
+      <figure><img src="B-poster.png" alt="Direction B poster"><figcaption>B-poster.png · 1080×1350</figcaption></figure>
+      <figure><img src="B-hero.png" alt="Direction B hero"><figcaption>B-hero.png · 1920×1080</figcaption></figure>
+    </div>
+  </section>
+
+  <section>
+    <div class="head">
+      <div>
+        <div class="tag">Direction C</div>
+        <h2>Rewind</h2>
+        <p>Record-sleeve loudness. A flat ultramarine field carries giant ultra-condensed caps, with the icon's mint as the only highlight. The real History options form a tape-counter scale, and objects carry hard ink shadows.</p>
+        <p><em>Motion:</em> punchy and on the beat. The scale rewinds, the words slam in on cuts, and the mint WAV slab shoots out with streaks.</p>
+      </div>
+      <dl>
+        <dt>Palette</dt><dd>
+          <span class="sw"><i style="background:#1E32D2"></i>#1E32D2</span><span class="sw"><i style="background:#2A3FE6"></i>#2A3FE6</span><span class="sw"><i style="background:#070C3D"></i>#070C3D</span><span class="sw"><i style="background:#F4F1E8"></i>#F4F1E8</span><span class="sw"><i style="background:#B0FBD3"></i>#B0FBD3</span></dd>
+        <dt>Type</dt><dd>Archivo variable (wdth 62 black caps / 125 labels / 100 body)</dd>
+        <dt>zh-TW</dt><dd>Noto Sans TC Black: workable, but needs its own line breaks</dd>
+        <dt>Copy</dt><dd>“Take it back.”</dd>
+      </dl>
+    </div>
+    <div class="frames">
+      <figure><img src="C-poster.png" alt="Direction C poster"><figcaption>C-poster.png · 1080×1350</figcaption></figure>
+      <figure><img src="C-hero.png" alt="Direction C hero"><figcaption>C-hero.png · 1920×1080</figcaption></figure>
+    </div>
+  </section>
+</main>
+</body>
+</html>

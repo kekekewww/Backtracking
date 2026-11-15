@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Backtracking — C hero</title>
+<link rel="stylesheet" href="shared/bt-panel.css">
+<link rel="stylesheet" href="C.css">
+<style>
+  body { width: 1920px; height: 1080px; }
+  .frame { width: 1920px; height: 1080px; }
+  .lockup { left: 96px; top: 64px; }
+  .lockup .wm { font-size: 30px; }
+  .tag { right: 96px; top: 84px; font-size: 14px; }
+  .bgwave { left: -40px; top: 520px; }
+  .mega { left: 86px; top: 188px; font-size: 316px; }
+  .panel { left: 998px; top: 214px; }
+  .panel .btp { zoom: 1.46; }
+  .streaks { left: 0; top: 0; }
+  .slab { left: 1236px; top: 512px; }
+  .cursor { left: 1222px; top: 498px; }
+  .sub { left: 998px; top: 650px; width: 760px; font-size: 27px; }
+  .scale { left: 96px; top: 850px; width: 1728px; font-size: 18px; }
+  .rule { left: 96px; width: 1728px; top: 952px; }
+  .editions { left: 96px; top: 980px; font-size: 17px; }
+  .license { right: 96px; top: 980px; font-size: 17px; color: var(--c-paper-2); }
+</style>
+</head>
+<body>
+<div class="frame">
+  <div class="bgwave" data-wave='{"width":2000,"height":560,"seed":23,"style":"mixed","step":3}'></div>
+
+  <div class="lockup">
+    <img src="../../assets/backtracking-icon.svg" width="62" height="62" alt="">
+    <span class="wm">Backtracking</span>
+  </div>
+  <div class="tag wide">Retrospective audio sampler</div>
+
+  <h1 class="mega">Take it<br><span class="m">back.</span></h1>
+
+  <div class="panel"><div class="btp c" data-btp='{"width":548,"waveHeight":70,"seed":19,"style":"mixed","selection":[0.36,0.6],"duration":"7.40 s","tooltip":{"text":"Drag and Drop","at":0.48,"y":54},"meter":"&minus;14.1","meterUnit":"LUFS"}'></div></div>
+
+  <svg class="streaks" width="1920" height="1080" viewBox="0 0 1920 1080">
+    <line x1="960" y1="528" x2="1196" y2="528" stroke-width="4"/>
+    <line x1="1040" y1="550" x2="1196" y2="550" stroke-width="4" opacity=".7"/>
+    <line x1="1110" y1="572" x2="1196" y2="572" stroke-width="4" opacity=".45"/>
+  </svg>
+
+  <div class="slab">
+    <div class="ic">WAV</div>
+    <div><div class="n">Backtracking-1794…-13.wav</div><div class="m">7.40 s · 48 kHz · 32-bit float</div></div>
+  </div>
+  <svg class="cursor" width="28" height="40" viewBox="0 0 14 20"><path d="M1 1v15.5l3.8-3.6 2.6 6 2.4-1-2.5-5.9h5.3Z" fill="#fff" stroke="#070c3d" stroke-width="1.1" stroke-linejoin="round"/></svg>
+
+  <p class="sub">Select what you just heard and drag it out as a WAV. Backtracking keeps up to <b>10&nbsp;minutes</b> of audio in memory.</p>
+
+  <div class="scale wide"><span>10 s</span><span>20 s</span><span>30 s</span><span>60 s</span><span>3 min</span><span>5 min</span><span class="on">10 min</span></div>
+
+  <div class="rule"></div>
+  <div class="editions wide"><span>Windows</span><span>macOS</span><span>VST3</span><span>CLAP</span></div>
+  <div class="license wide">Open source · Apache-2.0</div>
+</div>
+<script src="shared/bt-panel.js"></script>
+</body>
+</html>
