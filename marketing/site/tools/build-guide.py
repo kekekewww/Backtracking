@@ -594,7 +594,7 @@ def structured_data(lang, date):
                 "description": P["desc"], "inLanguage": P["html_lang"], "dateModified": date,
                 "image": "%s/img/og-%s.png" % (ORIGIN, "en" if lang == "en" else "zh-TW"),
                 "isPartOf": {"@type": "WebSite", "@id": ORIGIN + "/#website", "url": ORIGIN + "/", "name": "Backtracking"},
-                "about": {"@type": "SoftwareApplication", "@id": ORIGIN + "/#software", "name": "Backtracking", "url": home},
+                "about": {"@id": ORIGIN + "/#software"},
                 "author": {"@type": "Organization", "@id": ORIGIN + "/#publisher", "name": "Backtracking contributors", "url": GH},
             },
             {
