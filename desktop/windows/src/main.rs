@@ -12,6 +12,8 @@ mod file_drag;
 #[cfg(target_os = "windows")]
 mod loopback;
 #[cfg(target_os = "windows")]
+mod playback;
+#[cfg(target_os = "windows")]
 mod preferences;
 #[cfg(target_os = "windows")]
 mod snapshot_hotkey;

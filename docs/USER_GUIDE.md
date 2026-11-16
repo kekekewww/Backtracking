@@ -20,7 +20,7 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 ### 開啟設定
 
-點擊工具列的齒輪可開啟 **Options**。在插件視窗內按滑鼠右鍵也會開啟 Options；Windows／macOS 桌面版的右鍵則開啟選單，依序為 **Pause／Resume／Retry capture**、**Clear**、**Save snapshot**、**Show waveform only**、**Keep on top**、**Options…** 與 **Quit**。桌面版視窗有焦點時，按 `Space` 可暫停或恢復擷取，按 `Delete`（Mac 鍵盤為 `Fn` + `Delete`）清除目前錄音；有選區時會先取消選區。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
+點擊工具列的齒輪可開啟 **Options**。在插件視窗內按滑鼠右鍵也會開啟 Options；Windows／macOS 桌面版的右鍵則開啟選單，依序為 **Pause／Resume／Retry capture**、**Clear**、**Save snapshot**、**Show waveform only**、**Keep on top**、**Options…** 與 **Quit**。桌面版視窗有焦點時，按 `Space` 可暫停或恢復擷取，按 `Delete`（Mac 鍵盤為 `Fn` + `Delete`）清除目前錄音；有選區時，`Space` 改為試聽選區，`Delete` 則先取消選區。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
 
 Options 左側是分類，右側以一列一項的直向清單顯示設定。頁標題使用較大粗體，分組與欄位有明確層級，主要文字至少 15。保留時間、自動續錄、透明度和 WAV 格式使用下拉選單；少於 10 項時依實際項目數決定高度，最多顯示 10 列，超過則在選單內捲動。右側內容較長時向下捲動。桌面設定視窗可調整大小，底部關閉按鈕維持可見。插件會向 DAW 要求放大設定視窗，關閉後恢復原尺寸。
 
@@ -124,6 +124,14 @@ macOS 桌面版可從選單列顯示或隱藏視窗、暫停或恢復擷取、�
 
 Backtracking 視窗有焦點時，按 `Esc` 或 `Backspace` 可取消編輯並回到即時視野，不寫檔；背景錄音保持原狀，不會解除手動 Pause。
 
+### 試聽選區與淡入淡出
+
+有選區且 Backtracking 視窗有焦點時，按 `Space` 會從選區起點播放到終點，播放線在波形上由左往右移動；再按一次 `Space` 即停止。沒有選區時，`Space` 仍用於暫停或恢復擷取。取消選區、重新框選、移動旗標、保存或拖出選區時，播放都會停止；按住 `Alt` 調整淡化則不會。試聽依匯出方式擺放 A／B 軌，並套用 **全部轉成單聲道**。
+
+試聽期間，所有擷取系統播放的 Backtracking 錄音器都會錄入靜音，試聽內容不會進入歷史。麥克風、單一應用程式與插件傳送端照常錄音。插件的試聽從插件所在的軌道輸出，宿主處理音訊時才會播放；部分 DAW 停止走帶時不處理音訊。試聽是該軌輸出的一部分，因此訊號鏈後段的 Backtracking 或錄音會收到它，試聽期間進行的匯出或 bounce 也會包含它。
+
+按住 `Alt`（macOS 為 `Option`）拖曳選區起點旗標可調整淡入，拖曳終點旗標可調整淡出。往選區內拖得越深，淡化越長；淡入與淡出不會重疊。拖曳時波形會依淡化收窄，完整介面也會顯示淡化長度。淡化為線性，頭尾從無聲開始與結束。拖出的 WAV 與保存的選區快照都會套用淡化；試聽中調整，接下來播放的聲音就會套用新的淡化。重新框選會清除淡化；移動旗標時淡化保留，選區變短時會隨之縮短。
+
 ### 保存快照
 
 從 Options 選擇 **Save snapshot**，即可保存目前錄音器的快照。有框選時使用固定素材中的原始選段，A／B 依相同取樣邊界切割；未框選時保存觸發當下保留的整段音訊。準備和保存不隱含暫停背景錄音，也不強制解除手動 Pause。保存選段完成後可回到即時視野；全段保存於背景完成時，不會取消之後才建立的新選區。
@@ -200,7 +208,7 @@ On Windows, route the source to the default playback device. If a DAW uses ASIO,
 
 ### Open settings
 
-Click the gear in the toolbar to open **Options**. Right-clicking inside the plug-in also opens Options. In the Windows and macOS desktop apps, right-clicking opens a menu instead: **Pause / Resume / Retry capture**, **Clear**, **Save snapshot**, **Show waveform only**, **Keep on top**, **Options…**, and **Quit**. With the desktop window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording; if there is a selection, it cancels the selection first. The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
+Click the gear in the toolbar to open **Options**. Right-clicking inside the plug-in also opens Options. In the Windows and macOS desktop apps, right-clicking opens a menu instead: **Pause / Resume / Retry capture**, **Clear**, **Save snapshot**, **Show waveform only**, **Keep on top**, **Options…**, and **Quit**. With the desktop window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` previews the selection instead and `Delete` cancels the selection first. The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
 
 Choose a category on the left, then use the vertical settings list on the right. Larger bold titles, group headings, and body/control text of at least 15 distinguish hierarchy. History, auto-resume, transparency, and WAV format use dropdowns sized to their item count, up to ten rows before scrolling. Scroll the details pane for longer content. Desktop Options can be resized and keeps Close visible. The plug-in requests a larger editor and restores its prior size when closed.
 
@@ -303,6 +311,14 @@ In the full interface, hover over an unselected waveform to preview all retained
 Clicking, selecting, and dragging within the window only affect the waveform. To export a selected clip, drag it out and drop it on a target that accepts WAV files, or choose **Save snapshot** in Options. Canceled or rejected drops, including drops back in the source window, leave no export file. Keep the mouse button held while an export finishes preparing. If the DAW rejects the drop, choose **Save snapshot** in Options and import the WAV from the saved snapshots folder.
 
 With Backtracking focused, press `Esc` or `Backspace` to cancel editing and return to live view without writing a file. Background capture keeps its prior state; a manual Pause is not cleared.
+
+### Preview a selection and fade its ends
+
+With a selection on screen and the Backtracking window focused, press `Space` to play the selection from its start flag to its end flag. A playhead moves across the waveform from left to right. Press `Space` again to stop. Without a selection, `Space` still pauses or resumes capture. Playback also stops when you cancel the selection, draw a new one, move a flag, or save or drag out the selection. Fading with `Alt` does not stop it. The preview places lanes A and B the way their WAVs are exported and follows **Export every file as mono**.
+
+While a preview plays, every Backtracking recorder that captures System playback records silence, so the preview never enters the history. Microphones, single apps, and plug-in senders record as usual. In the plug-in, the preview plays through the plug-in's track while the host processes audio. Some DAWs stop processing audio while their transport is stopped. The preview is part of the track's output, so a Backtracking or a recording further down the signal path keeps it, and so does an export or bounce made while it plays.
+
+Hold `Alt` (`Option` on a Mac) and drag the selection's start flag to fade it in, or its end flag to fade it out. The further into the selection you drag, the longer the fade. A fade in and a fade out never overlap. The waveform tapers as you drag, and the full interface shows the fade's length. Fades are linear and start and end in silence. Dragged-out WAVs and saved snapshots of the selection include the fades. A fade changed during a preview applies to the audio that plays next. A new selection starts without fades. Moving a flag keeps them and shortens them if the selection becomes too short.
 
 ### Save a snapshot
 
@@ -468,5 +484,8 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 8. 指定保存資料夾。錄音中從 Options 選擇 **Save snapshot**，確認背景持續擷取，再框選一段並再次保存。確認保存資料夾內分別出現完整快照和固定選段，A／B 使用相同起訖；另在 0 秒手動 Pause 下保存，確認不會強制解除暫停。切換到其他程式後，Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift），macOS 按 Fn／Globe 加同一位置的鍵，確認背景快照可用。使用插件時，從 Options 指定一個目標實例，確認全域快捷鍵只保存該實例；在 DAW 按 `Ctrl+S` 不應觸發快照。
 
    Choose a saved snapshots folder. Save while recording and verify capture continues. Select a range and save again; verify the full snapshot/fixed clip with aligned A/B boundaries. Save at zero-second manual Pause and verify it is not forced to resume. Switch apps and verify background saving with Alt plus the physical key left of 1 (the ~ / grave key, without Shift) on Windows, or Fn/Globe plus that key on macOS. For plug-ins, verify only the selected target is saved; `Ctrl+S` in the DAW should not trigger a snapshot.
+9. 以系統播放為來源錄一段聲音後框選。按 `Space`，確認從起點旗標播放到終點旗標，播放線由左往右移動並在終點消失；播放中再按 `Space` 應立即停止。按住 `Alt`（Mac 為 `Option`）拖曳起點與終點旗標，確認波形收窄並顯示淡化長度，播放中調整也聽得出變化。拖出並保存選區，確認 WAV 頭尾有淡化；繼續錄音後，確認試聽內容沒有出現在歷史波形中。
+
+   Record some System playback and select part of it. Press `Space` and check that it plays from the start flag to the end flag, with the playhead moving left to right and leaving at the end. Press `Space` during playback to stop at once. Hold `Alt` (`Option` on a Mac) and drag the start and end flags: the waveform should taper and show the fade's length, and the change should be heard during playback. Drag out and save the selection and check that both WAVs fade at their ends. After capture continues, check that the preview does not appear in the history waveform.
 
 [回到專案首頁 / Back to the project README](../README.md)

@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{ChannelRoute, FrozenTrack, Snapshot};
+use crate::{ChannelRoute, Fades, FrozenTrack, Snapshot};
 
 const PHASES: usize = 256;
 /// How many output frames one piece of a clip holds, whatever the length of the clip.
@@ -115,14 +115,20 @@ fn with_slice_clip<R>(
     })
 }
 
-/// Runs `write` on the clip of `frames`, counted from the first frame `track` holds.
+/// Runs `write` on the clip of `frames`, counted from the first frame `track` holds, with
+/// `fades` applied to its ends.
 fn with_track_clip<T: TrackAudio + ?Sized, R>(
     track: &T,
     frames: &Range<usize>,
+    fades: Fades,
     write: impl FnOnce(&Clip) -> R,
 ) -> R {
+    let length = (frames.end - frames.start) as u64;
+    let channels = track.channels();
     let read = |first: usize, output: &mut [f32]| {
         if track.read_frames(frames.start + first, output) {
+            // The ramps are laid on the source frames, before any resampling.
+            fades.apply(output, channels, first as u64, length);
             Ok(())
         } else {
             Err(invalid_tracks())
@@ -732,17 +738,36 @@ pub fn export_routed_tracks_with_tempo<T: TrackAudio>(
     force_mono: bool,
     tempo_bpm: Option<f64>,
 ) -> io::Result<Vec<PathBuf>> {
+    export_routed_tracks_with_fades(
+        output_dir, snapshots, frames, profile, routes, force_mono, tempo_bpm, Fades::NONE,
+    )
+}
+
+/// Like [`export_routed_tracks_with_tempo`], with `fades` at the ends of the exported frames.
+/// The ramps are counted in source frames, so both lanes of a pair fade at the same moments.
+#[allow(clippy::too_many_arguments)]
+pub fn export_routed_tracks_with_fades<T: TrackAudio>(
+    output_dir: &Path,
+    snapshots: &[T],
+    frames: Range<usize>,
+    profile: WavExportProfile,
+    routes: &[ChannelRoute],
+    force_mono: bool,
+    tempo_bpm: Option<f64>,
+    fades: Fades,
+) -> io::Result<Vec<PathBuf>> {
     match snapshots {
         [one] => export_routed_track_refs(
-            output_dir, &[one], frames, profile, routes, force_mono, tempo_bpm,
+            output_dir, &[one], frames, profile, routes, force_mono, tempo_bpm, fades,
         ),
         [a, b] => export_routed_track_refs(
-            output_dir, &[a, b], frames, profile, routes, force_mono, tempo_bpm,
+            output_dir, &[a, b], frames, profile, routes, force_mono, tempo_bpm, fades,
         ),
         _ => Err(invalid_tracks()),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn export_routed_track_refs<T: TrackAudio>(
     output_dir: &Path,
     snapshots: &[&T],
@@ -751,11 +776,12 @@ pub(crate) fn export_routed_track_refs<T: TrackAudio>(
     routes: &[ChannelRoute],
     force_mono: bool,
     tempo_bpm: Option<f64>,
+    fades: Fades,
 ) -> io::Result<Vec<PathBuf>> {
     match (snapshots, routes) {
         ([snapshot], [route]) => {
             check_track_clip(*snapshot, &frames)?;
-            with_track_clip(*snapshot, &frames, |clip| {
+            with_track_clip(*snapshot, &frames, fades, |clip| {
                 export_clip_named(output_dir, clip, profile, *route, force_mono, tempo_bpm)
             })
             .map(|path| vec![path])
@@ -782,14 +808,14 @@ pub(crate) fn export_routed_track_refs<T: TrackAudio>(
                 let a_path = output_dir.join(format!("{prefix}-A.wav"));
                 let b_path = output_dir.join(format!("{prefix}-B.wav"));
                 // Both names are claimed before any audio is written.
-                let a_file = match with_track_clip(*a, &frames, |clip| {
+                let a_file = match with_track_clip(*a, &frames, fades, |clip| {
                     WavFile::create(&a_path, clip, profile, a_map)
                 }) {
                     Ok(file) => file,
                     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
                     Err(err) => return Err(err),
                 };
-                let b_file = match with_track_clip(*b, &frames, |clip| {
+                let b_file = match with_track_clip(*b, &frames, fades, |clip| {
                     WavFile::create(&b_path, clip, profile, b_map)
                 }) {
                     Ok(file) => file,
@@ -804,10 +830,10 @@ pub(crate) fn export_routed_track_refs<T: TrackAudio>(
                 let (a_written, b_written) = thread::scope(|scope| {
                     let lane_frames = &frames;
                     let b_writer = scope.spawn(move || {
-                        with_track_clip(*b, lane_frames, |clip| b_file.write(clip, threads))
+                        with_track_clip(*b, lane_frames, fades, |clip| b_file.write(clip, threads))
                     });
                     let a_written =
-                        with_track_clip(*a, lane_frames, |clip| a_file.write(clip, threads));
+                        with_track_clip(*a, lane_frames, fades, |clip| a_file.write(clip, threads));
                     (a_written, b_writer.join())
                 });
                 let b_written = b_written.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -1720,6 +1746,46 @@ mod tests {
     }
 
     #[test]
+    fn fades_ramp_both_files_of_a_pair_at_the_same_frames_and_survive_resampling() {
+        let dir = test_dir("fades");
+        let lane = |level: f32| FrozenTrack::from_interleaved(48_000, 1, 500, &[level; 400]).unwrap();
+        let tracks = [lane(1.0), lane(-0.5)];
+        let fades = Fades::new(20, 30);
+        let same_rate = WavExportProfile { sample_rate: 48_000, sample_format: WavSampleFormat::Float32 };
+        let paths = export_routed_tracks_with_fades(
+            &dir, &tracks, 10..110, same_rate, &[ChannelRoute::Merged; 2], false, None, fades,
+        )
+        .unwrap();
+        let [a, b] = [&paths[0], &paths[1]].map(|path| float_samples(&fs::read(path).unwrap()));
+        let gains: Vec<f32> = (0..100).map(|index| fades.gain(index, 100)).collect();
+        assert_eq!(a, gains);
+        assert_eq!(b, gains.iter().map(|gain| gain * -0.5).collect::<Vec<_>>());
+        assert_eq!((a[0], a[19], a[20], a[69], a[70], a[99]), (0.0, 0.95, 1.0, 1.0, 29.0 / 30.0, 0.0));
+
+        // Through the resampler the ramps keep their length in time.
+        let doubled = WavExportProfile { sample_rate: 96_000, sample_format: WavSampleFormat::Float32 };
+        let path = export_routed_tracks_with_fades(
+            &dir, &tracks[..1], 10..110, doubled, &[ChannelRoute::Merged], false, None, fades,
+        )
+        .unwrap();
+        let samples = float_samples(&fs::read(&path[0]).unwrap());
+        assert_eq!(samples.len(), 200);
+        assert!(samples[0].abs() < 0.05, "{}", samples[0]);
+        assert!(samples[..36].windows(2).all(|pair| pair[1] > pair[0]));
+        assert!((samples[100] - 1.0).abs() < 0.01, "{}", samples[100]);
+        assert!(samples[199].abs() < 0.05, "{}", samples[199]);
+
+        // Without fades the export is unchanged.
+        let plain = export_routed_tracks_with_fades(
+            &dir, &tracks[..1], 10..110, same_rate, &[ChannelRoute::Merged], false, None,
+            Fades::NONE,
+        )
+        .unwrap();
+        assert_eq!(float_samples(&fs::read(&plain[0]).unwrap()), vec![1.0; 100]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn clipped_pcm_side_channels_remain_exact_inverses() {
         let dir = test_dir("side");
         for (format, bytes_per_sample, data_offset, peak) in [
@@ -2185,7 +2251,7 @@ mod tests {
         // Resampled pieces are rendered on worker threads, so there the failure starts on one.
         for (rate, threads) in [(44_100, 1), (48_000, 1), (48_000, 2), (48_000, 3), (96_000, 8)] {
             let path = dir.join("lane.wav");
-            let error = with_track_clip(&lane(20_000), &(0..30_000), |clip| {
+            let error = with_track_clip(&lane(20_000), &(0..30_000), Fades::NONE, |clip| {
                 WavFile::create(&path, clip, profile(rate), WavChannelMap::Unchanged)?
                     .write(clip, threads)
             })
