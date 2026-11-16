@@ -1,0 +1,11 @@
+[package]
+name = "wav-export-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+backtracking-core = { path = "../../crates/backtracking-core" }
+
+# Standalone package: keeps cargo from walking up into the repository workspace.
+[workspace]

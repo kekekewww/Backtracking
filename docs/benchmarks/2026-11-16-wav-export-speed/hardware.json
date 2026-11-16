@@ -1,0 +1,140 @@
+{
+  "captured_utc": "2026-11-16T07:18:46.3322191Z",
+  "source_base_commit": "19ad609ec82e84137f755f3cf47861e499537366",
+  "source_has_uncommitted_changes": true,
+  "cpu": [
+    {
+      "Name": "13th Gen Intel(R) Core(TM) i9-13980HX",
+      "NumberOfCores": 24,
+      "NumberOfLogicalProcessors": 32,
+      "MaxClockSpeed": 2200
+    }
+  ],
+  "operating_system": {
+    "Caption": "Microsoft Windows 11 家用版",
+    "Version": "10.0.26200",
+    "BuildNumber": "26200",
+    "OSArchitecture": "64-bit",
+    "TotalVisibleMemorySize": 33163892
+  },
+  "computer_system": {
+    "Manufacturer": "ASUSTeK COMPUTER INC.",
+    "Model": "ROG Strix G614JI_G614JI",
+    "TotalPhysicalMemory": 33959825408
+  },
+  "storage": [
+    {
+      "volume": "C:",
+      "model": "NVMe WD PC SN560 SDDPNQE-1T00-1002",
+      "bus_type": "NVMe",
+      "media_type": "SSD",
+      "file_system": "NTFS"
+    },
+    {
+      "volume": "D:",
+      "model": "NVMe KINGSTON SKC3000D2048G",
+      "bus_type": "NVMe",
+      "media_type": "SSD",
+      "file_system": "NTFS"
+    }
+  ],
+  "export_output_volume": "C:",
+  "export_output_folder": "a temporary folder on C:, the volume of the default export folder; the path is not published",
+  "defender": {
+    "AMRunningMode": "Normal",
+    "RealTimeProtectionEnabled": true
+  },
+  "available_parallelism": 32,
+  "resampling_threads": {
+    "one_lane": 8,
+    "each_lane_of_a_pair": 4,
+    "rule": "half of available_parallelism, clamped to 1..=8; a pair gives each lane half of that, at least one"
+  },
+  "toolchain": {
+    "rustc": "1.95.0 (59807616e 2026-04-14)",
+    "cargo": "1.95.0 (f2d3ce0bd 2026-03-21)",
+    "host": "x86_64-pc-windows-msvc",
+    "llvm": "22.1.2",
+    "ci_toolchain": "1.99.1, not installed locally",
+    "python": "3.12.11"
+  },
+  "power_checks": [
+    {
+      "pass": "back_to_back",
+      "point": "before exports",
+      "captured_utc": "2026-11-16T07:11:52.0909057Z",
+      "battery_status": 2,
+      "battery_status_meaning": "on AC power",
+      "estimated_charge_percent": 81,
+      "power_scheme_name": "Turbo",
+      "power_scheme_guid": "6fecc5ae-f350-48a5-b669-b472cb895ccf",
+      "c_volume_free_bytes": 9158053888,
+      "c_volume_size_bytes": 994499170304
+    },
+    {
+      "pass": "back_to_back",
+      "point": "after exports",
+      "captured_utc": "2026-11-16T07:15:08.8228108Z",
+      "battery_status": 2,
+      "battery_status_meaning": "on AC power",
+      "estimated_charge_percent": 81,
+      "power_scheme_name": "Turbo",
+      "power_scheme_guid": "6fecc5ae-f350-48a5-b669-b472cb895ccf",
+      "c_volume_free_bytes": 9155317760,
+      "c_volume_size_bytes": 994499170304
+    },
+    {
+      "pass": "back_to_back",
+      "point": "after writes",
+      "captured_utc": "2026-11-16T07:15:21.0672082Z",
+      "battery_status": 2,
+      "battery_status_meaning": "on AC power",
+      "estimated_charge_percent": 81,
+      "power_scheme_name": "Turbo",
+      "power_scheme_guid": "6fecc5ae-f350-48a5-b669-b472cb895ccf",
+      "c_volume_free_bytes": 9155153920,
+      "c_volume_size_bytes": 994499170304
+    },
+    {
+      "pass": "paused",
+      "point": "before exports",
+      "captured_utc": "2026-11-16T07:18:03.1676424Z",
+      "battery_status": 2,
+      "battery_status_meaning": "on AC power",
+      "estimated_charge_percent": 81,
+      "power_scheme_name": "Turbo",
+      "power_scheme_guid": "6fecc5ae-f350-48a5-b669-b472cb895ccf",
+      "c_volume_free_bytes": 9153282048,
+      "c_volume_size_bytes": 994499170304
+    },
+    {
+      "pass": "paused",
+      "point": "after exports",
+      "captured_utc": "2026-11-16T07:29:55.4408332Z",
+      "battery_status": 2,
+      "battery_status_meaning": "on AC power",
+      "estimated_charge_percent": 81,
+      "power_scheme_name": "Turbo",
+      "power_scheme_guid": "6fecc5ae-f350-48a5-b669-b472cb895ccf",
+      "c_volume_free_bytes": 9147596800,
+      "c_volume_size_bytes": 994499170304
+    },
+    {
+      "pass": "paused",
+      "point": "after writes",
+      "captured_utc": "2026-11-16T07:31:18.3366895Z",
+      "battery_status": 2,
+      "battery_status_meaning": "on AC power",
+      "estimated_charge_percent": 81,
+      "power_scheme_name": "Turbo",
+      "power_scheme_guid": "6fecc5ae-f350-48a5-b669-b472cb895ccf",
+      "c_volume_free_bytes": 9146912768,
+      "c_volume_size_bytes": 994499170304
+    }
+  ],
+  "not_controlled": [
+    "CPU clocks and temperature",
+    "other running applications",
+    "Windows file cache and SSD internal caching"
+  ]
+}

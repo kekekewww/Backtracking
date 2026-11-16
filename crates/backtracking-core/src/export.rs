@@ -1,19 +1,33 @@
 use std::f64::consts::PI;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{ChannelRoute, FrozenTrack, Snapshot};
 
 const PHASES: usize = 256;
-/// How many frames the writer holds at a time, whatever the length of the clip.
+/// How many output frames one piece of a clip holds, whatever the length of the clip.
+/// The writer holds one piece at a time, and each resampling thread at most two more.
 const CHUNK_FRAMES: usize = 4096;
+/// The most threads one export resamples on, however many the processor offers.
+const MAX_RESAMPLING_THREADS: usize = 8;
+
+/// Threads an export may resample on: half of the processor's, so capture, the UI and
+/// a plug-in host's audio engine keep the rest, and never more than eight.
+fn resampling_threads() -> usize {
+    thread::available_parallelism()
+        .map_or(1, |threads| threads.get() / 2)
+        .clamp(1, MAX_RESAMPLING_THREADS)
+}
 
 /// One lane of audio the WAV exporter reads a piece at a time, so a lane held in
-/// shared pages is written without first being copied into one buffer.
-pub trait TrackAudio {
+/// shared pages is written without first being copied into one buffer. Resampling
+/// reads one lane from several threads at once.
+pub trait TrackAudio: Sync {
     fn sample_rate(&self) -> u32;
     fn channels(&self) -> usize;
     /// The frames this lane holds, on the retained-audio timeline.
@@ -72,7 +86,7 @@ struct Clip<'a> {
     /// False when the source ends inside a frame.
     whole_frames: bool,
     /// Fills its buffer with whole interleaved frames, starting at the given clip frame.
-    read: &'a dyn Fn(usize, &mut [f32]) -> io::Result<()>,
+    read: &'a (dyn Fn(usize, &mut [f32]) -> io::Result<()> + Sync),
 }
 
 impl Clip<'_> {
@@ -262,54 +276,99 @@ fn write_wav_mapped(
     profile: WavExportProfile,
     channel_map: WavChannelMap,
 ) -> io::Result<()> {
-    let source_sample_rate = clip.sample_rate;
-    let channels = clip.channels;
-    if source_sample_rate == 0 || !matches!(channels, 1 | 2) || !clip.whole_frames {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "expected a nonzero sample rate and whole mono or stereo frames",
-        ));
-    }
-    if !WavExportProfile::SAMPLE_RATES.contains(&profile.sample_rate) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "expected an export rate of 44,100, 48,000 or 96,000 Hz",
-        ));
-    }
+    WavFile::create(path, clip, profile, channel_map)?.write(clip, resampling_threads())
+}
 
-    let source_frames = clip.frames;
-    let rate = u128::from(source_sample_rate);
-    let rounded = (source_frames as u128 * u128::from(profile.sample_rate) + rate / 2) / rate;
-    let frames = rounded.max((source_frames != 0) as u128);
-    let output_channels = channel_map.output_channels(channels) as u16;
-    let frame_bytes = output_channels * (profile.sample_format.bits_per_sample() / 8);
-    let data_bytes = frames * u128::from(frame_bytes);
-    let riff_size = data_bytes + data_bytes % 2 + u128::from(profile.sample_format.riff_overhead());
-    if riff_size > u128::from(u32::MAX) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "selection exceeds the RIFF WAV size limit",
-        ));
-    }
+/// A new WAV file sized for one clip, with no audio in it yet. Creating it claims the
+/// name, so both files of a pair are claimed before either is written.
+struct WavFile<'p> {
+    path: &'p Path,
+    file: File,
+    profile: WavExportProfile,
+    channel_map: WavChannelMap,
+    channels: u16,
+    frames: u32,
+    data_bytes: u32,
+}
 
-    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    let result = {
-        let mut writer = BufWriter::new(file);
-        write_wave_from_clip(
-            &mut writer,
+impl<'p> WavFile<'p> {
+    fn create(
+        path: &'p Path,
+        clip: &Clip,
+        profile: WavExportProfile,
+        channel_map: WavChannelMap,
+    ) -> io::Result<Self> {
+        let source_sample_rate = clip.sample_rate;
+        let channels = clip.channels;
+        if source_sample_rate == 0 || !matches!(channels, 1 | 2) || !clip.whole_frames {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected a nonzero sample rate and whole mono or stereo frames",
+            ));
+        }
+        if !WavExportProfile::SAMPLE_RATES.contains(&profile.sample_rate) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected an export rate of 44,100, 48,000 or 96,000 Hz",
+            ));
+        }
+
+        let source_frames = clip.frames;
+        let rate = u128::from(source_sample_rate);
+        let rounded = (source_frames as u128 * u128::from(profile.sample_rate) + rate / 2) / rate;
+        let frames = rounded.max((source_frames != 0) as u128);
+        let output_channels = channel_map.output_channels(channels) as u16;
+        let frame_bytes = output_channels * (profile.sample_format.bits_per_sample() / 8);
+        let data_bytes = frames * u128::from(frame_bytes);
+        let riff_size =
+            data_bytes + data_bytes % 2 + u128::from(profile.sample_format.riff_overhead());
+        if riff_size > u128::from(u32::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "selection exceeds the RIFF WAV size limit",
+            ));
+        }
+
+        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        Ok(Self {
+            path,
+            file,
             profile,
-            output_channels,
-            frames as u32,
-            data_bytes as u32,
-            clip,
             channel_map,
-        )
-        .and_then(|()| writer.flush())
-    };
-    if result.is_err() {
-        let _ = fs::remove_file(path);
+            channels: output_channels,
+            frames: frames as u32,
+            data_bytes: data_bytes as u32,
+        })
     }
-    result
+
+    /// Writes `clip`, the clip the file was created for, resampling on up to `threads`
+    /// threads. A file that cannot be completed is removed.
+    fn write(self, clip: &Clip, threads: usize) -> io::Result<()> {
+        let result = {
+            let mut writer = BufWriter::new(self.file);
+            write_wave_from_clip(
+                &mut writer,
+                self.profile,
+                self.channels,
+                self.frames,
+                self.data_bytes,
+                clip,
+                self.channel_map,
+                threads,
+            )
+            .and_then(|()| writer.flush())
+        };
+        if result.is_err() {
+            let _ = fs::remove_file(self.path);
+        }
+        result
+    }
+
+    /// Closes and removes a file whose partner could not be created.
+    fn discard(self) -> io::Result<()> {
+        drop(self.file);
+        fs::remove_file(self.path)
+    }
 }
 
 /// Creates the output directory if needed and saves a uniquely named clip.
@@ -713,6 +772,8 @@ pub(crate) fn export_routed_track_refs<T: TrackAudio>(
                 clip_seconds(frames.end - frames.start, a.sample_rate()),
                 tempo_bpm,
             );
+            // The lanes are written at the same time, so each resamples on half the threads.
+            let threads = (resampling_threads() / 2).max(1);
             let mut attempt = 0;
             loop {
                 // Both lanes of a take share one name, so a clash on either file moves the pair on.
@@ -720,24 +781,51 @@ pub(crate) fn export_routed_track_refs<T: TrackAudio>(
                 let prefix = numbered_take(&take, attempt);
                 let a_path = output_dir.join(format!("{prefix}-A.wav"));
                 let b_path = output_dir.join(format!("{prefix}-B.wav"));
-                match with_track_clip(*a, &frames, |clip| {
-                    write_wav_mapped(&a_path, clip, profile, a_map)
+                // Both names are claimed before any audio is written.
+                let a_file = match with_track_clip(*a, &frames, |clip| {
+                    WavFile::create(&a_path, clip, profile, a_map)
                 }) {
-                    Ok(()) => {}
+                    Ok(file) => file,
                     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
                     Err(err) => return Err(err),
-                }
-                match with_track_clip(*b, &frames, |clip| {
-                    write_wav_mapped(&b_path, clip, profile, b_map)
+                };
+                let b_file = match with_track_clip(*b, &frames, |clip| {
+                    WavFile::create(&b_path, clip, profile, b_map)
                 }) {
-                    Ok(()) => return Ok(vec![a_path, b_path]),
+                    Ok(file) => file,
                     Err(err) => {
-                        fs::remove_file(a_path)?;
-                        if err.kind() != io::ErrorKind::AlreadyExists {
-                            return Err(err);
+                        a_file.discard()?;
+                        if err.kind() == io::ErrorKind::AlreadyExists {
+                            continue;
                         }
+                        return Err(err);
                     }
-                }
+                };
+                let (a_written, b_written) = thread::scope(|scope| {
+                    let lane_frames = &frames;
+                    let b_writer = scope.spawn(move || {
+                        with_track_clip(*b, lane_frames, |clip| b_file.write(clip, threads))
+                    });
+                    let a_written =
+                        with_track_clip(*a, lane_frames, |clip| a_file.write(clip, threads));
+                    (a_written, b_writer.join())
+                });
+                let b_written = b_written.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                // A lane that could not be written removed its own file. Its partner goes
+                // too, so half of a pair is never left behind.
+                return match (a_written, b_written) {
+                    (Ok(()), Ok(())) => Ok(vec![a_path, b_path]),
+                    (Err(err), b_written) => {
+                        if b_written.is_ok() {
+                            fs::remove_file(&b_path)?;
+                        }
+                        Err(err)
+                    }
+                    (Ok(()), Err(err)) => {
+                        fs::remove_file(&a_path)?;
+                        Err(err)
+                    }
+                };
             }
         }
         _ => Err(invalid_tracks()),
@@ -814,7 +902,9 @@ fn write_header(
 }
 
 /// Writes a complete WAV, reading the clip and, when the rates differ, resampling it
-/// a bounded piece at a time. The bytes are those of [`write_wave`] over the whole clip.
+/// a bounded piece at a time on up to `threads` threads. The bytes are those of
+/// [`write_wave`] over the whole clip, whatever the number of threads.
+#[allow(clippy::too_many_arguments)]
 fn write_wave_from_clip(
     output: &mut impl Write,
     profile: WavExportProfile,
@@ -823,6 +913,7 @@ fn write_wave_from_clip(
     data_bytes: u32,
     clip: &Clip,
     channel_map: WavChannelMap,
+    threads: usize,
 ) -> io::Result<()> {
     write_header(output, profile, channels, frames, data_bytes)?;
     let mut encoder = SampleEncoder::new(
@@ -848,55 +939,107 @@ fn write_wave_from_clip(
             })
         }
     };
-    let width = clip.channels;
-    let mut source = Vec::new();
     if clip.sample_rate == profile.sample_rate || clip.frames == 0 {
+        let mut source = Vec::new();
         let mut first = 0;
         while first < clip.frames {
             let count = (clip.frames - first).min(CHUNK_FRAMES);
-            source.resize(count * width, 0.0);
+            source.resize(count * clip.channels, 0.0);
             clip.read(first, &mut source)?;
             write(&source)?;
             first += count;
         }
     } else {
-        // Each piece of output needs only the source frames its filter taps reach,
-        // so the resampler runs on a short window instead of the whole clip.
-        let step = f64::from(clip.sample_rate) / f64::from(profile.sample_rate);
-        let kernel = ResamplingKernel::new(step);
-        let last_frame = (clip.frames - 1) as isize;
-        let window_frame = |frame: usize, reach: isize| {
-            (((frame as f64 * step).floor() as isize) + reach).clamp(0, last_frame) as usize
-        };
-        let frames = frames as usize;
-        let mut resampled = Vec::with_capacity(CHUNK_FRAMES.min(frames) * width);
-        let mut first = 0;
-        while first < frames {
-            let end = (first + CHUNK_FRAMES).min(frames);
-            let window_first = window_frame(first, -kernel.radius);
-            let window_last = window_frame(end - 1, kernel.radius);
-            source.resize((window_last - window_first + 1) * width, 0.0);
-            clip.read(window_first, &mut source)?;
-            resampled.clear();
-            for frame in first..end {
-                let frame = kernel.at_window(
-                    &source,
-                    width,
-                    frame as f64 * step,
-                    window_first as isize,
-                    last_frame,
-                );
-                resampled.extend_from_slice(&frame[..width]);
-            }
-            write(&resampled)?;
-            first = end;
-        }
+        resample_clip(clip, profile.sample_rate, frames as usize, threads, &mut write)?;
     }
     encoder.finish()?;
     if data_bytes % 2 != 0 {
         output.write_all(&[0])?;
     }
     Ok(())
+}
+
+/// Resamples `clip` to `frames` frames at `target_rate` and hands them to `write` in
+/// order, a piece of [`CHUNK_FRAMES`] at a time. With more than one thread, worker
+/// threads render the pieces while this one encodes and writes them.
+fn resample_clip(
+    clip: &Clip,
+    target_rate: u32,
+    frames: usize,
+    threads: usize,
+    write: &mut dyn FnMut(&[f32]) -> io::Result<()>,
+) -> io::Result<()> {
+    let width = clip.channels;
+    let step = f64::from(clip.sample_rate) / f64::from(target_rate);
+    let kernel = ResamplingKernel::new(step);
+    let last_frame = (clip.frames - 1) as isize;
+    let window_frame = |frame: usize, reach: isize| {
+        (((frame as f64 * step).floor() as isize) + reach).clamp(0, last_frame) as usize
+    };
+    // Each piece of output needs only the source frames its filter taps reach, so it
+    // is resampled from a short window instead of the whole clip.
+    let render = |piece: usize, window: &mut Vec<f32>, output: &mut Vec<f32>| -> io::Result<()> {
+        let first = piece * CHUNK_FRAMES;
+        let end = (first + CHUNK_FRAMES).min(frames);
+        let window_first = window_frame(first, -kernel.radius);
+        let window_last = window_frame(end - 1, kernel.radius);
+        window.resize((window_last - window_first + 1) * width, 0.0);
+        clip.read(window_first, window)?;
+        output.clear();
+        for frame in first..end {
+            let frame = kernel.at_window(
+                window,
+                width,
+                frame as f64 * step,
+                window_first as isize,
+                last_frame,
+            );
+            output.extend_from_slice(&frame[..width]);
+        }
+        Ok(())
+    };
+    let pieces = frames.div_ceil(CHUNK_FRAMES);
+    let workers = threads.min(pieces).max(1);
+    if workers == 1 {
+        let mut window = Vec::new();
+        let mut output = Vec::with_capacity(CHUNK_FRAMES.min(frames) * width);
+        for piece in 0..pieces {
+            render(piece, &mut window, &mut output)?;
+            write(&output)?;
+        }
+        return Ok(());
+    }
+    thread::scope(|scope| -> io::Result<()> {
+        let render = &render;
+        // Worker `w` renders pieces w, w + workers, w + 2 × workers and so on, each
+        // handed over through the worker's own channel. The pieces arrive in order, and
+        // no worker gets more than two pieces ahead of the writer.
+        let finished: Vec<_> = (0..workers)
+            .map(|worker| {
+                let (sender, receiver) = mpsc::sync_channel(1);
+                scope.spawn(move || {
+                    let mut window = Vec::new();
+                    for piece in (worker..pieces).step_by(workers) {
+                        let mut output = Vec::with_capacity(CHUNK_FRAMES * width);
+                        let rendered = render(piece, &mut window, &mut output).map(|()| output);
+                        let failed = rendered.is_err();
+                        // The writer stops listening when it fails, and the worker stops with it.
+                        if sender.send(rendered).is_err() || failed {
+                            break;
+                        }
+                    }
+                });
+                receiver
+            })
+            .collect();
+        for piece in 0..pieces {
+            let samples = finished[piece % workers]
+                .recv()
+                .map_err(|_| io::Error::other("a resampling thread stopped"))??;
+            write(&samples)?;
+        }
+        Ok(())
+    })
 }
 
 /// Turns samples into WAV bytes, handing them on a block at a time.
@@ -1059,6 +1202,43 @@ impl ResamplingKernel {
     /// `window_first` on. `last_frame` is the last frame of the whole clip, and
     /// `window` must hold every frame the taps around `position` reach.
     fn at_window(
+        &self,
+        window: &[f32],
+        channels: usize,
+        position: f64,
+        window_first: isize,
+        last_frame: isize,
+    ) -> [f32; 2] {
+        let first = position.floor() as isize - self.radius;
+        let weights = &self.phases[(position.fract() * PHASES as f64).round() as usize];
+        let last = first + weights.len() as isize - 1;
+        if first < 0 || last > last_frame || !matches!(channels, 1 | 2) {
+            return self.at_edge(window, channels, position, window_first, last_frame);
+        }
+        // Every tap lies inside the clip, so the taps are one run of the window and none
+        // needs clamping. Each sum adds the same products in the same order as
+        // `at_edge`, so the result is identical to the bit.
+        let start = (first - window_first) as usize * channels;
+        let taps = &window[start..start + weights.len() * channels];
+        if channels == 1 {
+            let mut sum = 0.0f64;
+            for (&sample, &weight) in taps.iter().zip(weights) {
+                sum += f64::from(sample) * weight;
+            }
+            [sum as f32, 0.0]
+        } else {
+            let (mut left, mut right) = (0.0f64, 0.0f64);
+            for (frame, &weight) in taps.chunks_exact(2).zip(weights) {
+                left += f64::from(frame[0]) * weight;
+                right += f64::from(frame[1]) * weight;
+            }
+            [left as f32, right as f32]
+        }
+    }
+
+    /// [`Self::at_window`] for any position: taps that reach past either end of the
+    /// clip repeat its first or last frame.
+    fn at_edge(
         &self,
         window: &[f32],
         channels: usize,
@@ -1854,16 +2034,20 @@ mod tests {
             let samples = noise(written + 1, frames * channels);
             let path = dir.join(format!("{written}.wav"));
             written += 1;
-            with_slice_clip(source_rate, channels, &samples, |clip| {
-                write_wav_mapped(&path, clip, profile, channel_map)
-            })
-            .unwrap();
             let expected = reference_wav(source_rate, channels, &samples, profile, channel_map);
-            assert!(
-                fs::read(&path).unwrap() == expected,
-                "{source_rate} Hz, {frames} frames of {channels} channels to {profile:?}"
-            );
-            fs::remove_file(path).unwrap();
+            // One thread, and thread counts that share a clip's pieces out unevenly.
+            for threads in [1, 2, 3, 8] {
+                with_slice_clip(source_rate, channels, &samples, |clip| {
+                    WavFile::create(&path, clip, profile, channel_map)?.write(clip, threads)
+                })
+                .unwrap();
+                assert!(
+                    fs::read(&path).unwrap() == expected,
+                    "{source_rate} Hz, {frames} frames of {channels} channels to {profile:?} \
+                     on {threads} threads"
+                );
+                fs::remove_file(&path).unwrap();
+            }
         };
         // Clip lengths on both sides of the piece the writer handles at a time, at the
         // same rate and resampled up and down, with the widest filter the exporter uses.
@@ -1921,6 +2105,156 @@ mod tests {
         }
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unclamped_interior_taps_sum_to_the_same_bits_as_clamped_ones() {
+        // Up and down, by small and large ratios, up to the widest filter the exporter uses.
+        for (source_rate, target_rate) in [
+            (48_000, 96_000),
+            (44_100, 96_000),
+            (44_100, 48_000),
+            (48_000, 44_100),
+            (96_000, 44_100),
+            (400_000, 44_100),
+        ] {
+            let step = f64::from(source_rate) / f64::from(target_rate);
+            let kernel = ResamplingKernel::new(step);
+            for channels in [1, 2] {
+                let frames = 3 * kernel.radius() + 700;
+                let samples = noise(channels as u64, frames * channels);
+                let last_frame = frames as isize - 1;
+                let mut interior = 0;
+                for frame in 0..(frames as f64 / step) as usize {
+                    let position = frame as f64 * step;
+                    let first = position.floor() as isize - kernel.radius;
+                    interior += usize::from(first >= 0 && first + 2 * kernel.radius <= last_frame);
+                    assert_eq!(
+                        kernel.at_window(&samples, channels, position, 0, last_frame).map(f32::to_bits),
+                        kernel.at_edge(&samples, channels, position, 0, last_frame).map(f32::to_bits),
+                        "{source_rate} Hz to {target_rate} Hz, {channels} channels, frame {frame}"
+                    );
+                }
+                assert!(interior > 0, "{source_rate} Hz to {target_rate} Hz");
+            }
+        }
+    }
+
+    /// A lane that claims frames it cannot read, like a source that fails during an export.
+    struct Unreadable {
+        lane: Snapshot,
+        readable: usize,
+    }
+
+    impl TrackAudio for Unreadable {
+        fn sample_rate(&self) -> u32 {
+            self.lane.sample_rate
+        }
+
+        fn channels(&self) -> usize {
+            self.lane.channels
+        }
+
+        fn frame_range(&self) -> Range<u64> {
+            self.lane.frame_range()
+        }
+
+        fn read_frames(&self, first: usize, output: &mut [f32]) -> bool {
+            first + output.len() / self.lane.channels <= self.readable
+                && TrackAudio::read_frames(&self.lane, first, output)
+        }
+    }
+
+    #[test]
+    fn an_export_that_fails_part_way_leaves_no_file_behind() {
+        let dir = test_dir("unreadable");
+        fs::create_dir_all(&dir).unwrap();
+        let lane = |readable| Unreadable {
+            lane: Snapshot {
+                sample_rate: 44_100,
+                channels: 2,
+                samples: noise(3, 30_000 * 2),
+                first_frame: 0,
+            },
+            readable,
+        };
+        let profile = |sample_rate| WavExportProfile {
+            sample_rate,
+            sample_format: WavSampleFormat::Float32,
+        };
+        // Resampled pieces are rendered on worker threads, so there the failure starts on one.
+        for (rate, threads) in [(44_100, 1), (48_000, 1), (48_000, 2), (48_000, 3), (96_000, 8)] {
+            let path = dir.join("lane.wav");
+            let error = with_track_clip(&lane(20_000), &(0..30_000), |clip| {
+                WavFile::create(&path, clip, profile(rate), WavChannelMap::Unchanged)?
+                    .write(clip, threads)
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(!path.exists(), "{rate} Hz on {threads} threads");
+        }
+        // Whichever lane of a pair fails, its partner is removed with it.
+        for readable in [[30_000, 20_000], [20_000, 30_000]] {
+            for rate in [44_100, 96_000] {
+                let lanes = readable.map(lane);
+                let routes = [ChannelRoute::Merged; 2];
+                assert!(export_routed_tracks_with_profile(
+                    &dir,
+                    &lanes,
+                    0..30_000,
+                    profile(rate),
+                    &routes,
+                    false
+                )
+                .is_err());
+                assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "{readable:?} at {rate} Hz");
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Takes `room` bytes, then fails like a full disk.
+    struct FullDisk {
+        room: usize,
+    }
+
+    impl Write for FullDisk {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.room == 0 {
+                return Err(io::Error::other("disk full"));
+            }
+            let taken = bytes.len().min(self.room);
+            self.room -= taken;
+            Ok(taken)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_write_stops_every_resampling_thread() {
+        let samples = noise(5, 100_000 * 2);
+        let profile = WavExportProfile::default();
+        let frames = ((100_000u64 * 48_000 + 22_050) / 44_100) as u32;
+        for threads in [1, 2, 3, 8] {
+            // Returning at all shows that no worker was left waiting to hand over a piece.
+            let error = with_slice_clip(44_100, 2, &samples, |clip| {
+                write_wave_from_clip(
+                    &mut FullDisk { room: 50_000 },
+                    profile,
+                    2,
+                    frames,
+                    frames * 8,
+                    clip,
+                    WavChannelMap::Unchanged,
+                    threads,
+                )
+            })
+            .unwrap_err();
+            assert_eq!(error.to_string(), "disk full", "{threads} threads");
+        }
     }
 
     #[test]

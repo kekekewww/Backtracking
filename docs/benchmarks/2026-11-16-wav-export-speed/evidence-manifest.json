@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-11-16T07:56:29.744269Z",
+  "evidence_type": "harness timings of the shared core's WAV export, base commit against the changed working tree, on one Windows laptop; plain-write timings on the same volume; local test-suite results",
+  "source_base_commit": "19ad609ec82e84137f755f3cf47861e499537366",
+  "source_has_uncommitted_changes": true,
+  "source_files": [
+    {
+      "path": "crates/backtracking-core/src/export.rs",
+      "version": "base",
+      "git_blob": "e96e2ace29f420a7f456b10043299dff24f6196d",
+      "size_bytes": 72065,
+      "sha256": "6bd550fd8e9e1cc9ad3ac6c8903268c4b26ee8c6d66eb66db73b34ed3cbfe919"
+    },
+    {
+      "path": "crates/backtracking-core/src/export.rs",
+      "version": "change",
+      "git_blob": "8f1a46160464ed9b1f3c80af8c58e56d8fe1d3b6",
+      "size_bytes": 85456,
+      "sha256": "3bde2568c371f2a6183d0a434a24e14c27c172862043da3f8de05c69128c012f"
+    }
+  ],
+  "source_files_note": "size_bytes and sha256 are of the bytes git stores for each blob, with LF line endings; the Windows working copies that were built had CRLF line endings from core.autocrlf",
+  "harness_build_command": "cargo build --release --locked, from target/wav-export-bench of each checkout",
+  "harness_builds": [
+    {
+      "pass": "back_to_back",
+      "harness_source_sha256": "7064aa3a6d7252b3533975efa5399168713b08d2758d62664965ef564537f621",
+      "harness_source_note": "the harness before its optional pause argument was added; called without that argument, the published source runs the same code and adds pause_before_ms to each line",
+      "base_exe_sha256": "ced73014d243dbe7078456ceff37f9725dfb809c8d7306ae1508e4963ae2ba79",
+      "change_exe_sha256": "d30779f955aa5a8ab70fa346701c210c82465dcd2ad7e9426d94b6c5bccd9d98"
+    },
+    {
+      "pass": "paused",
+      "harness_source_sha256": "c806f4be44eb5d1f379df0e6694b12f3747a7d3a436be410bf61bf475eeea45b",
+      "harness_source_note": "the published export-bench-source.rs",
+      "base_exe_sha256": "b1b019afebffe57999cbeb862a31d5c0db09da2c35a33ec18690f292087dbdbf",
+      "change_exe_sha256": "3080c87b407535fea2f98c57865154142fabdcd6eb13dc8ae6c530c2eeb969f1"
+    }
+  ],
+  "output_check_build": {
+    "source": "output-check-source.rs, built as src/bin/output-check.rs beside the paused-pass harness",
+    "source_sha256": "91c03f661384361e448fcb2b119f14f88654d550b653092db70d70e9a6ff21c5",
+    "base_exe_sha256": "2c1b67b8c231c6f58086b3ae8dd11effc32f974cd76e13adcf309a36a0edacf7",
+    "change_exe_sha256": "dca60edb34ee046db8c6e399aaf1fae628b4fc51ad72897549cfe6c5afabed1b"
+  },
+  "harness_exe_note": "the executables embed local build paths, so their hashes identify these builds only",
+  "files": [
+    {
+      "name": "compare-outputs.py",
+      "size_bytes": 2420,
+      "sha256": "cad76b6982e5e954d3ae022120a840370c964c644f9929f81b71c3896311802f"
+    },
+    {
+      "name": "disk-writes-back-to-back.jsonl",
+      "size_bytes": 2586,
+      "sha256": "d99113e62bebf4ce493fae409a914ef0bed081db0f160438397cc98a0c666b0f"
+    },
+    {
+      "name": "disk-writes-paused.jsonl",
+      "size_bytes": 3184,
+      "sha256": "d48304b1fdc4e375d7d1ab3834834b1a38ea5b1ee182801270e170579ac0a3ae"
+    },
+    {
+      "name": "export-bench-Cargo.lock",
+      "size_bytes": 259,
+      "sha256": "f7f59f600caa86e66c69c46e74b0452e52e9389030389866ccf4da436e71f50d"
+    },
+    {
+      "name": "export-bench-Cargo.toml",
+      "size_bytes": 261,
+      "sha256": "719e675f54967e4304f77554bdbf4872832bb94c0c3c58c6d207f090347cec8a"
+    },
+    {
+      "name": "export-bench-source.rs",
+      "size_bytes": 7011,
+      "sha256": "c806f4be44eb5d1f379df0e6694b12f3747a7d3a436be410bf61bf475eeea45b"
+    },
+    {
+      "name": "export-timings-back-to-back.jsonl",
+      "size_bytes": 36827,
+      "sha256": "63441c04a2818ac3944839d41410ed4796186d8f42eb04724cad02ec86343e29"
+    },
+    {
+      "name": "export-timings-paused.jsonl",
+      "size_bytes": 41059,
+      "sha256": "53d873518ff948c66b7e4bbc1b65d197f16d14c043af06038171b0b31cc64eaf"
+    },
+    {
+      "name": "hardware.json",
+      "size_bytes": 4480,
+      "sha256": "538ed2432c3302ea91e9aa4338369af3308d08e06902748c4021bd982ce8fad0"
+    },
+    {
+      "name": "local-validation.json",
+      "size_bytes": 5481,
+      "sha256": "e0bff0797e112814522d81820d3ebdeb515e089ccc60c2bf06417856832153ac"
+    },
+    {
+      "name": "output-check-source.rs",
+      "size_bytes": 5431,
+      "sha256": "91c03f661384361e448fcb2b119f14f88654d550b653092db70d70e9a6ff21c5"
+    },
+    {
+      "name": "output-comparison.jsonl",
+      "size_bytes": 243172,
+      "sha256": "50f1b06d49d1b8de2248a46cff052ff4cdcc55274aec184bf365e2c0a693ca7b"
+    },
+    {
+      "name": "README.md",
+      "size_bytes": 18503,
+      "sha256": "a6dfeaed4dd4ce5556a2b80867afddde2885700b36e98909408e4eba826421a2"
+    },
+    {
+      "name": "summarize-timings.py",
+      "size_bytes": 5989,
+      "sha256": "9578561591b85189ba7aeaad283bbb5ebf880aece96083f2ccc230cadff07712"
+    },
+    {
+      "name": "summary.json",
+      "size_bytes": 24103,
+      "sha256": "1443e4421637d88702641bf37c7762971585f6f14a41376077c4f492f1202d32"
+    }
+  ],
+  "limitations": [
+    "One laptop with 32 logical processors, on AC power with the Turbo power scheme; CPU clocks, temperature, other running applications, the Windows file cache and SSD caching were not controlled.",
+    "Machines with fewer logical processors resample on fewer threads (one per lane with 2 or 3 logical processors) and were not measured.",
+    "Timed through the shared core's export function with a harness; no export was timed in the desktop app, the plug-in or a DAW, and no drag was timed.",
+    "macOS was not built or timed locally; the Swift app reaches the same core through export_routed_track_refs.",
+    "Only 32-bit float output was timed; 16- and 24-bit PCM share the resampler but were not timed.",
+    "A run ends when its files are closed; neither the exporter nor the harness flushes them to the device, and Windows may still be writing cached data after a run.",
+    "The C: volume had about 9.2 GB (about 0.9%) free during the runs, and Microsoft Defender real-time protection was on.",
+    "Synthetic noise was exported; the resampler's cost does not depend on the audio content.",
+    "The output check compares the two builds with each other on synthetic noise in 540 combinations; other lengths, offsets and content are covered only by the unit tests.",
+    "The first pass ran an earlier harness source, before its pause argument was added; harness_builds records the source hash each pass ran.",
+    "Built with rustc 1.95.0; CI builds with 1.99.1.",
+    "Raw test logs are not published; local-validation.json copies the counts from the cargo test summaries."
+  ]
+}
