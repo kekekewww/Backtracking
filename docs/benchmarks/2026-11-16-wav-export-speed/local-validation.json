@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-11-16T07:43:02Z",
+  "evidence_origin": "fresh local runs of the four test commands in the Windows job of .github/workflows/desktop-verification.yml, on the changed working tree, with counts copied from the cargo test summaries and raw logs not published; and a byte comparison of files exported by the base and changed builds",
+  "source_base_commit": "19ad609ec82e84137f755f3cf47861e499537366",
+  "source_has_uncommitted_changes": true,
+  "changed_source_file": "crates/backtracking-core/src/export.rs",
+  "toolchain": "rustc 1.95.0 (59807616e 2026-04-14), cargo 1.95.0 (f2d3ce0bd 2026-03-21), x86_64-pc-windows-msvc; CI pins 1.99.1, which was not installed locally",
+  "local_suites": [
+    {
+      "component": "core library",
+      "command": "cargo test --workspace --locked",
+      "started_utc": "2026-11-16T07:10:23Z",
+      "finished_utc": "2026-11-16T07:10:32Z",
+      "passed": 109,
+      "failed": 0,
+      "ignored": 1,
+      "ignored_scope": "TCP loopback (same_named_senders_fan_out_and_snapshot_targets_are_independent)"
+    },
+    {
+      "component": "shared interface",
+      "command": "cargo test --locked --manifest-path crates/backtracking-ui/Cargo.toml",
+      "started_utc": "2026-11-16T07:10:32Z",
+      "finished_utc": "2026-11-16T07:11:10Z",
+      "passed": 27,
+      "failed": 0,
+      "ignored": 0,
+      "detail": "21 unit tests and 6 in tests/pinned.rs"
+    },
+    {
+      "component": "Windows desktop",
+      "command": "cargo test --locked --manifest-path desktop/windows/Cargo.toml",
+      "started_utc": "2026-11-16T07:11:10Z",
+      "finished_utc": "2026-11-16T07:11:17Z",
+      "passed": 109,
+      "failed": 0,
+      "ignored": 3,
+      "ignored_scope": [
+        "native Process Loopback smoke (native_quiet_retention_process_loopback_smoke)",
+        "durable preference-write probe (preference_save_latency_probe)",
+        "real Alt+grave shortcut registration (alt_grave_registers_reports_conflicts_and_is_released_on_exit)"
+      ]
+    },
+    {
+      "component": "VST3/CLAP plug-in",
+      "command": "cargo test --locked --manifest-path plugins/backtracking-plugin/Cargo.toml",
+      "started_utc": "2026-11-16T07:11:17Z",
+      "finished_utc": "2026-11-16T07:11:28Z",
+      "passed": 71,
+      "failed": 0,
+      "ignored": 0,
+      "warnings": "one dead-code warning for three Session setters in plugins/backtracking-plugin/src/session.rs; that file is not changed by this work"
+    }
+  ],
+  "export_tests": [
+    {
+      "name": "streamed_wavs_have_the_bytes_of_the_whole_clip_writer",
+      "status": "extended",
+      "checks": "streamed WAVs written on 1, 2, 3 and 8 resampling threads are byte-identical to the whole-clip reference writer, at the same rate and resampled up and down, for clip lengths around the 4,096-frame piece and for every sample format and channel map"
+    },
+    {
+      "name": "unclamped_interior_taps_sum_to_the_same_bits_as_clamped_ones",
+      "status": "new",
+      "checks": "the unclamped interior filter path returns the same f32 bits as the clamped edge path for mono and stereo at 48k to 96k, 44.1k to 96k, 44.1k to 48k, 48k to 44.1k, 96k to 44.1k and 400k to 44.1k"
+    },
+    {
+      "name": "an_export_that_fails_part_way_leaves_no_file_behind",
+      "status": "new",
+      "checks": "a lane that fails to read part way leaves no file, for single-lane exports on several rates and thread counts and for pairs whichever lane fails"
+    },
+    {
+      "name": "a_failed_write_stops_every_resampling_thread",
+      "status": "new",
+      "checks": "a writer that runs out of room part way returns its error on 1, 2, 3 and 8 threads; returning at all shows no resampling thread was left waiting to hand over a piece"
+    }
+  ],
+  "output_comparison": {
+    "program": "output-check-source.rs, built as a second binary of the harness package against each core",
+    "runs_utc": [
+      "2026-11-16T07:39:13Z",
+      "2026-11-16T07:42:17Z"
+    ],
+    "runs_note": "the second run used the final compare-outputs.py, which only reads its input more leniently; both runs wrote the same output-comparison.jsonl",
+    "exports_per_build": 540,
+    "files_per_build": 810,
+    "bytes_per_build": 1580053758,
+    "resampled_files": 540,
+    "same_rate_files": 270,
+    "identical_files": 810,
+    "different_files": 0,
+    "covers": "48 and 44.1 kHz sources; 96, 48 and 44.1 kHz exports; 16-bit, 24-bit and 32-bit float; stereo lanes merged and forced to mono, mono lanes placed left and right, as side and merged, and as mid and center; the whole 20-second clip and two short ranges starting part way in; the A/B pair and lane A alone",
+    "failure_check": "a copy of one file with one bit flipped hashed differently",
+    "detail": "output-comparison.jsonl; the WAV files are not published"
+  },
+  "not_run": [
+    "the TCP-loopback core test, which only the Linux CI job runs with --ignored",
+    "the three ignored desktop tests listed above",
+    "release builds of the desktop app and plug-in",
+    "the macOS app build and desktop/macos/verify-capture.sh, which run in CI only",
+    "clippy and rustfmt, which CI does not run; rustfmt is not installed for the local toolchain"
+  ],
+  "limitations": [
+    "Local suites are not full-platform runtime acceptance.",
+    "No exported WAV from the desktop app or a DAW was timed or inspected in this round; export speed and output bytes were checked with the programs described in README.md."
+  ]
+}

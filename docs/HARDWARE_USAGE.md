@@ -1,8 +1,86 @@
 # 硬體使用量 / Hardware usage
 
-本頁分開記錄各平台、版本與測試方式。Windows 為實機桌面版監測；下方保留較早的 Linux CLAP／共用核心資料。不同日期、版本、宿主及繪圖後端的數據不直接相比。
+本頁分開記錄各平台、版本與測試方式。Windows 為實機桌面版監測；下方保留較早的 Linux CLAP／共用核心資料。不同日期、版本、宿主及繪圖後端的數據不直接相比。2026-11-16 的 WAV 匯出速度一節例外：它在同一台電腦、同一時段，以同一個量測程式直接對照修改前後的共用核心。
 
-Windows results below cover the desktop application on a physical PC. The earlier Linux CLAP/shared-core dataset is preserved separately. Different builds, hosts, dates, and rendering backends are not controlled comparisons.
+Windows results below cover the desktop application on a physical PC. The earlier Linux CLAP/shared-core dataset is preserved separately. Different builds, hosts, dates, and rendering backends are not controlled comparisons. The 2026-11-16 WAV export section is the exception: it compares the shared core before and after one change directly, on one PC, in one sitting, with one harness.
+
+## Windows WAV 匯出速度：2026-11-16 / Windows WAV export speed
+
+較長片段匯出很慢，主因是取樣率轉換，不是寫入磁碟：修改前，600 秒的單軌以 96 kHz 匯出需 6.732 秒，而單純寫入同樣的 460.8 MB 只要 0.394 秒。本輪修改共用核心的 WAV 匯出：片段中段的濾波運算不再逐點檢查邊界、A／B 兩個檔案同時寫入，每條音軌的取樣率轉換也分給多個執行緒。同一個量測程式在同一台 Windows 筆電、同一時段交替執行修改前（`19ad609`）與修改後的核心。測試及 810 個匯出檔案的逐位元組比對都確認輸出不變。
+
+Long clips were slow to export because of resampling, not disk writes: before the change, exporting a 600-second lane at 96 kHz took 6.732 s, while a plain write of the same 460.8 MB took 0.394 s. This round changes the shared core's WAV export: interior filter taps skip the per-tap edge check, the two files of an A/B pair are written at the same time, and each lane's resampling is split across worker threads. One harness timed the core before (`19ad609`) and after the change, alternating between them on one Windows laptop in one sitting. Tests and a byte-for-byte comparison of 810 exported files confirm the output is unchanged.
+
+### 匯出測試環境 / Export test environment
+
+| 項目 / Item | 記錄 / Record |
+| --- | --- |
+| 時間 / Time | 2026-11-16 07:10–07:43 UTC，台灣時間 15:10–15:43；兩輪計時為 07:11:52–07:31:18 UTC / timing passes 07:11:52–07:31:18 UTC |
+| 系統 / OS | Windows 11 Home 64-bit, 10.0.26200 |
+| CPU | Intel Core i9-13980HX, 24 cores / 32 logical CPUs；單軌以 8 個執行緒轉換取樣率，A／B 每軌 4 個 / one lane resamples on 8 threads, each lane of a pair on 4 |
+| 輸出磁碟 / Output volume | C:，NVMe SSD（WD PC SN560），NTFS；可用空間約 9.2 GB（約 0.9%）；Microsoft Defender 即時保護開啟 / about 9.2 GB (about 0.9%) free; Defender real-time protection on |
+| 電源 / Power | 接 AC 電源，Turbo 電源計畫 / on AC power, Turbo power scheme |
+| 工具鏈 / Toolchain | rustc 1.95.0 (`59807616e`, 2026-04-14), cargo 1.95.0, `x86_64-pc-windows-msvc`；CI 使用 1.99.1 / CI uses 1.99.1 |
+| 程式 / Code | 修改前 / Before：`19ad609`；修改後 / After：`19ad609` 加上新的 `export.rs`，提交前量測 / plus the new `export.rs`, timed before it was committed |
+
+### 匯出量測方法 / Export method
+
+量測程式把兩條立體聲合成雜訊音軌放入 `Capture` 後凍結，交給 Windows 版寫出片段時呼叫的 `export_routed_tracks_with_profile`，輸出 32-bit float WAV 到 C: 的暫存資料夾，與預設匯出資料夾在同一磁碟。每次計時包含取得檔名、轉換取樣率、編碼、寫入及關閉檔案，不含建立擷取資料與刪除檔案。修改前後交替執行，每種情況 5 次（600 秒為 3 次），表列全部次數的中位數，沒有捨棄任何一次。整套量測跑了兩輪：第一輪連續執行，修改後的匯出與單純寫入有時比同一情況最快的一次慢上數倍；第二輪在每次計時前先等 3 秒，讓先前的寫入有時間完成，也較接近一次拖曳一個片段。下表取自第二輪；兩輪的完整數據及最快、最慢值見證據資料夾。
+
+The harness held two stereo lanes of synthetic noise in a `Capture`, froze them, and passed them to `export_routed_tracks_with_profile`, the call the Windows app makes when it writes a clip. Output was 32-bit float WAV in a temporary folder on C:, the volume of the default export folder. Each timed run covers claiming the file names, resampling, encoding, writing, and closing the files; building the capture and deleting the files are not timed. The builds alternated, each case ran five times (600-second cases three times), and the table reports the median of every run, with none discarded. The whole sequence ran twice. In the first pass runs followed each other directly, and some runs of the changed build and some plain writes took several times as long as the fastest run of the same case. The second pass waited 3 seconds before each timed run, giving earlier writes time to finish, which is also closer to dragging one clip at a time. The table is from the second pass; both passes, with fastest and slowest runs, are in the evidence directory.
+
+### 匯出時間 / Export time
+
+單位為秒，取中位數；括號內為修改後的倍速。/ Seconds, median; brackets give how many times as fast the change is.
+
+| 片段 / Clip | 取樣率 / Rates | A／B 成對，修改前 → 後 / A/B pair, before → after | 只匯出 A，修改前 → 後 / Lane A alone, before → after |
+| ---: | --- | ---: | ---: |
+| 60 s | 48 → 96 kHz | 1.281 → 0.103 (12.4×) | 0.619 → 0.079 (7.8×) |
+| 60 s | 48 → 48 kHz | 0.083 → 0.051 (1.6×) | 0.042 → 0.044 (0.9×) |
+| 60 s | 48 → 44.1 kHz | 0.662 → 0.053 (12.6×) | 0.324 → 0.036 (9.1×) |
+| 60 s | 44.1 → 96 kHz | 1.231 → 0.113 (10.9×) | 0.616 → 0.078 (7.9×) |
+| 60 s | 44.1 → 48 kHz | 0.623 → 0.049 (12.7×) | 0.311 → 0.037 (8.4×) |
+| 180 s | 48 → 96 kHz | 3.699 → 0.289 (12.8×) | 1.833 → 0.233 (7.9×) |
+| 180 s | 48 → 48 kHz | 0.221 → 0.118 (1.9×) | 0.117 → 0.109 (1.1×) |
+| 180 s | 48 → 44.1 kHz | 1.917 → 0.150 (12.8×) | 0.981 → 0.105 (9.4×) |
+| 600 s | 48 → 96 kHz | 13.157 → 1.300 (10.1×) | 6.732 → 0.923 (7.3×) |
+| 600 s | 48 → 48 kHz | 0.777 → 0.460 (1.7×) | 0.377 → 0.374 (1.0×) |
+
+需要轉換取樣率時，A／B 成對匯出快 10.1–12.8 倍，單軌快 7.3–9.4 倍；成對匯出的兩軌原本先後處理，現在同時進行，所以幅度較大。取樣率不變時不必轉換，只有兩個檔案同時寫入的部分生效：成對匯出快 1.6–1.9 倍；單軌的程式沒有改動，結果為修改前的 0.9–1.1 倍，兩者最快至最慢的範圍互相重疊。修改後，單純寫入 600 秒單軌的 460.8 MB 需 0.394 秒，約為該次匯出 0.923 秒的 43%，磁碟已是長片段匯出的主要成本之一。
+
+With resampling, A/B pairs were 10.1–12.8 times as fast and single lanes 7.3–9.4 times. Pairs gain more because their two lanes, which used to run one after the other, now run at the same time. At the capture rate nothing is resampled and only the simultaneous writing of both files applies: pairs were 1.6–1.9 times as fast. Single lanes at the capture rate, whose code is unchanged, measured 0.9–1.1 times the base, with overlapping ranges. After the change, a plain write of a 600-second lane's 460.8 MB took 0.394 s, 43% of the 0.923 s that lane's export took, so the disk is now a large part of a long export.
+
+第一輪連續執行時，修改後的中位數最多是第二輪的 2.78 倍，例如 180 秒 48 → 96 kHz 的成對匯出為 0.803 秒；修改前最多是 1.58 倍。可見在這顆幾乎全滿的磁碟上，連續匯出大量資料的耗時起伏很大。
+
+In the first pass, with runs back to back, the changed build's medians were up to 2.78 times the second pass's, for example 0.803 s for a 180-second pair from 48 to 96 kHz, and the base's up to 1.58 times. Back-to-back exports of this much data on this nearly full volume vary widely.
+
+### 匯出相關測試 / Export tests
+
+同一份修改以本機工具鏈通過 Windows CI 的四組測試：核心 109 passed／1 ignored（TCP loopback）、共用介面 27 passed、Windows 桌面 109 passed／3 ignored、插件 71 passed。與本次修改相關的匯出測試確認：以 1、2、3、8 個執行緒寫出的 WAV 與整段一次寫出的位元組相同；中段快速路徑的加總與逐點檢查邊界的結果位元相同；一條音軌中途讀取失敗時，單軌或成對匯出都不留下檔案；寫入失敗時沒有轉換執行緒卡住。插件建置有一則未使用方法的警告，位於本次未修改的檔案。另外以修改前後的核心各匯出同樣的 540 種組合，共 810 個檔案，涵蓋三種輸出取樣率、16／24-bit 與 32-bit float、所有聲道配置及從中段開始的短區段；逐檔比對 SHA-256，全部相同。
+
+The four test commands of the Windows CI job passed on the changed source with the local toolchain: core 109 passed and 1 ignored (TCP loopback), shared interface 27 passed, Windows desktop 109 passed and 3 ignored, and plug-in 71 passed. The export tests for this change check that WAVs written on 1, 2, 3, and 8 threads are byte-identical to the whole-clip writer, that the fast interior path sums to the same bits as the edge-checked path, that a lane failing part way leaves no file in single or paired exports, and that a failed write leaves no resampling thread waiting. The plug-in build printed one dead-code warning in a file this change does not touch. In addition, both builds exported the same 540 combinations, 810 files covering all three export rates, 16- and 24-bit PCM and 32-bit float, every channel map, and short ranges starting part way in; every file's SHA-256 matched.
+
+### 匯出量測的限制 / Export measurement limits
+
+- 只量測這台有 32 個邏輯 CPU 的筆電；邏輯 CPU 較少的電腦會用較少執行緒（2–3 個時每條音軌 1 個），未實測。CPU 時脈、溫度、其他程式及 Windows 檔案快取都未控制。
+- 量測程式直接呼叫共用核心；沒有在桌面版、插件或 DAW 內計時，也沒有計時實際拖曳。macOS 未在本機建置或計時。
+- 只量 32-bit float；16／24-bit PCM 使用同一個取樣率轉換，但未計時。計時在檔案關閉時結束，Windows 可能仍在把快取資料寫入磁碟。
+
+Only this laptop with 32 logical CPUs was measured; machines with fewer logical CPUs resample on fewer threads (one per lane with 2–3) and were not measured. CPU clocks, temperature, other apps, and the Windows file cache were not controlled. The harness calls the shared core directly: no export was timed in the desktop app, the plug-in, or a DAW, no drag was timed, and macOS was not built or timed locally. Only 32-bit float output was timed; 16- and 24-bit PCM share the resampler but were not timed. Timing stops when the files are closed, while Windows may still be writing cached data.
+
+### 匯出證據與重算 / Export evidence and reproduction
+
+每次計時都保留在 JSONL 檔，`summarize-timings.py` 由這些檔案重算中位數與範圍；量測程式原始碼、Cargo 設定及重跑指令見證據說明。
+
+Every timed run is kept in the JSONL files, from which `summarize-timings.py` recomputes the medians and ranges. The evidence README has the harness source, its Cargo files, and the commands to rerun it.
+
+- [量測說明與完整結果 / Method and full results](benchmarks/2026-11-16-wav-export-speed/README.md)
+- 每次匯出 / Every export run：[第二輪 / second pass](benchmarks/2026-11-16-wav-export-speed/export-timings-paused.jsonl)、[第一輪 / first pass](benchmarks/2026-11-16-wav-export-speed/export-timings-back-to-back.jsonl)
+- 單純寫入 / Plain writes：[第二輪 / second pass](benchmarks/2026-11-16-wav-export-speed/disk-writes-paused.jsonl)、[第一輪 / first pass](benchmarks/2026-11-16-wav-export-speed/disk-writes-back-to-back.jsonl)
+- [可重算摘要 / Summary](benchmarks/2026-11-16-wav-export-speed/summary.json)
+- [測試結果 / Test results](benchmarks/2026-11-16-wav-export-speed/local-validation.json)
+- [輸出逐檔比對 / Output comparison](benchmarks/2026-11-16-wav-export-speed/output-comparison.jsonl)
+- [硬體與電源 / Hardware and power](benchmarks/2026-11-16-wav-export-speed/hardware.json)
+- [檔案及建置 SHA-256 / Evidence manifest](benchmarks/2026-11-16-wav-export-speed/evidence-manifest.json)
 
 ## Windows 桌面版：2026-11-14 / Windows desktop
 
