@@ -30,6 +30,13 @@ typedef struct BtTimelineGuideCounts {
     size_t seconds;
 } BtTimelineGuideCounts;
 
+// Frames over which a selection fades in from its start and out to its end, at its own rate.
+// Ramps are linear; the outermost frame of each is silent.
+typedef struct BtFades {
+    uint64_t fade_in;
+    uint64_t fade_out;
+} BtFades;
+
 // Share display density and the exact drawn/snap targets across native UIs.
 BtWaveformDisplayPolicy bt_waveform_display_policy(float width, float height,
                                                    uint64_t visible_frames, uint32_t sample_rate,
@@ -116,6 +123,21 @@ int32_t bt_snapshots_export_pair_routed_frames_with_profile(const BtSnapshot *sn
                                                             uint32_t bits_per_sample, uint32_t route_a,
                                                             uint32_t route_b, uint32_t force_mono,
                                                             char **path_a, char **path_b);
+// The same exports with a fade in and a fade out, in the snapshot's own frames. Ramps that
+// do not fit the clip are shortened to fit it.
+char *bt_snapshot_export_routed_faded_frames(const BtSnapshot *snapshot, uint64_t first_frame,
+                                             uint64_t end_frame, const char *directory,
+                                             uint32_t sample_rate, uint32_t bits_per_sample,
+                                             uint32_t route, uint32_t force_mono,
+                                             uint64_t fade_in, uint64_t fade_out);
+int32_t bt_snapshots_export_pair_routed_faded_frames(const BtSnapshot *snapshot_a,
+                                                     const BtSnapshot *snapshot_b,
+                                                     uint64_t first_frame, uint64_t end_frame,
+                                                     const char *directory, uint32_t sample_rate,
+                                                     uint32_t bits_per_sample, uint32_t route_a,
+                                                     uint32_t route_b, uint32_t force_mono,
+                                                     uint64_t fade_in, uint64_t fade_out,
+                                                     char **path_a, char **path_b);
 int32_t bt_snapshots_export_pair_with_profile(const BtSnapshot *snapshot_a,
                                               const BtSnapshot *snapshot_b,
                                               double start, double end,
@@ -158,6 +180,49 @@ size_t bt_tracks_copy_bar_markers(const BtTracks *core, uint64_t first, uint64_t
                                    uint64_t *markers, size_t capacity);
 int32_t bt_tracks_attach_sender(const BtTracks *core, uint32_t lane, const char *id, uint32_t route);
 void bt_tracks_detach_sender(const BtTracks *core, uint32_t lane);
+// Nonzero marks a lane that records System playback: what it captures while a Backtracking
+// preview may be heard, from any Backtracking process, is kept as silence.
+void bt_tracks_set_preview_silence(const BtTracks *core, uint32_t lane, uint32_t enabled);
+
+// Plays a selection back. Render the slot from one audio thread; call the rest from one other
+// thread. bt_preview_slot_play reads the snapshots in place: keep them alive until the slot
+// has let the preview go (after the next play, bt_preview_slot_clear, bt_preview_slot_reap
+// returning 0, or bt_preview_slot_free). Stop rendering before freeing the slot.
+typedef struct BtPreviewSlot BtPreviewSlot;
+BtPreviewSlot *bt_preview_slot_new(void);
+void bt_preview_slot_free(BtPreviewSlot *slot);
+// One or two snapshots with their WAV routes, as exported. Returns 1 when it plays and 0,
+// leaving the slot as it was, when the snapshots do not all hold the selection at one rate.
+int32_t bt_preview_slot_play(const BtPreviewSlot *slot, const BtSnapshot *const *snapshots,
+                             size_t count, const uint32_t *routes, uint64_t first_frame,
+                             uint64_t end_frame, uint32_t force_mono, BtFades fades);
+// Falls silent over a few milliseconds, or lets go at once when nothing has rendered lately.
+void bt_preview_slot_stop(const BtPreviewSlot *slot);
+// Lets go at once, returning once no render reads the preview.
+void bt_preview_slot_clear(const BtPreviewSlot *slot);
+// Lets go of a finished preview, or of a stopped one that nothing renders. Returns 1 while the
+// slot still holds one.
+uint32_t bt_preview_slot_reap(const BtPreviewSlot *slot);
+// Holds the preview gate this much longer after each render, for an output that plays a frame
+// later than it is rendered. At most five seconds count.
+void bt_preview_slot_set_output_latency(const BtPreviewSlot *slot, uint64_t nanoseconds);
+void bt_preview_slot_set_fades(const BtPreviewSlot *slot, BtFades fades);
+// Writes the frame rendered up to. Returns 0 when nothing plays, 1 while playing and 2 while
+// falling silent after a stop.
+uint32_t bt_preview_slot_position(const BtPreviewSlot *slot, uint64_t *frame);
+// Real-time safe. Fills both outputs (pass one buffer, or a null right, for a single channel)
+// and returns the frames still to play. A preview captured at another rate renders silence.
+uint64_t bt_preview_slot_render(const BtPreviewSlot *slot, float *left, float *right,
+                                uint32_t frames, uint32_t sample_rate);
+// The fades after dragging a flag (end 0 = start flag, fade in; 1 = end flag, fade out) of
+// the selection first_frame..end_frame from frame press to frame pointer.
+BtFades bt_fades_dragged(uint32_t end, uint64_t first_frame, uint64_t end_frame,
+                         BtFades initial, uint64_t press, uint64_t pointer);
+BtFades bt_fades_fitted(BtFades fades, uint64_t length);
+// Tapers waveform bins over the visible frames by the selection's fades.
+void bt_waveform_fade_bins(float *minimum, float *maximum, uint32_t bins,
+                           uint64_t visible_first, uint64_t visible_end,
+                           uint64_t selection_first, uint64_t selection_end, BtFades fades);
 BtSenders *bt_senders_new(int32_t audio_only);
 void bt_senders_free(BtSenders *senders);
 size_t bt_senders_count(const BtSenders *senders);

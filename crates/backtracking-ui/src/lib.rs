@@ -8,6 +8,7 @@
 
 mod form;
 mod options;
+mod selection;
 #[cfg(windows)]
 mod system_fonts;
 mod theme;
@@ -25,6 +26,9 @@ pub use form::{
     remeasure_options_menu,
 };
 pub use options::{WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES, combo_popup_height, combo_row_height};
+pub use selection::{
+    FadeEnd, dragged_fades, fade_end_at, fade_waveform_bins, paint_fades, paint_playhead,
+};
 #[cfg(windows)]
 pub use system_fonts::add_system_font_fallbacks;
 pub use theme::{

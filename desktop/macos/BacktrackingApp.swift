@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Carbon
 import CoreGraphics
 import ServiceManagement
@@ -344,8 +345,10 @@ private final class CapturePanel: KeyPanel {
             if event.keyCode == 49 || event.keyCode == 117, !event.isARepeat,
                event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
                !(firstResponder is NSControl) {
-                // With a selection on screen, Delete drops the selection first.
+                // With a selection on screen, Delete drops the selection first and Space plays
+                // the selection or stops it.
                 if event.keyCode == 117, waveform?.cancelSelection() == true { return }
+                if event.keyCode == 49, waveform?.togglePreview() == true { return }
                 if onCommand?(event.keyCode == 49 ? .toggleCapture : .clear) == true { return }
             }
         case .leftMouseDown:
@@ -592,7 +595,7 @@ private final class WAVExport: @unchecked Sendable {
     private let snapshots: [OpaquePointer]
     private let routes: [UInt32]
     let span: Range<UInt64>
-    private let sampleRate: UInt32
+    let sampleRate: UInt32
     private let channels: [UInt32]
     private let bars: [UInt64]
     private let cacheLock = NSLock()
@@ -674,17 +677,30 @@ private final class WAVExport: @unchecked Sendable {
         return frame
     }
 
+    /// Starts a preview of `range` in `slot`, routed as the WAVs are. The slot reads the snapshots
+    /// in place, so whoever plays it keeps this material until the slot has let the preview go.
+    func play(in slot: OpaquePointer, range: Range<UInt64>, forceMono: Bool, fades: BtFades) -> Bool {
+        let lanes: [OpaquePointer?] = snapshots
+        return lanes.withUnsafeBufferPointer { lanes in
+            routes.withUnsafeBufferPointer { routes in
+                bt_preview_slot_play(slot, lanes.baseAddress, lanes.count, routes.baseAddress,
+                    range.lowerBound, range.upperBound, forceMono ? 1 : 0, fades) == 1
+            }
+        }
+    }
+
     func write(
-        range: Range<UInt64>, directory: String, sampleRate: UInt32, bitsPerSample: UInt32, forceMono: Bool
+        range: Range<UInt64>, directory: String, sampleRate: UInt32, bitsPerSample: UInt32, forceMono: Bool,
+        fades: BtFades
     ) -> [URL] {
         let mono: UInt32 = forceMono ? 1 : 0
         return directory.withCString { destination -> [URL] in
             if snapshots.count == 2 {
                 var a: UnsafeMutablePointer<CChar>?
                 var b: UnsafeMutablePointer<CChar>?
-                guard bt_snapshots_export_pair_routed_frames_with_profile(
+                guard bt_snapshots_export_pair_routed_faded_frames(
                     snapshots[0], snapshots[1], range.lowerBound, range.upperBound, destination,
-                    sampleRate, bitsPerSample, routes[0], routes[1], mono, &a, &b
+                    sampleRate, bitsPerSample, routes[0], routes[1], mono, fades.fade_in, fades.fade_out, &a, &b
                 ) == 1, let pathA = a, let pathB = b else { return [] }
                 defer {
                     bt_string_free(pathA)
@@ -695,13 +711,146 @@ private final class WAVExport: @unchecked Sendable {
                     URL(fileURLWithPath: String(cString: pathB))
                 ]
             }
-            guard let path = bt_snapshot_export_routed_frames_with_profile(
+            guard let path = bt_snapshot_export_routed_faded_frames(
                 snapshots[0], range.lowerBound, range.upperBound, destination,
-                sampleRate, bitsPerSample, routes[0], mono
+                sampleRate, bitsPerSample, routes[0], mono, fades.fade_in, fades.fade_out
             ) else { return [] }
             defer { bt_string_free(path) }
             return [URL(fileURLWithPath: String(cString: path))]
         }
+    }
+}
+
+private let noFades = BtFades(fade_in: 0, fade_out: 0)
+
+/// Plays a selection through the default output and reports how far it has got, for the
+/// playhead. While it may be heard it holds the preview gate, so every Backtracking recorder
+/// that captures System playback records silence instead of the preview.
+private final class PreviewPlayer {
+    private let slot: OpaquePointer
+    private var engine: AVAudioEngine?
+    private var engineRate: UInt32 = 0
+    /// Frames between rendering a frame and hearing it.
+    private var latencyFrames: UInt64 = 0
+    /// What the slot reads in place, kept until the slot has let the preview go.
+    private var material: WAVExport?
+    private var timer: Timer?
+    /// When the slot was found empty, while the device plays out what it still holds.
+    private var idleSince: TimeInterval?
+    /// The selection being played, until it ends or is stopped.
+    private(set) var range: Range<UInt64>?
+    /// Runs on the main thread when the playhead moves or the preview ends.
+    var onChange: (() -> Void)?
+
+    init?() {
+        guard let slot = bt_preview_slot_new() else { return nil }
+        self.slot = slot
+    }
+
+    deinit {
+        timer?.invalidate()
+        // Nothing renders the slot once the engine has stopped.
+        engine?.stop()
+        bt_preview_slot_free(slot)
+    }
+
+    /// Plays `range` of `material` from its start. Returns a problem to show, or nil.
+    func play(_ material: WAVExport, range: Range<UInt64>, forceMono: Bool, fades: BtFades) -> String? {
+        do {
+            try startEngine(rate: material.sampleRate)
+        } catch {
+            return "Could not play the selection: \(error.localizedDescription)"
+        }
+        // Started before playing, so that an engine left with nothing to play is stopped too.
+        if timer == nil {
+            let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.tick() }
+            RunLoop.main.add(timer, forMode: .common)
+            self.timer = timer
+        }
+        guard material.play(in: slot, range: range, forceMono: forceMono, fades: fades) else {
+            return "The selected audio is unavailable."
+        }
+        // Any earlier preview has been let go, and its material with it.
+        self.material = material
+        self.range = range
+        idleSince = nil
+        onChange?()
+        return nil
+    }
+
+    /// Falls silent over a few milliseconds. The playhead goes at once.
+    func stop() {
+        guard range != nil else { return }
+        range = nil
+        bt_preview_slot_stop(slot)
+        onChange?()
+    }
+
+    func setFades(_ fades: BtFades) {
+        if range != nil { bt_preview_slot_set_fades(slot, fades) }
+    }
+
+    /// The frame being heard, while the preview plays.
+    var playhead: UInt64? {
+        guard let range else { return nil }
+        var frame: UInt64 = 0
+        guard bt_preview_slot_position(slot, &frame) == 1 else { return nil }
+        let heard = frame > latencyFrames ? frame - latencyFrames : 0
+        return min(range.upperBound, max(range.lowerBound, heard))
+    }
+
+    private func startEngine(rate: UInt32) throws {
+        if let engine, engine.isRunning, engineRate == rate { return }
+        engine?.stop()
+        engine = nil
+        // A new engine each time follows the output device the user has chosen since.
+        let engine = AVAudioEngine()
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: Double(rate), channels: 2) else {
+            throw CaptureError("The selection's sample rate cannot be played")
+        }
+        let slot = self.slot
+        let source = AVAudioSourceNode(format: format) { _, _, frames, buffers -> OSStatus in
+            // The audio thread: no allocation, locks or Swift objects here.
+            let list = UnsafeMutableAudioBufferListPointer(buffers)
+            guard let left = list.first?.mData?.assumingMemoryBound(to: Float.self) else { return noErr }
+            let right = list.count > 1 ? list[1].mData?.assumingMemoryBound(to: Float.self) : nil
+            _ = bt_preview_slot_render(slot, left, right, frames, rate)
+            return noErr
+        }
+        engine.attach(source)
+        engine.connect(source, to: engine.mainMixerNode, format: format)
+        engine.prepare()
+        try engine.start()
+        self.engine = engine
+        engineRate = rate
+        // Kept within five seconds, so that the conversions below cannot overflow.
+        let latency = min(5, max(0, engine.outputNode.presentationLatency))
+        latencyFrames = UInt64(latency * Double(rate))
+        // A recorder may stamp what it hears that much after it was rendered.
+        bt_preview_slot_set_output_latency(slot, UInt64(latency * 1_000_000_000))
+    }
+
+    private func tick() {
+        // The engine stops by itself when the output device changes; the preview ends with it.
+        if engine?.isRunning != true { bt_preview_slot_clear(slot) }
+        if range != nil, bt_preview_slot_position(slot, nil) != 1 { range = nil }
+        if bt_preview_slot_reap(slot) != 0 {
+            idleSince = nil
+        } else {
+            material = nil
+            let now = ProcessInfo.processInfo.systemUptime
+            // The device still holds the last few milliseconds; stopping it at once cuts them off.
+            if let idleSince, now - idleSince >= 0.25 || engine?.isRunning != true {
+                timer?.invalidate()
+                timer = nil
+                engine?.stop()
+                engine = nil
+                self.idleSince = nil
+            } else if idleSince == nil {
+                idleSince = now
+            }
+        }
+        onChange?()
     }
 }
 
@@ -977,7 +1126,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var captureLanes: [CaptureLane] { dualSource ? [laneA, laneB] : [laneA] }
     private var exportSampleRate: UInt32 = 48_000
     private var exportBitsPerSample: UInt32 = 32
-    private var forceMonoExport = false
+    private(set) var forceMonoExport = false
     private var alwaysOnTop = true
     private var waveformOnly = false
     private var paused = true
@@ -1098,6 +1247,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             bt_cleanup_free(cleanup)
             self.cleanup = nil
         }
+        waveform?.endPreview()
         tap = nil
         waveform?.discardPreparedFile()
         // Worker jobs dispatch their completion asynchronously and never wait for this thread.
@@ -1182,6 +1332,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func hidePanel(_ panel: NSWindow) {
+        // Nothing would show the preview or stop it.
+        waveform?.stopPreview()
         if !independentWindow { panel.saveFrame(usingName: frameAutosaveName) }
         panel.orderOut(nil)
         updateOptionsVisibility()
@@ -2937,6 +3089,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard !editing else { return }
         guard waveform?.isPreparingMaterial != true else { setNotice("Preparing selection…"); return }
         let selected = waveform?.selectionForSaving()
+        // Read before the selection, and its fades with it, is cleared below.
+        let fades = waveform?.fadesForSaving() ?? noFades
         let save: (WAVExport?) -> Void = { [weak self] job in
             guard let self else { return }
             guard let job else { self.setNotice("No audio captured yet."); return }
@@ -2947,7 +3101,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             }
             let ticket = self.waveform?.reserveMarker()
             if selected != nil { self.waveform?.clearSelection() }
-            self.writeExport(job, range: range, directory: self.directory(for: .saved), provisional: false) { [weak self] urls in
+            self.writeExport(job, range: range, fades: fades, directory: self.directory(for: .saved),
+                             provisional: false) { [weak self] urls in
                 if !urls.isEmpty, let ticket { self?.waveform?.commitMarker(range, ticket: ticket) }
                 return true
             }
@@ -2960,14 +3115,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     func prepareDrag(
-        _ job: WAVExport, range: Range<UInt64>, completion: @escaping ([URL]) -> Bool
+        _ job: WAVExport, range: Range<UInt64>, fades: BtFades, completion: @escaping ([URL]) -> Bool
     ) -> DispatchWorkItem {
-        writeExport(job, range: range, directory: directory(for: .output), provisional: true, completion: completion)
+        writeExport(job, range: range, fades: fades, directory: directory(for: .output), provisional: true,
+                    completion: completion)
     }
 
     @discardableResult
     private func writeExport(
-        _ job: WAVExport, range: Range<UInt64>, directory: String,
+        _ job: WAVExport, range: Range<UInt64>, fades: BtFades, directory: String,
         provisional: Bool, completion: @escaping ([URL]) -> Bool
     ) -> DispatchWorkItem {
         let sampleRate = exportSampleRate
@@ -2977,7 +3133,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let write = DispatchWorkItem { @Sendable [weak self, worker, pendingProvisionalWAVs] in
             let urls = job.write(
                 range: range, directory: directory, sampleRate: sampleRate, bitsPerSample: bitsPerSample,
-                forceMono: forceMono
+                forceMono: forceMono, fades: fades
             )
             if provisional { pendingProvisionalWAVs.urls.formUnion(urls) }
             DispatchQueue.main.async {
@@ -3069,6 +3225,18 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     private var displayPolicy = bt_waveform_display_policy(0, 0, 0, 0, 0)
     private var guideBars: [UInt64] = []
     private var guideSeconds: [UInt64] = []
+    /// The selection's fades, in timeline frames. A new selection starts without any.
+    private var fades = noFades
+    private struct FadeGesture {
+        /// 0 drags the fade in from the start flag, 1 the fade out from the end flag.
+        let end: UInt32
+        let press: UInt64
+        let originX: CGFloat
+        let initial: BtFades
+        var moved = false
+    }
+    private var fadeGesture: FadeGesture?
+    private var player: PreviewPlayer?
 
     var hasEditingMaterial: Bool { editMaterial != nil || materialPending }
     var isPreparingMaterial: Bool { materialPending }
@@ -3188,7 +3356,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     private func readRequest() -> WaveformReadRequest {
         WaveformReadRequest(view: requestedView ?? (zoomed || editMaterial != nil ? visibleFrames : nil),
             width: Float(bounds.width), height: Float(bounds.height), stereo: stereo,
-            interactive: anchor != nil || mouseDownEvent != nil || dragging || panStart != nil)
+            interactive: anchor != nil || mouseDownEvent != nil || dragging || panStart != nil
+                || fadeGesture != nil)
     }
 
     func refresh(tap: SystemAudioTap, worker: DispatchQueue) {
@@ -3322,7 +3491,11 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     }
 
     func clearSelection() {
+        // The preview plays the selection, so it ends with it.
+        player?.stop()
         selection = nil
+        fades = noFades
+        fadeGesture = nil
         requestedView = nil
         materialVersion &+= 1
         materialPending = false
@@ -3366,7 +3539,52 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         return selection
     }
 
+    /// The fades a saved or dragged selection gets: none without a selection.
+    func fadesForSaving() -> BtFades {
+        guard let selection = selectionForSaving() else { return noFades }
+        return bt_fades_fitted(fades, selection.upperBound - selection.lowerBound)
+    }
+
     var hasSelection: Bool { selectionForSaving() != nil }
+
+    /// Space with a selection plays it from its start flag, or stops it. Returns false without a
+    /// selection, so that Space keeps pausing and resuming capture.
+    func togglePreview() -> Bool {
+        guard let selection = selectionForSaving() else { return false }
+        // A gesture in progress keeps the key to itself.
+        guard anchor == nil, fadeGesture == nil, mouseDownEvent == nil, !dragging else { return true }
+        if player?.range != nil {
+            player?.stop()
+            return true
+        }
+        guard let editMaterial else {
+            controller?.setNotice(materialPending ? "Preparing selection…" : "The selected audio is unavailable.")
+            return true
+        }
+        if player == nil {
+            player = PreviewPlayer()
+            player?.onChange = { [weak self] in self?.needsDisplay = true }
+        }
+        guard let player else {
+            controller?.setNotice("Could not play the selection.")
+            return true
+        }
+        let problem = player.play(editMaterial, range: selection,
+                                  forceMono: controller?.forceMonoExport ?? false, fades: fadesForSaving())
+        if let problem { controller?.setNotice(problem) }
+        return true
+    }
+
+    /// Silences the preview at once, for quitting.
+    func endPreview() {
+        player = nil
+        needsDisplay = true
+    }
+
+    /// Stops the preview over a few milliseconds, for when nothing would show it any longer.
+    func stopPreview() {
+        player?.stop()
+    }
 
     func clampSelectionToHistory() -> Bool {
         if hasEditingMaterial { return true }
@@ -3502,6 +3720,17 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
     override func mouseExited(with event: NSEvent) { clearPointerFeedback() }
 
+    /// Option on a selection flag drags its fade instead of moving it.
+    private func dragsFade(_ modifiers: NSEvent.ModifierFlags) -> Bool {
+        modifiers.contains(.option) && modifiers.intersection([.command, .control]).isEmpty
+    }
+
+    /// The frame under `x`, without snapping.
+    private func freeFrame(at x: CGFloat) -> UInt64 {
+        let count = visibleFrames.upperBound - visibleFrames.lowerBound
+        return visibleFrames.lowerBound + UInt64((Double(fraction(at: x)) * Double(count)).rounded())
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard !dragging, let controller else { return }
         if requestedView != nil {
@@ -3509,8 +3738,18 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             revision = nil
         }
         trackPointer(event)
-        let flag = draggableFlag(at: convert(event.locationInWindow, from: nil))
-        if let flag, let flags = selection ?? marker {
+        let position = convert(event.locationInWindow, from: nil)
+        let flag = draggableFlag(at: position)
+        if let flag, let selection = selectionForSaving(), dragsFade(event.modifierFlags) {
+            controller.beginEditing()
+            window?.makeKey()
+            window?.makeFirstResponder(self)
+            fadeGesture = FadeGesture(end: flag == selection.lowerBound ? 0 : 1, press: freeFrame(at: position.x),
+                                      originX: position.x, initial: fadesForSaving())
+            needsDisplay = true
+        } else if let flag, let flags = selection ?? marker {
+            // A resized selection replaces the one that was playing.
+            player?.stop()
             controller.beginEditing()
             window?.makeKey()
             window?.makeFirstResponder(self)
@@ -3540,7 +3779,19 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
     override func mouseDragged(with event: NSEvent) {
         trackPointer(event)
-        if let anchor {
+        if var gesture = fadeGesture {
+            guard let selection = selectionForSaving() else { return }
+            let x = convert(event.locationInWindow, from: nil).x
+            gesture.moved = gesture.moved || abs(x - gesture.originX) >= 2
+            if gesture.moved {
+                fades = bt_fades_dragged(gesture.end, selection.lowerBound, selection.upperBound,
+                                         gesture.initial, gesture.press, freeFrame(at: x))
+                // A playing preview takes the new ramps from its next block.
+                player?.setFades(fades)
+            }
+            fadeGesture = gesture
+            needsDisplay = true
+        } else if let anchor {
             let position = frame(at: event)
             selection = min(anchor, position)..<max(anchor, position)
             needsDisplay = true
@@ -3567,12 +3818,23 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
     override func mouseUp(with event: NSEvent) {
         trackPointer(event)
+        if fadeGesture != nil {
+            mouseDragged(with: event)
+            fadeGesture = nil
+            controller?.endEditing(allowImmediateResume: false)
+            needsDisplay = true
+            return
+        }
         guard anchor != nil || mouseDownEvent != nil else { return }
         var keepSelection = false
         if anchor != nil {
             mouseDragged(with: event)
             anchor = nil
             keepSelection = hasSelection
+            // A resized selection keeps the ramps at its flags, shortened to fit it.
+            if let selection = selectionForSaving() {
+                fades = bt_fades_fitted(fades, selection.upperBound - selection.lowerBound)
+            }
         } else if !dragging && dragRequested {
             discardPreparedFile()
             controller?.setNotice(nil)
@@ -3604,7 +3866,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         }
         let ticket = reserveMarker()
         // DAWs can keep the file URLs after the external drop. Treat both paths as one take.
-        pendingDragWrite = controller.prepareDrag(job, range: range) { [weak self] urls in
+        pendingDragWrite = controller.prepareDrag(job, range: range, fades: fadesForSaving()) { [weak self] urls in
             guard let self, self.exportVersion == version else { return false }
             self.pendingDragWrite = nil
             guard let event = self.mouseDownEvent, NSEvent.pressedMouseButtons & 1 != 0,
@@ -3715,6 +3977,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         guard rows > 0 else { return (fill, outline, coverage) }
         let totalHeight = bounds.height
         let rowHeight = totalHeight / CGFloat(rows)
+        let fitted = fadesForSaving()
+        let faded = fitted.fade_in > 0 || fitted.fade_out > 0 ? selectionForSaving() : nil
         for lane in 0..<rows {
             let middle = bounds.midY + totalHeight / 2 - (CGFloat(lane) + 0.5) * rowHeight
             if showsOverlay {
@@ -3724,7 +3988,14 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 )
             }
             if renderedFrames.isEmpty { continue }
-            let bins = traces[lane]
+            var bins = traces[lane]
+            if let faded {
+                // The waveform tapers the way the exported clip does.
+                bins.read { minimum, maximum, count in
+                    bt_waveform_fade_bins(minimum, maximum, count, renderedFrames.lowerBound,
+                        renderedFrames.upperBound, faded.lowerBound, faded.upperBound, fitted)
+                }
+            }
             func point(_ x: Double, _ value: Float) -> NSPoint {
                 NSPoint(x: bounds.minX + CGFloat(x) * bounds.width,
                         y: middle + CGFloat(value) * rowHeight * 0.46)
@@ -3785,6 +4056,88 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         color.setStroke()
         paths.outline.stroke()
         NSGraphicsContext.restoreGraphicsState()
+    }
+
+    /// Where `frame` falls across the plot, extended past either edge.
+    private func unclampedX(for frame: UInt64) -> CGFloat {
+        let fraction = (Double(frame) - Double(visibleFrames.lowerBound))
+            / Double(max(1, visibleFrames.upperBound - visibleFrames.lowerBound))
+        return bounds.minX + bounds.width * CGFloat(fraction)
+    }
+
+    /// Draws the selection's fades on each row: a wedge from silence at the flag to full level
+    /// where the ramp ends, with the cut-away level shaded.
+    private func drawFades(_ selection: Range<UInt64>) {
+        let fitted = fadesForSaving()
+        let rows = min(traceCount, traces.count)
+        guard fitted.fade_in > 0 || fitted.fade_out > 0, rows > 0, !visibleFrames.isEmpty else { return }
+        let rowHeight = bounds.height / CGFloat(rows)
+        let ramps = [(selection.lowerBound, selection.lowerBound + fitted.fade_in),
+                     (selection.upperBound, selection.upperBound - fitted.fade_out)]
+        for lane in 0..<rows {
+            let middle = bounds.midY + bounds.height / 2 - (CGFloat(lane) + 0.5) * rowHeight
+            // Full scale is drawn at the height tracePaths uses.
+            let extent = rowHeight * 0.46
+            for (edge, full) in ramps where edge != full {
+                let edgeX = unclampedX(for: edge)
+                let fullX = unclampedX(for: full)
+                let silent = NSPoint(x: edgeX, y: middle)
+                let top = NSPoint(x: fullX, y: middle + extent)
+                let bottom = NSPoint(x: fullX, y: middle - extent)
+                NSColor.black.withAlphaComponent(110 / 255).setFill()
+                for corner in [top, bottom] {
+                    let shade = NSBezierPath()
+                    shade.move(to: silent)
+                    shade.line(to: NSPoint(x: edgeX, y: corner.y))
+                    shade.line(to: corner)
+                    shade.close()
+                    shade.fill()
+                }
+                let wedge = NSBezierPath()
+                wedge.lineWidth = 1
+                wedge.move(to: top)
+                wedge.line(to: silent)
+                wedge.line(to: bottom)
+                NSColor.white.withAlphaComponent(0.9).setStroke()
+                wedge.stroke()
+            }
+        }
+    }
+
+    /// Draws the preview's playhead, while it plays and its frame is on screen.
+    private func drawPlayhead() {
+        guard let frame = player?.playhead, isVisible(frame) else { return }
+        let x = min(bounds.maxX, max(bounds.minX, x(for: frame)))
+        let color = NSColor(white: 245 / 255, alpha: 1)
+        let line = NSBezierPath()
+        line.lineWidth = 1.5
+        line.move(to: NSPoint(x: x, y: bounds.minY))
+        line.line(to: NSPoint(x: x, y: bounds.maxY))
+        color.setStroke()
+        line.stroke()
+        let size = min(10, max(4, bounds.height)) * 0.5
+        let head = NSBezierPath()
+        head.move(to: NSPoint(x: x - size, y: bounds.maxY))
+        head.line(to: NSPoint(x: x + size, y: bounds.maxY))
+        head.line(to: NSPoint(x: x, y: bounds.maxY - size))
+        head.close()
+        color.setFill()
+        head.fill()
+    }
+
+    /// Names the ramp being dragged and its length, in the plot's top-right corner.
+    private func drawFadeLabel() {
+        guard showsOverlay, let fadeGesture, sampleRate > 0 else { return }
+        let fitted = fadesForSaving()
+        let frames = fadeGesture.end == 0 ? fitted.fade_in : fitted.fade_out
+        let text = NSAttributedString(
+            string: String(format: "%@ %.2f s", fadeGesture.end == 0 ? "Fade in" : "Fade out",
+                           Double(frames) / Double(sampleRate)),
+            attributes: [.font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+                         .foregroundColor: NSColor.white]
+        )
+        let size = text.size()
+        text.draw(at: NSPoint(x: bounds.maxX - 8 - size.width, y: bounds.maxY - size.height))
     }
 
     private func updateDisplayPolicy() {
@@ -3858,6 +4211,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         } else {
             paintTrace(trace, color: accentColor(accentRGB))
         }
+        if let selection = selectionForSaving() { drawFades(selection) }
         if let marker, marker != selection {
             drawFlag(marker.lowerBound, pointsRight: true)
             drawFlag(marker.upperBound, pointsRight: false)
@@ -3866,6 +4220,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             drawFlag(selection.lowerBound, pointsRight: true)
             drawFlag(selection.upperBound, pointsRight: false)
         }
+        drawPlayhead()
+        drawFadeLabel()
         drawEmptyHint()
         drawCompactStatus()
         NSGraphicsContext.restoreGraphicsState()

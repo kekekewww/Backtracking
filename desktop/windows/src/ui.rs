@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use crate::context_menu::{self, WindowCommand};
 use crate::controller::{CaptureSource, Controller, EditSnapshot, SourceSettings};
 use crate::file_drag;
+use crate::playback::PreviewPlayer;
 use crate::preferences::{
     BORDER_WIDTHS, DEFAULT_ACCENT, Key, MeterMode, PreferenceWriter, Preferences, Settings,
     StatusMark, serialize_sources, wav_sample_format_preference,
@@ -20,18 +21,19 @@ use crate::tray::{self, Tray};
 use crate::updater::UpdateOptions;
 use crate::window_order;
 use backtracking_core::{
-    AutoResumeDelay, ChannelRoute, DurationChoice, FrozenTrack, MeterReadings, WavExportProfile,
-    WaveformView, cleanup, export_routed_tracks_with_profile, waveform,
+    AutoResumeDelay, ChannelRoute, DurationChoice, Fades, FrozenTrack, MeterReadings, Preview,
+    WavExportProfile, WaveformView, cleanup, export_routed_tracks_with_fades, waveform,
 };
 use backtracking_ui::{
-    CENTER_LINE, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, PLOT_BACKGROUND, RECORDING_DIM,
-    RECORDING_LIT, TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES,
-    accent_color, add_system_font_fallbacks, configure_options_menu, configure_options_style,
-    fit_frame_range, flag_handle_at, icon_button, meter_number, muted_accent, options_choice,
+    CENTER_LINE, FadeEnd, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, PLOT_BACKGROUND,
+    RECORDING_DIM, RECORDING_LIT, TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS,
+    WAV_SAMPLE_RATES, accent_color, add_system_font_fallbacks, configure_options_menu,
+    configure_options_style, dragged_fades, fade_end_at, fade_waveform_bins, fit_frame_range,
+    flag_handle_at, icon_button, meter_number, muted_accent, options_choice,
     options_control_width, options_field, options_group_heading, options_heading_text,
     options_list, options_menu_height, options_navigation_item, options_note, options_value,
-    paint_guide_lines, paint_transport_glyph, paint_waveform_trace, remeasure_options_menu,
-    selected_waveform_color, status_led, waveform_press,
+    paint_fades, paint_guide_lines, paint_playhead, paint_transport_glyph, paint_waveform_trace,
+    remeasure_options_menu, selected_waveform_color, status_led, waveform_press,
 };
 use eframe::egui::{
     self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection, Stroke, Vec2,
@@ -173,12 +175,17 @@ const DEFAULT_WAVEFORM_HEIGHT: f32 = 59.0;
 const WAVEFORM_INSET: f32 = 8.0;
 const FLAG_SNAP_DISTANCE: f64 = 8.0;
 const FLAG_REACH: FlagReach = FlagReach { above: 2.0, below: 13.0, radius: FLAG_SNAP_DISTANCE as f32 };
-/// Alt is taken: dragging with it moves the window.
+/// Alt is taken: dragging with it moves the window, except on a flag of the selection, where
+/// it drags that end's fade.
 const ALT_SELECTS: bool = false;
 const FLAG_COLOR: Color32 = Color32::from_rgb(255, 201, 109);
+/// The line that follows a playing selection.
+const PLAYHEAD_COLOR: Color32 = Color32::from_gray(245);
 /// The selected waveform takes the accent's complement when it differs by at least this much.
 const SELECTION_CONTRAST: u8 = 80;
 const PREPARING_WAV: &str = "Preparing WAV…";
+/// Shown when Space comes before the selected audio is ready to play.
+const PREPARING_SELECTION: &str = "Preparing selection…";
 
 pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
     let show_options_on_start = std::env::args_os().any(|arg| arg == "--show-options");
@@ -417,6 +424,10 @@ struct Recorder {
     next_refresh: Instant,
     generation: u64,
     selection: Option<Range<u64>>,
+    /// The selection's fade in and fade out, in frames from its flags.
+    fades: Fades,
+    /// The selection playing, started and stopped with Space.
+    preview: Option<PreviewPlayer>,
     flags: Option<FlagUpdate>,
     flag_order: u64,
     gesture: Option<Gesture>,
@@ -437,7 +448,10 @@ struct Recorder {
 }
 
 enum Gesture {
-    Select { anchor: u64, cursor: u64, origin_x: f32, moved: bool },
+    /// `resizing` when a flag of the current selection was picked up, which keeps its fades.
+    Select { anchor: u64, cursor: u64, origin_x: f32, moved: bool, resizing: bool },
+    /// Alt-dragging a flag of the selection sets the ramp at that end.
+    Fade { end: FadeEnd, press: u64, origin_x: f32, initial: Fades, moved: bool },
     Export { preparing: bool },
 }
 
@@ -644,6 +658,7 @@ struct SnapshotRead {
 
 struct SnapshotSpec {
     selection: Option<Range<u64>>,
+    fades: Fades,
     output: PathBuf,
     profile: WavExportProfile,
     routes: [ChannelRoute; 2],
@@ -683,7 +698,7 @@ impl SnapshotSpec {
         if let Some(flags) = &mut self.flags {
             flags.frames = snapshots.first()?.frame_range();
         }
-        WavClip::new(snapshots, self.selection.as_ref(), self.output,
+        WavClip::new(snapshots, self.selection.as_ref(), self.fades, self.output,
             self.profile, self.routes, self.force_mono, self.flags)
     }
 }
@@ -891,6 +906,7 @@ struct ExportJob {
 struct WavClip {
     snapshots: Arc<[FrozenTrack]>,
     frames: Range<usize>,
+    fades: Fades,
     output: PathBuf,
     profile: WavExportProfile,
     routes: [ChannelRoute; 2],
@@ -899,9 +915,11 @@ struct WavClip {
 }
 
 impl WavClip {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         snapshots: Arc<[FrozenTrack]>,
         selection: Option<&Range<u64>>,
+        fades: Fades,
         output: PathBuf,
         profile: WavExportProfile,
         routes: [ChannelRoute; 2],
@@ -921,6 +939,7 @@ impl WavClip {
         Some(Self {
             snapshots,
             frames: start..end,
+            fades,
             output,
             profile,
             routes,
@@ -930,13 +949,16 @@ impl WavClip {
     }
 
     fn write(self, keep: bool) -> io::Result<ExportedWav> {
-        let paths = export_routed_tracks_with_profile(
+        let paths = export_routed_tracks_with_fades(
             &self.output,
             &self.snapshots,
             self.frames,
             self.profile,
             &self.routes[..self.snapshots.len()],
             self.force_mono,
+            // System audio has no tempo to write into the file.
+            None,
+            self.fades,
         )?;
         let mut result = ExportedWav {
             paths,
@@ -1109,6 +1131,8 @@ impl Recorder {
             next_refresh: Instant::now(),
             generation,
             selection: None,
+            fades: Fades::NONE,
+            preview: None,
             flags: None,
             flag_order: 0,
             gesture: None,
@@ -1165,6 +1189,8 @@ impl Recorder {
     }
 
     fn hide(&mut self, ctx: &egui::Context) {
+        // Nothing would show the preview or stop it.
+        self.stop_preview();
         self.options_open = false;
         self.window_drag = None;
         if self.gesture.take().is_some() {
@@ -1346,6 +1372,8 @@ impl Recorder {
     }
 
     fn discard_editing(&mut self) {
+        // The preview plays the editing snapshot, so it ends with it.
+        self.stop_preview();
         if let Some(request) = self.edit_request.take() {
             if !request.saves.is_empty() {
                 self.pending_edit_save_reads.push(request);
@@ -1394,6 +1422,9 @@ impl Recorder {
         }
         self.editing = Some(FrozenEdit { snapshots, bars: snapshot.bar_markers,
             retention_seconds: request.retention_seconds });
+        if self.message == PREPARING_SELECTION {
+            self.message.clear();
+        }
         self.next_refresh = Instant::now();
         self.live_revision = None;
         if self.export_requested { self.start_export(); }
@@ -1445,6 +1476,7 @@ impl Recorder {
 
     fn reset_snapshot(&mut self) {
         self.selection = None;
+        self.fades = Fades::NONE;
         self.discard_editing();
         self.live_revision = None;
         self.next_refresh = Instant::now();
@@ -1472,6 +1504,69 @@ impl Recorder {
         self.message.clear();
         self.sync_generation();
         self.last_interaction = Instant::now();
+    }
+
+    /// Space with a selection: plays it from its start flag to its end flag, or stops it.
+    fn toggle_preview(&mut self, ctx: &egui::Context) {
+        self.last_interaction = Instant::now();
+        if self.preview.is_some() {
+            self.stop_preview();
+            return;
+        }
+        let Some(selection) = self.selection.clone() else {
+            return;
+        };
+        let Some(edit) = self.editing.as_ref() else {
+            self.message = if self.edit_request.is_some() {
+                PREPARING_SELECTION
+            } else {
+                "The selected audio is unavailable."
+            }
+            .into();
+            return;
+        };
+        let routes = self.controller.sources().each_ref().map(|settings| {
+            settings.as_ref().map_or(ChannelRoute::Merged, |settings| settings.route)
+        });
+        let Some(preview) =
+            Preview::new(&edit.snapshots, selection, &routes, self.wav_force_mono, self.fades)
+        else {
+            self.message = "The selected audio is unavailable.".into();
+            return;
+        };
+        let repaint = ctx.clone();
+        match PreviewPlayer::start(preview, Arc::new(move || repaint.request_repaint())) {
+            Ok(player) => self.preview = Some(player),
+            Err(error) => self.message = error,
+        }
+    }
+
+    fn stop_preview(&mut self) {
+        if let Some(player) = self.preview.take() {
+            player.preview().stop();
+            // Its share of the audio is released off this thread.
+            self.retire(player);
+        }
+    }
+
+    /// Lets go of a preview that has played to its end or failed.
+    fn collect_preview(&mut self) {
+        if self.preview.as_ref().is_some_and(PreviewPlayer::is_done) {
+            let player = self.preview.take().expect("a finished preview was observed");
+            if let Some(error) = player.take_error() {
+                self.message = error;
+            }
+            self.retire(player);
+        }
+    }
+
+    /// The ramp whose flag a press at `position` picks up, while the selection is on screen.
+    fn fade_flag(&self, audio: Rect, position: Pos2) -> Option<FadeEnd> {
+        let selection = self.selection.as_ref()?;
+        if self.editing.is_none() || self.history_frames.is_empty() || audio.width() <= 1.0 {
+            return None;
+        }
+        fade_end_at(audio, self.visible_frames.clone(), selection, position, FLAG_REACH)
     }
 
     fn background_color(&self, color: Color32) -> Color32 {
@@ -1593,7 +1688,9 @@ impl Recorder {
                 || self.snapshot_save.is_some()
                 || !self.pending_snapshot_saves.is_empty()
                 || self.plugin_snapshot_request.is_some()
-                || !self.pending_plugin_snapshots.is_empty(),
+                || !self.pending_plugin_snapshots.is_empty()
+                // The playhead moves every frame.
+                || self.preview.is_some(),
             polling: self.source_list_worker.is_some(),
             tray_retry: if self.options_in_taskbar {
                 None
@@ -2796,6 +2893,7 @@ impl Recorder {
         let has_selection = self.selection.is_some();
         let spec = SnapshotSpec {
             selection: self.selection.clone(),
+            fades: if has_selection { self.fades } else { Fades::NONE },
             output: self.saved_output.clone(),
             profile: self.wav_profile,
             routes: self.controller.sources().each_ref().map(|settings| settings.as_ref()
@@ -2837,6 +2935,7 @@ impl Recorder {
         WavClip::new(
             snapshots,
             self.selection.as_ref(),
+            if self.selection.is_some() { self.fades } else { Fades::NONE },
             output,
             self.wav_profile,
             routes,
@@ -2998,11 +3097,19 @@ impl Recorder {
         if self.interact_timeline(ui, rect) {
             return;
         }
-        let (position, press, down, snap) = ui.input(|input| {
+        let (position, press, alt_press, down, snap) = ui.input(|input| {
             let press = waveform_press(&input.events, ALT_SELECTS);
+            // Whether Alt was held at that press: on a flag of the selection it drags a fade.
+            let alt_press = input.events.iter().rev().find_map(|event| match event {
+                egui::Event::PointerButton {
+                    button: PointerButton::Primary, pressed: true, modifiers, ..
+                } => Some(modifiers.alt),
+                _ => None,
+            });
             (
                 input.pointer.interact_pos(),
                 press,
+                alt_press == Some(true),
                 input.pointer.button_down(PointerButton::Primary),
                 input.modifiers.shift,
             )
@@ -3011,17 +3118,31 @@ impl Recorder {
         if self.gesture.is_none() && let Some((position, selecting, snap_on_press)) =
             press.filter(|(point, _, _)| rect.contains(*point))
         {
-            let resize = self.flag_endpoints(self.audio_rect(rect), position);
-            if selecting || resize.is_some() {
+            let audio = self.audio_rect(rect);
+            let resize = self.flag_endpoints(audio, position);
+            if let Some(end) = alt_press.then(|| self.fade_flag(audio, position)).flatten() {
+                self.last_interaction = Instant::now();
+                self.gesture = Some(Gesture::Fade {
+                    end,
+                    press: self.free_frame_at(audio, position.x),
+                    origin_x: position.x,
+                    initial: self.fades,
+                    moved: false,
+                });
+            } else if selecting || resize.is_some() {
+                // A new or resized selection replaces the one that was playing.
+                self.stop_preview();
                 self.begin_editing();
                 self.last_interaction = Instant::now();
-                let start = self.frame_at(self.audio_rect(rect), position.x, snap_on_press);
+                let start = self.frame_at(audio, position.x, snap_on_press);
                 let (anchor, cursor) = resize.unwrap_or((start, start));
                 self.gesture = Some(Gesture::Select {
                     anchor,
                     cursor,
                     origin_x: position.x,
                     moved: false,
+                    // Flags left by an earlier export start a new selection, not a resize.
+                    resizing: resize.is_some() && self.selection.is_some(),
                 });
             } else {
                 self.gesture = Some(Gesture::Export { preparing: false });
@@ -3029,6 +3150,21 @@ impl Recorder {
         }
 
         let audio_rect = self.audio_rect(rect);
+        if let Some(position) = position
+            && let Some(Gesture::Fade { end, press, origin_x, initial, moved }) = self.gesture
+            && let Some(selection) = self.selection.clone()
+        {
+            let moved = moved || (position.x - origin_x).abs() >= 2.0;
+            if moved {
+                let pointer = self.free_frame_at(audio_rect, position.x);
+                self.fades = dragged_fades(end, &selection, initial, press, pointer);
+                // A playing preview takes the new ramps from its next block.
+                if let Some(player) = &self.preview {
+                    player.preview().set_fades(self.fades);
+                }
+            }
+            self.gesture = Some(Gesture::Fade { end, press, origin_x, initial, moved });
+        }
         if let Some(position) = position
             && matches!(self.gesture, Some(Gesture::Select { .. }))
         {
@@ -3048,17 +3184,29 @@ impl Recorder {
         };
         if !held && let Some(gesture) = self.gesture.take() {
             let keep_selection = match gesture {
-                Gesture::Select { anchor, cursor, moved, .. } => {
+                Gesture::Select { anchor, cursor, moved, resizing, .. } => {
                     let range = anchor.min(cursor)..anchor.max(cursor);
                     if moved && !range.is_empty() {
                         let flags = self.flag_update(range.clone());
                         self.apply_flags(flags);
+                        // A resized selection keeps the ramps at its flags; a new one has none.
+                        self.fades = if resizing {
+                            self.fades.fitted(range.end - range.start)
+                        } else {
+                            Fades::NONE
+                        };
                         self.selection = Some(range);
                         self.invalidate_export();
                     } else {
                         self.selection = None;
                     }
                     self.selection.is_some()
+                }
+                Gesture::Fade { initial, .. } => {
+                    if self.fades != initial {
+                        self.invalidate_export();
+                    }
+                    true
                 }
                 Gesture::Export { .. } => {
                     self.invalidate_export();
@@ -3190,6 +3338,14 @@ impl Recorder {
         Some((fixed.clamp(self.history_frames.start, self.history_frames.end), moved))
     }
 
+    /// The frame under `x` without snapping, so a fade follows the pointer smoothly.
+    fn free_frame_at(&self, audio: Rect, x: f32) -> u64 {
+        let visible = &self.visible_frames;
+        let length = visible.end.saturating_sub(visible.start);
+        let fraction = f64::from((x - audio.left()) / audio.width().max(1.0)).clamp(0.0, 1.0);
+        visible.start + ((length as f64 * fraction).round() as u64).min(length)
+    }
+
     fn frame_at(&self, audio: Rect, x: f32, snap: bool) -> u64 {
         let mut flags: Vec<_> = self.flags.iter()
             .flat_map(|flags| [flags.frames.start, flags.frames.end]).collect();
@@ -3256,6 +3412,11 @@ impl Recorder {
             }
             _ => self.selection.clone(),
         };
+        // A selection being drawn has no fades yet; one being resized keeps its own.
+        let fades = match self.gesture {
+            Some(Gesture::Select { resizing: false, .. }) => Fades::NONE,
+            _ => self.fades,
+        };
         let full_preview = !self.waveform_only
             && selection.is_none()
             && self.selection.is_none()
@@ -3309,20 +3470,46 @@ impl Recorder {
                     );
                 }
             }
+            let tapered;
+            let peaks = match &selection {
+                // The waveform tapers the way the exported clip does.
+                Some(range) if !fades.is_none() => {
+                    let mut faded = peaks.clone();
+                    fade_waveform_bins(&mut faded.low, &mut faded.high, visible.clone(), range, fades);
+                    tapered = faded;
+                    &tapered
+                }
+                _ => peaks,
+            };
             self.paint_waveform(&painter, row, peaks, highlight.as_ref());
+            if let Some(range) = &selection {
+                // Full scale is drawn at the height paint_waveform_geometry uses.
+                paint_fades(&painter, row, row.center().y, row.height() * 0.47, &visible, range,
+                    fades, FLAG_COLOR);
+            }
         }
         self.paint_flags(&painter, audio);
+        if let Some(player) = &self.preview {
+            paint_playhead(&painter, audio, &visible, player.playhead(), PLAYHEAD_COLOR);
+        }
 
-        if !self.waveform_only
-            && let Some(range) = selection.or_else(|| full_preview.then_some(visible))
-        {
+        let rate = f64::from(self.sample_rate.max(1));
+        let label = match self.gesture {
+            Some(Gesture::Fade { end: FadeEnd::In, .. }) => {
+                Some(format!("Fade in {:.2} s", fades.fade_in as f64 / rate))
+            }
+            Some(Gesture::Fade { end: FadeEnd::Out, .. }) => {
+                Some(format!("Fade out {:.2} s", fades.fade_out as f64 / rate))
+            }
+            _ => selection
+                .or_else(|| full_preview.then_some(visible))
+                .map(|range| format!("{:.2} s", (range.end - range.start) as f64 / rate)),
+        };
+        if !self.waveform_only && let Some(label) = label {
             painter.text(
                 audio.right_top() - Vec2::new(8.0, 0.0),
                 egui::Align2::RIGHT_TOP,
-                format!(
-                    "{:.2} s",
-                    (range.end - range.start) as f64 / f64::from(self.sample_rate.max(1)),
-                ),
+                label,
                 egui::FontId::monospace(11.0),
                 Color32::WHITE,
             );
@@ -3541,6 +3728,7 @@ impl eframe::App for Recorder {
             return;
         }
         let bounds = input.screen_rect.unwrap_or_else(|| ctx.viewport_rect());
+        let audio = self.audio_rect(self.plot_rect);
         for event in &mut input.events {
             let egui::Event::PointerButton {
                 pos,
@@ -3552,14 +3740,15 @@ impl eframe::App for Recorder {
                 continue;
             };
             if pressed {
-                self.window_drag =
-                    window_interaction(bounds, pos, modifiers.alt, can_resize).map(|interaction| {
-                        WindowDrag {
-                            interaction,
-                            press_position: pos,
-                            origin: None,
-                            released: false,
-                        }
+                // Alt on a flag of the selection drags its fade instead of the window.
+                let fading = modifiers.alt && self.fade_flag(audio, pos).is_some();
+                self.window_drag = window_interaction(bounds, pos, modifiers.alt, can_resize)
+                    .filter(|_| !fading)
+                    .map(|interaction| WindowDrag {
+                        interaction,
+                        press_position: pos,
+                        origin: None,
+                        released: false,
                     });
             }
             if let Some(drag) = &mut self.window_drag {
@@ -3603,6 +3792,7 @@ impl eframe::App for Recorder {
         self.controller_busy = !self.controller.poll();
         self.sync_generation();
         self.collect_editing();
+        self.collect_preview();
         if let Some(error) = self.preference_writer.as_ref().and_then(PreferenceWriter::poll_error) {
             self.message = format!("Could not save settings: {error}");
         }
@@ -3648,9 +3838,18 @@ impl eframe::App for Recorder {
                 if !self.waveform_only {
                     self.controls(ui, interaction_blocked);
                 }
+                // Alt over a flag of the selection offers its fade, not a window move.
+                let fade_hover = !interaction_blocked
+                    && self.gesture.is_none()
+                    && ui.input(|input| {
+                        input.modifiers.alt
+                            && input.pointer.hover_pos().is_some_and(|position| {
+                                self.fade_flag(self.audio_rect(self.plot_rect), position).is_some()
+                            })
+                    });
                 let window_cursor = if let Some(interaction) = window_drag {
                     Some(interaction.cursor())
-                } else if !interaction_blocked && self.gesture.is_none() {
+                } else if !interaction_blocked && self.gesture.is_none() && !fade_hover {
                     ui.input(|input| {
                         if input.viewport().fullscreen == Some(true) {
                             return None;
@@ -3696,6 +3895,8 @@ impl eframe::App for Recorder {
                 }
                 if let Some(cursor) = window_cursor {
                     ui.ctx().set_cursor_icon(cursor);
+                } else if fade_hover || matches!(self.gesture, Some(Gesture::Fade { .. })) {
+                    ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
                 } else if !interaction_blocked {
                     response.on_hover_cursor(CursorIcon::Grab);
                 }
@@ -3709,6 +3910,9 @@ impl eframe::App for Recorder {
             // Wiping the whole capture takes a second press.
             if command == WindowCommand::Clear && self.selection.is_some() {
                 self.cancel_selection();
+            } else if command == WindowCommand::ToggleCapture && self.selection.is_some() {
+                // Space with a selection plays it or stops it. Without one it pauses capture.
+                self.toggle_preview(ui.ctx());
             } else {
                 self.run_command(command, ui.ctx(), frame);
             }
@@ -3937,7 +4141,7 @@ mod tests {
         let newer: Arc<[FrozenTrack]> = vec![FrozenTrack::from_interleaved(48_000, 1, 500, &[0.9; 4]).unwrap()].into();
         let source = snapshot_source(Some(&retained), false, || Some(newer)).unwrap();
         assert!(Arc::ptr_eq(&source, &retained));
-        let clip = WavClip::new(source, Some(&(101..103)), PathBuf::new(),
+        let clip = WavClip::new(source, Some(&(101..103)), Fades::NONE, PathBuf::new(),
             WavExportProfile::default(), [ChannelRoute::Merged; 2], false, None).unwrap();
         assert_eq!(clip.frames, 1..3);
         assert_eq!(clip.snapshots[0].snapshot().frames(clip.frames.clone()), Some(&[0.2, 0.3][..]));
@@ -4313,7 +4517,8 @@ mod tests {
     fn an_unstarted_wav_job_keeps_its_audio_available_for_background_retirement() {
         let snapshots: Arc<[FrozenTrack]> = vec![FrozenTrack::from_interleaved(48000, 1, 1, &[0.1; 4]).unwrap()].into();
         let weak = Arc::downgrade(&snapshots);
-        let clip = WavClip::new(snapshots, None, PathBuf::new(), WavExportProfile::default(),
+        let clip = WavClip::new(snapshots, None, Fades::NONE, PathBuf::new(),
+            WavExportProfile::default(),
             [ChannelRoute::Merged; 2], false, None).unwrap();
         let (payload, job) = wav_job(clip, false);
         drop(job); // Thread creation failure drops the closure before it starts.
@@ -4498,6 +4703,7 @@ mod tests {
             WavClip::new(
                 snapshots.clone(),
                 Some(&(11..12)),
+                Fades::NONE,
                 folder.clone(),
                 WavExportProfile::default(),
                 [ChannelRoute::Left, ChannelRoute::Side],

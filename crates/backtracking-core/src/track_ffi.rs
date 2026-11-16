@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use crate::export::export_routed_track_refs;
 use crate::{
     cleanup, discover_senders, discover_snapshot_targets, request_sender_snapshot, ChannelRoute,
-    DurationChoice, MeterReadings, SenderInfo, SenderReceiver, Snapshot, SynchronizedCapture,
-    TimedAudioQueue, WavExportProfile, WavSampleFormat, WaveformView,
+    DurationChoice, Fades, MeterReadings, PreviewGate, SenderInfo, SenderReceiver, Snapshot,
+    SynchronizedCapture, TimedAudioQueue, WavExportProfile, WavSampleFormat, WaveformView,
 };
 
 struct TrackSender {
@@ -46,6 +46,10 @@ struct BtTracks {
     queues: [Option<Arc<TimedAudioQueue>>; 2],
     reader: Mutex<TrackReader>,
     enabled: AtomicBool,
+    /// Lanes that record System playback, where audio captured while a Backtracking preview may
+    /// have been heard is silenced, so the preview never enters the history.
+    preview_silence: [AtomicBool; 2],
+    gate: &'static PreviewGate,
 }
 
 impl BtTracks {
@@ -81,9 +85,16 @@ impl BtTracks {
                             sender.retry_at = Instant::now() + Duration::from_secs(2);
                         }
                     }
-                } else if let Some(packet) = queue.as_ref().and_then(|queue| queue.pop(scratch)) {
+                } else if let Some((queue, packet)) =
+                    queue.as_deref().and_then(|queue| Some((queue, queue.pop(scratch)?)))
+                {
                     progressed = true;
                     if ingest {
+                        if self.preview_silence[lane].load(Ordering::Relaxed) {
+                            self.gate.silence(
+                                packet.timestamp_ns, scratch, queue.channels(), packet.sample_rate,
+                            );
+                        }
                         let _ = synchronized.push_with_discontinuity(
                             lane, packet.timestamp_ns, packet.sample_rate, scratch, packet.discontinuity,
                         );
@@ -136,7 +147,18 @@ extern "C" fn bt_tracks_new(
             scratch: Vec::new(),
         }),
         enabled: AtomicBool::new(true),
+        preview_silence: [AtomicBool::new(false), AtomicBool::new(false)],
+        gate: PreviewGate::shared(),
     }))
+}
+
+/// Marks `lane` as recording System playback (nonzero `enabled`), so that what it captures
+/// while a Backtracking preview may be heard is kept as silence.
+#[no_mangle]
+unsafe extern "C" fn bt_tracks_set_preview_silence(core: *const BtTracks, lane: u32, enabled: u32) {
+    if let Some(flag) = core.as_ref().and_then(|core| core.preview_silence.get(lane as usize)) {
+        flag.store(enabled != 0, Ordering::Relaxed);
+    }
 }
 
 #[no_mangle]
@@ -613,6 +635,28 @@ unsafe extern "C" fn bt_snapshot_export_routed_frames_with_profile(
     route: u32,
     force_mono: u32,
 ) -> *mut c_char {
+    bt_snapshot_export_routed_faded_frames(
+        snapshot, first_frame, end_frame, directory, sample_rate, bits_per_sample, route,
+        force_mono, 0, 0,
+    )
+}
+
+/// Exports `first_frame..end_frame` with a fade in and a fade out of the given lengths, in
+/// the snapshot's own frames. Ramps longer than the clip are shortened to fit it.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn bt_snapshot_export_routed_faded_frames(
+    snapshot: *const Snapshot,
+    first_frame: u64,
+    end_frame: u64,
+    directory: *const c_char,
+    sample_rate: u32,
+    bits_per_sample: u32,
+    route: u32,
+    force_mono: u32,
+    fade_in: u64,
+    fade_out: u64,
+) -> *mut c_char {
     let Some(snapshot) = snapshot.as_ref() else {
         return ptr::null_mut();
     };
@@ -630,6 +674,7 @@ unsafe extern "C" fn bt_snapshot_export_routed_frames_with_profile(
         bits_per_sample,
         &[route],
         force_mono != 0,
+        Fades::new(fade_in, fade_out),
     ) else {
         return ptr::null_mut();
     };
@@ -679,6 +724,31 @@ unsafe extern "C" fn bt_snapshots_export_pair_routed_frames_with_profile(
     path_a: *mut *mut c_char,
     path_b: *mut *mut c_char,
 ) -> i32 {
+    bt_snapshots_export_pair_routed_faded_frames(
+        snapshot_a, snapshot_b, first_frame, end_frame, directory, sample_rate,
+        bits_per_sample, route_a, route_b, force_mono, 0, 0, path_a, path_b,
+    )
+}
+
+/// The A/B form of [`bt_snapshot_export_routed_faded_frames`]: both files fade at the same frames.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn bt_snapshots_export_pair_routed_faded_frames(
+    snapshot_a: *const Snapshot,
+    snapshot_b: *const Snapshot,
+    first_frame: u64,
+    end_frame: u64,
+    directory: *const c_char,
+    sample_rate: u32,
+    bits_per_sample: u32,
+    route_a: u32,
+    route_b: u32,
+    force_mono: u32,
+    fade_in: u64,
+    fade_out: u64,
+    path_a: *mut *mut c_char,
+    path_b: *mut *mut c_char,
+) -> i32 {
     let Some(frames) = snapshot_a
         .as_ref()
         .and_then(|snapshot| relative_frames(snapshot, first_frame, end_frame))
@@ -698,6 +768,7 @@ unsafe extern "C" fn bt_snapshots_export_pair_routed_frames_with_profile(
         [sample_rate, bits_per_sample],
         [route_a, route_b],
         force_mono != 0,
+        Fades::new(fade_in, fade_out),
         [path_a, path_b],
     )
 }
@@ -729,6 +800,7 @@ unsafe extern "C" fn bt_snapshots_export_pair_with_profile(
         [sample_rate, bits_per_sample],
         [ChannelRoute::Merged; 2],
         false,
+        Fades::NONE,
         [path_a, path_b],
     )
 }
@@ -740,6 +812,7 @@ fn relative_frames(snapshot: &Snapshot, first: u64, end: u64) -> Option<Range<us
     Some((first - snapshot.first_frame) as usize..(end - snapshot.first_frame) as usize)
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn export_pair(
     [snapshot_a, snapshot_b]: [*const Snapshot; 2],
     frames: Range<usize>,
@@ -747,6 +820,7 @@ unsafe fn export_pair(
     [sample_rate, bits_per_sample]: [u32; 2],
     routes: [ChannelRoute; 2],
     force_mono: bool,
+    fades: Fades,
     [path_a, path_b]: [*mut *mut c_char; 2],
 ) -> i32 {
     if path_a.is_null() || path_b.is_null() || path_a == path_b {
@@ -765,6 +839,7 @@ unsafe fn export_pair(
         bits_per_sample,
         &routes,
         force_mono,
+        fades,
     ) else {
         return 0;
     };
@@ -773,6 +848,7 @@ unsafe fn export_pair(
     1
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn export_snapshots(
     snapshots: &[&Snapshot],
     frames: Range<usize>,
@@ -781,6 +857,7 @@ unsafe fn export_snapshots(
     bits_per_sample: u32,
     routes: &[ChannelRoute],
     force_mono: bool,
+    fades: Fades,
 ) -> Option<Vec<CString>> {
     if directory.is_null() {
         return None;
@@ -803,6 +880,7 @@ unsafe fn export_snapshots(
         force_mono,
         // The desktop apps capture system audio and have no tempo to report.
         None,
+        fades,
     )
     .ok()?;
     let result: Option<Vec<CString>> = paths
@@ -877,6 +955,36 @@ mod display_tests {
             bt_tracks_set_retain_silence(core, 0);
             assert_eq!(bt_tracks_state(core), 2);
             assert_eq!(bt_tracks_end_frame(core), 100);
+            bt_tracks_free(core);
+        }
+    }
+
+    #[test]
+    fn system_lanes_record_silence_where_a_preview_may_have_been_heard() {
+        unsafe {
+            let core = bt_tracks_new(1_000., 1, 1, 10);
+            // Never the gate of a Backtracking that is recording on this computer.
+            let gate: &'static PreviewGate = Box::leak(Box::new(PreviewGate::local()));
+            (*core).gate = gate;
+            bt_tracks_set_retain_silence(core, 1);
+            bt_tracks_set_preview_silence(core, 0, 1);
+            bt_tracks_set_preview_silence(core, 7, 1);
+            // A preview was heard from 50 ms to 80 ms into packets captured at one second.
+            gate.hold(1_050_000_000, 1_080_000_000);
+            let a = [0.5; 100];
+            let b = [0.25; 100];
+            assert_eq!(bt_tracks_push_interleaved(core, 0, a.as_ptr(), 100, 1_000_000_000, 1_000.), 100);
+            assert_eq!(bt_tracks_push_interleaved(core, 1, b.as_ptr(), 100, 1_000_000_000, 1_000.), 100);
+            bt_tracks_pause(core);
+            let first = bt_tracks_snapshot(core, 0);
+            let second = bt_tracks_snapshot(core, 1);
+            let expected: Vec<f32> =
+                (0..100).map(|frame| if (50..80).contains(&frame) { 0.0 } else { 0.5 }).collect();
+            assert_eq!((*first).samples, expected);
+            // Lane B records something else, so it keeps all of it.
+            assert_eq!((*second).samples, b);
+            drop(Box::from_raw(first));
+            drop(Box::from_raw(second));
             bt_tracks_free(core);
         }
     }

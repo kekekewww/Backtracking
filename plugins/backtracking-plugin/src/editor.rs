@@ -8,16 +8,17 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{
-    AutoResumeDelay, ChannelRoute, DurationChoice, FrozenTrack, MeterReadings, WavExportProfile,
-    cleanup, export_routed_tracks_with_tempo, waveform,
+    AutoResumeDelay, ChannelRoute, DurationChoice, Fades, FrozenTrack, MeterReadings, Preview,
+    WavExportProfile, cleanup, export_routed_tracks_with_fades, waveform,
 };
 use backtracking_ui::{
-    CENTER_LINE, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, PLOT_BACKGROUND, RECORDING_DIM,
-    RECORDING_LIT, TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES,
-    accent_color, configure_options_style, fit_frame_range, flag_handle_at, icon_button,
-    meter_number, muted_accent, options_choice, options_control_width, options_field,
-    options_group_heading, options_heading_text, options_list, options_navigation_item,
-    options_note, options_value, paint_guide_lines, paint_transport_glyph, paint_waveform_trace,
+    CENTER_LINE, FadeEnd, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, PLOT_BACKGROUND,
+    RECORDING_DIM, RECORDING_LIT, TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS,
+    WAV_SAMPLE_RATES, accent_color, configure_options_style, dragged_fades, fade_end_at,
+    fade_waveform_bins, fit_frame_range, flag_handle_at, icon_button, meter_number, muted_accent,
+    options_choice, options_control_width, options_field, options_group_heading,
+    options_heading_text, options_list, options_navigation_item, options_note, options_value,
+    paint_fades, paint_guide_lines, paint_playhead, paint_transport_glyph, paint_waveform_trace,
     selected_waveform_color, status_led, waveform_press,
 };
 use egui::{Color32, CursorIcon, PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
@@ -36,6 +37,8 @@ use crate::settings::{
 
 #[cfg(target_os = "windows")]
 mod win_drag;
+#[cfg(target_os = "windows")]
+mod win_ime;
 mod preview;
 use preview::{PreviewKey, PreviewRequest, PreviewResult, PreviewWorker};
 
@@ -52,8 +55,15 @@ const MIN_WAVEFORM_HEIGHT: f32 = 60.0;
 const OPTIONS_EDITOR_SIZE: Vec2 = Vec2::new(760.0, 520.0);
 const FLAG_SNAP_RADIUS: f32 = 8.0;
 const FLAG_REACH: FlagReach = FlagReach { above: 4.0, below: 14.0, radius: FLAG_SNAP_RADIUS };
-/// Alt starts a free selection, as Ctrl does.
+/// Alt starts a free selection, as Ctrl does, except on a flag of the selection, where it drags
+/// that end's fade.
 const ALT_SELECTS: bool = true;
+/// The selection's flags and the fades drawn from them.
+const FLAG_COLOR: Color32 = Color32::from_rgb(255, 199, 103);
+/// The line that follows a playing preview across the selection.
+const PLAYHEAD_COLOR: Color32 = Color32::from_gray(245);
+/// How long a preview may wait for its first block before the editor says why it is silent.
+const PREVIEW_WAIT: Duration = Duration::from_millis(600);
 /// The selected waveform takes the accent's complement when it differs by at least this much.
 const SELECTION_CONTRAST: u8 = 64;
 const PRODUCT_ICON: &[u8] = include_bytes!("../../../assets/backtracking-icon.png");
@@ -93,6 +103,10 @@ pub struct CaptureUi {
     view: Option<Range<u64>>,
     peak_frames: Range<u64>,
     selection: Option<Range<u64>>,
+    /// The selection's fade in and fade out, in frames from its flags.
+    fades: Fades,
+    /// When Space last started a preview, until the host has played some of it.
+    preview_started: Option<Instant>,
     gesture: Option<Gesture>,
     drag_preparation: Option<DragPreparation>,
     snapshot_writer: Option<SnapshotWriter>,
@@ -100,6 +114,9 @@ pub struct CaptureUi {
     drag_results: Option<Receiver<Result<SavedWav, String>>>,
     output_cleanup: cleanup::Schedule,
     message: String,
+    /// Keeps a Chinese, Japanese or Korean input method from swallowing Space and the other keys.
+    #[cfg(target_os = "windows")]
+    input_method: win_ime::InputMethod,
 }
 
 enum Gesture {
@@ -114,6 +131,14 @@ enum Gesture {
     Drag {
         origin: Pos2,
         preparation_started: bool,
+    },
+    /// Alt on a flag of the selection: drags that end's fade, starting from `initial`.
+    Fade {
+        end: FadeEnd,
+        press: u64,
+        origin_x: f32,
+        initial: Fades,
+        moved: bool,
     },
 }
 
@@ -341,6 +366,8 @@ struct WavClip {
     marker: MarkerUpdate,
     /// The host tempo when the clip was taken, if the host reports one. Shown in the file name.
     tempo: Option<f64>,
+    /// The selection's ramps, counted from the ends of `range`.
+    fades: Fades,
 }
 
 #[derive(Clone)]
@@ -361,7 +388,7 @@ impl SavedWav {
 
 impl WavClip {
     fn write(self) -> io::Result<SavedWav> {
-        let paths = export_routed_tracks_with_tempo(
+        let paths = export_routed_tracks_with_fades(
             &self.output,
             &self.snapshots,
             self.range,
@@ -369,6 +396,7 @@ impl WavClip {
             &[ChannelRoute::Merged; 2][..self.snapshots.len()],
             self.force_mono,
             self.tempo,
+            self.fades,
         )?;
         Ok(SavedWav {
             paths: paths
@@ -553,6 +581,17 @@ impl NiceEguiApp for CaptureUi {
         if canceled_selection {
             self.cancel_selection();
         }
+        // Space with a selection plays it from its start flag to its end flag, or stops it.
+        // Without one the key goes on to the host.
+        let toggled_preview = !self.options_open
+            && self.selection.is_some()
+            && self.gesture.is_none()
+            && !self.native_dragging.load(Ordering::Acquire)
+            && ui.input_mut(take_space_press);
+        if toggled_preview {
+            self.toggle_preview(&settings);
+        }
+        self.explain_waiting_preview();
         let mut paused = self.session.is_paused();
         self.refresh_waveform(paused, settings.waveform_layout);
         ui.visuals_mut().selection.bg_fill = muted_accent(accent_color(settings.accent));
@@ -668,8 +707,16 @@ impl NiceEguiApp for CaptureUi {
                 .on_hover_text(&self.message);
         }
         self.displayed_settings = Some(settings);
+        // Only a text field being edited takes keys through the input method; Space and the
+        // other shortcuts come straight to the editor.
+        #[cfg(target_os = "windows")]
+        self.input_method.follow(
+            frame.baseview_window(),
+            ui.ctx().output(|output| output.ime.is_some()),
+        );
         ui.ctx().request_repaint_after(
-            if self.gesture.is_some() || self.drag_preparation.is_some() {
+            // The playhead moves every frame.
+            if self.gesture.is_some() || self.drag_preparation.is_some() || self.playhead().is_some() {
                 Duration::from_millis(16)
             } else {
                 REFRESH
@@ -681,6 +728,13 @@ impl NiceEguiApp for CaptureUi {
         self.gesture = None;
         self.recording_since = None;
         self.options_open = false;
+        // The next editor window starts with the input method Windows gave it.
+        #[cfg(target_os = "windows")]
+        {
+            self.input_method = win_ime::InputMethod::default();
+        }
+        // Nothing would show the preview or stop it.
+        self.stop_preview();
         self.discard_drag_preparation();
         if !self.native_dragging.load(Ordering::Acquire) {
             self.session.end_waveform_gesture(self.selection.is_some());
@@ -690,6 +744,7 @@ impl NiceEguiApp for CaptureUi {
 
 impl Drop for CaptureUi {
     fn drop(&mut self) {
+        self.stop_preview();
         if !self.native_dragging.load(Ordering::Acquire) {
             self.session.end_waveform_gesture(self.selection.is_some());
         }
@@ -728,6 +783,8 @@ impl CaptureUi {
             view: None,
             peak_frames: 0..0,
             selection: None,
+            fades: Fades::NONE,
+            preview_started: None,
             gesture: None,
             drag_preparation: None,
             snapshot_writer: None,
@@ -736,6 +793,8 @@ impl CaptureUi {
             // The project's choice arrives later, with the rest of the restored settings.
             output_cleanup: cleanup::Schedule::new(None, Instant::now()),
             message: String::new(),
+            #[cfg(target_os = "windows")]
+            input_method: win_ime::InputMethod::default(),
         }
     }
 
@@ -999,8 +1058,10 @@ impl CaptureUi {
             if clipped.is_empty() {
                 self.cancel_selection();
             } else if *range != clipped {
+                self.fades = self.fades.fitted(clipped.end - clipped.start);
                 *range = clipped;
-                self.session.set_snapshot_selection(self.selection.clone());
+                self.stop_preview();
+                self.publish_selection();
             }
         }
         self.timeline = timeline;
@@ -1025,8 +1086,11 @@ impl CaptureUi {
             let clipped = range.start.max(bounds.start)..range.end.min(bounds.end);
             let clipped = (!clipped.is_empty()).then_some(clipped);
             if self.selection != clipped {
+                self.fades = clipped.as_ref()
+                    .map_or(Fades::NONE, |range| self.fades.fitted(range.end - range.start));
                 self.selection = clipped;
-                self.session.set_snapshot_selection(self.selection.clone());
+                self.stop_preview();
+                self.publish_selection();
             }
         }
     }
@@ -1097,10 +1161,91 @@ impl CaptureUi {
 
     fn clear_selection_preview(&mut self) {
         self.selection = None;
+        self.fades = Fades::NONE;
+        // The preview plays the selection, so it ends with it.
+        self.stop_preview();
         self.preview_requested = None;
         self.editing_seconds = None;
         self.session.set_snapshot_selection(None);
         self.next_refresh = Instant::now();
+    }
+
+    /// Tells the session the selection and its fades, which a snapshot of it is written with.
+    fn publish_selection(&self) {
+        self.session.set_snapshot_edit(self.selection.clone(), self.fades);
+    }
+
+    /// Space with a selection: plays it from its start flag to its end flag, or stops it.
+    fn toggle_preview(&mut self, settings: &SessionSettings) {
+        self.session.mark_interaction();
+        if self.preview_playing() {
+            self.stop_preview();
+            return;
+        }
+        let Some(selection) = self.selection.clone() else {
+            return;
+        };
+        let Some(editing) = self.session.editing_snapshot() else {
+            self.message = "Preparing selected audio…".into();
+            return;
+        };
+        let routes = [ChannelRoute::Merged; 2];
+        let routes = &routes[..editing.snapshots.len().min(routes.len())];
+        match Preview::new(&editing.snapshots, selection, routes, settings.force_mono, self.fades) {
+            Some(preview) => {
+                self.session.preview.play(preview);
+                self.preview_started = Some(Instant::now());
+            }
+            None => self.message = "The selected audio is no longer available.".into(),
+        }
+    }
+
+    fn stop_preview(&mut self) {
+        self.preview_started = None;
+        self.session.preview.stop();
+    }
+
+    /// Whether a preview is playing and has not been asked to stop.
+    fn preview_playing(&self) -> bool {
+        self.session.preview
+            .with_current(|preview| !preview.is_finished() && !preview.stop_requested())
+            .unwrap_or(false)
+    }
+
+    /// The frame of the timeline the playing preview has reached. None once it is asked to stop.
+    fn playhead(&self) -> Option<u64> {
+        self.session.preview
+            .with_current(|preview| {
+                (!preview.is_finished() && !preview.stop_requested())
+                    .then(|| preview.frames().start + preview.rendered())
+            })
+            .flatten()
+    }
+
+    /// The plug-in plays a preview only while the host processes audio, which some hosts stop
+    /// doing while their transport is stopped. Says so when a preview has not begun.
+    fn explain_waiting_preview(&mut self) {
+        let Some(started) = self.preview_started else {
+            return;
+        };
+        let waiting = self.session.preview
+            .with_current(|preview| preview.rendered() == 0 && !preview.stop_requested())
+            .unwrap_or(false);
+        if !waiting {
+            self.preview_started = None;
+        } else if started.elapsed() >= PREVIEW_WAIT {
+            self.preview_started = None;
+            self.message = "The preview plays once the host processes audio.".into();
+        }
+    }
+
+    /// The ramp whose flag a press at `position` picks up, while the selection is on screen.
+    fn fade_flag(&self, audio_rect: Rect, position: Pos2) -> Option<FadeEnd> {
+        let selection = self.selection.as_ref()?;
+        if self.peak_frames.is_empty() || audio_rect.width() <= 1.0 {
+            return None;
+        }
+        fade_end_at(audio_rect, self.peak_frames.clone(), selection, position, FLAG_REACH)
     }
 
     fn can_cancel_selection(&self) -> bool {
@@ -1200,7 +1345,7 @@ impl CaptureUi {
         let hover_preview = !waveform_only
             && explicit_range.is_none()
             && match &self.gesture {
-                Some(Gesture::Select { .. } | Gesture::ResizeSelection { .. }) => false,
+                Some(Gesture::Select { .. } | Gesture::ResizeSelection { .. } | Gesture::Fade { .. }) => false,
                 Some(Gesture::Drag { .. }) => true,
                 None => {
                     allow_hover
@@ -1212,6 +1357,12 @@ impl CaptureUi {
                         })
                 }
             };
+        // A selection being drawn has no fades yet; one being resized keeps its own.
+        let fades = match &self.gesture {
+            Some(Gesture::Select { .. }) => Fades::NONE,
+            _ if explicit_range.is_some() => self.fades,
+            _ => Fades::NONE,
+        };
         let color = accent_color(settings.accent);
         if hover_preview && width > 0.0 {
             painter.rect_filled(audio_rect, 2.0, muted_accent(color));
@@ -1242,6 +1393,18 @@ impl CaptureUi {
             if width <= 0.0 {
                 continue;
             }
+            let tapered;
+            let peaks = match &explicit_range {
+                // The waveform tapers the way the exported clip does.
+                Some(range) if !fades.is_none() => {
+                    let mut faded = peaks.clone();
+                    fade_waveform_bins(&mut faded.minimum, &mut faded.maximum,
+                        self.peak_frames.clone(), range, fades);
+                    tapered = faded;
+                    &tapered
+                }
+                _ => peaks,
+            };
             let geometry = waveform::waveform_geometry(
                 &peaks.minimum, &peaks.maximum, self.peak_frames.clone());
             paint_waveform_geometry(&painter, &geometry, audio_rect, middle, extent,
@@ -1249,6 +1412,11 @@ impl CaptureUi {
             if let Some(clip) = selection_clip {
                 paint_waveform_geometry(&painter.with_clip_rect(clip), &geometry, audio_rect,
                     middle, extent, policy.waveform_stroke, selected_color);
+            }
+            if let Some(range) = &explicit_range {
+                // Full scale is drawn at the height paint_waveform_geometry uses.
+                paint_fades(&painter, audio_rect, middle, extent, &self.peak_frames, range,
+                    fades, FLAG_COLOR);
             }
         }
         if width > 0.0 {
@@ -1266,6 +1434,23 @@ impl CaptureUi {
                     }
                 }
             }
+            if let Some(frame) = self.playhead() {
+                paint_playhead(&painter, audio_rect, &self.peak_frames, frame, PLAYHEAD_COLOR);
+            }
+        }
+        if !waveform_only && let Some(Gesture::Fade { end, .. }) = &self.gesture {
+            let rate = f64::from(self.timeline.sample_rate.max(1));
+            let (name, frames) = match end {
+                FadeEnd::In => ("Fade in", fades.fade_in),
+                FadeEnd::Out => ("Fade out", fades.fade_out),
+            };
+            painter.text(
+                audio_rect.right_bottom() - Vec2::new(4.0, 2.0),
+                egui::Align2::RIGHT_BOTTOM,
+                format!("{name} {:.2} s", frames as f64 / rate),
+                egui::FontId::monospace(11.0),
+                Color32::WHITE,
+            );
         }
     }
 
@@ -1366,11 +1551,19 @@ impl CaptureUi {
         allow_new_gesture: bool,
     ) {
         let rect = waveform.rect;
-        let (position, press, down, shift) = ui.input(|input| {
+        let (position, press, alt_press, down, shift) = ui.input(|input| {
             let press = waveform_press(&input.events, ALT_SELECTS);
+            // Whether Alt was held at that press: on a flag of the selection it drags a fade.
+            let alt_press = input.events.iter().rev().find_map(|event| match event {
+                egui::Event::PointerButton {
+                    button: PointerButton::Primary, pressed: true, modifiers, ..
+                } => Some(modifiers.alt),
+                _ => None,
+            });
             (
                 input.pointer.interact_pos(),
                 press,
+                alt_press == Some(true),
                 input.pointer.button_down(PointerButton::Primary),
                 input.modifiers.shift,
             )
@@ -1390,13 +1583,27 @@ impl CaptureUi {
             self.next_refresh = Instant::now();
             self.refresh_waveform(self.session.is_paused(), settings.waveform_layout);
             let audio_rect = self.audio_rect(rect, settings.retention.seconds() as f32);
-            if let Some(fixed) = self.selection_handle(audio_rect, position) {
+            if let Some(end) = alt_press.then(|| self.fade_flag(audio_rect, position)).flatten() {
+                // The selection and a playing preview stay; only the ramp changes.
+                self.session.set_gesture_active(true);
+                waveform.request_focus();
+                self.gesture = Some(Gesture::Fade {
+                    end,
+                    press: self.frame_at_pointer(audio_rect, position.x, false, settings),
+                    origin_x: position.x,
+                    initial: self.fades,
+                    moved: false,
+                });
+            } else if let Some(fixed) = self.selection_handle(audio_rect, position) {
+                // A resized selection replaces the one that was playing.
+                self.stop_preview();
                 self.editing_seconds.get_or_insert(settings.retention.seconds() as f32);
                 self.session.begin_waveform_gesture();
                 waveform.request_focus();
                 let current = self.frame_at_pointer(audio_rect, position.x, snap, settings);
                 self.gesture = Some(Gesture::ResizeSelection { fixed, current });
             } else if selecting {
+                self.stop_preview();
                 self.editing_seconds.get_or_insert(settings.retention.seconds() as f32);
                 self.session.begin_waveform_gesture();
                 waveform.request_focus();
@@ -1408,6 +1615,22 @@ impl CaptureUi {
                     preparation_started: false,
                 });
             }
+        }
+
+        if let Some(position) = position
+            && let Some(Gesture::Fade { end, press: pressed, origin_x, initial, moved }) = self.gesture
+            && let Some(selection) = self.selection.clone()
+        {
+            let moved = moved || (position.x - origin_x).abs() >= 2.0;
+            if moved {
+                let audio_rect = self.audio_rect(rect, settings.retention.seconds() as f32);
+                let pointer = self.frame_at_pointer(audio_rect, position.x, false, settings);
+                self.fades = dragged_fades(end, &selection, initial, pressed, pointer);
+                // A playing preview takes the new ramps from its next block.
+                let fades = self.fades;
+                self.session.preview.with_current(|preview| preview.set_fades(fades));
+            }
+            self.gesture = Some(Gesture::Fade { end, press: pressed, origin_x, initial, moved });
         }
 
         if matches!(self.gesture, Some(Gesture::Select { .. } | Gesture::ResizeSelection { .. }))
@@ -1454,16 +1677,30 @@ impl CaptureUi {
                 } else if let Some(file) = self.take_prepared_drag() {
                     self.gesture = None;
                     self.selection = None;
+                    self.fades = Fades::NONE;
+                    self.stop_preview();
                     self.session.set_snapshot_selection(None);
                     self.message.clear();
                     self.start_native_drag(frame, file, origin);
                 }
             }
         } else if let Some(gesture) = self.gesture.take() {
+            if let Gesture::Fade { .. } = gesture {
+                // Only the ramps changed. The selection and its material stay as they were.
+                self.publish_selection();
+                self.session.set_gesture_active(false);
+                return;
+            }
+            let resized = matches!(gesture, Gesture::ResizeSelection { .. });
             if let Gesture::Select { anchor, current } | Gesture::ResizeSelection { fixed: anchor, current } = gesture {
                 let range = anchor.min(current)..anchor.max(current);
+                // A resized selection keeps the ramps at its flags; a new one has none.
+                self.fades = if resized { self.fades.fitted(range.end - range.start) } else { Fades::NONE };
                 self.selection = (!range.is_empty()).then_some(range);
-                self.session.set_snapshot_selection(self.selection.clone());
+                if self.selection.is_none() {
+                    self.fades = Fades::NONE;
+                }
+                self.publish_selection();
             } else {
                 self.clear_selection_preview();
             }
@@ -1618,6 +1855,7 @@ impl CaptureUi {
             range,
             marker: self.markers.issue(selected),
             tempo: self.session.host_tempo(),
+            fades: if self.selection.is_some() { self.fades } else { Fades::NONE },
         })
     }
 
@@ -1690,6 +1928,22 @@ fn primary_button_pressed() -> bool {
     return mac_drag::primary_button_pressed();
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     false
+}
+
+/// Takes the presses of Space without modifiers, held repeats included, and returns whether one
+/// was new. A held key does not repeat the command, as on the desktop.
+fn take_space_press(input: &mut egui::InputState) -> bool {
+    let mut pressed = false;
+    input.events.retain(|event| match event {
+        egui::Event::Key { key: egui::Key::Space, pressed: true, repeat, modifiers, .. }
+            if modifiers.is_none() =>
+        {
+            pressed |= !repeat;
+            false
+        }
+        _ => true,
+    });
+    pressed
 }
 
 fn export_frame_range(snapshot: &FrozenTrack, selection: &Range<u64>) -> Option<Range<usize>> {
@@ -2109,7 +2363,7 @@ fn paint_flag(painter: &egui::Painter, rect: Rect, fraction: f32, direction: f32
     let color = if muted {
         Color32::from_rgb(164, 131, 79)
     } else {
-        Color32::from_rgb(255, 199, 103)
+        FLAG_COLOR
     };
     let outline = Stroke::new(0.75, Color32::from_gray(35));
     painter.line_segment(
@@ -2135,6 +2389,26 @@ mod tests {
     fn auto_resume_choices_are_labelled_by_what_they_do() {
         let labels = AutoResumeDelay::ALL.map(auto_resume_label);
         assert_eq!(labels, ["Off", "5 seconds", "10 seconds"]);
+    }
+
+    #[test]
+    fn space_toggles_once_per_press_and_only_without_modifiers() {
+        let space = |pressed, repeat, modifiers| egui::Event::Key {
+            key: egui::Key::Space, physical_key: None, pressed, repeat, modifiers,
+        };
+        let mut input = egui::InputState::default();
+        // A held key's repeats are taken without toggling again.
+        input.events = vec![space(true, true, egui::Modifiers::NONE)];
+        assert!(!take_space_press(&mut input));
+        assert!(input.events.is_empty());
+        // Shift+Space is left alone.
+        input.events = vec![space(true, false, egui::Modifiers::SHIFT)];
+        assert!(!take_space_press(&mut input));
+        assert_eq!(input.events.len(), 1);
+        input.events = vec![space(true, false, egui::Modifiers::NONE),
+            space(false, false, egui::Modifiers::NONE)];
+        assert!(take_space_press(&mut input));
+        assert_eq!(input.events.len(), 1);
     }
 
     fn rendered_waveform(
@@ -2515,6 +2789,7 @@ mod tests {
                 range: 0..32,
                 marker: MarkerHistory::default().issue(0..32),
                 tempo: None,
+                fades: Fades::NONE,
             }
             .write()
             .unwrap()
@@ -2558,6 +2833,7 @@ mod tests {
                     marker: markers.issue(range.start as u64..range.end as u64),
                     range,
                     tempo: Some(120.0),
+                    fades: Fades::NONE,
                 })
                 .unwrap();
         }
@@ -2594,6 +2870,37 @@ mod tests {
                 .collect();
             assert_eq!(samples, expected);
         }
+        std::fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn a_clip_is_written_with_the_fades_of_its_selection() {
+        let output = std::env::temp_dir().join(format!(
+            "backtracking-plugin-fade-test-{}",
+            std::process::id()
+        ));
+        let snapshots: Arc<[FrozenTrack]> =
+            vec![FrozenTrack::from_interleaved(48_000, 1, 0, &[0.5; 8]).unwrap()].into();
+        let saved = WavClip {
+            profile: WavExportProfile::default(),
+            force_mono: false,
+            output: output.clone(),
+            snapshots,
+            range: 0..8,
+            marker: MarkerHistory::default().issue(0..8),
+            tempo: None,
+            fades: Fades::new(2, 4),
+        }
+        .write()
+        .unwrap();
+        let wav = std::fs::read(&saved.paths[0]).unwrap();
+        let data = wav.windows(4).position(|chunk| chunk == b"data").unwrap() + 8;
+        let samples: Vec<_> = wav[data..]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        // Silent at both flags, full level between the ramps.
+        assert_eq!(samples, [0.0, 0.25, 0.5, 0.5, 0.375, 0.25, 0.125, 0.0]);
         std::fs::remove_dir_all(output).unwrap();
     }
 

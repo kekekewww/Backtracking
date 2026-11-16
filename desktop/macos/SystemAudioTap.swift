@@ -927,6 +927,11 @@ final class SystemAudioTap {
         self.timeline = try TimelineHandle(history: history, a: widths[0], b: widths.count == 2 ? widths[1] : 0,
                                            retainSilence: retainSilence)
         self.slots = slots
+        // A selection preview from any Backtracking is heard in System playback. Those lanes
+        // record silence while it plays, so the preview never enters the history.
+        for (index, lane) in lanes.enumerated() where lane.source == .system {
+            bt_tracks_set_preview_silence(timeline.core, UInt32(index), 1)
+        }
         for index in self.slots.indices { bind(index) }
     }
 
