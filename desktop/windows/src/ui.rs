@@ -55,12 +55,14 @@ use winit::{
     window::Window,
 };
 
+mod addons_page;
 mod harness;
 mod stack;
 #[cfg(test)]
 mod test_profile;
 mod text;
 
+use addons_page::{AddonsPage, PageRequest};
 use stack::LaneBox;
 use text::Language;
 
@@ -261,6 +263,9 @@ pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
             recorder.test_copy = test_copy;
             recorder.auto_grow = test_size.is_none();
             recorder.harness = test_copy.then(harness::Harness::from_environment).flatten();
+            // Below the main window and as far off screen, so neither window appears.
+            recorder.options_test_position =
+                test_position.map(|position| position + Vec2::new(0.0, 2000.0));
             let repaint = context.egui_ctx.clone();
             recorder.controller.set_repaint(Arc::new(move || {
                 // A delayed request runs one pass. An immediate one runs two.
@@ -423,6 +428,9 @@ struct Recorder {
     options_in_taskbar: bool,
     options_focus_requested: bool,
     options_section: OptionsSection,
+    addons_page: AddonsPage,
+    /// Where a test copy puts its Options window, off every screen like its main window.
+    options_test_position: Option<Pos2>,
     available_sources: Vec<CaptureSource>,
     source_list_worker: Option<JoinHandle<Vec<CaptureSource>>>,
     source_list_refresh_pending: bool,
@@ -513,21 +521,27 @@ enum OptionsSection {
     Sources,
     Appearance,
     Export,
+    Addons,
     Updates,
 }
 
 impl OptionsSection {
-    const ALL: [(Self, &'static str); 6] = [
+    const ALL: [(Self, &'static str); 7] = [
         // One short word each, so the list never wraps and a page is easy to name.
         (Self::Actions, "Actions"),
         (Self::Capture, "Capture"),
         (Self::Sources, "Sources"),
         (Self::Appearance, "Appearance"),
         (Self::Export, "Export"),
+        (Self::Addons, "Add-ons"),
         (Self::Updates, "Updates"),
     ];
 
     fn title(self) -> &'static str {
+        // The Add-ons page is the first one written in both languages (see `text`).
+        if self == Self::Addons {
+            return Language::current().addons_section();
+        }
         Self::ALL.iter().find(|(section, _)| *section == self).unwrap().1
     }
 }
@@ -1129,6 +1143,8 @@ enum OptionsAction {
     GoToSaveFolder,
     SelectSnapshotFolder,
     OpenSnapshotFolder,
+    PickAddonFile,
+    OpenLink(String),
     Hide,
     Show,
     Quit,
@@ -1349,6 +1365,8 @@ impl Recorder {
             options_in_taskbar: false,
             options_focus_requested: false,
             options_section: OptionsSection::Actions,
+            addons_page: AddonsPage::default(),
+            options_test_position: None,
             available_sources: vec![CaptureSource::System, CaptureSource::DefaultMicrophone],
             source_list_worker: None,
             source_list_refresh_pending: false,
@@ -1969,7 +1987,8 @@ impl Recorder {
                 || !self.pending_snapshot_saves.is_empty()
                 || self.plugin_snapshot_request.is_some()
                 || !self.pending_plugin_snapshots.is_empty(),
-            polling: self.source_list_worker.is_some(),
+            // Add-on manager replies arrive without a repaint of their own.
+            polling: self.source_list_worker.is_some() || self.addons_page.waiting(),
             tray_retry: if self.options_in_taskbar || self.test_copy {
                 None
             } else if let Some(tray) = &self.tray {
@@ -2687,14 +2706,24 @@ impl Recorder {
         let pinned = self.pinned;
         let waveform_only = self.waveform_only;
         let old_border_inset = self.border_inset();
-        let title = if self.primary {
+        let mut title = if self.primary {
             tray::OPTIONS_TITLE.to_owned()
         } else {
             "Backtracking Capture Options".to_owned()
         };
-        let builder = egui::ViewportBuilder::default()
+        if self.test_copy {
+            // The installed app's Options window has the plain title, and windows are found
+            // by title (`tray::prepare_options_window`).
+            title.push_str(" (test copy)");
+        }
+        let size = self
+            .harness
+            .as_ref()
+            .and_then(harness::Harness::options_size)
+            .unwrap_or(Vec2::new(820.0, 640.0));
+        let mut builder = egui::ViewportBuilder::default()
             .with_title(&title)
-            .with_inner_size([820.0, 640.0])
+            .with_inner_size(size)
             .with_min_inner_size([680.0, 460.0])
             .with_resizable(true)
             .with_maximize_button(true)
@@ -2705,13 +2734,21 @@ impl Recorder {
             } else {
                 egui::WindowLevel::Normal
             });
+        if let Some(position) = self.options_test_position {
+            // A test copy's window appears off screen and leaves the keyboard where it is.
+            builder = builder.with_position(position).with_active(false);
+        }
         let action = ctx.show_viewport_immediate(options_viewport(), builder, |ui, class| {
             if ui.input(|input| input.viewport().close_requested()) {
                 return Some(OptionsAction::Close);
             }
-            // Escape closes the window unless it is closing a drop-down or a colour picker.
+            // Escape closes an open add-on question first, and leaves a text field alone.
+            // Otherwise it closes the window unless it is closing a drop-down or a colour picker.
             if !egui::Popup::is_any_open(ui.ctx())
                 && ui.input(|input| input.key_pressed(egui::Key::Escape))
+                && !ui.ctx().egui_wants_keyboard_input()
+                && !(self.options_section == OptionsSection::Addons
+                    && self.addons_page.cancel_on_escape())
             {
                 return Some(OptionsAction::Close);
             }
@@ -2724,12 +2761,26 @@ impl Recorder {
                 ui.ctx().send_viewport_cmd(ViewportCommand::Visible(true));
                 ui.ctx()
                     .send_viewport_cmd(ViewportCommand::Minimized(false));
-                ui.ctx().send_viewport_cmd(ViewportCommand::Focus);
+                if !self.test_copy {
+                    ui.ctx().send_viewport_cmd(ViewportCommand::Focus);
+                }
             }
             if ui.input(|input| input.pointer.any_pressed()) {
                 self.last_interaction = Instant::now();
             }
-            self.options_contents(ui, frame)
+            if let Some(harness) = &mut self.harness {
+                harness.drop_on_options(ui.ctx());
+            }
+            // A package dropped here opens its confirmation on the Add-ons page.
+            if let Some(dropped) = addons_page::dropped_package(&dropped_paths(ui.ctx())) {
+                self.review_addon(dropped);
+            }
+            let action = self.options_contents(ui, frame);
+            addons_page::paint_drop_hint(ui.ctx(), self.accent, Language::current());
+            if let Some(harness) = &mut self.harness {
+                harness.photograph_options(ui.ctx());
+            }
+            action
         });
         if self.waveform_only != waveform_only {
             self.apply_waveform_mode(ctx, frame);
@@ -2754,6 +2805,8 @@ impl Recorder {
             }
             Some(OptionsAction::SelectSnapshotFolder) => self.select_saved_snapshot_folder(frame),
             Some(OptionsAction::OpenSnapshotFolder) => self.open_saved_snapshot_folder(frame),
+            Some(OptionsAction::PickAddonFile) => self.pick_addon_file(frame),
+            Some(OptionsAction::OpenLink(link)) => self.open_link(&link),
             Some(OptionsAction::Hide) => self.hide(ctx),
             Some(OptionsAction::Show) => self.show(ctx),
             Some(OptionsAction::Quit) => self.quit(ctx),
@@ -2775,10 +2828,11 @@ impl Recorder {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 4.0;
                 ui.add_space(6.0);
-                for (section, label) in OptionsSection::ALL {
+                for (section, _) in OptionsSection::ALL {
                     if !self.primary && section == OptionsSection::Updates { continue; }
                     let selected = self.options_section == section;
-                    if options_navigation_item(ui, label, selected, self.accent).clicked() {
+                    if options_navigation_item(ui, section.title(), selected, self.accent).clicked()
+                    {
                         self.options_section = section;
                     }
                 }
@@ -2820,6 +2874,7 @@ impl Recorder {
                                 ui.separator();
                                 self.folder_options(ui)
                             }
+                            OptionsSection::Addons => self.addon_options(ui),
                             OptionsSection::Updates => self.updates.show(ui).then_some(OptionsAction::Quit),
                         }
                     })).inner
@@ -3313,6 +3368,66 @@ impl Recorder {
             Ok(()) => format!("Snapshot folder: {}", self.saved_output.display()),
             Err(error) => format!("Could not save settings: {error}"),
         };
+    }
+
+    fn addon_options(&mut self, ui: &mut egui::Ui) -> Option<OptionsAction> {
+        let handle = self.controller.addons();
+        match self
+            .addons_page
+            .show(ui, handle, Language::current(), self.accent)?
+        {
+            PageRequest::PickFile => Some(OptionsAction::PickAddonFile),
+            PageRequest::OpenLink(link) => Some(OptionsAction::OpenLink(link)),
+        }
+    }
+
+    /// Shows the confirmation for a dropped or chosen package on the Add-ons page.
+    fn review_addon(&mut self, dropped: addons_page::DroppedPackage) {
+        self.addons_page.review_package(
+            dropped.path,
+            dropped.others,
+            self.controller.addons(),
+            Language::current(),
+        );
+        self.options_section = OptionsSection::Addons;
+    }
+
+    fn pick_addon_file(&mut self, frame: &eframe::Frame) {
+        let language = Language::current();
+        let chosen = rfd::FileDialog::new()
+            .set_title(language.file_dialog_title())
+            .add_filter(language.file_filter(), &["btaddon"])
+            .set_parent(frame)
+            .pick_file();
+        if let Some(path) = chosen {
+            self.review_addon(addons_page::DroppedPackage { path, others: 0 });
+        }
+        self.last_interaction = Instant::now();
+    }
+
+    /// Opens an add-on's homepage in the default browser, only after the user clicked it.
+    fn open_link(&mut self, link: &str) {
+        use windows::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+        use windows::core::{HSTRING, PCWSTR, w};
+        if !addons_page::link_is_openable(link) {
+            return;
+        }
+        let file = HSTRING::from(link);
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                &file,
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // ShellExecute reports success with a value above 32.
+        if result.0 as isize <= 32 {
+            self.message =
+                Language::current().could_not_open_link(&io::Error::last_os_error().to_string());
+        }
     }
 
     fn open_saved_snapshot_folder(&mut self, frame: &eframe::Frame) {
@@ -4538,6 +4653,9 @@ impl eframe::App for Recorder {
         if input.viewport_id != egui::ViewportId::ROOT {
             return;
         }
+        if let Some(harness) = &mut self.harness {
+            harness.drop_on_main(input);
+        }
         let viewport = input.viewport();
         if viewport.minimized == Some(true) || viewport.fullscreen == Some(true) || !input.focused {
             self.window_drag = None;
@@ -4616,6 +4734,8 @@ impl eframe::App for Recorder {
         self.update_tray(ctx, frame);
         self.poll_snapshot_hotkey();
         self.collect_source_list();
+        self.addons_page
+            .poll(self.controller.addons(), Language::current());
         let now = Instant::now();
         self.watch_pin(frame, now);
         if let Some(drag) = &mut self.window_drag
@@ -4766,6 +4886,18 @@ impl eframe::App for Recorder {
                 self.run_command(command, ui.ctx(), frame);
             }
         }
+        // A package dropped on this window opens its confirmation in Options. Other files are
+        // left alone, and a clip dragged out never drops here (`file_drag` cancels a drop on
+        // the app's own windows).
+        if let Some(dropped) = addons_page::dropped_package(&dropped_paths(ui.ctx())) {
+            self.review_addon(dropped);
+            if self.options_open {
+                self.options_focus_requested = true;
+            } else {
+                self.open_options(ui.ctx());
+            }
+        }
+        addons_page::paint_drop_hint(ui.ctx(), self.accent, Language::current());
         self.draw_options_window(ui.ctx(), frame);
         // Drawing can start a gesture, an export or the recording blink.
         self.watch_pin(frame, Instant::now());
@@ -4824,6 +4956,18 @@ impl Drop for Recorder {
 
 fn lane_name(lane: usize) -> &'static str {
     if lane == 0 { "A" } else { "B" }
+}
+
+/// The files dropped on the window being drawn, in this pass.
+fn dropped_paths(ctx: &egui::Context) -> Vec<PathBuf> {
+    ctx.input(|input| {
+        input
+            .raw
+            .dropped_files
+            .iter()
+            .map(|file| egui::DroppedFile::path(file.as_ref()).to_path_buf())
+            .collect()
+    })
 }
 
 fn source_picker_label<'a>(

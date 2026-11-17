@@ -9,18 +9,27 @@
 //!   `zoom=<seconds>` shows only that much; `select=<from>-<to>` selects that stretch, as a
 //!   drag would; `scroll=<lane>:<row>` scrolls a stacked lane (A is 0) to that row;
 //!   `group=<lane>:<group id>` shows another channel group.
+//!   `options=<page>[:<width>x<height>]` opens the Options window on that page (`actions`,
+//!   `capture`, `sources`, `appearance`, `export`, `addons`, `updates`), optionally at that
+//!   size, and makes the picture of the Options window instead of the main window.
+//!   `drop=<file>` drops a file on the main window and `drop-options=<file>` on the Options
+//!   window: the file reaches egui's input as a dropped file, as one from Explorer does.
+//!   `remove=<add-on id>` opens the question that comes before removing that add-on.
+//!   `install` presses Install on the confirmation, and `set=<add-on id>:<key>=<JSON value>`
+//!   changes a setting as its control would, with any value. Each of these two waits until
+//!   the steps before it have settled (a dropped package has been read, say).
 //!
 //! The picture is `<file.png>`; `<file.png>.log` gets the frame times and any problem.
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
-use std::sync::mpsc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use super::Recorder;
+use super::{OptionsSection, Recorder};
 
 pub(super) const SCREENSHOT: &str = "BACKTRACKING_TEST_SCREENSHOT";
 const SCREENSHOT_DELAY: &str = "BACKTRACKING_TEST_SCREENSHOT_DELAY_MS";
@@ -38,6 +47,72 @@ pub(super) enum Step {
     Select(f64, f64),
     Scroll(usize, usize),
     Group(usize, String),
+    Options(OptionsSection, Option<egui::Vec2>),
+    Drop(PathBuf),
+    DropOnOptions(PathBuf),
+    Remove(String),
+    Install,
+    Set(String, String, serde_json::Value),
+}
+
+impl Step {
+    /// Steps that act on what earlier steps brought about, so they wait for it.
+    fn waits(&self) -> bool {
+        matches!(self, Self::Install | Self::Set(..))
+    }
+}
+
+fn options_page(name: &str) -> Result<OptionsSection, String> {
+    let wanted: String = name.trim().to_ascii_lowercase().replace('-', "");
+    OptionsSection::ALL
+        .iter()
+        .find(|(_, label)| label.to_ascii_lowercase().replace('-', "") == wanted)
+        .map(|(section, _)| *section)
+        .ok_or_else(|| format!("{name} is not an Options page"))
+}
+
+fn window_size(text: &str) -> Result<egui::Vec2, String> {
+    let (width, height) = text
+        .split_once('x')
+        .ok_or_else(|| format!("{text} is not <width>x<height>"))?;
+    let size = |text: &str| {
+        text.trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|value| (200.0..=4000.0).contains(value))
+            .ok_or_else(|| format!("{text} is not a size from 200 to 4000"))
+    };
+    Ok(egui::Vec2::new(size(width)?, size(height)?))
+}
+
+/// A file the harness drops, as egui-winit hands over one dropped from Explorer.
+#[derive(Debug)]
+struct DroppedForTest(PathBuf);
+
+impl egui::DroppedFile for DroppedForTest {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        fs::read(&self.0).map_err(|error| error.to_string())
+    }
+}
+
+type PictureResult = io::Result<[usize; 2]>;
+
+/// Writes a window's pixels as a PNG and returns its size.
+fn write_picture(output: &Path, image: &egui::ColorImage) -> PictureResult {
+    let size = image.size;
+    let pixels: Vec<u8> = image
+        .pixels
+        .iter()
+        // The colours are premultiplied, so dropping alpha shows the window over black.
+        .flat_map(|pixel| [pixel.r(), pixel.g(), pixel.b()])
+        .collect();
+    fs::File::create(output)
+        .and_then(|mut file| file.write_all(&png_rgb(size[0], size[1], &pixels)))
+        .map(|()| size)
 }
 
 pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
@@ -45,6 +120,9 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
         .map(str::trim)
         .filter(|step| !step.is_empty())
         .map(|step| {
+            if step == "install" {
+                return Ok(Step::Install);
+            }
             let (name, value) = step
                 .split_once('=')
                 .ok_or_else(|| format!("no '=' in {step}"))?;
@@ -84,6 +162,26 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                     let (lane_text, id) = pair(step, value)?;
                     Ok(Step::Group(lane(lane_text)?, id.trim().to_owned()))
                 }
+                "options" => match value.split_once(':') {
+                    Some((page, size)) => {
+                        Ok(Step::Options(options_page(page)?, Some(window_size(size)?)))
+                    }
+                    None => Ok(Step::Options(options_page(value)?, None)),
+                },
+                "drop" => Ok(Step::Drop(PathBuf::from(value.trim()))),
+                "drop-options" => Ok(Step::DropOnOptions(PathBuf::from(value.trim()))),
+                "remove" => Ok(Step::Remove(value.trim().to_owned())),
+                "set" => {
+                    let (id, setting) = value
+                        .split_once(':')
+                        .ok_or_else(|| format!("{step} needs <add-on id>:<key>=<value>"))?;
+                    let (key, json) = setting
+                        .split_once('=')
+                        .ok_or_else(|| format!("{step} needs <add-on id>:<key>=<value>"))?;
+                    let json = serde_json::from_str(json.trim())
+                        .map_err(|error| format!("{json} is not a JSON value: {error}"))?;
+                    Ok(Step::Set(id.trim().to_owned(), key.trim().to_owned(), json))
+                }
                 other => Err(format!("unknown step {other}")),
             }
         })
@@ -102,9 +200,67 @@ pub(super) struct Harness {
     first_timed: Option<Instant>,
     last_timed: Option<Instant>,
     notes: Vec<String>,
+    /// The picture is of the Options window, at this size when one was asked for.
+    options_picture: bool,
+    options_size: Option<egui::Vec2>,
+    main_drops: Vec<PathBuf>,
+    options_drops: Vec<PathBuf>,
+    /// Waits for the Options window's next pass to take its picture.
+    options_shot: Option<mpsc::SyncSender<PictureResult>>,
 }
 
 impl Harness {
+    /// The size the Options window is created at, when a step asked for one.
+    pub(super) fn options_size(&self) -> Option<egui::Vec2> {
+        self.options_size
+    }
+
+    /// Hands files the steps dropped on the main window to egui, in its raw input.
+    pub(super) fn drop_on_main(&mut self, input: &mut egui::RawInput) {
+        for path in self.main_drops.drain(..) {
+            input.dropped_files.push(Arc::new(DroppedForTest(path)));
+        }
+    }
+
+    /// Hands files the steps dropped on the Options window to its input, before it is read.
+    pub(super) fn drop_on_options(&mut self, ctx: &egui::Context) {
+        if self.options_drops.is_empty() {
+            return;
+        }
+        let drops = std::mem::take(&mut self.options_drops);
+        ctx.input_mut(|input| {
+            for path in drops {
+                input.raw.dropped_files.push(Arc::new(DroppedForTest(path)));
+            }
+        });
+    }
+
+    /// Takes the Options window's picture when it is due. eframe takes screenshots of the
+    /// main window only, so the last shape drawn reads the finished frame back from OpenGL.
+    pub(super) fn photograph_options(&mut self, ctx: &egui::Context) {
+        let Some(send) = self.options_shot.take() else {
+            return;
+        };
+        let job = Mutex::new(Some((self.output.clone(), send)));
+        let wake = ctx.clone();
+        let callback = eframe::egui_glow::CallbackFn::new(move |info, painter| {
+            let Some((output, send)) = job.lock().ok().and_then(|mut job| job.take()) else {
+                return;
+            };
+            let image = painter.read_screen_rgba(info.screen_size_px);
+            let _ = send.send(write_picture(&output, &image));
+            wake.request_repaint_of(egui::ViewportId::ROOT);
+        });
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Debug,
+            egui::Id::unique("harness-picture"),
+        ))
+        .add(egui::PaintCallback {
+            rect: ctx.content_rect(),
+            callback: Arc::new(callback),
+        });
+    }
+
     pub(super) fn from_environment() -> Option<Self> {
         let output = PathBuf::from(std::env::var_os(SCREENSHOT)?);
         let delay = std::env::var(SCREENSHOT_DELAY)
@@ -119,10 +275,16 @@ impl Harness {
             }),
             Err(_) => Vec::new(),
         };
+        let options_size = steps.iter().find_map(|step| match step {
+            Step::Options(_, size) => *size,
+            _ => None,
+        });
         Some(Self {
             output,
             started: Instant::now(),
             delay,
+            options_picture: steps.iter().any(|step| matches!(step, Step::Options(..))),
+            options_size,
             steps,
             applied: None,
             result: None,
@@ -130,6 +292,9 @@ impl Harness {
             first_timed: None,
             last_timed: None,
             notes,
+            main_drops: Vec::new(),
+            options_drops: Vec::new(),
+            options_shot: None,
         })
     }
 
@@ -224,60 +389,83 @@ impl Recorder {
         }
         let Some(applied) = harness.applied else {
             harness.applied = Some(now);
-            let steps = std::mem::take(&mut harness.steps);
-            for step in steps {
-                if let Err(error) = self.apply_test_step(&step) {
-                    if let Some(harness) = &mut self.harness {
-                        harness.notes.push(format!("{step:?}: {error}"));
-                    }
-                }
-            }
-            ctx.request_repaint_after(SETTLE);
+            self.apply_test_steps(ctx);
             return;
         };
+        let options_picture = harness.options_picture;
         let settled = now.duration_since(applied) >= SETTLE
             && self.edit_request.is_none()
-            && self.edit_preview.is_none();
+            && self.edit_preview.is_none()
+            // Dropped files are read in the next pass, and the manager answers after that.
+            && harness.main_drops.is_empty()
+            && harness.options_drops.is_empty()
+            && !self.addons_page.waiting();
         if !settled {
             ctx.request_repaint_after(Duration::from_millis(50));
             return;
         }
+        if !harness.steps.is_empty() {
+            harness.applied = Some(now);
+            self.apply_test_steps(ctx);
+            return;
+        }
         let (send, receive) = mpsc::sync_channel(1);
+        harness.result = Some(receive);
+        if options_picture {
+            if !self.options_open {
+                let _ = send.send(Err(io::Error::other("the Options window is not open")));
+                return;
+            }
+            // The Options window draws during this window's next pass and takes it then.
+            harness.options_shot = Some(send);
+            ctx.request_repaint();
+            return;
+        }
         let output = harness.output.clone();
         let wake = ctx.clone();
-        harness.result = Some(receive);
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
             egui::ScreenshotCallback::new(move |image| {
-                let size = image.size;
-                let pixels: Vec<u8> = image
-                    .pixels
-                    .iter()
-                    // The colours are premultiplied, so dropping alpha shows the window
-                    // over black.
-                    .flat_map(|pixel| [pixel.r(), pixel.g(), pixel.b()])
-                    .collect();
-                let written = fs::File::create(&output)
-                    .and_then(|mut file| file.write_all(&png_rgb(size[0], size[1], &pixels)))
-                    .map(|()| size);
-                let _ = send.send(written);
+                let _ = send.send(write_picture(&output, &image));
                 wake.request_repaint();
             }),
         ));
     }
 
-    fn apply_test_step(&mut self, step: &Step) -> Result<(), String> {
+    /// Does the steps that are left, up to the next one that waits for them to settle.
+    fn apply_test_steps(&mut self, ctx: &egui::Context) {
+        let Some(harness) = self.harness.as_mut() else {
+            return;
+        };
+        let wait = harness
+            .steps
+            .iter()
+            .skip(1)
+            .position(Step::waits)
+            .map_or(harness.steps.len(), |index| index + 1);
+        let steps: Vec<Step> = harness.steps.drain(..wait).collect();
+        for step in steps {
+            if let Err(error) = self.apply_test_step(&step, ctx)
+                && let Some(harness) = &mut self.harness
+            {
+                harness.notes.push(format!("{step:?}: {error}"));
+            }
+        }
+        ctx.request_repaint_after(SETTLE);
+    }
+
+    fn apply_test_step(&mut self, step: &Step, ctx: &egui::Context) -> Result<(), String> {
         let rate = u64::from(self.sample_rate.max(1));
         let frames = |seconds: f64| (seconds * rate as f64).round() as u64;
         let history = self.history_frames.clone();
-        if history.is_empty() {
+        if history.is_empty() && matches!(step, Step::Zoom(_) | Step::Select(..)) {
             return Err("no audio yet".into());
         }
-        match *step {
+        match step {
             Step::Zoom(seconds) => {
-                let count = frames(seconds).max(1);
+                let count = frames(*seconds).max(1);
                 self.set_visible_frames(history.end.saturating_sub(count), count);
             }
-            Step::Select(from, to) => {
+            &Step::Select(from, to) => {
                 let start = history
                     .end
                     .saturating_sub(frames(from.max(to)))
@@ -294,8 +482,37 @@ impl Recorder {
                 self.selection = Some(start..end);
                 self.invalidate_export();
             }
-            Step::Scroll(lane, row) => self.scroll_lane_to(lane, row),
-            Step::Group(lane, ref id) => self.show_group(lane, id)?,
+            &Step::Scroll(lane, row) => self.scroll_lane_to(lane, row),
+            Step::Group(lane, id) => self.show_group(*lane, id)?,
+            Step::Options(section, _) => {
+                self.options_section = *section;
+                if !self.options_open {
+                    self.open_options(ctx);
+                }
+            }
+            Step::Drop(path) | Step::DropOnOptions(path) => {
+                if !path.is_file() {
+                    return Err(format!("{} is not a file", path.display()));
+                }
+                let harness = self.harness.as_mut().ok_or("the harness has finished")?;
+                if matches!(step, Step::Drop(_)) {
+                    harness.main_drops.push(path.clone());
+                } else {
+                    harness.options_drops.push(path.clone());
+                }
+                ctx.request_repaint();
+            }
+            Step::Remove(id) => self.addons_page.ask_to_remove(id)?,
+            Step::Install => {
+                if !self.addons_page.press_install() {
+                    return Err("no confirmation is ready to install".into());
+                }
+                ctx.request_repaint();
+            }
+            Step::Set(id, key, value) => {
+                self.addons_page.change_setting(id, key, value.clone())?;
+                ctx.request_repaint();
+            }
         }
         Ok(())
     }
@@ -641,8 +858,64 @@ mod tests {
             ]
         );
         assert_eq!(parse_steps(" ").unwrap(), []);
-        for bad in ["zoom", "zoom=-1", "select=2", "scroll=C:1", "spin=1"] {
+        assert_eq!(
+            parse_steps(
+                r"options=Add-ons:820x1100; drop=D:\a b\tone.btaddon;drop-options=C:\x.btaddon;remove=com.example.tone;options=export"
+            )
+            .unwrap(),
+            [
+                Step::Options(OptionsSection::Addons, Some(egui::Vec2::new(820.0, 1100.0))),
+                Step::Drop(PathBuf::from(r"D:\a b\tone.btaddon")),
+                Step::DropOnOptions(PathBuf::from(r"C:\x.btaddon")),
+                Step::Remove("com.example.tone".into()),
+                Step::Options(OptionsSection::Export, None),
+            ]
+        );
+        assert_eq!(
+            parse_steps("options=addons").unwrap(),
+            [Step::Options(OptionsSection::Addons, None)]
+        );
+        let steps =
+            parse_steps("install; set=com.example.tone:frequency=5 ;set=a:b=\"x=y\"").unwrap();
+        assert_eq!(
+            steps,
+            [
+                Step::Install,
+                Step::Set(
+                    "com.example.tone".into(),
+                    "frequency".into(),
+                    serde_json::json!(5)
+                ),
+                Step::Set("a".into(), "b".into(), serde_json::json!("x=y")),
+            ]
+        );
+        assert!(steps.iter().all(Step::waits));
+        for bad in [
+            "set=a:b",
+            "set=a=1",
+            "set=a:b=not json",
+            "zoom",
+            "zoom=-1",
+            "select=2",
+            "scroll=C:1",
+            "spin=1",
+            "options=plugins",
+            "options=addons:820",
+            "options=addons:20x20",
+        ] {
             assert!(parse_steps(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_picture_keeps_its_size_and_drops_the_premultiplied_alpha() {
+        let folder = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&folder).unwrap();
+        let output = folder.join(format!("harness-picture-{}.png", std::process::id()));
+        let image = egui::ColorImage::new([3, 2], vec![egui::Color32::from_rgb(10, 20, 30); 6]);
+        assert_eq!(write_picture(&output, &image).unwrap(), [3, 2]);
+        let png = std::fs::read(&output).unwrap();
+        std::fs::remove_file(&output).unwrap();
+        assert_eq!(&png[16..24], &[0, 0, 0, 3, 0, 0, 0, 2]);
     }
 }
