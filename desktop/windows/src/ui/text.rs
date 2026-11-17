@@ -74,6 +74,14 @@ impl Language {
         )
     }
 
+    /// Space on a selection that covers a lane wider than stereo, which is not played.
+    pub(crate) fn no_wide_preview(self) -> &'static str {
+        self.pick(
+            "Preview plays mono and stereo sources only.",
+            "試聽只播放單聲道與立體聲來源。",
+        )
+    }
+
     /// Under the history setting, when wide lanes leave room for less than was asked for.
     pub(crate) fn shorter_history(self, channels: usize, seconds: f64) -> String {
         let length = self.duration(seconds);
@@ -828,6 +836,7 @@ mod tests {
         for language in [English, TraditionalChinese] {
             assert!(!language.scroll_hint().is_empty());
             assert!(!language.no_loudness().is_empty());
+            assert!(!language.no_wide_preview().is_empty());
             assert!(!language.wide_export_field().is_empty());
             assert!(!language.wide_export_note().is_empty());
             assert!(!language.test_copy_startup().is_empty());

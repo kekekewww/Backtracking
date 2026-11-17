@@ -21,6 +21,9 @@ use windows::core::{GUID, Interface, PWSTR};
 
 use super::{Apartment, audio_error, endpoint_enumerator, endpoint_id};
 
+/// Comes before a plug-in Sender's name in the source list.
+pub(crate) const SENDER_MARK: &str = "【Sender】";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CaptureSource {
     System,
@@ -53,6 +56,36 @@ impl CaptureSource {
             | Self::Application { name, .. }
             | Self::Sender { name, .. }
             | Self::Addon { name, .. } => name,
+        }
+    }
+
+    /// What this source's files are called when the user has not named it: its name in the
+    /// source list, without an application's extension or the mark before a Sender.
+    pub(crate) fn default_file_name(&self) -> &str {
+        match self {
+            Self::Application { name, .. } => {
+                Path::new(name).file_stem().and_then(|stem| stem.to_str()).unwrap_or(name)
+            }
+            Self::Sender { name, .. } => name.strip_prefix(SENDER_MARK).unwrap_or(name),
+            _ => self.label(),
+        }
+    }
+
+    /// The device as settings remember it. Two sources share an identity exactly when they
+    /// are the [`same_source`](Self::same_source).
+    pub(crate) fn identity(&self) -> String {
+        match self {
+            Self::System => "system".into(),
+            Self::DefaultMicrophone => "default-mic".into(),
+            Self::Microphone { id, .. } => format!("mic\t{id}"),
+            Self::Application { path, .. } => format!("app\t{}", path.to_lowercase()),
+            Self::Sender { id, .. } => format!("sender\t{id}"),
+            // Neither id can hold a tab: both are checked when an add-on is read.
+            Self::Addon {
+                addon_id,
+                source_id,
+                ..
+            } => format!("addon\t{addon_id}\t{source_id}"),
         }
     }
 

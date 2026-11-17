@@ -26,7 +26,7 @@ pub(crate) use layout::{LaneGroup, LaneMeterReadings};
 use layout::{combined_channels, lane_groups, lane_meter_readings, machine_history_budget_samples};
 use waveform::ChannelWaveforms;
 
-pub(crate) use crate::loopback::CaptureSource;
+pub(crate) use crate::loopback::{CaptureSource, SENDER_MARK};
 use crate::loopback::{
     DataWake, Format, Loopback, PACKET_QUEUE_CAPACITY, QuietModeBarrier, now_ns,
 };
@@ -341,7 +341,7 @@ fn with_senders(mut sources: Vec<CaptureSource>, senders: Vec<SenderInfo>) -> Ve
         at..at,
         senders.into_iter().map(|sender| CaptureSource::Sender {
             id: sender.id,
-            name: format!("【Sender】{}", sender.name),
+            name: format!("{SENDER_MARK}{}", sender.name),
         }),
     );
     sources

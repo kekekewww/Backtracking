@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use backtracking_core::{ChannelRoute, TimedAudioQueue, TimedPacket};
+use backtracking_core::{ChannelRoute, PreviewGate, TimedAudioQueue, TimedPacket};
 use windows::Win32::Foundation::{HANDLE, RPC_E_CHANGED_MODE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
@@ -35,7 +35,7 @@ use windows::core::{Error, GUID, HRESULT, HSTRING, Interface, PCWSTR, Ref, imple
 
 mod sources;
 mod timing;
-pub(crate) use sources::CaptureSource;
+pub(crate) use sources::{CaptureSource, SENDER_MARK};
 use sources::{OwnedHandle, RunningProcess, target_process};
 use timing::PacketClock;
 
@@ -911,6 +911,16 @@ impl WasapiStream {
             flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0,
             now_ns,
         );
+        // A Backtracking preview plays through the output this stream records. Record
+        // silence where it may have been heard, so the preview never enters the history.
+        if matches!(self.binding, SourceBinding::DefaultRender(_)) {
+            PreviewGate::shared().silence(
+                stamp.timestamp_ns,
+                samples,
+                self.format.channels,
+                self.format.sample_rate,
+            );
+        }
         // Never block the device when the consumer is busy. Tell it explicitly
         // if a previous queue write discarded audio, including a partial packet.
         self.queue_loss = self.packets.push_interleaved_with_discontinuity(

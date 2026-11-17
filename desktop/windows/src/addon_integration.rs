@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use backtracking_addon::package;
-use backtracking_core::{ChannelRoute, WavExportProfile};
+use backtracking_core::{ChannelRoute, Fades, TakeLabel, WavExportProfile};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
@@ -393,9 +393,11 @@ fn test_tone_child() {
         &root.join("exports"),
         &snapshot.snapshots,
         (visible.start - range.start) as usize..(visible.end - range.start) as usize,
+        Fades::NONE,
         WavExportProfile::default(),
         &[ChannelRoute::Merged],
         false,
+        &[TakeLabel::default()],
         &options,
     )
     .unwrap();

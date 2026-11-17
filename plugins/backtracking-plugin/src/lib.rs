@@ -7,6 +7,7 @@ mod settings;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use backtracking_core::PreviewSlot;
 use nice_plug::audio_setup::ProcessMode;
 use nice_plug::prelude::*;
 
@@ -144,12 +145,36 @@ impl Plugin for Backtracking {
                 sidechain.unwrap_or(&[]),
                 bar_frames(context.transport()),
             );
+            // The preview joins the output after the input was recorded, so it never lands in
+            // this plug-in's own history.
+            let previewing = mix_preview(&self.session.preview, buffer.as_slice(), worker.sample_rate());
             if context.plugin_api() == PluginApi::Clap && self.session.continuous_processing_requested() {
                 return ProcessStatus::KeepAlive;
+            }
+            if previewing != 0 {
+                // The rest of the preview plays even while the input is silent.
+                return ProcessStatus::Tail(previewing.min(u64::from(u32::MAX)) as u32);
             }
         }
         ProcessStatus::Normal
     }
+}
+
+/// Adds the editor's preview, when one is playing, to the audio leaving the plug-in. A mono
+/// output hears both sides. Returns how many frames of the preview are still to come.
+fn mix_preview(preview: &PreviewSlot, output: &mut [&mut [f32]], sample_rate: u32) -> u64 {
+    if !preview.is_occupied() {
+        return 0;
+    }
+    let frames = output.first().map_or(0, |channel| channel.len());
+    preview.render_with(frames, sample_rate, |index, [left, right]| match &mut *output {
+        [only] => only[index] += (left + right) * 0.5,
+        [first, second, ..] => {
+            first[index] += left;
+            second[index] += right;
+        }
+        [] => {}
+    }).remaining
 }
 
 /// A bar at or after the first sample, and the distance to subsequent bars.
@@ -407,6 +432,63 @@ mod tests {
             plugin.worker = None;
             plugin.capture_enabled = true;
             assert_eq!(process_preserving_audio(&mut plugin, &mut context, true), ProcessStatus::Normal);
+        }
+    }
+
+    /// Processes one block of `input` on both main channels and returns what left the plug-in.
+    fn process_block(plugin: &mut Backtracking, context: &mut AudioContext, main_channels: usize,
+        input: [f32; 4]) -> (Vec<[f32; 4]>, ProcessStatus)
+    {
+        let mut main = vec![input.to_vec(); main_channels];
+        let mut side = vec![0.0; 4];
+        let mut buffer = Buffer::default();
+        let mut sidechain = Buffer::default();
+        // All slices remain live until after process() and share the declared four-frame length.
+        unsafe {
+            buffer.set_slices(4, |slices| {
+                *slices = main.iter_mut().map(Vec::as_mut_slice).collect();
+            });
+            sidechain.set_slices(4, |slices| *slices = vec![side.as_mut_slice()]);
+        }
+        let mut inputs = [sidechain];
+        let mut outputs = [];
+        let mut auxiliary = AuxiliaryBuffers { inputs: &mut inputs, outputs: &mut outputs };
+        let status = plugin.process(&mut buffer, &mut auxiliary, context);
+        let output = buffer.as_slice_immutable().iter()
+            .map(|channel| std::array::from_fn(|frame| channel[frame]))
+            .collect();
+        (output, status)
+    }
+
+    #[test]
+    fn a_playing_preview_joins_the_output_but_not_the_history_and_keeps_the_host_processing() {
+        use backtracking_core::{ChannelRoute, Fades, FrozenTrack, Preview};
+
+        for (api, main_channels) in [(PluginApi::Clap, 2), (PluginApi::Vst3, 2), (PluginApi::Vst3, 1)] {
+            let mut plugin = Backtracking::default();
+            let mut context = AudioContext::new(api);
+            assert!(plugin.activate(&layout(main_channels as u32, &MONO_AUX, SIDECHAIN_NAMES),
+                &realtime_config(), &mut context));
+            let preview = |rate| {
+                let track = FrozenTrack::from_interleaved(rate, 1, 0, &[0.5; 6]).unwrap();
+                Preview::new(&[track], 0..6, &[ChannelRoute::Merged], false, Fades::NONE).unwrap()
+            };
+            plugin.session.preview.play(preview(1_000));
+            let (output, status) = process_block(&mut plugin, &mut context, main_channels, [0.25; 4]);
+            assert_eq!(output, vec![[0.75; 4]; main_channels]);
+            assert_eq!(status, ProcessStatus::Tail(2));
+            let (output, status) = process_block(&mut plugin, &mut context, main_channels, [0.25; 4]);
+            assert_eq!(output, vec![[0.75, 0.75, 0.25, 0.25]; main_channels]);
+            assert_eq!(status, ProcessStatus::Normal);
+            // The plug-in recorded what came in, never what it played.
+            let recorded = plugin.session.snapshot_live().unwrap().samples;
+            assert_eq!(recorded, vec![0.25; 8 * main_channels]);
+
+            // A preview captured at another rate would play at the wrong speed, so it stays silent.
+            plugin.session.preview.play(preview(2_000));
+            let (output, status) = process_block(&mut plugin, &mut context, main_channels, [0.25; 4]);
+            assert_eq!(output, vec![[0.25; 4]; main_channels]);
+            assert_eq!(status, ProcessStatus::Normal);
         }
     }
 

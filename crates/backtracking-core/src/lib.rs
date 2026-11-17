@@ -1,8 +1,11 @@
 mod capture;
 pub mod cleanup;
 mod export;
+mod fade;
 mod ffi;
 mod meter;
+mod preview;
+mod preview_ffi;
 mod queue;
 mod sender;
 mod synchronized;
@@ -14,12 +17,16 @@ pub use capture::{
     DEFAULT_MAX_BUFFER_SAMPLES,
 };
 pub use export::{
-    export_channel_range_with_profile, export_routed_tracks_with_profile,
-    export_routed_tracks_with_tempo, export_routed_wav_with_profile, export_tracks_with_profile,
-    export_wav, export_wav_with_profile, is_export_file_name, write_wav, write_wav_with_profile,
-    ChannelExportMode, TrackAudio, WavExportProfile, WavSampleFormat,
+    export_channel_range_with_profile, export_labelled_tracks, export_routed_tracks_with_fades,
+    export_routed_tracks_with_profile, export_routed_tracks_with_tempo,
+    export_routed_wav_with_profile, export_tracks_with_profile, export_wav,
+    export_wav_with_profile, file_name_source, is_export_file_name, write_wav,
+    write_wav_with_profile, ChannelExportMode, Lane, TakeLabel, TrackAudio, WavExportProfile,
+    WavSampleFormat, SOURCE_NAME_LIMIT,
 };
+pub use fade::{dragged_fades, fade_waveform_bins, FadeEnd, Fades};
 pub use meter::MeterReadings;
+pub use preview::{Preview, PreviewGate, PreviewSlot, SlotRender};
 pub use queue::{AudioQueue, TimedAudioQueue, TimedPacket};
 pub use sender::{
     capture_clock_ns, discover_senders, discover_snapshot_targets, new_sender_id,

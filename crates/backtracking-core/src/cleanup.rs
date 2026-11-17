@@ -208,12 +208,14 @@ mod tests {
         let old_pair =
             folder.file("Backtracking_2026-10-01_09-00-05_8.0s_120bpm_2-B.wav", now - 45 * DAY);
         let old_style = folder.file("Backtracking-1763100000000-4242-7.wav", now - 400 * DAY);
+        let old_named =
+            folder.file("Backtracking_Vocal mic_B_2026-10-01_09-00-07_3.0s.wav", now - 33 * DAY);
         let exact = folder.file("Backtracking_2026-10-15_09-00-00_1.0s.wav", now - 30 * DAY);
         let recent = folder.file("Backtracking_2026-11-10_09-00-00_12.4s.wav", now - 29 * DAY);
         let future = folder.file("Backtracking_2026-11-10_09-00-01_12.4s.wav", now + DAY);
 
-        assert_eq!(remove_old_exports(&folder.0, 30, &[], now).unwrap(), 4);
-        for gone in [&old, &old_pair, &old_style, &exact] {
+        assert_eq!(remove_old_exports(&folder.0, 30, &[], now).unwrap(), 5);
+        for gone in [&old, &old_pair, &old_style, &old_named, &exact] {
             assert!(!gone.exists(), "{}", gone.display());
         }
         assert!(recent.exists());

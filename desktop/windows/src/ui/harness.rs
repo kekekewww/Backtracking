@@ -9,6 +9,8 @@
 //!   `zoom=<seconds>` shows only that much; `select=<from>-<to>` selects that stretch, as a
 //!   drag would; `scroll=<lane>:<row>` scrolls a stacked lane (A is 0) to that row;
 //!   `group=<lane>:<group id>` shows another channel group.
+//!   `separate=<on|off>` edits lanes A and B on their own or together, as Right Ctrl does,
+//!   and `select-lane=<lane>` makes the next `select=` belong to that lane.
 //!   `options=<page>[:<width>x<height>]` opens the Options window on that page (`actions`,
 //!   `capture`, `sources`, `appearance`, `export`, `addons`, `updates`), optionally at that
 //!   size, and makes the picture of the Options window instead of the main window.
@@ -53,6 +55,10 @@ const SETTLE: Duration = Duration::from_millis(500);
 pub(super) enum Step {
     Zoom(f64),
     Select(f64, f64),
+    /// The lane a selection made after it belongs to, as if its drag started there.
+    SelectLane(usize),
+    /// Lanes A and B edited on their own, as Right Ctrl switches them.
+    Separate(bool),
     Scroll(usize, usize),
     Group(usize, String),
     Options(OptionsSection, Option<egui::Vec2>),
@@ -171,6 +177,12 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                         .ok_or_else(|| format!("{step} needs <from>-<to>"))?;
                     Ok(Step::Select(number(from)?, number(to)?))
                 }
+                "select-lane" => Ok(Step::SelectLane(lane(value)?)),
+                "separate" => match value.trim() {
+                    "on" => Ok(Step::Separate(true)),
+                    "off" => Ok(Step::Separate(false)),
+                    other => Err(format!("{other} is not on or off")),
+                },
                 "scroll" => {
                     let (lane_text, row) = pair(step, value)?;
                     let row = row
@@ -532,10 +544,19 @@ impl Recorder {
                 // As a finished drag does: freeze the audio, then keep the range.
                 self.begin_editing();
                 self.last_interaction = Instant::now();
-                let flags = self.flag_update(start..end);
+                let flags = self.flag_update(start..end, Some(self.selection_lane));
                 self.apply_flags(flags);
                 self.selection = Some(start..end);
                 self.invalidate_export();
+            }
+            &Step::SelectLane(lane) => self.selection_lane = lane,
+            &Step::Separate(on) => {
+                if !self.dual_source() {
+                    return Err("separate lanes need two sources".into());
+                }
+                if self.separate_lanes != on {
+                    self.toggle_separate_lanes();
+                }
             }
             &Step::Scroll(lane, row) => self.scroll_lane_to(lane, row),
             Step::Group(lane, id) => self.show_group(*lane, id)?,
@@ -973,6 +994,15 @@ mod tests {
                 Step::Group(1, "objects".into()),
             ]
         );
+        assert_eq!(
+            parse_steps("separate=on;select-lane=B;select=3-1").unwrap(),
+            [
+                Step::Separate(true),
+                Step::SelectLane(1),
+                Step::Select(3.0, 1.0)
+            ]
+        );
+        assert!(parse_steps("separate=maybe").is_err());
         assert_eq!(parse_steps(" ").unwrap(), []);
         assert_eq!(
             parse_steps(
