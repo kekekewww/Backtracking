@@ -20,7 +20,9 @@ use eframe::egui::{self, Color32, Stroke};
 use serde_json::Value;
 
 use super::text::Language;
-use crate::addons::{AddonHandle, AddonInfo, AddonReply, AddonSnapshot, AddonState};
+use crate::addons::{
+    AddonHandle, AddonInfo, AddonReply, AddonSnapshot, AddonState, InspectedPackage,
+};
 
 const PACKAGE_EXTENSION: &str = "btaddon";
 /// The colour of a state that needs the user: not responding, failed or broken.
@@ -289,11 +291,12 @@ struct Request {
 
 struct Reviewed {
     info: PackageInfo,
+    identity: [u8; 32],
     installed: Installed,
 }
 
 enum Stage {
-    Reading(AddonReply<PackageInfo>),
+    Reading(AddonReply<InspectedPackage>),
     Refused(String),
     Ready(Box<Reviewed>),
     Installing(Box<Reviewed>, AddonReply<PackageInfo>),
@@ -435,9 +438,13 @@ impl AddonsPage {
         };
         if let (Some(result), Some(review)) = (read, self.review.as_mut()) {
             review.stage = match result {
-                Ok(info) => {
+                Ok(InspectedPackage { info, identity }) => {
                     let installed = installed(&self.snapshot, &info.manifest.id);
-                    Stage::Ready(Box::new(Reviewed { info, installed }))
+                    Stage::Ready(Box::new(Reviewed {
+                        info,
+                        identity,
+                        installed,
+                    }))
                 }
                 Err(reason) => Stage::Refused(reason),
             };
@@ -648,7 +655,7 @@ impl AddonsPage {
                     note,
                 }) = self.review.take()
                 {
-                    let reply = handle.install(path.clone());
+                    let reply = handle.install(path.clone(), reviewed.identity);
                     self.review = Some(Review {
                         path,
                         stage: Stage::Installing(reviewed, reply),
@@ -1668,7 +1675,11 @@ mod tests {
         });
         page.poll(None, English);
         assert!(page.waiting());
-        send.send(Ok(package(manifest(r#""source""#, "")))).unwrap();
+        send.send(Ok(InspectedPackage {
+            info: package(manifest(r#""source""#, "")),
+            identity: [7; 32],
+        }))
+        .unwrap();
         page.poll(None, English);
         assert!(!page.waiting());
         let Some(Review {
@@ -1679,6 +1690,7 @@ mod tests {
             panic!("the package is ready to install");
         };
         assert_eq!(reviewed.installed, Installed::Version("0.2.0".into()));
+        assert_eq!(reviewed.identity, [7; 32]);
 
         // A package that fails inspection is refused with its reason.
         let (send, reply) = mpsc::channel();
@@ -1693,6 +1705,7 @@ mod tests {
         let (send, reply) = mpsc::channel();
         let reviewed = Box::new(Reviewed {
             info: package(manifest("", "")),
+            identity: [0; 32],
             installed: Installed::Version("0.1.0".into()),
         });
         let mut page = page_with(Stage::Installing(reviewed, reply));
@@ -1718,6 +1731,7 @@ mod tests {
         let (send, reply) = mpsc::channel();
         let reviewed = Box::new(Reviewed {
             info: package(manifest("", "")),
+            identity: [0; 32],
             installed: Installed::No,
         });
         let mut page = page_with(Stage::Installing(reviewed, reply));
@@ -1727,7 +1741,7 @@ mod tests {
         assert_eq!(page.notice.as_deref(), Some("Installed Tone 0.2.0."));
 
         // A manager that went away is a reason too, not a wait that never ends.
-        let (send, reply) = mpsc::channel::<Result<PackageInfo, String>>();
+        let (send, reply) = mpsc::channel::<Result<InspectedPackage, String>>();
         drop(send);
         let mut page = page_with(Stage::Reading(reply));
         page.poll(None, English);
@@ -1839,11 +1853,13 @@ mod tests {
             Stage::Refused("not a ZIP file".into()),
             Stage::Ready(Box::new(Reviewed {
                 info: package(manifest(r#""source""#, "")),
+                identity: [0; 32],
                 installed: Installed::Broken,
             })),
             Stage::Failed(
                 Box::new(Reviewed {
                     info: package(manifest("", "")),
+                    identity: [0; 32],
                     installed: Installed::No,
                 }),
                 "disk full".into(),

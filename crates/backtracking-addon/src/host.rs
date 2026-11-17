@@ -94,24 +94,7 @@ impl Host {
 
     /// Accept and advance a bounded number of handshakes. Returned connections are caller-owned.
     pub fn poll(&mut self) -> Result<Vec<HostEvent>> {
-        for _ in 0..ACCEPT_BUDGET {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    if self.pending.len() < MAX_PENDING {
-                        if let Ok(wire) = Wire::new(stream) {
-                            self.pending.push(Pending {
-                                wire,
-                                started: Instant::now(),
-                                rejecting: false,
-                            });
-                        }
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
+        accept_pending(&mut self.pending, || self.listener.accept())?;
         let mut events = Vec::new();
         for mut pending in std::mem::take(&mut self.pending) {
             if pending.started.elapsed() >= HANDSHAKE_TIMEOUT {
@@ -214,6 +197,40 @@ impl Host {
     }
 }
 
+fn accept_pending(
+    pending: &mut Vec<Pending>,
+    mut accept: impl FnMut() -> std::io::Result<(std::net::TcpStream, std::net::SocketAddr)>,
+) -> Result<()> {
+    for _ in 0..ACCEPT_BUDGET {
+        match accept() {
+            Ok((stream, _)) => {
+                if pending.len() < MAX_PENDING {
+                    if let Ok(wire) = Wire::new(stream) {
+                        pending.push(Pending {
+                            wire,
+                            started: Instant::now(),
+                            rejecting: false,
+                        });
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                // A peer can disconnect before accept without damaging the listener.
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 impl Connection {
     pub fn id(&self) -> &str {
         &self.id
@@ -245,5 +262,52 @@ impl Connection {
     }
     pub fn close(&mut self) {
         self.wire.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn reset_or_aborted_peer_does_not_fail_accepting_the_next_peer() {
+        for kind in [ErrorKind::ConnectionReset, ErrorKind::ConnectionAborted] {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut calls = 0;
+            let mut pending = Vec::new();
+            accept_pending(&mut pending, || {
+                calls += 1;
+                if calls == 1 {
+                    Err(std::io::Error::from(kind))
+                } else {
+                    listener.accept()
+                }
+            })
+            .unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(calls, 3);
+        }
+    }
+
+    #[test]
+    fn reset_peers_still_obey_the_accept_budget() {
+        let mut calls = 0;
+        accept_pending(&mut Vec::new(), || {
+            calls += 1;
+            Err(std::io::Error::from(ErrorKind::ConnectionReset))
+        })
+        .unwrap();
+        assert_eq!(calls, ACCEPT_BUDGET);
+    }
+
+    #[test]
+    fn listener_failures_are_still_reported() {
+        let result = accept_pending(&mut Vec::new(), || {
+            Err(std::io::Error::from(ErrorKind::PermissionDenied))
+        });
+        assert!(result.is_err());
     }
 }

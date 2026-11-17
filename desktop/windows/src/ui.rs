@@ -1855,7 +1855,7 @@ impl Recorder {
             self.refresh_edit_preview();
             return;
         }
-        let revision = self.controller.revision();
+        let mut revision = self.controller.revision();
         let now = Instant::now();
         let bins = self.display_policy(self.audio_rect(self.plot_rect), self.visible_frames.clone()).bins;
         // Scrolling a lane or switching its group asks for other rows.
@@ -1898,36 +1898,27 @@ impl Recorder {
                     }
                 }
             }
-            // Only the channels on screen are read. A second lane drawn the old way reads
-            // the same frames as the first.
-            let mut zoom = self.zoom_frames.clone();
-            let mut rendered = None;
-            let mut busy = false;
+            // Every row in a mixed view reads the same frozen audio and revision.
             if !channels.is_empty() {
-                match self.controller.try_render_channel_waveforms(
-                    &channels,
-                    zoom.clone(),
-                    &mut channel_traces,
-                ) {
-                    Some(result) => {
-                        zoom = Some(result.1.clone());
-                        rendered = Some(result);
-                    }
-                    None => busy = true,
-                }
+                self.controller
+                    .try_render_channel_waveforms(
+                        &channels,
+                        &views,
+                        self.zoom_frames.clone(),
+                        &mut channel_traces,
+                        &mut view_traces,
+                    )
+                    .map(|(history, visible, rate, bars, drawn_revision)| {
+                        revision = drawn_revision;
+                        (history, visible, rate, bars)
+                    })
+            } else {
+                self.controller.try_render_waveforms(
+                    &views,
+                    self.zoom_frames.clone(),
+                    &mut view_traces,
+                )
             }
-            if !busy && (!views.is_empty() || rendered.is_none()) {
-                match self
-                    .controller
-                    .try_render_waveforms(&views, zoom, &mut view_traces)
-                {
-                    Some(result) => {
-                        rendered.get_or_insert(result);
-                    }
-                    None => busy = true,
-                }
-            }
-            rendered.filter(|_| !busy)
         };
         let Some((history, visible, rate, bars)) = rendered else {
             self.next_refresh = now + Duration::from_millis(16);

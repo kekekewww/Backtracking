@@ -35,6 +35,8 @@ pub(super) struct AddonProcess {
     process: OwnedHandle,
     job: OwnedHandle,
     id: u32,
+    #[cfg(test)]
+    pub(super) fail_termination: bool,
 }
 
 impl AddonProcess {
@@ -141,6 +143,8 @@ impl AddonProcess {
             process,
             job,
             id: information.dwProcessId,
+            #[cfg(test)]
+            fail_termination: false,
         };
         if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
             return Err(last_error("Resume add-on"));
@@ -167,6 +171,10 @@ impl AddonProcess {
     }
 
     pub(super) fn terminate(&mut self) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_termination {
+            return Err("Injected termination failure".into());
+        }
         if unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) } == 0 {
             return Err(last_error("End add-on process tree"));
         }

@@ -19,8 +19,12 @@ use crate::preferences::{
     source_preference_key,
 };
 mod layout;
+mod waveform;
+#[cfg(test)]
+mod waveform_tests;
 pub(crate) use layout::{LaneGroup, LaneMeterReadings};
 use layout::{combined_channels, lane_groups, lane_meter_readings, machine_history_budget_samples};
+use waveform::ChannelWaveforms;
 
 pub(crate) use crate::loopback::CaptureSource;
 use crate::loopback::{
@@ -500,6 +504,9 @@ pub(crate) struct Controller {
     addons: Option<AddonHandle>,
     shown_groups: SourceGroupChoices,
     group_preferences: Option<PreferenceWriter>,
+    channel_waveforms: Mutex<ChannelWaveforms>,
+    #[cfg(test)]
+    channel_waveform_lock_ns: std::sync::atomic::AtomicU64,
 }
 
 impl Controller {
@@ -540,6 +547,7 @@ impl Controller {
         });
         let worker_state = Arc::clone(&state);
         let worker_ui = Arc::clone(&ui);
+        let channel_waveforms = Mutex::new(ChannelWaveforms::new(Arc::clone(&ui))?);
         let worker = thread::Builder::new()
             .name("backtracking-capture".into())
             .spawn(move || {
@@ -561,6 +569,9 @@ impl Controller {
             addons,
             shown_groups: SourceGroupChoices::new(),
             group_preferences: None,
+            channel_waveforms,
+            #[cfg(test)]
+            channel_waveform_lock_ns: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -782,51 +793,31 @@ impl Controller {
         self.source_status.history_budget_samples
     }
 
-    /// Reads only the requested lane-relative channels. Busy capture leaves all bins untouched.
+    /// Pins the visible audio, then renders requested rows off the capture and UI
+    /// threads. Pending work leaves every bin untouched. The last field is the
+    /// rendered revision, which can precede the newest capture revision.
     pub(crate) fn try_render_channel_waveforms(
         &self,
         channels: &[(usize, usize)],
+        views: &[(usize, WaveformView)],
         zoom: Option<Range<u64>>,
         traces: &mut [WaveformBuffers<'_>],
-    ) -> Option<(Range<u64>, Range<u64>, u32, Vec<u64>)> {
+        view_traces: &mut [WaveformBuffers<'_>],
+    ) -> Option<(Range<u64>, Range<u64>, u32, Vec<u64>, u64)> {
         let state = try_lock(&self.state)?;
-        let rate = state.shape.map_or(COMMON_RATE, |shape| shape.0);
-        let Some(capture) = state.capture.as_ref().map(SynchronizedCapture::capture) else {
-            for (minimum, maximum) in traces {
-                minimum.fill(0.0);
-                maximum.fill(0.0);
-            }
-            return Some((0..0, 0..0, rate, Vec::new()));
-        };
-        let history = capture.frame_range();
-        let visible = zoom.map_or_else(
-            || history.clone(),
-            |zoom| {
-                backtracking_ui::fit_frame_range(
-                    &history,
-                    zoom.start,
-                    zoom.end.saturating_sub(zoom.start),
-                )
-            },
+        #[cfg(test)]
+        let locked_at = Instant::now();
+        let rendered = self
+            .channel_waveforms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .render(&state, channels, views, zoom, traces, view_traces);
+        #[cfg(test)]
+        self.channel_waveform_lock_ns.store(
+            locked_at.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
         );
-        for (&(lane, channel), (minimum, maximum)) in channels.iter().zip(traces) {
-            match state.capture_lanes.get(lane).copied().flatten() {
-                Some(lane) => {
-                    capture.track_channel_waveform_range(
-                        lane,
-                        channel,
-                        visible.clone(),
-                        minimum,
-                        maximum,
-                    );
-                }
-                None => {
-                    minimum.fill(0.0);
-                    maximum.fill(0.0);
-                }
-            }
-        }
-        Some((history, visible.clone(), rate, capture.bar_markers(visible)))
+        rendered
     }
 
     pub(crate) fn track_channels(&self, lane: usize) -> Option<usize> {
@@ -1333,6 +1324,10 @@ impl CaptureSession {
         let Some(next) = self.addons.as_ref().map(AddonHandle::snapshot) else {
             return;
         };
+        self.apply_addon_snapshot(next);
+    }
+
+    fn apply_addon_snapshot(&mut self, next: Arc<AddonSnapshot>) {
         if self
             .addon_snapshot
             .as_ref()
@@ -1347,7 +1342,7 @@ impl CaptureSession {
             .flatten()
             .map(|lane| lane.source.clone())
             .collect();
-        let mut changed = false;
+        let mut reconnect = false;
         for source in selected {
             let CaptureSource::Addon {
                 addon_id,
@@ -1361,39 +1356,59 @@ impl CaptureSession {
                 .as_ref()
                 .and_then(|snapshot| snapshot.source(addon_id, source_id));
             let new = self.addon_source(&source);
-            // Transport position updates do not change the audio layout.
-            let layout_changed = match (old, new) {
+            // Only a reopened stream can establish that its audio layout changed.
+            let input_changed = match (old, new) {
                 (Some(old), Some(new)) => {
-                    old.sender != new.sender || old.format != new.format || old.groups != new.groups
+                    old.sender != new.sender || old.format != new.format
                 }
                 (None, None) => false,
                 _ => true,
             };
-            if layout_changed {
+            let groups_changed = match (old, new) {
+                (Some(old), Some(new)) => old.groups != new.groups,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if input_changed {
                 self.inputs
                     .retain(|input| !input.source.same_source(&source));
                 self.pending
                     .retain(|pending| !pending.source.same_source(&source));
-                for (lane, settings) in self.sources.iter().enumerate() {
-                    if settings
+                reconnect = true;
+            }
+            if groups_changed {
+                for lane in 0..2 {
+                    if self.sources[lane]
                         .as_ref()
                         .is_some_and(|settings| settings.source.same_source(&source))
+                        && self.formats[lane].is_some()
                     {
-                        self.formats[lane] = None;
-                        self.layout_blocked[lane] = false;
+                        match self.groups_for_lane(lane) {
+                            Ok(groups) => {
+                                self.groups[lane] = groups;
+                                if self.layout_blocked[lane] {
+                                    self.statuses[lane] = None;
+                                }
+                                self.layout_blocked[lane] = false;
+                            }
+                            Err(reason) => {
+                                self.statuses[lane] = Some(reason);
+                                self.layout_blocked[lane] = true;
+                            }
+                        }
                     }
                 }
-                changed = true;
+                self.revision = self.revision.wrapping_add(1);
             }
             if let Err(reason) = self.resolved_source(&source) {
                 self.set_source_status(&source, reason);
+            } else if input_changed {
+                self.set_source_status(&source, "Waiting for add-on audio".into());
             }
         }
-        if changed {
+        if reconnect {
             self.next_retry = Instant::now();
             self.next_layout_check = Instant::now();
-            self.reset_capture();
-            self.configure_capture();
         }
     }
 
@@ -1416,7 +1431,8 @@ impl CaptureSession {
                 Some(sender)
                     if sender.channels == format.channels
                         && sender.sample_rate == format.sample_rate => {}
-                _ => changed.push(input.source.clone()),
+                Some(_) => changed.push((input.source.clone(), "Waiting for Sender audio layout")),
+                None => changed.push((input.source.clone(), "Sender audio is unavailable")),
             }
         }
         if changed.is_empty() {
@@ -1425,23 +1441,20 @@ impl CaptureSession {
         self.inputs.retain(|input| {
             !changed
                 .iter()
-                .any(|source| input.source.same_source(source))
+                .any(|(source, _)| input.source.same_source(source))
         });
-        for source in &changed {
+        for (source, status) in &changed {
             for (lane, settings) in self.sources.iter().enumerate() {
                 if settings
                     .as_ref()
                     .is_some_and(|settings| settings.source.same_source(source))
                 {
-                    self.formats[lane] = None;
-                    self.statuses[lane] = Some("Waiting for Sender audio layout".into());
+                    self.statuses[lane] = Some((*status).into());
                     self.layout_blocked[lane] = false;
                 }
             }
         }
         self.next_retry = now;
-        self.reset_capture();
-        self.configure_capture();
     }
 
     fn active_lanes(&self) -> Vec<usize> {
@@ -1485,6 +1498,12 @@ impl CaptureSession {
             .ok_or("Waiting for source audio layout")?;
         let channels = capture_channels(&settings.source, format, settings.route)
             .ok_or("The selected channel is unavailable")?;
+        if matches!(settings.source, CaptureSource::Addon { .. })
+            && self.addon_source(&settings.source).is_none()
+            && !self.groups[lane].is_empty()
+        {
+            return Ok(self.groups[lane].clone());
+        }
         let native_groups = lane_groups(self.addon_source(&settings.source), format.channels)?;
         if channels == format.channels {
             return Ok(native_groups);
@@ -1640,14 +1659,23 @@ impl CaptureSession {
             capture_channels(&source.source, self.formats[lane].as_ref()?, source.route)
         };
         let mut widths = [channels(0), channels(1)];
-        self.layout_blocked = [false; 2];
         for (lane, source) in self.sources.iter().enumerate() {
             if let Some(source) = source
                 && let Some(format) = &self.formats[lane]
             {
-                self.statuses[lane] = missing_capture_channel(&source.source, format, source.route);
+                let missing = missing_capture_channel(&source.source, format, source.route);
+                if missing.is_some()
+                    || self.layout_blocked[lane]
+                    || self
+                        .inputs
+                        .iter()
+                        .any(|input| input.source.same_source(&source.source))
+                {
+                    self.statuses[lane] = missing;
+                }
             }
         }
+        self.layout_blocked = [false; 2];
         for lane in 0..2 {
             if widths[lane].is_none() {
                 continue;
@@ -2151,6 +2179,199 @@ mod tests {
         assert_eq!(listed.len(), 4);
         assert_eq!(listed[2], source);
         assert!(matches!(&listed[3], CaptureSource::Sender { id, .. } if id == "def-456"));
+    }
+
+    fn retained_addon_session() -> CaptureSession {
+        let mut session = CaptureSession::new();
+        session.sources = [
+            Some(SourceSettings {
+                source: addon_selection(),
+                route: ChannelRoute::Merged,
+            }),
+            Some(SourceSettings {
+                source: CaptureSource::System,
+                route: ChannelRoute::Merged,
+            }),
+        ];
+        session.addon_snapshot = Some(Arc::new(addon_fixture(AddonState::Running)));
+        session.formats = [
+            Some(Arc::new(Format::sender(48_000, 6))),
+            Some(Arc::new(Format::sender(48_000, 2))),
+        ];
+        session.history_budget_samples = 1024;
+        session.paused = false;
+        session.configure_capture();
+        session.inputs.push(Input {
+            source: addon_selection(),
+            stream: Stream::Sender {
+                receiver: None,
+                format: Arc::clone(session.formats[0].as_ref().unwrap()),
+                id: "abc-123".into(),
+                error: None,
+            },
+        });
+        session
+            .capture
+            .as_mut()
+            .unwrap()
+            .push_native_interleaved_with_markers(0, &[0.5; 80], false, &[])
+            .unwrap();
+        session
+    }
+
+    fn retained_samples(session: &CaptureSession) -> [Vec<f32>; 2] {
+        std::array::from_fn(|lane| {
+            session
+                .capture
+                .as_ref()
+                .unwrap()
+                .capture()
+                .track_snapshot(lane)
+                .unwrap()
+                .samples
+        })
+    }
+
+    fn reopen_retained_sender(session: &mut CaptureSession, rate: u32, channels: usize) {
+        let (reply, result) = mpsc::sync_channel(1);
+        reply
+            .send(Ok(Stream::Sender {
+                receiver: None,
+                format: Arc::new(Format::sender(rate, channels)),
+                id: "abc-123".into(),
+                error: None,
+            }))
+            .unwrap();
+        session.pending.push(PendingInput {
+            source: session.sources[0].as_ref().unwrap().source.clone(),
+            result,
+        });
+        session.poll_pending();
+    }
+
+    #[test]
+    fn addon_disappearance_and_return_preserve_both_lanes() {
+        for state in [
+            AddonState::Stopped,
+            AddonState::Starting,
+            AddonState::Failed("crashed".into()),
+        ] {
+            let mut session = retained_addon_session();
+            let samples = retained_samples(&session);
+            let generation = session.generation;
+            let groups = session.groups.clone();
+            let mut snapshot = addon_fixture(state);
+            snapshot.revision = 2;
+            snapshot.addons[0].sources.clear();
+            session.apply_addon_snapshot(Arc::new(snapshot));
+            assert_eq!(retained_samples(&session), samples);
+            assert_eq!(session.generation, generation);
+            assert_eq!(session.groups, groups);
+            assert!(session.inputs.is_empty());
+            assert!(session.statuses[0].is_some());
+            // Reconfiguring another input must not erase the missing source's status.
+            session.configure_capture();
+            assert!(session.statuses[0].is_some());
+            let mut snapshot = addon_fixture(AddonState::Running);
+            snapshot.revision = 3;
+            snapshot.addons[0].sources[0].sender = "abc-124".into();
+            session.apply_addon_snapshot(Arc::new(snapshot));
+            reopen_retained_sender(&mut session, 48_000, 6);
+            assert_eq!(retained_samples(&session), samples);
+            assert_eq!(session.generation, generation);
+            assert!(session.statuses[0].is_none());
+            session
+                .capture
+                .as_mut()
+                .unwrap()
+                .push_native_interleaved_with_markers(208_334, &[0.25; 80], false, &[])
+                .unwrap();
+            let resumed = retained_samples(&session);
+            for lane in 0..2 {
+                assert!(resumed[lane].len() > samples[lane].len());
+                assert_eq!(&resumed[lane][..samples[lane].len()], &samples[lane]);
+            }
+        }
+    }
+
+    #[test]
+    fn addon_group_and_format_labels_preserve_both_lanes() {
+        let mut session = retained_addon_session();
+        let samples = retained_samples(&session);
+        let generation = session.generation;
+        let mut snapshot = addon_fixture(AddonState::Running);
+        snapshot.revision = 2;
+        snapshot.addons[0].sources[0].groups.as_mut().unwrap()[0].channels[0] = "Left".into();
+        session.apply_addon_snapshot(Arc::new(snapshot.clone()));
+        assert_eq!(retained_samples(&session), samples);
+        assert_eq!(session.generation, generation);
+        assert_eq!(session.groups[0][0].labels[0], "Left");
+        assert_eq!(session.inputs.len(), 1);
+        snapshot.revision = 3;
+        snapshot.addons[0].sources[0].format = "renamed".into();
+        snapshot.addons[0].sources[0].formats[0].id = "renamed".into();
+        session.apply_addon_snapshot(Arc::new(snapshot));
+        reopen_retained_sender(&mut session, 48_000, 6);
+        assert_eq!(retained_samples(&session), samples);
+        assert_eq!(session.generation, generation);
+    }
+
+    #[test]
+    fn missing_sender_registration_preserves_both_lanes_until_real_format_change() {
+        for (rate, channels) in [(96_000, 6), (48_000, 8)] {
+            let mut session = retained_addon_session();
+            session.sources[0].as_mut().unwrap().source = CaptureSource::Sender {
+                id: "abc-123".into(),
+                name: "Sender".into(),
+            };
+            session.inputs[0].source = session.sources[0].as_ref().unwrap().source.clone();
+            let samples = retained_samples(&session);
+            let generation = session.generation;
+            session.check_sender_layouts();
+            assert_eq!(retained_samples(&session), samples);
+            assert_eq!(session.generation, generation);
+            assert!(session.inputs.is_empty());
+            assert!(
+                session.statuses[0]
+                    .as_ref()
+                    .unwrap()
+                    .contains("unavailable")
+            );
+            reopen_retained_sender(&mut session, 48_000, 6);
+            assert_eq!(retained_samples(&session), samples);
+            assert_eq!(session.generation, generation);
+            assert!(session.statuses[0].is_none());
+            session.inputs.clear();
+            reopen_retained_sender(&mut session, rate, channels);
+            assert!(session.generation > generation);
+            assert!(retained_samples(&session).iter().all(Vec::is_empty));
+        }
+    }
+
+    #[test]
+    fn sender_audio_switched_off_preserves_both_lanes() {
+        let mut endpoint = backtracking_core::SenderEndpoint::new().unwrap();
+        endpoint.update("Retention test", true, 48_000, 6);
+        let mut session = retained_addon_session();
+        session.sources[0].as_mut().unwrap().source = CaptureSource::Sender {
+            id: endpoint.id().into(),
+            name: "Sender".into(),
+        };
+        session.inputs[0].source = session.sources[0].as_ref().unwrap().source.clone();
+        if let Stream::Sender { id, .. } = &mut session.inputs[0].stream {
+            *id = endpoint.id().into();
+        }
+        let samples = retained_samples(&session);
+        let generation = session.generation;
+        session.check_sender_layouts();
+        assert_eq!(session.inputs.len(), 1);
+        endpoint.update("Retention test", false, 48_000, 6);
+        session.next_layout_check = Instant::now();
+        session.check_sender_layouts();
+        assert!(session.inputs.is_empty());
+        assert_eq!(retained_samples(&session), samples);
+        assert_eq!(session.generation, generation);
+        assert!(session.statuses[0].is_some());
     }
 
     #[test]

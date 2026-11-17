@@ -181,6 +181,8 @@ values from `welcome` and every later change from `set_setting`, and does not re
 Actions (capability `actions`): up to 16, `label` up to 40 characters.
 
 **`transport`** updates one source's position without resending everything. At most 4 per second.
+The host ignores updates for unknown sources and sources whose latest `describe` did not declare
+`transport`.
 
 ```json
 {"type":"transport","source":"main","state":"playing","position":13.0,"duration":60.0}
@@ -188,6 +190,8 @@ Actions (capability `actions`): up to 16, `label` up to 40 characters.
 
 **`message`** shows one line next to the add-on on the Add-ons page, replacing the previous one.
 `level` is `info`, `warning` or `error`; `text` is up to 300 characters. An empty `text` clears it.
+The host replaces control characters in `text`, including newlines and tabs, with spaces before
+showing it. They do not stop the add-on.
 
 ```json
 {"type":"message","level":"error","text":"This file has no object audio."}
@@ -245,8 +249,11 @@ followed by the id is a request Backtracking makes to its own plug-in; an add-on
 **Channels.** A Sender carries 1 to 64 channels at 8 000 to 384 000 Hz. A packet holds at most
 65 536 samples, so at most `65536 / channels` frames when that is below 8192. Changing the channel
 count or sample rate re-registers the Sender; Backtracking reconnects and starts a new capture,
-which clears the audio it was holding for that source. Backtracking 0.2.0 and earlier list only
-1- and 2-channel Senders.
+which clears the audio it was holding in both lanes because they share one history layout.
+When a source disappears, both lanes keep their retained audio and the affected lane reports that
+the source is gone. Capture resumes when it returns with the same sample rate and channel count.
+Changing only groups or channel labels updates the display without clearing audio.
+Backtracking 0.2.0 and earlier list only 1- and 2-channel Senders.
 
 **Timing.** Publish audio at the pace it should be heard, stamped with the time it is heard.
 Backtracking aligns sources by these timestamps.

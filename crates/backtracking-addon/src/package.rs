@@ -117,7 +117,7 @@ fn replace_install(stage: &Path, target: &Path, addons: &Path, id: &str) -> Resu
     Ok(())
 }
 
-/// Read each installed folder. Invalid manifests are returned as errors on that folder.
+/// Read each installed folder. Unreadable entries and invalid manifests are returned individually.
 pub fn list_installed(addons: impl AsRef<Path>) -> Result<Vec<InstalledAddon>> {
     let addons = addons.as_ref();
     let entries = match fs::read_dir(addons) {
@@ -125,13 +125,41 @@ pub fn list_installed(addons: impl AsRef<Path>) -> Result<Vec<InstalledAddon>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
+    list_installed_entries(addons, entries, |path| fs::symlink_metadata(path))
+}
+
+fn list_installed_entries(
+    addons: &Path,
+    entries: impl IntoIterator<Item = std::io::Result<fs::DirEntry>>,
+    metadata: impl Fn(&Path) -> std::io::Result<Metadata>,
+) -> Result<Vec<InstalledAddon>> {
     let mut installed = Vec::new();
-    for entry in entries {
-        let entry = entry?;
+    for (index, entry) in entries.into_iter().enumerate() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                installed.push(InstalledAddon {
+                    // A failed directory read does not provide a name. This label cannot be
+                    // mistaken for a valid add-on id by install or removal operations.
+                    path: addons.join(format!("(unreadable entry {})", index + 1)),
+                    manifest: Err(error.into()),
+                });
+                continue;
+            }
+        };
         if entry.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
-        let metadata = fs::symlink_metadata(entry.path())?;
+        let metadata = match metadata(&entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                installed.push(InstalledAddon {
+                    path: entry.path(),
+                    manifest: Err(error.into()),
+                });
+                continue;
+            }
+        };
         if !metadata.is_dir() && !is_link(&metadata) {
             continue;
         }
@@ -285,6 +313,77 @@ fn require_extension(path: &Path) -> Result<()> {
     Ok(())
 }
 
+struct PackagePath {
+    text: String,
+    #[cfg(windows)]
+    wide: Vec<u16>,
+    #[cfg(not(windows))]
+    folded: String,
+}
+
+impl PackagePath {
+    fn new(path: &str) -> Self {
+        Self {
+            text: path.into(),
+            #[cfg(windows)]
+            wide: path.encode_utf16().collect(),
+            #[cfg(not(windows))]
+            folded: path.to_uppercase(),
+        }
+    }
+}
+
+impl PartialEq for PackagePath {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for PackagePath {}
+
+impl PartialOrd for PackagePath {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PackagePath {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        #[cfg(windows)]
+        {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn CompareStringOrdinal(
+                    first: *const u16,
+                    first_len: i32,
+                    second: *const u16,
+                    second_len: i32,
+                    ignore_case: i32,
+                ) -> i32;
+            }
+            // Use Windows' ordinal uppercase table, not linguistic casing (which can expand
+            // one character into several). ZIP path lengths fit in an i32.
+            let comparison = unsafe {
+                CompareStringOrdinal(
+                    self.wide.as_ptr(),
+                    self.wide.len() as i32,
+                    other.wide.as_ptr(),
+                    other.wide.len() as i32,
+                    1,
+                )
+            };
+            match comparison {
+                1 => std::cmp::Ordering::Less,
+                2 => std::cmp::Ordering::Equal,
+                3 => std::cmp::Ordering::Greater,
+                _ => unreachable!("valid UTF-16 paths and lengths"),
+            }
+        }
+        #[cfg(not(windows))]
+        self.folded.cmp(&other.folded)
+    }
+}
+
 fn inspect_archive(archive: &mut ZipArchive<File>) -> Result<PackageInfo> {
     if archive.len() > MAX_ENTRIES {
         return Err(Error::new(
@@ -297,7 +396,7 @@ fn inspect_archive(archive: &mut ZipArchive<File>) -> Result<PackageInfo> {
     for index in 0..archive.len() {
         let entry = archive.by_index(index).map_err(zip_error)?;
         let name = archive_name(&entry)?;
-        let normalized = name.trim_end_matches('/').to_ascii_lowercase();
+        let normalized = PackagePath::new(name.trim_end_matches('/'));
         if paths.insert(normalized, entry.is_dir()).is_some() {
             return Err(Error::new(format!(
                 "Package has duplicate paths: {name}. Rename one of them."
@@ -316,9 +415,9 @@ fn inspect_archive(archive: &mut ZipArchive<File>) -> Result<PackageInfo> {
         }
     }
     for name in paths.keys() {
-        let mut ancestor = name.as_str();
+        let mut ancestor = name.text.as_str();
         while let Some((parent, _)) = ancestor.rsplit_once('/') {
-            if paths.get(parent) == Some(&false) {
+            if paths.get(&PackagePath::new(parent)) == Some(&false) {
                 return Err(Error::new(format!(
                     "Package path {parent} is both a file and a parent folder."
                 )));
@@ -814,6 +913,125 @@ mod tests {
         let entries = list_installed(&dir.0).unwrap();
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|entry| entry.manifest.is_err()));
+    }
+
+    #[test]
+    fn unreadable_entry_metadata_does_not_hide_other_addons() {
+        let dir = TestDir::new();
+        let good = dir.0.join("com.example.tone");
+        fs::create_dir_all(good.join("bin")).unwrap();
+        fs::write(good.join("addon.json"), manifest("1")).unwrap();
+        fs::write(good.join("bin/tone"), b"program").unwrap();
+        let broken = dir.0.join("com.example.unreadable");
+        fs::create_dir(&broken).unwrap();
+        let entries = list_installed_entries(&dir.0, fs::read_dir(&dir.0).unwrap(), |path| {
+            if path == broken {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "cannot read this entry",
+                ))
+            } else {
+                fs::symlink_metadata(path)
+            }
+        })
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .find(|entry| entry.path == good)
+            .unwrap()
+            .manifest
+            .is_ok());
+        assert!(entries
+            .iter()
+            .find(|entry| entry.path == broken)
+            .unwrap()
+            .manifest
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot read this entry"));
+    }
+
+    #[test]
+    fn unreadable_directory_entry_does_not_fail_the_list() {
+        let dir = TestDir::new();
+        fs::create_dir(dir.0.join("broken")).unwrap();
+        let entries = std::iter::once(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cannot enumerate this entry",
+        )))
+        .chain(fs::read_dir(&dir.0).unwrap());
+        let entries =
+            list_installed_entries(&dir.0, entries, |path| fs::symlink_metadata(path)).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry
+            .manifest
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot enumerate this entry")));
+    }
+
+    #[test]
+    fn non_ascii_case_duplicates_are_rejected_during_inspection() {
+        let dir = TestDir::new();
+        let path = dir.0.join("collision.btaddon");
+        for names in [
+            ["bin/\u{00e4}", "bin/\u{00c4}"],
+            ["bin/\u{0451}", "bin/\u{0401}"],
+            ["b\u{00ed}n", "B\u{00cd}N/file"],
+        ] {
+            archive(
+                &path,
+                &[
+                    ("addon.json", &manifest("1")),
+                    ("bin/tone", b"program"),
+                    (names[0], b"a"),
+                    (names[1], b"b"),
+                ],
+            );
+            assert!(inspect(&path).is_err(), "accepted {names:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn package_case_comparison_matches_windows_file_creation() {
+        for names in [
+            ["\u{00e4}", "\u{00c4}"],
+            ["\u{03c2}", "\u{03c3}"],
+            ["\u{0131}", "I"],
+            ["\u{00df}", "SS"],
+            ["\u{00e9}", "e\u{0301}"],
+        ] {
+            let dir = TestDir::new();
+            File::create(dir.0.join(names[0])).unwrap();
+            let collision = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dir.0.join(names[1]))
+            {
+                Ok(_) => false,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => true,
+                Err(error) => panic!("could not test the filesystem: {error}"),
+            };
+            let path = dir.0.join("comparison.btaddon");
+            archive(
+                &path,
+                &[
+                    ("addon.json", &manifest("1")),
+                    ("bin/tone", b"program"),
+                    (names[0], b"a"),
+                    (names[1], b"b"),
+                ],
+            );
+            assert_eq!(
+                inspect(&path).is_err(),
+                collision,
+                "comparison disagrees for {names:?}"
+            );
+        }
     }
 
     #[test]

@@ -236,11 +236,13 @@ fn seed_test_profile() {
             .unwrap_or_else(|error| panic!("the add-on manager refused: {error}"))
     }
     if tone_installed {
-        reply(handle.install(if wanted.contains(&"tone-opens") {
+        let path = if wanted.contains(&"tone-opens") {
             packages.join("tone-opens.btaddon")
         } else {
             tone_package
-        }));
+        };
+        let inspected = reply(handle.inspect(path.clone()));
+        reply(handle.install(path, inspected.identity));
         reply(handle.set_enabled(ADDON_ID, true));
         let running = |format: Option<&str>| {
             handle.snapshot().addon(ADDON_ID).is_some_and(|addon| {
@@ -263,7 +265,8 @@ fn seed_test_profile() {
             || PathBuf::from(r"D:\Developing\backtracking-joc\target\backtracking-joc.btaddon"),
             PathBuf::from,
         );
-        reply(handle.install(atmos_package));
+        let inspected = reply(handle.inspect(atmos_package.clone()));
+        reply(handle.install(atmos_package, inspected.identity));
         reply(handle.set_enabled(ATMOS_ID, true));
         wait_for(
             || {
@@ -310,7 +313,9 @@ fn seed_test_profile() {
     }
     if wanted.contains(&"quits") {
         // Its program says hello as the test tone, is refused and exits with an error.
-        reply(handle.install(packages.join("quits.btaddon")));
+        let path = packages.join("quits.btaddon");
+        let inspected = reply(handle.inspect(path.clone()));
+        reply(handle.install(path, inspected.identity));
         reply(handle.set_enabled(QUITS_ID, true));
     }
 

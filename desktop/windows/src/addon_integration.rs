@@ -25,7 +25,9 @@ struct TestFolder(PathBuf);
 
 impl TestFolder {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        fs::create_dir_all(&base).unwrap();
+        let root = base.join(format!(
             "backtracking-desktop-addon-{}-{}",
             std::process::id(),
             SystemTime::now()
@@ -228,7 +230,8 @@ fn test_tone_child() {
     let root = local.join("Backtracking");
     let manager = AddonManager::new(root.clone()).unwrap();
     let handle = manager.handle();
-    let installed = command(handle.install(package.clone()));
+    let reviewed = command(handle.inspect(package.clone()));
+    let installed = command(handle.install(package.clone(), reviewed.identity));
     assert_eq!(installed.manifest.id, ADDON_ID);
     assert!(
         root.join("addons")
@@ -358,7 +361,13 @@ fn test_tone_child() {
                 .map(|(low, high)| (low.as_mut_slice(), high.as_mut_slice()))
                 .collect();
             controller
-                .try_render_channel_waveforms(&channels, Some(visible.clone()), &mut traces)
+                .try_render_channel_waveforms(
+                    &channels,
+                    &[],
+                    Some(visible.clone()),
+                    &mut traces,
+                    &mut [],
+                )
                 .is_some()
         },
         "live per-channel waveforms",
@@ -447,7 +456,7 @@ fn test_tone_child() {
     command(handle.start(ADDON_ID));
     wait_running(&handle, "5.1");
     let before_update = handle.snapshot().addon(ADDON_ID).unwrap().pid.unwrap();
-    command(handle.install(package.clone()));
+    command(handle.install(package.clone(), reviewed.identity));
     wait_for(
         || {
             handle.snapshot().addon(ADDON_ID).is_some_and(|addon| {
@@ -463,7 +472,7 @@ fn test_tone_child() {
     let lock_path = root.join("addons").join(format!(".{ADDON_ID}.lock"));
     fs::write(&lock_path, b"isolated test owns this install lock").unwrap();
     let failed_update = handle
-        .install(package)
+        .install(package, reviewed.identity)
         .recv_timeout(Duration::from_secs(8))
         .unwrap();
     fs::remove_file(lock_path).unwrap();

@@ -52,7 +52,12 @@ impl RunningTone {
             "Cargo did not build {}",
             executable.display()
         );
-        let root = std::env::temp_dir().join(format!(
+        let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        #[cfg(windows)]
+        let base = base.expect("set LOCALAPPDATA to an isolated test folder");
+        #[cfg(not(windows))]
+        let base = base.unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!(
             "backtracking-test-tone-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)

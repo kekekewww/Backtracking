@@ -31,7 +31,7 @@ struct Request {
 enum WireCommand {
     Snapshot,
     Inspect(PathBuf),
-    Install(PathBuf),
+    Install(PathBuf, [u8; 32]),
     Remove { id: String, delete_data: bool },
     Enabled { id: String, enabled: bool },
     Start(String),
@@ -44,6 +44,7 @@ enum WireCommand {
 enum ResponseData {
     Snapshot(AddonSnapshot),
     Package(WirePackage),
+    Inspected(WirePackage, [u8; 32]),
     Done,
 }
 
@@ -230,8 +231,8 @@ fn dispatch(handle: &AddonHandle, command: WireCommand, stopping: &AtomicBool) -
     match command {
         WireCommand::Snapshot => Ok(ResponseData::Snapshot((*handle.snapshot()).clone())),
         WireCommand::Inspect(path) => await_reply(handle.inspect(path), stopping)
-            .map(|info| ResponseData::Package(info.into())),
-        WireCommand::Install(path) => await_reply(handle.install(path), stopping)
+            .map(|reviewed| ResponseData::Inspected(reviewed.info.into(), reviewed.identity)),
+        WireCommand::Install(path, identity) => await_reply(handle.install(path, identity), stopping)
             .map(|info| ResponseData::Package(info.into())),
         WireCommand::Remove { id, delete_data } => {
             await_reply(handle.remove(&id, delete_data), stopping).map(|()| ResponseData::Done)
@@ -381,10 +382,23 @@ fn proxy(root: PathBuf, receiver: mpsc::Receiver<Command>, shared: Arc<Shared>) 
 fn forward(root: &Path, command: Command, stopping: &AtomicBool) {
     match command {
         Command::Inspect(path, reply) => {
-            let _ = reply.send(request_package(root, WireCommand::Inspect(path), stopping));
+            let result = read_endpoint(root).and_then(|endpoint| {
+                exchange(&endpoint, WireCommand::Inspect(path), Some(stopping))
+            });
+            let _ = reply.send(result.and_then(|response| match response {
+                ResponseData::Inspected(info, identity) => Ok(InspectedPackage {
+                    info: info.into(),
+                    identity,
+                }),
+                _ => Err("The primary add-on host returned an unexpected reply".into()),
+            }));
         }
-        Command::Install(path, reply) => {
-            let _ = reply.send(request_package(root, WireCommand::Install(path), stopping));
+        Command::Install(path, identity, reply) => {
+            let _ = reply.send(request_package(
+                root,
+                WireCommand::Install(path, identity),
+                stopping,
+            ));
         }
         Command::Remove(id, delete_data, reply) => {
             let _ = reply.send(request_done(
@@ -425,7 +439,10 @@ fn forward(root: &Path, command: Command, stopping: &AtomicBool) {
 
 fn reject(command: Command, error: String) {
     match command {
-        Command::Inspect(_, reply) | Command::Install(_, reply) => {
+        Command::Inspect(_, reply) => {
+            let _ = reply.send(Err(error));
+        }
+        Command::Install(_, _, reply) => {
             let _ = reply.send(Err(error));
         }
         Command::Remove(_, _, reply)
@@ -755,7 +772,7 @@ mod tests {
         });
         assert!(
             handle
-                .install(root.0.join("missing.btaddon"))
+                .install(root.0.join("missing.btaddon"), [0; 32])
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap()
                 .is_err()

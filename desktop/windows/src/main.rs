@@ -69,12 +69,7 @@ fn main() {
             None
         };
         let data = data_paths::DataPaths::for_current_user()?;
-        let addons = if primary {
-            addons::AddonManager::new(data.root().to_path_buf())
-        } else {
-            addons::AddonManager::connect_existing(data.root().to_path_buf())
-        }
-        .map_err(std::io::Error::other)?;
+        let addons = start_addons(data.root().to_path_buf(), primary);
         let controller = controller::Controller::with_addons(addons.handle())?;
         ui::run(controller, primary)?;
         Ok::<(), Box<dyn std::error::Error>>(())
@@ -94,6 +89,83 @@ fn main() {
                 MB_OK | MB_ICONERROR,
             );
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn start_addons(data_root: std::path::PathBuf, primary: bool) -> addons::AddonManager {
+    let manager = if primary {
+        addons::AddonManager::new(data_root)
+    } else {
+        addons::AddonManager::connect_existing(data_root)
+    };
+    manager.unwrap_or_else(addons::AddonManager::unavailable)
+}
+
+#[cfg(all(target_os = "windows", test))]
+mod addon_startup_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    struct Folder(PathBuf);
+
+    impl Folder {
+        fn new() -> Self {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!(
+                    "addon-startup-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn assert_recorder_can_start(manager: addons::AddonManager) {
+        let handle = manager.handle();
+        let snapshot = handle.snapshot();
+        assert!(snapshot.addons.is_empty());
+        let reason = snapshot.error.as_deref().expect("show the startup failure");
+        assert!(reason.starts_with("Add-ons are unavailable:"));
+        assert!(reason.len() > "Add-ons are unavailable:".len());
+        assert!(
+            handle
+                .start("test.addon")
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_err()
+        );
+        let controller = controller::Controller::with_addons(handle).unwrap();
+        assert!(controller.addons().unwrap().snapshot().error.is_some());
+    }
+
+    #[test]
+    fn broken_addon_root_does_not_prevent_recorder_startup() {
+        let folder = Folder::new();
+        let root = folder.0.join("blocked");
+        fs::write(&root, b"not a folder").unwrap();
+        let manager = start_addons(root, true);
+        assert_recorder_can_start(manager);
+    }
+
+    #[test]
+    fn unavailable_primary_does_not_prevent_secondary_recorder_startup() {
+        let folder = Folder::new();
+        let manager = start_addons(folder.0.clone(), false);
+        assert_recorder_can_start(manager);
     }
 }
 

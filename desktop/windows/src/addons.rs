@@ -18,13 +18,16 @@ use backtracking_addon::protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 mod bridge;
 mod process;
+mod startup;
 use process::{AddonProcess, random_token};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RESTART_WINDOW: Duration = Duration::from_secs(60);
 const STATE_FILE: &str = "addon-host-v1.json";
@@ -32,6 +35,12 @@ const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 
 pub(crate) type AddonReply<T> = mpsc::Receiver<Result<T, String>>;
 pub(crate) type ChangeCallback = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Debug)]
+pub(crate) struct InspectedPackage {
+    pub(crate) info: PackageInfo,
+    pub(crate) identity: [u8; 32],
+}
 type Reply<T> = mpsc::Sender<Result<T, String>>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,12 +140,12 @@ impl AddonHandle {
             .push(callback);
     }
 
-    pub(crate) fn inspect(&self, path: PathBuf) -> AddonReply<PackageInfo> {
+    pub(crate) fn inspect(&self, path: PathBuf) -> AddonReply<InspectedPackage> {
         self.request(|reply| Command::Inspect(path, reply))
     }
 
-    pub(crate) fn install(&self, path: PathBuf) -> AddonReply<PackageInfo> {
-        self.request(|reply| Command::Install(path, reply))
+    pub(crate) fn install(&self, path: PathBuf, identity: [u8; 32]) -> AddonReply<PackageInfo> {
+        self.request(|reply| Command::Install(path, identity, reply))
     }
 
     pub(crate) fn remove(&self, id: &str, delete_data: bool) -> AddonReply<()> {
@@ -255,7 +264,7 @@ impl AddonHandle {
     }
 }
 
-/// Drop requests quit for every child, waits at most two seconds, then closes its Job Object.
+/// Drop requests quit for every child and bounds the wait for the worker.
 pub(crate) struct AddonManager {
     handle: AddonHandle,
     worker: Option<JoinHandle<()>>,
@@ -263,12 +272,27 @@ pub(crate) struct AddonManager {
 }
 
 impl AddonManager {
+    pub(crate) fn unavailable(reason: String) -> Self {
+        let (commands, _receive) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            snapshot: Mutex::new(Arc::new(AddonSnapshot {
+                error: Some(format!("Add-ons are unavailable: {reason}")),
+                ..AddonSnapshot::default()
+            })),
+            callbacks: Mutex::new(Vec::new()),
+        });
+        Self {
+            handle: AddonHandle { commands, shared },
+            worker: None,
+            bridge: None,
+        }
+    }
+
     pub(crate) fn new(data_root: PathBuf) -> Result<Self, String> {
         if !data_root.is_absolute() {
             return Err("The add-on data root must be absolute".into());
         }
         fs::create_dir_all(&data_root).map_err(|e| e.to_string())?;
-        bridge::ensure_no_primary(&data_root)?;
         let host = Host::bind(env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
         let (commands, receive) = mpsc::channel();
         let shared = Arc::new(Shared {
@@ -304,14 +328,22 @@ impl Drop for AddonManager {
         self.bridge.take();
         let _ = self.handle.commands.send(Command::Shutdown);
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+            while !worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(POLL_INTERVAL);
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
+            // A stuck worker keeps its resources until it returns, but cannot
+            // prevent the UI process from exiting.
         }
     }
 }
 
 enum Command {
-    Inspect(PathBuf, Reply<PackageInfo>),
-    Install(PathBuf, Reply<PackageInfo>),
+    Inspect(PathBuf, Reply<InspectedPackage>),
+    Install(PathBuf, [u8; 32], Reply<PackageInfo>),
     Remove(String, bool, Reply<()>),
     Enabled(String, bool, Reply<()>),
     Start(String, Reply<()>),
@@ -413,6 +445,7 @@ struct PendingInspection {
 struct PreparedPackage {
     path: PathBuf,
     info: PackageInfo,
+    identity: [u8; 32],
 }
 
 impl Drop for PreparedPackage {
@@ -460,6 +493,7 @@ impl Operation {
 
 struct Worker {
     root: PathBuf,
+    primary_lease: startup::PrimaryLease,
     host: Host,
     shared: Arc<Shared>,
     entries: BTreeMap<String, Entry>,
@@ -472,6 +506,9 @@ struct Worker {
 
 impl Worker {
     fn new(root: PathBuf, host: Host, shared: Arc<Shared>) -> Result<Self, String> {
+        let primary_lease = startup::PrimaryLease::acquire(&root)?;
+        bridge::ensure_no_primary(&root)?;
+        primary_lease.cleanup()?;
         let (saved, error) = match read_saved(&root) {
             Ok(saved) => (saved, None),
             Err(reason) => (SavedState::default(), Some(reason)),
@@ -492,6 +529,7 @@ impl Worker {
         }
         Ok(Self {
             root,
+            primary_lease,
             host,
             shared,
             entries,
@@ -582,19 +620,42 @@ impl Worker {
         }
         match command {
             Command::Inspect(path, reply) => {
+                let root = self.root.clone();
                 spawn_task(
                     "inspect add-on",
-                    move || package::inspect(path).map_err(|e| e.to_string()),
+                    move || {
+                        let prepared = prepare_package(&root, &path)?;
+                        Ok(InspectedPackage {
+                            info: PackageInfo {
+                                manifest: prepared.info.manifest.clone(),
+                                unpacked_size: prepared.info.unpacked_size,
+                                entry_count: prepared.info.entry_count,
+                                file_count: prepared.info.file_count,
+                                program: prepared.info.program.clone(),
+                            },
+                            identity: prepared.identity,
+                        })
+                    },
                     reply,
+                    self.primary_lease.clone(),
                 );
             }
-            Command::Install(path, reply) => {
+            Command::Install(path, identity, reply) => {
                 let root = self.root.clone();
                 let (send, result) = mpsc::channel();
                 spawn_task(
                     "inspect add-on",
-                    move || prepare_package(&root, &path),
+                    move || {
+                        let prepared = prepare_package(&root, &path)?;
+                        if prepared.identity != identity {
+                            return Err(
+                                "The file changed after it was checked. Check it again.".into()
+                            );
+                        }
+                        Ok(prepared)
+                    },
                     send,
+                    self.primary_lease.clone(),
                 );
                 self.inspections.push(PendingInspection { result, reply });
             }
@@ -865,6 +926,13 @@ impl Worker {
     fn poll(&mut self) {
         match self.host.poll() {
             Ok(events) => {
+                if self
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.starts_with("Add-on listener failed:"))
+                {
+                    self.error = None;
+                }
                 for event in events {
                     if let HostEvent::Connected(mut connection) = event {
                         let id = connection.id().to_owned();
@@ -889,6 +957,27 @@ impl Worker {
         }
         let ids: Vec<_> = self.entries.keys().cloned().collect();
         for id in ids {
+            if self.shutting_down
+                && self.entries[&id].runtime.as_ref().is_some_and(|runtime| {
+                    runtime
+                        .stop
+                        .as_ref()
+                        .is_some_and(|(deadline, _)| Instant::now() >= *deadline)
+                })
+            {
+                let entry = self.entries.get_mut(&id).unwrap();
+                let mut runtime = entry.runtime.take().unwrap();
+                if let Err(reason) = runtime.process.terminate() {
+                    self.error = Some(format!("Cannot stop {id}: {reason}"));
+                }
+                entry.info.state = runtime.stop.take().unwrap().1;
+                entry.info.pid = None;
+                entry.clear_description();
+                self.host.forget_addon(&id);
+                // Closing the job is the final attempt. Do not retry a process
+                // that Windows could not terminate during shutdown.
+                continue;
+            }
             let mut messages = Vec::new();
             let mut failure = None;
             let mut restart = false;
@@ -1045,14 +1134,15 @@ impl Worker {
                 duration,
             } => {
                 if has_capability(&entry.info, Capability::Source) {
-                    let source = entry
+                    let Some(source) = entry
                         .info
                         .sources
                         .iter_mut()
-                        .find(|item| item.id == source)
-                        .ok_or("Transport names an unknown source")?;
+                        .find(|item| item.id == source) else {
+                            return Ok(());
+                        };
                     if source.transport.is_none() {
-                        return Err("Transport was not declared for this source".into());
+                        return Ok(());
                     }
                     source.transport = Some(Transport {
                         state,
@@ -1062,9 +1152,16 @@ impl Worker {
                 }
             }
             AddonMessage::Message { level, text } => {
-                if text.chars().any(char::is_control) {
-                    return Err("Message text must be one line".into());
-                }
+                let text = text
+                    .chars()
+                    .map(|character| {
+                        if character.is_control() {
+                            ' '
+                        } else {
+                            character
+                        }
+                    })
+                    .collect::<String>();
                 entry.info.message = (!text.is_empty()).then_some(AddonNotice { level, text });
             }
             AddonMessage::Hello { .. } => return Err("hello may only be sent once".into()),
@@ -1142,6 +1239,7 @@ impl Worker {
                                 package::install(&prepared.path, addons).map_err(|e| e.to_string())
                             },
                             send,
+                            self.primary_lease.clone(),
                         );
                         self.operations.push(Operation::Install {
                             id,
@@ -1221,6 +1319,7 @@ impl Worker {
                                 Ok(())
                             },
                             send,
+                            self.primary_lease.clone(),
                         );
                         self.operations.push(Operation::Remove {
                             id,
@@ -1270,9 +1369,11 @@ fn spawn_task<T: Send + 'static>(
     name: &str,
     task: impl FnOnce() -> Result<T, String> + Send + 'static,
     reply: Reply<T>,
+    primary_lease: startup::PrimaryLease,
 ) {
     let failed = reply.clone();
     if let Err(reason) = thread::Builder::new().name(name.into()).spawn(move || {
+        let _primary_lease = primary_lease;
         let _ = reply.send(task());
     }) {
         let _ = failed.send(Err(reason.to_string()));
@@ -1287,8 +1388,8 @@ fn prepare_package(root: &Path, original: &Path) -> Result<PreparedPackage, Stri
     {
         return Err("An add-on package must have the .btaddon extension".into());
     }
-    // Inspection and installation use the same private copy, even if the selected
-    // download is replaced while the running version shuts down.
+    // Hash and inspect the same private bytes, so replacing the download cannot
+    // change the package between checking its identity and installing it.
     let path = root.join(format!(".install-{}.btaddon", random_token()?));
     let result = (|| {
         let mut input = File::open(original).map_err(|e| e.to_string())?;
@@ -1300,10 +1401,21 @@ fn prepare_package(root: &Path, original: &Path) -> Result<PreparedPackage, Stri
         std::io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
         output.sync_all().map_err(|e| e.to_string())?;
         drop(output);
+        let mut hasher = Sha256::new();
+        let mut copied = File::open(&path).map_err(|e| e.to_string())?;
+        let mut bytes = [0_u8; 64 * 1024];
+        loop {
+            let count = copied.read(&mut bytes).map_err(|e| e.to_string())?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&bytes[..count]);
+        }
         let info = package::inspect(&path).map_err(|e| e.to_string())?;
         Ok(PreparedPackage {
             path: path.clone(),
             info,
+            identity: hasher.finalize().into(),
         })
     })();
     if result.is_err() {
@@ -1314,7 +1426,10 @@ fn prepare_package(root: &Path, original: &Path) -> Result<PreparedPackage, Stri
 
 fn reject_command(command: Command, reason: &str) {
     match command {
-        Command::Inspect(_, reply) | Command::Install(_, reply) => {
+        Command::Inspect(_, reply) => {
+            let _ = reply.send(Err(reason.into()));
+        }
+        Command::Install(_, _, reply) => {
             let _ = reply.send(Err(reason.into()));
         }
         Command::Remove(_, _, reply)
@@ -1674,6 +1789,232 @@ mod tests {
         entry.info
     }
 
+    fn worker(root: &Path) -> Worker {
+        let shared = Arc::new(Shared {
+            snapshot: Mutex::new(Arc::new(AddonSnapshot::default())),
+            callbacks: Mutex::new(Vec::new()),
+        });
+        Worker::new(root.to_owned(), Host::bind("test").unwrap(), shared).unwrap()
+    }
+
+    #[test]
+    fn allowed_messages_sanitize_controls_and_ignore_unoffered_transport() {
+        let dir = TestDir::new();
+        let mut worker = worker(&dir.0);
+        let info = info(vec![Capability::Source]);
+        let id = info.id.clone();
+        worker.entries.insert(
+            id.clone(),
+            Entry {
+                info,
+                runtime: None,
+                restarts: RestartPolicy::default(),
+            },
+        );
+        worker
+            .receive(
+                &id,
+                AddonMessage::Message {
+                    level: MessageLevel::Error,
+                    text: "Cannot open\nfile\t\u{7f}".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            worker.entries[&id].info.message.as_ref().unwrap().text,
+            "Cannot open file  "
+        );
+        worker.entries.get_mut(&id).unwrap().info.sources[0].transport = None;
+        for source in ["main", "unknown"] {
+            worker
+                .receive(
+                    &id,
+                    AddonMessage::Transport {
+                        source: source.into(),
+                        state: TransportState::Playing,
+                        position: 1.0,
+                        duration: Some(60.0),
+                    },
+                )
+                .unwrap();
+        }
+        assert!(worker.entries[&id].info.sources[0].transport.is_none());
+        assert_eq!(worker.entries[&id].info.state, AddonState::Running);
+    }
+
+    #[test]
+    fn successful_listener_poll_clears_only_the_listener_error() {
+        let dir = TestDir::new();
+        let mut worker = worker(&dir.0);
+        worker.error = Some("Add-on listener failed: injected failure".into());
+        worker.poll();
+        assert!(worker.error.is_none());
+        worker.error = Some("Cannot read add-on preferences".into());
+        worker.poll();
+        assert_eq!(
+            worker.error.as_deref(),
+            Some("Cannot read add-on preferences")
+        );
+    }
+
+    #[test]
+    fn transport_for_unknown_and_undeclared_sources_is_ignored() {
+        let dir = TestDir::new();
+        let mut worker = worker(&dir.0);
+        let mut info = info(vec![Capability::Source]);
+        info.sources[0].transport = None;
+        let id = info.id.clone();
+        worker.entries.insert(
+            id.clone(),
+            Entry {
+                info,
+                runtime: None,
+                restarts: RestartPolicy::default(),
+            },
+        );
+        let results: Vec<_> = ["unknown", "main"]
+            .into_iter()
+            .map(|source| {
+                worker.receive(
+                    &id,
+                    AddonMessage::Transport {
+                        source: source.into(),
+                        state: TransportState::Playing,
+                        position: 1.0,
+                        duration: None,
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(results, vec![Ok(()), Ok(())]);
+        assert!(worker.entries[&id].info.sources[0].transport.is_none());
+    }
+
+    #[test]
+    fn shutdown_releases_process_after_one_failed_termination() {
+        let dir = TestDir::new();
+        let mut worker = worker(&dir.0);
+        let executable = std::env::current_exe().unwrap();
+        let mut process = AddonProcess::launch(
+            &executable,
+            &[
+                "--exact".into(),
+                "addons::process::tests::helper_child".into(),
+            ],
+            executable.parent().unwrap(),
+            &[("BACKTRACKING_PROCESS_UNIT_TEST_CHILD".into(), "1".into())],
+        )
+        .unwrap();
+        process.fail_termination = true;
+        let info = info(Vec::new());
+        let id = info.id.clone();
+        worker.entries.insert(
+            id.clone(),
+            Entry {
+                info,
+                runtime: Some(Runtime {
+                    process,
+                    started: Instant::now(),
+                    connection: None,
+                    described: false,
+                    disconnected_at: None,
+                    stop: Some((Instant::now(), AddonState::Stopped)),
+                    restart_after_stop: false,
+                }),
+                restarts: RestartPolicy::default(),
+            },
+        );
+        worker.shutting_down = true;
+        worker.poll();
+        assert!(worker.entries[&id].runtime.is_none());
+        assert!(
+            worker
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Injected termination failure")
+        );
+    }
+
+    #[test]
+    fn manager_drop_does_not_wait_forever_for_a_stuck_worker() {
+        let (release, released) = mpsc::channel();
+        let worker = thread::spawn(move || released.recv().unwrap());
+        let (commands, _receive) = mpsc::channel();
+        let manager = AddonManager {
+            handle: AddonHandle {
+                commands,
+                shared: Arc::new(Shared {
+                    snapshot: Mutex::new(Arc::new(AddonSnapshot::default())),
+                    callbacks: Mutex::new(Vec::new()),
+                }),
+            },
+            worker: Some(worker),
+            bridge: None,
+        };
+        let release_later = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(6));
+            let _ = release.send(());
+        });
+        let started = Instant::now();
+        drop(manager);
+        let elapsed = started.elapsed();
+        release_later.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(5_750),
+            "Drop blocked for {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn primary_startup_cleans_stale_files_but_a_second_manager_cannot_clean() {
+        let dir = TestDir::new();
+        fs::create_dir(dir.0.join("addons")).unwrap();
+        let lock = dir.0.join("addons/.com.example.test.lock");
+        let private = dir.0.join(format!(".install-{}.btaddon", "a".repeat(64)));
+        fs::write(&lock, b"stale").unwrap();
+        fs::write(&private, b"stale").unwrap();
+        let manager = AddonManager::new(dir.0.clone()).unwrap();
+        assert!(!lock.exists() && !private.exists());
+        let stage = dir.0.join("addons/.com.example.test.install-1-1");
+        fs::create_dir(&stage).unwrap();
+        assert!(AddonManager::new(dir.0.clone()).is_err());
+        assert!(stage.exists());
+        drop(manager);
+    }
+
+    #[test]
+    fn detached_package_task_keeps_primary_ownership_until_it_finishes() {
+        let dir = TestDir::new();
+        let worker = worker(&dir.0);
+        let (release, released) = mpsc::channel();
+        let (reply, result) = mpsc::channel();
+        spawn_task(
+            "ownership test",
+            move || {
+                released.recv().unwrap();
+                Ok(())
+            },
+            reply,
+            worker.primary_lease.clone(),
+        );
+        drop(worker);
+        assert!(startup::PrimaryLease::acquire(&dir.0).is_err());
+        release.send(()).unwrap();
+        result
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if startup::PrimaryLease::acquire(&dir.0).is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
     #[test]
     fn restart_stops_on_third_exit_in_rolling_sixty_seconds() {
         let now = Instant::now();
@@ -1902,6 +2243,81 @@ mod tests {
         let path = root.join(format!("{name}.btaddon"));
         package::pack(folder, &path).unwrap();
         path
+    }
+
+    #[test]
+    fn install_refuses_replacement_after_review_even_with_the_same_manifest() {
+        for use_proxy in [false, true] {
+            let dir = TestDir::new();
+            let original = test_package(&dir.0, "com.example.original", "original");
+            let replacement = test_package(&dir.0, "com.example.original", "replacement");
+            fs::write(dir.0.join("replacement/test.exe"), b"changed program").unwrap();
+            fs::remove_file(&replacement).unwrap();
+            package::pack(dir.0.join("replacement"), &replacement).unwrap();
+            let manager = AddonManager::new(dir.0.clone()).unwrap();
+            let proxy = use_proxy.then(|| AddonManager::connect_existing(dir.0.clone()).unwrap());
+            let handle = proxy.as_ref().unwrap_or(&manager).handle();
+            let reviewed = handle
+                .inspect(original.clone())
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            fs::rename(replacement, &original).unwrap();
+            let result = handle
+                .install(original, reviewed.identity)
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            assert!(result.unwrap_err().contains("changed after it was checked"));
+            assert!(!dir.0.join("addons/com.example.original").exists());
+            assert!(!fs::read_dir(&dir.0).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".install-")
+            }));
+        }
+    }
+
+    #[test]
+    fn reviewed_package_installs_and_cancelled_reviews_leave_no_private_copies() {
+        for use_proxy in [false, true] {
+            let dir = TestDir::new();
+            let original = test_package(&dir.0, "com.example.original", "original");
+            let manager = AddonManager::new(dir.0.clone()).unwrap();
+            let proxy = use_proxy.then(|| AddonManager::connect_existing(dir.0.clone()).unwrap());
+            let handle = proxy.as_ref().unwrap_or(&manager).handle();
+            for _ in 0..3 {
+                let reviewed = handle
+                    .inspect(original.clone())
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap();
+                drop(reviewed);
+                assert!(!fs::read_dir(&dir.0).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".install-")
+                }));
+            }
+            let reviewed = handle
+                .inspect(original.clone())
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            let installed = handle
+                .install(original, reviewed.identity)
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            assert_eq!(installed.manifest.id, reviewed.info.manifest.id);
+            assert_eq!(
+                fs::read(dir.0.join("addons/com.example.original/test.exe")).unwrap(),
+                b"package fixture"
+            );
+        }
     }
 
     #[test]
