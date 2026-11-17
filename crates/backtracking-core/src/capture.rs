@@ -1,6 +1,11 @@
 mod frozen;
 mod history;
 
+#[cfg(test)]
+mod channel_cache_bench;
+#[cfg(test)]
+mod channel_cache_tests;
+
 use std::collections::VecDeque;
 use std::time::Instant;
 use std::{error::Error, fmt, ops::Range};
@@ -767,6 +772,8 @@ impl Capture {
     /// Writes the finite min/max samples of one zero-based channel within a lane.
     /// Reads interleaved pages directly without copying a lane. The range uses the
     /// retained-audio timeline; invalid lanes or channels produce zeros and return 0.
+    /// Shared page peaks cover complete blocks. Extra channels use 16-frame peaks
+    /// and 128-frame summaries, built and extended by reads, never audio appends.
     pub fn track_channel_waveform_range(
         &self,
         lane: usize,

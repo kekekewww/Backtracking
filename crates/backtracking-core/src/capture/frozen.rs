@@ -383,6 +383,8 @@ impl FrozenTrack {
     /// The lowest and highest finite samples of one lane-relative channel over the
     /// retained part of `frames`. Reads the shared pages without copying the lane.
     /// Returns zeros for an invalid channel or an empty range.
+    /// Extra channels use lazily built 16-frame peaks and 128-frame summaries,
+    /// shared with live history and other frozen views. Edges read exact samples.
     pub fn channel_extrema(&self, channel: usize, frames: Range<u64>) -> (f32, f32) {
         if channel >= self.channels.len() {
             return (0.0, 0.0);
