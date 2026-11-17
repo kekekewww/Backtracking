@@ -1,4 +1,4 @@
 [workspace]
 members = ["crates/backtracking-core"]
-exclude = ["crates/backtracking-ui", "plugins/backtracking-plugin", "desktop/windows"]
+exclude = ["crates/backtracking-ui", "crates/backtracking-addon", "plugins/backtracking-plugin", "desktop/windows"]
 resolver = "2"

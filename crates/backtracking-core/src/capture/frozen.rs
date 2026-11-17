@@ -9,9 +9,10 @@ use crate::waveform::WaveformView;
 
 /// An immutable view of the audio a capture retained at one moment.
 ///
-/// It shares the capture's complete one-second pages instead of copying them, so
-/// taking one costs a pointer per retained second plus a copy of the page still being
-/// written, and cloning it costs one reference count. Nothing the capture does
+/// It shares the capture's complete pages instead of copying them. Each page holds
+/// up to one second; a small capture budget can use shorter pages. Taking a view
+/// costs a pointer per page plus a copy of the page still being written, and cloning
+/// it costs one reference count. Nothing the capture does
 /// afterwards changes what the view reads. The memory of a page is released when
 /// neither the capture nor any view refers to it.
 #[derive(Clone)]
@@ -40,7 +41,8 @@ impl FrozenCapture {
 
     /// Copies `interleaved` into a view of its own, as one lane whose first frame sits
     /// at `first_frame` on the retained-audio timeline. This is for audio that does not
-    /// come from a live capture; [`Capture::freeze`](super::Capture::freeze) never copies.
+    /// come from a live capture; [`Capture::freeze`](super::Capture::freeze) shares
+    /// complete pages and copies only the unfinished page.
     pub fn from_interleaved(
         sample_rate: u32,
         channels: usize,
@@ -50,7 +52,7 @@ impl FrozenCapture {
         if sample_rate == 0 {
             return Err(CaptureError::InvalidSampleRate);
         }
-        if channels == 0 {
+        if !(1..=64).contains(&channels) {
             return Err(CaptureError::InvalidChannelCount);
         }
         if interleaved.len() % channels != 0 {
@@ -129,7 +131,9 @@ impl FrozenCapture {
     /// A view of only `frames`, which must lie inside this one. It keeps just the
     /// pages holding those frames.
     pub fn slice(&self, frames: Range<u64>) -> Option<Self> {
-        if frames.start < self.frames.start || frames.end > self.frames.end || frames.end < frames.start
+        if frames.start < self.frames.start
+            || frames.end > self.frames.end
+            || frames.end < frames.start
         {
             return None;
         }
@@ -152,7 +156,7 @@ impl FrozenCapture {
     }
 
     /// The audio of `frames` in order, as contiguous runs of whole frames with every
-    /// lane's channels interleaved. A run ends where a one-second page does. Frames
+    /// lane's channels interleaved. A run ends where a page does. Frames
     /// outside the view are left out.
     pub fn slices(&self, frames: Range<u64>) -> impl Iterator<Item = &[f32]> {
         let channels = self.layout.channels;
@@ -202,7 +206,7 @@ impl FrozenCapture {
         }
     }
 
-    /// How many one-second pages hold this view's audio.
+    /// How many pages hold this view's audio.
     pub fn page_count(&self) -> usize {
         self.pages.len()
     }
@@ -211,7 +215,12 @@ impl FrozenCapture {
     pub fn shared_pages(&self, other: &Self) -> usize {
         self.pages
             .iter()
-            .filter(|page| other.pages.iter().any(|candidate| Arc::ptr_eq(page, candidate)))
+            .filter(|page| {
+                other
+                    .pages
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(page, candidate))
+            })
             .count()
     }
 
@@ -297,7 +306,7 @@ impl FrozenTrack {
     }
 
     /// This lane's audio of `frames` in order, as runs of whole interleaved frames
-    /// that each end where a one-second page does. A lane that is the capture's only
+    /// that each end where a page does. A lane that is the capture's only
     /// one borrows the pages; with two lanes each run is a de-interleaved copy.
     /// Frames outside the track are left out.
     pub fn chunks(&self, frames: Range<u64>) -> impl Iterator<Item = Cow<'_, [f32]>> {
@@ -369,6 +378,40 @@ impl FrozenTrack {
     ) -> usize {
         self.capture
             .trace_waveform(Layout::trace(self.lane, view), frames, minimum, maximum)
+    }
+
+    /// The lowest and highest finite samples of one lane-relative channel over the
+    /// retained part of `frames`. Reads the shared pages without copying the lane.
+    /// Returns zeros for an invalid channel or an empty range.
+    pub fn channel_extrema(&self, channel: usize, frames: Range<u64>) -> (f32, f32) {
+        if channel >= self.channels.len() {
+            return (0.0, 0.0);
+        }
+        history::channel_extrema(
+            self.capture.pages(frames),
+            self.capture.layout,
+            self.channels.start + channel,
+        )
+    }
+
+    /// Writes chronological min/max bins for one lane-relative channel over the
+    /// retained part of `frames`, without copying the lane. Returns the frame count.
+    /// An invalid channel clears both outputs and returns zero.
+    pub fn channel_waveform(
+        &self,
+        channel: usize,
+        frames: Range<u64>,
+        minimum: &mut [f32],
+        maximum: &mut [f32],
+    ) -> usize {
+        if channel >= self.channels.len() {
+            minimum.fill(0.0);
+            maximum.fill(0.0);
+            return 0;
+        }
+        waveform_bins(self.capture.clamp(frames), minimum, maximum, |frames| {
+            self.channel_extrema(channel, frames)
+        })
     }
 
     /// Copies the whole lane into one owned buffer.
@@ -501,7 +544,11 @@ mod tests {
         assert_eq!(view.frame_count(), flat.frame_count(), "{context}");
         assert_eq!(view.channels(), flat.channels, "{context}");
         assert_eq!(view.sample_rate(), flat.sample_rate, "{context}");
-        assert_eq!(bits(&view.snapshot().samples), bits(&flat.samples), "{context}");
+        assert_eq!(
+            bits(&view.snapshot().samples),
+            bits(&flat.samples),
+            "{context}"
+        );
         let tracks = view.tracks();
         assert_eq!(tracks.len(), lanes.len(), "{context}");
         assert_eq!(view.track_count(), lanes.len(), "{context}");
@@ -510,7 +557,11 @@ mod tests {
             assert_eq!(track.first_frame(), lane.first_frame, "{context}");
             assert_eq!(track.channels(), lane.channels, "{context}");
             assert_eq!(track.sample_rate(), lane.sample_rate, "{context}");
-            assert_eq!(bits(&track.snapshot().samples), bits(&lane.samples), "{context}");
+            assert_eq!(
+                bits(&track.snapshot().samples),
+                bits(&lane.samples),
+                "{context}"
+            );
         }
         let page_frames = u64::from(flat.sample_rate);
         for _ in 0..ranges {
@@ -522,10 +573,18 @@ mod tests {
             let joined: Vec<f32> = view.slices(range.clone()).flatten().copied().collect();
             assert_eq!(bits(&joined), bits(expected), "{context}");
             assert!(view.slices(range.clone()).all(|slice| !slice.is_empty()) || range.is_empty());
-            assert_eq!(view.extrema(range.clone()), scan(expected, 1, WaveformView::Left), "{context}");
+            assert_eq!(
+                view.extrema(range.clone()),
+                scan(expected, 1, WaveformView::Left),
+                "{context}"
+            );
             let sliced = view.slice(range.clone()).unwrap();
             assert_eq!(sliced.frame_range(), range, "{context}");
-            assert_eq!(bits(&sliced.snapshot().samples), bits(expected), "{context}");
+            assert_eq!(
+                bits(&sliced.snapshot().samples),
+                bits(expected),
+                "{context}"
+            );
 
             let bins = 1 + random.below(300) as usize;
             let (mut low, mut high) = (vec![9.0; bins], vec![9.0; bins + 1]);
@@ -546,7 +605,11 @@ mod tests {
                 assert!(track.read_frames(range.start, &mut read), "{context}");
                 assert_eq!(bits(&read), bits(expected), "{context}");
                 let sliced = track.slice(range.clone()).unwrap();
-                assert_eq!(bits(&sliced.snapshot().samples), bits(expected), "{context}");
+                assert_eq!(
+                    bits(&sliced.snapshot().samples),
+                    bits(expected),
+                    "{context}"
+                );
                 for view in VIEWS {
                     assert_eq!(
                         track.extrema(view, range.clone()),
@@ -558,7 +621,13 @@ mod tests {
                         scan(expected, lane.channels, view),
                         "{context}, {view:?} of a slice"
                     );
-                    view_peaks(expected, lane.channels, view, &mut expected_low, &mut expected_high);
+                    view_peaks(
+                        expected,
+                        lane.channels,
+                        view,
+                        &mut expected_low,
+                        &mut expected_high,
+                    );
                     assert_eq!(
                         track.waveform(view, range.clone(), &mut low, &mut high),
                         relative.len(),
@@ -570,16 +639,27 @@ mod tests {
             }
         }
         // Requests reaching outside the view are refused or clipped, never misread.
-        assert!(view.slice(frames.start..frames.end + 1).is_none(), "{context}");
-        assert_eq!(view.slices(0..u64::MAX).map(<[f32]>::len).sum::<usize>(), flat.samples.len());
+        assert!(
+            view.slice(frames.start..frames.end + 1).is_none(),
+            "{context}"
+        );
+        assert_eq!(
+            view.slices(0..u64::MAX).map(<[f32]>::len).sum::<usize>(),
+            flat.samples.len()
+        );
         let mut outside = [7.0; 4];
         let width = tracks[0].channels();
-        assert!(!tracks[0].read_frames(frames.end, &mut outside[..width]), "{context}");
+        assert!(
+            !tracks[0].read_frames(frames.end, &mut outside[..width]),
+            "{context}"
+        );
         assert_eq!(outside, [7.0; 4], "{context}");
     }
 
     fn flat_lanes(capture: &Capture) -> Vec<Snapshot> {
-        (0..2).filter_map(|lane| capture.track_snapshot(lane)).collect()
+        (0..2)
+            .filter_map(|lane| capture.track_snapshot(lane))
+            .collect()
     }
 
     #[test]
@@ -591,10 +671,14 @@ mod tests {
         ];
         // Low rates keep the histories small while every block spans several pages.
         // Pages of 256 frames are whole peak blocks; the others end in a partial one.
-        for (case, (rate, a_channels, b_channels)) in
-            [(150, 1, None), (256, 2, None), (190, 1, Some(2)), (300, 2, Some(2))]
-                .into_iter()
-                .enumerate()
+        for (case, (rate, a_channels, b_channels)) in [
+            (150, 1, None),
+            (256, 2, None),
+            (190, 1, Some(2)),
+            (300, 2, Some(2)),
+        ]
+        .into_iter()
+        .enumerate()
         {
             for seed in 1..=2u64 {
                 let mut random = Random(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) + case as u64);
@@ -615,7 +699,9 @@ mod tests {
                         }
                         8 | 9 => {
                             let frames = 1 + random.below(400) as usize;
-                            capture.push_interleaved(&vec![0.0; frames * channels]).unwrap();
+                            capture
+                                .push_interleaved(&vec![0.0; frames * channels])
+                                .unwrap();
                         }
                         10 => capture.set_retain_silence(random.below(2) == 0),
                         11 => {
@@ -655,7 +741,9 @@ mod tests {
                                     "{context}"
                                 );
                             }
-                            assert!(capture.freeze_range(retained.start..retained.end + 1).is_none());
+                            assert!(capture
+                                .freeze_range(retained.start..retained.end + 1)
+                                .is_none());
                             if frozen.len() == 3 {
                                 let (view, flat, lanes) = frozen.remove(random.below(3) as usize);
                                 assert_matches_flat(&view, &flat, &lanes, &mut random, 6, &context);
@@ -679,9 +767,8 @@ mod tests {
     fn loud(frames: Range<usize>, channels: usize) -> Vec<f32> {
         frames
             .flat_map(|frame| {
-                (0..channels).map(move |channel| {
-                    0.25 + ((frame * 7 + channel * 3) % 1_000) as f32 / 2_000.0
-                })
+                (0..channels)
+                    .map(move |channel| 0.25 + ((frame * 7 + channel * 3) % 1_000) as f32 / 2_000.0)
             })
             .collect()
     }
@@ -705,7 +792,10 @@ mod tests {
         capture.smooth_next_join();
         capture.resume();
         capture.push_interleaved(&loud(0..10, 3)).unwrap();
-        assert_eq!(flat.frames(25_499..25_500).unwrap(), loud(25_499..25_500, 3));
+        assert_eq!(
+            flat.frames(25_499..25_500).unwrap(),
+            loud(25_499..25_500, 3)
+        );
         assert_eq!(
             capture.snapshot().frames(25_499..25_500).unwrap(),
             [0.0; 3],
@@ -755,12 +845,23 @@ mod tests {
         assert!(!live.contains(&first.page_addresses()[5]));
         assert_eq!(first.shared_pages(&second), 5);
         assert_eq!(first.shared_pages(&first.clone()), 6);
-        assert_eq!(capture.history.sealed_page_addresses(), live, "freezing moves nothing");
+        assert_eq!(
+            capture.history.sealed_page_addresses(),
+            live,
+            "freezing moves nothing"
+        );
 
         // Lanes and slices are further references to the same pages.
         let track = first.track(0).unwrap();
         assert_eq!(track.capture().page_addresses(), first.page_addresses());
-        assert_eq!(track.slice(1_200..3_400).unwrap().capture().page_addresses(), live[1..4]);
+        assert_eq!(
+            track
+                .slice(1_200..3_400)
+                .unwrap()
+                .capture()
+                .page_addresses(),
+            live[1..4]
+        );
 
         // A range that ends before the page being written copies no audio at all.
         let part = capture.freeze_range(1_200..3_400).unwrap();
@@ -794,9 +895,20 @@ mod tests {
         let flat = capture.snapshot();
         fade_join(&mut capture);
         let after = capture.history.sealed_page_addresses();
-        assert_eq!(after[..4], before[..4], "pages the fade does not reach stay shared");
-        assert_ne!(after[4], before[4], "the faded page was copied for the capture");
-        assert_eq!(view.page_addresses()[..5], before, "the view keeps the original");
+        assert_eq!(
+            after[..4],
+            before[..4],
+            "pages the fade does not reach stay shared"
+        );
+        assert_ne!(
+            after[4], before[4],
+            "the faded page was copied for the capture"
+        );
+        assert_eq!(
+            view.page_addresses()[..5],
+            before,
+            "the view keeps the original"
+        );
         assert_eq!(bits(&view.snapshot().samples), bits(&flat.samples));
         assert_eq!(
             capture.snapshot().frames(4_999..5_002).unwrap()[..4],
@@ -847,7 +959,11 @@ mod tests {
         capture.push_interleaved(&loud(1_000..2_050, 1)).unwrap();
         assert_eq!(capture.frame_range(), 1_050..2_050);
         assert!(held.iter().all(|page| page.strong_count() == 1));
-        assert_eq!(capture.history.allocated_frames(), 5_100, "nine pages left with the view");
+        assert_eq!(
+            capture.history.allocated_frames(),
+            5_100,
+            "nine pages left with the view"
+        );
         assert_eq!(bits(&view.snapshot().samples), bits(&flat.samples));
         assert_eq!(capture.snapshot().samples, loud(1_050..2_050, 1));
 
@@ -878,10 +994,13 @@ mod tests {
     #[test]
     fn extrema_from_the_peak_cache_equal_a_brute_force_scan() {
         let mut random = Random(7);
-        for (rate, a_channels, b_channels) in [(1_000, 2, Some(1)), (441, 1, None), (128, 2, Some(2))] {
+        for (rate, a_channels, b_channels) in
+            [(1_000, 2, Some(1)), (441, 1, None), (128, 2, Some(2))]
+        {
             let channels = a_channels + b_channels.unwrap_or(0);
             let mut capture =
-                Capture::new_tracks(rate, a_channels, b_channels, DurationChoice::Seconds30).unwrap();
+                Capture::new_tracks(rate, a_channels, b_channels, DurationChoice::Seconds30)
+                    .unwrap();
             let audio: Vec<f32> = (0..(rate as usize * 12 + 77) * channels)
                 .map(|_| random.sample())
                 .collect();
@@ -900,7 +1019,11 @@ mod tests {
                     WaveformView::Left,
                 );
                 assert_eq!(view.extrema(range.clone()), every, "{range:?} at {rate} Hz");
-                assert_eq!(copied.extrema(range.start + 500..range.end + 500), every, "{range:?}");
+                assert_eq!(
+                    copied.extrema(range.start + 500..range.end + 500),
+                    every,
+                    "{range:?}"
+                );
                 for (track, lane) in view.tracks().iter().zip(&lanes) {
                     let expected = lane.frames(relative.clone()).unwrap();
                     for waveform_view in VIEWS {
@@ -924,7 +1047,12 @@ mod tests {
                         let (mut low, mut high) = (vec![0.0; bins], vec![0.0; bins]);
                         let (mut frozen_low, mut frozen_high) = (low.clone(), high.clone());
                         capture.track_waveform(lane, waveform_view, &mut low, &mut high);
-                        track.waveform(waveform_view, 0..u64::MAX, &mut frozen_low, &mut frozen_high);
+                        track.waveform(
+                            waveform_view,
+                            0..u64::MAX,
+                            &mut frozen_low,
+                            &mut frozen_high,
+                        );
                         assert_eq!((low, high), (frozen_low, frozen_high));
                     }
                 }
@@ -933,18 +1061,149 @@ mod tests {
     }
 
     #[test]
+    fn multichannel_frozen_tracks_read_and_draw_each_channel_without_mixing_lanes() {
+        let channels = 14;
+        let mut random = Random(31);
+        let audio: Vec<f32> = (0..2_173 * channels).map(|_| random.sample()).collect();
+        let mut capture =
+            Capture::new_tracks(1_000, 12, Some(2), DurationChoice::Seconds10).unwrap();
+        capture.set_retain_silence(true);
+        capture.push_interleaved(&audio).unwrap();
+        let view = capture.freeze();
+        assert_eq!(view.track_count(), 2);
+        assert_eq!(bits(&view.snapshot().samples), bits(&audio));
+        let tracks = view.tracks();
+        assert_eq!(tracks[0].channels(), 12);
+        assert_eq!(tracks[1].channels(), 2);
+
+        for (lane, track) in tracks.iter().enumerate() {
+            let offset = if lane == 0 { 0 } else { 12 };
+            let mut read = vec![0.0; 1_144 * track.channels()];
+            assert!(track.read_frames(999, &mut read));
+            let expected: Vec<f32> = audio[999 * channels..2_143 * channels]
+                .chunks_exact(channels)
+                .flat_map(|frame| frame[offset..offset + track.channels()].iter().copied())
+                .collect();
+            assert_eq!(bits(&read), bits(&expected));
+
+            for channel in 0..track.channels() {
+                for range in [
+                    0..2_173,
+                    127..1_025,
+                    999..1_001,
+                    2_100..3_000,
+                    5_000..6_000,
+                    12..3,
+                ] {
+                    let start = range.start.min(2_173);
+                    let end = range.end.min(2_173).max(start);
+                    let mono: Vec<f32> = audio[start * channels..end * channels]
+                        .chunks_exact(channels)
+                        .map(|frame| frame[offset + channel])
+                        .collect();
+                    let bounds = waveform::extrema(mono.iter().copied());
+                    assert_eq!(
+                        track.channel_extrema(channel, range.start as u64..range.end as u64),
+                        bounds
+                    );
+                    for bins in [1, 7, 300] {
+                        let (mut low, mut high) = (vec![3.0; bins], vec![3.0; bins]);
+                        let (mut expected_low, mut expected_high) =
+                            (vec![0.0; bins], vec![0.0; bins]);
+                        let count = track.channel_waveform(
+                            channel,
+                            range.start as u64..range.end as u64,
+                            &mut low,
+                            &mut high,
+                        );
+                        view_peaks(
+                            &mono,
+                            1,
+                            WaveformView::Left,
+                            &mut expected_low,
+                            &mut expected_high,
+                        );
+                        assert_eq!(count, end - start);
+                        assert_eq!(bits(&low), bits(&expected_low));
+                        assert_eq!(bits(&high), bits(&expected_high));
+                        let (mut live_low, mut live_high) = (vec![3.0; bins], vec![3.0; bins]);
+                        assert_eq!(
+                            capture.track_channel_waveform_range(
+                                lane,
+                                channel,
+                                range.start as u64..range.end as u64,
+                                &mut live_low,
+                                &mut live_high,
+                            ),
+                            count,
+                        );
+                        assert_eq!(bits(&live_low), bits(&low));
+                        assert_eq!(bits(&live_high), bits(&high));
+                    }
+                }
+            }
+            let (mut low, mut high) = ([9.0; 4], [9.0; 3]);
+            assert_eq!(
+                track.channel_waveform(track.channels(), 0..2_173, &mut low, &mut high),
+                0
+            );
+            assert_eq!(low, [0.0; 4]);
+            assert_eq!(high, [0.0; 3]);
+            assert_eq!(track.channel_extrema(usize::MAX, 0..2_173), (0.0, 0.0));
+        }
+
+        let slice = tracks[0].slice(900..1_100).unwrap();
+        assert_eq!(
+            slice.channel_extrema(11, 0..u64::MAX),
+            tracks[0].channel_extrema(11, 900..1_100)
+        );
+        capture.clear();
+        capture
+            .push_interleaved(&vec![0.5; 5_000 * channels])
+            .unwrap();
+        assert_eq!(bits(&view.snapshot().samples), bits(&audio));
+    }
+
+    #[test]
+    fn standalone_frozen_channels_accept_sixty_four_and_ignore_non_finite_extrema() {
+        let mut audio = vec![0.0; 257 * 64];
+        audio[63] = f32::NAN;
+        audio[128 * 64 + 63] = f32::INFINITY;
+        audio[129 * 64 + 63] = -0.75;
+        audio[256 * 64 + 63] = 0.5;
+        let track = FrozenTrack::from_interleaved(128, 64, 400, &audio).unwrap();
+        assert_eq!(track.channel_extrema(63, 400..657), (-0.75, 0.5));
+        assert_eq!(track.channel_extrema(62, 400..657), (0.0, 0.0));
+        assert_eq!(
+            FrozenTrack::from_interleaved(1_000, 65, 0, &[]).unwrap_err(),
+            CaptureError::InvalidChannelCount,
+        );
+    }
+
+    #[test]
     fn a_view_built_from_a_flat_buffer_reads_back_the_same_audio() {
         let audio = loud(0..2_300, 2);
         let track = FrozenTrack::from_interleaved(1_000, 2, 40, &audio).unwrap();
         assert_eq!(track.frame_range(), 40..2_340);
-        assert_eq!((track.channels(), track.sample_rate(), track.first_frame()), (2, 1_000, 40));
+        assert_eq!(
+            (track.channels(), track.sample_rate(), track.first_frame()),
+            (2, 1_000, 40)
+        );
         assert_eq!(track.capture().page_count(), 3);
         let snapshot = track.snapshot();
         assert_eq!(
             snapshot,
-            Snapshot { sample_rate: 1_000, channels: 2, samples: audio.clone(), first_frame: 40 }
+            Snapshot {
+                sample_rate: 1_000,
+                channels: 2,
+                samples: audio.clone(),
+                first_frame: 40
+            }
         );
-        assert_eq!(track.snapshot_range(1_039..1_042).unwrap().samples, audio[1_998..2_004]);
+        assert_eq!(
+            track.snapshot_range(1_039..1_042).unwrap().samples,
+            audio[1_998..2_004]
+        );
         assert!(track.snapshot_range(39..42).is_none());
         let empty = FrozenTrack::from_interleaved(48_000, 1, 9, &[]).unwrap();
         assert_eq!(empty.frame_range(), 9..9);

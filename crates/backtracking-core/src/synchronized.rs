@@ -105,6 +105,74 @@ impl ChannelRoute {
     }
 }
 
+/// A legacy route or all native source channels. Keeping this separate from
+/// `ChannelRoute` preserves exhaustive matches in existing clients and its C ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelRouting {
+    Routed(ChannelRoute),
+    /// Keeps every source channel in its original order, without a downmix.
+    Native,
+}
+
+impl ChannelRouting {
+    /// Codes 0 to 5 retain the existing routes; 6 selects every native channel.
+    pub const fn from_code(value: u32) -> Option<Self> {
+        if value == 6 {
+            Some(Self::Native)
+        } else {
+            match ChannelRoute::from_code(value) {
+                Some(route) => Some(Self::Routed(route)),
+                None => None,
+            }
+        }
+    }
+
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Routed(route) => route as u32,
+            Self::Native => 6,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Routed(route) => route.label(),
+            Self::Native => "Native",
+        }
+    }
+
+    /// Native accepts 1 to 64 channels. Legacy routes keep their existing rules.
+    pub fn output_channels(self, native: usize, center: Option<usize>) -> Option<usize> {
+        match self {
+            Self::Routed(route) => route.output_channels(native, center),
+            Self::Native => (1..=64).contains(&native).then_some(native),
+        }
+    }
+
+    pub fn route_interleaved(
+        self,
+        samples: &[f32],
+        native: usize,
+        center: Option<usize>,
+        output: &mut Vec<f32>,
+    ) -> Result<(), CaptureError> {
+        match self {
+            Self::Routed(route) => route.route_interleaved(samples, native, center, output),
+            Self::Native => {
+                output.clear();
+                if !(1..=64).contains(&native) {
+                    return Err(CaptureError::InvalidChannelCount);
+                }
+                if samples.len() % native != 0 {
+                    return Err(CaptureError::IncompleteFrame);
+                }
+                output.extend_from_slice(samples);
+                Ok(())
+            }
+        }
+    }
+}
+
 struct Clock {
     timestamp_ns: u64,
     frames: usize,
@@ -297,7 +365,32 @@ impl SynchronizedCapture {
         b_channels: Option<usize>,
         retention: DurationChoice,
     ) -> Result<Self, CaptureError> {
-        let capture = Capture::new_tracks(rate, a_channels, b_channels, retention)?;
+        Self::new_with_budget(
+            rate,
+            a_channels,
+            b_channels,
+            retention,
+            crate::capture::DEFAULT_MAX_BUFFER_SAMPLES,
+        )
+    }
+
+    /// Creates one or two lanes with at most 64 channels in total. The sample
+    /// budget caps retained history; use `capture().effective_retention_frames()` to read
+    /// the retention that fits.
+    pub fn new_with_budget(
+        rate: u32,
+        a_channels: usize,
+        b_channels: Option<usize>,
+        retention: DurationChoice,
+        max_buffer_samples: usize,
+    ) -> Result<Self, CaptureError> {
+        let capture = Capture::new_tracks_with_budget(
+            rate,
+            a_channels,
+            b_channels,
+            retention,
+            max_buffer_samples,
+        )?;
         Ok(Self {
             sample_rate: rate,
             lanes: [Some(Lane::new(a_channels)), b_channels.map(Lane::new)],
@@ -379,8 +472,7 @@ impl SynchronizedCapture {
                 let gap_frames = ((u128::from(gap_ns) * u128::from(self.sample_rate)
                     + NANOS_PER_SECOND / 2)
                     / NANOS_PER_SECOND)
-                    .min(u128::from(u64::MAX))
-                    as u64;
+                    .min(u128::from(u64::MAX)) as u64;
                 if self.retain_silence() {
                     // Known quiet time remains on the timeline. A timestamp gap
                     // alone is not a compressed edit seam; real discontinuities
@@ -402,13 +494,15 @@ impl SynchronizedCapture {
                     self.capture.smooth_next_join();
                     // Compression needs only enough silence to close the gate
                     // and fill pre-roll, independent of the interruption length.
-                    let mut remaining = gap_frames.min(frames_for_ms(self.sample_rate, GAP_TAIL_MS));
+                    let mut remaining =
+                        gap_frames.min(frames_for_ms(self.sample_rate, GAP_TAIL_MS));
                     let have_gap = remaining != 0;
                     self.scratch.clear();
                     self.scratch.resize(DRAIN_FRAMES * channels, 0.);
                     while remaining > 0 {
                         let count = remaining.min(DRAIN_FRAMES as u64) as usize;
-                        self.capture.push_interleaved(&self.scratch[..count * channels])?;
+                        self.capture
+                            .push_interleaved(&self.scratch[..count * channels])?;
                         remaining -= count as u64;
                     }
                     if have_gap {
@@ -444,7 +538,14 @@ impl SynchronizedCapture {
         interleaved: &[f32],
         discontinuity: bool,
     ) -> Result<(), CaptureError> {
-        self.push_with_markers(lane, timestamp_ns, source_rate, interleaved, discontinuity, &[])
+        self.push_with_markers(
+            lane,
+            timestamp_ns,
+            source_rate,
+            interleaved,
+            discontinuity,
+            &[],
+        )
     }
 
     /// Projects packet-relative bar starts onto the same time grid as both audio lanes.
@@ -732,6 +833,175 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_routing_preserves_every_channel_and_legacy_codes() {
+        for (code, route) in ChannelRoute::ALL.into_iter().enumerate() {
+            let routing = ChannelRouting::Routed(route);
+            assert_eq!(route as u32, code as u32);
+            assert_eq!(ChannelRoute::from_code(code as u32), Some(route));
+            assert_eq!(routing.code(), code as u32);
+            assert_eq!(ChannelRouting::from_code(code as u32), Some(routing));
+            assert_eq!(routing.label(), route.label());
+            assert_eq!(
+                routing.output_channels(12, Some(2)),
+                route.output_channels(12, Some(2))
+            );
+        }
+        assert_eq!(ChannelRoute::from_code(6), None);
+        assert_eq!(ChannelRouting::from_code(6), Some(ChannelRouting::Native));
+        assert_eq!(ChannelRouting::Native.code(), 6);
+        assert_eq!(ChannelRouting::Native.label(), "Native");
+        assert_eq!(ChannelRouting::from_code(7), None);
+
+        let mut routed = Vec::new();
+        for channels in [1, 2, 12, 64] {
+            let samples: Vec<f32> = (0..channels * 3)
+                .map(|sample| sample as f32 / 256.)
+                .collect();
+            assert_eq!(
+                ChannelRouting::Native.output_channels(channels, None),
+                Some(channels)
+            );
+            ChannelRouting::Native
+                .route_interleaved(&samples, channels, None, &mut routed)
+                .unwrap();
+            assert_eq!(routed, samples);
+            assert_eq!(
+                ChannelRoute::Merged.output_channels(channels, None),
+                Some(channels.min(2))
+            );
+        }
+        for channels in [0, 65, usize::MAX] {
+            assert_eq!(ChannelRouting::Native.output_channels(channels, None), None);
+            assert_eq!(
+                ChannelRouting::Native.route_interleaved(&[], channels, None, &mut routed),
+                Err(CaptureError::InvalidChannelCount)
+            );
+            assert!(routed.is_empty());
+        }
+        assert_eq!(
+            ChannelRouting::Native.route_interleaved(&[0.; 13], 12, None, &mut routed),
+            Err(CaptureError::IncompleteFrame)
+        );
+        assert!(routed.is_empty());
+    }
+
+    #[test]
+    fn twelve_and_two_channel_lanes_keep_every_frame_aligned() {
+        let mut capture =
+            SynchronizedCapture::new(1000, 12, Some(2), DurationChoice::Seconds10).unwrap();
+        capture.set_retain_silence(true);
+        let a: Vec<f32> = (0..20)
+            .flat_map(|frame| (0..12).map(move |channel| (frame * 12 + channel) as f32 / 512.))
+            .collect();
+        let b: Vec<f32> = (0..20)
+            .flat_map(|frame| [frame as f32 / 32., -(frame as f32) / 64.])
+            .collect();
+        for packet in 0..2 {
+            let timestamp = packet as u64 * 10_000_000;
+            capture
+                .push(0, timestamp, 1000, &a[packet * 120..(packet + 1) * 120])
+                .unwrap();
+            capture
+                .push(1, timestamp, 1000, &b[packet * 20..(packet + 1) * 20])
+                .unwrap();
+            capture.drain(false);
+        }
+        capture.drain(true);
+        assert!(capture.take_capture_error().is_none());
+        let a_track = capture.capture().track_snapshot(0).unwrap();
+        let b_track = capture.capture().track_snapshot(1).unwrap();
+        assert_eq!(a_track.frame_range(), 0..20);
+        assert_eq!(a_track.frame_range(), b_track.frame_range());
+        assert_eq!(a_track.samples, a);
+        assert_eq!(b_track.samples, b);
+    }
+
+    #[test]
+    fn multichannel_resampling_matches_independent_channel_filters() {
+        const CHANNELS: usize = 12;
+        const INPUT_RATE: u32 = 500;
+        const OUTPUT_RATE: u32 = 1000;
+        let mut capture =
+            SynchronizedCapture::new(OUTPUT_RATE, CHANNELS, None, DurationChoice::Seconds10)
+                .unwrap();
+        capture.set_retain_silence(true);
+        let raw: Vec<f32> = (0..300)
+            .flat_map(|frame| {
+                (0..CHANNELS).map(move |channel| {
+                    let phase = frame as f32 * (channel + 1) as f32 * 0.013;
+                    phase.sin() * 0.25 + channel as f32 / 64.
+                })
+            })
+            .collect();
+        for packet in 0..3 {
+            let first = packet * 100;
+            capture
+                .push(
+                    0,
+                    first as u64 * 1_000_000_000 / u64::from(INPUT_RATE),
+                    INPUT_RATE,
+                    &raw[first * CHANNELS..(first + 100) * CHANNELS],
+                )
+                .unwrap();
+            capture.drain(false);
+        }
+        capture.drain(true);
+        assert!(capture.take_capture_error().is_none());
+        let snapshot = capture.capture().track_snapshot(0).unwrap();
+        assert_eq!(snapshot.frame_range(), 0..600);
+        let step = f64::from(INPUT_RATE) / f64::from(OUTPUT_RATE);
+        let kernel = ResamplingKernel::new(step);
+        for channel in 0..CHANNELS {
+            let mono: Vec<f32> = raw
+                .chunks_exact(CHANNELS)
+                .map(|frame| frame[channel])
+                .collect();
+            for (frame, samples) in snapshot.samples.chunks_exact(CHANNELS).enumerate() {
+                let expected = kernel.at(&mono, 1, frame as f64 * step)[0];
+                assert!(
+                    (samples[channel] - expected).abs() < 1e-5,
+                    "channel {channel}, frame {frame}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_capture_accepts_sixty_four_channels_and_rejects_larger_totals() {
+        let mut capture =
+            SynchronizedCapture::new(1000, 64, None, DurationChoice::Seconds10).unwrap();
+        capture.set_retain_silence(true);
+        let samples: Vec<f32> = (0..64 * 8).map(|sample| sample as f32 / 1024.).collect();
+        capture.push_native_interleaved(0, &samples, false).unwrap();
+        assert_eq!(capture.capture().snapshot().samples, samples);
+        for (a, b) in [
+            (65, None),
+            (64, Some(1)),
+            (12, Some(53)),
+            (0, None),
+            (12, Some(0)),
+        ] {
+            assert!(matches!(
+                SynchronizedCapture::new(1000, a, b, DurationChoice::Seconds10),
+                Err(CaptureError::InvalidChannelCount)
+            ));
+        }
+    }
+
+    #[test]
+    fn synchronized_sample_budget_shortens_retention() {
+        let mut capture =
+            SynchronizedCapture::new_with_budget(1000, 12, Some(2), DurationChoice::Seconds10, 140)
+                .unwrap();
+        capture.set_retain_silence(true);
+        let samples: Vec<f32> = (0..20 * 14).map(|sample| sample as f32 / 512.).collect();
+        capture.push_native_interleaved(0, &samples, false).unwrap();
+        let retained = capture.capture().snapshot();
+        assert_eq!(retained.frame_range(), 10..20);
+        assert_eq!(retained.samples, samples[140..]);
+    }
+
+    #[test]
     fn retain_silence_keeps_native_quiet_gaps_and_bar_positions_on_both_lanes() {
         let mut capture =
             SynchronizedCapture::new(1000, 1, Some(1), DurationChoice::Seconds10).unwrap();
@@ -739,8 +1009,12 @@ mod tests {
         capture.set_retain_silence(true);
         let first = [0.0001, -0.0002, 0., 0., -0.0001, 0.0002, 0., 0.];
         let last = [0.0003, -0.0004, 0., 0., 0.0002, -0.0001, 0., 0.];
-        capture.push_native_interleaved_with_markers(0, &first, false, &[0, 3]).unwrap();
-        capture.push_native_interleaved_with_markers(2_000_000_000, &last, false, &[1]).unwrap();
+        capture
+            .push_native_interleaved_with_markers(0, &first, false, &[0, 3])
+            .unwrap();
+        capture
+            .push_native_interleaved_with_markers(2_000_000_000, &last, false, &[1])
+            .unwrap();
         let a = capture.capture().track_snapshot(0).unwrap();
         let b = capture.capture().track_snapshot(1).unwrap();
         assert_eq!(a.frame_range(), 0..2004);
@@ -760,18 +1034,26 @@ mod tests {
             SynchronizedCapture::new(1000, 1, Some(1), DurationChoice::Seconds10).unwrap();
         capture.set_retain_silence(true);
         for lane in 0..2 {
-            capture.push_with_markers(lane, 0, 1000, &[0.; 10], false, &[2]).unwrap();
+            capture
+                .push_with_markers(lane, 0, 1000, &[0.; 10], false, &[2])
+                .unwrap();
         }
         capture.drain(true);
         for lane in 0..2 {
-            capture.push_with_markers(lane, 2_000_000_000, 1000, &[0.; 10], false, &[5]).unwrap();
+            capture
+                .push_with_markers(lane, 2_000_000_000, 1000, &[0.; 10], false, &[5])
+                .unwrap();
         }
         capture.drain(true);
         let a = capture.capture().track_snapshot(0).unwrap();
         let b = capture.capture().track_snapshot(1).unwrap();
         assert_eq!(a.frame_range(), 0..2010);
         assert_eq!(a.frame_range(), b.frame_range());
-        assert!(a.samples.iter().chain(&b.samples).all(|&sample| sample == 0.));
+        assert!(a
+            .samples
+            .iter()
+            .chain(&b.samples)
+            .all(|&sample| sample == 0.));
         assert_eq!(capture.capture().bar_markers(0..2010), vec![2, 2005]);
     }
 
@@ -779,10 +1061,14 @@ mod tests {
     fn retain_silence_switch_does_not_restore_pending_or_earlier_unobserved_quiet() {
         let mut capture =
             SynchronizedCapture::new(1000, 1, None, DurationChoice::Seconds10).unwrap();
-        capture.push_with_markers(0, 0, 1000, &[0.; 100], false, &[10]).unwrap();
+        capture
+            .push_with_markers(0, 0, 1000, &[0.; 100], false, &[10])
+            .unwrap();
         capture.set_retain_silence(true);
         assert!(capture.capture().frame_range().is_empty());
-        capture.push_with_markers(0, 5_000_000_000, 1000, &[0.; 10], false, &[2]).unwrap();
+        capture
+            .push_with_markers(0, 5_000_000_000, 1000, &[0.; 10], false, &[2])
+            .unwrap();
         capture.drain(true);
         assert_eq!(capture.capture().frame_range(), 0..10);
         assert_eq!(capture.capture().bar_markers(0..10), vec![2]);
@@ -792,24 +1078,34 @@ mod tests {
         assert_eq!(capture.capture().snapshot(), before);
         capture.set_retain_silence(true);
         assert_eq!(capture.capture().snapshot(), before);
-        capture.push_native_interleaved(10_000_000_000, &[0.; 5], false).unwrap();
+        capture
+            .push_native_interleaved(10_000_000_000, &[0.; 5], false)
+            .unwrap();
         capture.set_retain_silence(true);
-        capture.push_native_interleaved(11_000_000_000, &[0.; 5], false).unwrap();
+        capture
+            .push_native_interleaved(11_000_000_000, &[0.; 5], false)
+            .unwrap();
         assert_eq!(capture.capture().frame_range(), 0..1015);
     }
 
     #[test]
     fn retained_native_long_gap_rolls_history_without_losing_absolute_time() {
-        let mut capture =
-            SynchronizedCapture::new(10, 1, None, DurationChoice::Seconds10).unwrap();
+        let mut capture = SynchronizedCapture::new(10, 1, None, DurationChoice::Seconds10).unwrap();
         capture.set_retain_silence(true);
-        capture.push_native_interleaved(0, &[0.125; 2], false).unwrap();
-        capture.push_native_interleaved_with_markers(1_000_000_000_000, &[0.25; 2], false, &[1]).unwrap();
+        capture
+            .push_native_interleaved(0, &[0.125; 2], false)
+            .unwrap();
+        capture
+            .push_native_interleaved_with_markers(1_000_000_000_000, &[0.25; 2], false, &[1])
+            .unwrap();
         let snapshot = capture.capture().snapshot();
         assert_eq!(snapshot.frame_range(), 9902..10002);
         assert!(snapshot.samples[..98].iter().all(|&sample| sample == 0.));
         assert_eq!(&snapshot.samples[98..], &[0.25; 2]);
-        assert_eq!(capture.capture().bar_markers(snapshot.frame_range()), vec![10001]);
+        assert_eq!(
+            capture.capture().bar_markers(snapshot.frame_range()),
+            vec![10001]
+        );
     }
 
     #[test]
@@ -817,8 +1113,12 @@ mod tests {
         let mut capture =
             SynchronizedCapture::new(1000, 1, None, DurationChoice::Seconds10).unwrap();
         capture.set_retain_silence(true);
-        capture.push_native_interleaved(0, &[0.25; 8], false).unwrap();
-        capture.push_native_interleaved(9_000_000, &[0.75; 8], true).unwrap();
+        capture
+            .push_native_interleaved(0, &[0.25; 8], false)
+            .unwrap();
+        capture
+            .push_native_interleaved(9_000_000, &[0.75; 8], true)
+            .unwrap();
         let snapshot = capture.capture().snapshot();
         assert_eq!(snapshot.frame_range(), 0..17);
         assert_eq!(&snapshot.samples[..7], &[0.25; 7]);
@@ -830,14 +1130,20 @@ mod tests {
     fn retain_silence_switch_preserves_an_explicit_pause_and_existing_audio() {
         let mut capture =
             SynchronizedCapture::new(1000, 1, None, DurationChoice::Seconds10).unwrap();
-        capture.push_native_interleaved(0, &[0.25; 4], false).unwrap();
+        capture
+            .push_native_interleaved(0, &[0.25; 4], false)
+            .unwrap();
         let before = capture.capture().snapshot();
         capture.capture_mut().pause();
         capture.set_retain_silence(true);
         assert_eq!(capture.capture().state(), crate::CaptureState::Paused);
         assert_eq!(capture.capture().snapshot(), before);
-        capture.push_native_interleaved(10_000_000_000, &[0.; 4], false).unwrap();
-        capture.push_native_interleaved(12_000_000_000, &[0.; 4], false).unwrap();
+        capture
+            .push_native_interleaved(10_000_000_000, &[0.; 4], false)
+            .unwrap();
+        capture
+            .push_native_interleaved(12_000_000_000, &[0.; 4], false)
+            .unwrap();
         capture.set_retain_silence(false);
         assert_eq!(capture.capture().state(), crate::CaptureState::Paused);
         assert_eq!(capture.capture().snapshot(), before);
@@ -866,7 +1172,12 @@ mod tests {
         assert_eq!(markers.len(), 5);
         assert_eq!(
             &markers[1..],
-            &[markers[0] + 2, markers[0] + 4, markers[0] + 14, markers[0] + 24]
+            &[
+                markers[0] + 2,
+                markers[0] + 4,
+                markers[0] + 14,
+                markers[0] + 24
+            ]
         );
     }
 

@@ -15,7 +15,9 @@ const CLOSE_LEVEL: f32 = 0.000_5;
 const PRE_ROLL_MS: u32 = 40;
 const TAIL_MS: u32 = 150;
 const JOIN_FADE_MS: u32 = 2;
-const MAX_BUFFER_SAMPLES: usize = 64 * 1024 * 1024;
+/// Default limit on retained interleaved audio samples (256 MiB of float samples).
+/// Page rounding, peak caches, pre-roll and pages held by frozen views are additional.
+pub const DEFAULT_MAX_BUFFER_SAMPLES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurationChoice {
@@ -85,7 +87,9 @@ impl fmt::Display for CaptureError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InvalidSampleRate => "sample rate must be greater than zero",
-            Self::InvalidChannelCount => "channel count must be greater than zero",
+            Self::InvalidChannelCount => {
+                "each lane must have 1 to 64 channels, at most 64 in total"
+            }
             Self::IncompleteFrame => "interleaved samples do not contain complete frames",
             Self::BufferTooLarge => "capture buffer exceeds the maximum supported size",
             Self::AllocationFailed => "could not allocate the capture buffer",
@@ -128,6 +132,7 @@ pub struct Capture {
     channels: usize,
     a_channels: usize,
     retention_frames: usize,
+    max_buffer_samples: usize,
     history: History,
     pre_roll: FrameRing,
     bar_markers: VecDeque<u64>,
@@ -205,42 +210,70 @@ impl Capture {
         channels: usize,
         retention: DurationChoice,
     ) -> Result<Self, CaptureError> {
-        Self::build(sample_rate, channels, None, retention)
+        Self::new_with_budget(sample_rate, channels, retention, DEFAULT_MAX_BUFFER_SAMPLES)
     }
 
-    /// Creates a shared history for one or two independently metered mono/stereo lanes.
+    /// Creates one lane with a limit on retained interleaved samples. The effective
+    /// retention is shortened when the requested duration would exceed this limit.
+    ///
+    /// History reserves up to 60 seconds initially and grows as audio arrives. The
+    /// limit excludes up to two pages of rounding/reuse space (each at most one
+    /// second), peak caches, 40 ms pre-roll, meters and pages held by frozen views.
+    /// The budget must hold at least one whole frame.
+    pub fn new_with_budget(
+        sample_rate: u32,
+        channels: usize,
+        retention: DurationChoice,
+        max_buffer_samples: usize,
+    ) -> Result<Self, CaptureError> {
+        Self::new_tracks_with_budget(sample_rate, channels, None, retention, max_buffer_samples)
+    }
+
+    /// Creates a shared history for one or two independently metered lanes,
+    /// each with 1 to 64 channels and at most 64 channels together.
     pub fn new_tracks(
         sample_rate: u32,
         a_channels: usize,
         b_channels: Option<usize>,
         retention: DurationChoice,
     ) -> Result<Self, CaptureError> {
-        if !(1..=2).contains(&a_channels)
-            || b_channels.is_some_and(|channels| !(1..=2).contains(&channels))
-        {
-            return Err(CaptureError::InvalidChannelCount);
-        }
-        Self::build(sample_rate, a_channels, b_channels, retention)
+        Self::new_tracks_with_budget(
+            sample_rate,
+            a_channels,
+            b_channels,
+            retention,
+            DEFAULT_MAX_BUFFER_SAMPLES,
+        )
     }
 
-    fn build(
+    /// Creates one or two lanes sharing a retained-sample budget. See
+    /// [`Self::new_with_budget`] for the memory excluded from that budget.
+    pub fn new_tracks_with_budget(
         sample_rate: u32,
         a_channels: usize,
         b_channels: Option<usize>,
         retention: DurationChoice,
+        max_buffer_samples: usize,
     ) -> Result<Self, CaptureError> {
         if sample_rate == 0 {
             return Err(CaptureError::InvalidSampleRate);
         }
-        if a_channels == 0 {
+        if !(1..=64).contains(&a_channels)
+            || b_channels.is_some_and(|channels| !(1..=64).contains(&channels))
+        {
             return Err(CaptureError::InvalidChannelCount);
         }
         let channels = a_channels
             .checked_add(b_channels.unwrap_or(0))
-            .ok_or(CaptureError::BufferTooLarge)?;
+            .filter(|&channels| channels <= 64)
+            .ok_or(CaptureError::InvalidChannelCount)?;
+        let budget_frames = max_buffer_samples / channels;
+        if budget_frames == 0 {
+            return Err(CaptureError::BufferTooLarge);
+        }
         let retention_frames = (sample_rate as usize)
-            .checked_mul(retention.seconds() as usize)
-            .ok_or(CaptureError::BufferTooLarge)?;
+            .saturating_mul(retention.seconds() as usize)
+            .min(budget_frames);
         let frames_for_ms = |ms| (u64::from(sample_rate) * u64::from(ms)).div_ceil(1_000) as usize;
 
         Ok(Self {
@@ -248,7 +281,8 @@ impl Capture {
             channels,
             a_channels,
             retention_frames,
-            history: History::new(sample_rate as usize, channels, a_channels)?,
+            max_buffer_samples,
+            history: History::new(sample_rate as usize, channels, a_channels, budget_frames)?,
             pre_roll: FrameRing::new(frames_for_ms(PRE_ROLL_MS), channels)?,
             bar_markers: VecDeque::new(),
             pending_bars: VecDeque::new(),
@@ -299,17 +333,32 @@ impl Capture {
             return Ok(());
         }
         let previous_end = self.history.total_frames();
-        previous_end.checked_add(frames).ok_or(CaptureError::BufferTooLarge)?;
+        previous_end
+            .checked_add(frames)
+            .ok_or(CaptureError::BufferTooLarge)?;
         let mut zero = Vec::new();
-        zero.try_reserve_exact(self.channels).map_err(|_| CaptureError::AllocationFailed)?;
+        zero.try_reserve_exact(self.channels)
+            .map_err(|_| CaptureError::AllocationFailed)?;
         zero.resize(self.channels, 0.0);
         let now = Instant::now();
         self.meter.begin_block(now);
-        if let Some(meter) = &mut self.meter_b { meter.begin_block(now); }
-        let prefix = if matches!(self.join_fade, JoinFade::None) { 0 }
-            else { frames.min(self.join_fade_frames as u64) };
-        let result = self.retain_frames(std::iter::repeat(zero.as_slice()).take(prefix as usize), &[])
-            .and_then(|()| self.history.append_silence(frames - prefix, self.retention_frames));
+        if let Some(meter) = &mut self.meter_b {
+            meter.begin_block(now);
+        }
+        let prefix = if matches!(self.join_fade, JoinFade::None) {
+            0
+        } else {
+            frames.min(self.join_fade_frames as u64)
+        };
+        let result = self
+            .retain_frames(
+                std::iter::repeat(zero.as_slice()).take(prefix as usize),
+                &[],
+            )
+            .and_then(|()| {
+                self.history
+                    .append_silence(frames - prefix, self.retention_frames)
+            });
         let retained = self.history.total_frames() - previous_end;
         let bulk = retained.saturating_sub(prefix);
         if bulk != 0 {
@@ -319,18 +368,24 @@ impl Capture {
             // still replay every frame, preserving their release/window behavior.
             if bulk >= u64::from(self.sample_rate) {
                 self.meter.reset();
-                if let Some(meter) = &mut self.meter_b { meter.reset(); }
+                if let Some(meter) = &mut self.meter_b {
+                    meter.reset();
+                }
             } else {
                 let (a, b) = zero.split_at(self.a_channels);
                 for _ in 0..bulk {
                     self.meter.push_frame(a);
-                    if let Some(meter) = &mut self.meter_b { meter.push_frame(b); }
+                    if let Some(meter) = &mut self.meter_b {
+                        meter.push_frame(b);
+                    }
                 }
             }
         }
         let now = Instant::now();
         self.meter.end_block(now);
-        if let Some(meter) = &mut self.meter_b { meter.end_block(now); }
+        if let Some(meter) = &mut self.meter_b {
+            meter.end_block(now);
+        }
         if retained != 0 {
             self.revision = self.revision.wrapping_add(1);
             self.prune_bars();
@@ -402,15 +457,21 @@ impl Capture {
 
             if self.retain_silence {
                 let retained_frame = self.history.total_frames();
-                self.join_fade.push(&mut self.history, frame, self.join_fade_frames)?;
-                if bar_here { self.bar_markers.push_back(retained_frame); }
+                self.join_fade
+                    .push(&mut self.history, frame, self.join_fade_frames)?;
+                if bar_here {
+                    self.bar_markers.push_back(retained_frame);
+                }
                 self.history.truncate_to(self.retention_frames);
                 if !self.gate_recording && peak >= OPEN_LEVEL {
                     self.gate_recording = true;
                     self.quiet_frames = 0;
                 }
-                if peak < CLOSE_LEVEL { self.advance_quiet_gate(1); }
-                else { self.quiet_frames = 0; }
+                if peak < CLOSE_LEVEL {
+                    self.advance_quiet_gate(1);
+                } else {
+                    self.quiet_frames = 0;
+                }
                 self.state = CaptureState::Recording;
                 continue;
             }
@@ -421,7 +482,8 @@ impl Capture {
                         self.pending_bars.push_back(self.pre_roll.total_frames);
                     }
                     self.pre_roll.push(frame);
-                    let pre_roll_start = self.pre_roll.total_frames - self.pre_roll.len_frames as u64;
+                    let pre_roll_start =
+                        self.pre_roll.total_frames - self.pre_roll.len_frames as u64;
                     while self
                         .pending_bars
                         .front()
@@ -442,14 +504,17 @@ impl Capture {
                     .chain(second.chunks_exact(self.channels))
                     .enumerate()
                 {
-                    if let Err(error) = self.join_fade
-                        .push(&mut self.history, pending_frame, self.join_fade_frames)
+                    if let Err(error) =
+                        self.join_fade
+                            .push(&mut self.history, pending_frame, self.join_fade_frames)
                     {
                         self.commit_pre_roll_bars(pre_roll_start, retained_start, offset);
                         self.pre_roll.clear();
                         self.history.truncate_to(self.retention_frames);
                         return Err(error);
                     }
+                    // A small budget may hold less than the pre-roll itself.
+                    self.history.truncate_to(self.retention_frames);
                 }
                 self.commit_pre_roll_bars(pre_roll_start, retained_start, pre_roll_frames);
                 self.pre_roll.clear();
@@ -479,10 +544,11 @@ impl Capture {
     }
 
     fn commit_pre_roll_bars(&mut self, source_start: u64, retained_start: u64, frames: usize) {
-        self.bar_markers.extend(self.pending_bars.drain(..).filter_map(|bar| {
-            let offset = bar - source_start;
-            (offset < frames as u64).then_some(retained_start + offset)
-        }));
+        self.bar_markers
+            .extend(self.pending_bars.drain(..).filter_map(|bar| {
+                let offset = bar - source_start;
+                (offset < frames as u64).then_some(retained_start + offset)
+            }));
     }
 
     fn prune_bars(&mut self) {
@@ -494,7 +560,9 @@ impl Capture {
 
     /// Locates bar starts on the retained-audio timeline, using a half-open range.
     pub fn bar_markers(&self, range: Range<u64>) -> Vec<u64> {
-        let first = self.bar_markers.partition_point(|&frame| frame < range.start);
+        let first = self
+            .bar_markers
+            .partition_point(|&frame| frame < range.start);
         let end = self.bar_markers.partition_point(|&frame| frame < range.end);
         self.bar_markers
             .range(first..end.max(first))
@@ -696,6 +764,29 @@ impl Capture {
         self.waveform_for(Layout::trace(lane, view), range, minimum, maximum)
     }
 
+    /// Writes the finite min/max samples of one zero-based channel within a lane.
+    /// Reads interleaved pages directly without copying a lane. The range uses the
+    /// retained-audio timeline; invalid lanes or channels produce zeros and return 0.
+    pub fn track_channel_waveform_range(
+        &self,
+        lane: usize,
+        channel: usize,
+        range: Range<u64>,
+        minimum: &mut [f32],
+        maximum: &mut [f32],
+    ) -> usize {
+        let Some(track) = self.track_range(lane).filter(|track| channel < track.len()) else {
+            minimum.fill(0.0);
+            maximum.fill(0.0);
+            return 0;
+        };
+        let retained = self.frame_range();
+        let range = range.start.max(retained.start)..range.end.min(retained.end);
+        waveform_bins(range, minimum, maximum, |frames| {
+            self.history.channel_extrema(track.start + channel, frames)
+        })
+    }
+
     fn waveform_for(
         &self,
         trace: usize,
@@ -709,8 +800,9 @@ impl Capture {
     }
 
     pub fn set_retention(&mut self, retention: DurationChoice) {
-        self.retention_frames =
-            (self.sample_rate as usize).saturating_mul(retention.seconds() as usize);
+        self.retention_frames = (self.sample_rate as usize)
+            .saturating_mul(retention.seconds() as usize)
+            .min(self.max_buffer_samples / self.channels);
         let retained = self.frame_range();
         if retained.end - retained.start > self.retention_frames as u64 {
             self.revision = self.revision.wrapping_add(1);
@@ -718,6 +810,21 @@ impl Capture {
         self.history.truncate_to(self.retention_frames);
         self.history.release_unused_capacity(self.retention_frames);
         self.prune_bars();
+    }
+
+    /// The maximum retained frame count after applying the requested duration and budget.
+    pub fn effective_retention_frames(&self) -> usize {
+        self.retention_frames
+    }
+
+    /// The maximum retained duration after applying the sample budget, in seconds.
+    pub fn effective_retention_seconds(&self) -> f64 {
+        self.retention_frames as f64 / f64::from(self.sample_rate)
+    }
+
+    /// The configured limit on retained interleaved audio samples.
+    pub fn max_buffer_samples(&self) -> usize {
+        self.max_buffer_samples
     }
 
     /// Drops retained audio and pre-roll. An armed capture waits for fresh signal.
@@ -784,7 +891,7 @@ impl FrameRing {
     fn new(capacity_frames: usize, channels: usize) -> Result<Self, CaptureError> {
         let sample_capacity = capacity_frames
             .checked_mul(channels)
-            .filter(|&samples| samples <= MAX_BUFFER_SAMPLES)
+            .filter(|&samples| samples <= DEFAULT_MAX_BUFFER_SAMPLES)
             .ok_or(CaptureError::BufferTooLarge)?;
         let mut samples = Vec::new();
         samples
@@ -847,16 +954,133 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sample_budget_shortens_retention_and_initial_reserve() {
+        let channels = 14;
+        let mut capture = Capture::new_tracks_with_budget(
+            100,
+            12,
+            Some(2),
+            DurationChoice::Minutes10,
+            channels * 15 + 5,
+        )
+        .unwrap();
+        assert_eq!(capture.max_buffer_samples(), 215);
+        assert_eq!(capture.effective_retention_frames(), 15);
+        assert_eq!(capture.effective_retention_seconds(), 0.15);
+        assert_eq!(capture.history.allocated_frames(), 15);
+        capture.set_retain_silence(true);
+        let samples: Vec<_> = (0..98 * channels)
+            .map(|sample| sample as f32 / 4096.0)
+            .collect();
+        capture.push_interleaved(&samples).unwrap();
+        assert_eq!(capture.frame_range(), 83..98);
+        assert_eq!(capture.snapshot().samples, samples[83 * channels..]);
+        assert!(capture.history.allocated_frames() <= 15 + 2 * 15);
+        capture.set_retention(DurationChoice::Seconds10);
+        assert_eq!(capture.effective_retention_frames(), 15);
+        assert_eq!(capture.freeze().snapshot(), capture.snapshot());
+        capture.clear();
+        assert_eq!(capture.history.allocated_frames(), 15);
+    }
+
+    #[test]
+    fn retention_changes_stay_inside_the_configured_budget() {
+        let mut capture =
+            Capture::new_with_budget(100, 12, DurationChoice::Seconds10, 1_500 * 12).unwrap();
+        assert_eq!(capture.effective_retention_frames(), 1_000);
+        capture.set_retention(DurationChoice::Minutes10);
+        assert_eq!(capture.effective_retention_frames(), 1_500);
+        assert_eq!(capture.effective_retention_seconds(), 15.0);
+        capture.set_retain_silence(true);
+        capture.push_interleaved(&vec![0.5; 1_600 * 12]).unwrap();
+        let frozen = capture.freeze();
+        assert_eq!(capture.frame_range(), 100..1_600);
+        capture.set_retention(DurationChoice::Seconds10);
+        assert_eq!(capture.frame_range(), 600..1_600);
+        assert_eq!(frozen.frame_range(), 100..1_600);
+        assert_eq!(frozen.snapshot().samples.len(), 1_500 * 12);
+    }
+
+    #[test]
+    fn channel_limits_and_a_budget_smaller_than_one_frame_are_rejected() {
+        for (a, b) in [
+            (0, None),
+            (65, None),
+            (1, Some(0)),
+            (63, Some(2)),
+            (1, Some(64)),
+        ] {
+            assert!(matches!(
+                Capture::new_tracks(100, a, b, DurationChoice::Seconds10),
+                Err(CaptureError::InvalidChannelCount),
+            ));
+        }
+        assert!(Capture::new_tracks(100, 62, Some(2), DurationChoice::Seconds10).is_ok());
+        assert!(matches!(
+            Capture::new_with_budget(100, 12, DurationChoice::Seconds10, 11),
+            Err(CaptureError::BufferTooLarge),
+        ));
+        assert!(matches!(
+            Capture::new_with_budget(100, 1, DurationChoice::Seconds10, 0),
+            Err(CaptureError::BufferTooLarge),
+        ));
+    }
+
+    #[test]
+    fn last_channel_opens_the_gate_and_all_channels_receive_join_fades() {
+        let mut capture = Capture::new(1_000, 12, DurationChoice::Seconds10).unwrap();
+        capture.push_interleaved(&vec![0.0; 60 * 12]).unwrap();
+        assert_eq!(capture.state(), CaptureState::Waiting);
+        let mut last_channel = [0.0; 12];
+        last_channel[11] = 0.75;
+        capture.push_interleaved(&last_channel).unwrap();
+        assert_eq!(capture.state(), CaptureState::Recording);
+        assert_eq!(capture.frame_range(), 0..41);
+        assert_eq!(&capture.snapshot().samples[40 * 12..], &last_channel);
+        capture.push_interleaved(&[0.5; 36]).unwrap();
+        let frozen = capture.freeze();
+        capture.smooth_next_join();
+        capture.push_interleaved(&[0.75; 36]).unwrap();
+        let snapshot = capture.snapshot();
+        assert_eq!(snapshot.frames(42..43).unwrap(), &[0.5; 12]);
+        assert_eq!(snapshot.frames(43..45).unwrap(), &[0.0; 24]);
+        assert_eq!(snapshot.frames(45..47).unwrap(), &[0.75; 24]);
+        assert_eq!(frozen.snapshot().frames(43..44).unwrap(), &[0.5; 12]);
+    }
+
+    #[test]
+    fn a_one_frame_budget_survives_pre_roll_and_gate_reopening() {
+        let mut capture =
+            Capture::new_with_budget(1_000, 64, DurationChoice::Minutes10, 64).unwrap();
+        capture.push_interleaved(&[0.0; 64 * 50]).unwrap();
+        let mut frame = [0.0; 64];
+        frame[63] = 0.5;
+        capture.push_interleaved(&frame).unwrap();
+        assert_eq!(capture.frame_range(), 40..41);
+        assert_eq!(capture.snapshot().samples, frame);
+        capture.push_interleaved(&[0.0; 64 * 200]).unwrap();
+        assert_eq!(capture.state(), CaptureState::Waiting);
+        capture.push_interleaved(&frame).unwrap();
+        assert_eq!(capture.snapshot().samples, frame);
+        assert_eq!(capture.effective_retention_frames(), 1);
+        assert!(capture.history.allocated_frames() <= 3);
+    }
+
+    #[test]
     fn retained_silence_is_opt_in_and_does_not_restore_discarded_pre_roll() {
         let mut capture = Capture::new(1_000, 1, DurationChoice::Seconds10).unwrap();
         assert!(!capture.retain_silence());
-        capture.push_interleaved_with_markers(&[0.; 100], &[20]).unwrap();
+        capture
+            .push_interleaved_with_markers(&[0.; 100], &[20])
+            .unwrap();
         assert!(capture.snapshot().samples.is_empty());
 
         capture.set_retain_silence(true);
         assert_eq!(capture.state(), CaptureState::Waiting);
         let quiet: Vec<_> = [0., 0.000_01, -0.000_4, 0., 0.000_2].repeat(20);
-        capture.push_interleaved_with_markers(&quiet, &[0, 50, 99]).unwrap();
+        capture
+            .push_interleaved_with_markers(&quiet, &[0, 50, 99])
+            .unwrap();
         assert_eq!(capture.snapshot().samples, quiet);
         assert_eq!(capture.frame_range(), 0..100);
         assert_eq!(capture.bar_markers(0..100), [0, 50, 99]);
@@ -874,9 +1098,12 @@ mod tests {
 
     #[test]
     fn silence_mode_preserves_manual_pause_clear_and_existing_dual_track_samples() {
-        let mut capture = Capture::new_tracks(1_000, 1, Some(1), DurationChoice::Seconds10).unwrap();
+        let mut capture =
+            Capture::new_tracks(1_000, 1, Some(1), DurationChoice::Seconds10).unwrap();
         capture.set_retain_silence(true);
-        capture.push_interleaved(&[0.000_1, -0.000_2, 0., 0.]).unwrap();
+        capture
+            .push_interleaved(&[0.000_1, -0.000_2, 0., 0.])
+            .unwrap();
         let fixed = capture.snapshot();
         capture.pause();
         capture.set_retain_silence(false);
@@ -887,8 +1114,14 @@ mod tests {
         assert_eq!(capture.snapshot(), fixed);
         capture.resume();
         capture.push_interleaved(&[0.000_3, -0.000_4]).unwrap();
-        assert_eq!(capture.snapshot().samples, [0.000_1, -0.000_2, 0., 0., 0.000_3, -0.000_4]);
-        assert_eq!(capture.track_snapshot(0).unwrap().frame_range(), capture.track_snapshot(1).unwrap().frame_range());
+        assert_eq!(
+            capture.snapshot().samples,
+            [0.000_1, -0.000_2, 0., 0., 0.000_3, -0.000_4]
+        );
+        assert_eq!(
+            capture.track_snapshot(0).unwrap().frame_range(),
+            capture.track_snapshot(1).unwrap().frame_range()
+        );
         capture.clear();
         assert!(capture.retain_silence());
         capture.push_interleaved(&[0., 0.]).unwrap();
@@ -903,9 +1136,12 @@ mod tests {
 
     #[test]
     fn long_retained_quiet_gap_advances_the_clock_with_bounded_history() {
-        let mut capture = Capture::new_tracks(1_000, 1, Some(1), DurationChoice::Seconds10).unwrap();
+        let mut capture =
+            Capture::new_tracks(1_000, 1, Some(1), DurationChoice::Seconds10).unwrap();
         capture.set_retain_silence(true);
-        capture.push_interleaved_with_markers(&[0.2, -0.3, 0.4, -0.5], &[0]).unwrap();
+        capture
+            .push_interleaved_with_markers(&[0.2, -0.3, 0.4, -0.5], &[0])
+            .unwrap();
         let fixed = capture.snapshot();
         capture.append_known_silence(1_000_000).unwrap();
         assert_eq!(capture.frame_range(), 990_002..1_000_002);
@@ -916,10 +1152,19 @@ mod tests {
         assert_eq!(fixed.samples, [0.2, -0.3, 0.4, -0.5]);
         capture.push_interleaved(&[0.000_1, -0.000_2]).unwrap();
         assert_eq!(capture.frame_range(), 990_003..1_000_003);
-        assert_eq!(capture.track_snapshot(0).unwrap().samples.last(), Some(&0.000_1));
-        assert_eq!(capture.track_snapshot(1).unwrap().samples.last(), Some(&-0.000_2));
+        assert_eq!(
+            capture.track_snapshot(0).unwrap().samples.last(),
+            Some(&0.000_1)
+        );
+        assert_eq!(
+            capture.track_snapshot(1).unwrap().samples.last(),
+            Some(&-0.000_2)
+        );
         let previous = capture.snapshot();
-        assert_eq!(capture.append_known_silence(u64::MAX), Err(CaptureError::BufferTooLarge));
+        assert_eq!(
+            capture.append_known_silence(u64::MAX),
+            Err(CaptureError::BufferTooLarge)
+        );
         assert_eq!(capture.snapshot(), previous);
     }
 

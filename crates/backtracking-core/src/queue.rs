@@ -13,7 +13,7 @@ pub struct AudioQueue {
 
 impl AudioQueue {
     pub fn new(capacity_frames: usize, channels: usize) -> Arc<Self> {
-        assert!(capacity_frames > 0 && (1..=2).contains(&channels));
+        assert!(capacity_frames > 0 && (1..=64).contains(&channels));
         Self::allocate(capacity_frames, channels)
     }
 
@@ -137,7 +137,7 @@ pub struct TimedAudioQueue {
 
 impl TimedAudioQueue {
     pub fn new(capacity_frames: usize, capacity_packets: usize, channels: usize) -> Arc<Self> {
-        assert!(capacity_frames > 0 && capacity_packets > 0 && (1..=32).contains(&channels));
+        assert!(capacity_frames > 0 && capacity_packets > 0 && (1..=64).contains(&channels));
         Arc::new(Self {
             audio: AudioQueue::allocate(capacity_frames, channels),
             packets: (0..capacity_packets.next_power_of_two())
@@ -251,7 +251,12 @@ impl TimedAudioQueue {
         debug_assert_eq!(copied, frames);
         self.read.store(read.wrapping_add(1), Ordering::Release);
         Some((
-            TimedPacket { timestamp_ns, sample_rate, frames, discontinuity },
+            TimedPacket {
+                timestamp_ns,
+                sample_rate,
+                frames,
+                discontinuity,
+            },
             tags,
         ))
     }
@@ -273,6 +278,37 @@ impl TimedAudioQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multichannel_queues_preserve_every_sample_across_wrap() {
+        for channels in [12, 64] {
+            let audio: Vec<f32> = (0..6 * channels).map(|sample| sample as f32).collect();
+            let queue = AudioQueue::new(4, channels);
+            assert_eq!(queue.push_interleaved(&audio[..3 * channels]), 3);
+            let mut first = vec![0.0; 2 * channels];
+            assert_eq!(queue.pop_interleaved(&mut first), 2);
+            assert_eq!(first, audio[..2 * channels]);
+            assert_eq!(queue.push_interleaved(&audio[3 * channels..]), 3);
+            let mut rest = vec![0.0; 4 * channels];
+            assert_eq!(queue.pop_interleaved(&mut rest), 4);
+            assert_eq!(rest, audio[2 * channels..]);
+            assert_eq!(queue.push_planar(&[1.0], None), 0);
+
+            let timed = TimedAudioQueue::new(4, 2, channels);
+            let mut received = Vec::new();
+            for frame in 0..6 {
+                let timestamp = frame as u64 * 1_000;
+                let samples = &audio[frame * channels..(frame + 1) * channels];
+                assert_eq!(timed.push_interleaved(timestamp, 48_000, samples), 1);
+                let packet = timed.pop(&mut received).unwrap();
+                assert_eq!(
+                    (packet.timestamp_ns, packet.sample_rate, packet.frames),
+                    (timestamp, 48_000, 1)
+                );
+                assert_eq!(received, samples);
+            }
+        }
+    }
 
     #[test]
     fn timed_queue_keeps_packet_metadata_and_native_layout_through_overflow() {

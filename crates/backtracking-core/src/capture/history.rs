@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
-use super::{CaptureError, MAX_BUFFER_SAMPLES};
+use super::CaptureError;
 use crate::waveform::WaveformView;
 
 const BASE_SECONDS: usize = 60;
@@ -89,7 +89,11 @@ impl Page {
     }
 
     /// A page sized for exactly `samples`, with its peak cache filled in.
-    fn from_samples(first_frame: u64, samples: &[f32], layout: Layout) -> Result<Self, CaptureError> {
+    fn from_samples(
+        first_frame: u64,
+        samples: &[f32],
+        layout: Layout,
+    ) -> Result<Self, CaptureError> {
         let mut page = Self::new(samples.len() / layout.channels, layout.channels)?;
         page.first_frame = first_frame;
         page.samples.extend_from_slice(samples);
@@ -219,6 +223,24 @@ pub(super) fn extrema<'a>(
     bounds.result()
 }
 
+/// Reads one interleaved channel in place. No lane or frame buffers are allocated.
+pub(super) fn channel_extrema<'a>(
+    pages: impl Iterator<Item = (&'a Page, Range<usize>)>,
+    layout: Layout,
+    channel: usize,
+) -> (f32, f32) {
+    let mut bounds = Bounds::EMPTY;
+    for (page, frames) in pages {
+        for frame in page
+            .samples(frames, layout.channels)
+            .chunks_exact(layout.channels)
+        {
+            bounds.add(frame[channel]);
+        }
+    }
+    bounds.result()
+}
+
 /// Splits `interleaved` into pages of their own, for audio that never was in a history.
 pub(super) fn pages_from_interleaved(
     first_frame: u64,
@@ -227,7 +249,11 @@ pub(super) fn pages_from_interleaved(
 ) -> Result<Arc<[Arc<Page>]>, CaptureError> {
     let mut pages = Vec::new();
     pages
-        .try_reserve_exact(interleaved.len().div_ceil(layout.page_frames * layout.channels))
+        .try_reserve_exact(
+            interleaved
+                .len()
+                .div_ceil(layout.page_frames * layout.channels),
+        )
         .map_err(|_| CaptureError::AllocationFailed)?;
     for (index, samples) in interleaved
         .chunks(layout.page_frames * layout.channels)
@@ -267,6 +293,7 @@ pub(super) struct History {
     /// The page being written. It follows the sealed pages and is never shared.
     open: Option<Page>,
     free: Vec<Page>,
+    base_pages: usize,
     layout: Layout,
     start: u64,
     end: u64,
@@ -277,19 +304,21 @@ impl History {
         page_frames: usize,
         channels: usize,
         a_channels: usize,
+        budget_frames: usize,
     ) -> Result<Self, CaptureError> {
+        let page_frames = page_frames.min(budget_frames);
         page_frames
             .checked_mul(channels)
-            .and_then(|samples| samples.checked_mul(BASE_SECONDS))
-            .filter(|&samples| samples <= MAX_BUFFER_SAMPLES)
             .ok_or(CaptureError::BufferTooLarge)?;
-        let free = (0..BASE_SECONDS)
+        let base_pages = BASE_SECONDS.min(budget_frames / page_frames);
+        let free = (0..base_pages)
             .map(|_| Page::new(page_frames, channels))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             sealed: VecDeque::new(),
             open: None,
             free,
+            base_pages,
             layout: Layout {
                 page_frames,
                 channels,
@@ -383,7 +412,8 @@ impl History {
         if gain == 1.0 {
             page.samples.extend_from_slice(frame);
         } else {
-            page.samples.extend(frame.iter().map(|&sample| sample * gain));
+            page.samples
+                .extend(frame.iter().map(|&sample| sample * gain));
         }
         self.end += 1;
         let frames = page.samples.len() / channels;
@@ -406,7 +436,9 @@ impl History {
         frames: u64,
         retained_frames: usize,
     ) -> Result<(), CaptureError> {
-        self.end.checked_add(frames).ok_or(CaptureError::BufferTooLarge)?;
+        self.end
+            .checked_add(frames)
+            .ok_or(CaptureError::BufferTooLarge)?;
         let skipped = frames.saturating_sub(retained_frames as u64);
         if skipped != 0 {
             // The retained zero suffix will immediately reuse these pages;
@@ -430,7 +462,8 @@ impl History {
             let page = self.open.as_mut().expect("capacity was reserved");
             let previous_frames = page.samples.len() / channels;
             let count = remaining.min((page_frames - previous_frames) as u64) as usize;
-            page.samples.resize((previous_frames + count) * channels, 0.0);
+            page.samples
+                .resize((previous_frames + count) * channels, 0.0);
             let completed_blocks = (previous_frames + count) / PEAK_FRAMES;
             while page.peaks.len() < completed_blocks {
                 let block = page.peaks.len();
@@ -473,7 +506,7 @@ impl History {
         // The oldest active page can be partly retained. Only free whole unused pages.
         let target = retained_frames
             .div_ceil(self.layout.page_frames)
-            .max(BASE_SECONDS);
+            .max(self.base_pages);
         self.free
             .truncate(target.saturating_sub(self.active_pages()));
     }
@@ -486,7 +519,11 @@ impl History {
 
     /// The sealed pages holding part of `range`, and whether the open page holds the rest.
     fn page_indices(&self, range: &Range<u64>) -> (Range<usize>, bool) {
-        let first = self.sealed.front().map(|page| &**page).or(self.open.as_ref());
+        let first = self
+            .sealed
+            .front()
+            .map(|page| &**page)
+            .or(self.open.as_ref());
         let Some(first) = first else {
             return (0..0, false);
         };
@@ -572,5 +609,9 @@ impl History {
 
     pub(super) fn extrema(&self, trace: usize, range: Range<u64>) -> (f32, f32) {
         extrema(self.pages(range), self.layout, trace)
+    }
+
+    pub(super) fn channel_extrema(&self, channel: usize, range: Range<u64>) -> (f32, f32) {
+        channel_extrema(self.pages(range), self.layout, channel)
     }
 }

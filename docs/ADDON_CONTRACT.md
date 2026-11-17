@@ -1,0 +1,269 @@
+# Backtracking add-on contract, version 1
+
+An add-on is a separate program that Backtracking starts and talks to. Backtracking never loads
+add-on code into its own process. This page is everything an add-on author needs: the package, how
+the program is started and stopped, the messages, and how audio reaches Backtracking.
+
+An add-on can be written in any language. Rust authors can use the `backtracking-addon` crate
+(`crates/backtracking-addon`), which implements the manifest and the messages below, and
+`backtracking-core` for the audio stream. `crates/backtracking-addon/examples/test_tone.rs` is a
+complete add-on in one file.
+
+Status: contract 1 is implemented by the Windows desktop app. The macOS app does not host add-ons
+yet.
+
+## 1. What an add-on can do
+
+An add-on declares **capabilities** in its manifest. Backtracking shows them to the user before
+installing and offers nothing else to the add-on.
+
+| Capability | What it allows |
+| --- | --- |
+| `source` | Provide audio sources that appear in Backtracking's source list, each with a list of formats and one or more groups of labelled channels. |
+| `open-files` | Register file types. Backtracking shows an "Open file" button and passes the chosen path to the add-on. |
+| `settings` | Declare settings. Backtracking draws them, stores the values and sends changes. |
+| `actions` | Declare named buttons. Backtracking shows them and tells the add-on when one is pressed. |
+| `clips` | Be told the paths of every clip Backtracking exports. |
+
+An add-on runs with the user's own permissions and is not sandboxed. The capabilities describe
+what Backtracking does for the add-on, not what the program is able to do on the computer. The
+install screen says so.
+
+## 2. Package
+
+A package is a ZIP file with the extension `.btaddon`. `addon.json` is at its root.
+
+```json
+{
+  "contract": 1,
+  "id": "com.example.test-tone",
+  "name": "Test tone",
+  "version": "0.1.0",
+  "author": "Example",
+  "description": "Plays a sine wave as a Backtracking source.",
+  "homepage": "https://example.com/test-tone",
+  "license": "MIT",
+  "capabilities": ["source", "settings", "actions"],
+  "run": {
+    "windows-x86_64": { "program": "bin/test-tone.exe", "args": [] }
+  }
+}
+```
+
+| Field | Rule |
+| --- | --- |
+| `contract` | Required. `1`. A package with a higher number than the app supports is refused. |
+| `id` | Required. Lower-case letters, digits, `.` and `-`; starts and ends with a letter or digit; at most 64 characters. Reverse-domain form is recommended. It names the install folder and must stay the same across versions. |
+| `name`, `version`, `author`, `description` | Required. Plain text without control characters. `name` and `author` at most 80 characters, `version` at most 32, `description` at most 400. `name` and `version` must not be empty. |
+| `homepage`, `license` | Optional. `homepage` must start with `https://`. |
+| `capabilities` | Required. A list of the names in section 1. A name this version of Backtracking does not know makes the package invalid, with a message that a newer Backtracking is needed. |
+| `open_files` | Required when `open-files` is declared, otherwise absent: `{ "description": "Audio files", "extensions": ["wav"] }`. `extensions` has 1 to 32 entries of 1 to 12 lower-case letters or digits, without the dot. |
+| `run` | Required. Keys are `windows-x86_64`, `windows-aarch64`, `macos-aarch64`, `macos-x86_64`, `linux-x86_64`. A package without an entry for the running platform is refused with a message that says so. |
+| `run.*.program` | A relative path inside the package (see the path rules below). The file must exist in the package. |
+| `run.*.args` | Optional list of strings passed to the program. |
+
+Every length in this document counts Unicode characters (scalar values), not bytes.
+
+Paths, for `program` and for every entry in the package: `/` separators; no `..`, `.` or empty
+component; no drive, root, backslash or colon; no name Windows cannot hold (control characters,
+`< > " | ? *`, a trailing dot or space, device names such as `CON` or `COM1`); no two entries
+that differ only by letter case. An `id` that is a Windows device name is refused for the same
+reason.
+
+The ZIP uses UTF-8 entry names, stored or deflate compression, and no encryption. Limits: at most
+4096 entries (folders count), at most 512 MiB unpacked, no symbolic links or other special
+entries. A package that breaks a rule is refused and nothing is written.
+
+Installing unpacks the package to `<data>/addons/<id>/`, replacing an earlier version of the same
+`id`; if installing fails, the earlier version stays. `<data>` is `%LOCALAPPDATA%\Backtracking` on
+Windows. Removing an add-on deletes that folder.
+The add-on's own files go in `<data>/addon-data/<id>/`, which survives updates and is deleted only
+when the user removes the add-on and chooses to delete its data.
+
+## 3. Starting and stopping
+
+Backtracking starts an enabled add-on's program when the app starts, and when the user enables it.
+The working directory is the install folder. Three environment variables are set:
+
+| Variable | Value |
+| --- | --- |
+| `BACKTRACKING_ADDON_PORT` | The TCP port on `127.0.0.1` to connect to. |
+| `BACKTRACKING_ADDON_TOKEN` | A random token for this run. Send it in `hello`. It is accepted once. |
+| `BACKTRACKING_ADDON_DATA` | The add-on's writable data folder. It exists. |
+
+The program has no console window and its standard streams are not read. It must connect and send
+`hello` within 10 seconds, or it is stopped and shown as "Not responding".
+
+To stop an add-on, Backtracking sends `quit`, waits up to 2 seconds for the process to exit, then
+ends it. All add-on processes are ended when Backtracking exits, also if Backtracking crashes. An
+add-on that loses its connection must exit.
+
+If the program exits by itself, Backtracking restarts it. After 3 exits within 60 seconds it stays
+stopped and the Add-ons page shows the reason.
+
+## 4. Messages
+
+The add-on opens one TCP connection to `127.0.0.1:<BACKTRACKING_ADDON_PORT>`. Each message is one
+JSON object on one line, UTF-8, ended by `\n`, at most 65 536 bytes including the `\n`. Every
+message has a `type`.
+Both sides ignore message types and fields they do not know, so later contract versions can add
+them.
+
+There are no request numbers. The add-on reports its state with `describe`; when something the host
+asked for changes that state, the add-on sends `describe` again. When it cannot do what was asked,
+it sends `message` with level `error`.
+
+### 4.1 Handshake
+
+Add-on to host, first line:
+
+```json
+{"type":"hello","contract":1,"token":"3f9c…","id":"com.example.test-tone","version":"0.1.0"}
+```
+
+Host to add-on:
+
+```json
+{"type":"welcome","contract":1,"app":"Backtracking","app_version":"0.3.0","settings":{"level":"-12"}}
+```
+
+`settings` holds the stored value of every setting the user has changed; a missing key means the
+default. If the token, id or contract number is wrong the host answers
+`{"type":"rejected","reason":"…"}` and closes the connection.
+
+### 4.2 Add-on to host
+
+**`describe`** replaces everything the host knows about the add-on. Send it after `welcome` and
+again whenever any part changes. Omitted lists count as empty.
+
+```json
+{"type":"describe",
+ "sources":[{
+   "id":"main",
+   "name":"Test tone",
+   "sender":"1a2b-3c4d-0",
+   "formats":[{"id":"stereo","label":"Stereo"},{"id":"5.1","label":"5.1"}],
+   "format":"5.1",
+   "groups":[{"id":"channels","label":"Channels","channels":["L","R","C","LFE","Ls","Rs"]}],
+   "transport":{"state":"playing","position":12.5,"duration":60.0}
+ }],
+ "settings":[
+   {"key":"level","label":"Level","kind":"choice","default":"-12",
+    "options":[{"value":"-12","label":"-12 dB"},{"value":"-6","label":"-6 dB"}],
+    "help":"How loud the tone is."},
+   {"key":"mute","label":"Mute","kind":"toggle","default":false},
+   {"key":"frequency","label":"Frequency (Hz)","kind":"number","default":440,"min":20,"max":20000,"step":1},
+   {"key":"title","label":"Title","kind":"text","default":""}
+ ],
+ "actions":[{"id":"restart","label":"Restart"}]}
+```
+
+Sources (capability `source`):
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Stable within the add-on. Up to 64 characters of letters, digits, `.`, `-`, `_`. |
+| `name` | Shown in the source list. Up to 120 characters. |
+| `sender` | The id of the Sender endpoint that carries this source's audio (section 5). |
+| `formats` | The formats the user can choose for this source, in display order. 1 to 32 entries. `label` is what the user sees, up to 40 characters. |
+| `format` | The `id` of the format now in use. |
+| `groups` | What the audio stream contains now: one or more groups of channels, in stream order. The channel counts of all groups add up to the Sender's channel count. Backtracking stacks one waveform per channel of the group on show and lets the user switch groups. Labels are up to 24 characters. A source without `groups` is treated as one group named "Channels" with numbered channels. |
+| `transport` | Optional. Present when the source plays something with a position. `state` is `playing`, `paused` or `stopped`. `position` and `duration` are seconds; `duration` may be absent for an endless source. |
+
+Settings (capability `settings`): `kind` is `toggle` (boolean), `choice` (one of `options`, a
+string), `number` (with `min` ≤ `default` ≤ `max` and a `step` above zero, which is how far one
+click moves the value) or `text` (up to 200 characters). `key` is 1 to 40 characters of lower-case
+letters, digits and `_`. Up to 32 settings. `help` is optional, up to 200 characters.
+
+Backtracking keeps the values. `describe` carries only defaults; the add-on learns the stored
+values from `welcome` and every later change from `set_setting`, and does not report them back.
+
+Actions (capability `actions`): up to 16, `label` up to 40 characters.
+
+**`transport`** updates one source's position without resending everything. At most 4 per second.
+
+```json
+{"type":"transport","source":"main","state":"playing","position":13.0,"duration":60.0}
+```
+
+**`message`** shows one line next to the add-on on the Add-ons page, replacing the previous one.
+`level` is `info`, `warning` or `error`; `text` is up to 300 characters. An empty `text` clears it.
+
+```json
+{"type":"message","level":"error","text":"This file has no object audio."}
+```
+
+### 4.3 Host to add-on
+
+| Message | Sent when | Fields |
+| --- | --- | --- |
+| `set_setting` | The user changes a setting. | `key`, `value` |
+| `run_action` | The user presses an action button. | `id` |
+| `open_file` | The user picks a file of a registered type (`open-files`). | `path` (absolute) |
+| `select_format` | The user picks a format for a source. | `source`, `format` |
+| `transport` | The user presses play, pause or stop, or moves the position. | `source`, `command` (`play`, `pause`, `stop`, `seek`), `position` (seconds, with `seek`) |
+| `clip_exported` | Backtracking has written a clip (`clips`). | `files` (absolute paths), `sample_rate`, `frames` |
+| `quit` | The add-on should exit. | none |
+
+Backtracking remembers the format the user picked for each source. After an add-on's first
+`describe` it sends `select_format` again when the remembered format is offered and differs from
+the one in use, so an add-on does not have to store that choice itself.
+
+## 5. Audio: the Sender stream
+
+A source's audio travels on Backtracking's Sender protocol, the one the Backtracking plug-in uses.
+Rust add-ons use `backtracking_core::SenderEndpoint`. The wire format is small enough to implement
+directly:
+
+**Registration.** The Sender picks an id (up to 72 characters of hex digits and `-`), listens on a
+TCP port on `127.0.0.1`, and writes the file `<senders>/<id>.sender` containing five
+tab-separated fields: port, `1` if audio is available or `0`, sample rate, channel count, name.
+It rewrites the file at least every 2 seconds; a file older than 8 seconds is treated as gone.
+Write to a temporary name and rename. Delete the file on exit.
+
+`<senders>` is `%LOCALAPPDATA%\Backtracking\senders-v1` on Windows,
+`~/Library/Application Support/Backtracking/senders-v1` on macOS, and
+`$XDG_RUNTIME_DIR/Backtracking/senders-v1` on Linux (`~/.local/state/Backtracking/senders-v1`
+when that variable is not set).
+
+**Connection.** Backtracking connects and sends the byte `A` followed directly by the id, with
+nothing after it, to receive audio. Close a connection that sends anything else. (The byte `S`
+followed by the id is a request Backtracking makes to its own plug-in; an add-on closes it too.)
+
+**Packets.** After `A` the Sender writes packets, all little-endian:
+
+| Bytes | Field |
+| --- | --- |
+| 4 | `BTA1` |
+| 8 | Time of the packet's first frame in nanoseconds on the monotonic clock (`QueryPerformanceCounter` on Windows, `mach_absolute_time` on macOS, `CLOCK_MONOTONIC` on Linux). |
+| 4 | Sample rate. Must equal the registered rate. |
+| 4 | Frame count, 1 to 8192. |
+| 4 | Bar marker count. |
+| 4 × markers | Frame offsets of bar starts inside this packet, ascending. |
+| 4 × frames × channels | 32-bit float samples, interleaved. |
+
+**Channels.** A Sender carries 1 to 64 channels at 8 000 to 384 000 Hz. A packet holds at most
+65 536 samples, so at most `65536 / channels` frames when that is below 8192. Changing the channel
+count or sample rate re-registers the Sender; Backtracking reconnects and starts a new capture,
+which clears the audio it was holding for that source. Backtracking 0.2.0 and earlier list only
+1- and 2-channel Senders.
+
+**Timing.** Publish audio at the pace it should be heard, stamped with the time it is heard.
+Backtracking aligns sources by these timestamps.
+
+## 6. Being a good guest
+
+- Produce only what is asked for. Render the selected format, not all of them, and offer costly
+  extras (for example separate objects) as a setting that is off by default.
+- Keep `describe` truthful: the groups must match the stream at the moment it is sent. Re-register
+  the Sender first, then send `describe`.
+- Give audio threads priority over everything else you do, and back off background work under load.
+- Exit promptly on `quit` and when the connection closes.
+
+## 7. Versions
+
+`contract` is a whole number. Additions that old add-ons and old hosts can ignore (new message
+types, new optional fields) do not change it. A new capability does not change it either: an
+add-on that declares one is refused by a Backtracking that does not know it, and installs on one
+that does. A change that would break an existing add-on raises the number, and the host keeps
+accepting the previous number for at least one release.

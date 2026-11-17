@@ -11,11 +11,15 @@ const MIN_ENERGY: f64 = 1e-12;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeterReadings {
-    /// Sample peak, with instantaneous attack and a 30 dB/s release.
+    /// Largest absolute sample across all lane channels, with instantaneous
+    /// attack and a 30 dB/s release.
     pub peak_dbfs: f32,
     /// 300 ms RMS, calibrated to 0 VU for a 1 kHz sine at −18 dBFS peak.
+    /// Uses the mean squared energy across all lane channels, with equal weights.
     pub vu: f32,
-    /// Ungated 400 ms momentary loudness for mono and stereo.
+    /// Ungated 400 ms momentary loudness for mono and stereo. For lanes with
+    /// more channels this is negative infinity: channel labels alone do not
+    /// specify the speaker weights or identify an LFE channel for BS.1770.
     pub momentary_lufs: f32,
 }
 
@@ -99,6 +103,8 @@ impl Meter {
             }
         }
         self.peak = (self.peak * self.peak_decay).max(f64::from(raw_peak));
+        // Every lane channel contributes equally to RMS, including channels
+        // carrying objects. Adding identical channels leaves VU unchanged.
         self.rms.push(rms / frame.len() as f64);
         if let Some(loudness) = &mut self.loudness {
             // BS.1770 channel weights are 1 for mono, left and right.
@@ -327,5 +333,32 @@ mod tests {
         assert_eq!(window.mean(), 1.0 / 400.0);
         window.push(0.0);
         assert_eq!(window.mean(), 0.0);
+    }
+
+    #[test]
+    fn multichannel_meters_use_every_channel_and_mean_energy() {
+        for channels in [12, 64] {
+            let mut meter = Meter::new(1_000, channels).unwrap();
+            let now = Instant::now();
+            let mut frame = vec![0.0; channels];
+            frame[channels - 1] = -0.5;
+            meter.begin_block(now);
+            for _ in 0..400 {
+                assert_eq!(meter.push_frame(&frame), 0.5);
+            }
+            meter.end_block(now);
+            let readings = meter.readings(now);
+            assert!((readings.peak_dbfs - energy_db(0.25)).abs() < 0.001);
+            assert!((readings.vu - (energy_db(0.5 / channels as f64) + 18.0)).abs() < 0.001);
+            assert_eq!(readings.momentary_lufs, f32::NEG_INFINITY);
+
+            frame.fill(0.5);
+            for _ in 0..300 {
+                meter.push_frame(&frame);
+            }
+            assert!((meter.readings(now).vu - (energy_db(0.5) + 18.0)).abs() < 0.001);
+            meter.reset();
+            assert_eq!(meter.readings(now), MeterReadings::default());
+        }
     }
 }

@@ -9,9 +9,13 @@ const HEARTBEAT: Duration = Duration::from_secs(2);
 const EXPIRES: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_CLIENTS: usize = 16;
+const MAX_CHANNELS: usize = 64;
 const MAX_FRAMES: usize = 8192;
+const MAX_SAMPLES: usize = 65_536;
 const MAX_MARKERS: usize = MAX_FRAMES;
 const HEADER_SIZE: usize = 24;
+// Even with one marker per frame, a packet is at most 294,936 bytes (266,264
+// at 64 channels). This bounds slow clients while allowing three full packets.
 const MAX_PENDING: usize = 1024 * 1024;
 const MAGIC: [u8; 4] = *b"BTA1";
 
@@ -67,7 +71,10 @@ impl Client {
         self.offset = 0;
         let mut probe = [0];
         self.stream.peek(&mut probe).is_err_and(|error| {
-            matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)
+            matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            )
         })
     }
 
@@ -86,8 +93,15 @@ impl Client {
 
 pub fn new_sender_id() -> String {
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    format!("{:x}-{:x}-{:x}", std::process::id(), now.as_nanos(), NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!(
+        "{:x}-{:x}-{:x}",
+        std::process::id(),
+        now.as_nanos(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 impl SenderEndpoint {
@@ -125,15 +139,29 @@ impl SenderEndpoint {
 
     pub fn update(&mut self, name: &str, sender_enabled: bool, sample_rate: u32, channels: usize) {
         let name = name.trim();
-        let name = if name.is_empty() { "Backtracking" } else { name };
+        let name = if name.is_empty() {
+            "Backtracking"
+        } else {
+            name
+        };
         let now = Instant::now();
-        let unchanged = self.registration.as_ref().is_some_and(|(old, active, rate, width)| {
-            old == name && *active == sender_enabled && *rate == sample_rate && *width == channels
-        });
+        let unchanged = self
+            .registration
+            .as_ref()
+            .is_some_and(|(old, active, rate, width)| {
+                old == name
+                    && *active == sender_enabled
+                    && *rate == sample_rate
+                    && *width == channels
+            });
         if !unchanged || now >= self.heartbeat_at {
-            if self.registration.as_ref().is_some_and(|(_, active, rate, width)| {
-                !sender_enabled || !*active || *rate != sample_rate || *width != channels
-            }) {
+            if self
+                .registration
+                .as_ref()
+                .is_some_and(|(_, active, rate, width)| {
+                    !sender_enabled || !*active || *rate != sample_rate || *width != channels
+                })
+            {
                 self.clients.clear();
             }
             let _ = self.register(name, sender_enabled, sample_rate, channels);
@@ -148,13 +176,18 @@ impl SenderEndpoint {
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         let name: String = name.chars().filter(|c| !c.is_control()).take(120).collect();
         let port = self.listener.local_addr()?.port();
-        fs::write(&temporary, format!("{port}\t{}\t{rate}\t{channels}\t{name}", u8::from(enabled)))?;
+        fs::write(
+            &temporary,
+            format!("{port}\t{}\t{rate}\t{channels}\t{name}", u8::from(enabled)),
+        )?;
         fs::rename(temporary, path)
     }
 
     fn service(&mut self, audio_enabled: bool) {
         for _ in 0..MAX_CLIENTS {
-            let Ok((stream, _)) = self.listener.accept() else { break };
+            let Ok((stream, _)) = self.listener.accept() else {
+                break;
+            };
             if self.pending.len() == MAX_CLIENTS || stream.set_nonblocking(true).is_err() {
                 continue;
             }
@@ -175,7 +208,9 @@ impl SenderEndpoint {
             let mut input = [0; 96];
             let remaining = self.id.len() + 1 - pending.token.len();
             match pending.stream.read(&mut input[..remaining]) {
-                Ok(0) => { self.pending.swap_remove(index); }
+                Ok(0) => {
+                    self.pending.swap_remove(index);
+                }
                 Ok(read) => {
                     pending.token.extend_from_slice(&input[..read]);
                     if pending.token.len() < self.id.len() + 1 {
@@ -183,19 +218,32 @@ impl SenderEndpoint {
                         continue;
                     }
                     let pending = self.pending.swap_remove(index);
-                    if &pending.token[1..] != self.id.as_bytes() { continue; }
+                    if &pending.token[1..] != self.id.as_bytes() {
+                        continue;
+                    }
                     match pending.token[0] {
                         b'A' if audio_enabled && self.clients.len() < MAX_CLIENTS => {
-                            self.clients.push(Client { stream: pending.stream, pending: Vec::new(), offset: 0 });
+                            self.clients.push(Client {
+                                stream: pending.stream,
+                                pending: Vec::new(),
+                                offset: 0,
+                            });
                         }
                         b'S' => self.snapshot_requested = true,
                         _ => {}
                     }
                 }
-                Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
                     index += 1;
                 }
-                Err(_) => { self.pending.swap_remove(index); }
+                Err(_) => {
+                    self.pending.swap_remove(index);
+                }
             }
         }
         self.clients.retain_mut(Client::flush);
@@ -214,36 +262,45 @@ impl SenderEndpoint {
         audio: &[f32],
         bar_offsets: &[u32],
     ) -> io::Result<()> {
-        if !valid_format(sample_rate, channels) || audio.len() % channels != 0
+        if !valid_format(sample_rate, channels)
+            || audio.len() % channels != 0
             || bar_offsets.windows(2).any(|pair| pair[0] >= pair[1])
-            || bar_offsets.last().is_some_and(|&offset| offset as usize >= audio.len() / channels)
+            || bar_offsets
+                .last()
+                .is_some_and(|&offset| offset as usize >= audio.len() / channels)
         {
             return Err(invalid("invalid Sender audio format"));
         }
         self.update(name, true, sample_rate, channels);
-        if self.clients.is_empty() { return Ok(()); }
-        for (chunk_index, chunk) in audio.chunks(MAX_FRAMES * channels).enumerate() {
-            let start = chunk_index * MAX_FRAMES;
+        if self.clients.is_empty() {
+            return Ok(());
+        }
+        let chunk_frames = MAX_FRAMES.min(MAX_SAMPLES / channels);
+        for (chunk_index, chunk) in audio.chunks(chunk_frames * channels).enumerate() {
+            let start = chunk_index * chunk_frames;
             let frames = chunk.len() / channels;
             let end = start + frames;
             let bars = bar_offsets.partition_point(|&offset| (offset as usize) < start)
                 ..bar_offsets.partition_point(|&offset| (offset as usize) < end);
-            let packet_time = timestamp_ns.saturating_add(
-                (start as u128 * 1_000_000_000 / u128::from(sample_rate)) as u64,
-            );
+            let packet_time = timestamp_ns
+                .saturating_add((start as u128 * 1_000_000_000 / u128::from(sample_rate)) as u64);
             self.encoded.clear();
             self.encoded.extend_from_slice(&MAGIC);
             self.encoded.extend_from_slice(&packet_time.to_le_bytes());
             self.encoded.extend_from_slice(&sample_rate.to_le_bytes());
-            self.encoded.extend_from_slice(&(frames as u32).to_le_bytes());
-            self.encoded.extend_from_slice(&(bars.len() as u32).to_le_bytes());
+            self.encoded
+                .extend_from_slice(&(frames as u32).to_le_bytes());
+            self.encoded
+                .extend_from_slice(&(bars.len() as u32).to_le_bytes());
             for offset in &bar_offsets[bars] {
-                self.encoded.extend_from_slice(&(*offset - start as u32).to_le_bytes());
+                self.encoded
+                    .extend_from_slice(&(*offset - start as u32).to_le_bytes());
             }
             for sample in chunk {
                 self.encoded.extend_from_slice(&sample.to_le_bytes());
             }
-            self.clients.retain_mut(|client| client.append(&self.encoded));
+            self.clients
+                .retain_mut(|client| client.append(&self.encoded));
         }
         Ok(())
     }
@@ -251,7 +308,9 @@ impl SenderEndpoint {
 
 impl Drop for SenderEndpoint {
     fn drop(&mut self) {
-        if let Ok(path) = registration_path(&self.id) { let _ = fs::remove_file(path); }
+        if let Ok(path) = registration_path(&self.id) {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -272,7 +331,8 @@ pub struct SenderReceiver {
 
 impl SenderReceiver {
     pub fn connect(id: &str) -> io::Result<Self> {
-        let registration = read_registration(id).filter(|entry| entry.audio_enabled)
+        let registration = read_registration(id)
+            .filter(|entry| entry.audio_enabled)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Sender is unavailable"))?;
         let stream = connect(&registration, b'A')?;
         stream.set_nonblocking(true)?;
@@ -285,7 +345,11 @@ impl SenderReceiver {
         })
     }
 
-    pub fn packet(&mut self, samples: &mut Vec<f32>, markers: &mut Vec<usize>) -> io::Result<Option<SenderPacket>> {
+    pub fn packet(
+        &mut self,
+        samples: &mut Vec<f32>,
+        markers: &mut Vec<usize>,
+    ) -> io::Result<Option<SenderPacket>> {
         if self.pending.len() - self.offset < HEADER_SIZE {
             self.receive()?;
         }
@@ -293,17 +357,28 @@ impl SenderReceiver {
             return self.incomplete();
         }
         let header = &self.pending[self.offset..self.offset + HEADER_SIZE];
-        if header[..4] != MAGIC { return Err(invalid("invalid Sender packet header")); }
+        if header[..4] != MAGIC {
+            return Err(invalid("invalid Sender packet header"));
+        }
         let timestamp_ns = u64::from_le_bytes(header[4..12].try_into().unwrap());
         let sample_rate = u32::from_le_bytes(header[12..16].try_into().unwrap());
         let frames = read_u32(&header[16..20]) as usize;
         let bars = read_u32(&header[20..24]) as usize;
-        if sample_rate != self.info.sample_rate || !(1..=MAX_FRAMES).contains(&frames) || bars > MAX_MARKERS {
+        if !valid_format(self.info.sample_rate, self.info.channels)
+            || sample_rate != self.info.sample_rate
+            || !(1..=MAX_FRAMES).contains(&frames)
+            || frames * self.info.channels > MAX_SAMPLES
+            || bars > MAX_MARKERS
+        {
             return Err(invalid("invalid Sender packet size or sample rate"));
         }
         let bytes = HEADER_SIZE + (bars + frames * self.info.channels) * 4;
-        if self.pending.len() - self.offset < bytes { self.receive()?; }
-        if self.pending.len() - self.offset < bytes { return self.incomplete(); }
+        if self.pending.len() - self.offset < bytes {
+            self.receive()?;
+        }
+        if self.pending.len() - self.offset < bytes {
+            return self.incomplete();
+        }
         let body = &self.pending[self.offset + HEADER_SIZE..self.offset + bytes];
         markers.clear();
         for value in body[..bars * 4].chunks_exact(4) {
@@ -316,10 +391,18 @@ impl SenderReceiver {
         samples.clear();
         samples.extend(body[bars * 4..].chunks_exact(4).map(|value| {
             let sample = f32::from_bits(read_u32(value));
-            if sample.is_finite() { sample } else { 0.0 }
+            if sample.is_finite() {
+                sample
+            } else {
+                0.0
+            }
         }));
         self.offset += bytes;
-        Ok(Some(SenderPacket { timestamp_ns, sample_rate, frames }))
+        Ok(Some(SenderPacket {
+            timestamp_ns,
+            sample_rate,
+            frames,
+        }))
     }
 
     fn receive(&mut self) -> io::Result<()> {
@@ -342,7 +425,10 @@ impl SenderReceiver {
 
     fn incomplete(&self) -> io::Result<Option<SenderPacket>> {
         if self.eof {
-            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Sender disconnected"))
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Sender disconnected",
+            ))
         } else {
             Ok(None)
         }
@@ -364,14 +450,24 @@ pub fn request_sender_snapshot(id: &str) -> io::Result<()> {
 }
 
 fn discover(audio_only: bool) -> Vec<SenderInfo> {
-    let Ok(directory) = sender_directory().and_then(fs::read_dir) else { return Vec::new() };
-    let mut entries: Vec<_> = directory.flatten().filter_map(|entry| {
-        let filename = entry.file_name();
-        let id = filename.to_str()?.strip_suffix(".sender")?;
-        let registration = read_registration(id)?;
-        (!audio_only || registration.audio_enabled).then_some(registration.info)
-    }).collect();
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.id.cmp(&b.id)));
+    let Ok(directory) = sender_directory().and_then(fs::read_dir) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<_> = directory
+        .flatten()
+        .filter_map(|entry| {
+            let filename = entry.file_name();
+            let id = filename.to_str()?.strip_suffix(".sender")?;
+            let registration = read_registration(id)?;
+            (!audio_only || registration.audio_enabled).then_some(registration.info)
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
     entries
 }
 
@@ -396,20 +492,39 @@ fn read_registration(id: &str) -> Option<Registration> {
     let text = fs::read_to_string(path).ok()?;
     let mut parts = text.splitn(5, '\t');
     let port = parts.next()?.parse().ok()?;
-    let audio_enabled = match parts.next()? { "1" => true, "0" => false, _ => return None };
+    let audio_enabled = match parts.next()? {
+        "1" => true,
+        "0" => false,
+        _ => return None,
+    };
     let sample_rate = parts.next()?.parse().ok()?;
     let channels = parts.next()?.parse().ok()?;
     let name = parts.next()?.to_owned();
-    if !valid_format(sample_rate, channels) || port == 0 { return None; }
-    Some(Registration { info: SenderInfo { id: id.to_owned(), name, sample_rate, channels }, port, audio_enabled })
+    if !valid_format(sample_rate, channels) || port == 0 {
+        return None;
+    }
+    Some(Registration {
+        info: SenderInfo {
+            id: id.to_owned(),
+            name,
+            sample_rate,
+            channels,
+        },
+        port,
+        audio_enabled,
+    })
 }
 
 fn valid_format(rate: u32, channels: usize) -> bool {
-    (8_000..=384_000).contains(&rate) && (1..=2).contains(&channels)
+    (8_000..=384_000).contains(&rate) && (1..=MAX_CHANNELS).contains(&channels)
 }
 
 fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 72 && id.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    !id.is_empty()
+        && id.len() <= 72
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
 }
 
 fn reserve_id(id: &str) -> io::Result<()> {
@@ -419,7 +534,9 @@ fn reserve_id(id: &str) -> io::Result<()> {
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let age = path.metadata()?.modified()?.elapsed().unwrap_or_default();
-            if age < EXPIRES { return Err(error); }
+            if age < EXPIRES {
+                return Err(error);
+            }
             fs::remove_file(&path)?;
             open().map(|_| ())
         }
@@ -439,7 +556,9 @@ fn create_sender_directory(path: &std::path::Path) -> io::Result<()> {
 }
 
 fn registration_path(id: &str) -> io::Result<PathBuf> {
-    if !valid_id(id) { return Err(invalid("invalid Sender instance ID")); }
+    if !valid_id(id) {
+        return Err(invalid("invalid Sender instance ID"));
+    }
     Ok(sender_directory()?.join(format!("{id}.sender")))
 }
 
@@ -453,12 +572,20 @@ fn sender_directory() -> io::Result<PathBuf> {
     } else if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"))
     } else {
-        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+            })
     };
     base.filter(|path| path.is_absolute())
         .map(|path| path.join("Backtracking").join("senders-v1"))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Backtracking Sender directory unavailable"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Backtracking Sender directory unavailable",
+            )
+        })
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -492,14 +619,20 @@ pub fn capture_clock_ns() -> u64 {
 pub fn capture_clock_ns() -> u64 {
     use std::sync::OnceLock;
     #[repr(C)]
-    struct Timebase { numerator: u32, denominator: u32 }
+    struct Timebase {
+        numerator: u32,
+        denominator: u32,
+    }
     extern "C" {
         fn mach_absolute_time() -> u64;
         fn mach_timebase_info(info: *mut Timebase) -> i32;
     }
     static TIMEBASE: OnceLock<Timebase> = OnceLock::new();
     let base = TIMEBASE.get_or_init(|| {
-        let mut value = Timebase { numerator: 1, denominator: 1 };
+        let mut value = Timebase {
+            numerator: 1,
+            denominator: 1,
+        };
         unsafe { mach_timebase_info(&mut value) };
         value
     });
@@ -511,11 +644,21 @@ pub fn capture_clock_ns() -> u64 {
 pub fn capture_clock_ns() -> u64 {
     use std::ffi::{c_int, c_long};
     #[repr(C)]
-    struct Timespec { seconds: c_long, nanos: c_long }
-    extern "C" { fn clock_gettime(clock: c_int, time: *mut Timespec) -> c_int; }
-    let mut value = Timespec { seconds: 0, nanos: 0 };
+    struct Timespec {
+        seconds: c_long,
+        nanos: c_long,
+    }
+    extern "C" {
+        fn clock_gettime(clock: c_int, time: *mut Timespec) -> c_int;
+    }
+    let mut value = Timespec {
+        seconds: 0,
+        nanos: 0,
+    };
     unsafe { clock_gettime(1, &mut value) };
-    (value.seconds as u64).saturating_mul(1_000_000_000).saturating_add(value.nanos as u64)
+    (value.seconds as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(value.nanos as u64)
 }
 
 #[cfg(test)]
@@ -526,6 +669,191 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestDirectory {
+        path: PathBuf,
+        previous: Option<PathBuf>,
+    }
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("backtracking-ipc-{}", new_sender_id()));
+            let previous = TEST_DIRECTORY.with(|directory| directory.replace(Some(path.clone())));
+            Self { path, previous }
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            TEST_DIRECTORY.with(|directory| directory.replace(self.previous.take()));
+            let _ = fs::remove_dir(&self.path);
+        }
+    }
+
+    fn connected_sender(channels: usize) -> (SenderEndpoint, SenderReceiver) {
+        let mut endpoint = SenderEndpoint::new().unwrap();
+        endpoint.update("Channels", true, 48_000, channels);
+        assert_eq!(discover_senders()[0].channels, channels);
+        let receiver = SenderReceiver::connect(endpoint.id()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while endpoint.clients.is_empty() && Instant::now() < deadline {
+            endpoint.update("Channels", true, 48_000, channels);
+            std::thread::yield_now();
+        }
+        assert_eq!(endpoint.clients.len(), 1);
+        (endpoint, receiver)
+    }
+
+    fn round_trip_channels(channels: usize) {
+        let _directory = TestDirectory::new();
+        let (mut endpoint, mut receiver) = connected_sender(channels);
+        let chunk_frames = MAX_FRAMES.min(MAX_SAMPLES / channels);
+        let frames = chunk_frames * 2 + 17;
+        let audio: Vec<_> = (0..frames * channels)
+            .map(|sample| (sample as i32 % 1024 - 512) as f32 / 1024.0)
+            .collect();
+        let markers: Vec<_> = (0..frames as u32).collect();
+        let timestamp_ns = 1_234_567;
+        endpoint
+            .publish("Channels", 48_000, channels, timestamp_ns, &audio, &markers)
+            .unwrap();
+
+        let mut samples = Vec::new();
+        let mut bars = Vec::new();
+        let mut received = Vec::new();
+        let mut packet_frames = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while received.len() < audio.len() && Instant::now() < deadline {
+            endpoint.update("Channels", true, 48_000, channels);
+            if let Some(packet) = receiver.packet(&mut samples, &mut bars).unwrap() {
+                let start = received.len() / channels;
+                assert_eq!(
+                    packet.timestamp_ns,
+                    timestamp_ns + start as u64 * 1_000_000_000 / 48_000
+                );
+                assert_eq!(packet.sample_rate, 48_000);
+                assert!((1..=MAX_FRAMES).contains(&packet.frames));
+                assert!(samples.len() <= MAX_SAMPLES);
+                assert_eq!(samples.len(), packet.frames * channels);
+                assert_eq!(bars, (0..packet.frames).collect::<Vec<_>>());
+                packet_frames.push(packet.frames);
+                received.extend_from_slice(&samples);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(packet_frames, [chunk_frames, chunk_frames, 17]);
+        assert_eq!(received, audio);
+    }
+
+    #[test]
+    fn mono_sender_round_trip_respects_chunk_limits() {
+        round_trip_channels(1);
+    }
+
+    #[test]
+    fn stereo_sender_round_trip_respects_chunk_limits() {
+        round_trip_channels(2);
+    }
+
+    #[test]
+    fn twelve_channel_sender_round_trip_respects_chunk_limits() {
+        round_trip_channels(12);
+    }
+
+    #[test]
+    fn sixty_four_channel_sender_round_trip_respects_chunk_limits() {
+        round_trip_channels(64);
+    }
+
+    #[test]
+    fn mono_and_stereo_packet_bytes_keep_the_released_format() {
+        let _directory = TestDirectory::new();
+        for channels in [1, 2] {
+            let (mut endpoint, _receiver) = connected_sender(channels);
+            let audio = &[-0.25_f32, 0.5, 0.75, -1.0][..2 * channels];
+            endpoint
+                .publish("Channels", 48_000, channels, 12_000, audio, &[1])
+                .unwrap();
+            let mut expected = Vec::new();
+            expected.extend_from_slice(b"BTA1");
+            expected.extend_from_slice(&12_000_u64.to_le_bytes());
+            expected.extend_from_slice(&48_000_u32.to_le_bytes());
+            expected.extend_from_slice(&2_u32.to_le_bytes());
+            expected.extend_from_slice(&1_u32.to_le_bytes());
+            expected.extend_from_slice(&1_u32.to_le_bytes());
+            for sample in audio {
+                expected.extend_from_slice(&sample.to_le_bytes());
+            }
+            assert_eq!(endpoint.encoded, expected);
+        }
+    }
+
+    #[test]
+    fn receiver_rejects_frames_samples_and_channels_outside_limits() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let mut receiver = SenderReceiver {
+            info: SenderInfo {
+                id: String::new(),
+                name: String::new(),
+                sample_rate: 48_000,
+                channels: 1,
+            },
+            stream,
+            pending: Vec::new(),
+            offset: 0,
+            eof: false,
+        };
+        for (channels, frames) in [
+            (1, 0),
+            (1, 8193),
+            (12, 5462),
+            (64, 1025),
+            (0, 1),
+            (65, 1),
+            (usize::MAX, 8192),
+        ] {
+            receiver.info.channels = channels;
+            receiver.pending.clear();
+            receiver.pending.extend_from_slice(b"BTA1");
+            receiver.pending.extend_from_slice(&0_u64.to_le_bytes());
+            receiver
+                .pending
+                .extend_from_slice(&48_000_u32.to_le_bytes());
+            receiver
+                .pending
+                .extend_from_slice(&(frames as u32).to_le_bytes());
+            receiver.pending.extend_from_slice(&0_u32.to_le_bytes());
+            assert_eq!(
+                receiver
+                    .packet(&mut Vec::new(), &mut Vec::new())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData,
+                "channels={channels}, frames={frames}",
+            );
+        }
+    }
+
+    #[test]
+    fn sender_formats_and_pending_limit_cover_all_channel_counts() {
+        for channels in 1..=MAX_CHANNELS {
+            assert!(valid_format(8_000, channels));
+            assert!(valid_format(384_000, channels));
+            let frames = MAX_FRAMES.min(MAX_SAMPLES / channels);
+            let largest_packet = HEADER_SIZE + 4 * frames * (channels + 1);
+            // Keep room for the receiver's next 16 KiB read as well.
+            assert!(largest_packet * 3 + 16 * 1024 <= MAX_PENDING);
+        }
+        for channels in [0, MAX_CHANNELS + 1, usize::MAX] {
+            assert!(!valid_format(48_000, channels));
+        }
+        assert!(!valid_format(7_999, 1));
+        assert!(!valid_format(384_001, 1));
+    }
 
     #[test]
     #[ignore = "requires TCP loopback permission"]
@@ -549,20 +877,38 @@ mod tests {
         let timeout = Instant::now() + Duration::from_secs(2);
         let mut requested = false;
         while Instant::now() < timeout {
-            first.publish("Audio 1", 48_000, 2, 12_000, &[0.5, -0.5, 0.25, -0.25], &[1]).unwrap();
+            first
+                .publish(
+                    "Audio 1",
+                    48_000,
+                    2,
+                    12_000,
+                    &[0.5, -0.5, 0.25, -0.25],
+                    &[1],
+                )
+                .unwrap();
             second.update("Audio 1", false, 48_000, 2);
             requested |= second.take_snapshot_request();
             for (i, receiver) in [&mut a, &mut b].into_iter().enumerate() {
                 if !received[i] {
                     if let Some(packet) = receiver.packet(&mut audio, &mut bars).unwrap() {
-                        assert_eq!(packet, SenderPacket { timestamp_ns: 12_000, sample_rate: 48_000, frames: 2 });
+                        assert_eq!(
+                            packet,
+                            SenderPacket {
+                                timestamp_ns: 12_000,
+                                sample_rate: 48_000,
+                                frames: 2
+                            }
+                        );
                         assert_eq!(audio, [0.5, -0.5, 0.25, -0.25]);
                         assert_eq!(bars, [1]);
                         received[i] = true;
                     }
                 }
             }
-            if requested && received == [true, true] { break; }
+            if requested && received == [true, true] {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(requested);
