@@ -20,6 +20,7 @@ pub(crate) enum WindowCommand {
     ToggleCapture,
     Clear,
     SaveSnapshot,
+    SeparateLanes,
     WaveformOnly,
     KeepOnTop,
     Options,
@@ -32,6 +33,8 @@ impl WindowCommand {
         match self {
             Self::ToggleCapture => Some("Space"),
             Self::Clear => Some("Delete"),
+            // A tap, on its own; see `lane_key`.
+            Self::SeparateLanes => Some("Right Ctrl"),
             // Saving has the global shortcut only; the Options window names its key.
             Self::SaveSnapshot
             | Self::WaveformOnly
@@ -67,6 +70,9 @@ pub(crate) struct State {
     pub(crate) capture_controls: bool,
     pub(crate) waveform_only: bool,
     pub(crate) keep_on_top: bool,
+    /// Two sources record, so their lanes can be edited on their own.
+    pub(crate) two_lanes: bool,
+    pub(crate) separate_lanes: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +112,12 @@ pub(crate) fn entries(state: State) -> Vec<Entry> {
         item(WindowCommand::Clear, "Clear", false, capture),
         item(WindowCommand::SaveSnapshot, "Save snapshot", false, capture),
         Entry::Separator,
+        item(
+            WindowCommand::SeparateLanes,
+            "Edit A and B separately",
+            state.two_lanes && state.separate_lanes,
+            state.two_lanes,
+        ),
         item(WindowCommand::WaveformOnly, "Show waveform only", state.waveform_only, true),
         item(WindowCommand::KeepOnTop, "Keep on top", state.keep_on_top, true),
         Entry::Separator,
@@ -201,6 +213,8 @@ mod tests {
             capture_controls: true,
             waveform_only: false,
             keep_on_top: false,
+            two_lanes: true,
+            separate_lanes: false,
         }
     }
 
@@ -232,6 +246,7 @@ mod tests {
                 "Clear\tDelete",
                 "Save snapshot",
                 "-",
+                "Edit A and B separately\tRight Ctrl",
                 "Show waveform only",
                 "Keep on top",
                 "-",
@@ -280,6 +295,7 @@ mod tests {
             assert!(!item(&entries, command).2, "{command:?}");
         }
         for command in [
+            WindowCommand::SeparateLanes,
             WindowCommand::WaveformOnly,
             WindowCommand::KeepOnTop,
             WindowCommand::Options,
@@ -287,5 +303,17 @@ mod tests {
         ] {
             assert!(item(&entries, command).2, "{command:?}");
         }
+    }
+
+    #[test]
+    fn separate_lanes_needs_two_sources_and_shows_when_it_is_on() {
+        let label = "Edit A and B separately";
+        let on = entries(State { separate_lanes: true, ..state() });
+        assert_eq!(item(&on, WindowCommand::SeparateLanes), (label, true, true));
+        let off = entries(state());
+        assert_eq!(item(&off, WindowCommand::SeparateLanes), (label, false, true));
+        // One source, even split into left and right, has no lanes to separate.
+        let one = entries(State { two_lanes: false, separate_lanes: true, ..state() });
+        assert_eq!(item(&one, WindowCommand::SeparateLanes), (label, false, false));
     }
 }

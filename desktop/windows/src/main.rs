@@ -10,7 +10,11 @@ mod controller;
 #[cfg(target_os = "windows")]
 mod file_drag;
 #[cfg(target_os = "windows")]
+mod lane_key;
+#[cfg(target_os = "windows")]
 mod loopback;
+#[cfg(target_os = "windows")]
+mod playback;
 #[cfg(target_os = "windows")]
 mod preferences;
 #[cfg(target_os = "windows")]

@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use crate::export::export_routed_track_refs;
 use crate::{
     cleanup, discover_senders, discover_snapshot_targets, request_sender_snapshot, ChannelRoute,
-    DurationChoice, MeterReadings, SenderInfo, SenderReceiver, Snapshot, SynchronizedCapture,
-    TimedAudioQueue, WavExportProfile, WavSampleFormat, WaveformView,
+    DurationChoice, Fades, Lane, MeterReadings, PreviewGate, SenderInfo, SenderReceiver, Snapshot,
+    SynchronizedCapture, TakeLabel, TimedAudioQueue, WavExportProfile, WavSampleFormat,
+    WaveformView,
 };
 
 struct TrackSender {
@@ -46,6 +47,10 @@ struct BtTracks {
     queues: [Option<Arc<TimedAudioQueue>>; 2],
     reader: Mutex<TrackReader>,
     enabled: AtomicBool,
+    /// Lanes that record System playback, where audio captured while a Backtracking preview may
+    /// have been heard is silenced, so the preview never enters the history.
+    preview_silence: [AtomicBool; 2],
+    gate: &'static PreviewGate,
 }
 
 impl BtTracks {
@@ -81,9 +86,16 @@ impl BtTracks {
                             sender.retry_at = Instant::now() + Duration::from_secs(2);
                         }
                     }
-                } else if let Some(packet) = queue.as_ref().and_then(|queue| queue.pop(scratch)) {
+                } else if let Some((queue, packet)) =
+                    queue.as_deref().and_then(|queue| Some((queue, queue.pop(scratch)?)))
+                {
                     progressed = true;
                     if ingest {
+                        if self.preview_silence[lane].load(Ordering::Relaxed) {
+                            self.gate.silence(
+                                packet.timestamp_ns, scratch, queue.channels(), packet.sample_rate,
+                            );
+                        }
                         let _ = synchronized.push_with_discontinuity(
                             lane, packet.timestamp_ns, packet.sample_rate, scratch, packet.discontinuity,
                         );
@@ -136,7 +148,18 @@ extern "C" fn bt_tracks_new(
             scratch: Vec::new(),
         }),
         enabled: AtomicBool::new(true),
+        preview_silence: [AtomicBool::new(false), AtomicBool::new(false)],
+        gate: PreviewGate::shared(),
     }))
+}
+
+/// Marks `lane` as recording System playback (nonzero `enabled`), so that what it captures
+/// while a Backtracking preview may be heard is kept as silence.
+#[no_mangle]
+unsafe extern "C" fn bt_tracks_set_preview_silence(core: *const BtTracks, lane: u32, enabled: u32) {
+    if let Some(flag) = core.as_ref().and_then(|core| core.preview_silence.get(lane as usize)) {
+        flag.store(enabled != 0, Ordering::Relaxed);
+    }
 }
 
 #[no_mangle]
@@ -613,6 +636,54 @@ unsafe extern "C" fn bt_snapshot_export_routed_frames_with_profile(
     route: u32,
     force_mono: u32,
 ) -> *mut c_char {
+    bt_snapshot_export_routed_faded_frames(
+        snapshot, first_frame, end_frame, directory, sample_rate, bits_per_sample, route,
+        force_mono, 0, 0,
+    )
+}
+
+/// Exports `first_frame..end_frame` with a fade in and a fade out of the given lengths, in
+/// the snapshot's own frames. Ramps longer than the clip are shortened to fit it.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn bt_snapshot_export_routed_faded_frames(
+    snapshot: *const Snapshot,
+    first_frame: u64,
+    end_frame: u64,
+    directory: *const c_char,
+    sample_rate: u32,
+    bits_per_sample: u32,
+    route: u32,
+    force_mono: u32,
+    fade_in: u64,
+    fade_out: u64,
+) -> *mut c_char {
+    bt_snapshot_export_labelled_frames(
+        snapshot, first_frame, end_frame, directory, sample_rate, bits_per_sample, route,
+        force_mono, fade_in, fade_out, ptr::null(), 0,
+    )
+}
+
+/// Like [`bt_snapshot_export_routed_faded_frames`], naming the file after its source and lane:
+/// `Backtracking_<source>_<lane>_<date>…`. `source_name` is UTF-8 and may be null or empty,
+/// which puts the lane after the take as the unnamed exports do; `lane` is 0 for none, 1 for
+/// A and 2 for B.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn bt_snapshot_export_labelled_frames(
+    snapshot: *const Snapshot,
+    first_frame: u64,
+    end_frame: u64,
+    directory: *const c_char,
+    sample_rate: u32,
+    bits_per_sample: u32,
+    route: u32,
+    force_mono: u32,
+    fade_in: u64,
+    fade_out: u64,
+    source_name: *const c_char,
+    lane: u32,
+) -> *mut c_char {
     let Some(snapshot) = snapshot.as_ref() else {
         return ptr::null_mut();
     };
@@ -620,6 +691,12 @@ unsafe extern "C" fn bt_snapshot_export_routed_frames_with_profile(
         return ptr::null_mut();
     };
     let Some(route) = ChannelRoute::from_code(route) else {
+        return ptr::null_mut();
+    };
+    let Some(lane) = lane_arg(lane) else {
+        return ptr::null_mut();
+    };
+    let Some(source) = source_name_arg(source_name) else {
         return ptr::null_mut();
     };
     let Some(mut paths) = export_snapshots(
@@ -630,10 +707,42 @@ unsafe extern "C" fn bt_snapshot_export_routed_frames_with_profile(
         bits_per_sample,
         &[route],
         force_mono != 0,
+        Fades::new(fade_in, fade_out),
+        &[TakeLabel::new(source, lane)],
     ) else {
         return ptr::null_mut();
     };
     paths.remove(0).into_raw()
+}
+
+/// A source name passed in from C: null is no name, and text that is not UTF-8 is refused.
+unsafe fn source_name_arg(name: *const c_char) -> Option<String> {
+    if name.is_null() {
+        return Some(String::new());
+    }
+    CStr::from_ptr(name).to_str().ok().map(str::to_owned)
+}
+
+/// A lane passed in from C: 0 is none, 1 is A and 2 is B. Anything else is refused.
+fn lane_arg(lane: u32) -> Option<Option<Lane>> {
+    match lane {
+        0 => Some(None),
+        1 => Some(Some(Lane::A)),
+        2 => Some(Some(Lane::B)),
+        _ => None,
+    }
+}
+
+/// How the files of a source and lane are named, up to the date, for showing in settings.
+/// Takes the same `source_name` and `lane` as [`bt_snapshot_export_labelled_frames`]; free
+/// the result with `bt_string_free`. Null for a lane it does not know or text that is not
+/// UTF-8.
+#[no_mangle]
+unsafe extern "C" fn bt_take_file_prefix(source_name: *const c_char, lane: u32) -> *mut c_char {
+    let (Some(source), Some(lane)) = (source_name_arg(source_name), lane_arg(lane)) else {
+        return ptr::null_mut();
+    };
+    CString::new(TakeLabel::new(source, lane).file_prefix()).map_or(ptr::null_mut(), CString::into_raw)
 }
 
 #[no_mangle]
@@ -679,6 +788,60 @@ unsafe extern "C" fn bt_snapshots_export_pair_routed_frames_with_profile(
     path_a: *mut *mut c_char,
     path_b: *mut *mut c_char,
 ) -> i32 {
+    bt_snapshots_export_pair_routed_faded_frames(
+        snapshot_a, snapshot_b, first_frame, end_frame, directory, sample_rate,
+        bits_per_sample, route_a, route_b, force_mono, 0, 0, path_a, path_b,
+    )
+}
+
+/// The A/B form of [`bt_snapshot_export_routed_faded_frames`]: both files fade at the same frames.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn bt_snapshots_export_pair_routed_faded_frames(
+    snapshot_a: *const Snapshot,
+    snapshot_b: *const Snapshot,
+    first_frame: u64,
+    end_frame: u64,
+    directory: *const c_char,
+    sample_rate: u32,
+    bits_per_sample: u32,
+    route_a: u32,
+    route_b: u32,
+    force_mono: u32,
+    fade_in: u64,
+    fade_out: u64,
+    path_a: *mut *mut c_char,
+    path_b: *mut *mut c_char,
+) -> i32 {
+    bt_snapshots_export_pair_labelled_frames(
+        snapshot_a, snapshot_b, first_frame, end_frame, directory, sample_rate,
+        bits_per_sample, route_a, route_b, force_mono, fade_in, fade_out, ptr::null(),
+        ptr::null(), path_a, path_b,
+    )
+}
+
+/// The A/B form of [`bt_snapshot_export_labelled_frames`]: each file is named after its own
+/// source, as lane A and lane B.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn bt_snapshots_export_pair_labelled_frames(
+    snapshot_a: *const Snapshot,
+    snapshot_b: *const Snapshot,
+    first_frame: u64,
+    end_frame: u64,
+    directory: *const c_char,
+    sample_rate: u32,
+    bits_per_sample: u32,
+    route_a: u32,
+    route_b: u32,
+    force_mono: u32,
+    fade_in: u64,
+    fade_out: u64,
+    source_name_a: *const c_char,
+    source_name_b: *const c_char,
+    path_a: *mut *mut c_char,
+    path_b: *mut *mut c_char,
+) -> i32 {
     let Some(frames) = snapshot_a
         .as_ref()
         .and_then(|snapshot| relative_frames(snapshot, first_frame, end_frame))
@@ -691,6 +854,11 @@ unsafe extern "C" fn bt_snapshots_export_pair_routed_frames_with_profile(
     ) else {
         return 0;
     };
+    let (Some(source_a), Some(source_b)) =
+        (source_name_arg(source_name_a), source_name_arg(source_name_b))
+    else {
+        return 0;
+    };
     export_pair(
         [snapshot_a, snapshot_b],
         frames,
@@ -698,6 +866,8 @@ unsafe extern "C" fn bt_snapshots_export_pair_routed_frames_with_profile(
         [sample_rate, bits_per_sample],
         [route_a, route_b],
         force_mono != 0,
+        Fades::new(fade_in, fade_out),
+        [TakeLabel::new(source_a, Some(Lane::A)), TakeLabel::new(source_b, Some(Lane::B))],
         [path_a, path_b],
     )
 }
@@ -729,6 +899,8 @@ unsafe extern "C" fn bt_snapshots_export_pair_with_profile(
         [sample_rate, bits_per_sample],
         [ChannelRoute::Merged; 2],
         false,
+        Fades::NONE,
+        Lane::BOTH.map(|lane| TakeLabel::new("", Some(lane))),
         [path_a, path_b],
     )
 }
@@ -740,6 +912,7 @@ fn relative_frames(snapshot: &Snapshot, first: u64, end: u64) -> Option<Range<us
     Some((first - snapshot.first_frame) as usize..(end - snapshot.first_frame) as usize)
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn export_pair(
     [snapshot_a, snapshot_b]: [*const Snapshot; 2],
     frames: Range<usize>,
@@ -747,6 +920,8 @@ unsafe fn export_pair(
     [sample_rate, bits_per_sample]: [u32; 2],
     routes: [ChannelRoute; 2],
     force_mono: bool,
+    fades: Fades,
+    labels: [TakeLabel; 2],
     [path_a, path_b]: [*mut *mut c_char; 2],
 ) -> i32 {
     if path_a.is_null() || path_b.is_null() || path_a == path_b {
@@ -765,6 +940,8 @@ unsafe fn export_pair(
         bits_per_sample,
         &routes,
         force_mono,
+        fades,
+        &labels,
     ) else {
         return 0;
     };
@@ -773,6 +950,7 @@ unsafe fn export_pair(
     1
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn export_snapshots(
     snapshots: &[&Snapshot],
     frames: Range<usize>,
@@ -781,6 +959,8 @@ unsafe fn export_snapshots(
     bits_per_sample: u32,
     routes: &[ChannelRoute],
     force_mono: bool,
+    fades: Fades,
+    labels: &[TakeLabel],
 ) -> Option<Vec<CString>> {
     if directory.is_null() {
         return None;
@@ -803,6 +983,8 @@ unsafe fn export_snapshots(
         force_mono,
         // The desktop apps capture system audio and have no tempo to report.
         None,
+        fades,
+        labels,
     )
     .ok()?;
     let result: Option<Vec<CString>> = paths
@@ -820,6 +1002,68 @@ unsafe fn export_snapshots(
 #[cfg(test)]
 mod display_tests {
     use super::*;
+
+    #[test]
+    fn labelled_ffi_exports_name_files_after_their_sources_and_lanes() {
+        let directory = std::env::temp_dir()
+            .join(format!("bt-labelled-ffi-{}", std::process::id()));
+        let folder = CString::new(directory.to_str().unwrap()).unwrap();
+        let lane = Snapshot { sample_rate: 48_000, channels: 1, samples: vec![0.25; 4_800], first_frame: 100 };
+        let name = |path: *mut c_char| unsafe {
+            assert!(!path.is_null());
+            let path = CString::from_raw(path);
+            Path::new(path.to_str().unwrap()).file_name().unwrap().to_str().unwrap().to_owned()
+        };
+        let spotify = CString::new("Spotify").unwrap();
+        let mic = CString::new("系統 mic").unwrap();
+        unsafe {
+            let (mut a, mut b) = (ptr::null_mut(), ptr::null_mut());
+            assert_eq!(
+                bt_snapshots_export_pair_labelled_frames(
+                    &lane, &lane, 100, 4_900, folder.as_ptr(), 48_000, 32, 5, 5, 0, 0, 0,
+                    spotify.as_ptr(), mic.as_ptr(), &mut a, &mut b,
+                ),
+                1
+            );
+            let (a, b) = (name(a), name(b));
+            assert!(a.starts_with("Backtracking_Spotify_A_"), "{a}");
+            assert!(b.starts_with("Backtracking_系統 mic_B_"), "{b}");
+
+            // One lane on its own keeps its letter; a single source shows none.
+            let single = bt_snapshot_export_labelled_frames(
+                &lane, 100, 4_900, folder.as_ptr(), 48_000, 32, 5, 0, 0, 0, mic.as_ptr(), 2,
+            );
+            assert!(name(single).starts_with("Backtracking_系統 mic_B_"));
+            let single = bt_snapshot_export_labelled_frames(
+                &lane, 100, 4_900, folder.as_ptr(), 48_000, 32, 5, 0, 0, 0, spotify.as_ptr(), 0,
+            );
+            let single = name(single);
+            assert!(single.starts_with("Backtracking_Spotify_2"), "{single}");
+
+            // An unknown lane and a name that is not UTF-8 write nothing.
+            let bad = [0xffu8, 0x00];
+            for (source, lane_code) in [(spotify.as_ptr(), 3), (bad.as_ptr().cast(), 1)] {
+                assert!(bt_snapshot_export_labelled_frames(
+                    &lane, 100, 4_900, folder.as_ptr(), 48_000, 32, 5, 0, 0, 0, source, lane_code,
+                )
+                .is_null());
+            }
+        }
+        let written = std::fs::read_dir(&directory).unwrap().count();
+        assert_eq!(written, 4);
+        std::fs::remove_dir_all(directory).unwrap();
+
+        // Settings show how those names begin.
+        let prefix = |name: *const c_char, lane| unsafe {
+            let text = bt_take_file_prefix(name, lane);
+            (!text.is_null()).then(|| CString::from_raw(text).into_string().unwrap())
+        };
+        assert_eq!(prefix(mic.as_ptr(), 2).as_deref(), Some("Backtracking_系統 mic_B_"));
+        assert_eq!(prefix(spotify.as_ptr(), 0).as_deref(), Some("Backtracking_Spotify_"));
+        // Without a source name the lane follows the take, so the beginning is the same.
+        assert_eq!(prefix(ptr::null(), 1).as_deref(), Some("Backtracking_"));
+        assert_eq!(prefix(spotify.as_ptr(), 3), None);
+    }
 
     #[test]
     fn cleanup_ffi_is_off_unless_an_offered_age_is_chosen_and_never_cleans_a_withheld_folder() {
@@ -877,6 +1121,36 @@ mod display_tests {
             bt_tracks_set_retain_silence(core, 0);
             assert_eq!(bt_tracks_state(core), 2);
             assert_eq!(bt_tracks_end_frame(core), 100);
+            bt_tracks_free(core);
+        }
+    }
+
+    #[test]
+    fn system_lanes_record_silence_where_a_preview_may_have_been_heard() {
+        unsafe {
+            let core = bt_tracks_new(1_000., 1, 1, 10);
+            // Never the gate of a Backtracking that is recording on this computer.
+            let gate: &'static PreviewGate = Box::leak(Box::new(PreviewGate::local()));
+            (*core).gate = gate;
+            bt_tracks_set_retain_silence(core, 1);
+            bt_tracks_set_preview_silence(core, 0, 1);
+            bt_tracks_set_preview_silence(core, 7, 1);
+            // A preview was heard from 50 ms to 80 ms into packets captured at one second.
+            gate.hold(1_050_000_000, 1_080_000_000);
+            let a = [0.5; 100];
+            let b = [0.25; 100];
+            assert_eq!(bt_tracks_push_interleaved(core, 0, a.as_ptr(), 100, 1_000_000_000, 1_000.), 100);
+            assert_eq!(bt_tracks_push_interleaved(core, 1, b.as_ptr(), 100, 1_000_000_000, 1_000.), 100);
+            bt_tracks_pause(core);
+            let first = bt_tracks_snapshot(core, 0);
+            let second = bt_tracks_snapshot(core, 1);
+            let expected: Vec<f32> =
+                (0..100).map(|frame| if (50..80).contains(&frame) { 0.0 } else { 0.5 }).collect();
+            assert_eq!((*first).samples, expected);
+            // Lane B records something else, so it keeps all of it.
+            assert_eq!((*second).samples, b);
+            drop(Box::from_raw(first));
+            drop(Box::from_raw(second));
             bt_tracks_free(core);
         }
     }

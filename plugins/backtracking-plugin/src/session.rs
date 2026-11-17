@@ -7,9 +7,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{
-    AutoResumeDelay, Capture, CaptureState, ChannelRoute, DurationChoice, FrozenTrack,
-    MeterReadings, SenderEndpoint, TimedAudioQueue, WavExportProfile, WaveformView,
-    capture_clock_ns, export_routed_tracks_with_tempo,
+    AutoResumeDelay, Capture, CaptureState, ChannelRoute, DurationChoice, Fades, FrozenTrack,
+    MeterReadings, PreviewSlot, SenderEndpoint, TimedAudioQueue, WavExportProfile, WaveformView,
+    capture_clock_ns, export_routed_tracks_with_fades,
 };
 #[cfg(test)]
 use backtracking_core::Snapshot;
@@ -124,7 +124,8 @@ struct PublishedState {
 
 enum EditorAction {
     Begin,
-    Selection(Option<Range<u64>>),
+    /// The selection and the fades at its flags.
+    Selection(Option<Range<u64>>, Fades),
     End(bool),
     Cancel,
     Gesture(bool),
@@ -297,6 +298,8 @@ struct State {
     paused: bool,
     gesture_active: bool,
     selection: Option<Range<u64>>,
+    /// The fades of `selection`, which a snapshot of it is written with.
+    fades: Fades,
     editing: Option<EditingSnapshot>,
     editing_pending: bool,
     edit_serial: u64,
@@ -324,9 +327,21 @@ pub(crate) struct Session {
     /// The running capture thread, so the editor can end its wait early. Never
     /// touched from the audio callback.
     consumer_thread: Mutex<Option<thread::Thread>>,
+    /// The selection the editor is playing. The audio callback mixes it into the output.
+    pub(crate) preview: PreviewSlot,
 }
 
 type SnapshotResult = (u64, Range<u64>, Result<Vec<PathBuf>, String>);
+
+/// Previews hold the gate every Backtracking recorder on this computer reads, so that one
+/// recording System playback records silence instead. Tests use a gate of their own, so they
+/// never silence a Backtracking that is recording here.
+fn preview_slot() -> PreviewSlot {
+    #[cfg(test)]
+    return PreviewSlot::with_gate(Box::leak(Box::new(backtracking_core::PreviewGate::local())));
+    #[cfg(not(test))]
+    PreviewSlot::new()
+}
 
 impl Session {
     pub(crate) fn new(settings: SettingsStore) -> Self {
@@ -349,6 +364,7 @@ impl Session {
                 paused: false,
                 gesture_active: false,
                 selection: None,
+                fades: Fades::NONE,
                 editing: None,
                 editing_pending: false,
                 edit_serial: 0,
@@ -368,6 +384,7 @@ impl Session {
             snapshot_result: Arc::new(Mutex::new(None)),
             host_tempo: AtomicU64::new(0),
             consumer_thread: Mutex::new(None),
+            preview: preview_slot(),
         }
     }
 
@@ -668,7 +685,14 @@ impl Session {
     }
 
     pub(crate) fn set_snapshot_selection(&self, selection: Option<Range<u64>>) {
-        self.queue_editor_action(EditorAction::Selection(selection.filter(|range| !range.is_empty())));
+        self.set_snapshot_edit(selection, Fades::NONE);
+    }
+
+    /// The selection a snapshot takes and the fades it is written with.
+    pub(crate) fn set_snapshot_edit(&self, selection: Option<Range<u64>>, fades: Fades) {
+        let selection = selection.filter(|range| !range.is_empty());
+        let fades = if selection.is_some() { fades } else { Fades::NONE };
+        self.queue_editor_action(EditorAction::Selection(selection, fades));
     }
 
     pub(crate) fn end_waveform_gesture(&self, keep_selection: bool) {
@@ -708,7 +732,10 @@ impl Session {
                         state.selection = None;
                     }
                 }
-                EditorAction::Selection(selection) => state.selection = selection,
+                EditorAction::Selection(selection, fades) => {
+                    state.selection = selection;
+                    state.fades = fades;
+                }
                 EditorAction::End(keep) => {
                     state.gesture_active = false;
                     if !keep {
@@ -901,6 +928,7 @@ impl Session {
     fn snapshot_for_shortcut_locked(&self, state: &mut State, full_history: bool) -> Option<SnapshotJob> {
         let settings = self.settings();
         let selected = if full_history { None } else { state.selection.clone() };
+        let fades = if selected.is_some() { state.fades } else { Fades::NONE };
         let epoch = state.timeline_epoch;
         let snapshots: Arc<[FrozenTrack]> = if selected.is_some() {
             if state.editing_pending { return None; }
@@ -939,6 +967,7 @@ impl Session {
             epoch,
             range,
             relative: first..end,
+            fades,
         })
     }
 
@@ -1025,6 +1054,7 @@ struct SnapshotJob {
     range: Range<u64>,
     relative: Range<usize>,
     tempo: Option<f64>,
+    fades: Fades,
 }
 
 enum SnapshotAttempt {
@@ -1035,7 +1065,7 @@ enum SnapshotAttempt {
 
 impl SnapshotJob {
     fn write(self) -> SnapshotResult {
-        let result = export_routed_tracks_with_tempo(
+        let result = export_routed_tracks_with_fades(
             &self.settings.saved_dir,
             &self.snapshots,
             self.relative,
@@ -1043,6 +1073,7 @@ impl SnapshotJob {
             &[ChannelRoute::Merged; 2][..self.snapshots.len()],
             self.settings.force_mono,
             self.tempo,
+            self.fades,
         ).map_err(|error| error.to_string());
         (self.epoch, self.range, result)
     }
@@ -1172,6 +1203,8 @@ impl Worker {
                         || sender.queue.pending_packets() != 0;
                     let pending = worker_session.consume();
                     sender.update(&worker_session);
+                    // A preview that has played out is freed here, off the audio thread.
+                    worker_session.preview.reap();
                     let had_work = arrived || pending || sender.pending_snapshots != 0;
                     thread::park_timeout(pace.wait(had_work, Instant::now()));
                 }
@@ -1197,6 +1230,11 @@ impl Worker {
             sidechain,
             capacity_frames,
         })
+    }
+
+    /// The rate the host processes at, which a preview must have been captured at.
+    pub(crate) fn sample_rate(&self) -> u32 {
+        self.rate
     }
 
     pub(crate) fn matches(&self, rate: u32, channels: usize, sidechain: usize, max_buffer: u32) -> bool {
@@ -1437,6 +1475,8 @@ impl Drop for Worker {
             let _ = thread.join();
         }
         self.session.accepting.store(false, Ordering::SeqCst);
+        // The host is not processing, so nothing would play the preview out.
+        self.session.preview.clear();
         let mut state = self.session.lock();
         state.consumer = None;
         state.selection = None;
@@ -2187,6 +2227,42 @@ mod tests {
         let next = session.snapshot_for_shortcut().unwrap();
         assert_eq!(next.range, 0..64);
         assert!(!session.is_paused());
+    }
+
+    #[test]
+    fn snapshot_hotkey_writes_a_selection_with_its_fades_and_the_whole_history_without() {
+        let session = Arc::new(Session::new(SettingsStore::default()));
+        let worker = Worker::new(session.clone(), 48_000, 1, 256).unwrap();
+        worker.push(&[&mut [0.25; 32]]);
+        session.consume();
+        session.begin_waveform_gesture();
+        session.consume();
+        session.set_snapshot_edit(Some(8..20), Fades::new(3, 5));
+        session.end_waveform_gesture(true);
+        session.consume();
+        let job = session.snapshot_for_shortcut().unwrap();
+        assert_eq!((job.range.clone(), job.fades), (8..20, Fades::new(3, 5)));
+
+        let output = std::env::temp_dir().join(format!(
+            "backtracking-faded-snapshot-test-{}", std::process::id(),
+        ));
+        let mut settings = job.settings.clone();
+        settings.saved_dir = output.clone();
+        let (_, _, written) = SnapshotJob { settings, ..job }.write();
+        let wav = std::fs::read(&written.unwrap()[0]).unwrap();
+        let data = wav.windows(4).position(|chunk| chunk == b"data").unwrap() + 8;
+        let samples: Vec<_> = wav[data..]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(samples.len(), 12);
+        assert_eq!((samples[0], samples[11]), (0.0, 0.0));
+        assert_eq!(&samples[3..7], &[0.25; 4]);
+        std::fs::remove_dir_all(output).unwrap();
+
+        // Without a selection the whole history is written, unfaded.
+        worker.push(&[&mut [0.75; 32]]);
+        assert_eq!(session.snapshot_for_shortcut().unwrap().fades, Fades::NONE);
     }
 
     #[test]

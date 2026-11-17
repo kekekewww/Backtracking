@@ -33,7 +33,7 @@ use super::ActiveDrag;
 const START_DRAG: u32 = WM_APP + 0x425;
 static NEXT_DRAG_ID: AtomicUsize = AtomicUsize::new(1);
 
-fn editor_hwnd(window: &impl HasWindowHandle) -> Result<HWND, String> {
+pub(super) fn editor_hwnd(window: &impl HasWindowHandle) -> Result<HWND, String> {
     let RawWindowHandle::Win32(handle) =
         window.window_handle().map_err(|e| e.to_string())?.as_raw()
     else {
