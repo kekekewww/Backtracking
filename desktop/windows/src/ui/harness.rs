@@ -18,6 +18,13 @@
 //!   `install` presses Install on the confirmation, and `set=<add-on id>:<key>=<JSON value>`
 //!   changes a setting as its control would, with any value. Each of these two waits until
 //!   the steps before it have settled (a dropped package has been read, say).
+//!   `format=<lane>:<format id>` chooses a format of the lane's add-on source,
+//!   `open-format=<lane>` shows that lane's format list open, `open=<add-on id>:<file>` opens a
+//!   file in an add-on, `transport=<lane>:<play|pause|stop|seek,<seconds>>` sends a transport
+//!   command and `wait=<ms>` lets the steps before it run for that much longer before the next
+//!   one. A test copy refuses `open=` (and any other way to open a file) unless the add-on's
+//!   `play_through_speakers` setting is known to be off, so a test makes no sound; use
+//!   `set=<add-on id>:play_through_speakers=false` first.
 //!
 //! The picture is `<file.png>`; `<file.png>.log` gets the frame times and any problem.
 
@@ -27,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use backtracking_addon::protocol::TransportCommand;
 use eframe::egui;
 
 use super::{OptionsSection, Recorder};
@@ -53,12 +61,25 @@ pub(super) enum Step {
     Remove(String),
     Install,
     Set(String, String, serde_json::Value),
+    Format(usize, String),
+    OpenFormatList(usize),
+    Open(String, PathBuf),
+    Transport(usize, TransportCommand, Option<f64>),
+    Wait(u64),
 }
 
 impl Step {
     /// Steps that act on what earlier steps brought about, so they wait for it.
     fn waits(&self) -> bool {
-        matches!(self, Self::Install | Self::Set(..))
+        matches!(
+            self,
+            Self::Install
+                | Self::Set(..)
+                | Self::Format(..)
+                | Self::Open(..)
+                | Self::Transport(..)
+                | Self::Wait(_)
+        )
     }
 }
 
@@ -168,6 +189,36 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                     }
                     None => Ok(Step::Options(options_page(value)?, None)),
                 },
+                "format" => {
+                    let (lane_text, id) = pair(step, value)?;
+                    Ok(Step::Format(lane(lane_text)?, id.trim().to_owned()))
+                }
+                "open-format" => Ok(Step::OpenFormatList(lane(value)?)),
+                "open" => {
+                    let (id, file) = pair(step, value)?;
+                    Ok(Step::Open(id.trim().to_owned(), PathBuf::from(file.trim())))
+                }
+                "transport" => {
+                    let (lane_text, command) = pair(step, value)?;
+                    let (command, position) = match command.trim().split_once(',') {
+                        Some(("seek", seconds)) => (TransportCommand::Seek, Some(number(seconds)?)),
+                        _ => (
+                            match command.trim() {
+                                "play" => TransportCommand::Play,
+                                "pause" => TransportCommand::Pause,
+                                "stop" => TransportCommand::Stop,
+                                other => return Err(format!("{other} is not a transport command")),
+                            },
+                            None,
+                        ),
+                    };
+                    Ok(Step::Transport(lane(lane_text)?, command, position))
+                }
+                "wait" => {
+                    Ok(Step::Wait(value.trim().parse().map_err(|_| {
+                        format!("{value} is not a number of milliseconds")
+                    })?))
+                }
                 "drop" => Ok(Step::Drop(PathBuf::from(value.trim()))),
                 "drop-options" => Ok(Step::DropOnOptions(PathBuf::from(value.trim()))),
                 "remove" => Ok(Step::Remove(value.trim().to_owned())),
@@ -207,6 +258,8 @@ pub(super) struct Harness {
     options_drops: Vec<PathBuf>,
     /// Waits for the Options window's next pass to take its picture.
     options_shot: Option<mpsc::SyncSender<PictureResult>>,
+    /// Extra time the last step asked for before the next one.
+    hold: Duration,
 }
 
 impl Harness {
@@ -295,6 +348,7 @@ impl Harness {
             main_drops: Vec::new(),
             options_drops: Vec::new(),
             options_shot: None,
+            hold: Duration::ZERO,
         })
     }
 
@@ -393,7 +447,7 @@ impl Recorder {
             return;
         };
         let options_picture = harness.options_picture;
-        let settled = now.duration_since(applied) >= SETTLE
+        let settled = now.duration_since(applied) >= SETTLE + harness.hold
             && self.edit_request.is_none()
             && self.edit_preview.is_none()
             // Dropped files are read in the next pass, and the manager answers after that.
@@ -442,6 +496,7 @@ impl Recorder {
             .skip(1)
             .position(Step::waits)
             .map_or(harness.steps.len(), |index| index + 1);
+        harness.hold = Duration::ZERO;
         let steps: Vec<Step> = harness.steps.drain(..wait).collect();
         for step in steps {
             if let Err(error) = self.apply_test_step(&step, ctx)
@@ -513,8 +568,69 @@ impl Recorder {
                 self.addons_page.change_setting(id, key, value.clone())?;
                 ctx.request_repaint();
             }
+            Step::Format(lane, format) => {
+                let (addon, source) = self.lane_addon_source(*lane)?;
+                let handle = self
+                    .controller
+                    .addons()
+                    .cloned()
+                    .ok_or("no add-on manager")?;
+                self.addon_sources
+                    .select_format(&handle, &addon, &source, format)?;
+                ctx.request_repaint();
+            }
+            Step::OpenFormatList(lane) => {
+                self.addon_sources.force_format_menu(*lane);
+                ctx.request_repaint();
+            }
+            Step::Open(addon, path) => {
+                if !path.is_file() {
+                    return Err(format!("{} is not a file", path.display()));
+                }
+                let handle = self
+                    .controller
+                    .addons()
+                    .cloned()
+                    .ok_or("no add-on manager")?;
+                self.addon_sources.open_file(&handle, addon, path.clone())?;
+                ctx.request_repaint();
+            }
+            Step::Transport(lane, command, position) => {
+                let (addon, source) = self.lane_addon_source(*lane)?;
+                let handle = self
+                    .controller
+                    .addons()
+                    .cloned()
+                    .ok_or("no add-on manager")?;
+                self.addon_sources
+                    .send_transport(&handle, &addon, &source, *command, *position);
+                ctx.request_repaint();
+            }
+            Step::Wait(milliseconds) => {
+                if let Some(harness) = self.harness.as_mut() {
+                    harness.hold = Duration::from_millis(*milliseconds);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// The add-on and source id of the lane's add-on source.
+    fn lane_addon_source(&self, lane: usize) -> Result<(String, String), String> {
+        match self
+            .controller
+            .sources()
+            .get(lane)
+            .and_then(Option::as_ref)
+            .map(|settings| &settings.source)
+        {
+            Some(crate::controller::CaptureSource::Addon {
+                addon_id,
+                source_id,
+                ..
+            }) => Ok((addon_id.clone(), source_id.clone())),
+            _ => Err("the lane has no add-on source".into()),
+        }
     }
 }
 
@@ -890,6 +1006,37 @@ mod tests {
             ]
         );
         assert!(steps.iter().all(Step::waits));
+        let steps = parse_steps(
+            r"format=B:7.1.4;open-format=a;open=com.example.player:C:\clips\joc.ec3;transport=A:play;transport=a:seek,12.5;transport=A:stop;wait=1500",
+        )
+        .unwrap();
+        assert_eq!(
+            steps,
+            [
+                Step::Format(1, "7.1.4".into()),
+                Step::OpenFormatList(0),
+                Step::Open(
+                    "com.example.player".into(),
+                    PathBuf::from(r"C:\clips\joc.ec3")
+                ),
+                Step::Transport(0, TransportCommand::Play, None),
+                Step::Transport(0, TransportCommand::Seek, Some(12.5)),
+                Step::Transport(0, TransportCommand::Stop, None),
+                Step::Wait(1500),
+            ]
+        );
+        // The step that only opens a list does not wait, as it changes nothing to settle on.
+        assert!(!Step::OpenFormatList(0).waits());
+        for bad in [
+            "transport=A:rewind",
+            "transport=A:seek,-1",
+            "transport=A",
+            "wait=soon",
+            "open=nocolon",
+            "format=C:x",
+        ] {
+            assert!(parse_steps(bad).is_err(), "{bad}");
+        }
         for bad in [
             "set=a:b",
             "set=a=1",

@@ -55,6 +55,7 @@ use winit::{
     window::Window,
 };
 
+mod addon_sources;
 mod addons_page;
 mod harness;
 mod stack;
@@ -62,6 +63,7 @@ mod stack;
 mod test_profile;
 mod text;
 
+use addon_sources::AddonSources;
 use addons_page::{AddonsPage, PageRequest};
 use stack::LaneBox;
 use text::Language;
@@ -429,6 +431,8 @@ struct Recorder {
     options_focus_requested: bool,
     options_section: OptionsSection,
     addons_page: AddonsPage,
+    /// What add-on sources add to the Sources section, and the compact transport.
+    addon_sources: AddonSources,
     /// Where a test copy puts its Options window, off every screen like its main window.
     options_test_position: Option<Pos2>,
     available_sources: Vec<CaptureSource>,
@@ -770,6 +774,18 @@ fn group_on_show(
         .map(|group| (group.id.clone(), group.label.clone()))
         .collect();
     (group, choices)
+}
+
+/// The least width of the plot, and height of a lane, that take the compact transport.
+const TRANSPORT_MIN_WIDTH: f32 = 240.0;
+const TRANSPORT_MIN_LANE_HEIGHT: f32 = 22.0;
+
+/// A lane's compact transport: play or pause, and the position.
+struct TransportChip {
+    rect: Rect,
+    addon_id: String,
+    source_id: String,
+    chip: addon_sources::Chip,
 }
 
 /// One button of a lane's channel group switch.
@@ -1144,6 +1160,8 @@ enum OptionsAction {
     SelectSnapshotFolder,
     OpenSnapshotFolder,
     PickAddonFile,
+    /// Choose a file for this add-on to open.
+    OpenAddonFile(String),
     OpenLink(String),
     Hide,
     Show,
@@ -1366,6 +1384,7 @@ impl Recorder {
             options_focus_requested: false,
             options_section: OptionsSection::Actions,
             addons_page: AddonsPage::default(),
+            addon_sources: AddonSources::new(startup::test_instance().is_some()),
             options_test_position: None,
             available_sources: vec![CaptureSource::System, CaptureSource::DefaultMicrophone],
             source_list_worker: None,
@@ -1988,7 +2007,9 @@ impl Recorder {
                 || self.plugin_snapshot_request.is_some()
                 || !self.pending_plugin_snapshots.is_empty(),
             // Add-on manager replies arrive without a repaint of their own.
-            polling: self.source_list_worker.is_some() || self.addons_page.waiting(),
+            polling: self.source_list_worker.is_some()
+                || self.addons_page.waiting()
+                || self.addon_sources.waiting(),
             tray_retry: if self.options_in_taskbar || self.test_copy {
                 None
             } else if let Some(tray) = &self.tray {
@@ -2771,9 +2792,13 @@ impl Recorder {
             if let Some(harness) = &mut self.harness {
                 harness.drop_on_options(ui.ctx());
             }
-            // A package dropped here opens its confirmation on the Add-ons page.
-            if let Some(dropped) = addons_page::dropped_package(&dropped_paths(ui.ctx())) {
-                self.review_addon(dropped);
+            // A package dropped here opens its confirmation on the Add-ons page; another file goes
+            // to the add-on that opens it.
+            let dropped = dropped_paths(ui.ctx());
+            if let Some(package) = addons_page::dropped_package(&dropped) {
+                self.review_addon(package);
+            } else {
+                self.route_dropped_files(ui.ctx(), &dropped, false);
             }
             let action = self.options_contents(ui, frame);
             addons_page::paint_drop_hint(ui.ctx(), self.accent, Language::current());
@@ -2806,6 +2831,7 @@ impl Recorder {
             Some(OptionsAction::SelectSnapshotFolder) => self.select_saved_snapshot_folder(frame),
             Some(OptionsAction::OpenSnapshotFolder) => self.open_saved_snapshot_folder(frame),
             Some(OptionsAction::PickAddonFile) => self.pick_addon_file(frame),
+            Some(OptionsAction::OpenAddonFile(id)) => self.pick_file_for_addon(frame, &id),
             Some(OptionsAction::OpenLink(link)) => self.open_link(&link),
             Some(OptionsAction::Hide) => self.hide(ctx),
             Some(OptionsAction::Show) => self.show(ctx),
@@ -2867,7 +2893,7 @@ impl Recorder {
                                 self.app_options(ui, frame)
                             }
                             OptionsSection::Capture => { self.capture_options(ui); None }
-                            OptionsSection::Sources => { self.source_options(ui); None }
+                            OptionsSection::Sources => self.source_options(ui),
                             OptionsSection::Appearance => { self.appearance_options(ui); None }
                             OptionsSection::Export => {
                                 self.wav_settings(ui);
@@ -2951,6 +2977,23 @@ impl Recorder {
         if clear { self.clear_capture(); }
     }
 
+    /// When wide lanes leave room for less history than the setting asks for, says how much is
+    /// kept.
+    fn short_history_note(&self) -> Option<String> {
+        let requested = f64::from(self.controller.retention().seconds());
+        let effective = self.controller.effective_retention_seconds()?;
+        if !effective.is_finite() || effective >= requested - 0.5 {
+            return None;
+        }
+        let channels: usize = self
+            .controller
+            .active_lanes()
+            .iter()
+            .filter_map(|&lane| self.controller.track_channels(lane))
+            .sum();
+        Some(Language::current().shorter_history(channels, effective))
+    }
+
     fn capture_options(&mut self, ui: &mut egui::Ui) {
         options_field(ui, "Retain the latest audio", |ui| {
             let mut retention = self.controller.retention();
@@ -2964,18 +3007,8 @@ impl Recorder {
             }
         });
         // Wide lanes fill memory sooner; say how much of the setting is really kept.
-        let requested = f64::from(self.controller.retention().seconds());
-        if let Some(effective) = self.controller.effective_retention_seconds()
-            && effective.is_finite()
-            && effective < requested - 0.5
-        {
-            let channels: usize = self
-                .controller
-                .active_lanes()
-                .iter()
-                .filter_map(|&lane| self.controller.track_channels(lane))
-                .sum();
-            options_note(ui, Language::current().shorter_history(channels, effective));
+        if let Some(note) = self.short_history_note() {
+            options_note(ui, note);
         }
         let mut retain_silence = self.controller.retain_silence();
         if ui.checkbox(&mut retain_silence, "Keep quiet sections").changed() {
@@ -3095,11 +3128,19 @@ impl Recorder {
         }
     }
 
-    fn source_options(&mut self, ui: &mut egui::Ui) {
+    fn source_options(&mut self, ui: &mut egui::Ui) -> Option<OptionsAction> {
+        let language = Language::current();
+        let mut action = None;
+        let mut go_to_addons = false;
+        // A dropped file that more than one add-on opens waits here for the user's choice.
+        if let Some((id, path)) = self.addon_sources.show_question(ui, language) {
+            self.open_in_addon(&id, path);
+        }
         // The list opened on a spinner and was measured for that; give the scanned rows room.
         if std::mem::take(&mut self.source_menu_outdated) && let Some(menu) = self.source_menu {
             remeasure_options_menu(ui.ctx(), menu);
         }
+        let history_note = self.short_history_note();
         let choices = self.available_sources.as_slice();
         let scanning = self.source_list_worker.is_some();
         let mut source_menu_opened = false;
@@ -3147,7 +3188,39 @@ impl Recorder {
                         source,
                         route: configured.filter(|_| same_source).map_or(ChannelRoute::Merged, |settings| settings.route),
                     });
-                    if let Some(settings) = settings {
+                    let mut show_route = true;
+                    let mut covered = false;
+                    if let Some(settings) = settings
+                        && let CaptureSource::Addon {
+                            addon_id,
+                            source_id,
+                            name,
+                        } = &settings.source
+                    {
+                        // An add-on source offers its formats where an ordinary one offers
+                        // routes. The routes stay for a format of one or two channels.
+                        let channels = self.controller.track_channels(lane);
+                        let history = history_note
+                            .clone()
+                            .filter(|_| channels.is_some_and(|count| count > 2));
+                        let outcome = self.addon_sources.show_lane(
+                            ui,
+                            self.controller.addons(),
+                            language,
+                            self.accent,
+                            lane,
+                            (addon_id, source_id, name),
+                            channels,
+                            history,
+                        );
+                        show_route = outcome.show_route;
+                        covered = outcome.covered;
+                        go_to_addons |= outcome.add_ons_page;
+                        if let Some(id) = outcome.open_file {
+                            action = Some(OptionsAction::OpenAddonFile(id));
+                        }
+                    }
+                    if let Some(settings) = settings.as_mut().filter(|_| show_route) {
                         options_field(ui, "Channel route", |ui| {
                             let width = options_control_width(ui);
                             egui::ComboBox::from_id_salt("route")
@@ -3162,8 +3235,12 @@ impl Recorder {
                                 });
                         });
                     }
-                    if let Some(status) = self.controller.source_status(lane) { options_note(ui, status); }
-                    if lane == 0 { ui.separator(); }
+                    if !covered && let Some(status) = self.controller.source_status(lane) {
+                        options_note(ui, status);
+                    }
+                    if lane == 0 {
+                        ui.separator();
+                    }
                 });
             }
         });
@@ -3173,6 +3250,73 @@ impl Recorder {
             self.save_preference(Key::CaptureSources, serialize_sources(&sources));
             self.controller.set_sources(sources);
             self.sync_generation();
+        }
+        if go_to_addons {
+            self.options_section = OptionsSection::Addons;
+        }
+        action
+    }
+
+    /// Sends a file to an add-on and says so in the status line when that fails.
+    fn open_in_addon(&mut self, id: &str, path: PathBuf) {
+        let Some(handle) = self.controller.addons().cloned() else {
+            return;
+        };
+        let file = path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        if let Err(reason) = self.addon_sources.open_file(&handle, id, path) {
+            self.message = Language::current().could_not_open_file(&file, &reason);
+        }
+    }
+
+    /// The "Open file…" button: a file dialog for the types the add-on declared.
+    fn pick_file_for_addon(&mut self, frame: &eframe::Frame, id: &str) {
+        let language = Language::current();
+        let Some((name, files)) = self.addon_sources.open_files_of(id) else {
+            return;
+        };
+        let extensions: Vec<&str> = files
+            .extensions
+            .iter()
+            .map(|extension| extension.trim_start_matches('.'))
+            .collect();
+        let chosen = rfd::FileDialog::new()
+            .set_title(language.open_file_title(&name))
+            .add_filter(files.description.as_str(), &extensions)
+            .set_parent(frame)
+            .pick_file();
+        if let Some(path) = chosen {
+            self.open_in_addon(id, path);
+        }
+        self.last_interaction = Instant::now();
+    }
+
+    /// Files dropped on a window that are not add-on packages go to the add-on that opens them.
+    fn route_dropped_files(
+        &mut self,
+        ctx: &egui::Context,
+        paths: &[PathBuf],
+        on_main_window: bool,
+    ) {
+        let handle = self.controller.addons().cloned();
+        match self
+            .addon_sources
+            .drop_files(handle.as_ref(), paths, Language::current())
+        {
+            addon_sources::DropResult::Ignored | addon_sources::DropResult::Opening => {}
+            addon_sources::DropResult::Message(text) => self.message = text,
+            addon_sources::DropResult::Choose => {
+                self.options_section = OptionsSection::Sources;
+                if !on_main_window {
+                    return;
+                }
+                if self.options_open {
+                    self.options_focus_requested = true;
+                } else {
+                    self.open_options(ctx);
+                }
+            }
         }
     }
 
@@ -3992,6 +4136,116 @@ impl Recorder {
         chips
     }
 
+    /// The compact transport of each lane whose add-on source reports one, at the lane's bottom
+    /// left, after its group switch. It is left out of a lane too short or a window too narrow
+    /// to take it without covering the waveform.
+    fn transport_chips(&self, ui: &egui::Ui, rect: Rect, boxes: &[LaneBox]) -> Vec<TransportChip> {
+        let mut chips = Vec::new();
+        if self.waveform_only {
+            return chips;
+        }
+        let inner = self.timeline_rect(rect);
+        if inner.width() < TRANSPORT_MIN_WIDTH {
+            return chips;
+        }
+        let groups = self.group_chips(ui, rect, boxes);
+        let now = Instant::now();
+        for (plan, lane_box) in self.lanes.iter().zip(boxes) {
+            if lane_box.height < TRANSPORT_MIN_LANE_HEIGHT {
+                continue;
+            }
+            let Some(CaptureSource::Addon {
+                addon_id,
+                source_id,
+                ..
+            }) = self
+                .controller
+                .sources()
+                .get(plan.lane)
+                .and_then(Option::as_ref)
+                .map(|settings| &settings.source)
+            else {
+                continue;
+            };
+            let Some(chip) = self.addon_sources.chip(addon_id, source_id, now) else {
+                continue;
+            };
+            let size = addon_sources::chip_size(ui.painter(), &chip.text);
+            let left = groups
+                .iter()
+                .filter(|group| group.lane == plan.lane)
+                .map(|group| group.rect.right() + 4.0)
+                .fold(inner.left() + 4.0, f32::max);
+            let bottom = inner.top() + lane_box.top + lane_box.height - 3.0;
+            let rect = Rect::from_min_size(Pos2::new(left, bottom - size.y), size);
+            if rect.right() > inner.right() - 4.0 {
+                continue;
+            }
+            chips.push(TransportChip {
+                rect,
+                addon_id: addon_id.clone(),
+                source_id: source_id.clone(),
+                chip,
+            });
+        }
+        chips
+    }
+
+    /// A press on a lane's compact transport plays or pauses its source.
+    fn interact_transport(&mut self, ui: &egui::Ui, rect: Rect) -> Option<String> {
+        if self.waveform_only {
+            return None;
+        }
+        let boxes = self.lane_boxes(self.timeline_rect(rect).height());
+        let chips = self.transport_chips(ui, rect, &boxes);
+        self.lane_controls
+            .extend(chips.iter().map(|chip| chip.rect));
+        let (hover, press) = ui.input(|input| {
+            let press = input.events.iter().find_map(|event| match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    ..
+                } => Some(*pos),
+                _ => None,
+            });
+            (input.pointer.hover_pos(), press)
+        });
+        if self.gesture.is_none()
+            && let Some(chip) =
+                press.and_then(|point| chips.iter().find(|chip| chip.rect.contains(point)))
+            && let Some(handle) = self.controller.addons().cloned()
+        {
+            self.addon_sources
+                .toggle_play(&handle, &chip.addon_id, &chip.source_id);
+        }
+        let chip = chips
+            .iter()
+            .find(|chip| hover.is_some_and(|point| chip.rect.contains(point)))?;
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        Some(Language::current().transport_tip(chip.chip.playing, &chip.chip.source))
+    }
+
+    fn paint_transport(
+        &self,
+        ui: &egui::Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        boxes: &[LaneBox],
+    ) {
+        let hover = ui.input(|input| input.pointer.hover_pos());
+        for chip in self.transport_chips(ui, rect, boxes) {
+            addon_sources::paint_chip(
+                painter,
+                chip.rect,
+                &chip.chip,
+                hover.is_some_and(|point| chip.rect.contains(point)),
+                self.accent,
+            );
+        }
+    }
+
     /// The scroll bar track of a lane that scrolls, in the plot's right margin.
     fn scroll_track(&self, rect: Rect, lane_box: &LaneBox) -> Rect {
         let inner = self.timeline_rect(rect);
@@ -4395,6 +4649,7 @@ impl Recorder {
         if stacked {
             self.paint_lane_furniture(ui, &painter, rect, audio, &boxes);
         }
+        self.paint_transport(ui, &painter, rect, &boxes);
         self.paint_flags(&painter, audio);
 
         if !self.waveform_only
@@ -4736,6 +4991,17 @@ impl eframe::App for Recorder {
         self.collect_source_list();
         self.addons_page
             .poll(self.controller.addons(), Language::current());
+        let in_use = |id: &str| {
+            self.controller.sources().iter().flatten().any(|settings| {
+                matches!(&settings.source, CaptureSource::Addon { addon_id, .. } if addon_id == id)
+            })
+        };
+        if let Some(message) =
+            self.addon_sources
+                .poll(self.controller.addons(), Language::current(), in_use)
+        {
+            self.message = message;
+        }
         let now = Instant::now();
         self.watch_pin(frame, now);
         if let Some(drag) = &mut self.window_drag
@@ -4844,6 +5110,9 @@ impl eframe::App for Recorder {
                 let mut lane_tip = None;
                 if !interaction_blocked {
                     lane_tip = self.interact_lanes(ui, rect.shrink(self.border_inset()));
+                    let transport_tip =
+                        self.interact_transport(ui, rect.shrink(self.border_inset()));
+                    lane_tip = transport_tip.or(lane_tip);
                     self.interact_waveform(ui, frame, rect.shrink(self.border_inset()));
                 }
                 self.draw_waveform(ui, rect, !interaction_blocked && window_cursor.is_none());
@@ -4889,13 +5158,16 @@ impl eframe::App for Recorder {
         // A package dropped on this window opens its confirmation in Options. Other files are
         // left alone, and a clip dragged out never drops here (`file_drag` cancels a drop on
         // the app's own windows).
-        if let Some(dropped) = addons_page::dropped_package(&dropped_paths(ui.ctx())) {
-            self.review_addon(dropped);
+        let dropped = dropped_paths(ui.ctx());
+        if let Some(package) = addons_page::dropped_package(&dropped) {
+            self.review_addon(package);
             if self.options_open {
                 self.options_focus_requested = true;
             } else {
                 self.open_options(ui.ctx());
             }
+        } else {
+            self.route_dropped_files(ui.ctx(), &dropped, true);
         }
         addons_page::paint_drop_hint(ui.ctx(), self.accent, Language::current());
         self.draw_options_window(ui.ctx(), frame);

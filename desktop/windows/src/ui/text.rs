@@ -592,6 +592,200 @@ impl Language {
             Self::TraditionalChinese => format!("無法開啟連結：{reason}"),
         }
     }
+
+    // Add-on sources in the Sources section: formats, files, transport and problems.
+
+    pub(crate) fn format_field(self) -> &'static str {
+        self.pick("Format", "格式")
+    }
+
+    pub(crate) fn channel_count(self, count: usize) -> String {
+        match self {
+            Self::English if count == 1 => "1 channel".to_owned(),
+            Self::English => format!("{count} channels"),
+            Self::TraditionalChinese => format!("{count} 個聲道"),
+        }
+    }
+
+    pub(crate) fn routes_only_for_narrow(self) -> &'static str {
+        self.pick(
+            "Each channel of a wide format has its own row, so there is no route to choose.",
+            "多聲道格式的每個聲道各有一列，因此不需選擇聲道路由。",
+        )
+    }
+
+    pub(crate) fn format_unavailable(self, format: &str) -> String {
+        match self {
+            Self::English => {
+                format!("The add-on reports the format \"{format}\", which it does not list.")
+            }
+            Self::TraditionalChinese => {
+                format!("附加元件回報的格式「{format}」不在它提供的清單中。")
+            }
+        }
+    }
+
+    pub(crate) fn could_not_choose_format(self, label: &str, reason: &str) -> String {
+        match self {
+            Self::English => format!("Could not choose {label}: {reason}"),
+            Self::TraditionalChinese => format!("無法選擇 {label}：{reason}"),
+        }
+    }
+
+    pub(crate) fn file_field(self) -> &'static str {
+        self.pick("File", "檔案")
+    }
+
+    pub(crate) fn open_file_button(self) -> &'static str {
+        self.pick("Open file…", "開啟檔案…")
+    }
+
+    pub(crate) fn open_file_title(self, addon: &str) -> String {
+        match self {
+            Self::English => format!("Open a file with {addon}"),
+            Self::TraditionalChinese => format!("用「{addon}」開啟檔案"),
+        }
+    }
+
+    pub(crate) fn open_file_help(self, description: &str, extensions: &str) -> String {
+        match self {
+            Self::English => format!(
+                "Opens {description} ({extensions}). You can also drop the file on a window."
+            ),
+            Self::TraditionalChinese => {
+                format!("可開啟 {description}（{extensions}）。也可以把檔案拖放到視窗上。")
+            }
+        }
+    }
+
+    pub(crate) fn opened_file(self, file: &str, addon: &str) -> String {
+        match self {
+            Self::English => format!("Sent {file} to {addon}."),
+            Self::TraditionalChinese => format!("已把 {file} 交給「{addon}」。"),
+        }
+    }
+
+    pub(crate) fn choose_its_source(self, source: &str) -> String {
+        match self {
+            Self::English => {
+                format!("Choose \"{source}\" as an audio source in Options, Sources, to see it.")
+            }
+            Self::TraditionalChinese => {
+                format!("請在「選項」的「來源」中選擇「{source}」才能看到它。")
+            }
+        }
+    }
+
+    pub(crate) fn could_not_open_file(self, file: &str, reason: &str) -> String {
+        match self {
+            Self::English => format!("Could not open {file}: {reason}"),
+            Self::TraditionalChinese => format!("無法開啟 {file}：{reason}"),
+        }
+    }
+
+    pub(crate) fn which_addon(self, file: &str) -> String {
+        match self {
+            Self::English => format!("Which add-on should open {file}?"),
+            Self::TraditionalChinese => format!("要用哪個附加元件開啟 {file}？"),
+        }
+    }
+
+    pub(crate) fn opener_not_running(self, addon: &str) -> String {
+        match self {
+            Self::English => format!(
+                "{addon} opens this kind of file but is not running. Turn it on in Options, Add-ons."
+            ),
+            Self::TraditionalChinese => {
+                format!(
+                    "「{addon}」可以開啟這種檔案，但它沒有執行。請在「選項」的「附加元件」中開啟它。"
+                )
+            }
+        }
+    }
+
+    pub(crate) fn play(self) -> &'static str {
+        self.pick("Play", "播放")
+    }
+
+    pub(crate) fn pause(self) -> &'static str {
+        self.pick("Pause", "暫停")
+    }
+
+    pub(crate) fn stop(self) -> &'static str {
+        self.pick("Stop", "停止")
+    }
+
+    pub(crate) fn playback_field(self) -> &'static str {
+        self.pick("Playback", "播放")
+    }
+
+    pub(crate) fn moving_to(self, time: &str) -> String {
+        match self {
+            Self::English => format!("Moving to {time}. The sound returns in a moment."),
+            Self::TraditionalChinese => format!("正在移到 {time}，聲音稍後就會回來。"),
+        }
+    }
+
+    pub(crate) fn source_not_installed(self, source: &str) -> String {
+        match self {
+            Self::English => format!("The add-on that provides \"{source}\" is not installed."),
+            Self::TraditionalChinese => format!("提供「{source}」的附加元件尚未安裝。"),
+        }
+    }
+
+    pub(crate) fn source_not_installed_hint(self) -> &'static str {
+        self.pick(
+            "Install it on the Add-ons page, or choose another source.",
+            "請在「附加元件」頁面安裝它，或選擇其他來源。",
+        )
+    }
+
+    pub(crate) fn source_not_running(self, addon: &str, state: &str) -> String {
+        match self {
+            Self::English => format!("{addon} is not available. {state}"),
+            Self::TraditionalChinese => format!("「{addon}」目前無法使用。{state}"),
+        }
+    }
+
+    pub(crate) fn source_not_running_hint(self) -> &'static str {
+        self.pick(
+            "Turn it on or start it again on the Add-ons page, or choose another source.",
+            "請在「附加元件」頁面開啟它或重新啟動它，或選擇其他來源。",
+        )
+    }
+
+    pub(crate) fn source_gone(self, addon: &str, source: &str) -> String {
+        match self {
+            Self::English => format!("{addon} no longer offers \"{source}\"."),
+            Self::TraditionalChinese => format!("「{addon}」不再提供「{source}」。"),
+        }
+    }
+
+    pub(crate) fn source_gone_hint(self) -> &'static str {
+        self.pick(
+            "Choose another source. If you expected it, restart the add-on on the Add-ons page.",
+            "請選擇其他來源。如果它應該存在，請在「附加元件」頁面重新啟動附加元件。",
+        )
+    }
+
+    pub(crate) fn addon_error_hint(self) -> &'static str {
+        self.pick(
+            "Try another file or format, or restart the add-on on the Add-ons page.",
+            "請試試其他檔案或格式，或在「附加元件」頁面重新啟動附加元件。",
+        )
+    }
+
+    pub(crate) fn open_addons_page(self) -> &'static str {
+        self.pick("Open the Add-ons page", "開啟附加元件頁面")
+    }
+
+    pub(crate) fn transport_tip(self, playing: bool, source: &str) -> String {
+        let action = if playing { self.pause() } else { self.play() };
+        match self {
+            Self::English => format!("{action} {source}"),
+            Self::TraditionalChinese => format!("{action}：{source}"),
+        }
+    }
 }
 
 /// A size as Windows Explorer shows it, in units of 1024.
@@ -653,6 +847,102 @@ mod tests {
         assert_eq!(English.channel(3, 12, "C"), "Channel 3 of 12: C");
         assert_eq!(TraditionalChinese.show_group("Objects"), "顯示Objects");
         assert_ne!(English.scroll_hint(), TraditionalChinese.scroll_hint());
+    }
+
+    #[test]
+    fn every_source_text_exists_in_both_languages_and_differs() {
+        let pairs: Vec<(String, String)> = [
+            super::Language::format_field,
+            super::Language::routes_only_for_narrow,
+            super::Language::file_field,
+            super::Language::open_file_button,
+            super::Language::play,
+            super::Language::pause,
+            super::Language::stop,
+            super::Language::playback_field,
+            super::Language::source_not_installed_hint,
+            super::Language::source_not_running_hint,
+            super::Language::source_gone_hint,
+            super::Language::addon_error_hint,
+            super::Language::open_addons_page,
+        ]
+        .into_iter()
+        .map(|text| {
+            (
+                text(English).to_owned(),
+                text(TraditionalChinese).to_owned(),
+            )
+        })
+        .chain([
+            (
+                English.channel_count(12),
+                TraditionalChinese.channel_count(12),
+            ),
+            (
+                English.format_unavailable("x"),
+                TraditionalChinese.format_unavailable("x"),
+            ),
+            (
+                English.could_not_choose_format("L", "x"),
+                TraditionalChinese.could_not_choose_format("L", "x"),
+            ),
+            (
+                English.open_file_title("A"),
+                TraditionalChinese.open_file_title("A"),
+            ),
+            (
+                English.open_file_help("Audio", ".ec3"),
+                TraditionalChinese.open_file_help("Audio", ".ec3"),
+            ),
+            (
+                English.opened_file("f", "A"),
+                TraditionalChinese.opened_file("f", "A"),
+            ),
+            (
+                English.choose_its_source("S"),
+                TraditionalChinese.choose_its_source("S"),
+            ),
+            (
+                English.could_not_open_file("f", "x"),
+                TraditionalChinese.could_not_open_file("f", "x"),
+            ),
+            (
+                English.which_addon("f"),
+                TraditionalChinese.which_addon("f"),
+            ),
+            (
+                English.opener_not_running("A"),
+                TraditionalChinese.opener_not_running("A"),
+            ),
+            (
+                English.moving_to("1:00"),
+                TraditionalChinese.moving_to("1:00"),
+            ),
+            (
+                English.source_not_installed("S"),
+                TraditionalChinese.source_not_installed("S"),
+            ),
+            (
+                English.source_not_running("A", "Stopped"),
+                TraditionalChinese.source_not_running("A", "已停止"),
+            ),
+            (
+                English.source_gone("A", "S"),
+                TraditionalChinese.source_gone("A", "S"),
+            ),
+            (
+                English.transport_tip(true, "S"),
+                TraditionalChinese.transport_tip(true, "S"),
+            ),
+        ])
+        .collect();
+        for (english, chinese) in pairs {
+            assert!(!english.is_empty() && !chinese.is_empty());
+            assert_ne!(english, chinese);
+            assert!(chinese.chars().any(|c| c as u32 >= 0x3000), "{chinese}");
+        }
+        assert_eq!(English.channel_count(1), "1 channel");
+        assert_eq!(English.channel_count(12), "12 channels");
     }
 
     #[test]

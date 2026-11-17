@@ -17,11 +17,21 @@
 //! - `BACKTRACKING_TEST_ADDONS`: which add-ons are installed, separated by `,`: `tone` (the
 //!   default), `quits` (a package whose program exits at once, so it fails), `broken` (an
 //!   installed folder whose `addon.json` cannot be read), or `none`. Add-ons from an earlier
-//!   seed are removed first.
+//!   seed are removed first. Two more: `tone-opens` installs the test tone, under the same id,
+//!   with the `open-files` capability for `.ec3` files (it ignores the file, but it makes a
+//!   second add-on that opens them), and `atmos` installs the Dolby Atmos add-on from
+//!   `BACKTRACKING_TEST_ATMOS_PACKAGE` (default
+//!   `D:\Developing\backtracking-joc\target\backtracking-joc.btaddon`), switches its
+//!   `play_through_speakers` setting off as soon as it runs (and `capture_objects` on when `BACKTRACKING_TEST_ATMOS_OBJECTS=1`) and waits until the host holds
+//!   that value. Nothing may make sound, so no file is ever opened before that.
+//! - `BACKTRACKING_TEST_LANE_A`: `tone` (default when the test tone is installed), `atmos`
+//!   (default when only the Atmos add-on is) or `off`. Lane B takes `atmos` as well. To see a
+//!   missing source: `stopped` (the add-on from `quits`, which has stopped), `gone` (the test
+//!   tone no longer offers it) or `uninstalled` (no such add-on).
 //!
 //! Seeding also writes packages to drop on the window into `<LOCALAPPDATA>\packages`:
-//! `tone-0.2.0.btaddon` (the test tone with a newer version), `quits.btaddon` and
-//! `not-a-package.btaddon` (not a ZIP file).
+//! `tone-0.2.0.btaddon` (the test tone with a newer version), `quits.btaddon`,
+//! `not-a-package.btaddon` (not a ZIP file) and `not-audio.ec3` (text, for the Atmos add-on).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,6 +47,8 @@ use crate::preferences::{Key, Preferences, serialize_sources};
 const ADDON_ID: &str = "com.example.test-tone";
 const QUITS_ID: &str = "com.example.quits";
 const BROKEN_ID: &str = "com.example.broken";
+const ATMOS_ID: &str = "com.kamelkyp.backtracking.joc";
+const ATMOS_SETTING: &str = "play_through_speakers";
 /// Sender ids are hexadecimal digits and dashes.
 const STEREO_SENDER_ID: &str = "c1c1-5e7d-0002";
 const STEREO_SENDER_NAME: &str = "Stereo test tone";
@@ -71,12 +83,32 @@ fn preference_key(name: &str) -> Option<Key> {
         "always-on-top" => Key::AlwaysOnTop,
         "wide-lane-export-v1" => Key::WideExport,
         "show-second-lines" => Key::SecondsLines,
+        "keep-quiet-sections" => Key::RetainSilence,
         _ => return None,
     })
 }
 
 /// Writes a copy of the unpacked test tone with other manifest fields, packed as `output`.
 fn repack(unpacked: &Path, work: &Path, changes: &[(&str, &str)], output: &Path) {
+    repack_manifest(
+        unpacked,
+        work,
+        |manifest| {
+            for (field, value) in changes {
+                manifest[*field] = serde_json::Value::from(*value);
+            }
+        },
+        output,
+    );
+}
+
+/// The same, with any change to the manifest.
+fn repack_manifest(
+    unpacked: &Path,
+    work: &Path,
+    change: impl FnOnce(&mut serde_json::Value),
+    output: &Path,
+) {
     let copy = work.join(output.file_stem().unwrap());
     if copy.exists() {
         fs::remove_dir_all(&copy).unwrap();
@@ -89,10 +121,11 @@ fn repack(unpacked: &Path, work: &Path, changes: &[(&str, &str)], output: &Path)
     .unwrap();
     let mut manifest: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(unpacked.join("addon.json")).unwrap()).unwrap();
-    for (field, value) in changes {
-        manifest[*field] = serde_json::Value::from(*value);
-    }
+    change(&mut manifest);
     fs::write(copy.join("addon.json"), manifest.to_string()).unwrap();
+    if output.exists() {
+        fs::remove_file(output).unwrap();
+    }
     package::pack(&copy, output).unwrap();
     fs::remove_dir_all(&copy).unwrap();
 }
@@ -118,10 +151,11 @@ fn seed_test_profile() {
         .collect();
     for name in &wanted {
         assert!(
-            ["tone", "quits", "broken", "none"].contains(name),
-            "BACKTRACKING_TEST_ADDONS takes tone, quits, broken or none, not {name}"
+            ["tone", "tone-opens", "quits", "broken", "atmos", "none"].contains(name),
+            "BACKTRACKING_TEST_ADDONS takes tone, tone-opens, quits, broken, atmos or none, not {name}"
         );
     }
+    let tone_installed = wanted.contains(&"tone") || wanted.contains(&"tone-opens");
 
     // Packages to drop on the window, made from the test tone's own program.
     let packages = folder.join("packages");
@@ -149,6 +183,26 @@ fn seed_test_profile() {
         ],
         &packages.join("quits.btaddon"),
     );
+    repack_manifest(
+        &unpacked,
+        &work,
+        |manifest| {
+            manifest["name"] = "Test tone with files".into();
+            manifest["capabilities"]
+                .as_array_mut()
+                .unwrap()
+                .push("open-files".into());
+            manifest["open_files"] =
+                serde_json::json!({"description": "E-AC-3 audio", "extensions": ["ec3"]});
+        },
+        &packages.join("tone-opens.btaddon"),
+    );
+    // A file the Atmos add-on cannot decode, to see an add-on's error message.
+    fs::write(
+        packages.join("not-audio.ec3"),
+        "This is not an E-AC-3 stream.",
+    )
+    .unwrap();
     fs::write(
         packages.join("not-a-package.btaddon"),
         "This is not a ZIP file.",
@@ -179,10 +233,14 @@ fn seed_test_profile() {
         reply
             .recv_timeout(Duration::from_secs(15))
             .expect("add-on manager answers")
-            .unwrap()
+            .unwrap_or_else(|error| panic!("the add-on manager refused: {error}"))
     }
-    if wanted.contains(&"tone") {
-        reply(handle.install(tone_package));
+    if tone_installed {
+        reply(handle.install(if wanted.contains(&"tone-opens") {
+            packages.join("tone-opens.btaddon")
+        } else {
+            tone_package
+        }));
         reply(handle.set_enabled(ADDON_ID, true));
         let running = |format: Option<&str>| {
             handle.snapshot().addon(ADDON_ID).is_some_and(|addon| {
@@ -200,6 +258,56 @@ fn seed_test_profile() {
             "the test tone uses the chosen format",
         );
     }
+    if wanted.contains(&"atmos") {
+        let atmos_package = std::env::var_os("BACKTRACKING_TEST_ATMOS_PACKAGE").map_or_else(
+            || PathBuf::from(r"D:\Developing\backtracking-joc\target\backtracking-joc.btaddon"),
+            PathBuf::from,
+        );
+        reply(handle.install(atmos_package));
+        reply(handle.set_enabled(ATMOS_ID, true));
+        wait_for(
+            || {
+                handle
+                    .snapshot()
+                    .addon(ATMOS_ID)
+                    .is_some_and(|addon| addon.state == AddonState::Running)
+            },
+            "the Atmos add-on runs",
+        );
+        // Before anything else can happen: it plays through the speakers unless told not to.
+        // The add-on is Running before it has described its settings; ask again until they exist.
+        let mut settings = vec![(ATMOS_SETTING, false)];
+        if std::env::var("BACKTRACKING_TEST_ATMOS_OBJECTS").is_ok_and(|value| value == "1") {
+            settings.push(("capture_objects", true));
+        }
+        for (key, value) in settings {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let answer = handle
+                    .set_setting(ATMOS_ID, key, serde_json::json!(value))
+                    .recv_timeout(Duration::from_secs(15))
+                    .expect("add-on manager answers");
+                match answer {
+                    Ok(()) => break,
+                    Err(error) => {
+                        assert!(Instant::now() < deadline, "{key} refused: {error}");
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+            wait_for(
+                || {
+                    handle.snapshot().addon(ATMOS_ID).is_some_and(|addon| {
+                        addon.settings.iter().any(|setting| {
+                            setting.declaration.key == key
+                                && setting.value == serde_json::json!(value)
+                        })
+                    })
+                },
+                "the Atmos add-on holds the setting",
+            );
+        }
+    }
     if wanted.contains(&"quits") {
         // Its program says hello as the test tone, is refused and exits with an error.
         reply(handle.install(packages.join("quits.btaddon")));
@@ -214,6 +322,38 @@ fn seed_test_profile() {
         },
         route: ChannelRoute::Merged,
     };
+    let atmos = SourceSettings {
+        source: CaptureSource::Addon {
+            addon_id: ATMOS_ID.into(),
+            source_id: "main".into(),
+            name: "Dolby Atmos file".into(),
+        },
+        route: ChannelRoute::Merged,
+    };
+    // A lane whose add-on is stopped, whose source the add-on no longer offers, and whose
+    // add-on is not installed: the three ways a saved add-on source can be missing.
+    let missing = |addon_id: &str, source_id: &str, name: &str| SourceSettings {
+        source: CaptureSource::Addon {
+            addon_id: addon_id.into(),
+            source_id: source_id.into(),
+            name: name.into(),
+        },
+        route: ChannelRoute::Merged,
+    };
+    let lane_a = match std::env::var("BACKTRACKING_TEST_LANE_A").as_deref() {
+        Ok("tone") => Some(tone.clone()),
+        Ok("atmos") => Some(atmos.clone()),
+        Ok("off") => None,
+        Ok("stopped") => Some(missing(QUITS_ID, "main", "Quits at once stream")),
+        Ok("gone") => Some(missing(ADDON_ID, "old-stream", "Old stream")),
+        Ok("uninstalled") => Some(missing("com.example.removed", "main", "Removed stream")),
+        Ok(other) => panic!(
+            "BACKTRACKING_TEST_LANE_A is tone, atmos, stopped, gone, uninstalled or off, not {other}"
+        ),
+        Err(_) if tone_installed => Some(tone.clone()),
+        Err(_) if wanted.contains(&"atmos") => Some(atmos.clone()),
+        Err(_) => Some(tone.clone()),
+    };
     let lane_b = match std::env::var("BACKTRACKING_TEST_LANE_B").as_deref() {
         Ok("sender") => Some(SourceSettings {
             source: CaptureSource::Sender {
@@ -223,15 +363,13 @@ fn seed_test_profile() {
             route: ChannelRoute::Merged,
         }),
         Ok("tone") => Some(tone.clone()),
+        Ok("atmos") => Some(atmos.clone()),
         Ok("off") | Err(_) => None,
-        Ok(other) => panic!("BACKTRACKING_TEST_LANE_B is off, sender or tone, not {other}"),
+        Ok(other) => panic!("BACKTRACKING_TEST_LANE_B is off, sender, tone or atmos, not {other}"),
     };
     let preferences = Preferences::in_data_root(&root);
     preferences
-        .save(
-            Key::CaptureSources,
-            &serialize_sources(&[Some(tone), lane_b]),
-        )
+        .save(Key::CaptureSources, &serialize_sources(&[lane_a, lane_b]))
         .unwrap();
     // Exports stay in the test folder, and the window does not sit above the user's.
     let exports = folder.join("exports");

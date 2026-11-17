@@ -24,9 +24,9 @@ use crate::addons::{AddonHandle, AddonInfo, AddonReply, AddonSnapshot, AddonStat
 
 const PACKAGE_EXTENSION: &str = "btaddon";
 /// The colour of a state that needs the user: not responding, failed or broken.
-const PROBLEM: Color32 = Color32::from_rgb(246, 196, 118);
+pub(super) const PROBLEM: Color32 = Color32::from_rgb(246, 196, 118);
 /// A request the add-on or the manager refused.
-const ERROR_TEXT: Color32 = Color32::from_rgb(255, 160, 150);
+pub(super) const ERROR_TEXT: Color32 = Color32::from_rgb(255, 160, 150);
 const STARTING: Color32 = Color32::from_gray(170);
 const OFF: Color32 = Color32::from_gray(110);
 /// The longest value a text setting may hold (contract section 4.2).
@@ -1025,11 +1025,11 @@ fn addon_name(addon: &AddonInfo) -> &str {
         .map_or(addon.id.as_str(), |manifest| manifest.name.as_str())
 }
 
-fn problem_line(ui: &mut egui::Ui, text: &str) {
+pub(super) fn problem_line(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).color(ERROR_TEXT));
 }
 
-fn state_line(ui: &mut egui::Ui, tone: Tone, words: &str, accent: Color32) {
+pub(super) fn state_line(ui: &mut egui::Ui, tone: Tone, words: &str, accent: Color32) {
     let color = match tone {
         Tone::Running => accent,
         Tone::Busy => STARTING,
