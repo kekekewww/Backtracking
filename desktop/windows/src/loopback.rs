@@ -35,7 +35,7 @@ use windows::core::{Error, GUID, HRESULT, HSTRING, Interface, PCWSTR, Ref, imple
 
 mod sources;
 mod timing;
-pub(crate) use sources::CaptureSource;
+pub(crate) use sources::{CaptureSource, SENDER_MARK};
 use sources::{OwnedHandle, RunningProcess, target_process};
 use timing::PacketClock;
 

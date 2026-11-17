@@ -28,6 +28,9 @@ private func checkAudio(_ status: OSStatus, _ operation: String) throws {
     }
 }
 
+/// Comes before a plug-in Sender's name in the source list.
+let senderMark = "【Sender】"
+
 enum CaptureSource: Hashable {
     case system
     case microphone(String)
@@ -57,7 +60,7 @@ enum CaptureSource: Hashable {
         case .microphone(let uid):
             if uid.isEmpty { "Default microphone" } else { "Microphone · \(uid)" }
         case .application(let identifier): "Application · \(identifier)"
-        case .sender: "【Sender】"
+        case .sender: senderMark
         }
     }
 
@@ -307,9 +310,56 @@ func availableCaptureSources(excluding privateDevices: Set<AudioObjectID>) -> [(
     }
     choices += sortedApps.map { (.application($0.key), $0.value) }
     choices.insert(
-        contentsOf: availableSenders().map { (.sender($0.id), "【Sender】\($0.name)") }, at: fixedChoices
+        contentsOf: availableSenders().map { (.sender($0.id), "\(senderMark)\($0.name)") }, at: fixedChoices
     )
     return choices
+}
+
+/// The name each source was last found under, by key, so its files keep that name after the
+/// device, app or Sender goes away.
+@MainActor private var knownFileNames: [String: String] = [:]
+
+/// What a source's files are called when the user has not named it: its name in the source
+/// list, without the mark before a Sender. A source that is gone keeps the name it was last
+/// found under, or else its identifier.
+@MainActor
+func defaultFileName(for source: CaptureSource) -> String {
+    if let name = presentFileName(for: source), !name.isEmpty {
+        knownFileNames[source.key] = name
+        return name
+    }
+    if let known = knownFileNames[source.key] { return known }
+    switch source {
+    case .system:
+        return source.label
+    case .microphone(let uid):
+        return uid
+    case .application(let identifier):
+        // An app that is not running is named the way the Finder shows it, without ".app".
+        return NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier)?
+            .deletingPathExtension().lastPathComponent ?? identifier
+    case .sender:
+        return "Sender"
+    }
+}
+
+/// The name `source` is listed under now, or nil while it is gone.
+@MainActor
+private func presentFileName(for source: CaptureSource) -> String? {
+    switch source {
+    case .system:
+        return source.label
+    case .microphone(let uid):
+        guard !uid.isEmpty else { return source.label }
+        let device = audioObjects(kAudioHardwarePropertyDevices).first {
+            audioString($0, kAudioDevicePropertyDeviceUID) == uid
+        }
+        return device.flatMap { audioString($0, kAudioObjectPropertyName) }
+    case .application(let identifier):
+        return NSRunningApplication.runningApplications(withBundleIdentifier: identifier).first?.localizedName
+    case .sender(let id):
+        return availableSenders().first { $0.id == id }?.name
+    }
 }
 
 private let systemObject = AudioObjectID(kAudioObjectSystemObject)

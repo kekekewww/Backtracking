@@ -20,7 +20,7 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 ### 開啟設定
 
-點擊工具列的齒輪可開啟 **Options**。在插件視窗內按滑鼠右鍵也會開啟 Options；Windows／macOS 桌面版的右鍵則開啟選單，依序為 **Pause／Resume／Retry capture**、**Clear**、**Save snapshot**、**Show waveform only**、**Keep on top**、**Options…** 與 **Quit**。桌面版視窗有焦點時，按 `Space` 可暫停或恢復擷取，按 `Delete`（Mac 鍵盤為 `Fn` + `Delete`）清除目前錄音；有選區時，`Space` 改為試聽選區，`Delete` 則先取消選區。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
+點擊工具列的齒輪可開啟 **Options**。在插件視窗內按滑鼠右鍵也會開啟 Options；Windows／macOS 桌面版的右鍵則開啟選單，依序為 **Pause／Resume／Retry capture**、**Clear**、**Save snapshot**、**Edit A and B separately**、**Show waveform only**、**Keep on top**、**Options…** 與 **Quit**。桌面版視窗有焦點時，按 `Space` 可暫停或恢復擷取，按 `Delete`（Mac 鍵盤為 `Fn` + `Delete`）清除目前錄音；有選區時，`Space` 改為試聽選區，`Delete` 則先取消選區。擷取兩個來源時，單獨輕按右側 `Ctrl`（Mac 為右側 `Command`）可切換[分開編輯 A 和 B](#分開編輯-a-和-b)。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
 
 Options 左側是分類，右側以一列一項的直向清單顯示設定。頁標題使用較大粗體，分組與欄位有明確層級，主要文字至少 15。保留時間、自動續錄、透明度和 WAV 格式使用下拉選單；少於 10 項時依實際項目數決定高度，最多顯示 10 列，超過則在選單內捲動。右側內容較長時向下捲動。桌面設定視窗可調整大小，底部關閉按鈕維持可見。插件會向 DAW 要求放大設定視窗，關閉後恢復原尺寸。
 
@@ -52,7 +52,7 @@ macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`C
 - 框選、調整旗標、縮放或平移會固定原編輯素材與視野，背景照常擷取。即時歷史循環覆寫或縮短保留時間，不會改變固定選區的原始取樣；A／B 共用起訖。完成或取消編輯後回到即時視野，手動 Pause 狀態獨立。
 - 波形區間數、筆畫和參考線密度依實際音訊區域、可見時間跨度及互動狀態調整。
 - 遠／中倍率以連續 min/max 填色與輪廓顯示峰值範圍，放大到個別取樣時改為連接原始 samples 的折線。最小縮放範圍依波形實際寬度決定，約讓一個 sample 占四個邏輯像素；調整視窗尺寸保留原視野，後續縮放遵守有效上下限。這些畫法不改變選區或匯出取樣；[本輪驗證紀錄](QUIET_CAPTURE_AND_WAVEFORM_2026-11-14.md)另列測試狀態。
-- **Save snapshot**、全域快照快捷鍵與成功拖放會同時匯出 A／B。兩個 WAV 使用同一起訖和取樣率。若 DAW 要求指定匯入位置，可選擇分開音軌並使用相同開始位置。
+- **Save snapshot**、全域快照快捷鍵與成功拖放會同時匯出 A／B。兩個 WAV 使用同一起訖和取樣率。若 DAW 要求指定匯入位置，可選擇分開音軌並使用相同開始位置。開啟[分開編輯 A 和 B](#分開編輯-a-和-b)時，選區只匯出所屬的那一軌，沒有選區時拖出的是游標所在的那一軌。
 
 [桌面版更新設定](UPDATES.md)
 
@@ -86,6 +86,7 @@ macOS 桌面版可從選單列顯示或隱藏視窗、暫停或恢復擷取、�
 | 移動視窗 | 在內容區按住 `Alt`，用滑鼠左鍵拖曳。 | 在波形外的內容區按住 `Option`，用左鍵拖曳。在內容區任意位置可按住 `Command` + `Option` 再用左鍵拖曳。 |
 | 調整視窗大小 | 將游標移到視窗內容區的內緣或內角，按住左鍵拖曳。 | 將游標移到視窗內容區的內緣或內角，按住左鍵拖曳。 |
 | 框選音訊 | `Ctrl` 加左鍵自由框選，或 `Shift` 加左鍵吸附框選；兩者可合用。 | `Option`／`Control` 加左鍵自由框選，或 `Shift` 加左鍵吸附框選；可再加 Shift 吸附。 |
+| 分開編輯 A 和 B | 單獨輕按右側 `Ctrl`。 | 單獨輕按右側 `Command`。 |
 
 ### 讀懂波形與錄音狀態
 
@@ -132,9 +133,24 @@ Backtracking 視窗有焦點時，按 `Esc` 或 `Backspace` 可取消編輯並�
 
 按住 `Alt`（macOS 為 `Option`）拖曳選區起點旗標可調整淡入，拖曳終點旗標可調整淡出。往選區內拖得越深，淡化越長；淡入與淡出不會重疊。拖曳時波形會依淡化收窄，完整介面也會顯示淡化長度。淡化為線性，頭尾從無聲開始與結束。拖出的 WAV 與保存的選區快照都會套用淡化；試聽中調整，接下來播放的聲音就會套用新的淡化。重新框選會清除淡化；移動旗標時淡化保留，選區變短時會隨之縮短。
 
+### 分開編輯 A 和 B
+
+同時擷取 A 和 B 時，可以只框選、試聽、拖出或保存其中一軌。在波形上按右鍵選擇 **Edit A and B separately**，或在 Backtracking 視窗有焦點時單獨輕按一下右側 `Ctrl`（Mac 為右側 `Command`）；再選一次或再輕按一次，就回到兩軌一起編輯。這個模式預設關閉，結束程式後不保留。只有一個來源時無法使用，單一來源分成 L／R 兩列也一樣。按住超過半秒，或同時按下其他按鍵或滑鼠按鈕，都不算輕按。
+
+| 動作 | 一起編輯（預設） | 分開編輯 |
+| --- | --- | --- |
+| 框選 | 選區涵蓋 A 和 B | 選區屬於開始拖曳的那一軌，只有該軌變色 |
+| 試聽（`Space`） | 依匯出方式播放 A 和 B | 只播放選區所屬的那一軌 |
+| 淡入淡出 | 套用到 A 和 B | 只套用到選區所屬的那一軌 |
+| 拖出選區 | 匯出 A、B 各一個 WAV | 只匯出選區所屬的那一軌 |
+| 未框選時拖出 | 匯出 A 和 B 的整段音訊 | 只匯出游標所在那一軌的整段音訊 |
+| **Save snapshot**／全域快照快捷鍵 | 保存 A 和 B | 有選區時只保存該軌；沒有選區時仍保存 A 和 B |
+
+開啟後，A 和 B 之間會出現一條細線，游標移到波形上時只有所在的那一軌會亮起。一次只有一個選區，旗標仍由兩軌共用。切換模式不會取消選區：開啟時選區縮到開始框選的那一軌，關閉時恢復涵蓋兩軌。完整介面會標示選區屬於 A 或 B。框選、拖出或調整淡化進行中時，切換不會生效。
+
 ### 保存快照
 
-從 Options 選擇 **Save snapshot**，即可保存目前錄音器的快照。有框選時使用固定素材中的原始選段，A／B 依相同取樣邊界切割；未框選時保存觸發當下保留的整段音訊。準備和保存不隱含暫停背景錄音，也不強制解除手動 Pause。保存選段完成後可回到即時視野；全段保存於背景完成時，不會取消之後才建立的新選區。
+從 Options 選擇 **Save snapshot**，即可保存目前錄音器的快照。有框選時使用固定素材中的原始選段，A／B 依相同取樣邊界切割；開啟分開編輯 A 和 B 時只保存選區所屬的那一軌。未框選時保存觸發當下保留的整段音訊。準備和保存不隱含暫停背景錄音，也不強制解除手動 Pause。保存選段完成後可回到即時視野；全段保存於背景完成時，不會取消之後才建立的新選區。
 
 Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift），macOS 使用 Fn／Globe 加同一位置的鍵，可在背景觸發快照，不必讓 Backtracking 或插件視窗取得焦點。Linux 請使用[快照快捷鍵常駐程式](../desktop/linux/README.md)。在 Options 可指定單一插件實例作為全域快照快捷鍵的目標。Backtracking 沒有綁定 `Ctrl+S`；在 DAW 中仍可用它儲存專案。
 
@@ -171,9 +187,11 @@ Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift
 
 在 WAV 設定勾選 **全部轉成單聲道／Export every file as mono**，每個檔案都會單獨轉成單聲道。立體聲 Merged 與插件的左右聲道會取平均，Side 則輸出擷取到的 Side 訊號。A／B 仍各自匯出，選項預設關閉。回溯歷史儲存在記憶體，關閉桌面程式或移除插件前，請先存下需要的片段。
 
+**檔名**。桌面版以來源名稱為 WAV 命名。同時擷取 A 和 B 時為 `Backtracking_<名稱>_A_<日期>_<時間>_<長度>s.wav` 與 `Backtracking_<名稱>_B_…`；只有一個來源時不加 A／B，例如 `Backtracking_Spotify_2026-11-17_09-05-00_12.4s.wav`。分開編輯 A 和 B 時單獨匯出的一軌仍標示 A 或 B。名稱預設為來源清單中的裝置或 App 名稱，不含 `.exe` 等副檔名；系統播放為 `System audio`，Sender 為音軌名稱。要改名時，在 Options → Sources 該來源下方的 **File name** 欄位輸入，欄位下方會顯示檔名的開頭；清空欄位即恢復預設。名稱屬於裝置而不是 A／B：把系統播放命名為 `Loop` 後，不論它在 A 還是 B 擷取，檔名都使用 `Loop`。檔名不能使用的字元（`\ / : * ? " < > |`）會改成空格，名稱最多保留 48 個字元。VST3／CLAP 的檔名不含來源名稱，為 `Backtracking_<日期>_<時間>_<長度>s.wav`，DAW 提供速度時在長度後加上 BPM，例如 `_120bpm`；擷取 A 和 B 時，兩個檔案分別以 `-A`、`-B` 結尾。**Delete old drag-and-drop files** 也認得舊版的檔名。
+
 ### 保存與還原設定
 
-Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續錄、主題色、背景透明度、音量表模式、WAV 匯出設定、兩個資料夾、置頂及只顯示波形的設定，下次開啟時還原。
+Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續錄、主題色、背景透明度、音量表模式、WAV 匯出設定、兩個資料夾、置頂、只顯示波形的設定及各來源的檔名，下次開啟時還原。分開編輯 A 和 B 不保存，每次開啟都是關閉。
 
 - **Windows**。設定儲存在 `%LOCALAPPDATA%\Backtracking\Settings`。若找不到 `LOCALAPPDATA`，則使用 `%APPDATA%\Backtracking\Settings`。程式會還原上次的視窗位置。
 - **macOS**。設定儲存在系統的使用者偏好中，也會記住桌面視窗的位置與尺寸。
@@ -208,7 +226,7 @@ On Windows, route the source to the default playback device. If a DAW uses ASIO,
 
 ### Open settings
 
-Click the gear in the toolbar to open **Options**. Right-clicking inside the plug-in also opens Options. In the Windows and macOS desktop apps, right-clicking opens a menu instead: **Pause / Resume / Retry capture**, **Clear**, **Save snapshot**, **Show waveform only**, **Keep on top**, **Options…**, and **Quit**. With the desktop window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` previews the selection instead and `Delete` cancels the selection first. The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
+Click the gear in the toolbar to open **Options**. Right-clicking inside the plug-in also opens Options. In the Windows and macOS desktop apps, right-clicking opens a menu instead: **Pause / Resume / Retry capture**, **Clear**, **Save snapshot**, **Edit A and B separately**, **Show waveform only**, **Keep on top**, **Options…**, and **Quit**. With the desktop window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` previews the selection instead and `Delete` cancels the selection first. With two sources, tapping the right `Ctrl` key on its own (the right `Command` key on a Mac) switches [Edit A and B separately](#edit-a-and-b-separately) on or off. The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
 
 Choose a category on the left, then use the vertical settings list on the right. Larger bold titles, group headings, and body/control text of at least 15 distinguish hierarchy. History, auto-resume, transparency, and WAV format use dropdowns sized to their item count, up to ten rows before scrolling. Scroll the details pane for longer content. Desktop Options can be resized and keeps Close visible. The plug-in requests a larger editor and restores its prior size when closed.
 
@@ -240,7 +258,7 @@ The settings menu offers five background transparency levels. Choose 0%, 25%, 50
 - Selecting, adjusting flags, zooming, or panning fixes the original editing material/view while background capture continues. The selected samples and aligned A/B boundaries survive live rollover or a shorter history limit. Finishing/canceling returns to live view without changing manual Pause.
 - Waveform bins, strokes, and guide density adapt to the actual audio rectangle, visible duration, and interaction state.
 - Wider views use a continuous filled min/max envelope and outline; close views connect the original samples with a polyline. The width-based zoom limit allows about four logical pixels per sample. Resizing preserves the view; subsequent zooming follows valid limits. Drawing does not change selected or exported samples; see the [current-round record](QUIET_CAPTURE_AND_WAVEFORM_2026-11-14.md) for validation status.
-- **Save snapshot**, the global snapshot shortcut, and accepted drops export both tracks with the same boundaries and sample rate. If your DAW prompts for placement, choose separate tracks at the same start position.
+- **Save snapshot**, the global snapshot shortcut, and accepted drops export both tracks with the same boundaries and sample rate. If your DAW prompts for placement, choose separate tracks at the same start position. With [Edit A and B separately](#edit-a-and-b-separately) on, a selection exports its own lane only, and dragging out without a selection exports the lane under the pointer.
 
 [Desktop update settings](UPDATES.md)
 
@@ -274,6 +292,7 @@ On macOS, use the menu bar item to show or hide the window, pause or resume capt
 | Move the window | Hold `Alt` and left-drag inside the content area. | Hold `Option` and left-drag outside the waveform. Hold `Command` + `Option` and left-drag from anywhere in the content area. |
 | Resize the window | Move the pointer to an inside edge or corner, then left-drag. | Move the pointer to an inside edge or corner, then left-drag. |
 | Select audio | Ctrl-left-drag for free selection or Shift-left-drag for snapping; combine both if desired. | Option/Control-left-drag for free selection or Shift-left-drag for snapping; adding Shift also snaps. |
+| Edit A and B separately | Tap the right `Ctrl` key on its own. | Tap the right `Command` key on its own. |
 
 ### Read the waveform and capture status
 
@@ -320,9 +339,24 @@ While a preview plays, every Backtracking recorder that captures System playback
 
 Hold `Alt` (`Option` on a Mac) and drag the selection's start flag to fade it in, or its end flag to fade it out. The further into the selection you drag, the longer the fade. A fade in and a fade out never overlap. The waveform tapers as you drag, and the full interface shows the fade's length. Fades are linear and start and end in silence. Dragged-out WAVs and saved snapshots of the selection include the fades. A fade changed during a preview applies to the audio that plays next. A new selection starts without fades. Moving a flag keeps them and shortens them if the selection becomes too short.
 
+### Edit A and B separately
+
+While A and B both record, you can select, preview, drag out or save one lane on its own. Right-click the waveform and choose **Edit A and B separately**, or, with the Backtracking window focused, tap the right `Ctrl` key on its own (the right `Command` key on a Mac). Choose it or tap again to edit both lanes together. The mode is off by default and is not kept when you quit. It needs two sources: one source shown as L and R rows has no lanes to separate. Holding the key for more than half a second, or pressing another key or a mouse button with it, is not a tap.
+
+| Action | Together (default) | Separately |
+| --- | --- | --- |
+| Select | The selection covers A and B | The selection belongs to the lane you start dragging in, and only that lane is highlighted |
+| Preview (`Space`) | Plays A and B as they export | Plays the selection's lane only |
+| Fade in and out | Applies to A and B | Applies to the selection's lane only |
+| Drag out a selection | Exports a WAV for A and one for B | Exports the selection's lane only |
+| Drag out without a selection | Exports all of A and B | Exports all of the lane under the pointer |
+| **Save snapshot** / global snapshot shortcut | Saves A and B | Saves the selection's lane; without a selection it still saves A and B |
+
+While the mode is on, a thin line runs between A and B, and hovering lights only the lane under the pointer. There is one selection at a time, and both lanes share the flags. Switching keeps the selection: turning the mode on narrows it to the lane it began in, and turning it off widens it back to both. The full interface shows which lane a selection belongs to. Switching does nothing while you are selecting, dragging out or fading.
+
 ### Save a snapshot
 
-Choose **Save snapshot** in Options to save from the current recorder. A selection uses its original fixed samples with the same A/B sample boundaries. With no selection, it saves all audio retained when triggered. Saving neither implicitly pauses capture nor forces manual Pause to resume. Selected-range completion can return to live view; completion of a background full-history save does not cancel a selection created afterward.
+Choose **Save snapshot** in Options to save from the current recorder. A selection uses its original fixed samples with the same A/B sample boundaries; with Edit A and B separately on, it saves the selection's lane only. With no selection, it saves all audio retained when triggered. Saving neither implicitly pauses capture nor forces manual Pause to resume. Selected-range completion can return to live view; completion of a background full-history save does not cancel a selection created afterward.
 
 On Windows, press Alt plus the physical key to the left of 1 (the ~ / grave key, without Shift). On macOS, press Fn/Globe plus that same physical key. The global shortcut works from the background, without focusing Backtracking or the plug-in editor. On Linux, use the [snapshot shortcut helper](../desktop/linux/README.md). Options can select one plug-in instance as the global shortcut target. Backtracking does not bind `Ctrl+S`; it remains available to save the DAW project.
 
@@ -359,9 +393,11 @@ Snapshot saves and drag-and-drop exports use the current WAV settings. Any sampl
 
 Enable **Export every file as mono** to export each WAV in mono. Stereo Merged and stereo plug-in captures average the left and right channels. Side exports the captured Side signal. A and B still export as individual files. The option defaults to Off. The rolling history lives in memory, so export any clips you need before closing the app or removing the plug-in.
 
+**File names**. The desktop apps name each WAV after its source. With A and B recording, the files are `Backtracking_<name>_A_<date>_<time>_<length>s.wav` and `Backtracking_<name>_B_…`. With one source the letter is left out, as in `Backtracking_Spotify_2026-11-17_09-05-00_12.4s.wav`. A lane exported on its own while editing A and B separately keeps its letter. The name defaults to the device or app name in the source list, without an extension such as `.exe`: `System audio` for system playback, and the track name for a Sender. To change it, type in the **File name** field under the source in Options → Sources. The note under the field shows how the files will begin. Clear the field to go back to the default. A name belongs to the device, not to A or B: name system playback `Loop` and its files say `Loop` whether it records on A or on B. Characters that file names cannot hold (`\ / : * ? " < > |`) become spaces, and a name keeps at most 48 characters. VST3 and CLAP files carry no source name: `Backtracking_<date>_<time>_<length>s.wav`, with the tempo after the length, as in `_120bpm`, when the DAW reports one. With A and B recording, the two files end in `-A` and `-B`. **Delete old drag-and-drop files** also recognizes the names that earlier versions used.
+
 ### Save and restore settings
 
-The Windows and macOS desktop apps save your history length, auto-resume delay, theme accent, background transparency, meter mode, WAV export settings, both folders, keep-on-top setting, and waveform-only mode as you change them. Those preferences are restored the next time you open the app.
+The Windows and macOS desktop apps save your history length, auto-resume delay, theme accent, background transparency, meter mode, WAV export settings, both folders, keep-on-top setting, waveform-only mode, and each source's file name as you change them. Those preferences are restored the next time you open the app. Edit A and B separately is not saved and is off each time the app opens.
 
 - **Windows**. Settings are stored in `%LOCALAPPDATA%\Backtracking\Settings`, with `%APPDATA%\Backtracking\Settings` as a fallback when `LOCALAPPDATA` is unavailable. The app restores its previous window position.
 - **macOS**. Settings are stored in the macOS user preferences. The app also restores the desktop window's size and position.
@@ -487,5 +523,8 @@ For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder u
 9. 以系統播放為來源錄一段聲音後框選。按 `Space`，確認從起點旗標播放到終點旗標，播放線由左往右移動並在終點消失；播放中再按 `Space` 應立即停止。按住 `Alt`（Mac 為 `Option`）拖曳起點與終點旗標，確認波形收窄並顯示淡化長度，播放中調整也聽得出變化。拖出並保存選區，確認 WAV 頭尾有淡化；繼續錄音後，確認試聽內容沒有出現在歷史波形中。
 
    Record some System playback and select part of it. Press `Space` and check that it plays from the start flag to the end flag, with the playhead moving left to right and leaving at the end. Press `Space` during playback to stop at once. Hold `Alt` (`Option` on a Mac) and drag the start and end flags: the waveform should taper and show the fade's length, and the change should be heard during playback. Drag out and save the selection and check that both WAVs fade at their ends. After capture continues, check that the preview does not appear in the history waveform.
+10. 以兩個來源擷取。在 Options → Sources 為 A 的來源輸入檔名，確認欄位下方顯示的檔名開頭；拖出整段，確認兩個 WAV 各以自己來源的名稱與字母開頭。把該來源改放到 B，確認名稱跟著來源。輕按右側 `Ctrl`（Mac 為右側 `Command`），確認 A、B 之間出現細線。在 B 框選後按 `Space`，確認只播放 B；拖出該選區，確認只寫出 B 的檔案。再在 B 框選並選擇 **Save snapshot**，確認只保存 B。不框選，從 A 拖出，確認只寫出完整的 A。最後在 B 框選後再輕按一次，確認選區擴大為涵蓋兩軌。
+
+   Record two sources. In Options → Sources, type a file name for source A and check the beginning shown under the field. Drag everything out and check that each WAV begins with its own source's name and letter. Move that source to B and check that its name follows it. Tap the right `Ctrl` key (right `Command` on a Mac) and check that a line appears between A and B. Select part of B and press `Space`: only B should play. Drag that selection out and check that only a B file is written. Select part of B again and choose **Save snapshot**: only B should be saved. Without a selection, drag from lane A and check that all of A, and only A, is written. Finally, select part of B, tap again, and check that the selection widens to both lanes.
 
 [回到專案首頁 / Back to the project README](../README.md)

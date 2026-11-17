@@ -447,7 +447,9 @@ fn export_routed_wav_named(
     tempo_bpm: Option<f64>,
 ) -> io::Result<PathBuf> {
     with_slice_clip(source_sample_rate, channels, interleaved, |clip| {
-        export_clip_named(output_dir, clip, profile, route, force_mono, tempo_bpm)
+        export_clip_named(
+            output_dir, clip, profile, route, force_mono, tempo_bpm, &TakeLabel::default(),
+        )
     })
 }
 
@@ -458,13 +460,14 @@ fn export_clip_named(
     route: ChannelRoute,
     force_mono: bool,
     tempo_bpm: Option<f64>,
+    label: &TakeLabel,
 ) -> io::Result<PathBuf> {
     let channel_map = WavChannelMap::from_route(route, clip.channels, force_mono)?;
     fs::create_dir_all(output_dir)?;
-    let take = take_name(clip_seconds(clip.frames, clip.sample_rate), tempo_bpm);
+    let take = dated_take(clip_seconds(clip.frames, clip.sample_rate), tempo_bpm);
     let mut attempt = 1;
     loop {
-        let path = output_dir.join(format!("{}.wav", numbered_take(&take, attempt)));
+        let path = output_dir.join(format!("{}.wav", label.file_stem(&take, attempt)));
         match write_wav_mapped(&path, clip, profile, channel_map) {
             Ok(()) => return Ok(path),
             // Another export in the same second, or a file that was already there.
@@ -607,15 +610,129 @@ fn clip_seconds(frames: usize, sample_rate: u32) -> f64 {
     frames as f64 / f64::from(sample_rate.max(1))
 }
 
-/// The name a DAW shows for the clip: when it was taken, how long it is, and the tempo if known.
-fn take_name(seconds: f64, tempo_bpm: Option<f64>) -> String {
-    take_name_at(TakeTime::now(), seconds, tempo_bpm)
+/// A lane of a two-source recording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Lane {
+    A,
+    B,
 }
 
-fn take_name_at(time: TakeTime, seconds: f64, tempo_bpm: Option<f64>) -> String {
+impl Lane {
+    pub const BOTH: [Self; 2] = [Self::A, Self::B];
+
+    /// The lane at `index` of a recording's tracks: 0 is A and 1 is B.
+    pub const fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::A),
+            1 => Some(Self::B),
+            _ => None,
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::A => 0,
+            Self::B => 1,
+        }
+    }
+
+    pub const fn letter(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::B => "B",
+        }
+    }
+}
+
+/// The longest source name a file name keeps, in characters.
+pub const SOURCE_NAME_LIMIT: usize = 48;
+
+/// What one exported file's name says about its audio, ahead of when it was taken:
+/// `Backtracking_<source>_<lane>_<date>_<time>_<length>s.wav`, leaving out what is empty.
+/// A lane whose source has no name keeps the form the plug-in names its pairs with, the
+/// letter after the take: `Backtracking_<date>_<time>_<length>s-A.wav`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TakeLabel {
+    /// The name of the source the audio came from. Characters a file name cannot hold are
+    /// left out when the name is written, and an empty name leaves the field out.
+    pub source: String,
+    /// The lane, given whenever two sources were recording, even if only this one is exported.
+    pub lane: Option<Lane>,
+}
+
+impl TakeLabel {
+    pub fn new(source: impl Into<String>, lane: Option<Lane>) -> Self {
+        Self { source: source.into(), lane }
+    }
+
+    /// The label of an unnamed lane of a pair, or of a single file when `lane` is `None`.
+    fn unnamed(lane: Option<Lane>) -> Self {
+        Self { source: String::new(), lane }
+    }
+
+    /// How the names of this label's files begin: everything before the date, such as
+    /// `Backtracking_System audio_A_`. Without a source name it is `Backtracking_`, since the
+    /// lane then follows the take.
+    pub fn file_prefix(&self) -> String {
+        match (file_name_source(&self.source), self.lane) {
+            (Some(source), Some(lane)) => format!("Backtracking_{source}_{}_", lane.letter()),
+            (Some(source), None) => format!("Backtracking_{source}_"),
+            (None, _) => String::from("Backtracking_"),
+        }
+    }
+
+    /// The file name without `.wav` for attempt `attempt` at writing `take`, a [`dated_take`].
+    fn file_stem(&self, take: &str, attempt: u32) -> String {
+        let stem = self.file_prefix() + &numbered_take(take, attempt);
+        match (self.lane, file_name_source(&self.source)) {
+            (Some(lane), None) => format!("{stem}-{}", lane.letter()),
+            _ => stem,
+        }
+    }
+}
+
+/// `name` as it can stand in a file name on Windows and macOS, or `None` when nothing is left.
+/// Characters either system refuses count as spaces, runs of spaces close up to one, the ends
+/// are trimmed, and the name stops at [`SOURCE_NAME_LIMIT`] characters.
+pub fn file_name_source(name: &str) -> Option<String> {
+    let mut cleaned = String::new();
+    let mut length = 0;
+    let mut gap = false;
+    for character in name.chars() {
+        if character.is_whitespace()
+            || character.is_control()
+            || matches!(character, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        {
+            gap = length > 0;
+            continue;
+        }
+        if gap {
+            if length + 1 == SOURCE_NAME_LIMIT {
+                break;
+            }
+            cleaned.push(' ');
+            length += 1;
+            gap = false;
+        }
+        cleaned.push(character);
+        length += 1;
+        if length == SOURCE_NAME_LIMIT {
+            break;
+        }
+    }
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// The part of a file name a DAW reads the take by: when it was taken, how long it is, and the
+/// tempo if known. It follows the source and lane, which [`TakeLabel`] adds.
+fn dated_take(seconds: f64, tempo_bpm: Option<f64>) -> String {
+    dated_take_at(TakeTime::now(), seconds, tempo_bpm)
+}
+
+fn dated_take_at(time: TakeTime, seconds: f64, tempo_bpm: Option<f64>) -> String {
     let seconds = if seconds.is_finite() { seconds.max(0.0) } else { 0.0 };
     let mut name = format!(
-        "Backtracking_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}_{seconds:.1}s",
+        "{:04}-{:02}-{:02}_{:02}-{:02}-{:02}_{seconds:.1}s",
         time.year, time.month, time.day, time.hour, time.minute, time.second,
     );
     if let Some(tempo) = tempo_bpm.filter(|tempo| tempo.is_finite() && (1.0..1_000.0).contains(tempo))
@@ -630,16 +747,22 @@ fn take_name_at(time: TakeTime, seconds: f64, tempo_bpm: Option<f64>) -> String 
     name
 }
 
-/// Whether `name` is a file name this module's WAV exports produce, in the current form or the
-/// earlier `Backtracking-<milliseconds>-<process>-<serial>` one. Housekeeping asks before it
-/// removes anything, so a file the user put in an export folder is never touched.
+/// Whether `name` is a file name this module's WAV exports produce: the form with a source
+/// and lane, the form without a source whose pairs end in `-A` and `-B`, or the first
+/// `Backtracking-<milliseconds>-<process>-<serial>` one. Housekeeping asks before it removes
+/// anything, so a file the user put in an export folder is never touched.
 pub fn is_export_file_name(name: &str) -> bool {
     let Some(stem) = name.strip_suffix(".wav") else {
         return false;
     };
+    // A lane follows the take only when no source is named.
     let stem = stem.strip_suffix("-A").or_else(|| stem.strip_suffix("-B")).unwrap_or(stem);
     if let Some(take) = stem.strip_prefix("Backtracking_") {
+        // The source's name may hold underscores itself, so the date can start at any field.
         is_dated_take(take)
+            || take
+                .match_indices('_')
+                .any(|(index, _)| index > 0 && is_dated_take(&take[index + 1..]))
     } else if let Some(take) = stem.strip_prefix("Backtracking-") {
         let mut numbers = take.split('-');
         (0..3).all(|_| numbers.next().is_some_and(is_digits)) && numbers.next().is_none()
@@ -657,8 +780,8 @@ fn is_decimal(text: &str) -> bool {
     parts.next().is_some_and(is_digits) && parts.next().is_none_or(is_digits) && parts.next().is_none()
 }
 
-/// The part of a take name after `Backtracking_`: date, time, length, then optionally a tempo
-/// and a collision number, as `take_name_at` and `numbered_take` write them.
+/// The part of a file name after its source and lane: date, time, length, then optionally a
+/// tempo and a collision number, as `dated_take_at` and `numbered_take` write them.
 fn is_dated_take(take: &str) -> bool {
     let dashed = |text: Option<&str>, widths: [usize; 3]| {
         text.is_some_and(|text| {
@@ -695,7 +818,7 @@ fn numbered_take(take: &str, attempt: u32) -> String {
 }
 
 /// Exports one or two lanes from the same retained time range.
-/// Both files in a pair share a take name, with A/B suffixes.
+/// Both files in a pair share a take name, after their lane letters.
 /// The lanes can be owned [`Snapshot`]s or [`FrozenTrack`]s that share a capture's pages.
 pub fn export_tracks_with_profile<T: TrackAudio>(
     output_dir: &Path,
@@ -756,14 +879,45 @@ pub fn export_routed_tracks_with_fades<T: TrackAudio>(
     tempo_bpm: Option<f64>,
     fades: Fades,
 ) -> io::Result<Vec<PathBuf>> {
+    let labels = TakeLabel::unnamed_lanes(snapshots.len());
+    export_labelled_tracks(
+        output_dir, snapshots, frames, profile, routes, force_mono, tempo_bpm, fades, &labels,
+    )
+}
+
+/// Like [`export_routed_tracks_with_fades`], naming each file after the label of its lane:
+/// `labels` has one entry per track. The two files of a pair need different labels.
+#[allow(clippy::too_many_arguments)]
+pub fn export_labelled_tracks<T: TrackAudio>(
+    output_dir: &Path,
+    snapshots: &[T],
+    frames: Range<usize>,
+    profile: WavExportProfile,
+    routes: &[ChannelRoute],
+    force_mono: bool,
+    tempo_bpm: Option<f64>,
+    fades: Fades,
+    labels: &[TakeLabel],
+) -> io::Result<Vec<PathBuf>> {
     match snapshots {
         [one] => export_routed_track_refs(
-            output_dir, &[one], frames, profile, routes, force_mono, tempo_bpm, fades,
+            output_dir, &[one], frames, profile, routes, force_mono, tempo_bpm, fades, labels,
         ),
         [a, b] => export_routed_track_refs(
-            output_dir, &[a, b], frames, profile, routes, force_mono, tempo_bpm, fades,
+            output_dir, &[a, b], frames, profile, routes, force_mono, tempo_bpm, fades, labels,
         ),
         _ => Err(invalid_tracks()),
+    }
+}
+
+impl TakeLabel {
+    /// Labels for `count` tracks that carry no source names: a single file has no lane, the
+    /// two files of a pair are lanes A and B.
+    pub(crate) fn unnamed_lanes(count: usize) -> Vec<Self> {
+        match count {
+            2 => Lane::BOTH.map(|lane| Self::unnamed(Some(lane))).to_vec(),
+            count => vec![Self::unnamed(None); count],
+        }
     }
 }
 
@@ -777,24 +931,28 @@ pub(crate) fn export_routed_track_refs<T: TrackAudio>(
     force_mono: bool,
     tempo_bpm: Option<f64>,
     fades: Fades,
+    labels: &[TakeLabel],
 ) -> io::Result<Vec<PathBuf>> {
-    match (snapshots, routes) {
-        ([snapshot], [route]) => {
+    match (snapshots, routes, labels) {
+        ([snapshot], [route], [label]) => {
             check_track_clip(*snapshot, &frames)?;
             with_track_clip(*snapshot, &frames, fades, |clip| {
-                export_clip_named(output_dir, clip, profile, *route, force_mono, tempo_bpm)
+                export_clip_named(output_dir, clip, profile, *route, force_mono, tempo_bpm, label)
             })
             .map(|path| vec![path])
         }
-        ([a, b], [route_a, route_b])
-            if a.sample_rate() == b.sample_rate() && a.frame_range() == b.frame_range() =>
+        ([a, b], [route_a, route_b], [label_a, label_b])
+            if a.sample_rate() == b.sample_rate()
+                && a.frame_range() == b.frame_range()
+                // Two files of one take under one name would keep colliding with each other.
+                && label_a.file_stem("", 1) != label_b.file_stem("", 1) =>
         {
             check_track_clip(*a, &frames)?;
             check_track_clip(*b, &frames)?;
             let a_map = WavChannelMap::from_route(*route_a, a.channels(), force_mono)?;
             let b_map = WavChannelMap::from_route(*route_b, b.channels(), force_mono)?;
             fs::create_dir_all(output_dir)?;
-            let take = take_name(
+            let take = dated_take(
                 clip_seconds(frames.end - frames.start, a.sample_rate()),
                 tempo_bpm,
             );
@@ -804,9 +962,8 @@ pub(crate) fn export_routed_track_refs<T: TrackAudio>(
             loop {
                 // Both lanes of a take share one name, so a clash on either file moves the pair on.
                 attempt += 1;
-                let prefix = numbered_take(&take, attempt);
-                let a_path = output_dir.join(format!("{prefix}-A.wav"));
-                let b_path = output_dir.join(format!("{prefix}-B.wav"));
+                let a_path = output_dir.join(format!("{}.wav", label_a.file_stem(&take, attempt)));
+                let b_path = output_dir.join(format!("{}.wav", label_b.file_stem(&take, attempt)));
                 // Both names are claimed before any audio is written.
                 let a_file = match with_track_clip(*a, &frames, fades, |clip| {
                     WavFile::create(&a_path, clip, profile, a_map)
@@ -1371,15 +1528,18 @@ mod tests {
             minute: 32,
             second: 7,
         };
-        // Every name the exporter can write: with and without tempo, a collision number and
-        // a lane suffix.
+        // Every name the exporter can write: with and without a source and a lane, tempo and a
+        // collision number. A source's name can hold anything a file name can, and the
+        // nameless source stands for the plug-in's files, whose pairs end in their lane.
+        let sources = ["", "Spotify", "chrome", "Mic_2", "Headset (USB) 2", "系統聲音", "A", "2026-11-14"];
         for tempo in [None, Some(120.0), Some(98.46)] {
-            let take = take_name_at(time, 12.44, tempo);
+            let take = dated_take_at(time, 12.44, tempo);
             for attempt in [1, 2, 37] {
-                let numbered = numbered_take(&take, attempt);
-                for lane in ["", "-A", "-B"] {
-                    let name = format!("{numbered}{lane}.wav");
-                    assert!(is_export_file_name(&name), "{name}");
+                for source in sources {
+                    for lane in [None, Some(Lane::A), Some(Lane::B)] {
+                        let name = format!("{}.wav", TakeLabel::new(source, lane).file_stem(&take, attempt));
+                        assert!(is_export_file_name(&name), "{name}");
+                    }
                 }
             }
         }
@@ -1388,6 +1548,12 @@ mod tests {
         assert!(is_export_file_name("Backtracking-1763100000000-4242-7-B.wav"));
 
         for other in [
+            "Backtracking_Spotify.wav",
+            "Backtracking_Spotify_A.wav",
+            "Backtracking__2026-11-14_15-32-07_12.4s.wav",
+            "Backtracking_Spotify_A_2026-11-14_15-32-07_12.4s_final.wav",
+            "Backtracking_Spotify_2026-11-14_15-32-07_12.4s.mp3",
+            "Spotify_A_2026-11-14_15-32-07_12.4s.wav",
             "Backtracking.wav",
             "Backtracking_notes.wav",
             "Backtracking_2026-11-14_15-32-07_12.4s.mp3",
@@ -1419,36 +1585,89 @@ mod tests {
             minute: 32,
             second: 7,
         };
+        let unnamed = TakeLabel::default();
         assert_eq!(
-            take_name_at(time, 12.44, None),
+            unnamed.file_stem(&dated_take_at(time, 12.44, None), 1),
             "Backtracking_2026-11-14_15-32-07_12.4s"
         );
         assert_eq!(
-            take_name_at(time, 12.44, Some(120.0)),
+            unnamed.file_stem(&dated_take_at(time, 12.44, Some(120.0)), 1),
             "Backtracking_2026-11-14_15-32-07_12.4s_120bpm"
         );
         assert_eq!(
-            take_name_at(time, 0.5, Some(98.46)),
-            "Backtracking_2026-11-14_15-32-07_0.5s_98.5bpm"
+            dated_take_at(time, 0.5, Some(98.46)),
+            "2026-11-14_15-32-07_0.5s_98.5bpm"
         );
         // A host that reports no usable tempo leaves the name as it is without one.
         for tempo in [0.0, -120.0, f64::NAN, f64::INFINITY] {
             assert_eq!(
-                take_name_at(time, f64::NAN, Some(tempo)),
-                "Backtracking_2026-11-14_15-32-07_0.0s"
+                dated_take_at(time, f64::NAN, Some(tempo)),
+                "2026-11-14_15-32-07_0.0s"
             );
         }
-        let name = take_name_at(time, 12.44, Some(120.5));
+        let take = dated_take_at(time, 12.44, Some(120.5));
+        let name = unnamed.file_stem(&take, 1);
         assert_take_shape(&name, "12.4s");
-        assert_eq!(numbered_take(&name, 1), name);
-        assert_eq!(numbered_take(&name, 2), format!("{name}_2"));
+        assert_eq!(unnamed.file_stem(&take, 2), format!("{name}_2"));
         // Names sort in the order they were taken, whatever the clip length.
         let later = TakeTime {
             minute: 33,
             second: 0,
             ..time
         };
-        assert!(take_name_at(time, 99.0, None) < take_name_at(later, 1.0, None));
+        assert!(dated_take_at(time, 99.0, None) < dated_take_at(later, 1.0, None));
+    }
+
+    #[test]
+    fn take_names_lead_with_the_source_and_its_lane() {
+        let time = TakeTime { year: 2026, month: 11, day: 17, hour: 9, minute: 5, second: 0 };
+        let take = dated_take_at(time, 12.44, None);
+        let stem = |source: &str, lane| TakeLabel::new(source, lane).file_stem(&take, 1);
+        assert_eq!(stem("Spotify", Some(Lane::A)), "Backtracking_Spotify_A_2026-11-17_09-05-00_12.4s");
+        assert_eq!(stem("Vocal mic", Some(Lane::B)), "Backtracking_Vocal mic_B_2026-11-17_09-05-00_12.4s");
+        // One source shows no lane.
+        assert_eq!(stem("chrome", None), "Backtracking_chrome_2026-11-17_09-05-00_12.4s");
+        assert_eq!(stem("  \t ", None), "Backtracking_2026-11-17_09-05-00_12.4s");
+        // A lane without a source name, as the plug-in writes its pairs, ends in its letter.
+        assert_eq!(stem("", Some(Lane::B)), "Backtracking_2026-11-17_09-05-00_12.4s-B");
+        assert_eq!(stem("/:", Some(Lane::A)), "Backtracking_2026-11-17_09-05-00_12.4s-A");
+        // The collision number stays after the length, and ahead of a trailing lane.
+        assert_eq!(
+            TakeLabel::new("Spotify", Some(Lane::A)).file_stem(&take, 3),
+            "Backtracking_Spotify_A_2026-11-17_09-05-00_12.4s_3"
+        );
+        assert_eq!(
+            TakeLabel::new("", Some(Lane::A)).file_stem(&take, 2),
+            "Backtracking_2026-11-17_09-05-00_12.4s_2-A"
+        );
+        // Settings show the part before the date, cleaned the way the file will be.
+        assert_eq!(TakeLabel::new("AC/DC ", Some(Lane::B)).file_prefix(), "Backtracking_AC DC_B_");
+        assert_eq!(TakeLabel::new("", None).file_prefix(), "Backtracking_");
+        assert_eq!(TakeLabel::new("", Some(Lane::B)).file_prefix(), "Backtracking_");
+    }
+
+    #[test]
+    fn source_names_keep_what_a_file_name_can_hold() {
+        assert_eq!(file_name_source("Spotify").as_deref(), Some("Spotify"));
+        assert_eq!(file_name_source("系統聲音").as_deref(), Some("系統聲音"));
+        assert_eq!(
+            file_name_source("Microphone (Realtek(R) Audio)").as_deref(),
+            Some("Microphone (Realtek(R) Audio)")
+        );
+        // What Windows or macOS refuses reads as a space, and spaces close up.
+        assert_eq!(file_name_source("AC/DC: Live?").as_deref(), Some("AC DC Live"));
+        assert_eq!(file_name_source(" a\\b*c\"d<e>f|g ").as_deref(), Some("a b c d e f g"));
+        assert_eq!(file_name_source("tab\there\nnew").as_deref(), Some("tab here new"));
+        assert_eq!(file_name_source("under_score.v2").as_deref(), Some("under_score.v2"));
+        for nothing in ["", "   ", "/:*?", "\u{7}"] {
+            assert_eq!(file_name_source(nothing), None, "{nothing:?}");
+        }
+        // Long names stop at the limit, counted in characters, and never end in a space.
+        let long = "名".repeat(SOURCE_NAME_LIMIT + 10);
+        assert_eq!(file_name_source(&long).unwrap().chars().count(), SOURCE_NAME_LIMIT);
+        let spaced = format!("{} tail", "x".repeat(SOURCE_NAME_LIMIT - 1));
+        let cut = file_name_source(&spaced).unwrap();
+        assert_eq!(cut, "x".repeat(SOURCE_NAME_LIMIT - 1));
     }
 
     #[test]
@@ -1502,6 +1721,7 @@ mod tests {
     fn exports_in_the_same_second_get_numbered_names_and_keep_existing_files() {
         let dir = test_dir("names");
         let samples = [0.25; 4_800];
+        let take_name = |seconds, tempo| format!("Backtracking_{}", dated_take(seconds, tempo));
         loop {
             // The name an export started right now will ask for first.
             let take = take_name(0.1, None);
@@ -1556,6 +1776,8 @@ mod tests {
             )
             .unwrap()
         };
+        // Unnamed lanes, as the plug-in exports them, keep the letter at the end of the name.
+        let take_name = |seconds, tempo| format!("Backtracking_{}", dated_take(seconds, tempo));
         loop {
             let take = take_name(0.5, Some(174.0));
             assert!(take.ends_with("_0.5s_174bpm"), "{take}");
@@ -1579,6 +1801,59 @@ mod tests {
             assert!(single.ends_with("_0.5s_92.5bpm.wav"), "{single}");
             break;
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn labelled_exports_name_each_file_after_its_source_and_lane() {
+        let dir = test_dir("labelled");
+        let profile = WavExportProfile::default();
+        let lane = Snapshot {
+            sample_rate: 48_000,
+            channels: 1,
+            samples: vec![0.25; 4_800],
+            first_frame: 0,
+        };
+        let export = |tracks: &[Snapshot], labels: &[TakeLabel]| {
+            export_labelled_tracks(
+                &dir,
+                tracks,
+                0..4_800,
+                profile,
+                &[ChannelRoute::Merged; 2][..tracks.len()],
+                false,
+                None,
+                Fades::NONE,
+                labels,
+            )
+        };
+        let pair = export(
+            &[lane.clone(), lane.clone()],
+            &[TakeLabel::new("Spotify", Some(Lane::A)), TakeLabel::new("Vocal/mic", Some(Lane::B))],
+        )
+        .unwrap();
+        let [a, b] = pair.as_slice() else {
+            panic!("expected A/B files")
+        };
+        let (a, b) = (file_name(a), file_name(b));
+        assert!(a.starts_with("Backtracking_Spotify_A_") && a.ends_with("_0.1s.wav"), "{a}");
+        assert!(b.starts_with("Backtracking_Vocal mic_B_") && b.ends_with("_0.1s.wav"), "{b}");
+        assert_eq!(
+            a.strip_prefix("Backtracking_Spotify_A_"),
+            b.strip_prefix("Backtracking_Vocal mic_B_")
+        );
+        // One lane of a two-source recording keeps its letter.
+        let one = export(&[lane.clone()], &[TakeLabel::new("Vocal mic", Some(Lane::B))]).unwrap();
+        let one = file_name(&one[0]);
+        assert!(one.starts_with("Backtracking_Vocal mic_B_"), "{one}");
+        for name in [&a, &b, &one] {
+            assert!(is_export_file_name(name), "{name}");
+        }
+        // The two files of a pair must not ask for one name, and each track needs a label.
+        let same = [TakeLabel::new("System", Some(Lane::A)), TakeLabel::new("System_A", None)];
+        assert!(export(&[lane.clone(), lane.clone()], &same).is_err());
+        assert!(export(&[lane.clone(), lane.clone()], &[TakeLabel::default()]).is_err());
+        assert!(export(&[lane], &[]).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 

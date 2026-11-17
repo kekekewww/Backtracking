@@ -83,6 +83,7 @@ pub(crate) enum Key {
     MeterB,
     SplitWaveform,
     CaptureSources,
+    SourceNames,
     WavSampleRate,
     WavSampleFormat,
     WavForceMono,
@@ -118,6 +119,7 @@ impl Key {
             Self::MeterB => "meter-b-unit",
             Self::SplitWaveform => "split-waveform",
             Self::CaptureSources => "capture-sources",
+            Self::SourceNames => "source-file-names",
             Self::WavSampleRate => "wav-sample-rate",
             Self::WavSampleFormat => "wav-sample-format",
             Self::WavForceMono => "wav-force-mono",
@@ -154,6 +156,7 @@ pub(crate) struct Settings {
     pub(crate) meter_b_mode: MeterMode,
     pub(crate) split_waveform: bool,
     pub(crate) sources: [Option<SourceSettings>; 2],
+    pub(crate) source_names: SourceNames,
     pub(crate) wav_profile: WavExportProfile,
     pub(crate) wav_force_mono: bool,
     pub(crate) output: PathBuf,
@@ -198,6 +201,7 @@ impl Default for Settings {
                 }),
                 None,
             ],
+            source_names: SourceNames::default(),
             wav_profile: WavExportProfile::default(),
             wav_force_mono: false,
             output: directory.join("output"),
@@ -268,6 +272,9 @@ impl Preferences {
             .and_then(parse_sources)
         {
             settings.sources = sources;
+        }
+        if let Some(names) = self.read(Key::SourceNames) {
+            settings.source_names = SourceNames::parse(&names);
         }
         if let Some(rate @ (44_100 | 48_000 | 96_000)) = self.read_number(Key::WavSampleRate) {
             settings.wav_profile.sample_rate = rate;
@@ -602,6 +609,73 @@ pub(crate) fn wav_sample_format_preference(format: WavSampleFormat) -> &'static 
         WavSampleFormat::Pcm16 => "pcm16",
         WavSampleFormat::Pcm24 => "pcm24",
         WavSampleFormat::Float32 => "float32",
+    }
+}
+
+/// The names the user gave sources for their files, by [`CaptureSource::identity`], the one
+/// named most recently last. A name belongs to the device, so it follows it to either lane.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SourceNames(Vec<(String, String)>);
+
+impl SourceNames {
+    /// The most names kept. Naming one more forgets the one named longest ago, which keeps
+    /// the file far inside what a preference may hold.
+    const LIMIT: usize = 64;
+
+    /// The name the user gave `source`, as they typed it.
+    pub(crate) fn get(&self, source: &CaptureSource) -> Option<&str> {
+        let identity = source.identity();
+        self.0.iter().find(|(key, _)| *key == identity).map(|(_, name)| name.as_str())
+    }
+
+    /// Gives `source` the name `name`, or forgets its name when `name` is blank. True when
+    /// that changed anything.
+    pub(crate) fn set(&mut self, source: &CaptureSource, name: &str) -> bool {
+        let identity = source.identity();
+        let name: String = name.chars()
+            .map(|character| if character.is_control() { ' ' } else { character })
+            .collect();
+        let index = self.0.iter().position(|(key, _)| *key == identity);
+        if name.trim().is_empty() {
+            return index.map(|index| self.0.remove(index)).is_some();
+        }
+        if index.is_some_and(|index| self.0[index].1 == name) {
+            return false;
+        }
+        if let Some(index) = index {
+            self.0.remove(index);
+        }
+        self.0.push((identity, name));
+        if self.0.len() > Self::LIMIT {
+            self.0.remove(0);
+        }
+        true
+    }
+
+    pub(crate) fn serialize(&self) -> String {
+        let lines: Vec<_> = self.0.iter()
+            .map(|(identity, name)| format!("{}\t{}", encode_text(identity), encode_text(name)))
+            .collect();
+        lines.join("\n")
+    }
+
+    /// A damaged line loses only its own name.
+    fn parse(value: &str) -> Self {
+        let mut names = Self::default();
+        for line in value.lines() {
+            let Some((identity, name)) = line.split_once('\t') else { continue };
+            let (Some(identity), Some(name)) = (decode_text(identity), decode_text(name)) else {
+                continue;
+            };
+            if name.trim().is_empty() || name.chars().any(char::is_control) {
+                continue;
+            }
+            names.0.retain(|(key, _)| *key != identity);
+            names.0.push((identity, name));
+        }
+        let excess = names.0.len().saturating_sub(Self::LIMIT);
+        names.0.drain(..excess);
+        names
     }
 }
 
@@ -1044,6 +1118,61 @@ mod tests {
             Some(one_source)
         );
         assert_eq!(parse_sources("off\noff"), None);
+    }
+
+    #[test]
+    fn source_names_belong_to_the_device_and_survive_a_reload() {
+        let chrome = CaptureSource::Application {
+            path: r"C:\Apps\Chrome.exe".into(),
+            name: "Chrome.exe".into(),
+        };
+        // The same program, listed again with its path in other letters.
+        let chrome_again = CaptureSource::Application {
+            path: r"c:\apps\chrome.exe".into(),
+            name: "chrome.exe".into(),
+        };
+        let microphone = |id: &str| CaptureSource::Microphone { id: id.into(), name: "USB mic".into() };
+        let mut names = SourceNames::default();
+        assert!(names.set(&CaptureSource::System, "Desk\tspeakers 系統聲音"));
+        assert!(names.set(&chrome, "Browser "));
+        assert!(names.set(&microphone("one"), "Vocal"));
+        assert!(!names.set(&chrome_again, "Browser "), "the same name changes nothing");
+        assert_eq!(names.get(&CaptureSource::System), Some("Desk speakers 系統聲音"));
+        assert_eq!(names.get(&chrome_again), Some("Browser "));
+        assert_eq!(names.get(&microphone("two")), None, "another device of the same name");
+        assert_eq!(names.get(&CaptureSource::DefaultMicrophone), None);
+
+        let preferences = workspace_preferences("source-names");
+        preferences.save(Key::SourceNames, &names.serialize()).unwrap();
+        assert_eq!(preferences.load().source_names, names);
+
+        // A blank name goes back to the default.
+        assert!(names.set(&chrome, "   "));
+        assert!(!names.set(&chrome, ""));
+        assert_eq!(names.get(&chrome), None);
+        preferences.save(Key::SourceNames, &names.serialize()).unwrap();
+        assert_eq!(preferences.load().source_names, names);
+        fs::remove_dir_all(preferences.directory.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn source_names_keep_the_latest_names_and_skip_damaged_lines() {
+        let microphone = |index: usize| CaptureSource::Microphone {
+            id: format!("mic-{index}"),
+            name: "Mic".into(),
+        };
+        let mut names = SourceNames::default();
+        for index in 0..=SourceNames::LIMIT {
+            names.set(&microphone(index), &format!("Take {index}"));
+        }
+        assert_eq!(names.get(&microphone(0)), None, "the name set longest ago is forgotten");
+        assert_eq!(names.get(&microphone(1)).unwrap(), "Take 1");
+        assert_eq!(names.get(&microphone(SourceNames::LIMIT)).unwrap(),
+            format!("Take {}", SourceNames::LIMIT));
+
+        let text = format!("{}\nnot hex\tzz\n{}\t\n", names.serialize(), encode_text("system"));
+        assert_eq!(SourceNames::parse(&text), names);
+        assert_eq!(SourceNames::parse(""), SourceNames::default());
     }
 
     #[test]

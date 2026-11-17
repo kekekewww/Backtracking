@@ -78,6 +78,8 @@ You can try this in a browser, with nothing to install: [open the live demo](htt
 
 - **History you choose.** 10, 20, 30 or 60 seconds, or 3, 5 or 10 minutes. Long silence is left out by default; **Keep quiet sections** keeps it.
 - **Editing never stops the recording.** Selecting, moving flags, zooming and panning work on a fixed copy of the audio while capture continues in the background.
+- **One lane at a time.** With two sources, tap the right `Ctrl` key (right `Command` on a Mac) to select, preview, fade and drag out A or B on its own.
+- **Files named after their source.** Desktop WAVs are named like `Backtracking_Spotify_A_…`. Give each device its own name in **Options → Sources**, and the name follows it to either lane.
 - **Plug-in to desktop.** Tick **Send to Backtracking desktop** in a plug-in instance and the desktop app lists that track as a source.
 - **More than one recorder.** **New capture window** opens extra desktop recorders, each with its own source.
 - **WAV the way you need it.** 44.1, 48 or 96 kHz, in 16-bit PCM, 24-bit PCM or 32-bit float. The default is 48 kHz, 32-bit float.
@@ -117,7 +119,7 @@ Each release lists what changed and the SHA-256 of its files: [all releases](htt
 3. Drag the waveform out of the window onto a DAW track or a folder to export everything it holds. For a shorter clip, select first: `Ctrl`-drag on Windows or `Option`-drag on macOS for a free selection, `Shift`-drag for a snapped one. Then drag the highlighted range out.
 4. Press `Esc` to drop the selection and return to the live view.
 
-On the desktop, right-click the window for the menu, or click the gear for **Options**. With the window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` plays the selection and `Alt`-dragging (`Option` on a Mac) a selection flag fades it in or out.
+On the desktop, right-click the window for the menu, or click the gear for **Options**. With the window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` plays the selection and `Alt`-dragging (`Option` on a Mac) a selection flag fades it in or out. With two sources, a tap of the right `Ctrl` key (right `Command` on a Mac) lets you edit A and B separately.
 
 ## Watch
 

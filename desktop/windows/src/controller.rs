@@ -12,7 +12,7 @@ use backtracking_core::{
     SenderInfo, SenderReceiver, SynchronizedCapture, TimedPacket, WaveformView, discover_senders,
 };
 
-pub(crate) use crate::loopback::CaptureSource;
+pub(crate) use crate::loopback::{CaptureSource, SENDER_MARK};
 use crate::loopback::{
     DataWake, Format, Loopback, PACKET_QUEUE_CAPACITY, QuietModeBarrier, now_ns,
 };
@@ -317,7 +317,7 @@ fn with_senders(mut sources: Vec<CaptureSource>, senders: Vec<SenderInfo>) -> Ve
     let at = sources.len().min(FIXED_SOURCES);
     sources.splice(at..at, senders.into_iter().map(|sender| CaptureSource::Sender {
         id: sender.id,
-        name: format!("【Sender】{}", sender.name),
+        name: format!("{SENDER_MARK}{}", sender.name),
     }));
     sources
 }

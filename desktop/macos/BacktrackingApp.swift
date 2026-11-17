@@ -25,8 +25,18 @@ private let problemColor = NSColor(srgbRed: 246 / 255, green: 196 / 255, blue: 1
 
 /// The recorder window's own keys, which the right-click menu names beside its items.
 private enum WindowCommand {
-    case toggleCapture, clear
+    case toggleCapture, clear, separateLanes
 }
+/// The Right Command key, tapped on its own, separates lanes A and B.
+private let rightCommandKeyCode: UInt16 = 54
+/// The device-dependent bits AppKit keeps in `modifierFlags` for each Command key (IOLLEvent.h).
+private let leftCommandDeviceMask: UInt = 0x08
+private let rightCommandDeviceMask: UInt = 0x10
+/// A key held longer than this was not tapped.
+private let tapLimit: TimeInterval = 0.5
+/// As long as a source's name in a file name may be, as in the core.
+private let sourceNameLimit = 48
+private let sourceFileNamesKey = "sourceFileNames"
 private let fullWaveformMinimumHeight: CGFloat = 51
 private let defaultAccentRGB: UInt32 = 0x52E3D1
 
@@ -292,6 +302,8 @@ private final class CapturePanel: KeyPanel {
     private var move: MoveGesture?
     private var resize: ResizeGesture?
     private var chromeCursorActive = false
+    /// When Right Command went down on its own, until it comes up or anything else happens.
+    private var rightCommandPress: TimeInterval?
 
     private struct Edges: OptionSet {
         let rawValue: UInt8
@@ -331,7 +343,37 @@ private final class CapturePanel: KeyPanel {
         let startOrigin: NSPoint
     }
 
+    /// A tap is Right Command going down and up again soon, with no other key, modifier or
+    /// mouse button in between. Command held for a shortcut, or for Command-Option window
+    /// moves, is not one.
+    private func followRightCommand(_ event: NSEvent) {
+        guard event.type == .flagsChanged, event.keyCode == rightCommandKeyCode else {
+            rightCommandPress = nil
+            return
+        }
+        let flags = event.modifierFlags
+        if flags.rawValue & rightCommandDeviceMask != 0 {
+            let alone = flags.intersection([.shift, .control, .option, .function]).isEmpty
+                && flags.rawValue & leftCommandDeviceMask == 0 && NSEvent.pressedMouseButtons == 0
+            rightCommandPress = alone ? event.timestamp : nil
+        } else if let press = rightCommandPress {
+            rightCommandPress = nil
+            if event.timestamp - press <= tapLimit { _ = onCommand?(.separateLanes) }
+        }
+    }
+
+    override func resignKey() {
+        super.resignKey()
+        // Keys pressed while another window has the keyboard are not this window's.
+        rightCommandPress = nil
+    }
+
     override func sendEvent(_ event: NSEvent) {
+        switch event.type {
+        case .flagsChanged, .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel:
+            followRightCommand(event)
+        default: break
+        }
         switch event.type {
         case .keyDown:
             // Hardware codes 51 and 53 are Backspace and Escape on macOS.
@@ -677,31 +719,50 @@ private final class WAVExport: @unchecked Sendable {
         return frame
     }
 
-    /// Starts a preview of `range` in `slot`, routed as the WAVs are. The slot reads the snapshots
-    /// in place, so whoever plays it keeps this material until the slot has let the preview go.
-    func play(in slot: OpaquePointer, range: Range<UInt64>, forceMono: Bool, fades: BtFades) -> Bool {
-        let lanes: [OpaquePointer?] = snapshots
-        return lanes.withUnsafeBufferPointer { lanes in
-            routes.withUnsafeBufferPointer { routes in
+    /// The lanes to play or write: `lane` alone, or all of them. Nil for a lane there is not.
+    private func laneRange(_ lane: Int?) -> Range<Int>? {
+        guard let lane else { return snapshots.indices }
+        return snapshots.indices.contains(lane) ? lane..<(lane + 1) : nil
+    }
+
+    /// Starts a preview of `range` in `slot`, routed as the WAVs are, of one lane or all of them.
+    /// The slot reads the snapshots in place, so whoever plays it keeps this material until the
+    /// slot has let the preview go.
+    func play(in slot: OpaquePointer, range: Range<UInt64>, forceMono: Bool, fades: BtFades, lane: Int?) -> Bool {
+        guard let chosen = laneRange(lane) else { return false }
+        let played: [OpaquePointer?] = Array(snapshots[chosen])
+        let playedRoutes = Array(routes[chosen])
+        return played.withUnsafeBufferPointer { lanes in
+            playedRoutes.withUnsafeBufferPointer { routes in
                 bt_preview_slot_play(slot, lanes.baseAddress, lanes.count, routes.baseAddress,
                     range.lowerBound, range.upperBound, forceMono ? 1 : 0, fades) == 1
             }
         }
     }
 
+    /// Writes `range` of one lane or all of them, each file named after its lane's source in
+    /// `names`. With two lanes recording, a file names its lane even when it is written alone.
     func write(
         range: Range<UInt64>, directory: String, sampleRate: UInt32, bitsPerSample: UInt32, forceMono: Bool,
-        fades: BtFades
+        fades: BtFades, names: [String], lane: Int?
     ) -> [URL] {
+        guard let chosen = laneRange(lane) else { return [] }
         let mono: UInt32 = forceMono ? 1 : 0
+        let name = { (index: Int) in index < names.count ? names[index] : "" }
         return directory.withCString { destination -> [URL] in
-            if snapshots.count == 2 {
+            if chosen.count == 2 {
                 var a: UnsafeMutablePointer<CChar>?
                 var b: UnsafeMutablePointer<CChar>?
-                guard bt_snapshots_export_pair_routed_faded_frames(
-                    snapshots[0], snapshots[1], range.lowerBound, range.upperBound, destination,
-                    sampleRate, bitsPerSample, routes[0], routes[1], mono, fades.fade_in, fades.fade_out, &a, &b
-                ) == 1, let pathA = a, let pathB = b else { return [] }
+                let written = name(0).withCString { nameA in
+                    name(1).withCString { nameB in
+                        bt_snapshots_export_pair_labelled_frames(
+                            snapshots[0], snapshots[1], range.lowerBound, range.upperBound, destination,
+                            sampleRate, bitsPerSample, routes[0], routes[1], mono, fades.fade_in, fades.fade_out,
+                            nameA, nameB, &a, &b
+                        )
+                    }
+                }
+                guard written == 1, let pathA = a, let pathB = b else { return [] }
                 defer {
                     bt_string_free(pathA)
                     bt_string_free(pathB)
@@ -711,10 +772,15 @@ private final class WAVExport: @unchecked Sendable {
                     URL(fileURLWithPath: String(cString: pathB))
                 ]
             }
-            guard let path = bt_snapshot_export_routed_faded_frames(
-                snapshots[0], range.lowerBound, range.upperBound, destination,
-                sampleRate, bitsPerSample, routes[0], mono, fades.fade_in, fades.fade_out
-            ) else { return [] }
+            let index = chosen.lowerBound
+            // 0 leaves the letter out; 1 and 2 are A and B.
+            let letter: UInt32 = snapshots.count == 2 ? UInt32(index + 1) : 0
+            guard let path = name(index).withCString({ source in
+                bt_snapshot_export_labelled_frames(
+                    snapshots[index], range.lowerBound, range.upperBound, destination,
+                    sampleRate, bitsPerSample, routes[index], mono, fades.fade_in, fades.fade_out, source, letter
+                )
+            }) else { return [] }
             defer { bt_string_free(path) }
             return [URL(fileURLWithPath: String(cString: path))]
         }
@@ -754,8 +820,9 @@ private final class PreviewPlayer {
         bt_preview_slot_free(slot)
     }
 
-    /// Plays `range` of `material` from its start. Returns a problem to show, or nil.
-    func play(_ material: WAVExport, range: Range<UInt64>, forceMono: Bool, fades: BtFades) -> String? {
+    /// Plays `range` of `material`, or of its `lane` alone, from its start. Returns a problem to
+    /// show, or nil.
+    func play(_ material: WAVExport, range: Range<UInt64>, forceMono: Bool, fades: BtFades, lane: Int?) -> String? {
         do {
             try startEngine(rate: material.sampleRate)
         } catch {
@@ -767,7 +834,7 @@ private final class PreviewPlayer {
             RunLoop.main.add(timer, forMode: .common)
             self.timer = timer
         }
-        guard material.play(in: slot, range: range, forceMono: forceMono, fades: fades) else {
+        guard material.play(in: slot, range: range, forceMono: forceMono, fades: fades, lane: lane) else {
             return "The selected audio is unavailable."
         }
         // Any earlier preview has been let go, and its material with it.
@@ -1026,7 +1093,8 @@ private enum ExportFolder: Int {
 }
 
 @MainActor
-private final class BacktrackingController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
+private final class BacktrackingController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate,
+    NSTextFieldDelegate {
     private let independentWindow = CommandLine.arguments.contains(receiverWindowArgument)
     private lazy var defaults: UserDefaults = {
         guard independentWindow else { return .standard }
@@ -1119,6 +1187,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var laneA = CaptureLane(source: .system)
     private var laneB = CaptureLane(source: .microphone(""))
     private var dualSource = false
+    /// The names the user gave sources for their files, by source key. A name belongs to the
+    /// device, so it follows it to either lane.
+    private var sourceFileNames: [String: String] = [:]
+    private var fileNameFields: [NSTextField] = []
+    /// The source each File name field shows the name of, so typing never names another one.
+    private var fileNameSourceKeys: [String] = []
+    private var fileNameNotes: [NSTextField] = []
+    private var fileNameRowB: NSView?
+    /// Lanes A and B are selected, previewed, dragged out and saved on their own. Only two
+    /// sources have lanes to separate, and the choice is not kept between launches.
+    private var separateLanes = false
     private var stereoWaveform = false
     private var microphonePromptPending = false
     private var lastSourceCheck = 0.0
@@ -1221,6 +1300,35 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if let raw = unsignedSetting("meterModeB"), let mode = MeterMode(rawValue: raw) { meterModeB = mode }
         dualSource = defaults.bool(forKey: "dualCaptureSource")
         stereoWaveform = defaults.bool(forKey: "stereoWaveform")
+        if let names = defaults.dictionary(forKey: sourceFileNamesKey) as? [String: String] {
+            sourceFileNames = names.filter { !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        }
+    }
+
+    /// What `source` is called in file names: the name the user gave it, or its own name when
+    /// they gave none or one that leaves nothing a file name can hold.
+    private func fileName(for source: CaptureSource) -> String {
+        if let custom = sourceFileNames[source.key], filePrefix(custom, lane: 0) != filePrefix("", lane: 0) {
+            return custom
+        }
+        return defaultFileName(for: source)
+    }
+
+    /// How the core begins the names of a source's files: everything before the date.
+    /// `lane` is 0 for a single source, 1 for A and 2 for B.
+    private func filePrefix(_ name: String, lane: UInt32) -> String {
+        guard let prefix = name.withCString({ bt_take_file_prefix($0, lane) }) else { return "" }
+        defer { bt_string_free(prefix) }
+        return String(cString: prefix)
+    }
+
+    /// The names each recording lane's files carry.
+    private var laneFileNames: [String] { captureLanes.map { fileName(for: $0.source) } }
+
+    /// Looks up each recording source's own name while it is there, so files exported after it
+    /// goes away still carry that name.
+    private func rememberSourceNames() {
+        for lane in captureLanes { _ = defaultFileName(for: lane.source) }
     }
 
     private func unsignedSetting(_ key: String) -> UInt32? {
@@ -1819,15 +1927,56 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             route.tag = index
             route.autoenablesItems = false
             routePopups.append(route)
+            // The name belongs to the device, so it follows it to the other lane.
+            let name = NSTextField(string: sourceFileNames[configuration.source.key] ?? "")
+            name.placeholderString = defaultFileName(for: configuration.source)
+            name.tag = index
+            name.delegate = self
+            fileNameFields.append(name)
+            fileNameSourceKeys.append(configuration.source.key)
+            let note = optionNote("")
+            fileNameNotes.append(note)
             let sourceField = optionField("Audio source", source)
             let routeField = optionField("Channel route", route)
+            let nameField = optionField("File name", name, below: [note])
             source.setAccessibilityLabel("Source \(label) audio source")
             route.setAccessibilityLabel("Source \(label) channel route")
-            // Source B has no route while it is Off.
-            if index == 1 { routeRowB = routeField }
-            groups.append(optionGroup("Source \(label)", rows: [sourceField, routeField]))
+            name.setAccessibilityLabel("Source \(label) file name")
+            // Source B has no route or name while it is Off.
+            if index == 1 {
+                routeRowB = routeField
+                fileNameRowB = nameField
+            }
+            groups.append(optionGroup("Source \(label)", rows: [sourceField, routeField, nameField]))
         }
         return optionsTab("Sources", groups: groups)
+    }
+
+    /// Typing in a File name field names that lane's source, or gives it back its own name when
+    /// the field is empty.
+    func controlTextDidChange(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField, let index = fileNameFields.firstIndex(of: field),
+              index < fileNameSourceKeys.count else { return }
+        if field.stringValue.count > sourceNameLimit {
+            field.stringValue = String(field.stringValue.prefix(sourceNameLimit))
+        }
+        let key = fileNameSourceKeys[index]
+        let name = String(field.stringValue.map { $0.isNewline ? " " : $0 })
+        if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            sourceFileNames[key] = nil
+        } else {
+            sourceFileNames[key] = name
+        }
+        defaults.set(sourceFileNames, forKey: sourceFileNamesKey)
+        refreshFileNameNotes()
+    }
+
+    /// Shows under each File name field how that lane's files will begin.
+    private func refreshFileNameNotes() {
+        for (index, lane) in [laneA, laneB].enumerated() where index < fileNameNotes.count {
+            let letter: UInt32 = dualSource ? UInt32(index + 1) : 0
+            fileNameNotes[index].stringValue = "Files start with \(filePrefix(fileName(for: lane.source), lane: letter))"
+        }
     }
 
     @objc private func openReceiverWindow() {
@@ -1860,6 +2009,19 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             }
         }
         routeRowB?.isHidden = !dualSource
+        fileNameRowB?.isHidden = !dualSource
+        for (index, lane) in [laneA, laneB].enumerated() where index < fileNameFields.count && index < fileNameSourceKeys.count {
+            let field = fileNameFields[index]
+            field.placeholderString = defaultFileName(for: lane.source)
+            // A field being typed in keeps what it shows, unless its lane now records another
+            // source: what was typed is already saved for the old one.
+            if fileNameSourceKeys[index] != lane.source.key {
+                fileNameSourceKeys[index] = lane.source.key
+                if field.currentEditor() != nil { _ = field.abortEditing() }
+            }
+            if field.currentEditor() == nil { field.stringValue = sourceFileNames[lane.source.key] ?? "" }
+        }
+        refreshFileNameNotes()
         waveformModePopup?.isEnabled = !dualSource
         meterALabel?.stringValue = dualSource ? "Meter A" : "Meter"
         optionsMeterPopup?.setAccessibilityLabel(dualSource ? "Meter A" : "Meter")
@@ -1957,14 +2119,19 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         editing = false
         tap = nil
         waveform?.resetTimeline()
+        // One source has no lanes to separate, and the mode does not come back with a second.
+        if !dualSource { separateLanes = false }
+        waveform?.separateLanes = separateLanes && dualSource
         notice = nil
         captureError = nil
         registerClick()
         if wasRunning {
             resume()
         } else {
-            do { tap = try SystemAudioTap(history: history, lanes: captureLanes, retainSilence: retainSilence) }
-            catch { captureError = error.localizedDescription }
+            do {
+                tap = try SystemAudioTap(history: history, lanes: captureLanes, retainSilence: retainSilence)
+                rememberSourceNames()
+            } catch { captureError = error.localizedDescription }
         }
         refreshWaveform()
         refreshSourceOptions()
@@ -2367,6 +2534,22 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         add("Clear", #selector(clearCapture), key: "\u{F728}", enabled: captureControls)
         add("Save snapshot", #selector(saveCurrentSnapshot), enabled: captureControls)
         menu.addItem(.separator())
+        let separate = add(
+            "Edit A and B separately", #selector(toggleSeparateLanes), enabled: dualSource,
+            checked: dualSource && separateLanes
+        )
+        // A menu key cannot be a modifier on its own, so the tap is named after the title, as
+        // the Windows menu names Right Ctrl.
+        let font = NSFont.menuFont(ofSize: 0)
+        let width = (separate.title as NSString).size(withAttributes: [.font: font]).width
+        let style = NSMutableParagraphStyle()
+        style.tabStops = [NSTextTab(textAlignment: .left, location: ceil(width) + 24)]
+        var attributes: [NSAttributedString.Key: Any] = [.font: font, .paragraphStyle: style]
+        // An enabled item keeps the menu's own colours, which change as it is highlighted. A
+        // styled title is not always dimmed for a disabled one.
+        if !dualSource { attributes[.foregroundColor] = NSColor.disabledControlTextColor }
+        separate.attributedTitle = NSAttributedString(string: "\(separate.title)\tRight ⌘", attributes: attributes)
+        separate.setAccessibilityLabel("Edit A and B separately, Right Command")
         add("Show waveform only", #selector(toggleWaveformOnly), checked: waveformOnly)
         add("Keep on top", #selector(togglePin), checked: alwaysOnTop)
         menu.addItem(.separator())
@@ -2381,8 +2564,23 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         switch command {
         case .toggleCapture: toggleCapture(nil)
         case .clear: clearCapture()
+        case .separateLanes: toggleSeparateLanes()
         }
         return true
+    }
+
+    /// Lets lanes A and B be selected, previewed, dragged out and saved on their own, or together
+    /// again. A selection stays, narrowed to the lane it began in or widened back to both.
+    @objc private func toggleSeparateLanes() {
+        guard !editing else { return }
+        guard dualSource else {
+            setNotice("Editing A and B separately needs two sources.")
+            return
+        }
+        separateLanes.toggle()
+        waveform?.separateLanes = separateLanes
+        registerClick()
+        setNotice(separateLanes ? "Editing A and B separately" : "Editing A and B together")
     }
 
     private func loginItem() -> NSMenuItem {
@@ -2927,6 +3125,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         do {
             if tap == nil {
                 tap = try SystemAudioTap(history: history, lanes: captureLanes, retainSilence: retainSilence)
+                rememberSourceNames()
             }
             requestMicrophonePermissionIfNeeded()
             try tap?.resume()
@@ -3038,7 +3237,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         } else if waveform?.isPreparingMaterial == true {
             line = "Preparing selection…"
         } else if waveform?.hasSelection == true && notice == nil {
-            line = paused ? "Selection / Paused" : "Selection"
+            // A selection of one lane names it.
+            let selection = waveform?.selectedLane.map { "Selection · \($0 == 0 ? "A" : "B")" } ?? "Selection"
+            line = paused ? "\(selection) / Paused" : selection
         } else {
             line = [state == .paused ? stateText : nil, message.isEmpty ? nil : message]
                 .compactMap { $0 }.joined(separator: " · ")
@@ -3089,8 +3290,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard !editing else { return }
         guard waveform?.isPreparingMaterial != true else { setNotice("Preparing selection…"); return }
         let selected = waveform?.selectionForSaving()
-        // Read before the selection, and its fades with it, is cleared below.
+        // Read before the selection, and its fades and lane with it, is cleared below. Without a
+        // selection both lanes are saved.
         let fades = waveform?.fadesForSaving() ?? noFades
+        let lane = selected == nil ? nil : waveform?.selectedLane
+        // The marker the save leaves keeps the selection's lane; a whole save marks both.
+        let markerLane = selected == nil ? nil : waveform?.selectionLane
         let save: (WAVExport?) -> Void = { [weak self] job in
             guard let self else { return }
             guard let job else { self.setNotice("No audio captured yet."); return }
@@ -3101,9 +3306,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             }
             let ticket = self.waveform?.reserveMarker()
             if selected != nil { self.waveform?.clearSelection() }
-            self.writeExport(job, range: range, fades: fades, directory: self.directory(for: .saved),
+            self.writeExport(job, range: range, fades: fades, lane: lane, directory: self.directory(for: .saved),
                              provisional: false) { [weak self] urls in
-                if !urls.isEmpty, let ticket { self?.waveform?.commitMarker(range, ticket: ticket) }
+                if !urls.isEmpty, let ticket { self?.waveform?.commitMarker(range, lane: markerLane, ticket: ticket) }
                 return true
             }
         }
@@ -3115,25 +3320,28 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     func prepareDrag(
-        _ job: WAVExport, range: Range<UInt64>, fades: BtFades, completion: @escaping ([URL]) -> Bool
+        _ job: WAVExport, range: Range<UInt64>, fades: BtFades, lane: Int?,
+        completion: @escaping ([URL]) -> Bool
     ) -> DispatchWorkItem {
-        writeExport(job, range: range, fades: fades, directory: directory(for: .output), provisional: true,
-                    completion: completion)
+        writeExport(job, range: range, fades: fades, lane: lane, directory: directory(for: .output),
+                    provisional: true, completion: completion)
     }
 
+    /// Writes `range` of every lane, or of `lane` alone, on the worker.
     @discardableResult
     private func writeExport(
-        _ job: WAVExport, range: Range<UInt64>, fades: BtFades, directory: String,
+        _ job: WAVExport, range: Range<UInt64>, fades: BtFades, lane: Int?, directory: String,
         provisional: Bool, completion: @escaping ([URL]) -> Bool
     ) -> DispatchWorkItem {
         let sampleRate = exportSampleRate
         let bitsPerSample = exportBitsPerSample
         let forceMono = forceMonoExport
+        let names = laneFileNames
         setNotice(provisional ? "Preparing WAV…" : "Saving snapshot…")
         let write = DispatchWorkItem { @Sendable [weak self, worker, pendingProvisionalWAVs] in
             let urls = job.write(
                 range: range, directory: directory, sampleRate: sampleRate, bitsPerSample: bitsPerSample,
-                forceMono: forceMono, fades: fades
+                forceMono: forceMono, fades: fades, names: names, lane: lane
             )
             if provisional { pendingProvisionalWAVs.urls.formUnion(urls) }
             DispatchQueue.main.async {
@@ -3203,9 +3411,12 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     private var bars: [UInt64] = []
     private var selection: Range<UInt64>?
     private var marker: Range<UInt64>?
+    /// The lane the marker was left on, which a selection taken back from it covers while
+    /// lanes are separate. nil marks both lanes.
+    private var markerLane: Int?
     private var markerRevision: UInt64 = 0
     private var committedMarkerRevision: UInt64 = 0
-    private var pendingDragMarker: (range: Range<UInt64>, ticket: UInt64)?
+    private var pendingDragMarker: (range: Range<UInt64>, lane: Int?, ticket: UInt64)?
     private var anchor: UInt64?
     private var pointer: NSPoint?
     private var pointerModifiers: NSEvent.ModifierFlags = []
@@ -3237,6 +3448,35 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     }
     private var fadeGesture: FadeGesture?
     private var player: PreviewPlayer?
+    /// Lanes A and B are selected, previewed and dragged out on their own. The controller sets
+    /// it only while two sources record.
+    var separateLanes = false {
+        didSet {
+            guard separateLanes != oldValue else { return }
+            // The selection stays, but what it plays and carries changes with the mode.
+            player?.stop()
+            if !dragging { discardPreparedFile() }
+            needsDisplay = true
+        }
+    }
+    /// The lane the selection began in: 0 is A, at the top, and 1 is B. It is all the selection
+    /// covers while lanes are separate.
+    private(set) var selectionLane = 0
+    /// The lane a drag out began in, while lanes are separate.
+    private var dragLane: Int?
+    /// The lane a selection covers alone, or nil when it covers every lane or there is none.
+    var selectedLane: Int? { separateLanes && hasSelection ? selectionLane : nil }
+    /// The row a selection, or one being made, is drawn on alone.
+    private var selectionRow: Int? { separateLanes && min(traceCount, traces.count) == 2 ? selectionLane : nil }
+
+    /// The lane drawn at height `y` when two lanes share the plot.
+    private func lane(at y: CGFloat) -> Int { y >= bounds.midY ? 0 : 1 }
+
+    /// Where `lane` is drawn when two lanes share the plot.
+    private func laneRect(_ lane: Int) -> NSRect {
+        let height = bounds.height / 2
+        return NSRect(x: bounds.minX, y: lane == 0 ? bounds.midY : bounds.minY, width: bounds.width, height: height)
+    }
 
     var hasEditingMaterial: Bool { editMaterial != nil || materialPending }
     var isPreparingMaterial: Bool { materialPending }
@@ -3519,6 +3759,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         revision = nil
         bars.removeAll()
         marker = nil
+        markerLane = nil
         committedMarkerRevision = reserveMarker()
     }
 
@@ -3527,10 +3768,13 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         return markerRevision
     }
 
-    func commitMarker(_ range: Range<UInt64>, ticket: UInt64) {
+    /// Leaves the marker on `range` after an export. `lane` is the lane it was taken from, or
+    /// nil for both.
+    func commitMarker(_ range: Range<UInt64>, lane: Int?, ticket: UInt64) {
         guard ticket > committedMarkerRevision, !range.isEmpty else { return }
         committedMarkerRevision = ticket
         marker = range
+        markerLane = lane
         needsDisplay = true
     }
 
@@ -3570,7 +3814,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             return true
         }
         let problem = player.play(editMaterial, range: selection,
-                                  forceMono: controller?.forceMonoExport ?? false, fades: fadesForSaving())
+                                  forceMono: controller?.forceMonoExport ?? false, fades: fadesForSaving(),
+                                  lane: selectedLane)
         if let problem { controller?.setNotice(problem) }
         return true
     }
@@ -3756,6 +4001,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             let edge = min(max(flag, retainedFrames.lowerBound), retainedFrames.upperBound)
             let other = flag == flags.lowerBound ? flags.upperBound : flags.lowerBound
             let opposite = min(max(other, retainedFrames.lowerBound), retainedFrames.upperBound)
+            // A selection taken back from the marker covers the lane the marker was left on.
+            if selection == nil { selectionLane = markerLane ?? lane(at: position.y) }
             anchor = opposite
             selection = min(edge, opposite)..<max(edge, opposite)
             needsDisplay = true
@@ -3767,9 +4014,13 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             controller.refreshWaveform()
             anchor = frame(at: event)
             selection = anchor.map { $0..<$0 }
+            // Kept whether or not lanes are separate, so that separating them later narrows the
+            // selection to the lane it began in.
+            selectionLane = lane(at: position.y)
             needsDisplay = true
         } else {
             mouseDownEvent = event
+            dragLane = separateLanes ? lane(at: position.y) : nil
         }
     }
 
@@ -3865,8 +4116,14 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             return
         }
         let ticket = reserveMarker()
+        // While lanes are separate, a selection carries its own lane and a drag without one the
+        // lane it began in.
+        let lane = selectionForSaving() != nil ? selectedLane : (separateLanes ? dragLane : nil)
+        // The marker left by the drop keeps the selection's lane, or the lane dragged out.
+        let markerLane: Int? = selectionForSaving() != nil ? selectionLane : lane
         // DAWs can keep the file URLs after the external drop. Treat both paths as one take.
-        pendingDragWrite = controller.prepareDrag(job, range: range, fades: fadesForSaving()) { [weak self] urls in
+        pendingDragWrite = controller.prepareDrag(job, range: range, fades: fadesForSaving(), lane: lane) {
+            [weak self] urls in
             guard let self, self.exportVersion == version else { return false }
             self.pendingDragWrite = nil
             guard let event = self.mouseDownEvent, NSEvent.pressedMouseButtons & 1 != 0,
@@ -3876,7 +4133,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 return false
             }
             if !urls.isEmpty {
-                self.pendingDragMarker = (range, ticket)
+                self.pendingDragMarker = (range, markerLane, ticket)
                 self.beginFileDrag(urls, event: event)
             }
             return true
@@ -3920,7 +4177,9 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         let saved = accepted ? exportDescription(readyFiles) : nil
         if accepted {
             readyFiles.removeAll()
-            if let pendingDragMarker { commitMarker(pendingDragMarker.range, ticket: pendingDragMarker.ticket) }
+            if let pendingDragMarker {
+                commitMarker(pendingDragMarker.range, lane: pendingDragMarker.lane, ticket: pendingDragMarker.ticket)
+            }
             pendingDragMarker = nil
         } else { discardPreparedFile() }
         endGesture()
@@ -3989,7 +4248,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             }
             if renderedFrames.isEmpty { continue }
             var bins = traces[lane]
-            if let faded {
+            // Separate lanes taper only the selected one.
+            if let faded, selectionRow == nil || selectionRow == lane {
                 // The waveform tapers the way the exported clip does.
                 bins.read { minimum, maximum, count in
                     bt_waveform_fade_bins(minimum, maximum, count, renderedFrames.lowerBound,
@@ -4074,7 +4334,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         let rowHeight = bounds.height / CGFloat(rows)
         let ramps = [(selection.lowerBound, selection.lowerBound + fitted.fade_in),
                      (selection.upperBound, selection.upperBound - fitted.fade_out)]
-        for lane in 0..<rows {
+        for lane in 0..<rows where selectionRow == nil || selectionRow == lane {
             let middle = bounds.midY + bounds.height / 2 - (CGFloat(lane) + 0.5) * rowHeight
             // Full scale is drawn at the height tracePaths uses.
             let extent = rowHeight * 0.46
@@ -4187,15 +4447,26 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         let panel = NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6)
         NSGraphicsContext.saveGraphicsState()
         panel.addClip()
+        let rows = min(traceCount, traces.count)
+        let separate = separateLanes && rows == 2
         if showsOverlay, selection == nil, !visibleFrames.isEmpty,
            pointer != nil || mouseDownEvent != nil || dragging {
+            // While lanes are separate, a drag takes only the lane it starts in.
+            let hoverLane = !separate ? nil
+                : (mouseDownEvent != nil || dragging ? dragLane : pointer.map { lane(at: $0.y) })
             accentColor(accentRGB).withAlphaComponent(0.23).setFill()
-            NSBezierPath.fill(bounds)
+            NSBezierPath.fill(hoverLane.map(laneRect) ?? bounds)
         }
 
         drawTimeGrid()
         let trace = tracePaths()
-        if let selectedRect = selection.flatMap(waveformRect(for:)) {
+        // A selection of one lane is drawn on that lane alone.
+        let selectedArea = selection.flatMap(waveformRect(for:)).flatMap { rect -> NSRect? in
+            guard let row = selectionRow else { return rect }
+            let area = rect.intersection(laneRect(row))
+            return area.isEmpty ? nil : area
+        }
+        if let selectedRect = selectedArea {
             let outside = NSBezierPath(rect: bounds)
             outside.append(NSBezierPath(rect: selectedRect))
             outside.windingRule = .evenOdd
@@ -4212,6 +4483,13 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             paintTrace(trace, color: accentColor(accentRGB))
         }
         if let selection = selectionForSaving() { drawFades(selection) }
+        if separate {
+            // The lanes are apart: a line runs between them for as long as they are.
+            accentColor(accentRGB).withAlphaComponent(0.7).setStroke()
+            NSBezierPath.strokeLine(
+                from: NSPoint(x: bounds.minX, y: bounds.midY), to: NSPoint(x: bounds.maxX, y: bounds.midY)
+            )
+        }
         if let marker, marker != selection {
             drawFlag(marker.lowerBound, pointsRight: true)
             drawFlag(marker.upperBound, pointsRight: false)

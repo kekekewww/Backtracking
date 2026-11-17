@@ -138,6 +138,31 @@ int32_t bt_snapshots_export_pair_routed_faded_frames(const BtSnapshot *snapshot_
                                                      uint32_t route_b, uint32_t force_mono,
                                                      uint64_t fade_in, uint64_t fade_out,
                                                      char **path_a, char **path_b);
+// The faded exports, with each file named after its source and lane:
+// Backtracking_<source>_<lane>_<date>_<time>_<length>s.wav. A source name is UTF-8 and may be
+// NULL or empty to leave it out; the lane then follows the take, as in the unnamed exports:
+// Backtracking_<date>_<time>_<length>s-A.wav. lane is 0 for a single source, 1 for A and 2
+// for B, and is given whenever two sources record, even when only one of them is exported.
+char *bt_snapshot_export_labelled_frames(const BtSnapshot *snapshot, uint64_t first_frame,
+                                         uint64_t end_frame, const char *directory,
+                                         uint32_t sample_rate, uint32_t bits_per_sample,
+                                         uint32_t route, uint32_t force_mono,
+                                         uint64_t fade_in, uint64_t fade_out,
+                                         const char *source_name, uint32_t lane);
+int32_t bt_snapshots_export_pair_labelled_frames(const BtSnapshot *snapshot_a,
+                                                 const BtSnapshot *snapshot_b,
+                                                 uint64_t first_frame, uint64_t end_frame,
+                                                 const char *directory, uint32_t sample_rate,
+                                                 uint32_t bits_per_sample, uint32_t route_a,
+                                                 uint32_t route_b, uint32_t force_mono,
+                                                 uint64_t fade_in, uint64_t fade_out,
+                                                 const char *source_name_a,
+                                                 const char *source_name_b,
+                                                 char **path_a, char **path_b);
+// How those files' names begin, up to the date, such as "Backtracking_System audio_A_", for
+// showing in settings; "Backtracking_" without a source name. Free the result with
+// bt_string_free. NULL for an unknown lane.
+char *bt_take_file_prefix(const char *source_name, uint32_t lane);
 int32_t bt_snapshots_export_pair_with_profile(const BtSnapshot *snapshot_a,
                                               const BtSnapshot *snapshot_b,
                                               double start, double end,
