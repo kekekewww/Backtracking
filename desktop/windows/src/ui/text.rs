@@ -110,7 +110,7 @@ impl Language {
     }
 
     pub(crate) fn wide_export_field(self) -> &'static str {
-        self.pick("Sources with more than two channels", "超過兩個聲道的來源")
+        self.pick("Multichannel sources", "多聲道來源")
     }
 
     pub(crate) fn wide_export_mode(self, multichannel: bool) -> &'static str {
