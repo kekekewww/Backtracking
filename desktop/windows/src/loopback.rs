@@ -99,7 +99,10 @@ enum Woke {
 fn wait_for(signal: &Signal, audio: Option<HANDLE>, timeout: Option<Duration>) -> Woke {
     let milliseconds = timeout.map_or(INFINITE, |timeout| {
         // Round up so a deadline is never serviced early and re-armed at zero.
-        timeout.as_nanos().div_ceil(1_000_000).min(u128::from(INFINITE - 1)) as u32
+        timeout
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(u128::from(INFINITE - 1)) as u32
     });
     let handles = [signal.0.0, audio.unwrap_or_default()];
     let count = if audio.is_some() { 2 } else { 1 };
@@ -136,7 +139,11 @@ enum EventWatch {
 
 impl EventWatch {
     fn new(has_event: bool) -> Self {
-        if has_event { Self::Unproven } else { Self::Polling }
+        if has_event {
+            Self::Unproven
+        } else {
+            Self::Polling
+        }
     }
 
     /// `by_event` is true when the event was signalled for this read, even if
@@ -312,12 +319,16 @@ impl QuietModeState {
     }
 
     fn should_emit_tail(&self, idle_for: Duration) -> bool {
-        !self.retain_silence && !self.idle_reported && self.pending.is_none()
+        !self.retain_silence
+            && !self.idle_reported
+            && self.pending.is_none()
             && idle_for >= IDLE_PACKET_GAP
     }
 
     fn should_emit_retained(&self, idle_for: Duration, since_attempt: Duration) -> bool {
-        self.retain_silence && self.pending.is_none() && idle_for >= IDLE_PACKET_GAP
+        self.retain_silence
+            && self.pending.is_none()
+            && idle_for >= IDLE_PACKET_GAP
             && since_attempt >= RETAINED_IDLE_INTERVAL
     }
 }
@@ -386,10 +397,14 @@ impl Loopback {
     }
 
     /// Call from the capture worker; the UI only queues its controller command.
-    pub(crate) fn prepare_retain_silence(&mut self, enabled: bool) -> Result<QuietModeBarrier, String> {
+    pub(crate) fn prepare_retain_silence(
+        &mut self,
+        enabled: bool,
+    ) -> Result<QuietModeBarrier, String> {
         let (reply, ready) = mpsc::sync_channel(1);
         let (release, released) = mpsc::sync_channel(1);
-        self.commands.send(Command::PrepareRetainSilence(enabled, reply, released))
+        self.commands
+            .send(Command::PrepareRetainSilence(enabled, reply, released))
             .map_err(|_| "WASAPI 連線已中斷".to_string())?;
         self.wake.set();
         match ready.recv_timeout(QUIET_MODE_TIMEOUT) {
@@ -542,7 +557,12 @@ fn capture_thread(
                         quiet_mode.note_real_packet();
                         data_wake();
                     }
-                    Ok(false) if quiet_mode.should_emit_retained(last_packet.elapsed(), last_padding_attempt.elapsed()) => {
+                    Ok(false)
+                        if quiet_mode.should_emit_retained(
+                            last_packet.elapsed(),
+                            last_padding_attempt.elapsed(),
+                        ) =>
+                    {
                         last_padding_attempt = Instant::now();
                         let guard = IDLE_CUTOFF_GUARD.max(watch.read_latency(stream.poll_interval));
                         if stream.push_retained_idle_silence(guard) {
@@ -692,7 +712,9 @@ impl WasapiStream {
                             .map_err(|error| audio_error("找不到已選取的麥克風", error))?,
                         0,
                     ),
-                    CaptureSource::Application { .. } | CaptureSource::Sender { .. } => unreachable!(),
+                    CaptureSource::Application { .. }
+                    | CaptureSource::Sender { .. }
+                    | CaptureSource::Addon { .. } => unreachable!(),
                 };
                 let binding = match source {
                     CaptureSource::System => SourceBinding::DefaultRender(endpoint_id(&device)?),
@@ -700,7 +722,9 @@ impl WasapiStream {
                         SourceBinding::DefaultCapture(endpoint_id(&device)?)
                     }
                     CaptureSource::Microphone { id, .. } => SourceBinding::Microphone(id),
-                    CaptureSource::Application { .. } | CaptureSource::Sender { .. } => unreachable!(),
+                    CaptureSource::Application { .. }
+                    | CaptureSource::Sender { .. }
+                    | CaptureSource::Addon { .. } => unreachable!(),
                 };
                 let (client, format, event) = open_device_client(&device, flags)?;
                 (client, format, binding, Some(enumerator), event)
@@ -919,8 +943,9 @@ impl WasapiStream {
         // GetBuffer timestamps refer to each packet's first frame. Leave a
         // complete device buffer plus one read in flight rather than replacing
         // samples that the engine has not made available yet with virtual zeroes.
-        let until_ns = self.clock.idle_cutoff_ns(now_ns(), self.packet_capacity,
-            guard.as_nanos() as u64);
+        let until_ns =
+            self.clock
+                .idle_cutoff_ns(now_ns(), self.packet_capacity, guard.as_nanos() as u64);
         let Some((stamp, frames)) = self.clock.retained_idle_stamp(until_ns, max_frames) else {
             return false;
         };
@@ -1055,7 +1080,11 @@ fn open_device_client(
     // duration for event-driven shared streams, so try that before giving up
     // on events. A client whose Initialize failed cannot be reused.
     let attempts: &[(bool, i64)] = if !loopback || sources::supports_event_loopback() {
-        &[(true, DEVICE_BUFFER_100NS), (true, 0), (false, DEVICE_BUFFER_100NS)]
+        &[
+            (true, DEVICE_BUFFER_100NS),
+            (true, 0),
+            (false, DEVICE_BUFFER_100NS),
+        ]
     } else {
         &[(false, DEVICE_BUFFER_100NS)]
     };
@@ -1088,8 +1117,8 @@ fn open_device_client(
         if !with_event {
             return Ok((client, format, None));
         }
-        if let Ok(event) = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
-            .map(OwnedHandle)
+        if let Ok(event) =
+            unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.map(OwnedHandle)
             && unsafe { client.SetEventHandle(event.0) }.is_ok()
         {
             return Ok((client, format, Some(event)));
@@ -1420,19 +1449,43 @@ mod tests {
             let contents = unsafe { &property_ref.Anonymous.Anonymous };
             assert_eq!(contents.vt, VT_BLOB);
             let blob = unsafe { &contents.Anonymous.blob };
-            assert_eq!(blob.cbSize as usize, size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>());
-            assert_eq!(blob.pBlobData.cast_const(), ptr::from_ref(&arguments.params).cast());
-            assert_eq!(unsafe { arguments.params.Anonymous.ProcessLoopbackParams.TargetProcessId }, pid);
+            assert_eq!(
+                blob.cbSize as usize,
+                size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>()
+            );
+            assert_eq!(
+                blob.pBlobData.cast_const(),
+                ptr::from_ref(&arguments.params).cast()
+            );
+            assert_eq!(
+                unsafe {
+                    arguments
+                        .params
+                        .Anonymous
+                        .ProcessLoopbackParams
+                        .TargetProcessId
+                },
+                pid
+            );
 
             let (sender, _result) = mpsc::sync_channel(1);
             let handler: IActivateAudioInterfaceCompletionHandler = ActivationComplete {
-                sender, _arguments: arguments,
-            }.into();
+                sender,
+                _arguments: arguments,
+            }
+            .into();
             let callback_reference = handler.clone();
             drop(handler);
             let retained_blob = unsafe { &contents.Anonymous.blob };
-            let params = unsafe { &*retained_blob.pBlobData.cast::<AUDIOCLIENT_ACTIVATION_PARAMS>() };
-            assert_eq!(unsafe { params.Anonymous.ProcessLoopbackParams.TargetProcessId }, pid);
+            let params = unsafe {
+                &*retained_blob
+                    .pBlobData
+                    .cast::<AUDIOCLIENT_ACTIVATION_PARAMS>()
+            };
+            assert_eq!(
+                unsafe { params.Anonymous.ProcessLoopbackParams.TargetProcessId },
+                pid
+            );
             drop(callback_reference);
         }
     }
@@ -1442,7 +1495,10 @@ mod tests {
         let (release, released) = mpsc::sync_channel(1);
         state.prepare(enabled, reply, released);
         assert!(matches!(ready.try_recv(), Ok(Ok(()))));
-        QuietModeBarrier { release: Some(release), wake: Arc::new(Signal::new().unwrap()) }
+        QuietModeBarrier {
+            release: Some(release),
+            wake: Arc::new(Signal::new().unwrap()),
+        }
     }
 
     fn waiting(state: impl FnOnce(&mut WaitState)) -> Option<Duration> {
@@ -1513,7 +1569,10 @@ mod tests {
         assert_eq!(retained(5_000, 15), Some(Duration::from_millis(5)));
         assert_eq!(retained(5_000, 500), Some(Duration::ZERO));
         // Each due state is one that the capture loop services and re-arms.
-        let state = QuietModeState { retain_silence: true, ..Default::default() };
+        let state = QuietModeState {
+            retain_silence: true,
+            ..Default::default()
+        };
         assert!(state.should_emit_retained(Duration::from_secs(5), Duration::from_millis(500)));
         assert!(QuietModeState::default().should_emit_tail(Duration::from_millis(900)));
     }
@@ -1526,7 +1585,10 @@ mod tests {
             state.retain_silence = true;
         });
         assert_eq!(frozen, Some(ENDPOINT_CHECK_INTERVAL));
-        assert_eq!(waiting(|state| state.idle_reported = true), Some(ENDPOINT_CHECK_INTERVAL));
+        assert_eq!(
+            waiting(|state| state.idle_reported = true),
+            Some(ENDPOINT_CHECK_INTERVAL)
+        );
     }
 
     #[test]
@@ -1558,9 +1620,15 @@ mod tests {
     #[test]
     fn an_unproven_event_never_waits_longer_than_half_the_endpoint_buffer() {
         let poll = Duration::from_millis(10);
-        assert_eq!(unproven_wait(4_800, 48_000, poll), Duration::from_millis(50));
+        assert_eq!(
+            unproven_wait(4_800, 48_000, poll),
+            Duration::from_millis(50)
+        );
         assert_eq!(unproven_wait(48_000, 48_000, poll), MAX_UNPROVEN_WAIT);
-        assert_eq!(unproven_wait(1_056, 48_000, poll), Duration::from_millis(11));
+        assert_eq!(
+            unproven_wait(1_056, 48_000, poll),
+            Duration::from_millis(11)
+        );
         // A tiny buffer cannot be read more often than the polling fallback would.
         assert_eq!(unproven_wait(480, 48_000, poll), poll);
     }
@@ -1654,7 +1722,10 @@ mod tests {
     #[test]
     fn canceling_a_prepared_quiet_change_restores_each_previous_policy() {
         for previous in [false, true] {
-            let mut state = QuietModeState { retain_silence: previous, ..Default::default() };
+            let mut state = QuietModeState {
+                retain_silence: previous,
+                ..Default::default()
+            };
             let barrier = prepared_mode(&mut state, !previous);
             assert!(!state.should_emit_tail(Duration::from_secs(60)));
             assert!(!state.should_emit_retained(Duration::from_secs(60), Duration::from_secs(60)));
@@ -1693,8 +1764,10 @@ mod tests {
                     let _ = done.send(enabled && state.pending.is_none());
                     break;
                 }
-                if matches!(receiver.try_recv(),
-                    Ok(Command::Shutdown) | Err(mpsc::TryRecvError::Disconnected)) {
+                if matches!(
+                    receiver.try_recv(),
+                    Ok(Command::Shutdown) | Err(mpsc::TryRecvError::Disconnected)
+                ) {
                     break;
                 }
                 // A paused stream has no timeout: only the barrier can end this wait.
@@ -1714,7 +1787,10 @@ mod tests {
             }
         });
         assert!(matches!(ready.recv(), Ok(Ok(()))));
-        drop(QuietModeBarrier { release: Some(release), wake: Arc::clone(&wake) });
+        drop(QuietModeBarrier {
+            release: Some(release),
+            wake: Arc::clone(&wake),
+        });
         let completed_without_wake = finished.recv_timeout(Duration::from_secs(2));
         let _ = commands.send(Command::Shutdown);
         wake.set();
@@ -1782,7 +1858,9 @@ mod tests {
         state.restore_after_resume(&mut recreated_clock, resumed);
         assert!(state.pending.is_none());
         assert!(state.retain_silence);
-        let (stamp, _) = recreated_clock.retained_idle_stamp(resumed + 1_000_000_000, 9_600).unwrap();
+        let (stamp, _) = recreated_clock
+            .retained_idle_stamp(resumed + 1_000_000_000, 9_600)
+            .unwrap();
         assert_eq!(stamp.timestamp_ns, resumed);
     }
 
@@ -1793,21 +1871,34 @@ mod tests {
         let mut clock = PacketClock::new(rate);
         clock.set_retain_silence(true, start);
         let mut capture = backtracking_core::SynchronizedCapture::new(
-            rate, 1, None, backtracking_core::DurationChoice::Seconds10,
-        ).unwrap();
+            rate,
+            1,
+            None,
+            backtracking_core::DurationChoice::Seconds10,
+        )
+        .unwrap();
         capture.set_retain_silence(true);
         let first = clock.timestamp(0, 480, Some(start), false, || unreachable!());
-        capture.push_native_interleaved(first.timestamp_ns, &[0.5; 480], first.discontinuity).unwrap();
+        capture
+            .push_native_interleaved(first.timestamp_ns, &[0.5; 480], first.discontinuity)
+            .unwrap();
         let now = start + 1_000_000_000;
         let cutoff = clock.idle_cutoff_ns(now, 4_800, IDLE_CUTOFF_GUARD.as_nanos() as u64);
         while let Some((stamp, frames)) = clock.retained_idle_stamp(cutoff, 9_600) {
             assert!(!stamp.discontinuity);
-            capture.push_native_interleaved(stamp.timestamp_ns, &vec![0.; frames], stamp.discontinuity).unwrap();
+            capture
+                .push_native_interleaved(stamp.timestamp_ns, &vec![0.; frames], stamp.discontinuity)
+                .unwrap();
         }
         let real = clock.timestamp(480, 480, Some(now - 10_000_000), false, || unreachable!());
-        capture.push_native_interleaved(real.timestamp_ns, &[0.25; 480], real.discontinuity).unwrap();
+        capture
+            .push_native_interleaved(real.timestamp_ns, &[0.25; 480], real.discontinuity)
+            .unwrap();
         assert_eq!(capture.capture().frame_range(), 0..48_000);
-        let snapshot = capture.capture().track_snapshot_range(0, 0..48_000).unwrap();
+        let snapshot = capture
+            .capture()
+            .track_snapshot_range(0, 0..48_000)
+            .unwrap();
         let samples = snapshot.frames(0..48_000).unwrap();
         assert_eq!(&samples[..480], &[0.5; 480]);
         assert!(samples[480..47_520].iter().all(|&sample| sample == 0.));
@@ -1822,20 +1913,30 @@ mod tests {
         let mut clock = PacketClock::new(rate);
         clock.set_retain_silence(true, start);
         let mut capture = backtracking_core::SynchronizedCapture::new(
-            rate, 1, None, backtracking_core::DurationChoice::Seconds10,
-        ).unwrap();
+            rate,
+            1,
+            None,
+            backtracking_core::DurationChoice::Seconds10,
+        )
+        .unwrap();
         capture.set_retain_silence(true);
         let first = clock.timestamp(0, 10, Some(start), false, || unreachable!());
-        capture.push_native_interleaved(first.timestamp_ns, &[0.5; 10], first.discontinuity).unwrap();
+        capture
+            .push_native_interleaved(first.timestamp_ns, &[0.5; 10], first.discontinuity)
+            .unwrap();
         for _ in 0..2 {
             let (stamp, frames) = clock.retained_idle_stamp(until, 200).unwrap();
             assert!(frames <= 200);
             assert!(!stamp.discontinuity);
-            capture.push_native_interleaved(stamp.timestamp_ns, &vec![0.; frames], stamp.discontinuity).unwrap();
+            capture
+                .push_native_interleaved(stamp.timestamp_ns, &vec![0.; frames], stamp.discontinuity)
+                .unwrap();
         }
         assert!(clock.retained_idle_stamp(until, 200).is_none());
         let last = clock.timestamp(10, 10, Some(until), false, || unreachable!());
-        capture.push_native_interleaved(last.timestamp_ns, &[0.25; 10], last.discontinuity).unwrap();
+        capture
+            .push_native_interleaved(last.timestamp_ns, &[0.25; 10], last.discontinuity)
+            .unwrap();
         let snapshot = capture.capture().snapshot();
         assert_eq!(snapshot.frame_range(), 3_590_010..3_600_010);
         assert!(snapshot.samples[..9_990].iter().all(|&sample| sample == 0.));

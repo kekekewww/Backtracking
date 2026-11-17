@@ -3,10 +3,18 @@
     windows_subsystem = "windows"
 )]
 
+#[cfg(all(target_os = "windows", test))]
+mod addon_integration;
+#[cfg(target_os = "windows")]
+mod addons;
+#[cfg(target_os = "windows")]
+mod clip_export;
 #[cfg(target_os = "windows")]
 mod context_menu;
 #[cfg(target_os = "windows")]
 mod controller;
+#[cfg(target_os = "windows")]
+mod data_paths;
 #[cfg(target_os = "windows")]
 mod file_drag;
 #[cfg(target_os = "windows")]
@@ -49,7 +57,15 @@ fn main() {
         } else {
             None
         };
-        ui::run(controller::Controller::new()?, primary)?;
+        let data = data_paths::DataPaths::for_current_user()?;
+        let addons = if primary {
+            addons::AddonManager::new(data.root().to_path_buf())
+        } else {
+            addons::AddonManager::connect_existing(data.root().to_path_buf())
+        }
+        .map_err(std::io::Error::other)?;
+        let controller = controller::Controller::with_addons(addons.handle())?;
+        ui::run(controller, primary)?;
         Ok::<(), Box<dyn std::error::Error>>(())
     })();
     if let Err(error) = result {

@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 
 use crate::context_menu::{self, WindowCommand};
 use crate::controller::{CaptureSource, Controller, EditSnapshot, SourceSettings};
+use crate::clip_export::{ExportOptions, export_clip};
 use crate::file_drag;
 use crate::preferences::{
     BORDER_WIDTHS, DEFAULT_ACCENT, Key, MeterMode, PreferenceWriter, Preferences, Settings,
-    StatusMark, serialize_sources, wav_sample_format_preference,
+    StatusMark, WideExportMode, serialize_sources, wav_sample_format_preference,
 };
 use crate::snapshot_hotkey::{self, SnapshotHotkey};
 use crate::startup;
@@ -21,7 +22,7 @@ use crate::updater::UpdateOptions;
 use crate::window_order;
 use backtracking_core::{
     AutoResumeDelay, ChannelRoute, DurationChoice, FrozenTrack, MeterReadings, WavExportProfile,
-    WaveformView, cleanup, export_routed_tracks_with_profile, waveform,
+    WaveformView, cleanup, waveform,
 };
 use backtracking_ui::{
     CENTER_LINE, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, PLOT_BACKGROUND, RECORDING_DIM,
@@ -395,6 +396,7 @@ struct Recorder {
     split_waveform: bool,
     wav_profile: WavExportProfile,
     wav_force_mono: bool,
+    wide_export: WideExportMode,
     last_interaction: Instant,
     recording_started: Option<f64>,
     peaks: [WaveformPeaks; 2],
@@ -607,11 +609,20 @@ impl WaveformPeaks {
 
 struct FrozenEdit {
     snapshots: Arc<[FrozenTrack]>,
+    lanes: Vec<usize>,
     bars: Vec<u64>,
     retention_seconds: u32,
+    export_options: ExportOptions,
 }
 
 impl FrozenEdit {
+    fn track(&self, lane: usize) -> Option<&FrozenTrack> {
+        self.lanes
+            .iter()
+            .position(|&logical| logical == lane)
+            .and_then(|index| self.snapshots.get(index))
+    }
+
     fn frames(&self) -> Range<u64> {
         self.snapshots.first().map_or(0..0, FrozenTrack::frame_range)
     }
@@ -638,7 +649,7 @@ struct EditPreviewJob {
 }
 
 struct SnapshotRead {
-    result: mpsc::Receiver<Option<Arc<[FrozenTrack]>>>,
+    result: mpsc::Receiver<Option<EditSnapshot>>,
     saves: Vec<SnapshotSpec>,
 }
 
@@ -649,6 +660,7 @@ struct SnapshotSpec {
     routes: [ChannelRoute; 2],
     force_mono: bool,
     flags: Option<FlagUpdate>,
+    export_options: ExportOptions,
 }
 
 type RetiredValue = Box<dyn std::any::Any + Send>;
@@ -679,21 +691,75 @@ impl Drop for UiRetirement {
 }
 
 impl SnapshotSpec {
-    fn clip(mut self, snapshots: Arc<[FrozenTrack]>) -> Option<WavClip> {
+    fn frozen_clip(mut self, snapshot: &EditSnapshot) -> Option<WavClip> {
+        self.export_options.groups = snapshot_groups(snapshot);
+        self.clip(Arc::clone(&snapshot.snapshots), &snapshot.lanes)
+    }
+
+    fn clip(mut self, snapshots: Arc<[FrozenTrack]>, lanes: &[usize]) -> Option<WavClip> {
+        if lanes.len() != snapshots.len() || lanes.iter().any(|&lane| lane > 1) {
+            return None;
+        }
         if let Some(flags) = &mut self.flags {
             flags.frames = snapshots.first()?.frame_range();
         }
-        WavClip::new(snapshots, self.selection.as_ref(), self.output,
-            self.profile, self.routes, self.force_mono, self.flags)
+        WavClip::new(
+            snapshots,
+            self.selection.as_ref(),
+            self.output,
+            self.profile,
+            physical_routes(self.routes, lanes),
+            self.force_mono,
+            self.flags,
+        )
+        .map(|mut clip| {
+            clip.export_options = self.export_options;
+            clip
+        })
     }
 }
 
-fn edit_preview(snapshots: &[FrozenTrack], key: &EditPreviewKey) -> [WaveformPeaks; 2] {
+fn physical_routes(routes: [ChannelRoute; 2], lanes: &[usize]) -> [ChannelRoute; 2] {
+    std::array::from_fn(|index| {
+        lanes
+            .get(index)
+            .and_then(|&lane| routes.get(lane))
+            .copied()
+            .unwrap_or(ChannelRoute::Merged)
+    })
+}
+
+fn snapshot_groups(snapshot: &EditSnapshot) -> [Option<crate::controller::LaneGroup>; 2] {
+    std::array::from_fn(|index| {
+        let &lane = snapshot.lanes.get(index)?;
+        if lane > 1 {
+            return None;
+        }
+        snapshot.shown_groups[lane]
+            .as_ref()
+            .and_then(|id| snapshot.groups[lane].iter().find(|group| &group.id == id))
+            .or_else(|| snapshot.groups[lane].first())
+            .cloned()
+    })
+}
+
+fn edit_preview(
+    snapshots: &[FrozenTrack],
+    lanes: &[usize],
+    key: &EditPreviewKey,
+) -> [WaveformPeaks; 2] {
     std::array::from_fn(|row| {
         let mut peaks = WaveformPeaks::empty(key.bins);
-        if row >= key.rows { return peaks; }
+        if row >= key.rows {
+            return peaks;
+        }
         let (lane, view) = key.views[row];
-        let Some(track) = snapshots.get(lane) else { return peaks; };
+        let Some(index) = lanes.iter().position(|&logical| logical == lane) else {
+            return peaks;
+        };
+        let Some(track) = snapshots.get(index) else {
+            return peaks;
+        };
         // The track answers whole peak blocks from the capture's peak cache and
         // clips the request to the frames it holds.
         track.waveform(view, key.frames.clone(), &mut peaks.low, &mut peaks.high);
@@ -722,10 +788,16 @@ fn snapshot_source(
 }
 
 fn edit_snapshot_matches(snapshot: &EditSnapshot, generation: u64) -> bool {
-    snapshot.generation == generation && snapshot.snapshots.first().is_some_and(|first| {
-        !first.frame_range().is_empty() && snapshot.snapshots.iter().all(|next|
-            next.frame_range() == first.frame_range() && next.sample_rate() == first.sample_rate())
-    })
+    snapshot.generation == generation
+        && snapshot.lanes.len() == snapshot.snapshots.len()
+        && matches!(snapshot.lanes.as_slice(), [0] | [1] | [0, 1])
+        && snapshot.snapshots.first().is_some_and(|first| {
+            !first.frame_range().is_empty()
+                && snapshot.snapshots.iter().all(|next| {
+                    next.frame_range() == first.frame_range()
+                        && next.sample_rate() == first.sample_rate()
+                })
+        })
 }
 
 fn frame_from_pointer(
@@ -896,6 +968,7 @@ struct WavClip {
     routes: [ChannelRoute; 2],
     force_mono: bool,
     flags: Option<FlagUpdate>,
+    export_options: ExportOptions,
 }
 
 impl WavClip {
@@ -926,17 +999,19 @@ impl WavClip {
             routes,
             force_mono,
             flags,
+            export_options: ExportOptions::default(),
         })
     }
 
     fn write(self, keep: bool) -> io::Result<ExportedWav> {
-        let paths = export_routed_tracks_with_profile(
+        let paths = export_clip(
             &self.output,
             &self.snapshots,
             self.frames,
             self.profile,
             &self.routes[..self.snapshots.len()],
             self.force_mono,
+            &self.export_options,
         )?;
         let mut result = ExportedWav {
             paths,
@@ -1018,6 +1093,7 @@ impl Recorder {
         settings: Settings,
         primary: bool,
     ) -> Self {
+        let group_error = controller.set_group_preferences(preferences.clone()).err();
         controller.set_retention(settings.history);
         controller.set_retain_silence(settings.retain_silence);
         controller.set_sources(settings.sources);
@@ -1028,11 +1104,21 @@ impl Recorder {
                 Ok(writer) => (Some(writer), String::new()),
                 Err(error) => (None, format!("Could not start settings writer: {error}")),
             }
-        } else { (None, String::new()) };
+        } else {
+            (None, String::new())
+        };
+        if let Some(error) = group_error {
+            if !preference_error.is_empty() {
+                preference_error.push_str("; ");
+            }
+            preference_error.push_str(&format!("Could not load channel group settings: {error}"));
+        }
         let retirement = match UiRetirement::new() {
             Ok(retirement) => Some(retirement),
             Err(error) => {
-                if !preference_error.is_empty() { preference_error.push_str("; "); }
+                if !preference_error.is_empty() {
+                    preference_error.push_str("; ");
+                }
                 preference_error.push_str(&format!("Could not start selection cleanup: {error}"));
                 None
             }
@@ -1087,6 +1173,7 @@ impl Recorder {
             split_waveform: settings.split_waveform,
             wav_profile: settings.wav_profile,
             wav_force_mono: settings.wav_force_mono,
+            wide_export: settings.wide_export,
             last_interaction: Instant::now(),
             recording_started: None,
             peaks: std::array::from_fn(|_| WaveformPeaks::empty(DEFAULT_BINS)),
@@ -1363,20 +1450,37 @@ impl Recorder {
     }
 
     fn collect_editing(&mut self) {
-        let result = self.edit_request.as_ref().and_then(|request| match request.result.try_recv() {
-            Ok(snapshots) => Some(snapshots),
-            Err(mpsc::TryRecvError::Disconnected) => Some(None),
-            Err(mpsc::TryRecvError::Empty) => None,
-        });
-        let Some(snapshots) = result else { return; };
+        let result =
+            self.edit_request
+                .as_ref()
+                .and_then(|request| match request.result.try_recv() {
+                    Ok(snapshots) => Some(snapshots),
+                    Err(mpsc::TryRecvError::Disconnected) => Some(None),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                });
+        let Some(snapshots) = result else {
+            return;
+        };
         let request = self.edit_request.take().expect("edit request was observed");
-        let Some(snapshot) = snapshots.and_then(|snapshot| self.accept_edit_snapshot(snapshot, request.generation)) else {
+        let Some(snapshot) =
+            snapshots.and_then(|snapshot| self.accept_edit_snapshot(snapshot, request.generation))
+        else {
             self.selection = None;
             self.gesture = None;
             self.export_requested = false;
             self.message = "No audio available for this selection.".into();
             return;
         };
+        let export_options = ExportOptions {
+            groups: snapshot_groups(&snapshot),
+            wide_mode: self.wide_export,
+            addons: self.controller.addons().cloned(),
+        };
+        for save in request.saves {
+            if let Some(clip) = save.frozen_clip(&snapshot) {
+                self.pending_snapshot_saves.push_back(clip);
+            }
+        }
         let snapshots = snapshot.snapshots;
         let frames = snapshots[0].frame_range();
         if let Some(selection) = &mut self.selection {
@@ -1387,16 +1491,18 @@ impl Recorder {
             *anchor = (*anchor).clamp(frames.start, frames.end);
             *cursor = (*cursor).clamp(frames.start, frames.end);
         }
-        for save in request.saves {
-            if let Some(clip) = save.clip(Arc::clone(&snapshots)) {
-                self.pending_snapshot_saves.push_back(clip);
-            }
-        }
-        self.editing = Some(FrozenEdit { snapshots, bars: snapshot.bar_markers,
-            retention_seconds: request.retention_seconds });
+        self.editing = Some(FrozenEdit {
+            snapshots,
+            lanes: snapshot.lanes,
+            bars: snapshot.bar_markers,
+            retention_seconds: request.retention_seconds,
+            export_options,
+        });
         self.next_refresh = Instant::now();
         self.live_revision = None;
-        if self.export_requested { self.start_export(); }
+        if self.export_requested {
+            self.start_export();
+        }
     }
 
     fn sync_generation(&mut self) {
@@ -1649,20 +1755,37 @@ impl Recorder {
     }
 
     fn refresh_edit_preview(&mut self) {
-        let edit = self.editing.as_ref().expect("editing preview has immutable material");
+        let edit = self
+            .editing
+            .as_ref()
+            .expect("editing preview has immutable material");
         let history = edit.frames();
-        let visible = self.zoom_frames.as_ref().map_or_else(|| history.clone(), |zoom|
-            fit_frame_range(&history, zoom.start, zoom.end.saturating_sub(zoom.start)));
+        let visible = self.zoom_frames.as_ref().map_or_else(
+            || history.clone(),
+            |zoom| fit_frame_range(&history, zoom.start, zoom.end.saturating_sub(zoom.start)),
+        );
         let inner = self.timeline_rect(self.plot_rect);
-        let width = if visible != history { inner.width() } else {
+        let width = if visible != history {
+            inner.width()
+        } else {
             let seconds = (history.end - history.start) as f32 / self.sample_rate.max(1) as f32;
             inner.width() * (seconds / edit.retention_seconds.max(1) as f32).clamp(0.0, 1.0)
         };
-        let policy = self.display_policy(Rect::from_min_size(inner.min, Vec2::new(width, inner.height())), visible.clone());
+        let policy = self.display_policy(
+            Rect::from_min_size(inner.min, Vec2::new(width, inner.height())),
+            visible.clone(),
+        );
         let (views, rows) = self.waveform_layout();
-        let key = EditPreviewKey { frames: visible, views, rows, bins: policy.bins };
+        let key = EditPreviewKey {
+            frames: visible,
+            views,
+            rows,
+            bins: policy.bins,
+        };
         if let Some(job) = &self.edit_preview {
-            if !job.worker.is_finished() { return; }
+            if !job.worker.is_finished() {
+                return;
+            }
         }
         if let Some(job) = self.edit_preview.take() {
             if let Ok(peaks) = job.worker.join() {
@@ -1676,16 +1799,32 @@ impl Recorder {
                     self.bar_markers.clone_from(&edit.bars);
                     self.peaks = peaks;
                     self.visible_frames = key.frames.clone();
-                    self.seconds = (key.frames.end - key.frames.start) as f32 / self.sample_rate.max(1) as f32;
+                    self.seconds =
+                        (key.frames.end - key.frames.start) as f32 / self.sample_rate.max(1) as f32;
                     self.edit_preview_key = Some(key.clone());
                 }
             }
         }
-        if self.edit_preview_key.as_ref() == Some(&key) { return; }
-        let snapshots = Arc::clone(&self.editing.as_ref().expect("material remains available").snapshots);
+        if self.edit_preview_key.as_ref() == Some(&key) {
+            return;
+        }
+        let snapshots = Arc::clone(
+            &self
+                .editing
+                .as_ref()
+                .expect("material remains available")
+                .snapshots,
+        );
+        let lanes = self
+            .editing
+            .as_ref()
+            .expect("material remains available")
+            .lanes
+            .clone();
         let render_key = key.clone();
-        match thread::Builder::new().name("backtracking-selection-peaks".into())
-            .spawn(move || edit_preview(&snapshots, &render_key))
+        match thread::Builder::new()
+            .name("backtracking-selection-peaks".into())
+            .spawn(move || edit_preview(&snapshots, &lanes, &render_key))
         {
             Ok(worker) => self.edit_preview = Some(EditPreviewJob { key, worker }),
             Err(error) => self.message = format!("Could not prepare selection display: {error}"),
@@ -1695,9 +1834,15 @@ impl Recorder {
     fn waveform_layout(&self) -> ([(usize, WaveformView); 2], usize) {
         if self.dual_source() {
             ([(0, WaveformView::Merged), (1, WaveformView::Merged)], 2)
-        } else if self.split_waveform && self.editing.as_ref()
-            .and_then(|edit| edit.snapshots.first()).map(FrozenTrack::channels)
-            .or_else(|| self.controller.track_channels(0)) == Some(2) {
+        } else if self.split_waveform
+            && self
+                .editing
+                .as_ref()
+                .and_then(|edit| edit.track(0))
+                .map(FrozenTrack::channels)
+                .or_else(|| self.controller.track_channels(0))
+                == Some(2)
+        {
             ([(0, WaveformView::Left), (0, WaveformView::Right)], 2)
         } else {
             ([(0, WaveformView::Merged); 2], 1)
@@ -2506,10 +2651,13 @@ impl Recorder {
             self.source_list_refresh_pending = true;
             return;
         }
+        let addons = self.controller.addons().cloned();
         match thread::Builder::new()
             .name("backtracking-sources".into())
-            .spawn(Controller::available_sources)
-        {
+            .spawn(move || match addons {
+                Some(addons) => Controller::available_sources_with_addons(&addons.snapshot()),
+                None => Controller::available_sources(),
+            }) {
             Ok(worker) => self.source_list_worker = Some(worker),
             Err(error) => self.message = format!("Could not list audio sources: {error}"),
         }
@@ -2798,13 +2946,17 @@ impl Recorder {
             selection: self.selection.clone(),
             output: self.saved_output.clone(),
             profile: self.wav_profile,
-            routes: self.controller.sources().each_ref().map(|settings| settings.as_ref()
-                .map_or(ChannelRoute::Merged, |settings| settings.route)),
+            routes: self.controller.sources().each_ref().map(|settings| {
+                settings
+                    .as_ref()
+                    .map_or(ChannelRoute::Merged, |settings| settings.route)
+            }),
             force_mono: self.wav_force_mono,
             flags: (!has_selection).then(|| self.flag_update(0..0)),
+            export_options: self.export_options(),
         };
         if let Some(edit) = &self.editing {
-            if let Some(clip) = spec.clip(Arc::clone(&edit.snapshots)) {
+            if let Some(clip) = spec.clip(Arc::clone(&edit.snapshots), &edit.lanes) {
                 self.pending_snapshot_saves.push_back(clip);
             } else {
                 self.message = "The selected audio is unavailable.".into();
@@ -2815,12 +2967,34 @@ impl Recorder {
             self.message = "Preparing snapshot…".into();
         } else {
             self.pending_snapshot_reads.push(SnapshotRead {
-                result: self.controller.request_snapshots(None), saves: vec![spec],
+                result: self.controller.request_edit_snapshot(),
+                saves: vec![spec],
             });
             self.message = "Preparing snapshot…".into();
         }
-        if has_selection { self.clear_snapshot(); }
+        if has_selection {
+            self.clear_snapshot();
+        }
         self.collect_snapshot_saves();
+    }
+
+    fn export_options(&self) -> ExportOptions {
+        let mut options = self.editing.as_ref().map_or_else(
+            || ExportOptions {
+                groups: std::array::from_fn(|index| {
+                    self.controller
+                        .active_lanes()
+                        .get(index)
+                        .and_then(|&lane| self.controller.shown_group(lane))
+                        .cloned()
+                }),
+                wide_mode: self.wide_export,
+                addons: self.controller.addons().cloned(),
+            },
+            |edit| edit.export_options.clone(),
+        );
+        options.wide_mode = self.wide_export;
+        options
     }
 
     fn wav_clip(&mut self, snapshots: Arc<[FrozenTrack]>, output: PathBuf) -> Option<WavClip> {
@@ -2834,15 +3008,23 @@ impl Recorder {
                 .as_ref()
                 .map_or(ChannelRoute::Merged, |settings| settings.route)
         });
+        let lanes = self.editing.as_ref().map_or_else(
+            || self.controller.active_lanes(),
+            |edit| edit.lanes.as_slice(),
+        );
         WavClip::new(
             snapshots,
             self.selection.as_ref(),
             output,
             self.wav_profile,
-            routes,
+            physical_routes(routes, lanes),
             self.wav_force_mono,
             flags,
         )
+        .map(|mut clip| {
+            clip.export_options = self.export_options();
+            clip
+        })
     }
 
     fn collect_snapshot_saves(&mut self) {
@@ -2851,12 +3033,17 @@ impl Recorder {
             let result = match self.pending_edit_save_reads[index].result.try_recv() {
                 Ok(result) => result,
                 Err(mpsc::TryRecvError::Disconnected) => None,
-                Err(mpsc::TryRecvError::Empty) => { index += 1; continue; }
+                Err(mpsc::TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
             };
             let read = self.pending_edit_save_reads.remove(index);
-            if let Some(snapshot) = result.and_then(|snapshot| self.accept_edit_snapshot(snapshot, read.generation)) {
+            if let Some(snapshot) =
+                result.and_then(|snapshot| self.accept_edit_snapshot(snapshot, read.generation))
+            {
                 for spec in read.saves {
-                    if let Some(clip) = spec.clip(Arc::clone(&snapshot.snapshots)) {
+                    if let Some(clip) = spec.frozen_clip(&snapshot) {
                         self.pending_snapshot_saves.push_back(clip);
                     } else {
                         self.message = "The selected audio is unavailable.".into();
@@ -2872,18 +3059,21 @@ impl Recorder {
             let result = match self.pending_snapshot_reads[index].result.try_recv() {
                 Ok(result) => result,
                 Err(mpsc::TryRecvError::Disconnected) => None,
-                Err(mpsc::TryRecvError::Empty) => { index += 1; continue; }
+                Err(mpsc::TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
             };
             let read = self.pending_snapshot_reads.remove(index);
-            if let Some(snapshots) = result {
+            if let Some(snapshot) = result {
                 for spec in read.saves {
-                    if let Some(clip) = spec.clip(Arc::clone(&snapshots)) {
+                    if let Some(clip) = spec.frozen_clip(&snapshot) {
                         self.pending_snapshot_saves.push_back(clip);
                     } else {
                         self.message = "The selected audio is unavailable.".into();
                     }
                 }
-                self.retire(snapshots);
+                self.retire(snapshot);
             } else {
                 self.message = "No audio captured yet.".into();
             }
@@ -3735,7 +3925,7 @@ impl Drop for Recorder {
             if let Ok(Some(snapshot)) = read.result.recv() {
                 if edit_snapshot_matches(&snapshot, read.generation) {
                     for spec in read.saves {
-                        if let Some(clip) = spec.clip(Arc::clone(&snapshot.snapshots)) {
+                        if let Some(clip) = spec.frozen_clip(&snapshot) {
                             self.pending_snapshot_saves.push_back(clip);
                         }
                     }
@@ -3743,9 +3933,9 @@ impl Drop for Recorder {
             }
         }
         for read in self.pending_snapshot_reads.drain(..) {
-            if let Ok(Some(snapshots)) = read.result.recv() {
+            if let Ok(Some(snapshot)) = read.result.recv() {
                 for spec in read.saves {
-                    if let Some(clip) = spec.clip(Arc::clone(&snapshots)) {
+                    if let Some(clip) = spec.frozen_clip(&snapshot) {
                         self.pending_snapshot_saves.push_back(clip);
                     }
                 }
@@ -3761,7 +3951,9 @@ impl Drop for Recorder {
             let _ = clip.write(true);
         }
         if let Some(writer) = &self.preference_writer {
-            if let Err(error) = writer.flush() { eprintln!("Could not save settings on exit: {error}"); }
+            if let Err(error) = writer.flush() {
+                eprintln!("Could not save settings on exit: {error}");
+            }
         }
     }
 }
@@ -3957,16 +4149,25 @@ mod tests {
     #[test]
     fn capture_replacement_is_rejected_even_when_its_absolute_frames_overlap() {
         let make_reply = |generation, second_first| EditSnapshot {
-            generation, bar_markers: vec![101],
+            generation,
+            bar_markers: vec![101],
+            lanes: vec![0, 1],
+            groups: std::array::from_fn(|_| Vec::new()),
+            shown_groups: [None, None],
             snapshots: vec![
                 FrozenTrack::from_interleaved(48000, 1, 100, &[0.1; 4]).unwrap(),
                 FrozenTrack::from_interleaved(48000, 1, second_first, &[-0.1; 4]).unwrap(),
-            ].into(),
+            ]
+            .into(),
         };
-        assert!(!edit_snapshot_matches(&make_reply(2, 100), 1),
-            "A reconnected source must not replace the material being selected");
-        assert!(!edit_snapshot_matches(&make_reply(1, 101), 1),
-            "A/B editing material must have exactly the same frame boundaries");
+        assert!(
+            !edit_snapshot_matches(&make_reply(2, 100), 1),
+            "A reconnected source must not replace the material being selected"
+        );
+        assert!(
+            !edit_snapshot_matches(&make_reply(1, 101), 1),
+            "A/B editing material must have exactly the same frame boundaries"
+        );
         let accepted = make_reply(1, 100);
         assert!(edit_snapshot_matches(&accepted, 1));
         assert_eq!(accepted.snapshots[0].frame_range(), 100..104);
@@ -4284,29 +4485,58 @@ mod tests {
 
     #[test]
     fn selection_and_unread_snapshot_cleanup_run_off_the_calling_thread() {
-        struct ObservedDrop<T> { _value: T, observed: mpsc::Sender<thread::ThreadId> }
+        struct ObservedDrop<T> {
+            _value: T,
+            observed: mpsc::Sender<thread::ThreadId>,
+        }
         impl<T> Drop for ObservedDrop<T> {
-            fn drop(&mut self) { let _ = self.observed.send(thread::current().id()); }
+            fn drop(&mut self) {
+                let _ = self.observed.send(thread::current().id());
+            }
         }
         let retirement = UiRetirement::new().unwrap();
         let caller = thread::current().id();
-        let snapshots: Arc<[FrozenTrack]> = vec![FrozenTrack::from_interleaved(48000, 1, 1, &[0.1; 4]).unwrap()].into();
+        let snapshots: Arc<[FrozenTrack]> =
+            vec![FrozenTrack::from_interleaved(48000, 1, 1, &[0.1; 4]).unwrap()].into();
         let first = Arc::downgrade(&snapshots);
         let (observed, drops) = mpsc::channel();
-        assert!(retirement.retire(ObservedDrop { _value: FrozenEdit { snapshots,
-            bars: vec![1], retention_seconds: 600 }, observed: observed.clone() }).is_ok());
+        assert!(
+            retirement
+                .retire(ObservedDrop {
+                    _value: FrozenEdit {
+                        snapshots,
+                        lanes: vec![0],
+                        bars: vec![1],
+                        retention_seconds: 600,
+                        export_options: ExportOptions::default()
+                    },
+                    observed: observed.clone()
+                })
+                .is_ok()
+        );
         assert_ne!(drops.recv_timeout(Duration::from_secs(2)).unwrap(), caller);
 
-        let snapshots: Arc<[FrozenTrack]> = vec![FrozenTrack::from_interleaved(48000, 1, 1, &[0.2; 4]).unwrap()].into();
+        let snapshots: Arc<[FrozenTrack]> =
+            vec![FrozenTrack::from_interleaved(48000, 1, 1, &[0.2; 4]).unwrap()].into();
         let second = Arc::downgrade(&snapshots);
         let (result, unread) = mpsc::channel();
         result.send(Some(snapshots)).unwrap();
         drop(result);
-        assert!(retirement.retire(ObservedDrop { _value: unread, observed }).is_ok());
+        assert!(
+            retirement
+                .retire(ObservedDrop {
+                    _value: unread,
+                    observed
+                })
+                .is_ok()
+        );
         assert_ne!(drops.recv_timeout(Duration::from_secs(2)).unwrap(), caller);
         drop(retirement);
         assert!(first.upgrade().is_none());
-        assert!(second.upgrade().is_none(), "Discarding an unread reply must release its last audio reference on cleanup");
+        assert!(
+            second.upgrade().is_none(),
+            "Discarding an unread reply must release its last audio reference on cleanup"
+        );
     }
 
     #[test]
@@ -4344,21 +4574,45 @@ mod tests {
 
     #[test]
     fn pinned_preview_preserves_absolute_frames_and_independent_channels() {
-        let stereo = FrozenTrack::from_interleaved(48000, 2, 1000, &[0.1, 0.7, 0.2, 0.6, 0.3, 0.5, 0.4, 0.4]).unwrap();
-        let key = EditPreviewKey { frames: 1001..1003,
-            views: [(0, WaveformView::Left), (0, WaveformView::Right)], rows: 2, bins: 2 };
-        let peaks = edit_preview(&[stereo], &key);
+        let stereo = FrozenTrack::from_interleaved(
+            48000,
+            2,
+            1000,
+            &[0.1, 0.7, 0.2, 0.6, 0.3, 0.5, 0.4, 0.4],
+        )
+        .unwrap();
+        let key = EditPreviewKey {
+            frames: 1001..1003,
+            views: [(0, WaveformView::Left), (0, WaveformView::Right)],
+            rows: 2,
+            bins: 2,
+        };
+        let peaks = edit_preview(&[stereo], &[0], &key);
         assert_eq!(peaks[0].low, [0.2, 0.3]);
         assert_eq!(peaks[0].high, [0.2, 0.3]);
         assert_eq!(peaks[1].low, [0.6, 0.5]);
         let tracks = [
-            FrozenTrack::from_interleaved(48000, 1, 1000, &[0.1,0.2,0.3,0.4]).unwrap(),
-            FrozenTrack::from_interleaved(48000, 1, 1000, &[-0.1,-0.2,-0.3,-0.4]).unwrap(),
+            FrozenTrack::from_interleaved(48000, 1, 1000, &[0.1, 0.2, 0.3, 0.4]).unwrap(),
+            FrozenTrack::from_interleaved(48000, 1, 1000, &[-0.1, -0.2, -0.3, -0.4]).unwrap(),
         ];
-        let key = EditPreviewKey { views: [(0, WaveformView::Merged), (1, WaveformView::Merged)], ..key };
-        let peaks = edit_preview(&tracks, &key);
+        let key = EditPreviewKey {
+            views: [(0, WaveformView::Merged), (1, WaveformView::Merged)],
+            ..key
+        };
+        let peaks = edit_preview(&tracks, &[0, 1], &key);
         assert_eq!(peaks[0].low, [0.2, 0.3]);
         assert_eq!(peaks[1].high, [-0.2, -0.3]);
+        let peaks = edit_preview(&tracks[1..], &[1], &key);
+        assert_eq!(
+            peaks[0].low,
+            [0.0, 0.0],
+            "Unavailable lane A must stay empty"
+        );
+        assert_eq!(
+            peaks[1].high,
+            [-0.2, -0.3],
+            "Lane B must retain its logical row"
+        );
     }
 
     #[test]
@@ -4535,5 +4789,122 @@ mod tests {
         drop(accepted);
         assert!(accepted_paths.iter().all(|path| path.is_file()));
         std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn snapshot_export_keeps_the_group_labels_frozen_with_its_audio() {
+        use crate::controller::LaneGroup;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let folder = std::env::temp_dir().join(format!(
+            "Backtracking-frozen-group-{}-{nonce}",
+            std::process::id()
+        ));
+        let snapshot = EditSnapshot {
+            snapshots: vec![
+                FrozenTrack::from_interleaved(48_000, 6, 100, &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+                    .unwrap(),
+            ]
+            .into(),
+            generation: 1,
+            lanes: vec![1],
+            bar_markers: Vec::new(),
+            groups: [
+                Vec::new(),
+                vec![
+                    LaneGroup {
+                        id: "bed".into(),
+                        label: "Bed".into(),
+                        channels: 0..2,
+                        labels: vec!["L".into(), "R".into()],
+                    },
+                    LaneGroup {
+                        id: "objects".into(),
+                        label: "Objects".into(),
+                        channels: 2..6,
+                        labels: vec![
+                            "Object 1".into(),
+                            "Object 2".into(),
+                            "Object 3".into(),
+                            "Object 4".into(),
+                        ],
+                    },
+                ],
+            ],
+            shown_groups: [None, Some("objects".into())],
+        };
+        let spec = SnapshotSpec {
+            selection: None,
+            output: folder.clone(),
+            profile: WavExportProfile::default(),
+            routes: [ChannelRoute::Merged; 2],
+            force_mono: false,
+            flags: None,
+            export_options: ExportOptions::default(),
+        };
+        let clip = spec.frozen_clip(&snapshot).unwrap();
+        drop(snapshot);
+        let files = clip.write(false).unwrap();
+        assert_eq!(files.paths.len(), 4);
+        for (index, path) in files.paths.iter().enumerate() {
+            assert!(
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(&format!("Object {}", index + 1))
+            );
+            let wav = std::fs::read(path).unwrap();
+            assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 1);
+            let sample = f32::from_le_bytes(wav[wav.len() - 4..].try_into().unwrap());
+            assert!((sample - [0.3, 0.4, 0.5, 0.6][index]).abs() < 0.000001);
+        }
+        drop(files);
+        std::fs::remove_dir(folder).unwrap();
+    }
+
+    #[test]
+    fn snapshot_export_uses_lane_b_route_when_lane_a_is_unavailable() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let folder = std::env::temp_dir().join(format!(
+            "Backtracking-lane-b-route-{}-{nonce}",
+            std::process::id()
+        ));
+        let snapshot = EditSnapshot {
+            snapshots: vec![FrozenTrack::from_interleaved(48_000, 1, 100, &[0.5]).unwrap()].into(),
+            generation: 1,
+            lanes: vec![1],
+            bar_markers: Vec::new(),
+            groups: [Vec::new(), Vec::new()],
+            shown_groups: [None, None],
+        };
+        let spec = SnapshotSpec {
+            selection: None,
+            output: folder.clone(),
+            profile: WavExportProfile::default(),
+            routes: [ChannelRoute::Left, ChannelRoute::Right],
+            force_mono: false,
+            flags: None,
+            export_options: ExportOptions::default(),
+        };
+        let files = spec.frozen_clip(&snapshot).unwrap().write(false).unwrap();
+        assert_eq!(files.paths.len(), 1);
+        let wav = std::fs::read(&files.paths[0]).unwrap();
+        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 2);
+        assert_eq!(
+            f32::from_le_bytes(wav[wav.len() - 8..wav.len() - 4].try_into().unwrap()),
+            0.0
+        );
+        assert_eq!(
+            f32::from_le_bytes(wav[wav.len() - 4..].try_into().unwrap()),
+            0.5
+        );
+        drop(files);
+        std::fs::remove_dir(folder).unwrap();
     }
 }

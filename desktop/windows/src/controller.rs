@@ -1,16 +1,26 @@
-use std::io;
-use std::ops::Range;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{
-    CaptureError, CaptureState, ChannelRoute, DurationChoice, FrozenTrack, MeterReadings,
-    SenderInfo, SenderReceiver, SynchronizedCapture, TimedPacket, WaveformView, discover_senders,
+    CaptureError, CaptureState, ChannelRoute, ChannelRouting, DurationChoice, FrozenTrack,
+    MeterReadings, SenderInfo, SenderReceiver, SynchronizedCapture, TimedPacket, WaveformView,
+    discover_senders,
 };
+
+use crate::addons::{AddonHandle, AddonSnapshot, AddonState};
+use crate::preferences::{
+    Key, PreferenceWriter, Preferences, SourceGroupChoices, serialize_shown_groups,
+    source_preference_key,
+};
+mod layout;
+pub(crate) use layout::{LaneGroup, LaneMeterReadings};
+use layout::{combined_channels, lane_groups, lane_meter_readings, machine_history_budget_samples};
 
 pub(crate) use crate::loopback::CaptureSource;
 use crate::loopback::{
@@ -19,6 +29,7 @@ use crate::loopback::{
 
 const COMMON_RATE: u32 = 48_000;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
+const SENDER_LAYOUT_POLL: Duration = Duration::from_millis(250);
 /// A Sender source is a socket that nothing announces, so it is read on a timer:
 /// quickly while its packets keep arriving and slowly while it is silent.
 const SENDER_ACTIVE_POLL: Duration = Duration::from_millis(4);
@@ -62,7 +73,7 @@ impl DisplayStamp {
         for (lane, format) in state.formats.iter().enumerate() {
             format.as_ref().map(Arc::as_ptr).hash(&mut status);
             capture
-                .and_then(|capture| capture.track_channels(lane))
+                .and_then(|capture| capture.track_channels(state.capture_lanes[lane]?))
                 .hash(&mut status);
         }
         Self {
@@ -70,7 +81,7 @@ impl DisplayStamp {
             revision: state.revision,
             meters: std::array::from_fn(|lane| {
                 capture
-                    .and_then(|capture| capture.track_meter_readings(lane))
+                    .and_then(|capture| capture.track_meter_readings(state.capture_lanes[lane]?))
                     .map(|meter| {
                         [meter.peak_dbfs, meter.vu, meter.momentary_lufs]
                             .map(|value| (value * 10.0).round() as i32)
@@ -223,7 +234,9 @@ impl Stream {
         bars.clear();
         match self {
             Self::Wasapi(stream) => stream.packet(samples),
-            Self::Sender { receiver, error, .. } => match receiver.as_mut()?.packet(samples, bars) {
+            Self::Sender {
+                receiver, error, ..
+            } => match receiver.as_mut()?.packet(samples, bars) {
                 Ok(packet) => packet.map(|packet| TimedPacket {
                     timestamp_ns: packet.timestamp_ns,
                     sample_rate: packet.sample_rate,
@@ -269,10 +282,15 @@ impl Stream {
         match self {
             Self::Wasapi(stream) => stream.resume(),
             Self::Sender {
-                receiver, format, id, ..
+                receiver,
+                format,
+                id,
+                ..
             } => {
                 let next = SenderReceiver::connect(id).map_err(|error| error.to_string())?;
-                if next.info.sample_rate != format.sample_rate || next.info.channels != format.channels {
+                if next.info.sample_rate != format.sample_rate
+                    || next.info.channels != format.channels
+                {
                     return Err("Sender format changed".into());
                 }
                 *receiver = Some(next);
@@ -315,11 +333,76 @@ const FIXED_SOURCES: usize = 2;
 /// long list of devices and applications would otherwise push them out of the visible rows.
 fn with_senders(mut sources: Vec<CaptureSource>, senders: Vec<SenderInfo>) -> Vec<CaptureSource> {
     let at = sources.len().min(FIXED_SOURCES);
-    sources.splice(at..at, senders.into_iter().map(|sender| CaptureSource::Sender {
-        id: sender.id,
-        name: format!("【Sender】{}", sender.name),
-    }));
+    sources.splice(
+        at..at,
+        senders.into_iter().map(|sender| CaptureSource::Sender {
+            id: sender.id,
+            name: format!("【Sender】{}", sender.name),
+        }),
+    );
     sources
+}
+
+fn sources_with_addons(
+    sources: Vec<CaptureSource>,
+    senders: Vec<SenderInfo>,
+    snapshot: &AddonSnapshot,
+) -> Vec<CaptureSource> {
+    let owned: std::collections::HashSet<_> = snapshot
+        .addons
+        .iter()
+        .flat_map(|addon| addon.sources.iter().map(|source| source.sender.as_str()))
+        .collect();
+    let mut sources = with_senders(
+        sources,
+        senders
+            .into_iter()
+            .filter(|sender| !owned.contains(sender.id.as_str()))
+            .collect(),
+    );
+    let entries = snapshot
+        .addons
+        .iter()
+        .filter(|addon| addon.state == AddonState::Running)
+        .flat_map(|addon| {
+            addon.sources.iter().map(|source| CaptureSource::Addon {
+                addon_id: addon.id.clone(),
+                source_id: source.id.clone(),
+                name: source.name.clone(),
+            })
+        });
+    let at = sources.len().min(FIXED_SOURCES);
+    sources.splice(at..at, entries);
+    sources
+}
+
+fn is_sender(source: &CaptureSource) -> bool {
+    matches!(
+        source,
+        CaptureSource::Sender { .. } | CaptureSource::Addon { .. }
+    )
+}
+
+fn capture_channels(source: &CaptureSource, format: &Format, route: ChannelRoute) -> Option<usize> {
+    if is_sender(source) && format.channels > 2 {
+        ChannelRouting::Native.output_channels(format.channels, None)
+    } else {
+        format.route_channels(route)
+    }
+}
+
+fn route_samples(
+    source: &CaptureSource,
+    format: &Format,
+    route: ChannelRoute,
+    samples: &[f32],
+    output: &mut Vec<f32>,
+) {
+    if is_sender(source) && format.channels > 2 {
+        let _ = ChannelRouting::Native.route_interleaved(samples, format.channels, None, output);
+    } else {
+        format.route(route, samples, output);
+    }
 }
 type WaveformBuffers<'a> = (&'a mut [f32], &'a mut [f32]);
 
@@ -328,12 +411,18 @@ pub(crate) struct EditSnapshot {
     pub(crate) snapshots: Arc<[FrozenTrack]>,
     pub(crate) bar_markers: Vec<u64>,
     pub(crate) generation: u64,
+    /// Group metadata is frozen with the audio, before a later format change.
+    pub(crate) groups: [Vec<LaneGroup>; 2],
+    pub(crate) shown_groups: [Option<String>; 2],
+    /// Physical snapshot index to logical lane (A = 0, B = 1).
+    pub(crate) lanes: Vec<usize>,
 }
 
 enum CaptureCommand {
     SetSources(Sources),
     SetRetention(DurationChoice),
     SetRetainSilence(bool),
+    SetShownGroups(SourceGroupChoices),
     Pause,
     Resume,
     Clear,
@@ -365,6 +454,11 @@ struct SourceStatus {
     revision: u64,
     channels: [Option<usize>; 2],
     meters: [Option<MeterReadings>; 2],
+    groups: [Vec<LaneGroup>; 2],
+    shown_groups: [Option<String>; 2],
+    effective_retention_seconds: Option<f64>,
+    history_budget_samples: usize,
+    lanes: Vec<usize>,
 }
 
 impl SourceStatus {
@@ -379,11 +473,17 @@ impl SourceStatus {
             generation: state.generation,
             revision: state.revision,
             channels: std::array::from_fn(|lane| {
-                capture.and_then(|capture| capture.track_channels(lane))
+                capture.and_then(|capture| capture.track_channels(state.capture_lanes[lane]?))
             }),
             meters: std::array::from_fn(|lane| {
-                capture.and_then(|capture| capture.track_meter_readings(lane))
+                capture.and_then(|capture| capture.track_meter_readings(state.capture_lanes[lane]?))
             }),
+            groups: state.groups.clone(),
+            shown_groups: state.current_shown_groups(),
+            effective_retention_seconds: capture
+                .map(|capture| capture.effective_retention_seconds()),
+            history_budget_samples: state.history_budget_samples,
+            lanes: state.active_lanes(),
         }
     }
 }
@@ -397,10 +497,21 @@ pub(crate) struct Controller {
     ui: Arc<UiLink>,
     commands: mpsc::Sender<Request>,
     worker: Option<JoinHandle<()>>,
+    addons: Option<AddonHandle>,
+    shown_groups: SourceGroupChoices,
+    group_preferences: Option<PreferenceWriter>,
 }
 
 impl Controller {
     pub(crate) fn new() -> io::Result<Self> {
+        Self::create(None)
+    }
+
+    pub(crate) fn with_addons(addons: AddonHandle) -> io::Result<Self> {
+        Self::create(Some(addons))
+    }
+
+    fn create(addons: Option<AddonHandle>) -> io::Result<Self> {
         let (commands, requests) = mpsc::channel();
         // Many packets can arrive before the worker runs. One queued wake covers them all.
         let wake_pending = Arc::new(AtomicBool::new(false));
@@ -416,7 +527,13 @@ impl Controller {
                 }
             })
         };
-        let state = Arc::new(Mutex::new(CaptureSession::with_wake(wake)));
+        if let Some(addons) = &addons {
+            addons.subscribe(Arc::clone(&wake));
+        }
+        let mut session = CaptureSession::with_wake(wake);
+        session.addons = addons.clone();
+        let history_budget_samples = session.history_budget_samples;
+        let state = Arc::new(Mutex::new(session));
         let ui = Arc::new(UiLink {
             repaint: OnceLock::new(),
             watching: AtomicBool::new(true),
@@ -434,18 +551,25 @@ impl Controller {
             retain_silence: false,
             source_status: SourceStatus {
                 paused: true,
+                history_budget_samples,
                 ..SourceStatus::default()
             },
             state,
             ui,
             commands,
             worker: Some(worker),
+            addons,
+            shown_groups: SourceGroupChoices::new(),
+            group_preferences: None,
         })
     }
 
     /// Installs the way the capture worker asks for a repaint when what the UI
     /// draws has changed. Until then the UI only sees the changes it polls for.
     pub(crate) fn set_repaint(&self, repaint: RepaintRequest) {
+        if let Some(addons) = &self.addons {
+            addons.subscribe(Arc::clone(&repaint));
+        }
         let _ = self.ui.repaint.set(repaint);
     }
 
@@ -461,7 +585,9 @@ impl Controller {
 
     pub(crate) fn set_sources(&mut self, mut sources: Sources) {
         if sources[0].is_none() {
-            sources[0] = sources[1].take().or_else(|| Some(SourceSettings::default()));
+            sources[0] = sources[1]
+                .take()
+                .or_else(|| Some(SourceSettings::default()));
         }
         if self.sources != sources {
             self.sources = sources.clone();
@@ -478,8 +604,86 @@ impl Controller {
         with_senders(Loopback::available_sources(), discover_senders())
     }
 
+    pub(crate) fn available_sources_with_addons(snapshot: &AddonSnapshot) -> Vec<CaptureSource> {
+        sources_with_addons(Loopback::available_sources(), discover_senders(), snapshot)
+    }
+
+    pub(crate) fn addons(&self) -> Option<&AddonHandle> {
+        self.addons.as_ref()
+    }
+
+    /// Enables persistent group choices using the same injected preferences as the recorder.
+    pub(crate) fn set_group_preferences(&mut self, preferences: Preferences) -> io::Result<()> {
+        let choices = preferences.load_shown_groups();
+        self.group_preferences = Some(PreferenceWriter::new(preferences)?);
+        self.set_shown_groups(choices);
+        Ok(())
+    }
+
+    pub(crate) fn set_shown_groups(&mut self, choices: SourceGroupChoices) {
+        self.shown_groups = choices.clone();
+        self.request(CaptureCommand::SetShownGroups(choices));
+    }
+
+    pub(crate) fn shown_groups(&self) -> &SourceGroupChoices {
+        &self.shown_groups
+    }
+
+    pub(crate) fn lane_groups(&self, lane: usize) -> &[LaneGroup] {
+        self.source_status
+            .groups
+            .get(lane)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn shown_group(&self, lane: usize) -> Option<&LaneGroup> {
+        let id = self.source_status.shown_groups.get(lane)?.as_ref()?;
+        self.lane_groups(lane).iter().find(|group| group.id == *id)
+    }
+
+    pub(crate) fn select_group(&mut self, lane: usize, id: &str) -> Result<(), String> {
+        if !self.lane_groups(lane).iter().any(|group| group.id == id) {
+            return Err("This channel group is not available".into());
+        }
+        let source = &self
+            .sources
+            .get(lane)
+            .and_then(Option::as_ref)
+            .ok_or("This lane has no source")?
+            .source;
+        self.shown_groups
+            .insert(source_preference_key(source), id.into());
+        if let Some(writer) = &self.group_preferences {
+            writer
+                .save(
+                    Key::ShownGroups,
+                    &serialize_shown_groups(&self.shown_groups),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        self.request(CaptureCommand::SetShownGroups(self.shown_groups.clone()));
+        Ok(())
+    }
+
+    pub(crate) fn group_preference_error(&self) -> Option<io::Error> {
+        self.group_preferences
+            .as_ref()
+            .and_then(PreferenceWriter::poll_error)
+    }
+
     pub(crate) fn route_available(&self, lane: usize, route: ChannelRoute) -> bool {
-        if let Some(format) = self.source_status.formats.get(lane).and_then(Option::as_ref) {
+        if self
+            .track_channels(lane)
+            .is_some_and(|channels| channels > 2)
+        {
+            return route == ChannelRoute::Merged;
+        }
+        if let Some(format) = self
+            .source_status
+            .formats
+            .get(lane)
+            .and_then(Option::as_ref)
+        {
             return format.route_channels(route).is_some();
         }
         // Until a source opens, avoid rejecting a saved route that the device may support.
@@ -487,7 +691,10 @@ impl Controller {
     }
 
     pub(crate) fn source_status(&self, lane: usize) -> Option<&str> {
-        self.source_status.statuses.get(lane).and_then(Option::as_deref)
+        self.source_status
+            .statuses
+            .get(lane)
+            .and_then(Option::as_deref)
     }
 
     /// Returns false when the capture worker was busy and the status is unchanged.
@@ -560,8 +767,74 @@ impl Controller {
         self.source_status.meters.get(lane).copied().flatten()
     }
 
+    pub(crate) fn lane_meter_readings(&self, lane: usize) -> Option<LaneMeterReadings> {
+        Some(lane_meter_readings(
+            self.track_meter_readings(lane)?,
+            self.track_channels(lane)?,
+        ))
+    }
+
+    pub(crate) fn effective_retention_seconds(&self) -> Option<f64> {
+        self.source_status.effective_retention_seconds
+    }
+
+    pub(crate) fn history_budget_samples(&self) -> usize {
+        self.source_status.history_budget_samples
+    }
+
+    /// Reads only the requested lane-relative channels. Busy capture leaves all bins untouched.
+    pub(crate) fn try_render_channel_waveforms(
+        &self,
+        channels: &[(usize, usize)],
+        zoom: Option<Range<u64>>,
+        traces: &mut [WaveformBuffers<'_>],
+    ) -> Option<(Range<u64>, Range<u64>, u32, Vec<u64>)> {
+        let state = try_lock(&self.state)?;
+        let rate = state.shape.map_or(COMMON_RATE, |shape| shape.0);
+        let Some(capture) = state.capture.as_ref().map(SynchronizedCapture::capture) else {
+            for (minimum, maximum) in traces {
+                minimum.fill(0.0);
+                maximum.fill(0.0);
+            }
+            return Some((0..0, 0..0, rate, Vec::new()));
+        };
+        let history = capture.frame_range();
+        let visible = zoom.map_or_else(
+            || history.clone(),
+            |zoom| {
+                backtracking_ui::fit_frame_range(
+                    &history,
+                    zoom.start,
+                    zoom.end.saturating_sub(zoom.start),
+                )
+            },
+        );
+        for (&(lane, channel), (minimum, maximum)) in channels.iter().zip(traces) {
+            match state.capture_lanes.get(lane).copied().flatten() {
+                Some(lane) => {
+                    capture.track_channel_waveform_range(
+                        lane,
+                        channel,
+                        visible.clone(),
+                        minimum,
+                        maximum,
+                    );
+                }
+                None => {
+                    minimum.fill(0.0);
+                    maximum.fill(0.0);
+                }
+            }
+        }
+        Some((history, visible.clone(), rate, capture.bar_markers(visible)))
+    }
+
     pub(crate) fn track_channels(&self, lane: usize) -> Option<usize> {
         self.source_status.channels.get(lane).copied().flatten()
+    }
+
+    pub(crate) fn active_lanes(&self) -> &[usize] {
+        &self.source_status.lanes
     }
 
     #[cfg(test)]
@@ -613,7 +886,15 @@ impl Controller {
             },
         );
         for (&(lane, view), (minimum, maximum)) in views.iter().zip(traces) {
-            capture.track_waveform_range(lane, view, visible.clone(), minimum, maximum);
+            match state.capture_lanes.get(lane).copied().flatten() {
+                Some(lane) => {
+                    capture.track_waveform_range(lane, view, visible.clone(), minimum, maximum);
+                }
+                None => {
+                    minimum.fill(0.0);
+                    maximum.fill(0.0);
+                }
+            }
         }
         let bars = capture.bar_markers(visible.clone());
         (history, visible, rate, bars)
@@ -684,7 +965,9 @@ impl Drop for Controller {
 }
 
 fn lock(state: &Mutex<CaptureSession>) -> MutexGuard<'_, CaptureSession> {
-    state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn try_lock(state: &Mutex<CaptureSession>) -> Option<MutexGuard<'_, CaptureSession>> {
@@ -720,6 +1003,14 @@ struct CaptureSession {
     /// Wakes the worker that owns this session. Every capture thread gets a copy.
     wake: DataWake,
     sender_packet_at: Option<Instant>,
+    addons: Option<AddonHandle>,
+    addon_snapshot: Option<Arc<AddonSnapshot>>,
+    groups: [Vec<LaneGroup>; 2],
+    shown_groups: SourceGroupChoices,
+    history_budget_samples: usize,
+    next_layout_check: Instant,
+    layout_blocked: [bool; 2],
+    capture_lanes: [Option<usize>; 2],
 }
 
 impl CaptureSession {
@@ -754,6 +1045,14 @@ impl CaptureSession {
             next_mode_retry: Instant::now(),
             wake,
             sender_packet_at: None,
+            addons: None,
+            addon_snapshot: None,
+            groups: std::array::from_fn(|_| Vec::new()),
+            shown_groups: SourceGroupChoices::new(),
+            history_budget_samples: machine_history_budget_samples(),
+            next_layout_check: Instant::now(),
+            layout_blocked: [false; 2],
+            capture_lanes: [Some(0), Some(1)],
         }
     }
 
@@ -781,6 +1080,10 @@ impl CaptureSession {
                         CaptureCommand::SetRetention(retention) => state.set_retention(retention),
                         CaptureCommand::SetRetainSilence(retain_silence) => {
                             state.set_retain_silence(retain_silence);
+                        }
+                        CaptureCommand::SetShownGroups(choices) => {
+                            state.shown_groups = choices;
+                            state.revision = state.revision.wrapping_add(1);
                         }
                         CaptureCommand::Pause => state.pause(),
                         CaptureCommand::Resume => state.resume(),
@@ -828,10 +1131,11 @@ impl CaptureSession {
 
     fn source_missing(&self) -> bool {
         self.sources.iter().flatten().any(|lane| {
-            !self
-                .inputs
-                .iter()
-                .any(|input| input.source.same_source(&lane.source))
+            self.resolved_source(&lane.source).is_ok()
+                && !self
+                    .inputs
+                    .iter()
+                    .any(|input| input.source.same_source(&lane.source))
                 && !self
                     .pending
                     .iter()
@@ -840,10 +1144,16 @@ impl CaptureSession {
     }
 
     fn next_wait(&self, now: Instant) -> Option<Duration> {
-        worker_wait(&WorkerWait {
+        let wait = worker_wait(&WorkerWait {
             paused: self.paused,
             sender_connected: self.inputs.iter().any(|input| {
-                matches!(&input.stream, Stream::Sender { receiver: Some(_), .. })
+                matches!(
+                    &input.stream,
+                    Stream::Sender {
+                        receiver: Some(_),
+                        ..
+                    }
+                )
             }),
             since_sender_packet: self
                 .sender_packet_at
@@ -853,7 +1163,19 @@ impl CaptureSession {
             source_retry_in: self
                 .source_missing()
                 .then(|| self.next_retry.saturating_duration_since(now)),
-        })
+        });
+        if !self.paused
+            && self
+                .sources
+                .iter()
+                .flatten()
+                .any(|lane| is_sender(&lane.source))
+        {
+            let layout = self.next_layout_check.saturating_duration_since(now);
+            Some(wait.map_or(layout, |wait| wait.min(layout)))
+        } else {
+            wait
+        }
     }
 
     fn set_sources(&mut self, sources: Sources) {
@@ -887,7 +1209,9 @@ impl CaptureSession {
         });
         self.discard_before_ns = now_ns();
         for input in &mut self.inputs {
-            input.stream.discard_pending(&mut self.native, &mut self.bars);
+            input
+                .stream
+                .discard_pending(&mut self.native, &mut self.bars);
         }
         self.formats = std::array::from_fn(|lane| {
             let source = &self.sources[lane].as_ref()?.source;
@@ -899,9 +1223,11 @@ impl CaptureSession {
         self.statuses = std::array::from_fn(|lane| {
             let settings = self.sources[lane].as_ref()?;
             let format = self.formats[lane].as_ref()?;
-            missing_channel(format, settings.route)
+            missing_capture_channel(&settings.source, format, settings.route)
         });
         self.error = None;
+        self.layout_blocked = [false; 2];
+        self.groups = std::array::from_fn(|_| Vec::new());
         self.reset_capture();
         self.configure_capture();
         if !self.paused {
@@ -910,9 +1236,11 @@ impl CaptureSession {
     }
 
     fn poll(&mut self) {
+        self.refresh_addon_state();
         if self.paused {
             return;
         }
+        self.check_sender_layouts();
         self.poll_pending();
         if self.requested_retain_silence != self.retain_silence
             && Instant::now() >= self.next_mode_retry
@@ -947,7 +1275,230 @@ impl CaptureSession {
         self.update_error();
     }
 
+    fn resolved_source(&self, source: &CaptureSource) -> Result<CaptureSource, String> {
+        let CaptureSource::Addon {
+            addon_id,
+            source_id,
+            ..
+        } = source
+        else {
+            return Ok(source.clone());
+        };
+        let addon = self
+            .addon_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.addon(addon_id))
+            .ok_or_else(|| "Add-on is not installed".to_string())?;
+        let reason = match &addon.state {
+            AddonState::Running => None,
+            AddonState::Starting => Some("Add-on is starting".into()),
+            AddonState::Stopping => Some("Add-on is stopping".into()),
+            AddonState::Stopped => Some("Add-on is stopped".into()),
+            AddonState::NotResponding => Some("Add-on is not responding".into()),
+            AddonState::Failed(reason) | AddonState::BrokenPackage(reason) => {
+                Some(format!("Add-on unavailable: {reason}"))
+            }
+        };
+        if let Some(reason) = reason {
+            return Err(reason);
+        }
+        let source = addon
+            .sources
+            .iter()
+            .find(|source| source.id == *source_id)
+            .ok_or_else(|| "Add-on source is not available".to_string())?;
+        Ok(CaptureSource::Sender {
+            id: source.sender.clone(),
+            name: source.name.clone(),
+        })
+    }
+
+    fn addon_source(
+        &self,
+        source: &CaptureSource,
+    ) -> Option<&backtracking_addon::protocol::Source> {
+        let CaptureSource::Addon {
+            addon_id,
+            source_id,
+            ..
+        } = source
+        else {
+            return None;
+        };
+        self.addon_snapshot.as_ref()?.source(addon_id, source_id)
+    }
+
+    fn refresh_addon_state(&mut self) {
+        // This worker may wait for the short Arc swap. A UI frame must use try_snapshot instead.
+        let Some(next) = self.addons.as_ref().map(AddonHandle::snapshot) else {
+            return;
+        };
+        if self
+            .addon_snapshot
+            .as_ref()
+            .is_some_and(|old| old.revision == next.revision)
+        {
+            return;
+        }
+        let previous = self.addon_snapshot.replace(next);
+        let selected: Vec<_> = self
+            .sources
+            .iter()
+            .flatten()
+            .map(|lane| lane.source.clone())
+            .collect();
+        let mut changed = false;
+        for source in selected {
+            let CaptureSource::Addon {
+                addon_id,
+                source_id,
+                ..
+            } = &source
+            else {
+                continue;
+            };
+            let old = previous
+                .as_ref()
+                .and_then(|snapshot| snapshot.source(addon_id, source_id));
+            let new = self.addon_source(&source);
+            // Transport position updates do not change the audio layout.
+            let layout_changed = match (old, new) {
+                (Some(old), Some(new)) => {
+                    old.sender != new.sender || old.format != new.format || old.groups != new.groups
+                }
+                (None, None) => false,
+                _ => true,
+            };
+            if layout_changed {
+                self.inputs
+                    .retain(|input| !input.source.same_source(&source));
+                self.pending
+                    .retain(|pending| !pending.source.same_source(&source));
+                for (lane, settings) in self.sources.iter().enumerate() {
+                    if settings
+                        .as_ref()
+                        .is_some_and(|settings| settings.source.same_source(&source))
+                    {
+                        self.formats[lane] = None;
+                        self.layout_blocked[lane] = false;
+                    }
+                }
+                changed = true;
+            }
+            if let Err(reason) = self.resolved_source(&source) {
+                self.set_source_status(&source, reason);
+            }
+        }
+        if changed {
+            self.next_retry = Instant::now();
+            self.next_layout_check = Instant::now();
+            self.reset_capture();
+            self.configure_capture();
+        }
+    }
+
+    fn check_sender_layouts(&mut self) {
+        let now = Instant::now();
+        if now < self.next_layout_check {
+            return;
+        }
+        self.next_layout_check = now + SENDER_LAYOUT_POLL;
+        if !self.inputs.iter().any(|input| is_sender(&input.source)) {
+            return;
+        }
+        let registrations = discover_senders();
+        let mut changed = Vec::new();
+        for input in &self.inputs {
+            let Stream::Sender { id, format, .. } = &input.stream else {
+                continue;
+            };
+            match registrations.iter().find(|sender| sender.id == *id) {
+                Some(sender)
+                    if sender.channels == format.channels
+                        && sender.sample_rate == format.sample_rate => {}
+                _ => changed.push(input.source.clone()),
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        self.inputs.retain(|input| {
+            !changed
+                .iter()
+                .any(|source| input.source.same_source(source))
+        });
+        for source in &changed {
+            for (lane, settings) in self.sources.iter().enumerate() {
+                if settings
+                    .as_ref()
+                    .is_some_and(|settings| settings.source.same_source(source))
+                {
+                    self.formats[lane] = None;
+                    self.statuses[lane] = Some("Waiting for Sender audio layout".into());
+                    self.layout_blocked[lane] = false;
+                }
+            }
+        }
+        self.next_retry = now;
+        self.reset_capture();
+        self.configure_capture();
+    }
+
+    fn active_lanes(&self) -> Vec<usize> {
+        let Some(capture) = self.capture.as_ref() else {
+            return Vec::new();
+        };
+        let mut lanes: Vec<_> = self
+            .capture_lanes
+            .iter()
+            .enumerate()
+            .filter_map(|(logical, physical)| {
+                let physical = (*physical)?;
+                capture
+                    .capture()
+                    .track_channels(physical)
+                    .map(|_| (physical, logical))
+            })
+            .collect();
+        lanes.sort_unstable();
+        lanes.into_iter().map(|(_, logical)| logical).collect()
+    }
+
+    fn current_shown_groups(&self) -> [Option<String>; 2] {
+        std::array::from_fn(|lane| {
+            let source = &self.sources[lane].as_ref()?.source;
+            let saved = self.shown_groups.get(&source_preference_key(source));
+            self.groups[lane]
+                .iter()
+                .find(|group| Some(&group.id) == saved)
+                .or_else(|| self.groups[lane].first())
+                .map(|group| group.id.clone())
+        })
+    }
+
+    fn groups_for_lane(&self, lane: usize) -> Result<Vec<LaneGroup>, String> {
+        let settings = self.sources[lane]
+            .as_ref()
+            .ok_or("This lane has no source")?;
+        let format = self.formats[lane]
+            .as_ref()
+            .ok_or("Waiting for source audio layout")?;
+        let channels = capture_channels(&settings.source, format, settings.route)
+            .ok_or("The selected channel is unavailable")?;
+        let native_groups = lane_groups(self.addon_source(&settings.source), format.channels)?;
+        if channels == format.channels {
+            return Ok(native_groups);
+        }
+        // Mono/stereo routing keeps its existing behavior; group coordinates describe its output.
+        let mut groups = lane_groups(None, channels)?;
+        if channels == 1 {
+            groups[0].labels[0] = settings.route.label().into();
+        }
+        Ok(groups)
+    }
+
     fn request_missing(&mut self) {
+        self.refresh_addon_state();
         self.next_retry = Instant::now() + RETRY_DELAY;
         let sources: Vec<_> = self
             .sources
@@ -967,7 +1518,13 @@ impl CaptureSession {
             {
                 continue;
             }
-            let selected = source.clone();
+            let selected = match self.resolved_source(&source) {
+                Ok(source) => source,
+                Err(reason) => {
+                    self.set_source_status(&source, reason);
+                    continue;
+                }
+            };
             let (sender, result) = mpsc::sync_channel(1);
             let wake = Arc::clone(&self.wake);
             match thread::Builder::new()
@@ -1003,12 +1560,31 @@ impl CaptureSession {
                         self.set_source_status(&source, error);
                         continue;
                     }
+                    let sender_layout_changed = is_sender(&source)
+                        && self.sources.iter().enumerate().any(|(lane, settings)| {
+                            settings
+                                .as_ref()
+                                .is_some_and(|settings| settings.source.same_source(&source))
+                                && self.formats[lane].as_ref().is_some_and(|old| {
+                                    old.channels != stream.format().channels
+                                        || old.sample_rate != stream.format().sample_rate
+                                })
+                        });
+                    if sender_layout_changed {
+                        // Independent lanes use a common output rate. A native rate change still
+                        // starts a new history even when that common output shape is unchanged.
+                        self.reset_capture();
+                    }
                     for (lane, settings) in self.sources.iter().enumerate() {
                         if let Some(settings) = settings
                             && settings.source.same_source(&source)
                         {
                             self.formats[lane] = Some(Arc::clone(stream.format()));
-                            self.statuses[lane] = missing_channel(stream.format(), settings.route);
+                            self.statuses[lane] = missing_capture_channel(
+                                &settings.source,
+                                stream.format(),
+                                settings.route,
+                            );
                         }
                     }
                     self.inputs.push(Input { source, stream });
@@ -1046,47 +1622,92 @@ impl CaptureSession {
         self.error = if active || !self.pending.is_empty() {
             None
         } else {
-            self.statuses.iter().flatten().next().cloned()
+            self.statuses
+                .iter()
+                .zip(&self.sources)
+                .filter(|(_, source)| {
+                    !source.as_ref().is_some_and(|settings| {
+                        matches!(settings.source, CaptureSource::Addon { .. })
+                    })
+                })
+                .find_map(|(status, _)| status.clone())
         };
     }
 
     fn configure_capture(&mut self) {
-        if self.formats.iter().all(Option::is_none) {
-            return;
-        }
         let channels = |lane: usize| {
             let source = self.sources[lane].as_ref()?;
-            Some(
-                self.formats[lane]
-                    .as_ref()
-                    .and_then(|format| format.route_channels(source.route))
-                    .unwrap_or_else(|| {
-                        if source.route != ChannelRoute::Merged {
-                            return 1;
-                        }
-                        match source.source {
-                            CaptureSource::System
-                            | CaptureSource::Application { .. }
-                            | CaptureSource::Sender { .. } => 2,
-                            CaptureSource::DefaultMicrophone | CaptureSource::Microphone { .. } => {
-                                1
-                            }
-                        }
-                    }),
-            )
+            capture_channels(&source.source, self.formats[lane].as_ref()?, source.route)
+        };
+        let mut widths = [channels(0), channels(1)];
+        self.layout_blocked = [false; 2];
+        for (lane, source) in self.sources.iter().enumerate() {
+            if let Some(source) = source
+                && let Some(format) = &self.formats[lane]
+            {
+                self.statuses[lane] = missing_capture_channel(&source.source, format, source.route);
+            }
+        }
+        for lane in 0..2 {
+            if widths[lane].is_none() {
+                continue;
+            }
+            match self.groups_for_lane(lane) {
+                Ok(groups) => self.groups[lane] = groups,
+                Err(reason) => {
+                    self.statuses[lane] = Some(reason);
+                    self.layout_blocked[lane] = true;
+                    widths[lane] = None;
+                }
+            }
+        }
+        if let Some(a) = widths[0]
+            && let Err(reason) = combined_channels(a, widths[1])
+        {
+            self.statuses[1] = Some(reason);
+            self.layout_blocked[1] = true;
+            widths[1] = None;
+        }
+        let previous_lanes = self.capture_lanes;
+        let mut physical = 0;
+        self.capture_lanes = widths.map(|width| {
+            width.map(|_| {
+                let lane = physical;
+                physical += 1;
+                lane
+            })
+        });
+        let active: Vec<_> = widths
+            .iter()
+            .enumerate()
+            .filter_map(|(lane, width)| width.map(|width| (lane, width)))
+            .collect();
+        let Some(&(first_lane, first_width)) = active.first() else {
+            self.reset_capture();
+            return;
         };
         let sample_rate = if self.shared_source_routes().is_some() {
-            self.formats[0]
+            self.formats[first_lane]
                 .as_ref()
                 .map_or(COMMON_RATE, |format| format.sample_rate)
         } else {
             COMMON_RATE
         };
-        let mut shape = (sample_rate, channels(0).unwrap_or(2), channels(1));
-        if self.shape == Some(shape) {
+        let mut shape = (
+            sample_rate,
+            first_width,
+            active.get(1).map(|&(_, width)| width),
+        );
+        if self.shape == Some(shape) && previous_lanes == self.capture_lanes {
             return;
         }
-        let mut capture = SynchronizedCapture::new(shape.0, shape.1, shape.2, self.retention);
+        let mut capture = SynchronizedCapture::new_with_budget(
+            shape.0,
+            shape.1,
+            shape.2,
+            self.retention,
+            self.history_budget_samples,
+        );
         if matches!(
             capture,
             Err(CaptureError::BufferTooLarge | CaptureError::AllocationFailed)
@@ -1094,10 +1715,16 @@ impl CaptureSession {
         {
             // Very high native rates can exceed the maximum history allocation.
             shape.0 = COMMON_RATE;
-            if self.shape == Some(shape) {
+            if self.shape == Some(shape) && previous_lanes == self.capture_lanes {
                 return;
             }
-            capture = SynchronizedCapture::new(shape.0, shape.1, shape.2, self.retention);
+            capture = SynchronizedCapture::new_with_budget(
+                shape.0,
+                shape.1,
+                shape.2,
+                self.retention,
+                self.history_budget_samples,
+            );
         }
         match capture {
             Ok(mut capture) => {
@@ -1125,8 +1752,13 @@ impl CaptureSession {
     }
 
     fn shared_source_routes(&self) -> Option<([ChannelRoute; 2], usize)> {
-        let a = self.sources[0].as_ref()?;
-        match &self.sources[1] {
+        let mut active = self
+            .sources
+            .iter()
+            .enumerate()
+            .filter_map(|(lane, source)| self.capture_lanes[lane].and(source.as_ref()));
+        let a = active.next()?;
+        match active.next() {
             None => Some(([a.route, a.route], 1)),
             Some(b) if a.source.same_source(&b.source) => Some(([a.route, b.route], 2)),
             Some(_) => None,
@@ -1153,6 +1785,14 @@ impl CaptureSession {
                     self.sender_packet_at = Some(Instant::now());
                 }
                 let format = input.stream.format();
+                if !self.sources.iter().enumerate().any(|(lane, source)| {
+                    self.capture_lanes[lane].is_some()
+                        && source
+                            .as_ref()
+                            .is_some_and(|source| source.source.same_source(&input.source))
+                }) {
+                    continue;
+                }
                 let delta = self.discard_before_ns.saturating_sub(packet.timestamp_ns);
                 let skip = (u128::from(delta) * u128::from(packet.sample_rate))
                     .div_ceil(1_000_000_000) as usize;
@@ -1172,30 +1812,50 @@ impl CaptureSession {
                 {
                     // Both routes came from the same hardware frame and can stay on
                     // its native clock. WAV export converts the complete selection once.
-                    format.route_tracks(&routes[..count], samples, &mut self.scratch);
+                    if is_sender(&input.source) && format.channels > 2 {
+                        self.scratch.clear();
+                        for frame in samples.chunks_exact(format.channels) {
+                            for _ in 0..count {
+                                self.scratch.extend_from_slice(frame);
+                            }
+                        }
+                    } else {
+                        format.route_tracks(&routes[..count], samples, &mut self.scratch);
+                    }
                     if let Err(error) = capture.push_native_interleaved_with_markers(
                         timestamp_ns,
                         &self.scratch,
                         packet.discontinuity,
                         &self.bars,
                     ) {
-                        for status in &mut self.statuses[..count] {
-                            *status = Some(error.to_string());
+                        for (lane, status) in self.statuses.iter_mut().enumerate() {
+                            if self.capture_lanes[lane].is_some() {
+                                *status = Some(error.to_string());
+                            }
                         }
                     }
                     continue;
                 }
                 for (lane, source) in self.sources.iter().enumerate() {
+                    let Some(physical_lane) = self.capture_lanes[lane] else {
+                        continue;
+                    };
                     let Some(source) = source
                         .as_ref()
                         .filter(|source| source.source.same_source(&input.source))
                     else {
                         continue;
                     };
-                    format.route(source.route, samples, &mut self.scratch);
+                    route_samples(
+                        &source.source,
+                        format,
+                        source.route,
+                        samples,
+                        &mut self.scratch,
+                    );
                     if !self.scratch.is_empty()
                         && let Err(error) = capture.push_with_markers(
-                            lane,
+                            physical_lane,
                             timestamp_ns,
                             packet.sample_rate,
                             &self.scratch,
@@ -1305,7 +1965,11 @@ impl CaptureSession {
         if frames.is_empty() {
             return None;
         }
-        let count = if self.sources[1].is_some() { 2 } else { 1 };
+        let count = if capture.track_channels(1).is_some() {
+            2
+        } else {
+            1
+        };
         let frozen = capture.freeze_range(frames)?;
         let tracks = (0..count)
             .map(|lane| frozen.track(lane))
@@ -1320,13 +1984,18 @@ impl CaptureSession {
             snapshots: self.snapshots(Some(frames.clone()))?,
             bar_markers: capture.bar_markers(frames),
             generation: self.generation,
+            groups: self.groups.clone(),
+            shown_groups: self.current_shown_groups(),
+            lanes: self.active_lanes(),
         })
     }
 
     fn clear(&mut self) {
         self.discard_before_ns = now_ns();
         for input in &mut self.inputs {
-            input.stream.discard_pending(&mut self.native, &mut self.bars);
+            input
+                .stream
+                .discard_pending(&mut self.native, &mut self.bars);
         }
         if let Some(capture) = &mut self.capture {
             capture.reset_input();
@@ -1368,7 +2037,9 @@ impl CaptureSession {
             for barrier in barriers {
                 barrier.cancel();
             }
-            self.mode_error = failures.into_iter().next()
+            self.mode_error = failures
+                .into_iter()
+                .next()
                 .map(|(_, error)| format!("Could not change quiet-section capture: {error}"));
             self.next_mode_retry = Instant::now() + RETRY_DELAY;
             return;
@@ -1390,9 +2061,365 @@ fn missing_channel(format: &Format, route: ChannelRoute) -> Option<String> {
         .then(|| "目前的來源沒有提供所選聲道".into())
 }
 
+fn missing_capture_channel(
+    source: &CaptureSource,
+    format: &Format,
+    route: ChannelRoute,
+) -> Option<String> {
+    if is_sender(source) && format.channels > 2 {
+        None
+    } else {
+        missing_channel(format, route)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn addon_fixture(state: AddonState) -> AddonSnapshot {
+        use backtracking_addon::protocol::{ChannelGroup, Format as AddonFormat, Source};
+        AddonSnapshot {
+            revision: 1,
+            error: None,
+            addons: vec![crate::addons::AddonInfo {
+                id: "test.addon".into(),
+                manifest: None,
+                enabled: true,
+                state,
+                pid: None,
+                message: None,
+                settings: Vec::new(),
+                actions: Vec::new(),
+                sources: vec![Source {
+                    id: "main".into(),
+                    name: "Six channels".into(),
+                    sender: "abc-123".into(),
+                    formats: vec![AddonFormat {
+                        id: "5.1".into(),
+                        label: "5.1".into(),
+                    }],
+                    format: "5.1".into(),
+                    transport: None,
+                    groups: Some(vec![ChannelGroup {
+                        id: "bed".into(),
+                        label: "Bed".into(),
+                        channels: ["L", "R", "C", "LFE", "Ls", "Rs"]
+                            .map(str::to_string)
+                            .into(),
+                    }]),
+                }],
+            }],
+        }
+    }
+
+    fn addon_selection() -> CaptureSource {
+        CaptureSource::Addon {
+            addon_id: "test.addon".into(),
+            source_id: "main".into(),
+            name: "Six channels".into(),
+        }
+    }
+
+    #[test]
+    fn addon_identity_and_source_list_do_not_duplicate_its_sender() {
+        let snapshot = addon_fixture(AddonState::Running);
+        let source = addon_selection();
+        assert!(source.same_source(&CaptureSource::Addon {
+            addon_id: "test.addon".into(),
+            source_id: "main".into(),
+            name: "New name".into(),
+        }));
+        let listed = sources_with_addons(
+            vec![CaptureSource::System, CaptureSource::DefaultMicrophone],
+            vec![
+                SenderInfo {
+                    id: "abc-123".into(),
+                    name: "Unlabelled".into(),
+                    sample_rate: 48000,
+                    channels: 6,
+                },
+                SenderInfo {
+                    id: "def-456".into(),
+                    name: "Other".into(),
+                    sample_rate: 48000,
+                    channels: 2,
+                },
+            ],
+            &snapshot,
+        );
+        assert_eq!(listed.len(), 4);
+        assert_eq!(listed[2], source);
+        assert!(matches!(&listed[3], CaptureSource::Sender { id, .. } if id == "def-456"));
+    }
+
+    #[test]
+    fn stopped_addon_has_status_without_repeated_connection_attempts() {
+        let mut session = CaptureSession::new();
+        session.sources = [
+            Some(SourceSettings {
+                source: addon_selection(),
+                route: ChannelRoute::Merged,
+            }),
+            None,
+        ];
+        session.addon_snapshot = Some(Arc::new(addon_fixture(AddonState::Stopped)));
+        session.paused = false;
+        assert!(!session.source_missing());
+        session.request_missing();
+        assert!(session.pending.is_empty());
+        assert_eq!(session.statuses[0].as_deref(), Some("Add-on is stopped"));
+        session.update_error();
+        assert!(session.error.is_none());
+    }
+
+    #[test]
+    fn wide_sender_ignores_saved_stereo_route_and_preserves_native_channels() {
+        let mut session = CaptureSession::new();
+        let source = addon_selection();
+        session.sources = [
+            Some(SourceSettings {
+                source: source.clone(),
+                route: ChannelRoute::Left,
+            }),
+            None,
+        ];
+        session.addon_snapshot = Some(Arc::new(addon_fixture(AddonState::Running)));
+        session.formats[0] = Some(Arc::new(Format::sender(10, 6)));
+        session.history_budget_samples = 120;
+        session.configure_capture();
+        assert_eq!(session.shape, Some((10, 6, None)));
+        assert_eq!(session.groups[0][0].channels, 0..6);
+        assert_eq!(
+            session.groups[0][0].labels,
+            ["L", "R", "C", "LFE", "Ls", "Rs"]
+        );
+        let input = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let mut routed = Vec::new();
+        route_samples(
+            &source,
+            session.formats[0].as_ref().unwrap(),
+            ChannelRoute::Left,
+            &input,
+            &mut routed,
+        );
+        assert_eq!(routed, input);
+        assert_eq!(
+            session
+                .capture
+                .as_ref()
+                .unwrap()
+                .capture()
+                .effective_retention_seconds(),
+            2.0
+        );
+    }
+
+    #[test]
+    fn second_lane_over_64_is_refused_without_allocating_its_channels() {
+        let mut session = CaptureSession::new();
+        session.sources = ["abc-1", "abc-2"].map(|id| {
+            Some(SourceSettings {
+                source: CaptureSource::Sender {
+                    id: id.into(),
+                    name: id.into(),
+                },
+                route: ChannelRoute::Merged,
+            })
+        });
+        session.formats = [
+            Some(Arc::new(Format::sender(48_000, 40))),
+            Some(Arc::new(Format::sender(48_000, 25))),
+        ];
+        session.history_budget_samples = 640;
+        session.configure_capture();
+        assert_eq!(session.shape, Some((48_000, 40, None)));
+        assert!(
+            session.statuses[1]
+                .as_ref()
+                .unwrap()
+                .contains("limit is 64")
+        );
+        assert!(
+            session
+                .capture
+                .as_ref()
+                .unwrap()
+                .capture()
+                .track_channels(1)
+                .is_none()
+        );
+        session.formats[1] = Some(Arc::new(Format::sender(48_000, 24)));
+        session.configure_capture();
+        assert_eq!(session.shape, Some((48_000, 40, Some(24))));
+        assert!(session.statuses[1].is_none());
+    }
+
+    #[test]
+    fn mismatched_addon_groups_do_not_start_capture() {
+        let mut session = CaptureSession::new();
+        session.sources = [
+            Some(SourceSettings {
+                source: addon_selection(),
+                route: ChannelRoute::Merged,
+            }),
+            None,
+        ];
+        session.addon_snapshot = Some(Arc::new(addon_fixture(AddonState::Running)));
+        session.formats[0] = Some(Arc::new(Format::sender(10, 12)));
+        session.configure_capture();
+        assert!(session.capture.is_none());
+        assert!(
+            session.statuses[0]
+                .as_ref()
+                .unwrap()
+                .contains("Sender has 12")
+        );
+    }
+
+    #[test]
+    fn lane_b_records_while_lane_a_is_unavailable_without_phantom_channels() {
+        let mut session = CaptureSession::new();
+        session.sources = [
+            Some(SourceSettings {
+                source: addon_selection(),
+                route: ChannelRoute::Merged,
+            }),
+            Some(SourceSettings {
+                source: CaptureSource::Sender {
+                    id: "def-1".into(),
+                    name: "B".into(),
+                },
+                route: ChannelRoute::Merged,
+            }),
+        ];
+        session.addon_snapshot = Some(Arc::new(addon_fixture(AddonState::Stopped)));
+        session.formats[1] = Some(Arc::new(Format::sender(10, 6)));
+        session.history_budget_samples = 120;
+        session.paused = false;
+        session.configure_capture();
+        assert_eq!(session.shape, Some((10, 6, None)));
+        assert_eq!(session.capture_lanes, [None, Some(0)]);
+        assert_eq!(
+            SourceStatus::from_session(&session).channels,
+            [None, Some(6)]
+        );
+        let capture = session.capture.as_mut().unwrap();
+        assert_eq!(capture.capture().effective_retention_seconds(), 2.0);
+        capture
+            .push_native_interleaved_with_markers(0, &[0.5; 60], false, &[])
+            .unwrap();
+        let frozen = session.edit_snapshot().unwrap();
+        assert_eq!(frozen.lanes, vec![1]);
+        assert_eq!(frozen.snapshots.len(), 1);
+        assert_eq!(frozen.snapshots[0].channels(), 6);
+        let mut low = [0.0; 2];
+        let mut high = [0.0; 2];
+        Controller::render_waveforms_from(
+            &session,
+            &[(1, WaveformView::Merged)],
+            None,
+            &mut [(&mut low, &mut high)],
+        );
+        assert!(high.iter().any(|&peak| peak > 0.0));
+
+        // Reusing the same physical shape for another logical lane must clear old audio.
+        session.sources[0] = session.sources[1].clone();
+        session.formats[0] = session.formats[1].take();
+        session.configure_capture();
+        assert_eq!(session.capture_lanes, [Some(0), None]);
+        assert!(
+            session
+                .capture
+                .as_ref()
+                .unwrap()
+                .capture()
+                .frame_range()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sender_rate_change_resets_independent_lanes_even_with_same_output_rate() {
+        let mut session = CaptureSession::new();
+        session.sources = ["abc-1", "abc-2"].map(|id| {
+            Some(SourceSettings {
+                source: CaptureSource::Sender {
+                    id: id.into(),
+                    name: id.into(),
+                },
+                route: ChannelRoute::Merged,
+            })
+        });
+        session.formats = [
+            Some(Arc::new(Format::sender(44_100, 6))),
+            Some(Arc::new(Format::sender(48_000, 2))),
+        ];
+        session.history_budget_samples = 1024;
+        session.paused = false;
+        session.configure_capture();
+        assert_eq!(session.shape, Some((48_000, 6, Some(2))));
+        session
+            .capture
+            .as_mut()
+            .unwrap()
+            .push_native_interleaved_with_markers(0, &[0.5; 80], false, &[])
+            .unwrap();
+        let before = session.generation;
+        let (reply, result) = mpsc::sync_channel(1);
+        reply
+            .send(Ok(Stream::Sender {
+                receiver: None,
+                format: Arc::new(Format::sender(96_000, 6)),
+                id: "abc-1".into(),
+                error: None,
+            }))
+            .unwrap();
+        session.pending.push(PendingInput {
+            source: session.sources[0].as_ref().unwrap().source.clone(),
+            result,
+        });
+        session.poll_pending();
+        assert_eq!(session.shape, Some((48_000, 6, Some(2))));
+        assert!(session.generation > before);
+        assert!(
+            session
+                .capture
+                .as_ref()
+                .unwrap()
+                .capture()
+                .frame_range()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn frozen_snapshot_keeps_channel_groups_after_live_layout_changes() {
+        let mut session = CaptureSession::new();
+        session.sources = [
+            Some(SourceSettings {
+                source: addon_selection(),
+                route: ChannelRoute::Merged,
+            }),
+            None,
+        ];
+        session.addon_snapshot = Some(Arc::new(addon_fixture(AddonState::Running)));
+        session.formats[0] = Some(Arc::new(Format::sender(10, 6)));
+        session.history_budget_samples = 120;
+        session.paused = false;
+        session.configure_capture();
+        session
+            .capture
+            .as_mut()
+            .unwrap()
+            .push_native_interleaved_with_markers(0, &[0.5; 60], false, &[])
+            .unwrap();
+        let frozen = session.edit_snapshot().unwrap();
+        session.groups[0][0].labels[0] = "Changed".into();
+        assert_eq!(frozen.groups[0][0].labels[0], "L");
+        assert_eq!(frozen.shown_groups[0].as_deref(), Some("bed"));
+        assert_eq!(frozen.snapshots[0].channels(), 6);
+    }
 
     #[test]
     fn senders_are_listed_right_after_the_fixed_sources() {
@@ -1402,22 +2429,43 @@ mod tests {
             sample_rate: 48_000,
             channels: 2,
         };
-        let microphone = |name: &str| CaptureSource::Microphone { id: name.into(), name: name.into() };
+        let microphone = |name: &str| CaptureSource::Microphone {
+            id: name.into(),
+            name: name.into(),
+        };
         let devices = vec![
             CaptureSource::System,
             CaptureSource::DefaultMicrophone,
             microphone("Input 1"),
             microphone("Input 2"),
         ];
-        let listed = with_senders(devices.clone(), vec![sender("a-1", "Drums"), sender("b-2", "Bass")]);
+        let listed = with_senders(
+            devices.clone(),
+            vec![sender("a-1", "Drums"), sender("b-2", "Bass")],
+        );
         assert_eq!(listed.len(), 6);
         assert_eq!(listed[..2], devices[..2]);
-        assert_eq!(listed[2], CaptureSource::Sender { id: "a-1".into(), name: "【Sender】Drums".into() });
-        assert_eq!(listed[3], CaptureSource::Sender { id: "b-2".into(), name: "【Sender】Bass".into() });
+        assert_eq!(
+            listed[2],
+            CaptureSource::Sender {
+                id: "a-1".into(),
+                name: "【Sender】Drums".into()
+            }
+        );
+        assert_eq!(
+            listed[3],
+            CaptureSource::Sender {
+                id: "b-2".into(),
+                name: "【Sender】Bass".into()
+            }
+        );
         assert_eq!(listed[4..], devices[2..]);
         // Without senders the list is unchanged, and a short list still takes them.
         assert_eq!(with_senders(devices.clone(), Vec::new()), devices);
-        assert_eq!(with_senders(Vec::new(), vec![sender("a-1", "Drums")]).len(), 1);
+        assert_eq!(
+            with_senders(Vec::new(), vec![sender("a-1", "Drums")]).len(),
+            1
+        );
     }
 
     fn wait_native_condition(
@@ -1439,7 +2487,9 @@ mod tests {
     }
 
     fn native_recorded_end(controller: &Controller) -> u64 {
-        lock(&controller.state).capture.as_ref()
+        lock(&controller.state)
+            .capture
+            .as_ref()
             .map_or(0, |capture| capture.capture().frame_range().end)
     }
 
@@ -1456,108 +2506,204 @@ mod tests {
 
         struct FixtureHandle(HANDLE);
         impl Drop for FixtureHandle {
-            fn drop(&mut self) { let _ = unsafe { CloseHandle(self.0) }; }
+            fn drop(&mut self) {
+                let _ = unsafe { CloseHandle(self.0) };
+            }
         }
 
         let pid: u32 = std::env::var("BACKTRACKING_QUIET_TEST_PROCESS_ID")
             .expect("set BACKTRACKING_QUIET_TEST_PROCESS_ID to the isolated silent fixture")
-            .parse().expect("fixture PID must be an integer");
+            .parse()
+            .expect("fixture PID must be an integer");
         assert!(pid != 0 && pid != std::process::id());
-        assert!(CaptureSource::supports_app_capture(), "Process Loopback is unsupported");
-        let handle = FixtureHandle(unsafe {
-            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, false, pid)
-        }.expect("cannot query the exact fixture process"));
+        assert!(
+            CaptureSource::supports_app_capture(),
+            "Process Loopback is unsupported"
+        );
+        let handle = FixtureHandle(
+            unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    false,
+                    pid,
+                )
+            }
+            .expect("cannot query the exact fixture process"),
+        );
         assert_eq!(unsafe { WaitForSingleObject(handle.0, 0) }, WAIT_TIMEOUT);
         let mut name = vec![0u16; 32_768];
         let mut length = name.len() as u32;
         unsafe {
-            QueryFullProcessImageNameW(handle.0, PROCESS_NAME_WIN32, PWSTR(name.as_mut_ptr()), &mut length)
-        }.expect("cannot resolve the exact fixture executable");
+            QueryFullProcessImageNameW(
+                handle.0,
+                PROCESS_NAME_WIN32,
+                PWSTR(name.as_mut_ptr()),
+                &mut length,
+            )
+        }
+        .expect("cannot resolve the exact fixture executable");
         let path = PathBuf::from(String::from_utf16(&name[..length as usize]).unwrap());
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap().to_path_buf();
-        assert!(path.canonicalize().unwrap().starts_with(workspace.join("target").canonicalize().unwrap()),
-            "the native test may only capture a fixture under the workspace target directory");
-        assert!(path.file_name().unwrap().to_string_lossy().to_ascii_lowercase()
-            .starts_with("backtracking-quiet"), "unexpected fixture executable");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(
+            path.canonicalize()
+                .unwrap()
+                .starts_with(workspace.join("target").canonicalize().unwrap()),
+            "the native test may only capture a fixture under the workspace target directory"
+        );
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("backtracking-quiet"),
+            "unexpected fixture executable"
+        );
         let path = path.to_string_lossy().into_owned();
-        assert_eq!(crate::loopback::resolved_process_id_for_test(&path).unwrap(), pid,
-            "Application source resolution selected a different process");
+        assert_eq!(
+            crate::loopback::resolved_process_id_for_test(&path).unwrap(),
+            pid,
+            "Application source resolution selected a different process"
+        );
         eprintln!("native quiet smoke: fixture identity verified");
 
-        let source = CaptureSource::Application { path, name: "Quiet native fixture".into() };
+        let source = CaptureSource::Application {
+            path,
+            name: "Quiet native fixture".into(),
+        };
         let mut controller = Controller::new().unwrap();
-        controller.set_sources([Some(SourceSettings { source: source.clone(), route: ChannelRoute::Merged }), None]);
+        controller.set_sources([
+            Some(SourceSettings {
+                source: source.clone(),
+                route: ChannelRoute::Merged,
+            }),
+            None,
+        ]);
         controller.resume();
         eprintln!("native quiet smoke: dedicated Process Loopback activation requested");
-        assert!(wait_native_condition(&mut controller, Duration::from_secs(8), |controller| {
-            let state = lock(&controller.state);
-            state.capture.is_some() && state.inputs.len() == 1
-                && state.inputs[0].source.same_source(&source)
-                && matches!(state.inputs[0].stream, Stream::Wasapi(_))
-        }), "could not activate the isolated fixture: {:?}", controller.error());
+        assert!(
+            wait_native_condition(&mut controller, Duration::from_secs(8), |controller| {
+                let state = lock(&controller.state);
+                state.capture.is_some()
+                    && state.inputs.len() == 1
+                    && state.inputs[0].source.same_source(&source)
+                    && matches!(state.inputs[0].stream, Stream::Wasapi(_))
+            }),
+            "could not activate the isolated fixture: {:?}",
+            controller.error()
+        );
         eprintln!("native quiet smoke: dedicated Process Loopback activated");
-        assert!(controller.sources()[0].as_ref().unwrap().source.same_source(&source));
+        assert!(
+            controller.sources()[0]
+                .as_ref()
+                .unwrap()
+                .source
+                .same_source(&source)
+        );
         let rate = lock(&controller.state).shape.unwrap().0;
 
         thread::sleep(Duration::from_millis(900));
-        assert_eq!(native_recorded_end(&controller), 0, "default OFF retained idle audio");
+        assert_eq!(
+            native_recorded_end(&controller),
+            0,
+            "default OFF retained idle audio"
+        );
         eprintln!("native quiet smoke: default OFF stable");
         controller.set_retain_silence(true);
-        assert!(wait_native_condition(&mut controller, Duration::from_secs(2), |controller|
-            lock(&controller.state).retain_silence));
+        assert!(wait_native_condition(
+            &mut controller,
+            Duration::from_secs(2),
+            |controller| lock(&controller.state).retain_silence
+        ));
         let on_start = native_recorded_end(&controller);
         let on_clock = Instant::now();
-        assert!(wait_native_condition(&mut controller, Duration::from_secs(6), |controller|
-            native_recorded_end(controller) >= on_start + u64::from(rate) * 3 / 5),
-            "quiet ON did not advance the connected, silent Process Loopback stream");
+        assert!(
+            wait_native_condition(&mut controller, Duration::from_secs(6), |controller| {
+                native_recorded_end(controller) >= on_start + u64::from(rate) * 3 / 5
+            }),
+            "quiet ON did not advance the connected, silent Process Loopback stream"
+        );
         let on_elapsed = on_clock.elapsed().as_secs_f64();
         let on_end = native_recorded_end(&controller);
         eprintln!("native quiet smoke: quiet ON advances");
-        assert!((on_end - on_start) as f64 <= (on_elapsed + 0.3) * f64::from(rate),
-            "quiet ON retroactively retained the earlier OFF idle interval");
+        assert!(
+            (on_end - on_start) as f64 <= (on_elapsed + 0.3) * f64::from(rate),
+            "quiet ON retroactively retained the earlier OFF idle interval"
+        );
         let pinned = controller.request_edit_snapshot().recv().unwrap().unwrap();
         let pinned_range = pinned.snapshots[0].frame_range();
         assert!(pinned_range.end >= on_end);
-        assert!(pinned.snapshots.iter().flat_map(|track| track.snapshot().samples).all(|sample| sample == 0.0),
-            "the isolated silent fixture unexpectedly produced nonzero audio");
+        assert!(
+            pinned
+                .snapshots
+                .iter()
+                .flat_map(|track| track.snapshot().samples)
+                .all(|sample| sample == 0.0),
+            "the isolated silent fixture unexpectedly produced nonzero audio"
+        );
 
         controller.set_retain_silence(false);
-        assert!(wait_native_condition(&mut controller, Duration::from_secs(2), |controller|
-            !lock(&controller.state).retain_silence));
+        assert!(wait_native_condition(
+            &mut controller,
+            Duration::from_secs(2),
+            |controller| !lock(&controller.state).retain_silence
+        ));
         let off_end = native_recorded_end(&controller);
         thread::sleep(Duration::from_millis(700));
-        assert_eq!(native_recorded_end(&controller), off_end, "quiet OFF kept advancing");
+        assert_eq!(
+            native_recorded_end(&controller),
+            off_end,
+            "quiet OFF kept advancing"
+        );
         eprintln!("native quiet smoke: quiet OFF stable");
 
         controller.pause();
         controller.set_retain_silence(true);
-        assert!(wait_native_condition(&mut controller, Duration::from_secs(2), |controller|
-            lock(&controller.state).retain_silence));
+        assert!(wait_native_condition(
+            &mut controller,
+            Duration::from_secs(2),
+            |controller| lock(&controller.state).retain_silence
+        ));
         let paused_end = native_recorded_end(&controller);
         thread::sleep(Duration::from_millis(650));
-        assert_eq!(native_recorded_end(&controller), paused_end, "manual Pause recorded quiet audio");
+        assert_eq!(
+            native_recorded_end(&controller),
+            paused_end,
+            "manual Pause recorded quiet audio"
+        );
         assert!(controller.is_paused());
         eprintln!("native quiet smoke: manual Pause stable with quiet ON");
         controller.resume();
         let resume_clock = Instant::now();
-        assert!(wait_native_condition(&mut controller, Duration::from_secs(6), |controller|
-            native_recorded_end(controller) >= paused_end + u64::from(rate) / 4),
-            "quiet recording did not continue after Resume");
+        assert!(
+            wait_native_condition(&mut controller, Duration::from_secs(6), |controller| {
+                native_recorded_end(controller) >= paused_end + u64::from(rate) / 4
+            }),
+            "quiet recording did not continue after Resume"
+        );
         let resumed_frames = native_recorded_end(&controller) - paused_end;
         let resume_elapsed = resume_clock.elapsed().as_secs_f64();
-        assert!(resumed_frames as f64 <= (resume_elapsed + 0.3) * f64::from(rate),
-            "Resume backfilled the manually paused interval");
+        assert!(
+            resumed_frames as f64 <= (resume_elapsed + 0.3) * f64::from(rate),
+            "Resume backfilled the manually paused interval"
+        );
         assert_eq!(pinned.snapshots[0].frame_range(), pinned_range);
         assert_eq!(unsafe { WaitForSingleObject(handle.0, 0) }, WAIT_TIMEOUT);
         eprintln!("native quiet smoke: Resume advances without paused backfill");
-        println!("{}", serde_json::json!({
-            "scope": "isolated silent Process Loopback; memory snapshots only",
-            "sample_rate": rate, "quiet_on_frames": on_end - on_start,
-            "quiet_on_seconds_observed": on_elapsed, "quiet_off_end": off_end,
-            "paused_end": paused_end, "resumed_frames": resumed_frames,
-            "resume_seconds_observed": resume_elapsed,
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "scope": "isolated silent Process Loopback; memory snapshots only",
+                "sample_rate": rate, "quiet_on_frames": on_end - on_start,
+                "quiet_on_seconds_observed": on_elapsed, "quiet_off_end": off_end,
+                "paused_end": paused_end, "resumed_frames": resumed_frames,
+                "resume_seconds_observed": resume_elapsed,
+            })
+        );
     }
 
     #[test]
@@ -1577,7 +2723,10 @@ mod tests {
         let returned_while_busy = response.is_ok();
         drop(busy);
         ui.join().unwrap();
-        assert!(returned_while_busy, "quiet retention waited for the capture mutex");
+        assert!(
+            returned_while_busy,
+            "quiet retention waited for the capture mutex"
+        );
         let controller = response.unwrap();
         assert!(controller.request_snapshots(None).recv().unwrap().is_none());
         assert!(lock(&state).retain_silence);
@@ -1595,9 +2744,9 @@ mod tests {
             session.next_retry = Instant::now() + Duration::from_secs(3600);
             let mut capture =
                 SynchronizedCapture::new(10, 1, Some(1), DurationChoice::Seconds20).unwrap();
-            capture.push_native_interleaved_with_markers(
-                0, &vec![0.25, -0.5].repeat(6), false, &[1],
-            ).unwrap();
+            capture
+                .push_native_interleaved_with_markers(0, &vec![0.25, -0.5].repeat(6), false, &[1])
+                .unwrap();
             session.capture = Some(capture);
         }
         let edit = controller.request_edit_snapshot().recv().unwrap().unwrap();
@@ -1612,12 +2761,15 @@ mod tests {
             let capture = session.capture.as_mut().unwrap();
             assert!(capture.retain_silence());
             assert_eq!(capture.capture().state(), CaptureState::Recording);
-            capture.push_native_interleaved_with_markers(
-                600_000_000, &[0.0; 20], false, &[2, 7],
-            ).unwrap();
+            capture
+                .push_native_interleaved_with_markers(600_000_000, &[0.0; 20], false, &[2, 7])
+                .unwrap();
         }
         let live = controller.snapshots(None).unwrap();
-        assert!(live.iter().all(|snapshot| snapshot.frame_range() == (0..16)));
+        assert!(
+            live.iter()
+                .all(|snapshot| snapshot.frame_range() == (0..16))
+        );
         assert_eq!(&live[0].snapshot().samples[..6], &[0.25; 6]);
         assert_eq!(&live[1].snapshot().samples[..6], &[-0.5; 6]);
         assert_eq!(&live[0].snapshot().samples[6..], &[0.0; 10]);
@@ -1633,16 +2785,25 @@ mod tests {
             let mut session = lock(&controller.state);
             assert!(!session.retain_silence);
             assert_eq!(session.generation, 7);
-            session.capture.as_mut().unwrap().push_native_interleaved_with_markers(
-                1_600_000_000, &[0.0; 200], false, &[],
-            ).unwrap();
+            session
+                .capture
+                .as_mut()
+                .unwrap()
+                .push_native_interleaved_with_markers(1_600_000_000, &[0.0; 200], false, &[])
+                .unwrap();
         }
         let after = controller.snapshots(None).unwrap();
         assert!(after[0].frame_range().end < 116);
         assert!(after[0].frame_range().end >= 16);
         assert_eq!(after[0].frame_range(), after[1].frame_range());
-        assert_eq!(&after[0].snapshot().samples[..16], &live[0].snapshot().samples);
-        assert_eq!(&after[1].snapshot().samples[..16], &live[1].snapshot().samples);
+        assert_eq!(
+            &after[0].snapshot().samples[..16],
+            &live[0].snapshot().samples
+        );
+        assert_eq!(
+            &after[1].snapshot().samples[..16],
+            &live[1].snapshot().samples
+        );
     }
 
     #[test]
@@ -1653,9 +2814,10 @@ mod tests {
         session.requested_retain_silence = true;
         session.mode_error = Some("temporary source-control timeout".into());
         session.next_mode_retry = Instant::now();
-        let mut capture =
-            SynchronizedCapture::new(10, 1, None, DurationChoice::Seconds20).unwrap();
-        capture.push_native_interleaved(0, &[0.25; 4], false).unwrap();
+        let mut capture = SynchronizedCapture::new(10, 1, None, DurationChoice::Seconds20).unwrap();
+        capture
+            .push_native_interleaved(0, &[0.25; 4], false)
+            .unwrap();
         session.capture = Some(capture);
 
         session.poll();
@@ -1667,7 +2829,14 @@ mod tests {
         let capture = session.capture.as_ref().unwrap();
         assert!(capture.retain_silence());
         assert_eq!(capture.capture().frame_range(), 0..4);
-        assert_eq!(capture.capture().track_snapshot_range(0, 0..4).unwrap().samples, [0.25; 4]);
+        assert_eq!(
+            capture
+                .capture()
+                .track_snapshot_range(0, 0..4)
+                .unwrap()
+                .samples,
+            [0.25; 4]
+        );
     }
 
     #[test]
@@ -1769,7 +2938,10 @@ mod tests {
         let returned_while_busy = result.is_ok();
         drop(busy);
         painter.join().unwrap();
-        assert!(returned_while_busy, "snapshot request waited for capture work");
+        assert!(
+            returned_while_busy,
+            "snapshot request waited for capture work"
+        );
         let snapshots = result.unwrap().recv().unwrap().unwrap();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].frame_range(), 1..3);
@@ -1804,7 +2976,11 @@ mod tests {
         assert_eq!(edit.generation, 7);
         assert_eq!(edit.bar_markers, [10, 30, 170, 190]);
         assert_eq!(edit.snapshots.len(), 2);
-        assert!(edit.snapshots.iter().all(|snapshot| snapshot.frame_range() == (0..200)));
+        assert!(
+            edit.snapshots
+                .iter()
+                .all(|snapshot| snapshot.frame_range() == (0..200))
+        );
 
         controller.set_retention(DurationChoice::Seconds10);
         let live = controller.snapshots(None).unwrap();
@@ -1844,7 +3020,11 @@ mod tests {
         {
             let session = lock(&controller.state);
             let live = session.capture.as_ref().unwrap().capture().freeze();
-            assert_eq!(view.shared_pages(&live), 9, "the edit copied the capture's pages");
+            assert_eq!(
+                view.shared_pages(&live),
+                9,
+                "the edit copied the capture's pages"
+            );
         }
         // A selection pins only the pages it touches, at its absolute frames.
         let selected = controller.snapshots(Some(28..41)).unwrap();
@@ -1885,7 +3065,10 @@ mod tests {
         let selected = controller.snapshots(Some(298..302)).unwrap();
         assert_eq!(selected[0].frame_range(), 298..302);
         assert_eq!(selected[0].snapshot().samples, [299.0, 300.0, 301.0, 302.0]);
-        assert_eq!(selected[1].snapshot().samples, [-299.0, -300.0, -301.0, -302.0]);
+        assert_eq!(
+            selected[1].snapshot().samples,
+            [-299.0, -300.0, -301.0, -302.0]
+        );
 
         let mut low = [0.0; 2];
         let mut high = [0.0; 2];
@@ -1932,7 +3115,10 @@ mod tests {
     fn the_worker_wakes_for_the_earliest_retry_it_owes() {
         let source = Duration::from_millis(1_500);
         let mode = Duration::from_millis(300);
-        assert_eq!(waiting(|state| state.source_retry_in = Some(source)), Some(source));
+        assert_eq!(
+            waiting(|state| state.source_retry_in = Some(source)),
+            Some(source)
+        );
         assert_eq!(
             waiting(|state| {
                 state.source_retry_in = Some(source);
@@ -1940,7 +3126,10 @@ mod tests {
             }),
             Some(mode),
         );
-        assert_eq!(waiting(|state| state.mode_retry_in = Some(Duration::ZERO)), Some(Duration::ZERO));
+        assert_eq!(
+            waiting(|state| state.mode_retry_in = Some(Duration::ZERO)),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
@@ -1975,7 +3164,10 @@ mod tests {
         let wait = session.next_wait(Instant::now()).unwrap();
         assert!(wait <= Duration::from_secs(1) && wait > Duration::from_millis(500));
         let (_sender, result) = mpsc::sync_channel(1);
-        session.pending.push(PendingInput { source: CaptureSource::System, result });
+        session.pending.push(PendingInput {
+            source: CaptureSource::System,
+            result,
+        });
         assert!(!session.source_missing());
         // The open thread wakes the worker itself when it finishes.
         assert_eq!(session.next_wait(Instant::now()), None);
@@ -1997,9 +3189,15 @@ mod tests {
                 Notify::Idle => panic!("a change was dropped"),
             }
         }
-        assert_eq!(requests, 12, "no more repaints than the old 80 ms refresh timer");
+        assert_eq!(
+            requests, 12,
+            "no more repaints than the old 80 ms refresh timer"
+        );
         // The stream stops. Its last change is still delivered, once.
-        assert_eq!(throttle.update(false, at(1_000)), Notify::Later(Duration::from_millis(40)));
+        assert_eq!(
+            throttle.update(false, at(1_000)),
+            Notify::Later(Duration::from_millis(40))
+        );
         assert_eq!(throttle.update(false, at(1_040)), Notify::Now);
         assert_eq!(throttle.update(false, at(1_041)), Notify::Idle);
         assert_eq!(throttle.update(true, at(9_000)), Notify::Now);

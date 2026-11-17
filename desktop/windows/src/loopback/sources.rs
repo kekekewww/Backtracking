@@ -25,9 +25,23 @@ use super::{Apartment, audio_error, endpoint_enumerator, endpoint_id};
 pub(crate) enum CaptureSource {
     System,
     DefaultMicrophone,
-    Microphone { id: String, name: String },
-    Application { path: String, name: String },
-    Sender { id: String, name: String },
+    Microphone {
+        id: String,
+        name: String,
+    },
+    Application {
+        path: String,
+        name: String,
+    },
+    Sender {
+        id: String,
+        name: String,
+    },
+    Addon {
+        addon_id: String,
+        source_id: String,
+        name: String,
+    },
 }
 
 impl CaptureSource {
@@ -35,7 +49,10 @@ impl CaptureSource {
         match self {
             Self::System => "System audio",
             Self::DefaultMicrophone => "Default microphone",
-            Self::Microphone { name, .. } | Self::Application { name, .. } | Self::Sender { name, .. } => name,
+            Self::Microphone { name, .. }
+            | Self::Application { name, .. }
+            | Self::Sender { name, .. }
+            | Self::Addon { name, .. } => name,
         }
     }
 
@@ -49,6 +66,18 @@ impl CaptureSource {
             (Self::Application { path, .. }, Self::Application { path: other, .. }) => {
                 same_path(path, other)
             }
+            (
+                Self::Addon {
+                    addon_id,
+                    source_id,
+                    ..
+                },
+                Self::Addon {
+                    addon_id: other_addon,
+                    source_id: other_source,
+                    ..
+                },
+            ) => addon_id == other_addon && source_id == other_source,
             _ => false,
         }
     }
