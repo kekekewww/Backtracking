@@ -8,7 +8,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::context_menu::{self, WindowCommand};
-use crate::controller::{CaptureSource, Controller, EditSnapshot, SourceSettings};
+use crate::controller::{
+    CaptureSource, Controller, EditSnapshot, LaneGroup, LaneMeterReadings, SourceSettings,
+};
 use crate::clip_export::{ExportOptions, export_clip};
 use crate::file_drag;
 use crate::preferences::{
@@ -21,8 +23,8 @@ use crate::tray::{self, Tray};
 use crate::updater::UpdateOptions;
 use crate::window_order;
 use backtracking_core::{
-    AutoResumeDelay, ChannelRoute, DurationChoice, FrozenTrack, MeterReadings, WavExportProfile,
-    WaveformView, cleanup, waveform,
+    AutoResumeDelay, ChannelRoute, DurationChoice, FrozenTrack, WavExportProfile, WaveformView,
+    cleanup, waveform,
 };
 use backtracking_ui::{
     CENTER_LINE, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, PLOT_BACKGROUND, RECORDING_DIM,
@@ -53,7 +55,15 @@ use winit::{
     window::Window,
 };
 
-const DEFAULT_BINS: usize = 384;
+mod harness;
+mod stack;
+#[cfg(test)]
+mod test_profile;
+mod text;
+
+use stack::LaneBox;
+use text::Language;
+
 /// How often the window looks at work that only reports progress when asked.
 const REFRESH: Duration = Duration::from_millis(80);
 /// Frame interval while a drag, gesture, export or pending reply is in progress.
@@ -183,14 +193,33 @@ const PREPARING_WAV: &str = "Preparing WAV…";
 
 pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
     let show_options_on_start = std::env::args_os().any(|arg| arg == "--show-options");
-    let test_size = show_options_on_start.then(|| std::env::var("BACKTRACKING_TEST_WINDOW_SIZE").ok()).flatten();
+    let test_copy = startup::test_instance().is_some();
+    let test_size = (show_options_on_start || test_copy)
+        .then(|| std::env::var("BACKTRACKING_TEST_WINDOW_SIZE").ok())
+        .flatten()
+        .filter(|size| !size.trim().is_empty());
+    let test_position = test_copy
+        .then(|| std::env::var(harness::WINDOW_POSITION).ok())
+        .flatten()
+        .and_then(|value| {
+            let (x, y) = value.split_once(',')?;
+            Some(egui::Pos2::new(
+                x.trim().parse().ok()?,
+                y.trim().parse().ok()?,
+            ))
+        });
     let preferences = Preferences::for_current_user();
     let settings = preferences.load();
     let icon =
         eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/backtracking-icon.png"))
             .expect("decode the Backtracking icon");
+    let mut viewport = egui::ViewportBuilder::default();
+    if test_copy {
+        // A test copy appears without taking the keyboard from whatever the user is doing.
+        viewport = viewport.with_active(false);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+        viewport: viewport
             .with_inner_size(initial_window_size(settings.waveform_only, test_size.as_deref()))
             .with_min_inner_size(min_window_size(settings.waveform_only))
             .with_icon(icon)
@@ -216,12 +245,22 @@ pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
             if settings.waveform_only {
                 set_waveform_frame(context.winit_window(), true);
             }
-            if primary && let (Some(window), Some(position)) =
-                (context.winit_window(), settings.window_position)
+            if let (Some(window), Some(position)) = (context.winit_window(), test_position) {
+                // The window is still hidden here; it first appears where it is asked to.
+                window.set_outer_position(winit::dpi::PhysicalPosition::new(
+                    position.x.round() as i32,
+                    position.y.round() as i32,
+                ));
+            } else if primary
+                && let (Some(window), Some(position)) =
+                    (context.winit_window(), settings.window_position)
             {
                 window_order::restore_position(window, position);
             }
             let mut recorder = Recorder::new(controller, preferences, settings, primary);
+            recorder.test_copy = test_copy;
+            recorder.auto_grow = test_size.is_none();
+            recorder.harness = test_copy.then(harness::Harness::from_environment).flatten();
             let repaint = context.egui_ctx.clone();
             recorder.controller.set_repaint(Arc::new(move || {
                 // A delayed request runs one pass. An immediate one runs two.
@@ -231,16 +270,22 @@ pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
             if show_options_on_start {
                 recorder.open_options(&context.egui_ctx);
             }
-            if primary {
+            // A test copy leaves the shortcut, the tray, the startup entry and updates to the
+            // installed app.
+            if primary && !test_copy {
                 match SnapshotHotkey::start(context.egui_ctx.clone()) {
                     Ok(hotkey) => recorder.hotkey = Some(hotkey),
                     Err(error) => recorder.hotkey_error = Some(error.to_string()),
                 }
             }
-            if !show_options_on_start && let Some(window) = context.winit_window() {
+            if test_copy {
+                if let Some(window) = context.winit_window() {
+                    tray::suppress_taskbar(window);
+                }
+            } else if !show_options_on_start && let Some(window) = context.winit_window() {
                 recorder.attach_tray(window, &context.egui_ctx);
             }
-            if primary {
+            if primary && !test_copy {
                 match startup::enabled() {
                     Ok(enabled) => recorder.launch_at_login = enabled,
                     Err(error) => recorder.message = format!("Could not read startup setting: {error}"),
@@ -399,7 +444,20 @@ struct Recorder {
     wide_export: WideExportMode,
     last_interaction: Instant,
     recording_started: Option<f64>,
-    peaks: [WaveformPeaks; 2],
+    /// The rows last rendered, and what each one shows.
+    peaks: Vec<WaveformPeaks>,
+    peak_rows: Vec<RowSource>,
+    /// How each lane on screen is drawn, worked out once per pass.
+    lanes: Vec<LanePlan>,
+    /// The first row on screen of each logical lane that scrolls.
+    lane_first_row: [usize; 2],
+    /// A scroll thumb being dragged: its lane and where on the thumb it was grabbed.
+    scroll_drag: Option<(usize, f32)>,
+    /// Presses here belong to a lane's group switch or scroll bar, not to the timeline.
+    lane_controls: Vec<Rect>,
+    /// The wheel scrolls a lane's rows here instead of zooming.
+    lane_scroll_zones: Vec<(usize, Rect)>,
+    growth: Option<WindowGrowth>,
     plot_rect: Rect,
     editing: Option<FrozenEdit>,
     edit_request: Option<EditRequest>,
@@ -436,6 +494,11 @@ struct Recorder {
     clip_revision: u64,
     exported: Option<ExportedWav>,
     message: String,
+    /// Started as a test copy beside the installed app (`startup::test_instance`).
+    test_copy: bool,
+    /// The window may grow to give a stacked lane's rows room. Off when a test asked for a size.
+    auto_grow: bool,
+    harness: Option<harness::Harness>,
 }
 
 enum Gesture {
@@ -607,12 +670,137 @@ impl WaveformPeaks {
     }
 }
 
+/// What one waveform row draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowSource {
+    /// A mono or stereo lane, merged or one side, as such lanes always were.
+    View(usize, WaveformView),
+    /// One channel of a lane wider than two channels: the lane, then the channel within it.
+    Channel(usize, usize),
+}
+
+impl RowSource {
+    fn lane(self) -> usize {
+        match self {
+            Self::View(lane, _) | Self::Channel(lane, _) => lane,
+        }
+    }
+}
+
+/// How one lane is drawn: as before, or one row per channel of the group on show.
+#[derive(Clone, Debug, PartialEq)]
+struct LanePlan {
+    lane: usize,
+    kind: LaneKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum LaneKind {
+    Views(Vec<WaveformView>),
+    /// `groups` names every group the lane can show, as (id, label), in the source's order.
+    Stack {
+        group: LaneGroup,
+        groups: Vec<(String, String)>,
+    },
+}
+
+impl LanePlan {
+    fn stacked(&self) -> bool {
+        matches!(self.kind, LaneKind::Stack { .. })
+    }
+
+    fn rows(&self) -> usize {
+        match &self.kind {
+            LaneKind::Views(views) => views.len(),
+            LaneKind::Stack { group, .. } => group.channels.len(),
+        }
+    }
+
+    fn row(&self, row: usize) -> RowSource {
+        match &self.kind {
+            LaneKind::Views(views) => RowSource::View(self.lane, views[row]),
+            LaneKind::Stack { group, .. } => {
+                RowSource::Channel(self.lane, group.channels.start + row)
+            }
+        }
+    }
+
+    fn spec(&self) -> stack::LaneRows {
+        stack::LaneRows {
+            rows: self.rows(),
+            stacked: self.stacked(),
+        }
+    }
+}
+
+/// The group a lane wider than two channels shows: the chosen one, else the first, else all
+/// of its channels, numbered.
+fn group_on_show(
+    groups: &[LaneGroup],
+    shown: Option<&str>,
+    channels: usize,
+) -> (LaneGroup, Vec<(String, String)>) {
+    let group = shown
+        .and_then(|id| groups.iter().find(|group| group.id == id))
+        .or_else(|| groups.first())
+        .filter(|group| !group.channels.is_empty() && group.channels.end <= channels)
+        .cloned()
+        .unwrap_or_else(|| LaneGroup {
+            id: String::new(),
+            label: String::new(),
+            channels: 0..channels,
+            labels: (1..=channels).map(|channel| channel.to_string()).collect(),
+        });
+    let choices = groups
+        .iter()
+        .map(|group| (group.id.clone(), group.label.clone()))
+        .collect();
+    (group, choices)
+}
+
+/// One button of a lane's channel group switch.
+struct GroupChip {
+    rect: Rect,
+    lane: usize,
+    /// The group a click shows.
+    id: String,
+    label: String,
+    current: bool,
+}
+
+/// The window grew so a stacked lane's rows have room. It goes back to `before` when no lane
+/// is stacked any more, unless the user has resized it since.
+#[derive(Clone, Copy, Debug)]
+struct WindowGrowth {
+    before: f32,
+    after: f32,
+    /// Until then the window may still report its old size.
+    settles: Instant,
+}
+
+/// The tallest a window grows by itself for stacked rows, in points.
+const MAX_GROWN_WINDOW_HEIGHT: f32 = 560.0;
+
+/// The meter's number for a lane. Loudness is not measured for lanes wider than stereo.
+fn meter_value(mode: MeterMode, readings: LaneMeterReadings) -> Option<f32> {
+    match mode {
+        MeterMode::Dbfs => Some(readings.peak_dbfs),
+        MeterMode::Vu => Some(readings.vu),
+        MeterMode::Lufs => readings.momentary_lufs,
+    }
+}
+
 struct FrozenEdit {
     snapshots: Arc<[FrozenTrack]>,
     lanes: Vec<usize>,
     bars: Vec<u64>,
-    retention_seconds: u32,
+    /// The audio that fills the plot's width: the history setting or, when wide lanes leave
+    /// room for less, what memory holds.
+    retention_seconds: f32,
     export_options: ExportOptions,
+    /// Channel groups frozen with the audio, by logical lane.
+    groups: [Vec<LaneGroup>; 2],
+    shown_groups: [Option<String>; 2],
 }
 
 impl FrozenEdit {
@@ -631,21 +819,21 @@ impl FrozenEdit {
 struct EditRequest {
     result: mpsc::Receiver<Option<EditSnapshot>>,
     generation: u64,
-    retention_seconds: u32,
+    retention_seconds: f32,
     saves: Vec<SnapshotSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EditPreviewKey {
     frames: Range<u64>,
-    views: [(usize, WaveformView); 2],
-    rows: usize,
+    /// The rows on screen, in drawing order.
+    rows: Vec<RowSource>,
     bins: usize,
 }
 
 struct EditPreviewJob {
     key: EditPreviewKey,
-    worker: JoinHandle<[WaveformPeaks; 2]>,
+    worker: JoinHandle<Vec<WaveformPeaks>>,
 }
 
 struct SnapshotRead {
@@ -747,24 +935,36 @@ fn edit_preview(
     snapshots: &[FrozenTrack],
     lanes: &[usize],
     key: &EditPreviewKey,
-) -> [WaveformPeaks; 2] {
-    std::array::from_fn(|row| {
-        let mut peaks = WaveformPeaks::empty(key.bins);
-        if row >= key.rows {
-            return peaks;
-        }
-        let (lane, view) = key.views[row];
-        let Some(index) = lanes.iter().position(|&logical| logical == lane) else {
-            return peaks;
-        };
-        let Some(track) = snapshots.get(index) else {
-            return peaks;
-        };
-        // The track answers whole peak blocks from the capture's peak cache and
-        // clips the request to the frames it holds.
-        track.waveform(view, key.frames.clone(), &mut peaks.low, &mut peaks.high);
-        peaks
-    })
+) -> Vec<WaveformPeaks> {
+    key.rows
+        .iter()
+        .map(|&row| {
+            let mut peaks = WaveformPeaks::empty(key.bins);
+            let Some(index) = lanes.iter().position(|&logical| logical == row.lane()) else {
+                return peaks;
+            };
+            let Some(track) = snapshots.get(index) else {
+                return peaks;
+            };
+            // The track answers whole peak blocks from the capture's peak cache and
+            // clips the request to the frames it holds. Only rows on screen are asked for.
+            match row {
+                RowSource::View(_, view) => {
+                    track.waveform(view, key.frames.clone(), &mut peaks.low, &mut peaks.high);
+                }
+                RowSource::Channel(_, channel) if channel < track.channels() => {
+                    track.channel_waveform(
+                        channel,
+                        key.frames.clone(),
+                        &mut peaks.low,
+                        &mut peaks.high,
+                    );
+                }
+                RowSource::Channel(..) => {}
+            }
+            peaks
+        })
+        .collect()
 }
 
 struct FlagUpdate {
@@ -937,14 +1137,6 @@ enum OptionsAction {
 
 impl MeterMode {
     const OPTIONS: [Self; 3] = [Self::Dbfs, Self::Vu, Self::Lufs];
-
-    fn value(self, readings: MeterReadings) -> f32 {
-        match self {
-            Self::Dbfs => readings.peak_dbfs,
-            Self::Vu => readings.vu,
-            Self::Lufs => readings.momentary_lufs,
-        }
-    }
 
     fn description(self) -> &'static str {
         match self {
@@ -1176,7 +1368,14 @@ impl Recorder {
             wide_export: settings.wide_export,
             last_interaction: Instant::now(),
             recording_started: None,
-            peaks: std::array::from_fn(|_| WaveformPeaks::empty(DEFAULT_BINS)),
+            peaks: Vec::new(),
+            peak_rows: Vec::new(),
+            lanes: Vec::new(),
+            lane_first_row: [0; 2],
+            scroll_drag: None,
+            lane_controls: Vec::new(),
+            lane_scroll_zones: Vec::new(),
+            growth: None,
             plot_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(610.0, DEFAULT_WAVEFORM_HEIGHT)),
             editing: None,
             edit_request: None,
@@ -1213,6 +1412,9 @@ impl Recorder {
             clip_revision: 0,
             exported: None,
             message: preference_error,
+            test_copy: false,
+            auto_grow: true,
+            harness: None,
         }
     }
 
@@ -1233,6 +1435,10 @@ impl Recorder {
     }
 
     fn set_launch_at_login(&mut self, enabled: bool, frame: &eframe::Frame) {
+        if self.test_copy {
+            self.message = Language::current().test_copy_startup().into();
+            return;
+        }
         match startup::set_enabled(enabled) {
             Ok(()) => self.launch_at_login = enabled,
             Err(error) => {
@@ -1280,7 +1486,10 @@ impl Recorder {
     fn update_tray(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         // Diagnostic taskbar windows remain directly targetable. Tray subclassing
         // otherwise restores WS_EX_TOOLWINDOW whenever winit updates native styles.
-        if self.options_in_taskbar { return; }
+        // A test copy has no tray icon at all.
+        if self.options_in_taskbar || self.test_copy {
+            return;
+        }
         if self.tray.is_none()
             && Instant::now() >= self.next_tray_attach
             && let Some(window) = frame.winit_window()
@@ -1425,7 +1634,7 @@ impl Recorder {
         self.edit_request = Some(EditRequest {
             result: self.controller.request_edit_snapshot(),
             generation: self.generation,
-            retention_seconds: self.controller.retention().seconds(),
+            retention_seconds: self.plot_retention_seconds(),
             saves: Vec::new(),
         });
         self.live_revision = None;
@@ -1481,6 +1690,8 @@ impl Recorder {
                 self.pending_snapshot_saves.push_back(clip);
             }
         }
+        let groups = snapshot.groups;
+        let shown_groups = snapshot.shown_groups;
         let snapshots = snapshot.snapshots;
         let frames = snapshots[0].frame_range();
         if let Some(selection) = &mut self.selection {
@@ -1497,6 +1708,8 @@ impl Recorder {
             bars: snapshot.bar_markers,
             retention_seconds: request.retention_seconds,
             export_options,
+            groups,
+            shown_groups,
         });
         self.next_refresh = Instant::now();
         self.live_revision = None;
@@ -1521,6 +1734,8 @@ impl Recorder {
             self.visible_frames = 0..0;
             self.seconds = 0.0;
             for peaks in &mut self.peaks { peaks.low.fill(0.0); peaks.high.fill(0.0); }
+            self.lane_first_row = [0; 2];
+            self.scroll_drag = None;
         }
     }
 
@@ -1606,30 +1821,83 @@ impl Recorder {
         let revision = self.controller.revision();
         let now = Instant::now();
         let bins = self.display_policy(self.audio_rect(self.plot_rect), self.visible_frames.clone()).bins;
-        let resolution_changed = self.peaks[0].low.len() != bins;
-        if !resolution_changed && (self.live_revision == Some(revision) || now < self.next_refresh) {
+        // Scrolling a lane or switching its group asks for other rows.
+        let rows = self.visible_rows();
+        let resolution_changed =
+            self.peak_rows != rows || self.peaks.iter().any(|peaks| peaks.low.len() != bins);
+        if !resolution_changed && (self.live_revision == Some(revision) || now < self.next_refresh)
+        {
             return;
         }
 
-        let (views, rows) = self.waveform_layout();
-        let mut peaks = self.peaks.clone();
+        // Rows already on screen keep their old peaks until the new ones are in.
+        let mut peaks: Vec<WaveformPeaks> = rows
+            .iter()
+            .map(|row| {
+                self.peak_rows
+                    .iter()
+                    .position(|old| old == row)
+                    .and_then(|index| self.peaks.get(index).cloned())
+                    .unwrap_or_else(|| WaveformPeaks::empty(bins))
+            })
+            .collect();
         for peak in &mut peaks {
             peak.low.resize(bins, 0.0);
             peak.high.resize(bins, 0.0);
         }
-        let mut traces = peaks.each_mut().map(|peaks| {
-            (peaks.low.as_mut_slice(), peaks.high.as_mut_slice())
-        });
-        let Some((history, visible, rate, bars)) =
-            self.controller.try_render_waveforms(
-                &views[..rows],
-                self.zoom_frames.clone(),
-                &mut traces[..rows],
-            ) else {
-                self.next_refresh = now + Duration::from_millis(16);
-                return;
-            };
+        let rendered = {
+            let (mut channels, mut channel_traces) = (Vec::new(), Vec::new());
+            let (mut views, mut view_traces) = (Vec::new(), Vec::new());
+            for (peak, row) in peaks.iter_mut().zip(&rows) {
+                let trace = (peak.low.as_mut_slice(), peak.high.as_mut_slice());
+                match *row {
+                    RowSource::Channel(lane, channel) => {
+                        channels.push((lane, channel));
+                        channel_traces.push(trace);
+                    }
+                    RowSource::View(lane, view) => {
+                        views.push((lane, view));
+                        view_traces.push(trace);
+                    }
+                }
+            }
+            // Only the channels on screen are read. A second lane drawn the old way reads
+            // the same frames as the first.
+            let mut zoom = self.zoom_frames.clone();
+            let mut rendered = None;
+            let mut busy = false;
+            if !channels.is_empty() {
+                match self.controller.try_render_channel_waveforms(
+                    &channels,
+                    zoom.clone(),
+                    &mut channel_traces,
+                ) {
+                    Some(result) => {
+                        zoom = Some(result.1.clone());
+                        rendered = Some(result);
+                    }
+                    None => busy = true,
+                }
+            }
+            if !busy && (!views.is_empty() || rendered.is_none()) {
+                match self
+                    .controller
+                    .try_render_waveforms(&views, zoom, &mut view_traces)
+                {
+                    Some(result) => {
+                        rendered.get_or_insert(result);
+                    }
+                    None => busy = true,
+                }
+            }
+            rendered.filter(|_| !busy)
+        };
+        let Some((history, visible, rate, bars)) = rendered else {
+            self.next_refresh = now + Duration::from_millis(16);
+            return;
+        };
         self.peaks = peaks;
+        self.peak_rows = rows;
         self.history_frames = history;
         self.visible_frames = visible;
         self.sample_rate = rate;
@@ -1681,8 +1949,9 @@ impl Recorder {
         let hidden = window.is_some_and(|window| window_is_hidden(window));
         let meter_shown = |lane: usize| {
             self.controller
-                .track_meter_readings(lane)
-                .is_some_and(|readings| self.meter_modes[lane].value(readings).is_finite())
+                .lane_meter_readings(lane)
+                .and_then(|readings| meter_value(self.meter_modes[lane], readings))
+                .is_some_and(f32::is_finite)
         };
         let live = self.editing.is_none() && self.edit_request.is_none();
         Waits {
@@ -1701,7 +1970,7 @@ impl Recorder {
                 || self.plugin_snapshot_request.is_some()
                 || !self.pending_plugin_snapshots.is_empty(),
             polling: self.source_list_worker.is_some(),
-            tray_retry: if self.options_in_taskbar {
+            tray_retry: if self.options_in_taskbar || self.test_copy {
                 None
             } else if let Some(tray) = &self.tray {
                 tray.retry_in()
@@ -1769,17 +2038,15 @@ impl Recorder {
             inner.width()
         } else {
             let seconds = (history.end - history.start) as f32 / self.sample_rate.max(1) as f32;
-            inner.width() * (seconds / edit.retention_seconds.max(1) as f32).clamp(0.0, 1.0)
+            inner.width() * (seconds / edit.retention_seconds.max(1.0)).clamp(0.0, 1.0)
         };
         let policy = self.display_policy(
             Rect::from_min_size(inner.min, Vec2::new(width, inner.height())),
             visible.clone(),
         );
-        let (views, rows) = self.waveform_layout();
         let key = EditPreviewKey {
             frames: visible,
-            views,
-            rows,
+            rows: self.visible_rows(),
             bins: policy.bins,
         };
         if let Some(job) = &self.edit_preview {
@@ -1798,6 +2065,7 @@ impl Recorder {
                     self.sample_rate = edit.snapshots[0].sample_rate();
                     self.bar_markers.clone_from(&edit.bars);
                     self.peaks = peaks;
+                    self.peak_rows.clone_from(&key.rows);
                     self.visible_frames = key.frames.clone();
                     self.seconds =
                         (key.frames.end - key.frames.start) as f32 / self.sample_rate.max(1) as f32;
@@ -1831,21 +2099,197 @@ impl Recorder {
         }
     }
 
-    fn waveform_layout(&self) -> ([(usize, WaveformView); 2], usize) {
-        if self.dual_source() {
-            ([(0, WaveformView::Merged), (1, WaveformView::Merged)], 2)
-        } else if self.split_waveform
-            && self
-                .editing
-                .as_ref()
-                .and_then(|edit| edit.track(0))
-                .map(FrozenTrack::channels)
-                .or_else(|| self.controller.track_channels(0))
-                == Some(2)
+    /// The audio that fills the plot's width: the history setting, or less when memory cannot
+    /// hold that much of the lanes' channels.
+    fn plot_retention_seconds(&self) -> f32 {
+        let requested = self.controller.retention().seconds().max(1) as f32;
+        self.controller
+            .effective_retention_seconds()
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .map_or(requested, |seconds| requested.min(seconds as f32).max(1.0))
+    }
+
+    /// Mono and stereo lanes are drawn as they always were: merged, or Left / Right for one
+    /// stereo source when chosen. A wider lane gets one row per channel of its group on show.
+    fn lane_plans(&self) -> Vec<LanePlan> {
+        let dual = self.dual_source();
+        let edit = self.editing.as_ref();
+        (0..if dual { 2 } else { 1 })
+            .map(|lane| {
+                let channels = edit
+                    .and_then(|edit| edit.track(lane))
+                    .map(FrozenTrack::channels)
+                    .or_else(|| self.controller.track_channels(lane));
+                if let Some(channels) = channels.filter(|&channels| channels > 2) {
+                    let (groups, shown) = match edit {
+                        Some(edit) => (
+                            edit.groups[lane].as_slice(),
+                            edit.shown_groups[lane].as_deref(),
+                        ),
+                        None => (
+                            self.controller.lane_groups(lane),
+                            self.controller
+                                .shown_group(lane)
+                                .map(|group| group.id.as_str()),
+                        ),
+                    };
+                    let (group, groups) = group_on_show(groups, shown, channels);
+                    return LanePlan {
+                        lane,
+                        kind: LaneKind::Stack { group, groups },
+                    };
+                }
+                let views = if !dual && self.split_waveform && channels == Some(2) {
+                    vec![WaveformView::Left, WaveformView::Right]
+                } else {
+                    vec![WaveformView::Merged]
+                };
+                LanePlan {
+                    lane,
+                    kind: LaneKind::Views(views),
+                }
+            })
+            .collect()
+    }
+
+    /// Works out this pass's lanes. A lane whose rows changed starts again at its first row.
+    fn update_lanes(&mut self) {
+        let lanes = self.lane_plans();
+        if lanes != self.lanes {
+            for plan in &lanes {
+                let same = self
+                    .lanes
+                    .iter()
+                    .find(|old| old.lane == plan.lane)
+                    .is_some_and(|old| match (&old.kind, &plan.kind) {
+                        (
+                            LaneKind::Stack { group: old, .. },
+                            LaneKind::Stack { group: new, .. },
+                        ) => old.id == new.id && old.channels == new.channels,
+                        _ => false,
+                    });
+                if !same {
+                    self.lane_first_row[plan.lane] = 0;
+                }
+            }
+            self.lanes = lanes;
+            self.live_revision = None;
+            self.next_refresh = Instant::now();
+        }
+        // A taller window shows more rows; never leave empty space below the last one.
+        let boxes = self.lane_boxes(self.timeline_rect(self.plot_rect).height());
+        for (plan, lane_box) in self.lanes.iter().zip(&boxes) {
+            self.lane_first_row[plan.lane] = lane_box.first;
+        }
+    }
+
+    fn stacked(&self) -> bool {
+        self.lanes.iter().any(LanePlan::stacked)
+    }
+
+    /// Where each lane's rows go in a plot area this high.
+    fn lane_boxes(&self, height: f32) -> Vec<LaneBox> {
+        let specs: Vec<_> = self.lanes.iter().map(LanePlan::spec).collect();
+        let first: Vec<_> = self
+            .lanes
+            .iter()
+            .map(|plan| self.lane_first_row[plan.lane])
+            .collect();
+        stack::lay_out(height, &specs, &first)
+    }
+
+    /// The rows on screen, top to bottom. Only these are rendered.
+    fn visible_rows(&self) -> Vec<RowSource> {
+        let boxes = self.lane_boxes(self.timeline_rect(self.plot_rect).height());
+        self.lanes
+            .iter()
+            .zip(&boxes)
+            .flat_map(|(plan, lane_box)| lane_box.visible().map(|row| plan.row(row)))
+            .collect()
+    }
+
+    fn scroll_lane_to(&mut self, lane: usize, row: usize) {
+        let Some(slot) = self.lane_first_row.get_mut(lane) else {
+            return;
+        };
+        if *slot != row {
+            *slot = row;
+            // Clamped to the lane's last page, then rendered on the next pass.
+            self.update_lanes();
+            self.live_revision = None;
+            self.next_refresh = Instant::now();
+            self.last_interaction = Instant::now();
+        }
+    }
+
+    /// Shows another channel group of a lane. A selection on screen switches with it, so a
+    /// drag-out exports the group the user sees.
+    fn show_group(&mut self, lane: usize, id: &str) -> Result<(), String> {
+        if let Some(edit) = &mut self.editing
+            && let Some(group) = edit
+                .groups
+                .get(lane)
+                .and_then(|groups| groups.iter().find(|group| group.id == id))
         {
-            ([(0, WaveformView::Left), (0, WaveformView::Right)], 2)
-        } else {
-            ([(0, WaveformView::Merged); 2], 1)
+            let group = group.clone();
+            edit.shown_groups[lane] = Some(id.to_owned());
+            if let Some(index) = edit.lanes.iter().position(|&logical| logical == lane) {
+                edit.export_options.groups[index] = Some(group);
+            }
+        }
+        let result = self.controller.select_group(lane, id);
+        if let Some(slot) = self.lane_first_row.get_mut(lane) {
+            *slot = 0;
+        }
+        self.invalidate_export();
+        self.live_revision = None;
+        self.next_refresh = Instant::now();
+        result
+    }
+
+    /// Grows the window once when a lane starts stacking rows, so they need not scroll, and
+    /// puts it back when no lane stacks any more unless the user resized it meanwhile.
+    fn fit_window_to_rows(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if !self.auto_grow || self.waveform_only || self.window_drag.is_some() {
+            return;
+        }
+        let window = ctx.viewport_rect().size();
+        let now = Instant::now();
+        let specs: Vec<_> = self.lanes.iter().map(LanePlan::spec).collect();
+        match (stack::comfortable_height(&specs), self.growth) {
+            (Some(wanted), None) => {
+                let current = self.timeline_rect(self.plot_rect).height();
+                let screen = frame
+                    .winit_window()
+                    .and_then(|window| window.current_monitor())
+                    .map(|monitor| monitor.size().height as f32 / ctx.pixels_per_point() * 0.85);
+                let cap = screen.map_or(MAX_GROWN_WINDOW_HEIGHT, |screen| {
+                    screen.min(MAX_GROWN_WINDOW_HEIGHT)
+                });
+                let target = (window.y + wanted - current).min(cap).max(window.y);
+                self.growth = Some(WindowGrowth {
+                    before: window.y,
+                    after: target,
+                    settles: now + Duration::from_secs(1),
+                });
+                if target > window.y + 0.5 {
+                    let size = Vec2::new(window.x, target);
+                    // A test copy stays where it was put, off every screen.
+                    if !self.test_copy {
+                        fit_expanded_window(ctx, frame, size);
+                    }
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+                }
+            }
+            (None, Some(growth)) => {
+                self.growth = None;
+                let untouched = (window.y - growth.after).abs() < 1.0 || now < growth.settles;
+                if untouched && growth.after > growth.before + 0.5 {
+                    let size = Vec2::new(window.x, growth.before).max(min_window_size(false));
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2078,10 +2522,11 @@ impl Recorder {
 
     fn meter_readout(&self, ui: &mut egui::Ui, lane: usize) {
         let mode = self.meter_modes[lane];
-        let value = self
-            .controller
-            .track_meter_readings(lane)
-            .map(|readings| mode.value(readings));
+        let readings = self.controller.lane_meter_readings(lane);
+        let value = readings.and_then(|readings| meter_value(mode, readings));
+        // A wide lane has peak and VU levels but no loudness; it shows a dash, not a number.
+        let unmeasured = mode == MeterMode::Lufs
+            && readings.is_some_and(|readings| readings.momentary_lufs.is_none());
         let number = meter_number(value, mode == MeterMode::Vu);
         let text = if self.dual_source() {
             format!("{} {number} {}", lane_name(lane), mode.unit())
@@ -2091,7 +2536,15 @@ impl Recorder {
         let width = if self.dual_source() { 91.0 } else { 102.0 };
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 24.0), egui::Sense::hover());
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Status, true, &text));
-        response.on_hover_text(mode.description());
+        if unmeasured {
+            response.on_hover_text(format!(
+                "{}\n{}",
+                mode.description(),
+                Language::current().no_loudness()
+            ));
+        } else {
+            response.on_hover_text(mode.description());
+        }
         let painter = ui.painter();
         painter.rect_filled(rect, 5.0, ui.visuals().widgets.inactive.bg_fill);
         painter.text(
@@ -2455,6 +2908,20 @@ impl Recorder {
                 self.save_preference(Key::History, retention.seconds().to_string());
             }
         });
+        // Wide lanes fill memory sooner; say how much of the setting is really kept.
+        let requested = f64::from(self.controller.retention().seconds());
+        if let Some(effective) = self.controller.effective_retention_seconds()
+            && effective.is_finite()
+            && effective < requested - 0.5
+        {
+            let channels: usize = self
+                .controller
+                .active_lanes()
+                .iter()
+                .filter_map(|&lane| self.controller.track_channels(lane))
+                .sum();
+            options_note(ui, Language::current().shorter_history(channels, effective));
+        }
         let mut retain_silence = self.controller.retain_silence();
         if ui.checkbox(&mut retain_silence, "Keep quiet sections").changed() {
             self.controller.set_retain_silence(retain_silence);
@@ -2562,6 +3029,14 @@ impl Recorder {
                     self.save_preference(if lane == 0 { Key::Meter } else { Key::MeterB }, self.meter_modes[lane].unit());
                 }
             }));
+            if self.meter_modes[lane] == MeterMode::Lufs
+                && self
+                    .controller
+                    .track_channels(lane)
+                    .is_some_and(|channels| channels > 2)
+            {
+                options_note(ui, Language::current().no_loudness());
+            }
         }
     }
 
@@ -2865,6 +3340,26 @@ impl Recorder {
                 WAV_SAMPLE_FORMATS.into_iter().map(|(format, label)| (format, label.to_owned())));
         });
         let mono_changed = ui.checkbox(&mut self.wav_force_mono, "Export every file as mono").changed();
+        let language = Language::current();
+        options_field(ui, language.wide_export_field(), |ui| {
+            if options_choice(
+                ui,
+                "wide-export",
+                &mut self.wide_export,
+                WideExportMode::ALL.into_iter().map(|mode| {
+                    (
+                        mode,
+                        language
+                            .wide_export_mode(mode == WideExportMode::Multichannel)
+                            .to_owned(),
+                    )
+                }),
+            ) {
+                self.save_preference(Key::WideExport, self.wide_export.preference());
+                self.invalidate_export();
+            }
+        });
+        options_note(ui, language.wide_export_note());
         if self.wav_profile != previous || mono_changed {
             self.invalidate_export();
             self.message.clear();
@@ -3163,6 +3658,16 @@ impl Recorder {
     fn timeline_rect(&self, rect: Rect) -> Rect {
         if self.waveform_only {
             rect.shrink2(Vec2::new(WAVEFORM_INSET, 0.0))
+        } else if self.stacked() {
+            // Channel names need a wider column than "L" and "R".
+            let inner = rect.shrink(WAVEFORM_INSET);
+            Rect::from_min_max(
+                Pos2::new(
+                    (rect.left() + stack::LABEL_GUTTER).min(inner.right()),
+                    inner.top(),
+                ),
+                inner.max,
+            )
         } else {
             rect.shrink(WAVEFORM_INSET)
         }
@@ -3177,9 +3682,8 @@ impl Recorder {
             (self.history_frames.end - self.history_frames.start) as f32 / self.sample_rate.max(1) as f32;
         let retention = self.editing.as_ref().map(|edit| edit.retention_seconds)
             .or_else(|| self.edit_request.as_ref().map(|request| request.retention_seconds))
-            .unwrap_or_else(|| self.controller.retention().seconds());
-        let width = inner.width() * (history_seconds / retention.max(1) as f32)
-            .clamp(0.0, 1.0);
+            .unwrap_or_else(|| self.plot_retention_seconds());
+        let width = inner.width() * (history_seconds / retention.max(1.0)).clamp(0.0, 1.0);
         Rect::from_min_max(Pos2::new(inner.right() - width, inner.top()), inner.max)
     }
 
@@ -3198,8 +3702,15 @@ impl Recorder {
             )
         });
 
-        if self.gesture.is_none() && let Some((position, selecting, snap_on_press)) =
-            press.filter(|(point, _, _)| rect.contains(*point))
+        if self.gesture.is_none()
+            && self.scroll_drag.is_none()
+            && let Some((position, selecting, snap_on_press)) = press.filter(|(point, _, _)| {
+                rect.contains(*point)
+                    && !self
+                        .lane_controls
+                        .iter()
+                        .any(|control| control.contains(*point))
+            })
         {
             let resize = self.flag_endpoints(self.audio_rect(rect), position);
             if selecting || resize.is_some() {
@@ -3299,6 +3810,242 @@ impl Recorder {
         }
     }
 
+    /// The group switch of each stacked lane with more than one group, at the lane's bottom
+    /// left. When the buttons would cover too much of the lane, one button shows the group on
+    /// show and moves to the next.
+    fn group_chips(&self, ui: &egui::Ui, rect: Rect, boxes: &[LaneBox]) -> Vec<GroupChip> {
+        let mut chips = Vec::new();
+        if self.waveform_only {
+            return chips;
+        }
+        let inner = self.timeline_rect(rect);
+        let font = egui::FontId::proportional(10.0);
+        for (plan, lane_box) in self.lanes.iter().zip(boxes) {
+            let LaneKind::Stack { group, groups } = &plan.kind else {
+                continue;
+            };
+            if groups.len() < 2 || lane_box.height < 18.0 {
+                continue;
+            }
+            let width = |label: &str| {
+                ui.painter()
+                    .layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE)
+                    .size()
+                    .x
+                    + 10.0
+            };
+            let bottom = inner.top() + lane_box.top + lane_box.height - 3.0;
+            let mut x = inner.left() + 4.0;
+            let total: f32 = groups.iter().map(|(_, label)| width(label)).sum();
+            if total <= inner.width() * 0.6 {
+                for (id, label) in groups {
+                    let rect = Rect::from_min_size(
+                        Pos2::new(x, bottom - 14.0),
+                        Vec2::new(width(label), 14.0),
+                    );
+                    x = rect.right();
+                    chips.push(GroupChip {
+                        rect,
+                        lane: plan.lane,
+                        id: id.clone(),
+                        label: label.clone(),
+                        current: *id == group.id,
+                    });
+                }
+            } else {
+                let index = groups
+                    .iter()
+                    .position(|(id, _)| *id == group.id)
+                    .unwrap_or(0);
+                let (id, _) = &groups[(index + 1) % groups.len()];
+                let label = groups
+                    .get(index)
+                    .map_or_else(|| group.label.clone(), |(_, label)| label.clone());
+                let rect = Rect::from_min_size(
+                    Pos2::new(x, bottom - 14.0),
+                    Vec2::new(width(&label).min(inner.width() * 0.6), 14.0),
+                );
+                chips.push(GroupChip {
+                    rect,
+                    lane: plan.lane,
+                    id: id.clone(),
+                    label,
+                    current: false,
+                });
+            }
+        }
+        chips
+    }
+
+    /// The scroll bar track of a lane that scrolls, in the plot's right margin.
+    fn scroll_track(&self, rect: Rect, lane_box: &LaneBox) -> Rect {
+        let inner = self.timeline_rect(rect);
+        Rect::from_x_y_ranges(
+            inner.right()..=rect.right(),
+            inner.top() + lane_box.top..=inner.top() + lane_box.top + lane_box.height,
+        )
+    }
+
+    /// Group switches, scroll bars and the wheel over a stacked lane's margins. Returns the
+    /// tooltip for what is under the pointer.
+    fn interact_lanes(&mut self, ui: &egui::Ui, rect: Rect) -> Option<String> {
+        self.lane_controls.clear();
+        self.lane_scroll_zones.clear();
+        if !self.stacked() || self.history_frames.is_empty() {
+            self.scroll_drag = None;
+            return None;
+        }
+        let language = Language::current();
+        let inner = self.timeline_rect(rect);
+        let boxes = self.lane_boxes(inner.height());
+        let chips = self.group_chips(ui, rect, &boxes);
+        self.lane_controls
+            .extend(chips.iter().map(|chip| chip.rect));
+        for (plan, lane_box) in self.lanes.iter().zip(&boxes) {
+            if lane_box.scrolls() {
+                let track = self.scroll_track(rect, lane_box);
+                self.lane_controls.push(track);
+                self.lane_scroll_zones.push((plan.lane, track));
+                self.lane_scroll_zones.push((
+                    plan.lane,
+                    Rect::from_x_y_ranges(rect.left()..=inner.left(), track.y_range()),
+                ));
+            }
+        }
+        let (hover, position, press, down, steps) = ui.input(|input| {
+            let mut press = None;
+            let mut steps = 0.0f32;
+            for event in &input.events {
+                match event {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        ..
+                    } => press = Some(*pos),
+                    egui::Event::MouseWheel { unit, delta, .. } => {
+                        steps += match unit {
+                            egui::MouseWheelUnit::Point => delta.y / 48.0,
+                            egui::MouseWheelUnit::Line => delta.y,
+                            egui::MouseWheelUnit::Page => delta.y * 3.0,
+                        };
+                    }
+                    _ => {}
+                }
+            }
+            (
+                input.pointer.hover_pos(),
+                input.pointer.interact_pos(),
+                press,
+                input.pointer.button_down(PointerButton::Primary),
+                steps,
+            )
+        });
+        let by_lane: Vec<(usize, LaneBox)> = self
+            .lanes
+            .iter()
+            .map(|plan| plan.lane)
+            .zip(boxes.iter().copied())
+            .collect();
+        let lane_box = |lane: usize| {
+            by_lane
+                .iter()
+                .find(|(logical, _)| *logical == lane)
+                .map(|(_, lane_box)| *lane_box)
+        };
+
+        if self.gesture.is_none()
+            && let Some(point) = press
+        {
+            if let Some(chip) = chips.iter().find(|chip| chip.rect.contains(point)) {
+                if !chip.current {
+                    let (lane, id) = (chip.lane, chip.id.clone());
+                    if let Err(error) = self.show_group(lane, &id) {
+                        self.message = error;
+                    }
+                }
+            } else if let Some(&(lane, _)) = self
+                .lane_scroll_zones
+                .iter()
+                .find(|(_, zone)| zone.contains(point) && zone.left() >= inner.right())
+                && let Some(lane_box) = lane_box(lane)
+            {
+                let thumb = lane_box.thumb();
+                let (top, bottom) = (inner.top() + thumb.start, inner.top() + thumb.end);
+                let grab = if (top..=bottom).contains(&point.y) {
+                    point.y - top
+                } else {
+                    // A press beside the thumb brings it there.
+                    (bottom - top) / 2.0
+                };
+                self.scroll_drag = Some((lane, grab));
+            }
+        }
+        if let Some((lane, grab)) = self.scroll_drag {
+            if down
+                && let Some(point) = position
+                && let Some(lane_box) = lane_box(lane)
+            {
+                let first = lane_box.first_for_thumb(point.y - grab - inner.top());
+                self.scroll_lane_to(lane, first);
+            } else if !down {
+                self.scroll_drag = None;
+            }
+        }
+        if steps != 0.0
+            && let Some(point) = hover
+            && let Some(&(lane, _)) = self
+                .lane_scroll_zones
+                .iter()
+                .find(|(_, zone)| zone.contains(point))
+            && let Some(lane_box) = lane_box(lane)
+        {
+            // At least one row for each turn of the wheel; up shows earlier channels.
+            let rows = steps.abs().ceil().max(1.0) as usize;
+            let first = if steps > 0.0 {
+                lane_box.first.saturating_sub(rows)
+            } else {
+                lane_box.first + rows
+            };
+            self.scroll_lane_to(lane, first);
+        }
+
+        let point = hover?;
+        if let Some(chip) = chips.iter().find(|chip| chip.rect.contains(point)) {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            return Some(if chip.current {
+                language.group_shown(&chip.label)
+            } else {
+                let next = self.lanes.iter().find_map(|plan| match &plan.kind {
+                    LaneKind::Stack { groups, .. } if plan.lane == chip.lane => groups
+                        .iter()
+                        .find(|(id, _)| *id == chip.id)
+                        .map(|(_, label)| label.clone()),
+                    _ => None,
+                });
+                language.show_group(next.as_deref().unwrap_or(&chip.label))
+            });
+        }
+        if point.x >= inner.left() && point.x < inner.right() || !rect.contains(point) {
+            return None;
+        }
+        let (index, row) = stack::row_at(&boxes, point.y - inner.top())?;
+        let plan = self.lanes.get(index)?;
+        let LaneKind::Stack { group, .. } = &plan.kind else {
+            return None;
+        };
+        let label = group
+            .labels
+            .get(row)
+            .map_or_else(|| (row + 1).to_string(), Clone::clone);
+        let mut text = language.channel(row + 1, group.channels.len(), &label);
+        if boxes[index].scrolls() {
+            text.push('\n');
+            text.push_str(language.scroll_hint());
+        }
+        Some(text)
+    }
+
     fn interact_timeline(&mut self, ui: &egui::Ui, rect: Rect) -> bool {
         let audio = self.audio_rect(rect);
         let (hover, position, pan_press, pan_down, steps) = ui.input(|input| {
@@ -3341,7 +4088,15 @@ impl Recorder {
             }
             return true;
         }
-        if steps != 0.0 && let Some(point) = hover.filter(|point| rect.contains(*point)) {
+        if steps != 0.0
+            && let Some(point) = hover.filter(|point| {
+                rect.contains(*point)
+                    && !self
+                        .lane_scroll_zones
+                        .iter()
+                        .any(|(_, zone)| zone.contains(*point))
+            })
+        {
             let requested = self.zoom_frames.as_ref().unwrap_or(&self.history_frames);
             let count = requested.end - requested.start;
             let total = self.history_frames.end - self.history_frames.start;
@@ -3468,38 +4223,62 @@ impl Recorder {
             let end = waveform::flag_fraction(range.end.min(visible.end), visible.clone())?;
             Some(start as f32..end as f32)
         });
-        let (_, rows) = self.waveform_layout();
-        let row_height = audio.height() / rows as f32;
-        for (index, peaks) in self.peaks.iter().take(rows).enumerate() {
-            let top = audio.top() + index as f32 * row_height;
-            let row = Rect::from_min_size(
-                Pos2::new(audio.left(), top),
-                Vec2::new(audio.width(), row_height),
-            );
-            if !self.waveform_only {
-                painter.hline(
-                    row.x_range(),
-                    row.center().y,
-                    Stroke::new(1.0, CENTER_LINE),
+        let boxes = self.lane_boxes(audio.height());
+        let stacked = self.stacked();
+        let rows: usize = boxes.iter().map(|lane| lane.shown).sum();
+        let dual = self.dual_source();
+        for (plan, lane_box) in self.lanes.iter().zip(&boxes) {
+            for index in lane_box.visible() {
+                let top = audio.top() + lane_box.row_top(index).unwrap_or_default();
+                let row = Rect::from_min_size(
+                    Pos2::new(audio.left(), top),
+                    Vec2::new(audio.width(), lane_box.row_height),
                 );
-                if rows == 2 {
-                    let label = if self.dual_source() {
-                        lane_name(index)
-                    } else if index == 0 {
-                        "L"
-                    } else {
-                        "R"
+                let source = plan.row(index);
+                if !self.waveform_only {
+                    painter.hline(row.x_range(), row.center().y, Stroke::new(1.0, CENTER_LINE));
+                    // Mono and stereo lanes are labelled as before; a stacked lane names
+                    // each channel.
+                    let label = match (&plan.kind, source) {
+                        (LaneKind::Stack { group, .. }, _) => Some(stack::short_label(
+                            group.labels.get(index).map_or("", String::as_str),
+                        ))
+                        .filter(|label| !label.is_empty())
+                        .or_else(|| Some((index + 1).to_string())),
+                        (_, RowSource::View(lane, view)) if rows == 2 || stacked => {
+                            Some(match view {
+                                _ if dual => lane_name(lane).to_owned(),
+                                WaveformView::Left => "L".to_owned(),
+                                WaveformView::Right => "R".to_owned(),
+                                _ => String::new(),
+                            })
+                        }
+                        _ => None,
                     };
-                    painter.text(
-                        Pos2::new(rect.left() + 1.0, row.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        label,
-                        egui::FontId::monospace(8.0),
-                        Color32::from_gray(180),
-                    );
+                    if let Some(label) = label.filter(|label| {
+                        !label.is_empty() && lane_box.row_height >= stack::LABELLED_ROW_HEIGHT
+                    }) {
+                        painter.text(
+                            Pos2::new(rect.left() + 1.0, row.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            label,
+                            egui::FontId::monospace(8.0),
+                            Color32::from_gray(180),
+                        );
+                    }
+                }
+                if let Some(peaks) = self
+                    .peak_rows
+                    .iter()
+                    .position(|row| *row == source)
+                    .and_then(|position| self.peaks.get(position))
+                {
+                    self.paint_waveform(&painter, row, peaks, highlight.as_ref());
                 }
             }
-            self.paint_waveform(&painter, row, peaks, highlight.as_ref());
+        }
+        if stacked {
+            self.paint_lane_furniture(ui, &painter, rect, audio, &boxes);
         }
         self.paint_flags(&painter, audio);
 
@@ -3516,6 +4295,75 @@ impl Recorder {
                 egui::FontId::monospace(11.0),
                 Color32::WHITE,
             );
+        }
+    }
+
+    /// The line between two lanes, the scroll bars and the group switches of stacked lanes.
+    fn paint_lane_furniture(
+        &self,
+        ui: &egui::Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        audio: Rect,
+        boxes: &[LaneBox],
+    ) {
+        let hover = ui.input(|input| input.pointer.hover_pos());
+        for lane_box in boxes.iter().skip(1) {
+            painter.hline(
+                rect.left() + 1.0..=audio.right(),
+                audio.top() + lane_box.top,
+                Stroke::new(1.0, Color32::from_white_alpha(36)),
+            );
+        }
+        for (plan, lane_box) in self.lanes.iter().zip(boxes) {
+            if !lane_box.scrolls() {
+                continue;
+            }
+            let track = self.scroll_track(rect, lane_box);
+            let x = track.center().x - 1.5..=track.center().x + 1.5;
+            painter.rect_filled(
+                Rect::from_x_y_ranges(x.clone(), track.y_range()),
+                1.5,
+                Color32::from_white_alpha(18),
+            );
+            let thumb = lane_box.thumb();
+            let active = self.scroll_drag.is_some_and(|(lane, _)| lane == plan.lane)
+                || hover.is_some_and(|point| track.contains(point));
+            painter.rect_filled(
+                Rect::from_x_y_ranges(x, audio.top() + thumb.start..=audio.top() + thumb.end),
+                1.5,
+                Color32::from_gray(if active { 200 } else { 128 }),
+            );
+        }
+        // The same dark backing as the waveform-only status mark keeps the switch readable.
+        let chips = self.group_chips(ui, rect, boxes);
+        for lane in [0, 1] {
+            let lane_chips: Vec<_> = chips.iter().filter(|chip| chip.lane == lane).collect();
+            let (Some(start), Some(end)) = (lane_chips.first(), lane_chips.last()) else {
+                continue;
+            };
+            painter.rect_filled(
+                start.rect.union(end.rect),
+                3.0,
+                Color32::from_black_alpha(168),
+            );
+            for chip in lane_chips {
+                let hovered = hover.is_some_and(|point| chip.rect.contains(point));
+                if chip.current {
+                    painter.rect_filled(chip.rect.shrink(1.0), 2.5, muted_accent(self.accent));
+                }
+                painter.text(
+                    chip.rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &chip.label,
+                    egui::FontId::proportional(10.0),
+                    if chip.current || hovered {
+                        Color32::WHITE
+                    } else {
+                        Color32::from_gray(180)
+                    },
+                );
+            }
         }
     }
 
@@ -3866,12 +4714,16 @@ impl eframe::App for Recorder {
                 let plot = rect.shrink(self.border_inset());
                 if self.plot_rect.size() != plot.size() { self.next_refresh = Instant::now(); }
                 self.plot_rect = plot;
+                self.update_lanes();
+                self.fit_window_to_rows(ui.ctx(), frame);
                 self.refresh_waveform();
                 if !self.waveform_only {
                     self.full_waveform_height = rect.height() - 2.0 * WAVEFORM_INSET;
                     self.full_window_size = ui.ctx().viewport_rect().size();
                 }
+                let mut lane_tip = None;
                 if !interaction_blocked {
+                    lane_tip = self.interact_lanes(ui, rect.shrink(self.border_inset()));
                     self.interact_waveform(ui, frame, rect.shrink(self.border_inset()));
                 }
                 self.draw_waveform(ui, rect, !interaction_blocked && window_cursor.is_none());
@@ -3884,9 +4736,20 @@ impl eframe::App for Recorder {
                             .on_hover_text(&status);
                     }
                 }
+                let response = match lane_tip {
+                    Some(tip) if window_cursor.is_none() && self.gesture.is_none() => {
+                        response.on_hover_text_at_pointer(tip)
+                    }
+                    _ => response,
+                };
                 if let Some(cursor) = window_cursor {
                     ui.ctx().set_cursor_icon(cursor);
-                } else if !interaction_blocked {
+                } else if !interaction_blocked
+                    && self.lane_controls.iter().all(|control| {
+                        !ui.input(|input| input.pointer.hover_pos())
+                            .is_some_and(|point| control.contains(point))
+                    })
+                {
                     response.on_hover_cursor(CursorIcon::Grab);
                 }
             });
@@ -3907,6 +4770,7 @@ impl eframe::App for Recorder {
         // Drawing can start a gesture, an export or the recording blink.
         self.watch_pin(frame, Instant::now());
         self.schedule_wake(ui.ctx(), frame);
+        self.drive_harness(ui.ctx(), frame);
     }
 }
 
@@ -4507,8 +5371,10 @@ mod tests {
                         snapshots,
                         lanes: vec![0],
                         bars: vec![1],
-                        retention_seconds: 600,
-                        export_options: ExportOptions::default()
+                        retention_seconds: 600.0,
+                        export_options: ExportOptions::default(),
+                        groups: Default::default(),
+                        shown_groups: Default::default(),
                     },
                     observed: observed.clone()
                 })
@@ -4583,8 +5449,10 @@ mod tests {
         .unwrap();
         let key = EditPreviewKey {
             frames: 1001..1003,
-            views: [(0, WaveformView::Left), (0, WaveformView::Right)],
-            rows: 2,
+            rows: vec![
+                RowSource::View(0, WaveformView::Left),
+                RowSource::View(0, WaveformView::Right),
+            ],
             bins: 2,
         };
         let peaks = edit_preview(&[stereo], &[0], &key);
@@ -4596,7 +5464,10 @@ mod tests {
             FrozenTrack::from_interleaved(48000, 1, 1000, &[-0.1, -0.2, -0.3, -0.4]).unwrap(),
         ];
         let key = EditPreviewKey {
-            views: [(0, WaveformView::Merged), (1, WaveformView::Merged)],
+            rows: vec![
+                RowSource::View(0, WaveformView::Merged),
+                RowSource::View(1, WaveformView::Merged),
+            ],
             ..key
         };
         let peaks = edit_preview(&tracks, &[0, 1], &key);
@@ -4906,5 +5777,99 @@ mod tests {
         );
         drop(files);
         std::fs::remove_dir(folder).unwrap();
+    }
+
+    fn group(id: &str, channels: Range<usize>) -> LaneGroup {
+        LaneGroup {
+            id: id.into(),
+            label: id.to_uppercase(),
+            labels: channels
+                .clone()
+                .map(|channel| format!("ch{channel}"))
+                .collect(),
+            channels,
+        }
+    }
+
+    #[test]
+    fn a_wide_lane_shows_its_chosen_group_or_the_first_or_every_channel_numbered() {
+        let groups = [group("bed", 0..12), group("objects", 12..28)];
+        let (shown, choices) = group_on_show(&groups, Some("objects"), 28);
+        assert_eq!(shown, groups[1]);
+        assert_eq!(
+            choices,
+            [
+                ("bed".into(), "BED".into()),
+                ("objects".into(), "OBJECTS".into())
+            ]
+        );
+        assert_eq!(group_on_show(&groups, Some("gone"), 28).0, groups[0]);
+        assert_eq!(group_on_show(&groups, None, 28).0, groups[0]);
+        // A group the audio is too narrow for, or no groups at all, falls back to numbers.
+        let (numbered, choices) = group_on_show(&groups[1..], None, 12);
+        assert_eq!((numbered.channels, numbered.labels.len()), (0..12, 12));
+        assert_eq!(numbered.labels[11], "12");
+        assert_eq!(choices.len(), 1);
+        assert_eq!(group_on_show(&[], None, 6).0.channels, 0..6);
+    }
+
+    #[test]
+    fn a_stacked_lane_draws_and_asks_for_each_channel_of_its_group_in_order() {
+        let plan = LanePlan {
+            lane: 1,
+            kind: LaneKind::Stack {
+                group: group("objects", 12..28),
+                groups: Vec::new(),
+            },
+        };
+        assert!(plan.stacked());
+        assert_eq!(plan.rows(), 16);
+        assert_eq!(plan.row(0), RowSource::Channel(1, 12));
+        assert_eq!(plan.row(15), RowSource::Channel(1, 27));
+        let stereo = LanePlan {
+            lane: 0,
+            kind: LaneKind::Views(vec![WaveformView::Left, WaveformView::Right]),
+        };
+        assert!(!stereo.stacked());
+        assert_eq!(stereo.row(1), RowSource::View(0, WaveformView::Right));
+        // Only rows on screen reach the preview: three channels of a scrolled 12-channel lane.
+        let track = FrozenTrack::from_interleaved(
+            48000,
+            12,
+            0,
+            &(0..24)
+                .map(|sample| sample as f32 / 100.0)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let key = EditPreviewKey {
+            frames: 0..2,
+            rows: (4..7)
+                .map(|channel| RowSource::Channel(0, channel))
+                .collect(),
+            bins: 2,
+        };
+        let peaks = edit_preview(&[track], &[0], &key);
+        assert_eq!(peaks.len(), 3);
+        assert_eq!(peaks[0].high, [0.04, 0.16]);
+        assert_eq!(peaks[2].low, [0.06, 0.18]);
+    }
+
+    #[test]
+    fn wide_lanes_keep_peak_and_vu_but_show_no_loudness_number() {
+        let wide = LaneMeterReadings {
+            peak_dbfs: -12.0,
+            vu: -3.0,
+            momentary_lufs: None,
+        };
+        assert_eq!(meter_value(MeterMode::Dbfs, wide), Some(-12.0));
+        assert_eq!(meter_value(MeterMode::Vu, wide), Some(-3.0));
+        assert_eq!(meter_value(MeterMode::Lufs, wide), None);
+        assert_eq!(meter_number(meter_value(MeterMode::Lufs, wide), false), "—");
+        let stereo = LaneMeterReadings {
+            momentary_lufs: Some(-20.0),
+            ..wide
+        };
+        assert_eq!(meter_value(MeterMode::Lufs, stereo), Some(-20.0));
     }
 }

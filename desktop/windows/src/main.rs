@@ -41,8 +41,19 @@ fn main() {
     use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
     use windows::core::{HSTRING, PCWSTR, w};
 
+    // A test copy runs beside the installed app and never touches its updates.
+    let test_instance = startup::test_instance().is_some();
     let result = (|| {
-        if updater::run_helper()? || updater::other_launch_during_update() {
+        if startup::test_instance_invalid() {
+            return Err(format!(
+                "{} takes 1 to 40 letters, digits, - or _.",
+                startup::TEST_INSTANCE_VARIABLE
+            )
+            .into());
+        }
+        if test_instance {
+            startup::check_test_data_folder()?;
+        } else if updater::run_helper()? || updater::other_launch_during_update() {
             return Ok(());
         }
         let primary = !std::env::args_os().any(|arg| arg == "--new-capture-window");
@@ -50,7 +61,7 @@ fn main() {
             let Some(instance) = startup::Instance::acquire()? else {
                 return Ok(());
             };
-            if updater::install_before_start() {
+            if !test_instance && updater::install_before_start() {
                 return Ok(());
             }
             Some(instance)
@@ -69,6 +80,11 @@ fn main() {
         Ok::<(), Box<dyn std::error::Error>>(())
     })();
     if let Err(error) = result {
+        if test_instance || startup::test_instance_invalid() {
+            // Nobody is there to close a message box. The harness reads standard error.
+            eprintln!("Backtracking test copy could not start: {error}");
+            std::process::exit(2);
+        }
         let message = HSTRING::from(format!("無法開啟 Backtracking。\n\n{error}"));
         unsafe {
             MessageBoxW(
