@@ -20,8 +20,7 @@
 //!   seed are removed first. Two more: `tone-opens` installs the test tone, under the same id,
 //!   with the `open-files` capability for `.ec3` files (it ignores the file, but it makes a
 //!   second add-on that opens them), and `atmos` installs the Dolby Atmos add-on from
-//!   `BACKTRACKING_TEST_ATMOS_PACKAGE` (default
-//!   `D:\Developing\backtracking-joc\target\backtracking-joc.btaddon`), switches its
+//!   `BACKTRACKING_TEST_ATMOS_PACKAGE` (the path of a built `backtracking-joc.btaddon`), switches its
 //!   `play_through_speakers` setting off as soon as it runs (and `capture_objects` on when `BACKTRACKING_TEST_ATMOS_OBJECTS=1`) and waits until the host holds
 //!   that value. Nothing may make sound, so no file is ever opened before that.
 //! - `BACKTRACKING_TEST_LANE_A`: `tone` (default when the test tone is installed), `atmos`
@@ -261,9 +260,9 @@ fn seed_test_profile() {
         );
     }
     if wanted.contains(&"atmos") {
-        let atmos_package = std::env::var_os("BACKTRACKING_TEST_ATMOS_PACKAGE").map_or_else(
-            || PathBuf::from(r"D:\Developing\backtracking-joc\target\backtracking-joc.btaddon"),
-            PathBuf::from,
+        let atmos_package = PathBuf::from(
+            std::env::var_os("BACKTRACKING_TEST_ATMOS_PACKAGE")
+                .expect("set BACKTRACKING_TEST_ATMOS_PACKAGE to the Atmos add-on package"),
         );
         let inspected = reply(handle.inspect(atmos_package.clone()));
         reply(handle.install(atmos_package, inspected.identity));
