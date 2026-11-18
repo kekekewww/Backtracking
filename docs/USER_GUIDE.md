@@ -232,7 +232,7 @@ Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift
 
 匯出整條多聲道軌道時（沒有分開編輯，或選取了所有列），另外寫一個 L 與 R 的檔案：**L/R of multichannel sources／多聲道來源的 L/R** 為立體聲時是 `-Stereo.wav`，為雙耳時是 `-Binaural.wav`；與上表的檔案相同時只寫一次。分開編輯時只匯出選取的列，選取 L 與 R 兩列就寫這個 L/R 檔案。只會匯出目前顯示的聲道群組。開啟 **Hide silent channels／隱藏無聲的聲道** 時，系統、應用程式與麥克風軌道整條匯出只寫畫面上顯示的聲道（有聲音的聲道）和 L/R 檔案；除了前左與前右都沒有聲音時，只寫 L/R 檔案。
 
-物件群組裡帶有位置資料的物件，在兩種雙耳選項中會依位置移動。沒有位置資料的物件無法定位，會寫成單聲道檔案，狀態列會說明一次。匯出的內容含有帶位置資料的聲道時，旁邊會多一個 `-Positions.json`，記錄這些聲道在片段中的位置與時間，以片段的第一個取樣為 0。
+附加元件可以為一組聲道送出位置資料，例如電影音軌中的物件。這些聲道在兩種雙耳選項中會依位置移動；其中在整個片段都沒有位置資料的聲道無法定位，會寫成單聲道檔案，狀態列會說明一次。匯出的內容含有帶位置資料的聲道時，旁邊會多一個 `-Positions.json`，記錄這些聲道在片段中的位置與時間，以片段的第一個取樣為 0。
 
 檔名開頭與其他來源相同，依[檔名](#輸出位置與檔案規格)的規則包含來源名稱（A／B 分開擷取時還有 A 或 B），依名稱排序即為聲道順序，例如 `Backtracking_Test tone_2026-11-17_09-05-00_12.4s-Ch01_L_binaural.wav`。附加元件的來源同樣可在 Options → Sources 的 **File name** 欄位改名。淡入淡出會套用到每個檔案。
 
@@ -485,7 +485,7 @@ If you chose mono files or one multichannel file before, that choice is kept. Th
 
 Exporting a whole multichannel lane (not editing separately, or every row selected) also writes one file for L and R: `-Stereo.wav` when **L/R of multichannel sources** is Stereo, `-Binaural.wav` when it is Binaural, written once when the table above already produces it. While editing separately, only the selected rows are exported, and selecting the L and R rows writes that L/R file. Only the channel group on show is exported. With **Hide silent channels** on, a whole system, app or microphone lane writes only the channels it shows (the ones that had sound), plus the L/R file; when nothing but the front left and right has sound, it writes the L/R file alone.
 
-Objects in the objects group that carry positions move as they say in both binaural choices. An object without positions cannot be placed: it is written as a mono file, and the status line says so once. When the export includes channels with positions, a `-Positions.json` file is written beside the audio. It records where those channels were during the clip and when, counting from the clip's first sample.
+An add-on can send positions for a group of channels, such as the objects of a film soundtrack. Those channels move as the positions say in both binaural choices. One of them that has no position anywhere in the clip cannot be placed: it is written as a mono file, and the status line says so once. When the export includes channels with positions, a `-Positions.json` file is written beside the audio. It records where those channels were during the clip and when, counting from the clip's first sample.
 
 The files begin like any other source's, with its name (and A or B when two lanes record) as described under [file names](#output-location-and-file-format), and sorting by name puts the channels in order, as in `Backtracking_Test tone_2026-11-17_09-05-00_12.4s-Ch01_L_binaural.wav`. An add-on's sources can be renamed in the **File name** field in Options → Sources too. Fades apply to every file.
 
