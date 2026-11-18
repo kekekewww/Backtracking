@@ -9,6 +9,8 @@ use std::sync::OnceLock;
 use backtracking_addon::manifest::{Capability, OpenFiles};
 use backtracking_addon::protocol::MessageLevel;
 
+use crate::preferences::WideExportMode;
+
 /// Lines the capture code (`controller.rs`) writes in both languages at once, word for word.
 /// A test checks that the capture code still writes them so.
 const BILINGUAL_FALLBACK_TO_MERGED: &str =
@@ -204,19 +206,70 @@ impl Language {
         self.pick("Multichannel sources", "多聲道來源")
     }
 
-    pub(crate) fn wide_export_mode(self, multichannel: bool) -> &'static str {
-        if multichannel {
-            self.pick("One multichannel WAV", "一個多聲道 WAV")
-        } else {
-            self.pick("One mono WAV per channel", "每個聲道一個單聲道 WAV")
+    /// One choice of the Multichannel sources list on the Export page.
+    pub(crate) fn wide_export_mode(self, mode: WideExportMode) -> &'static str {
+        match mode {
+            WideExportMode::BinauralFiles => {
+                self.pick("Binaural, one file per channel", "雙耳音訊，每聲道一個檔案")
+            }
+            WideExportMode::MonoFiles => {
+                self.pick("Mono, one file per channel", "單聲道，每聲道一個檔案")
+            }
+            WideExportMode::Multichannel => self.pick("One multichannel file", "一個多聲道檔案"),
+            WideExportMode::BinauralMix => self.pick("One binaural mix", "一個雙耳混音檔案"),
         }
     }
 
+    /// The help under the Multichannel sources list.
     pub(crate) fn wide_export_note(self) -> &'static str {
         self.pick(
-            "Only the channel group on show is exported.",
-            "只匯出目前顯示的聲道群組。",
+            "Binaural files let you hear on headphones where each channel sits.",
+            "雙耳音訊檔可讓你用耳機聽出每個聲道所在的位置。",
         )
+    }
+
+    /// Several files saved into `folder`: `wav` WAV files and `positions` positions files.
+    pub(crate) fn files_in(self, wav: usize, positions: usize, folder: &str) -> String {
+        match self {
+            Self::English => {
+                let wav_files = format!("{wav} WAV file{}", if wav == 1 { "" } else { "s" });
+                match positions {
+                    0 => format!("{wav_files} in {folder}"),
+                    1 => format!("{wav_files} and a positions file in {folder}"),
+                    _ => format!("{wav_files} and {positions} positions files in {folder}"),
+                }
+            }
+            Self::TraditionalChinese => match positions {
+                0 => format!("{wav} 個 WAV 檔，位於 {folder}"),
+                _ => format!("{wav} 個 WAV 檔與 {positions} 個位置檔，位於 {folder}"),
+            },
+        }
+    }
+
+    /// The status line once `files` are saved, by the Save command (`snapshot`) or a drag.
+    pub(crate) fn saved(self, snapshot: bool, files: &str) -> String {
+        match (self, snapshot) {
+            (Self::English, true) => format!("Saved snapshot {files}"),
+            (Self::English, false) => format!("Saved {files}"),
+            (Self::TraditionalChinese, true) => format!("已儲存快照：{files}"),
+            (Self::TraditionalChinese, false) => format!("已儲存：{files}"),
+        }
+    }
+
+    /// Said once for a take whose objects without positions could not be placed.
+    pub(crate) fn objects_in_mono(self) -> &'static str {
+        self.pick(
+            "Objects without positions were written in mono.",
+            "沒有位置資料的物件已匯出為單聲道。",
+        )
+    }
+
+    /// `saved`, led by `objects_in_mono`, so a narrow status line still shows it.
+    pub(crate) fn with_objects_in_mono(self, saved: &str) -> String {
+        match self {
+            Self::English => format!("{} {saved}", self.objects_in_mono()),
+            Self::TraditionalChinese => format!("{}{saved}", self.objects_in_mono()),
+        }
     }
 
     /// The right-click menu's item for selecting rows on their own (Right Ctrl).
@@ -921,6 +974,7 @@ pub(crate) fn byte_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::Language::{English, TraditionalChinese};
+    use crate::preferences::WideExportMode;
 
     #[test]
     fn durations_read_as_plain_words_in_both_languages() {
@@ -944,10 +998,13 @@ mod tests {
             assert!(!language.wide_export_field().is_empty());
             assert!(!language.wide_export_note().is_empty());
             assert!(!language.test_copy_startup().is_empty());
-            assert_ne!(
-                language.wide_export_mode(true),
-                language.wide_export_mode(false)
-            );
+            let modes = WideExportMode::ALL.map(|mode| language.wide_export_mode(mode));
+            for (index, mode) in modes.iter().enumerate() {
+                assert!(
+                    !mode.is_empty() && !modes[..index].contains(mode),
+                    "{modes:?}"
+                );
+            }
             assert_ne!(
                 language.editing_separately(true),
                 language.editing_separately(false)
@@ -964,6 +1021,8 @@ mod tests {
             super::Language::all_channels,
             super::Language::all_channels_fallback,
             super::Language::positions_trimmed,
+            super::Language::wide_export_note,
+            super::Language::objects_in_mono,
         ] {
             assert_ne!(text(English), text(TraditionalChinese));
             assert!(text(TraditionalChinese).chars().any(|c| c as u32 >= 0x3000));
@@ -981,6 +1040,54 @@ mod tests {
         assert_eq!(English.channel(3, 12, "C"), "Channel 3 of 12: C");
         assert_eq!(TraditionalChinese.show_group("Objects"), "顯示Objects");
         assert_ne!(English.scroll_hint(), TraditionalChinese.scroll_hint());
+    }
+
+    #[test]
+    fn export_modes_and_saved_files_read_as_the_spec_says_in_both_languages() {
+        let labels =
+            |language: super::Language| WideExportMode::ALL.map(|m| language.wide_export_mode(m));
+        assert_eq!(
+            labels(English),
+            [
+                "Binaural, one file per channel",
+                "Mono, one file per channel",
+                "One multichannel file",
+                "One binaural mix"
+            ]
+        );
+        assert_eq!(
+            labels(TraditionalChinese),
+            [
+                "雙耳音訊，每聲道一個檔案",
+                "單聲道，每聲道一個檔案",
+                "一個多聲道檔案",
+                "一個雙耳混音檔案"
+            ]
+        );
+        assert_eq!(English.files_in(12, 0, "D:\\x"), "12 WAV files in D:\\x");
+        assert_eq!(
+            English.files_in(1, 1, "D:\\x"),
+            "1 WAV file and a positions file in D:\\x"
+        );
+        assert_eq!(
+            English.files_in(3, 2, "D:\\x"),
+            "3 WAV files and 2 positions files in D:\\x"
+        );
+        assert_eq!(
+            TraditionalChinese.files_in(3, 1, "D:\\x"),
+            "3 個 WAV 檔與 1 個位置檔，位於 D:\\x"
+        );
+        assert_eq!(English.saved(true, "a.wav"), "Saved snapshot a.wav");
+        assert_eq!(English.saved(false, "a.wav"), "Saved a.wav");
+        assert_eq!(TraditionalChinese.saved(true, "a.wav"), "已儲存快照：a.wav");
+        assert_eq!(
+            English.with_objects_in_mono("Saved a.wav"),
+            "Objects without positions were written in mono. Saved a.wav"
+        );
+        assert_eq!(
+            TraditionalChinese.with_objects_in_mono("已儲存：a.wav"),
+            "沒有位置資料的物件已匯出為單聲道。已儲存：a.wav"
+        );
     }
 
     #[test]

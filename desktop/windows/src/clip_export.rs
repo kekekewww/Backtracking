@@ -23,92 +23,8 @@ pub(crate) struct ExportOptions {
     pub(crate) addons: Option<AddonHandle>,
 }
 
-/// Writes a frozen clip on a worker thread. Wide lanes use the selected group; mono and stereo
-/// retain the existing routing and file naming behavior.
-/// `file_labels` names each track's files and `fades` ramp every file, wide lanes included.
-#[allow(clippy::too_many_arguments)]
-// The window writes through `export_clip_channels`; tests and the add-on checks call this.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn export_clip(
-    output: &Path,
-    tracks: &[FrozenTrack],
-    frames: Range<usize>,
-    fades: Fades,
-    profile: WavExportProfile,
-    routes: &[ChannelRoute],
-    force_mono: bool,
-    file_labels: &[TakeLabel],
-    options: &ExportOptions,
-) -> io::Result<Vec<PathBuf>> {
-    export_clip_channels(
-        output,
-        tracks,
-        frames,
-        fades,
-        profile,
-        routes,
-        force_mono,
-        file_labels,
-        options,
-        &[None, None],
-    )
-}
-
-/// As `export_clip`, writing of each track only `channels`, when only some of a lane's rows
-/// were selected; `None` writes the lane as `export_clip` does. A wide lane writes the
-/// channels chosen in its export mode, and one side of a stereo lane chosen on its own is
-/// written as a mono file under the lane's own name.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn export_clip_channels(
-    output: &Path,
-    tracks: &[FrozenTrack],
-    frames: Range<usize>,
-    fades: Fades,
-    profile: WavExportProfile,
-    routes: &[ChannelRoute],
-    force_mono: bool,
-    file_labels: &[TakeLabel],
-    options: &ExportOptions,
-    channels: &[Option<Range<usize>>; 2],
-) -> io::Result<Vec<PathBuf>> {
-    for (track, range) in tracks.iter().zip(channels) {
-        if range
-            .as_ref()
-            .is_some_and(|r| r.is_empty() || r.end > track.channels())
-        {
-            return Err(invalid_selection());
-        }
-    }
-    let lanes = std::array::from_fn(|lane| {
-        let selected = channels[lane].clone().filter(|range| {
-            tracks
-                .get(lane)
-                .is_none_or(|track| *range != (0..track.channels()))
-        });
-        RowExport {
-            pair: selected.is_none()
-                && options.groups[lane]
-                    .as_ref()
-                    .is_none_or(|group| !objects(group)),
-            channels: selected.map(Iterator::collect),
-            ..RowExport::default()
-        }
-    });
-    Ok(export_rows(
-        output,
-        tracks,
-        frames,
-        fades,
-        profile,
-        routes,
-        force_mono,
-        file_labels,
-        options,
-        &lanes,
-    )?
-    .paths)
-}
-
+/// What one lane of a clip writes. A wide lane writes its channels in the export mode, and the
+/// L/R pair when `pair` is set; a stereo lane with one channel chosen writes that side as mono.
 #[derive(Default)]
 pub(crate) struct RowExport<'a> {
     /// None selects every native channel of the displayed group. An empty list selects only the pair.
@@ -124,6 +40,10 @@ pub(crate) struct ExportResult {
     pub(crate) objects_in_mono: bool,
 }
 
+/// Writes a frozen clip on a worker thread: of each track, the rows in `rows`, in physical
+/// snapshot order. Wide lanes use their group in `options`; mono and stereo keep the existing
+/// routing and file naming. `file_labels` names each track's files and `fades` ramp every file,
+/// wide lanes included.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn export_rows(
     output: &Path,
@@ -1335,7 +1255,7 @@ mod tests {
         )
         .unwrap();
         let mut options = options();
-        let paths = export_clip(
+        let paths = export_rows(
             &folder.0,
             std::slice::from_ref(&track),
             0..2,
@@ -1345,8 +1265,10 @@ mod tests {
             true,
             &[TakeLabel::default()],
             &options,
+            &[RowExport::default(), RowExport::default()],
         )
-        .unwrap();
+        .unwrap()
+        .paths;
         assert_eq!(paths.len(), 3);
         for (channel, path) in paths.iter().enumerate() {
             assert!(path.is_absolute());
@@ -1363,7 +1285,7 @@ mod tests {
             assert_eq!(first, [0.4, 0.5, 0.6][channel]);
         }
         options.wide_mode = WideExportMode::Multichannel;
-        let paths = export_clip(
+        let paths = export_rows(
             &folder.0,
             &[track],
             0..2,
@@ -1373,8 +1295,10 @@ mod tests {
             true,
             &[TakeLabel::default()],
             &options,
+            &[RowExport::default(), RowExport::default()],
         )
-        .unwrap();
+        .unwrap()
+        .paths;
         assert_eq!(paths.len(), 1);
         let data = std::fs::read(&paths[0]).unwrap();
         assert_eq!(u16::from_le_bytes(data[22..24].try_into().unwrap()), 3);
@@ -1399,7 +1323,7 @@ mod tests {
             labels: vec!["A".into(), "B".into(), "C".into()],
         });
         assert!(
-            export_clip(
+            export_rows(
                 &folder.0,
                 &[track.clone(), track],
                 0..2,
@@ -1408,7 +1332,8 @@ mod tests {
                 &[ChannelRoute::Merged; 2],
                 false,
                 &[TakeLabel::default(), TakeLabel::default()],
-                &options
+                &options,
+                &[RowExport::default(), RowExport::default()]
             )
             .is_err()
         );
@@ -1433,7 +1358,7 @@ mod tests {
             TakeLabel::new("Test tone", Some(Lane::A)),
             TakeLabel::new("System audio", Some(Lane::B)),
         ];
-        let paths = export_clip(
+        let paths = export_rows(
             &folder.0,
             &[wide.clone(), stereo],
             0..4,
@@ -1443,8 +1368,16 @@ mod tests {
             false,
             &labels,
             &ExportOptions::default(),
+            &[
+                RowExport {
+                    pair: true,
+                    ..RowExport::default()
+                },
+                RowExport::default(),
+            ],
         )
-        .unwrap();
+        .unwrap()
+        .paths;
         let names = file_names(&paths);
         assert_eq!(names.len(), 5, "{names:?}");
         assert!(names[3].ends_with("-Stereo.wav"));
@@ -1473,7 +1406,7 @@ mod tests {
         assert_eq!(sorted[1..], names[..4]);
 
         // Without a source name the lane letter follows the take, then the channel follows it.
-        let paths = export_clip(
+        let paths = export_rows(
             &folder.0,
             std::slice::from_ref(&wide),
             0..4,
@@ -1483,8 +1416,16 @@ mod tests {
             false,
             &[TakeLabel::new("", Some(Lane::A))],
             &ExportOptions::default(),
+            &[
+                RowExport {
+                    pair: true,
+                    ..RowExport::default()
+                },
+                RowExport::default(),
+            ],
         )
-        .unwrap();
+        .unwrap()
+        .paths;
         for name in file_names(&paths) {
             assert!(name.starts_with("Backtracking_2"), "{name}");
             assert!(
@@ -1516,7 +1457,7 @@ mod tests {
         let options = options();
         // Channels 2 and 3 of the wide lane, which straddle the start of its "objects" group,
         // and the right side of the stereo lane.
-        let paths = export_clip_channels(
+        let paths = export_rows(
             &folder.0,
             &[wide.clone(), stereo.clone()],
             0..4,
@@ -1526,9 +1467,19 @@ mod tests {
             false,
             &labels,
             &options,
-            &[Some(2..4), Some(1..2)],
+            &[
+                RowExport {
+                    channels: Some(vec![2, 3]),
+                    ..RowExport::default()
+                },
+                RowExport {
+                    channels: Some(vec![1]),
+                    ..RowExport::default()
+                },
+            ],
         )
-        .unwrap();
+        .unwrap()
+        .paths;
         let names = file_names(&paths);
         assert_eq!(names.len(), 3, "{names:?}");
         assert!(names[0].ends_with("-Ch03_Channel 3.wav"), "{names:?}");
@@ -1545,7 +1496,7 @@ mod tests {
             assert_eq!(last, value);
         }
         // Both sides, or every channel, are the whole lane as before.
-        let whole = export_clip_channels(
+        let whole = export_rows(
             &folder.0,
             &[wide.clone(), stereo],
             0..4,
@@ -1555,14 +1506,15 @@ mod tests {
             false,
             &labels,
             &options,
-            &[Some(0..6), Some(0..2)],
+            &[RowExport::default(), RowExport::default()],
         )
-        .unwrap();
+        .unwrap()
+        .paths;
         assert_eq!(whole.len(), 4, "the objects group and one stereo file");
         // Channels the track does not have are refused, and nothing is left behind.
         let before = std::fs::read_dir(&folder.0).unwrap().count();
         assert!(
-            export_clip_channels(
+            export_rows(
                 &folder.0,
                 std::slice::from_ref(&wide),
                 0..4,
@@ -1572,7 +1524,13 @@ mod tests {
                 false,
                 &[TakeLabel::default()],
                 &options,
-                &[Some(5..7), None],
+                &[
+                    RowExport {
+                        channels: Some(vec![5, 6]),
+                        ..RowExport::default()
+                    },
+                    RowExport::default(),
+                ],
             )
             .is_err()
         );
@@ -1590,7 +1548,7 @@ mod tests {
         let mut options = ExportOptions::default();
         for mode in [WideExportMode::MonoFiles, WideExportMode::Multichannel] {
             options.wide_mode = mode;
-            let paths = export_clip(
+            let paths = export_rows(
                 &folder.0,
                 std::slice::from_ref(&wide),
                 0..frames as usize,
@@ -1600,8 +1558,16 @@ mod tests {
                 false,
                 &[TakeLabel::default()],
                 &options,
+                &[
+                    RowExport {
+                        pair: true,
+                        ..RowExport::default()
+                    },
+                    RowExport::default(),
+                ],
             )
-            .unwrap();
+            .unwrap()
+            .paths;
             assert_eq!(
                 paths.len(),
                 if mode == WideExportMode::Multichannel {

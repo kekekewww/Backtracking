@@ -13,7 +13,7 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOU
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
 use crate::addons::{AddonHandle, AddonManager, AddonState};
-use crate::clip_export::{ExportOptions, export_clip};
+use crate::clip_export::{ExportOptions, RowExport, export_rows};
 use crate::controller::{CaptureSource, Controller, EditSnapshot, SourceSettings};
 use crate::preferences::WideExportMode;
 
@@ -389,7 +389,8 @@ fn test_tone_child() {
         wide_mode: WideExportMode::MonoFiles,
         addons: Some(handle.clone()),
     };
-    let files = export_clip(
+    // The whole lane, as the window writes it: every channel and the pair.
+    let files = export_rows(
         &root.join("exports"),
         &snapshot.snapshots,
         (visible.start - range.start) as usize..(visible.end - range.start) as usize,
@@ -399,8 +400,16 @@ fn test_tone_child() {
         false,
         &[TakeLabel::default()],
         &options,
+        &[
+            RowExport {
+                pair: true,
+                ..RowExport::default()
+            },
+            RowExport::default(),
+        ],
     )
-    .unwrap();
+    .unwrap()
+    .paths;
     // A whole wide lane writes its channels and, last, the L/R file.
     assert_eq!(files.len(), 7);
     assert!(

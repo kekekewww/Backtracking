@@ -7,7 +7,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::clip_export::{ExportOptions, export_clip_channels};
+use crate::clip_export::{self, ExportOptions};
 use crate::context_menu::{self, WindowCommand};
 use crate::controller::{
     CaptureSource, ChannelWaveform, Controller, EditSnapshot, LaneGroup, LaneMeterReadings,
@@ -514,6 +514,8 @@ struct Recorder {
     wav_profile: WavExportProfile,
     wav_force_mono: bool,
     wide_export: WideExportMode,
+    /// A test copy opens the Multichannel sources list on the Options page's next pass.
+    force_wide_export_menu: bool,
     /// How the pair of a wide lane is played and exported.
     pair_render: PairRender,
     /// A system, application or microphone lane on All channels shows only its active rows.
@@ -1247,14 +1249,11 @@ fn row_drag(
     row_at_height(lanes, boxes, offset).map(RowDrag::To)
 }
 
-/// What a choice of rows writes and plays.
+/// The rows a choice of rows names, by logical lane: what a selection writes and plays.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct RowExport {
+struct ChosenRows {
     /// The one lane the rows lie in, or `None` when they lie in both.
     lane: Option<usize>,
-    /// By logical lane: the channels of the rows chosen, or `None` for the whole lane. A pair
-    /// row is made from the whole lane's Channels group, so it writes the whole lane here.
-    channels: [Option<Range<usize>>; 2],
     /// By logical lane: the lane-native channels of the channel rows chosen, in order, or
     /// `None` for the whole lane. Empty when only the pair is chosen.
     native: [Option<Vec<usize>>; 2],
@@ -1262,8 +1261,8 @@ struct RowExport {
     pair: [bool; 2],
 }
 
-/// What `rows` write, or `None` when no rows are named, which means every row.
-fn row_export(rows: &[RowSource]) -> Option<RowExport> {
+/// What `rows` name, or `None` when no rows are named, which means every row.
+fn chosen_rows(rows: &[RowSource]) -> Option<ChosenRows> {
     let lanes: Vec<usize> = (0..2)
         .filter(|&lane| rows.iter().any(|row| row.lane() == lane))
         .collect();
@@ -1292,19 +1291,99 @@ fn row_export(rows: &[RowSource]) -> Option<RowExport> {
         channels.dedup();
         Some(channels)
     });
-    let channels = std::array::from_fn(|lane| {
-        if pair[lane] {
-            return None;
-        }
-        let native = native[lane].as_ref()?;
-        Some(*native.first()?..native.last()? + 1)
-    });
-    Some(RowExport {
-        lane,
-        channels,
-        native,
-        pair,
+    Some(ChosenRows { lane, native, pair })
+}
+
+/// By logical lane: whether `rows` hold every row `lanes` draw of that lane. Such a lane is
+/// written whole, as it is when rows are not separate.
+fn lanes_chosen_whole(lanes: &[LanePlan], rows: &[RowSource]) -> [bool; 2] {
+    std::array::from_fn(|lane| {
+        lanes
+            .iter()
+            .find(|plan| plan.lane == lane)
+            .is_some_and(|plan| {
+                plan.rows() > 0 && (0..plan.rows()).all(|row| rows.contains(&plan.row(row)))
+            })
     })
+}
+
+/// What the export call writes of one wide or narrow snapshot, worked out on the export
+/// worker. `groups` are all the lane's groups frozen with the audio, `shown` the group on show
+/// when the clip was made, and `active` the lane's active channels in the frozen audio when the
+/// lane hides silent rows and is written whole.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LaneWrite {
+    /// Lane-native channels written, or `None` for every channel of `shown`.
+    channels: Option<Vec<usize>>,
+    pair: bool,
+    /// The group the written channels are named by, and whose objects may move.
+    shown: Option<LaneGroup>,
+    /// The lane's Channels group, which the pair is made from.
+    bed: Option<LaneGroup>,
+}
+
+fn lane_write(
+    width: usize,
+    choice: &RowChoice,
+    groups: &[LaneGroup],
+    shown: Option<&LaneGroup>,
+    active: Option<u64>,
+) -> LaneWrite {
+    if width <= 2 {
+        // One side of a stereo lane is written on its own; anything else is the whole lane.
+        return LaneWrite {
+            channels: choice
+                .channels
+                .clone()
+                .filter(|channels| channels.len() == 1 && width == 2),
+            ..LaneWrite::default()
+        };
+    }
+    let fits = |group: &&LaneGroup| !group.channels.is_empty() && group.channels.end <= width;
+    let bed = groups
+        .iter()
+        .filter(fits)
+        .find(|group| !is_objects(group))
+        .cloned();
+    let (channels, pair, shown) = match &choice.channels {
+        None => {
+            let shown = shown.cloned();
+            // A lane that hides silent rows writes what it shows: its active channels, or none
+            // but the pair while nothing beyond the front left and right has sound.
+            let channels = active.map(|active| {
+                let group = shown
+                    .clone()
+                    .or_else(|| bed.clone())
+                    .unwrap_or_else(|| numbered_group(width));
+                shown_channels(&group, Some(active))
+            });
+            (channels, true, shown)
+        }
+        Some(native) => {
+            // The rows are named by their own group, whatever is on show now: the objects
+            // when any row is an object, else the group that holds them.
+            let holding = |objects: bool| {
+                groups.iter().filter(fits).find(|group| {
+                    is_objects(group) == objects
+                        && native
+                            .iter()
+                            .any(|channel| group.channels.contains(channel))
+                })
+            };
+            let named = holding(true).or_else(|| holding(false)).or(shown).cloned();
+            (Some(native.clone()), choice.pair, named)
+        }
+    };
+    // A lane of objects only makes its pair from every channel, numbered, as its rows show.
+    let bed = bed.or_else(|| {
+        (pair && shown.as_ref().is_some_and(is_objects)).then(|| numbered_group(width))
+    });
+    LaneWrite {
+        channels,
+        pair,
+        shown,
+        bed,
+    }
 }
 
 /// The least width of the plot, and height of a lane, that take the compact transport.
@@ -1376,7 +1455,7 @@ impl FrozenEdit {
     /// channel rows and whether the pair is chosen. No rows choose every row of every lane.
     #[cfg_attr(not(test), allow(dead_code))]
     fn row_choice(&self, rows: &[RowSource]) -> [RowChoice; 2] {
-        let chosen = row_export(rows);
+        let chosen = chosen_rows(rows);
         std::array::from_fn(|index| match (chosen.as_ref(), self.lanes.get(index)) {
             (Some(chosen), Some(&lane)) if lane < 2 => RowChoice {
                 channels: chosen.native[lane].clone(),
@@ -1449,6 +1528,8 @@ struct SnapshotSpec {
     export_options: ExportOptions,
     /// The rows saved, or none for every row.
     rows: Vec<RowSource>,
+    /// By logical lane: `rows` hold every row the window drew of it, so it is saved whole.
+    whole: [bool; 2],
 }
 
 /// How a clip's files are written: their format, each lane's channels and source name, and
@@ -1462,6 +1543,11 @@ struct ClipFormat {
     names: [String; 2],
     /// One lane of a two-lane recording, or `None` for every lane.
     lane: Option<usize>,
+    /// The L/R pair of a wide lane is written binaural rather than as the stereo fold-down.
+    pair_binaural: bool,
+    /// By logical lane: the lane hides its silent rows, so written whole it writes only the
+    /// channels active in its frozen audio, and the pair.
+    hide_silent: [bool; 2],
 }
 
 impl ClipFormat {
@@ -1474,6 +1560,8 @@ impl ClipFormat {
             force_mono,
             names: Default::default(),
             lane: None,
+            pair_binaural: false,
+            hide_silent: [false; 2],
         }
     }
 }
@@ -1555,6 +1643,7 @@ impl SnapshotSpec {
             clip.export_options = self.export_options;
             clip.with_rows(&self.rows, groups)
         })
+        .map(|clip| clip.whole_lanes(self.whole))
     }
 }
 
@@ -1837,16 +1926,14 @@ struct WavClip {
     output: PathBuf,
     format: ClipFormat,
     flags: Option<FlagUpdate>,
+    /// `groups` holds, by snapshot, the group on show when the clip was made.
     export_options: ExportOptions,
-    /// By snapshot: only these channels are written, when only some of a lane's rows are.
-    channels: [Option<Range<usize>>; 2],
-    /// By snapshot: the rows chosen, as lane-native channels and the pair, for the export
-    /// call that writes the pair and sparse channels. `channels` above is what is written now.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// By snapshot: every channel group frozen with the audio, not only the one on show.
+    groups: [Vec<LaneGroup>; 2],
+    /// By snapshot: the rows chosen, as lane-native channels and the pair.
     rows: [RowChoice; 2],
     /// By snapshot: the position tracks frozen with the audio, when the clip was made from a
     /// frozen view.
-    #[cfg_attr(not(test), allow(dead_code))]
     positions: [Option<FrozenPositionTrack>; 2],
 }
 
@@ -1892,7 +1979,7 @@ impl WavClip {
             format,
             flags,
             export_options: ExportOptions::default(),
-            channels: [None, None],
+            groups: Default::default(),
             rows: Default::default(),
             positions: [None, None],
         })
@@ -1914,7 +2001,14 @@ impl WavClip {
     /// the audio, by logical lane; the rows' own group names their files, even when another
     /// group is on show now.
     fn with_rows(mut self, rows: &[RowSource], groups: &[Vec<LaneGroup>; 2]) -> Option<Self> {
-        let Some(chosen) = row_export(rows) else {
+        self.groups = std::array::from_fn(|index| {
+            self.lanes
+                .get(index)
+                .and_then(|&lane| groups.get(lane))
+                .cloned()
+                .unwrap_or_default()
+        });
+        let Some(chosen) = chosen_rows(rows) else {
             return Some(self);
         };
         if let Some(lane) = chosen.lane {
@@ -1924,29 +2018,53 @@ impl WavClip {
             self.format.lane = Some(lane);
         }
         for (index, &lane) in self.lanes.iter().enumerate() {
-            self.rows[index] = RowChoice {
-                channels: chosen.native[lane].clone(),
-                pair: chosen.pair[lane],
-            };
-            let Some(channels) = chosen.channels.get(lane).cloned().flatten() else {
-                continue;
-            };
+            let channels = chosen.native[lane].clone();
             let track = self.snapshots.get(index)?;
-            if channels.end > track.channels() {
+            if channels
+                .as_ref()
+                .is_some_and(|channels| channels.iter().any(|&channel| channel >= track.channels()))
+            {
                 return None;
             }
-            if track.channels() > 2
-                && let Some(group) = groups.get(lane).and_then(|groups| {
-                    groups.iter().find(|group| {
-                        group.channels.start <= channels.start && channels.end <= group.channels.end
-                    })
-                })
-            {
-                self.export_options.groups[index] = Some(group.clone());
-            }
-            self.channels[index] = Some(channels);
+            self.rows[index] = RowChoice {
+                channels,
+                pair: chosen.pair[lane],
+            };
         }
         Some(self)
+    }
+
+    /// Writes the lanes in `whole` (by logical lane) whole: their rows were every row drawn.
+    fn whole_lanes(mut self, whole: [bool; 2]) -> Self {
+        for (index, &lane) in self.lanes.iter().enumerate() {
+            if whole.get(lane).copied().unwrap_or(false) {
+                self.rows[index] = RowChoice::default();
+            }
+        }
+        self
+    }
+
+    /// What snapshot `index` writes. Runs on the export worker: a lane that hides silent rows
+    /// and is written whole asks its frozen audio which channels are active.
+    fn lane_write(&self, index: usize) -> LaneWrite {
+        let Some(track) = self.snapshots.get(index) else {
+            return LaneWrite::default();
+        };
+        let choice = &self.rows[index];
+        let active = (track.channels() > 2
+            && choice.channels.is_none()
+            && self
+                .lanes
+                .get(index)
+                .is_some_and(|&lane| self.format.hide_silent.get(lane) == Some(&true)))
+        .then(|| track.active_channels());
+        lane_write(
+            track.channels(),
+            choice,
+            &self.groups[index],
+            self.export_options.groups[index].as_ref(),
+            active,
+        )
     }
 
     /// The snapshots written: every one, or the one of the lane saved on its own.
@@ -1972,31 +2090,46 @@ impl WavClip {
             })
             .collect();
         let routes = physical_routes(format.routes, &self.lanes);
-        // Groups are held by snapshot, so they move along with the snapshots written.
-        let mut options = self.export_options.clone();
-        options.groups = std::array::from_fn(|index| {
-            self.export_options
-                .groups
-                .get(saved.start + index)
-                .cloned()
-                .flatten()
+        // Everything is held by snapshot, so it moves along with the snapshots written: a
+        // B-only save hands B's rows, groups and positions over in the first place.
+        let writes: [LaneWrite; 2] = std::array::from_fn(|slot| {
+            if saved.start + slot < saved.end {
+                self.lane_write(saved.start + slot)
+            } else {
+                LaneWrite::default()
+            }
         });
-        let channels =
-            std::array::from_fn(|index| self.channels.get(saved.start + index).cloned().flatten());
-        let paths = export_clip_channels(
+        let mut options = self.export_options.clone();
+        options.groups = std::array::from_fn(|slot| writes[slot].shown.clone());
+        let rows: [clip_export::RowExport<'_>; 2] = std::array::from_fn(|slot| {
+            let write = &writes[slot];
+            clip_export::RowExport {
+                channels: write.channels.clone(),
+                pair: write.pair,
+                pair_binaural: format.pair_binaural,
+                bed: write.bed.as_ref(),
+                positions: self
+                    .positions
+                    .get(saved.start + slot)
+                    .filter(|_| saved.start + slot < saved.end)
+                    .and_then(Option::as_ref),
+            }
+        });
+        let written = clip_export::export_rows(
             &self.output,
             &self.snapshots[saved.clone()],
-            self.frames,
+            self.frames.clone(),
             self.fades,
             format.profile,
             &routes[saved],
             format.force_mono,
             &labels,
             &options,
-            &channels,
+            &rows,
         )?;
         let mut result = ExportedWav {
-            paths,
+            paths: written.paths,
+            objects_in_mono: written.objects_in_mono,
             keep,
             flags: self.flags,
         };
@@ -2010,7 +2143,10 @@ impl WavClip {
 }
 
 struct ExportedWav {
+    /// Every file written, the positions file included.
     paths: Vec<PathBuf>,
+    /// Objects without positions had to be written in mono.
+    objects_in_mono: bool,
     keep: bool,
     flags: Option<FlagUpdate>,
 }
@@ -2060,15 +2196,32 @@ fn spawn_wav_write(
 }
 
 impl ExportedWav {
-    fn description(&self) -> String {
-        match self.paths.as_slice() {
+    /// The status line after the files were saved: by the Save command (`snapshot`) or a
+    /// drag. It counts the WAV files and the positions files apart, and says once when
+    /// objects without positions were written in mono.
+    fn saved_message(&self, language: Language, snapshot: bool) -> String {
+        let positions = self
+            .paths
+            .iter()
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            })
+            .count();
+        let files = match self.paths.as_slice() {
             [file] => file.display().to_string(),
-            [first, ..] => format!(
-                "{} WAV files in {}",
-                self.paths.len(),
-                first.parent().unwrap_or(first).display(),
+            [first, ..] => language.files_in(
+                self.paths.len() - positions,
+                positions,
+                &first.parent().unwrap_or(first).display().to_string(),
             ),
             [] => String::new(),
+        };
+        let saved = language.saved(snapshot, &files);
+        if self.objects_in_mono {
+            language.with_objects_in_mono(&saved)
+        } else {
+            saved
         }
     }
 }
@@ -2175,6 +2328,7 @@ impl Recorder {
             wav_profile: settings.wav_profile,
             wav_force_mono: settings.wav_force_mono,
             wide_export: settings.wide_export,
+            force_wide_export_menu: false,
             pair_render: settings.pair_render,
             hide_silent: settings.hide_silent_channels,
             activity: Default::default(),
@@ -4407,6 +4561,8 @@ impl Recorder {
             );
             self.live_revision = None;
             self.next_refresh = Instant::now();
+            // A lane written whole writes what it shows, so a prepared drag is out of date.
+            self.invalidate_export();
         }
         options_note(ui, language.hide_silent_note());
         options_field(ui, language.pair_render_field(), |ui| {
@@ -4419,6 +4575,7 @@ impl Recorder {
                     .map(|mode| (mode, language.pair_render(mode.binaural()).to_owned())),
             ) {
                 self.save_preference(Key::PairRender, self.pair_render.preference());
+                self.invalidate_export();
             }
         });
         options_note(ui, language.pair_render_note());
@@ -5217,18 +5374,18 @@ impl Recorder {
             .changed();
         let language = Language::current();
         options_field(ui, language.wide_export_field(), |ui| {
+            // A test copy can photograph the list open.
+            if std::mem::take(&mut self.force_wide_export_menu) {
+                let combo = ui.make_persistent_id(egui::IdSalt::new("wide-export"));
+                egui::Popup::open_id(ui.ctx(), combo.with("popup"));
+            }
             if options_choice(
                 ui,
                 "wide-export",
                 &mut self.wide_export,
-                WideExportMode::ALL.into_iter().map(|mode| {
-                    (
-                        mode,
-                        language
-                            .wide_export_mode(mode == WideExportMode::Multichannel)
-                            .to_owned(),
-                    )
-                }),
+                WideExportMode::ALL
+                    .into_iter()
+                    .map(|mode| (mode, language.wide_export_mode(mode).to_owned())),
             ) {
                 self.save_preference(Key::WideExport, self.wide_export.preference());
                 self.invalidate_export();
@@ -5336,7 +5493,13 @@ impl Recorder {
         self.controller.poll();
         self.sync_generation();
         let has_selection = self.selection.is_some();
+        let rows: Vec<RowSource> = self
+            .selected_rows()
+            .filter(|_| has_selection)
+            .map(<[RowSource]>::to_vec)
+            .unwrap_or_default();
         let spec = SnapshotSpec {
+            whole: lanes_chosen_whole(&self.lanes, &rows),
             selection: self.selection.clone(),
             fades: if has_selection {
                 self.fades
@@ -5348,11 +5511,7 @@ impl Recorder {
             flags: (!has_selection).then(|| self.flag_update(0..0, Vec::new())),
             export_options: self.export_options(),
             // Separate rows save the selection's own rows, and every row without a selection.
-            rows: self
-                .selected_rows()
-                .filter(|_| has_selection)
-                .map(<[RowSource]>::to_vec)
-                .unwrap_or_default(),
+            rows,
         };
         if let Some(edit) = &self.editing {
             if let Some(clip) = spec.clip(Arc::clone(&edit.snapshots), &edit.lanes, &edit.groups) {
@@ -5438,6 +5597,7 @@ impl Recorder {
             clip.export_options = self.export_options();
             clip.with_rows(&rows, &groups)
         })
+        .map(|clip| clip.whole_lanes(lanes_chosen_whole(&self.lanes, &rows)))
         .map(|clip| match &self.editing {
             Some(edit) if Arc::ptr_eq(&edit.snapshots, &clip.snapshots) => {
                 clip.with_positions(&edit.positions)
@@ -5459,6 +5619,8 @@ impl Recorder {
                 })
             }),
             lane,
+            pair_binaural: self.pair_render.binaural(),
+            hide_silent: [0, 1].map(|lane| self.hides_silent_rows(lane)),
         }
     }
 
@@ -5537,15 +5699,14 @@ impl Recorder {
                     if let Some(harness) = &mut self.harness {
                         harness.note_saved(&file.paths);
                     }
-                    format!("Saved snapshot {}", file.description())
+                    file.saved_message(Language::current(), true)
                 }
                 Ok(Err(error)) => format!("Could not save snapshot: {error}"),
                 Err(_) => "Snapshot worker stopped unexpectedly.".into(),
             };
-            if let Some(harness) = &mut self.harness
-                && !self.message.starts_with("Saved")
-            {
-                harness.note(self.message.clone());
+            // The log holds what the status line says, saved or not.
+            if let Some(harness) = &mut self.harness {
+                harness.note(format!("status: {}", self.message));
             }
         }
         if let Some(clip) = self.pending_snapshot_saves.pop_front() {
@@ -5878,7 +6039,7 @@ impl Recorder {
                     if let Some(flags) = file.flags.take() {
                         self.apply_flags(flags);
                     }
-                    self.message = format!("Saved {}", file.description());
+                    self.message = file.saved_message(Language::current(), false);
                     self.finish_waveform_gesture(false);
                 }
                 Ok(false) => self.finish_waveform_gesture(false),
@@ -7466,7 +7627,7 @@ fn preview_plan(
         return Err(SELECTION_UNAVAILABLE);
     }
     let routes = physical_routes(routes, lanes);
-    let chosen = rows.and_then(row_export);
+    let chosen = rows.and_then(chosen_rows);
     let mut parts = Vec::new();
     for (index, (track, &lane)) in snapshots.iter().zip(lanes).enumerate() {
         let lane_rows: Option<Vec<RowSource>> = rows.map(|rows| {
@@ -8797,12 +8958,21 @@ mod tests {
             flags: None,
             export_options: ExportOptions::default(),
             rows: Vec::new(),
+            whole: [false; 2],
         };
         let clip = spec.frozen_clip(&snapshot).unwrap();
         drop(snapshot);
         let files = clip.write(false).unwrap();
-        assert_eq!(files.paths.len(), 4);
-        for (index, path) in files.paths.iter().enumerate() {
+        // The objects on show, which have no positions and so are written in mono and say so,
+        // then the pair, made from the bed frozen with them.
+        assert_eq!(files.paths.len(), 5);
+        assert!(files.objects_in_mono);
+        assert!(
+            files.paths[4].to_string_lossy().ends_with("-Stereo.wav"),
+            "{:?}",
+            files.paths
+        );
+        for (index, path) in files.paths[..4].iter().enumerate() {
             assert!(
                 path.file_name()
                     .unwrap()
@@ -8845,6 +9015,7 @@ mod tests {
             flags: None,
             export_options: ExportOptions::default(),
             rows: Vec::new(),
+            whole: [false; 2],
         };
         let files = spec.frozen_clip(&snapshot).unwrap().write(false).unwrap();
         assert_eq!(files.paths.len(), 1);
@@ -9447,27 +9618,21 @@ mod tests {
             [pair[0], pair[1], a(2), a(3), a(6)]
         );
         // What the rows write and play: the pair, and the lane-native channels.
-        let export = row_export(&[pair[0], pair[1], a(6), a(2)]).unwrap();
+        let export = chosen_rows(&[pair[0], pair[1], a(6), a(2)]).unwrap();
         assert_eq!(export.lane, Some(0));
         assert_eq!(export.pair, [true, false]);
         assert_eq!(export.native[0], Some(vec![2, 6]));
-        // Until the export call writes the pair, a pair writes its whole lane.
-        assert_eq!(export.channels, [None, None]);
-        let channels = row_export(&[a(6), a(2)]).unwrap();
+        let channels = chosen_rows(&[a(6), a(2)]).unwrap();
         assert_eq!(
-            (channels.pair, channels.channels[0].clone()),
-            ([false, false], Some(2..7))
+            (channels.pair, channels.native[0].clone()),
+            ([false, false], Some(vec![2, 6]))
         );
-        let only_pair = row_export(&pair).unwrap();
+        let only_pair = chosen_rows(&pair).unwrap();
         assert_eq!(only_pair.native[0], Some(Vec::new()));
-        let right = row_export(&[RowSource::View(1, WaveformView::Right)]).unwrap();
+        let right = chosen_rows(&[RowSource::View(1, WaveformView::Right)]).unwrap();
         assert_eq!(
-            (
-                right.lane,
-                right.native[1].clone(),
-                right.channels[1].clone()
-            ),
-            (Some(1), Some(vec![1]), Some(1..2))
+            (right.lane, right.native[1].clone()),
+            (Some(1), Some(vec![1]))
         );
     }
 
@@ -10339,5 +10504,465 @@ mod tests {
         // Together, both lanes are written.
         assert_eq!(file_names(None).len(), 14);
         std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    fn objects_group(channels: Range<usize>) -> LaneGroup {
+        LaneGroup {
+            id: "objects".into(),
+            label: "Objects".into(),
+            labels: (1..=channels.len())
+                .map(|object| format!("Object {object}"))
+                .collect(),
+            channels,
+        }
+    }
+
+    #[test]
+    fn rows_become_what_the_export_call_writes_of_each_lane() {
+        let bed = bed_group();
+        let objects = objects_group(12..14);
+        let groups = [bed.clone(), objects.clone()];
+        let choice = |channels: Option<Vec<usize>>, pair| RowChoice { channels, pair };
+        let write = |channels, pair, shown: &LaneGroup, bed: &LaneGroup| LaneWrite {
+            channels,
+            pair,
+            shown: Some(shown.clone()),
+            bed: Some(bed.clone()),
+        };
+        // The whole lane: the group on show and the pair.
+        assert_eq!(
+            lane_write(14, &RowChoice::default(), &groups, Some(&bed), None),
+            write(None, true, &bed, &bed)
+        );
+        // Rows of the bed, the pair alone, and the pair with rows.
+        assert_eq!(
+            lane_write(
+                14,
+                &choice(Some(vec![2, 4]), false),
+                &groups,
+                Some(&bed),
+                None
+            ),
+            write(Some(vec![2, 4]), false, &bed, &bed)
+        );
+        assert_eq!(
+            lane_write(
+                14,
+                &choice(Some(Vec::new()), true),
+                &groups,
+                Some(&bed),
+                None
+            ),
+            write(Some(Vec::new()), true, &bed, &bed)
+        );
+        assert_eq!(
+            lane_write(14, &choice(Some(vec![2]), true), &groups, Some(&bed), None),
+            write(Some(vec![2]), true, &bed, &bed)
+        );
+        // Object rows are named by the Objects group, with the bed for the pair, even when the
+        // bed is on show again; the Objects group written whole takes the bed along as well.
+        assert_eq!(
+            lane_write(14, &choice(Some(vec![12]), true), &groups, Some(&bed), None),
+            write(Some(vec![12]), true, &objects, &bed)
+        );
+        assert_eq!(
+            lane_write(14, &RowChoice::default(), &groups, Some(&objects), None),
+            write(None, true, &objects, &bed)
+        );
+        // A lane of objects only makes its pair from every channel, numbered.
+        let only = objects_group(0..4);
+        assert_eq!(
+            lane_write(
+                4,
+                &RowChoice::default(),
+                std::slice::from_ref(&only),
+                Some(&only),
+                None
+            ),
+            write(None, true, &only, &numbered_group(4))
+        );
+        // A groupless lane names its channels by number and folds all of them.
+        assert_eq!(
+            lane_write(6, &RowChoice::default(), &[], None, None),
+            LaneWrite {
+                pair: true,
+                ..LaneWrite::default()
+            }
+        );
+        // Stereo and mono: one side alone, or the whole lane.
+        assert_eq!(
+            lane_write(2, &choice(Some(vec![1]), false), &[], None, None).channels,
+            Some(vec![1])
+        );
+        assert_eq!(
+            lane_write(2, &choice(Some(vec![0, 1]), false), &[], None, None),
+            LaneWrite::default()
+        );
+        assert_eq!(
+            lane_write(1, &choice(Some(vec![0]), false), &[], None, None),
+            LaneWrite::default()
+        );
+        // A lane that hides silent rows, written whole, writes its active channels, or only
+        // the pair while nothing but the front left and right is active.
+        let system = LaneGroup {
+            id: String::new(),
+            label: String::new(),
+            channels: 0..8,
+            labels: SYSTEM_71.iter().map(|&label| label.to_owned()).collect(),
+        };
+        let whole = |active| {
+            lane_write(
+                8,
+                &RowChoice::default(),
+                std::slice::from_ref(&system),
+                Some(&system),
+                Some(active),
+            )
+        };
+        assert_eq!(whole(0b11), write(Some(Vec::new()), true, &system, &system));
+        assert_eq!(
+            whole(0b111),
+            write(Some(vec![0, 1, 2]), true, &system, &system)
+        );
+        assert_eq!(whole(0xff).channels, Some((0..8).collect()));
+    }
+
+    /// The channel labels a 7.1 system device gets from its channel mask.
+    const SYSTEM_71: [&str; 8] = ["FL", "FR", "FC", "LFE", "Lb", "Rb", "Ls", "Rs"];
+
+    /// What a clip wrote: the file names, after the take name, and whether objects without
+    /// positions were written in mono.
+    fn written_names(clip: WavClip) -> (Vec<String>, bool) {
+        let folder = clip.output.clone();
+        let files = clip.write(false).unwrap();
+        let names = files
+            .paths
+            .iter()
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                // From the length of the take on: `…_0s-Ch01_L.wav` reads `-Ch01_L.wav`.
+                name.split_once("s-")
+                    .map_or(name.clone(), |(_, rest)| format!("-{rest}"))
+            })
+            .collect();
+        let mono = files.objects_in_mono;
+        drop(files);
+        let _ = std::fs::remove_dir_all(folder);
+        (names, mono)
+    }
+
+    fn clip_folder(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "Backtracking-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn a_lane_b_save_and_swapped_lanes_write_lane_bs_rows_groups_and_positions() {
+        use crate::preferences::WideExportMode;
+
+        let objects = objects_group(12..14);
+        let groups = [Vec::new(), vec![bed_group(), objects.clone()]];
+        let mut positions = backtracking_core::PositionTrack::new();
+        for frame in [0, 200] {
+            positions.insert(
+                12,
+                backtracking_core::PositionKey {
+                    frame,
+                    position: backtracking_core::Position {
+                        x: 0.5,
+                        y: 0.5,
+                        z: 0.0,
+                        size: 0.0,
+                        gain: 1.0,
+                    },
+                },
+            );
+        }
+        // By logical lane: only lane B, the wide one, has positions.
+        let tracks = [
+            backtracking_core::PositionTrack::new().freeze(),
+            positions.freeze(),
+        ];
+        // Lane B's snapshot second, as captured, or first, as when lane A started later.
+        for swapped in [false, true] {
+            let (snapshots, lanes): (Arc<[FrozenTrack]>, [usize; 2]) = if swapped {
+                (vec![numbered(14), numbered(2)].into(), [1, 0])
+            } else {
+                (vec![numbered(2), numbered(14)].into(), [0, 1])
+            };
+            let clip = |rows: &[RowSource], mode| {
+                let format = ClipFormat {
+                    names: ["Music".into(), "Tone".into()],
+                    ..ClipFormat::unnamed([ChannelRoute::Merged; 2], false)
+                };
+                let mut clip = WavClip::new(
+                    Arc::clone(&snapshots),
+                    &lanes,
+                    Some(&(101..105)),
+                    Fades::NONE,
+                    clip_folder("lane-b-rows"),
+                    format,
+                    None,
+                )
+                .unwrap();
+                // By snapshot: the bed is on show in lane B.
+                clip.export_options.groups = lanes.map(|lane| (lane == 1).then(bed_group));
+                clip.export_options.wide_mode = mode;
+                clip.with_rows(rows, &groups)
+                    .unwrap()
+                    .with_positions(&tracks)
+            };
+            // The pair and C of lane B: B alone, its C and its pair.
+            let (names, mono) = written_names(clip(
+                &[
+                    RowSource::Pair(1, PairSide::Left),
+                    RowSource::Pair(1, PairSide::Right),
+                    RowSource::Channel(1, 2),
+                ],
+                WideExportMode::MonoFiles,
+            ));
+            assert_eq!(names, ["-Ch03_C.wav", "-Stereo.wav"], "{swapped} {names:?}");
+            assert!(!mono);
+            // Both objects of B: the moving one binaural with its positions, the other mono.
+            let (names, mono) = written_names(clip(
+                &[RowSource::Channel(1, 12), RowSource::Channel(1, 13)],
+                WideExportMode::BinauralFiles,
+            ));
+            assert_eq!(
+                names,
+                [
+                    "-Ch13_Object 1_binaural.wav",
+                    "-Ch14_Object 2.wav",
+                    "-Positions.json"
+                ],
+                "{swapped} {names:?}"
+            );
+            assert!(mono);
+            // Lane A alone: its stereo file only.
+            let (names, _) = written_names(clip(
+                &[RowSource::View(0, WaveformView::Merged)],
+                WideExportMode::BinauralFiles,
+            ));
+            assert_eq!(names.len(), 1, "{swapped} {names:?}");
+            assert!(!names[0].contains("-Ch"), "{swapped} {names:?}");
+            // Every row of B chosen is B written whole: the bed and the pair.
+            let whole = clip(&[RowSource::Channel(1, 0)], WideExportMode::MonoFiles)
+                .whole_lanes([false, true]);
+            let (names, _) = written_names(whole);
+            assert_eq!(names.len(), 13, "{swapped} {names:?}");
+            assert_eq!(names[12], "-Stereo.wav");
+        }
+    }
+
+    /// A 7.1 system lane whose channels in `active` hold a tone and the rest silence.
+    fn system_71(active: &[usize]) -> FrozenTrack {
+        FrozenTrack::from_interleaved(
+            48_000,
+            8,
+            100,
+            &(0..8 * 8)
+                .map(|sample| {
+                    let channel = sample % 8;
+                    if active.contains(&channel) {
+                        0.25 * (channel + 1) as f32 / 8.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_system_lane_that_hides_silent_rows_saves_what_it_shows() {
+        use crate::preferences::WideExportMode;
+
+        let system = LaneGroup {
+            id: String::new(),
+            label: String::new(),
+            channels: 0..8,
+            labels: SYSTEM_71.iter().map(|&label| label.to_owned()).collect(),
+        };
+        let names = |track: FrozenTrack, hiding: bool, mode| {
+            let format = ClipFormat {
+                names: ["System audio".into(), String::new()],
+                hide_silent: [hiding, false],
+                ..ClipFormat::unnamed([ChannelRoute::AllChannels; 2], false)
+            };
+            let mut clip = WavClip::new(
+                vec![track].into(),
+                &[0],
+                None,
+                Fades::NONE,
+                clip_folder("hide-silent"),
+                format,
+                None,
+            )
+            .unwrap();
+            clip.export_options.groups = [Some(system.clone()), None];
+            clip.export_options.wide_mode = mode;
+            let clip = clip
+                .with_rows(&[], &[vec![system.clone()], Vec::new()])
+                .unwrap();
+            written_names(clip).0
+        };
+        for mode in [WideExportMode::BinauralFiles, WideExportMode::Multichannel] {
+            // Stereo content on a 7.1 device: the pair file alone.
+            assert_eq!(
+                names(system_71(&[0, 1]), true, mode),
+                ["-Stereo.wav"],
+                "{mode:?}"
+            );
+            // Every channel active: the mode's files of all eight, and the pair.
+            let all = names(system_71(&(0..8).collect::<Vec<_>>()), true, mode);
+            assert_eq!(
+                all.len(),
+                if mode == WideExportMode::Multichannel {
+                    2
+                } else {
+                    9
+                },
+                "{all:?}"
+            );
+            assert_eq!(all.last().unwrap(), "-Stereo.wav");
+            // With hiding off every channel is written, active or not.
+            for active in [vec![0, 1], (0..8).collect()] {
+                assert_eq!(
+                    names(system_71(&active), false, mode),
+                    all,
+                    "{mode:?} {active:?}"
+                );
+            }
+        }
+        // Three active channels: those three, in native order, and the pair.
+        assert_eq!(
+            names(system_71(&[0, 1, 6]), true, WideExportMode::MonoFiles),
+            [
+                "-Ch01_FL.wav",
+                "-Ch02_FR.wav",
+                "-Ch07_Ls.wav",
+                "-Stereo.wav"
+            ]
+        );
+        let format = ClipFormat {
+            hide_silent: [true, false],
+            ..ClipFormat::unnamed([ChannelRoute::AllChannels; 2], false)
+        };
+        // One multichannel file of a subset holds only those channels.
+        let mut clip = WavClip::new(
+            vec![system_71(&[0, 1, 6])].into(),
+            &[0],
+            None,
+            Fades::NONE,
+            clip_folder("hide-silent-multichannel"),
+            format,
+            None,
+        )
+        .unwrap();
+        clip.export_options.groups = [Some(system.clone()), None];
+        clip.export_options.wide_mode = WideExportMode::Multichannel;
+        let folder = clip.output.clone();
+        let files = clip.write(false).unwrap();
+        assert_eq!(files.paths.len(), 2);
+        let wav = std::fs::read(&files.paths[0]).unwrap();
+        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 3);
+        let last: Vec<f32> = wav[wav.len() - 12..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&bytes| f32::from_le_bytes(bytes))
+            .collect();
+        assert_eq!(last, [0.25 / 8.0, 0.5 / 8.0, 0.25 * 7.0 / 8.0]);
+        drop(files);
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn a_lane_that_does_not_hide_rows_saves_its_silent_channels_too() {
+        use crate::preferences::WideExportMode;
+
+        // An add-on lane never hides rows, so its clip format does not ask for it.
+        let format = ClipFormat {
+            names: ["Test tone".into(), String::new()],
+            ..ClipFormat::unnamed([ChannelRoute::Merged; 2], false)
+        };
+        assert_eq!(format.hide_silent, [false, false]);
+        let mut clip = WavClip::new(
+            vec![system_71(&[0, 1])].into(),
+            &[0],
+            None,
+            Fades::NONE,
+            clip_folder("addon-silent"),
+            format,
+            None,
+        )
+        .unwrap();
+        let bed = LaneGroup {
+            id: "channels".into(),
+            label: "Channels".into(),
+            channels: 0..8,
+            labels: SYSTEM_71.iter().map(|&label| label.to_owned()).collect(),
+        };
+        clip.export_options.groups = [Some(bed.clone()), None];
+        clip.export_options.wide_mode = WideExportMode::MonoFiles;
+        let clip = clip.with_rows(&[], &[vec![bed], Vec::new()]).unwrap();
+        let (names, _) = written_names(clip);
+        assert_eq!(names.len(), 9, "{names:?}");
+    }
+
+    #[test]
+    fn every_row_of_a_lane_chosen_is_that_lane_whole() {
+        let lanes = [
+            paired_plan(0, bed_group(), vec![0, 1, 2]),
+            views_plan(1, &[WaveformView::Left, WaveformView::Right]),
+        ];
+        let every_a = rows_between(&lanes, lanes[0].row(0), lanes[0].row(4));
+        assert_eq!(lanes_chosen_whole(&lanes, &every_a), [true, false]);
+        assert_eq!(lanes_chosen_whole(&lanes, &every_a[..4]), [false, false]);
+        let across = rows_between(&lanes, lanes[0].row(3), lanes[1].row(1));
+        assert_eq!(lanes_chosen_whole(&lanes, &across), [false, true]);
+        assert_eq!(lanes_chosen_whole(&lanes, &[]), [false, false]);
+        // A lane that shows only its pair, while its other rows are hidden, is whole when the
+        // pair is chosen; the export then asks the audio which channels have sound.
+        let pair_only = [paired_plan(0, bed_group(), Vec::new())];
+        assert_eq!(
+            lanes_chosen_whole(&pair_only, &RowSource::pair(0)),
+            [true, false]
+        );
+    }
+
+    #[test]
+    fn the_saved_message_counts_wav_and_positions_files_and_says_when_objects_are_mono() {
+        let folder = PathBuf::from(r"D:\takes");
+        let file = |names: &[&str], objects_in_mono| ExportedWav {
+            paths: names.iter().map(|name| folder.join(name)).collect(),
+            objects_in_mono,
+            keep: true,
+            flags: None,
+        };
+        let english = Language::English;
+        assert_eq!(
+            file(&["a.wav"], false).saved_message(english, true),
+            r"Saved snapshot D:\takes\a.wav"
+        );
+        assert_eq!(
+            file(&["a.wav", "b.wav", "c-Positions.json"], false).saved_message(english, false),
+            r"Saved 2 WAV files and a positions file in D:\takes"
+        );
+        assert_eq!(
+            file(&["a.wav", "b.wav", "c-Positions.json"], true).saved_message(english, true),
+            r"Objects without positions were written in mono. Saved snapshot 2 WAV files and a positions file in D:\takes"
+        );
+        assert_eq!(
+            file(&["a.wav", "b.wav"], true).saved_message(Language::TraditionalChinese, true),
+            r"沒有位置資料的物件已匯出為單聲道。已儲存快照：2 個 WAV 檔，位於 D:\takes"
+        );
     }
 }

@@ -39,6 +39,15 @@
 //!   silent channels, as their Options controls do (for this run only). `preview-plan` writes
 //!   to the log what Space would play of the selection and whether it could be prepared; it
 //!   never plays it.
+//!   `export-mode=<binaural-files|mono-files|multichannel|binaural-mix>` chooses how the lanes
+//!   wider than stereo are exported, as the Export page's Multichannel sources list does (for
+//!   this run only), once the steps before it have settled, and `open-export-mode` shows that
+//!   list open on the Options window.
+//!   `drag-prepare=<folder>` writes the files a drag-out of the selection (or of the row the
+//!   steps chose, or everything) would carry, through the drag's own code, waits until they are
+//!   written, copies them into that folder and lists them in the log. The drag itself, which
+//!   Windows runs, is not done; the selection stays, so a `save=` after it writes the same
+//!   audio.
 //!
 //! The picture is `<file.png>`; `<file.png>.log` gets the frame times and any problem.
 
@@ -52,7 +61,7 @@ use backtracking_addon::protocol::TransportCommand;
 use eframe::egui;
 
 use super::{OptionsSection, Recorder, RowSource, rows_between};
-use crate::preferences::PairRender;
+use crate::preferences::{PairRender, WideExportMode};
 
 pub(super) const SCREENSHOT: &str = "BACKTRACKING_TEST_SCREENSHOT";
 const SCREENSHOT_DELAY: &str = "BACKTRACKING_TEST_SCREENSHOT_DELAY_MS";
@@ -96,6 +105,12 @@ pub(super) enum Step {
     HideSilent(bool),
     /// Logs what Space would play, without playing it.
     PreviewPlan,
+    /// How lanes wider than stereo are exported.
+    ExportMode(WideExportMode),
+    /// Shows the Multichannel sources list open on the Options window.
+    OpenExportMode,
+    /// Writes what a drag-out would carry and copies it into this folder.
+    DragPrepare(PathBuf),
 }
 
 impl Step {
@@ -109,6 +124,9 @@ impl Step {
                 | Self::Open(..)
                 | Self::Transport(..)
                 | Self::Save(_)
+                | Self::DragPrepare(_)
+                // A drag being prepared is written in the mode it began with.
+                | Self::ExportMode(_)
                 | Self::Wait(_)
                 | Self::PreviewPlan
                 // Rows are counted in the lanes as drawn, so a `group=` or `hide-silent=`
@@ -183,6 +201,9 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
             if step == "preview-plan" {
                 return Ok(Step::PreviewPlan);
             }
+            if step == "open-export-mode" {
+                return Ok(Step::OpenExportMode);
+            }
             let (name, value) = step
                 .split_once('=')
                 .ok_or_else(|| format!("no '=' in {step}"))?;
@@ -235,6 +256,16 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                     ))
                 }
                 "save" => Ok(Step::Save(PathBuf::from(value.trim()))),
+                "drag-prepare" => Ok(Step::DragPrepare(PathBuf::from(value.trim()))),
+                "export-mode" => WideExportMode::ALL
+                    .into_iter()
+                    .find(|mode| mode.preference() == value.trim())
+                    .map(Step::ExportMode)
+                    .ok_or_else(|| {
+                        format!(
+                            "{value} is not binaural-files, mono-files, multichannel or binaural-mix"
+                        )
+                    }),
                 "separate" => match value.trim() {
                     "on" => Ok(Step::Separate(true)),
                     "off" => Ok(Step::Separate(false)),
@@ -337,6 +368,8 @@ pub(super) struct Harness {
     options_shot: Option<mpsc::SyncSender<PictureResult>>,
     /// Extra time the last step asked for before the next one.
     hold: Duration,
+    /// A `drag-prepare=` waits for the drag's files and copies them here.
+    drag_copy: Option<PathBuf>,
 }
 
 impl Harness {
@@ -426,6 +459,7 @@ impl Harness {
             options_drops: Vec::new(),
             options_shot: None,
             hold: Duration::ZERO,
+            drag_copy: None,
         })
     }
 
@@ -548,6 +582,22 @@ impl Recorder {
             return;
         };
         let options_picture = harness.options_picture;
+        // A `drag-prepare=` copies the drag's files once they are written.
+        if harness.drag_copy.is_some()
+            && self.export.is_none()
+            && !self.export_requested
+            && self.edit_request.is_none()
+        {
+            let folder = harness.drag_copy.take();
+            if let Some(folder) = folder {
+                self.copy_drag_files(&folder);
+            }
+            ctx.request_repaint();
+            return;
+        }
+        let Some(harness) = self.harness.as_mut() else {
+            return;
+        };
         let settled = now.duration_since(applied) >= SETTLE + harness.hold
             && self.edit_request.is_none()
             && self.edit_preview.is_none()
@@ -559,7 +609,10 @@ impl Recorder {
             && self.snapshot_save.is_none()
             && self.pending_snapshot_saves.is_empty()
             && self.pending_snapshot_reads.is_empty()
-            && self.pending_edit_save_reads.is_empty();
+            && self.pending_edit_save_reads.is_empty()
+            // A `drag-prepare=` waits for the drag's files.
+            && self.export.is_none()
+            && !self.export_requested;
         if !settled {
             ctx.request_repaint_after(Duration::from_millis(50));
             return;
@@ -754,7 +807,29 @@ impl Recorder {
                     harness.hold = Duration::from_millis(*milliseconds);
                 }
             }
-            &Step::Pair(render) => self.pair_render = render,
+            &Step::Pair(render) => {
+                self.pair_render = render;
+                self.invalidate_export();
+            }
+            &Step::ExportMode(mode) => {
+                self.wide_export = mode;
+                self.invalidate_export();
+            }
+            Step::OpenExportMode => {
+                self.force_wide_export_menu = true;
+                ctx.request_repaint();
+            }
+            Step::DragPrepare(folder) => {
+                fs::create_dir_all(folder)
+                    .map_err(|error| format!("{}: {error}", folder.display()))?;
+                // As a drag past the window's edge does: freeze, then write the clip.
+                self.invalidate_export();
+                self.start_export();
+                if let Some(harness) = self.harness.as_mut() {
+                    harness.drag_copy = Some(folder.clone());
+                }
+                ctx.request_repaint();
+            }
             &Step::HideSilent(on) => {
                 self.hide_silent = on;
                 self.live_revision = None;
@@ -768,6 +843,40 @@ impl Recorder {
             }
         }
         Ok(())
+    }
+
+    /// Copies the files a drag-out would carry into `folder` and lists them in the log, with
+    /// the status line the drag would leave. The drag's own files are removed as usual when the
+    /// prepared drag is dropped.
+    fn copy_drag_files(&mut self, folder: &Path) {
+        let Some(file) = self.exported.as_ref() else {
+            let note = format!("drag-prepare: nothing was prepared ({})", self.message);
+            if let Some(harness) = self.harness.as_mut() {
+                harness.note(note);
+            }
+            return;
+        };
+        let mut copied = Vec::new();
+        let mut notes = Vec::new();
+        for path in &file.paths {
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let target = folder.join(name);
+            match fs::copy(path, &target) {
+                Ok(_) => copied.push(target),
+                Err(error) => notes.push(format!("drag-prepare: {}: {error}", path.display())),
+            }
+        }
+        let status = file.saved_message(super::Language::current(), false);
+        if let Some(harness) = self.harness.as_mut() {
+            harness.note(format!("drag-prepare: {} files", file.paths.len()));
+            harness.note_saved(&copied);
+            for note in notes {
+                harness.note(note);
+            }
+            harness.note(format!("drag status would be: {status}"));
+        }
     }
 
     /// What Space would play now, for the log: the plan lane by lane, and whether the preview
@@ -1281,6 +1390,30 @@ mod tests {
         assert!(Step::PreviewPlan.waits());
         assert!(!Step::Pair(PairRender::Binaural).waits());
         for bad in ["pair=surround", "pair", "hide-silent=yes"] {
+            assert!(parse_steps(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            parse_steps(
+                "export-mode=binaural-files;export-mode=mono-files; export-mode=multichannel;\
+                 export-mode=binaural-mix;open-export-mode;drag-prepare=D:\\a b"
+            )
+            .unwrap(),
+            [
+                Step::ExportMode(WideExportMode::BinauralFiles),
+                Step::ExportMode(WideExportMode::MonoFiles),
+                Step::ExportMode(WideExportMode::Multichannel),
+                Step::ExportMode(WideExportMode::BinauralMix),
+                Step::OpenExportMode,
+                Step::DragPrepare(PathBuf::from("D:\\a b")),
+            ]
+        );
+        assert!(Step::ExportMode(WideExportMode::MonoFiles).waits());
+        assert!(Step::DragPrepare(PathBuf::new()).waits());
+        for bad in [
+            "export-mode=mono",
+            "export-mode",
+            "export-mode=Multichannel",
+        ] {
             assert!(parse_steps(bad).is_err(), "{bad}");
         }
         assert_eq!(parse_steps(" ").unwrap(), []);
