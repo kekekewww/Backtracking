@@ -20,7 +20,7 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 ### 開啟設定
 
-點擊工具列的齒輪可開啟 **Options**。在插件視窗內按滑鼠右鍵也會開啟 Options；Windows／macOS 桌面版的右鍵則開啟選單，依序為 **Pause／Resume／Retry capture**、**Clear**、**Save snapshot**、**Edit A and B separately**、**Show waveform only**、**Keep on top**、**Options…** 與 **Quit**。桌面版視窗有焦點時，按 `Space` 可暫停或恢復擷取，按 `Delete`（Mac 鍵盤為 `Fn` + `Delete`）清除目前錄音；有選區時，`Space` 改為試聽選區，`Delete` 則先取消選區。擷取兩個來源時，單獨輕按右側 `Ctrl`（Mac 為右側 `Command`）可切換[分開編輯 A 和 B](#分開編輯-a-和-b)。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
+點擊工具列的齒輪可開啟 **Options**。在插件視窗內按滑鼠右鍵也會開啟 Options；Windows／macOS 桌面版的右鍵則開啟選單，依序為 **Pause／Resume／Retry capture**、**Clear**、**Save snapshot**、**Edit separately／分開編輯**（macOS 為 **Edit A and B separately**）、**Show waveform only**、**Keep on top**、**Options…** 與 **Quit**。桌面版視窗有焦點時，按 `Space` 可暫停或恢復擷取，按 `Delete`（Mac 鍵盤為 `Fn` + `Delete`）清除目前錄音；有選區時，`Space` 改為試聽選區，`Delete` 則先取消選區。波形有一列以上時（macOS 為擷取兩個來源時），單獨輕按右側 `Ctrl`（Mac 為右側 `Command`）可切換[分開編輯](#分開編輯)。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
 
 Options 左側是分類，右側以一列一項的直向清單顯示設定。頁標題使用較大粗體，分組與欄位有明確層級，主要文字至少 15。保留時間、自動續錄、透明度和 WAV 格式使用下拉選單；少於 10 項時依實際項目數決定高度，最多顯示 10 列，超過則在選單內捲動。右側內容較長時向下捲動。桌面設定視窗可調整大小，底部關閉按鈕維持可見。插件會向 DAW 要求放大設定視窗，關閉後恢復原尺寸。
 
@@ -52,7 +52,7 @@ macOS 桌面版可使用滑鼠右鍵或觸控板的次要點擊開啟選單。`C
 - 框選、調整旗標、縮放或平移會固定原編輯素材與視野，背景照常擷取。即時歷史循環覆寫或縮短保留時間，不會改變固定選區的原始取樣；A／B 共用起訖。完成或取消編輯後回到即時視野，手動 Pause 狀態獨立。
 - 波形區間數、筆畫和參考線密度依實際音訊區域、可見時間跨度及互動狀態調整。
 - 遠／中倍率以連續 min/max 填色與輪廓顯示峰值範圍，放大到個別取樣時改為連接原始 samples 的折線。最小縮放範圍依波形實際寬度決定，約讓一個 sample 占四個邏輯像素；調整視窗尺寸保留原視野，後續縮放遵守有效上下限。這些畫法不改變選區或匯出取樣；[本輪驗證紀錄](QUIET_CAPTURE_AND_WAVEFORM_2026-11-14.md)另列測試狀態。
-- **Save snapshot**、全域快照快捷鍵與成功拖放會同時匯出 A／B。兩個 WAV 使用同一起訖和取樣率。若 DAW 要求指定匯入位置，可選擇分開音軌並使用相同開始位置。開啟[分開編輯 A 和 B](#分開編輯-a-和-b)時，選區只匯出所屬的那一軌，沒有選區時拖出的是游標所在的那一軌。
+- **Save snapshot**、全域快照快捷鍵與成功拖放會同時匯出 A／B。兩個 WAV 使用同一起訖和取樣率。若 DAW 要求指定匯入位置，可選擇分開音軌並使用相同開始位置。開啟[分開編輯](#分開編輯)時，選區只匯出選取的列，沒有選區時拖出的是游標所在的那一列（macOS 為那一軌）。
 
 [桌面版更新設定](UPDATES.md)
 
@@ -86,7 +86,7 @@ macOS 桌面版可從選單列顯示或隱藏視窗、暫停或恢復擷取、�
 | 移動視窗 | 在內容區按住 `Alt`，用滑鼠左鍵拖曳。 | 在波形外的內容區按住 `Option`，用左鍵拖曳。在內容區任意位置可按住 `Command` + `Option` 再用左鍵拖曳。 |
 | 調整視窗大小 | 將游標移到視窗內容區的內緣或內角，按住左鍵拖曳。 | 將游標移到視窗內容區的內緣或內角，按住左鍵拖曳。 |
 | 框選音訊 | `Ctrl` 加左鍵自由框選，或 `Shift` 加左鍵吸附框選；兩者可合用。 | `Option`／`Control` 加左鍵自由框選，或 `Shift` 加左鍵吸附框選；可再加 Shift 吸附。 |
-| 分開編輯 A 和 B | 單獨輕按右側 `Ctrl`。 | 單獨輕按右側 `Command`。 |
+| 分開編輯 | 單獨輕按右側 `Ctrl`。 | 單獨輕按右側 `Command`。 |
 
 ### 讀懂波形與錄音狀態
 
@@ -133,24 +133,26 @@ Backtracking 視窗有焦點時，按 `Esc` 或 `Backspace` 可取消編輯並�
 
 按住 `Alt`（macOS 為 `Option`）拖曳選區起點旗標可調整淡入，拖曳終點旗標可調整淡出。往選區內拖得越深，淡化越長；淡入與淡出不會重疊。拖曳時波形會依淡化收窄，完整介面也會顯示淡化長度。淡化為線性，頭尾從無聲開始與結束。拖出的 WAV 與保存的選區快照都會套用淡化；試聽中調整，接下來播放的聲音就會套用新的淡化。重新框選會清除淡化；移動旗標時淡化保留，選區變短時會隨之縮短。
 
-### 分開編輯 A 和 B
+### 分開編輯
 
-同時擷取 A 和 B 時，可以只框選、試聽、拖出或保存其中一軌。在波形上按右鍵選擇 **Edit A and B separately**，或在 Backtracking 視窗有焦點時單獨輕按一下右側 `Ctrl`（Mac 為右側 `Command`）；再選一次或再輕按一次，就回到兩軌一起編輯。這個模式預設關閉，結束程式後不保留。只有一個來源時無法使用，單一來源分成 L／R 兩列也一樣。按住超過半秒，或同時按下其他按鍵或滑鼠按鈕，都不算輕按。
+可以只框選、試聽、淡化、拖出或保存部分波形列：A、B 其中一軌，立體聲來源分成 L／R 兩列時的其中一側，或多聲道來源的部分聲道。在波形上按右鍵選擇 **Edit separately／分開編輯**（macOS 為 **Edit A and B separately**），或在 Backtracking 視窗有焦點時單獨輕按一下右側 `Ctrl`（Mac 為右側 `Command`）；再選一次或再輕按一次，就回到全部一起編輯。這個模式預設關閉，結束程式後不保留。Windows 版需要畫面上有一列以上的波形，macOS 版需要擷取兩個來源。按住超過半秒，或同時按下其他按鍵或滑鼠按鈕，都不算輕按。
+
+Windows 版開啟這個模式後，選區涵蓋從開始拖曳的那一列到游標所在的那一列：往上或往下拖可納入更多列，拖回來就再放掉。拖過可捲動軌道的上緣或下緣時，軌道會跟著捲動。多聲道軌道最上方的 L 與 R 兩列一律一起選取。macOS 版的選區則屬於開始拖曳的那一軌。
 
 | 動作 | 一起編輯（預設） | 分開編輯 |
 | --- | --- | --- |
-| 框選 | 選區涵蓋 A 和 B | 選區屬於開始拖曳的那一軌，只有該軌變色 |
-| 試聽（`Space`） | 依匯出方式播放 A 和 B | 只播放選區所屬的那一軌 |
-| 淡入淡出 | 套用到 A 和 B | 只套用到選區所屬的那一軌 |
-| 拖出選區 | 匯出 A、B 各一個 WAV | 只匯出選區所屬的那一軌 |
-| 未框選時拖出 | 匯出 A 和 B 的整段音訊 | 只匯出游標所在那一軌的整段音訊 |
-| **Save snapshot**／全域快照快捷鍵 | 保存 A 和 B | 有選區時只保存該軌；沒有選區時仍保存 A 和 B |
+| 框選 | 選區涵蓋所有列 | 選區只涵蓋拖過的列（macOS：開始拖曳的那一軌），只有這些列變色 |
+| 試聽（`Space`） | 依匯出方式播放全部 | 只播放選取的列 |
+| 淡入淡出 | 套用到全部 | 只套用到選取的列 |
+| 拖出選區 | 匯出每一軌 | 只匯出選取的列 |
+| 未框選時拖出 | 匯出 A 和 B 的整段音訊 | 只匯出游標所在那一列（macOS：那一軌）的整段音訊 |
+| **Save snapshot**／全域快照快捷鍵 | 保存 A 和 B | 有選區時只保存選取的列；沒有選區時仍保存 A 和 B |
 
-開啟後，A 和 B 之間會出現一條細線，游標移到波形上時只有所在的那一軌會亮起。一次只有一個選區，旗標仍由兩軌共用。切換模式不會取消選區：開啟時選區縮到開始框選的那一軌，關閉時恢復涵蓋兩軌。完整介面會標示選區屬於 A 或 B。框選、拖出或調整淡化進行中時，切換不會生效。
+一次只有一個選區，選取的列共用旗標，旗標畫在選取的列上方。完整介面的狀態列與長度標籤會寫出選取的列，例如「Selection · C–Ls」；包含 L 與 R 兩列時寫成「L/R」。切換模式不會取消選區：關閉時選區恢復涵蓋所有列，再開啟時又縮回原先拖過的列（macOS：開始框選的那一軌）。框選、拖出或調整淡化進行中時，切換不會生效。
 
 ### 保存快照
 
-從 Options 選擇 **Save snapshot**，即可保存目前錄音器的快照。有框選時使用固定素材中的原始選段，A／B 依相同取樣邊界切割；開啟分開編輯 A 和 B 時只保存選區所屬的那一軌。未框選時保存觸發當下保留的整段音訊。準備和保存不隱含暫停背景錄音，也不強制解除手動 Pause。保存選段完成後可回到即時視野；全段保存於背景完成時，不會取消之後才建立的新選區。
+從 Options 選擇 **Save snapshot**，即可保存目前錄音器的快照。有框選時使用固定素材中的原始選段，A／B 依相同取樣邊界切割；開啟分開編輯時只保存選取的列。未框選時保存觸發當下保留的整段音訊。準備和保存不隱含暫停背景錄音，也不強制解除手動 Pause。保存選段完成後可回到即時視野；全段保存於背景完成時，不會取消之後才建立的新選區。
 
 Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift），macOS 使用 Fn／Globe 加同一位置的鍵，可在背景觸發快照，不必讓 Backtracking 或插件視窗取得焦點。Linux 請使用[快照快捷鍵常駐程式](../desktop/linux/README.md)。在 Options 可指定單一插件實例作為全域快照快捷鍵的目標。Backtracking 沒有綁定 `Ctrl+S`；在 DAW 中仍可用它儲存專案。
 
@@ -189,7 +191,7 @@ Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift
 
 **檔名**。桌面版以來源名稱為 WAV 命名。同時擷取 A 和 B 時為 `Backtracking_<名稱>_A_<日期>_<時間>_<長度>s.wav` 與 `Backtracking_<名稱>_B_…`；只有一個來源時不加 A／B，例如 `Backtracking_Spotify_2026-11-17_09-05-00_12.4s.wav`。分開編輯 A 和 B 時單獨匯出的一軌仍標示 A 或 B。名稱預設為來源清單中的裝置或 App 名稱，不含 `.exe` 等副檔名；系統播放為 `System audio`，Sender 為音軌名稱。要改名時，在 Options → Sources 該來源下方的 **File name** 欄位輸入，欄位下方會顯示檔名的開頭；清空欄位即恢復預設。名稱屬於裝置而不是 A／B：把系統播放命名為 `Loop` 後，不論它在 A 還是 B 擷取，檔名都使用 `Loop`。檔名不能使用的字元（`\ / : * ? " < > |`）會改成空格，名稱最多保留 48 個字元。VST3／CLAP 的檔名不含來源名稱，為 `Backtracking_<日期>_<時間>_<長度>s.wav`，DAW 提供速度時在長度後加上 BPM，例如 `_120bpm`；擷取 A 和 B 時，兩個檔案分別以 `-A`、`-B` 結尾。**Delete old drag-and-drop files** 也認得舊版的檔名。
 
-### 附加元件與多聲道來源（Windows 桌面版）
+### 附加元件（Windows 桌面版）
 
 附加元件（add-on）是獨立的程式，Backtracking 會啟動它並擷取它送出的音訊。附加元件可以提供新的音訊來源、開啟檔案、有自己的設定與按鈕。附加元件檔案的副檔名是 `.btaddon`。目前只有 Windows 桌面版支援，macOS 桌面版與插件尚未支援。
 
@@ -203,11 +205,21 @@ Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift
 - 能開啟檔案的附加元件會多一個 **Open file…** 按鈕，也可以直接把檔案拖到視窗上。
 - 能播放的來源會有 **Play**／**Pause**、**Stop** 和位置滑桿，主視窗的波形左下角也有一個播放／暫停按鈕。
 
-**多聲道波形。** 超過兩個聲道的來源，每個聲道各佔一列波形並標上聲道名稱；7.1.4 就是 12 列。列數放不下時可用滾輪捲動。框選會橫跨所有聲道。來源若有多個聲道群組（例如聲道與物件），波形左下角可切換目前顯示的群組。多聲道來源的音量表只有 Peak 與 VU，沒有 LUFS。聲道越多，記憶體能保留的歷史越短；實際保留的長度會顯示在 Options 的 **Capture** 頁。
-
-**匯出多聲道片段。** 在 Options 的 **Export** 頁用 **Multichannel sources** 選擇 **One mono WAV per channel**（每個聲道一個單聲道 WAV）或 **One multichannel WAV**（一個多聲道 WAV）。只會匯出目前顯示的聲道群組。檔名開頭與其他來源相同，依[檔名](#輸出位置與檔案規格)的規則包含來源名稱與 A／B；每個聲道的檔案再加上 `-Ch01_聲道名稱`，例如 `Backtracking_Test tone_A_2026-11-17_09-05-00_12.4s-Ch01_L.wav`，依名稱排序即為聲道順序。附加元件的來源同樣可在 Options → Sources 的 **File name** 欄位改名。淡入淡出會套用到每個聲道的檔案與多聲道 WAV。按 `Space` 試聽只播放單聲道與立體聲來源：選區涵蓋多聲道來源時不會播放，狀態列會說明原因；分開編輯 A 和 B 時，仍可試聽另一軌的單聲道或立體聲來源。
-
 想自己寫附加元件，請看 [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md)。
+
+### 多聲道來源（Windows 桌面版）
+
+**擷取系統、應用程式或麥克風的所有聲道。** 系統播放、單一應用程式或麥克風的裝置超過兩個聲道時（例如 5.1 或 7.1 喇叭），Options → Sources 的 **Channel route** 會多一個 **All channels／所有聲道**，選了之後每個聲道各成一列，聲道名稱來自 Windows 的喇叭配置（`FL`、`FR`、`FC`、`LFE` 等）。裝置只有一或兩個聲道時不會列出這個選項；之前選過、但裝置現在只有立體聲時，Backtracking 改用合併聲道擷取，並在來源下方說明。只有一或兩個聲道的來源仍是一列或 L／R 兩列，不會變成多聲道軌道。
+
+**多聲道波形。** 超過兩個聲道的來源，最上方是 **L** 與 **R** 兩列：所有聲道混成立體聲的結果，下方以細線分隔。再往下每個聲道各佔一列並標上聲道名稱；7.1.4 就是 L、R 加 12 列。列數放不下時可用滾輪捲動。來源若有多個聲道群組（例如聲道與物件），波形左下角可切換目前顯示的群組；L 與 R 一律由聲道群組混成。多聲道來源的音量表只有 Peak 與 VU，沒有 LUFS。聲道越多，記憶體能保留的歷史越短；實際保留的長度會顯示在 Options 的 **Capture** 頁。
+
+**隱藏無聲的聲道。** Options → **Capture** 的 **Hide silent channels／隱藏無聲的聲道**（預設開啟）讓系統、應用程式與麥克風來源在 L 與 R 下方只顯示有聲音的聲道：保留的歷史中只要有樣本高於 -90 dBFS，該聲道就算有聲音。除了前左與前右以外都沒有聲音時，只顯示 L 與 R 兩列。聲道開始有聲音時，那一列就出現；它的聲音從保留的歷史中移出後，那一列才隱藏。附加元件的來源一律顯示所有聲道。隱藏的聲道仍會擷取。
+
+**L 與 R 的聲音。** Options → **Capture** 的 **L/R of multichannel sources／多聲道來源的 L/R** 可選 **Stereo／立體聲**（預設）或 **Binaural／雙耳**。立體聲依每個聲道的位置把它混到左右；雙耳把每個聲道放在頭部周圍它的喇叭方向，用耳機就聽得出哪個聲道在哪裡。這個設定只改變試聽與匯出的聲音，波形相同。
+
+**試聽。** 按 `Space` 也能試聽多聲道來源：播放選區涵蓋的聲道依上述設定混成的聲音，分開編輯時只播放選取的列。帶有位置資料的物件（例如附加元件送出的物件）會依位置移動，以雙耳方式播放，與匯出相同。
+
+**匯出多聲道片段。** 在 Options 的 **Export** 頁用 **Multichannel sources** 選擇 **One mono WAV per channel**（每個聲道一個單聲道 WAV）或 **One multichannel WAV**（一個多聲道 WAV）。只會匯出目前顯示的聲道群組。檔名開頭與其他來源相同，依[檔名](#輸出位置與檔案規格)的規則包含來源名稱與 A／B；每個聲道的檔案再加上 `-Ch01_聲道名稱`，例如 `Backtracking_Test tone_A_2026-11-17_09-05-00_12.4s-Ch01_L.wav`，依名稱排序即為聲道順序。附加元件的來源同樣可在 Options → Sources 的 **File name** 欄位改名。淡入淡出會套用到每個聲道的檔案與多聲道 WAV。
 
 ### 保存與還原設定
 
@@ -246,7 +258,7 @@ On Windows, route the source to the default playback device. If a DAW uses ASIO,
 
 ### Open settings
 
-Click the gear in the toolbar to open **Options**. Right-clicking inside the plug-in also opens Options. In the Windows and macOS desktop apps, right-clicking opens a menu instead: **Pause / Resume / Retry capture**, **Clear**, **Save snapshot**, **Edit A and B separately**, **Show waveform only**, **Keep on top**, **Options…**, and **Quit**. With the desktop window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` previews the selection instead and `Delete` cancels the selection first. With two sources, tapping the right `Ctrl` key on its own (the right `Command` key on a Mac) switches [Edit A and B separately](#edit-a-and-b-separately) on or off. The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
+Click the gear in the toolbar to open **Options**. Right-clicking inside the plug-in also opens Options. In the Windows and macOS desktop apps, right-clicking opens a menu instead: **Pause / Resume / Retry capture**, **Clear**, **Save snapshot**, **Edit separately** (**Edit A and B separately** in the macOS app), **Show waveform only**, **Keep on top**, **Options…**, and **Quit**. With the desktop window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` previews the selection instead and `Delete` cancels the selection first. With more than one waveform row (two sources in the macOS app), tapping the right `Ctrl` key on its own (the right `Command` key on a Mac) switches [Edit separately](#edit-separately) on or off. The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
 
 Choose a category on the left, then use the vertical settings list on the right. Larger bold titles, group headings, and body/control text of at least 15 distinguish hierarchy. History, auto-resume, transparency, and WAV format use dropdowns sized to their item count, up to ten rows before scrolling. Scroll the details pane for longer content. Desktop Options can be resized and keeps Close visible. The plug-in requests a larger editor and restores its prior size when closed.
 
@@ -278,7 +290,7 @@ The settings menu offers five background transparency levels. Choose 0%, 25%, 50
 - Selecting, adjusting flags, zooming, or panning fixes the original editing material/view while background capture continues. The selected samples and aligned A/B boundaries survive live rollover or a shorter history limit. Finishing/canceling returns to live view without changing manual Pause.
 - Waveform bins, strokes, and guide density adapt to the actual audio rectangle, visible duration, and interaction state.
 - Wider views use a continuous filled min/max envelope and outline; close views connect the original samples with a polyline. The width-based zoom limit allows about four logical pixels per sample. Resizing preserves the view; subsequent zooming follows valid limits. Drawing does not change selected or exported samples; see the [current-round record](QUIET_CAPTURE_AND_WAVEFORM_2026-11-14.md) for validation status.
-- **Save snapshot**, the global snapshot shortcut, and accepted drops export both tracks with the same boundaries and sample rate. If your DAW prompts for placement, choose separate tracks at the same start position. With [Edit A and B separately](#edit-a-and-b-separately) on, a selection exports its own lane only, and dragging out without a selection exports the lane under the pointer.
+- **Save snapshot**, the global snapshot shortcut, and accepted drops export both tracks with the same boundaries and sample rate. If your DAW prompts for placement, choose separate tracks at the same start position. With [Edit separately](#edit-separately) on, a selection exports its selected rows only, and dragging out without a selection exports the row under the pointer (the lane, in the macOS app).
 
 [Desktop update settings](UPDATES.md)
 
@@ -312,7 +324,7 @@ On macOS, use the menu bar item to show or hide the window, pause or resume capt
 | Move the window | Hold `Alt` and left-drag inside the content area. | Hold `Option` and left-drag outside the waveform. Hold `Command` + `Option` and left-drag from anywhere in the content area. |
 | Resize the window | Move the pointer to an inside edge or corner, then left-drag. | Move the pointer to an inside edge or corner, then left-drag. |
 | Select audio | Ctrl-left-drag for free selection or Shift-left-drag for snapping; combine both if desired. | Option/Control-left-drag for free selection or Shift-left-drag for snapping; adding Shift also snaps. |
-| Edit A and B separately | Tap the right `Ctrl` key on its own. | Tap the right `Command` key on its own. |
+| Edit separately | Tap the right `Ctrl` key on its own. | Tap the right `Command` key on its own. |
 
 ### Read the waveform and capture status
 
@@ -359,24 +371,26 @@ While a preview plays, every Backtracking recorder that captures System playback
 
 Hold `Alt` (`Option` on a Mac) and drag the selection's start flag to fade it in, or its end flag to fade it out. The further into the selection you drag, the longer the fade. A fade in and a fade out never overlap. The waveform tapers as you drag, and the full interface shows the fade's length. Fades are linear and start and end in silence. Dragged-out WAVs and saved snapshots of the selection include the fades. A fade changed during a preview applies to the audio that plays next. A new selection starts without fades. Moving a flag keeps them and shortens them if the selection becomes too short.
 
-### Edit A and B separately
+### Edit separately
 
-While A and B both record, you can select, preview, drag out or save one lane on its own. Right-click the waveform and choose **Edit A and B separately**, or, with the Backtracking window focused, tap the right `Ctrl` key on its own (the right `Command` key on a Mac). Choose it or tap again to edit both lanes together. The mode is off by default and is not kept when you quit. It needs two sources: one source shown as L and R rows has no lanes to separate. Holding the key for more than half a second, or pressing another key or a mouse button with it, is not a tap.
+You can select, preview, fade, drag out or save some waveform rows on their own: one of the lanes A and B, one side of a stereo source shown as L and R rows, or some channels of a multichannel source. Right-click the waveform and choose **Edit separately** (**Edit A and B separately** in the macOS app), or, with the Backtracking window focused, tap the right `Ctrl` key on its own (the right `Command` key on a Mac). Choose it or tap again to edit everything together. The mode is off by default and is not kept when you quit. On Windows it needs more than one waveform row on screen; the macOS app needs two sources. Holding the key for more than half a second, or pressing another key or a mouse button with it, is not a tap.
+
+On Windows, while the mode is on, a selection covers the rows from the one you start dragging in to the one under the pointer: drag up or down to take in more rows, and back to let them go again. Drag past the top or bottom of a lane that scrolls to scroll it. The L and R rows on top of a multichannel lane are always taken together. In the macOS app a selection belongs to the lane you start dragging in.
 
 | Action | Together (default) | Separately |
 | --- | --- | --- |
-| Select | The selection covers A and B | The selection belongs to the lane you start dragging in, and only that lane is highlighted |
-| Preview (`Space`) | Plays A and B as they export | Plays the selection's lane only |
-| Fade in and out | Applies to A and B | Applies to the selection's lane only |
-| Drag out a selection | Exports a WAV for A and one for B | Exports the selection's lane only |
-| Drag out without a selection | Exports all of A and B | Exports all of the lane under the pointer |
-| **Save snapshot** / global snapshot shortcut | Saves A and B | Saves the selection's lane; without a selection it still saves A and B |
+| Select | The selection covers every row | The selection covers the rows you drag across (macOS: the lane you start in), and only those rows are highlighted |
+| Preview (`Space`) | Plays everything as it exports | Plays the selected rows only |
+| Fade in and out | Applies to everything | Applies to the selected rows only |
+| Drag out a selection | Exports every lane | Exports the selected rows only |
+| Drag out without a selection | Exports all of A and B | Exports all of the row under the pointer (macOS: the lane) |
+| **Save snapshot** / global snapshot shortcut | Saves A and B | Saves the selected rows; without a selection it still saves A and B |
 
-While the mode is on, a thin line runs between A and B, and hovering lights only the lane under the pointer. There is one selection at a time, and both lanes share the flags. Switching keeps the selection: turning the mode on narrows it to the lane it began in, and turning it off widens it back to both. The full interface shows which lane a selection belongs to. Switching does nothing while you are selecting, dragging out or fading.
+There is one selection at a time, and its rows share the flags, which stand on top of the selected rows. The status line and the length label of the full interface name the rows, for example "Selection · C–Ls", and the L and R rows of a multichannel lane as "L/R". Switching keeps the selection: turning the mode off widens it to every row, and turning it on again narrows it back to the rows you dragged across (macOS: the lane it began in). Switching does nothing while you are selecting, dragging out or fading.
 
 ### Save a snapshot
 
-Choose **Save snapshot** in Options to save from the current recorder. A selection uses its original fixed samples with the same A/B sample boundaries; with Edit A and B separately on, it saves the selection's lane only. With no selection, it saves all audio retained when triggered. Saving neither implicitly pauses capture nor forces manual Pause to resume. Selected-range completion can return to live view; completion of a background full-history save does not cancel a selection created afterward.
+Choose **Save snapshot** in Options to save from the current recorder. A selection uses its original fixed samples with the same A/B sample boundaries; with Edit separately on, it saves the selected rows only. With no selection, it saves all audio retained when triggered. Saving neither implicitly pauses capture nor forces manual Pause to resume. Selected-range completion can return to live view; completion of a background full-history save does not cancel a selection created afterward.
 
 On Windows, press Alt plus the physical key to the left of 1 (the ~ / grave key, without Shift). On macOS, press Fn/Globe plus that same physical key. The global shortcut works from the background, without focusing Backtracking or the plug-in editor. On Linux, use the [snapshot shortcut helper](../desktop/linux/README.md). Options can select one plug-in instance as the global shortcut target. Backtracking does not bind `Ctrl+S`; it remains available to save the DAW project.
 
@@ -415,7 +429,7 @@ Enable **Export every file as mono** to export each WAV in mono. Stereo Merged a
 
 **File names**. The desktop apps name each WAV after its source. With A and B recording, the files are `Backtracking_<name>_A_<date>_<time>_<length>s.wav` and `Backtracking_<name>_B_…`. With one source the letter is left out, as in `Backtracking_Spotify_2026-11-17_09-05-00_12.4s.wav`. A lane exported on its own while editing A and B separately keeps its letter. The name defaults to the device or app name in the source list, without an extension such as `.exe`: `System audio` for system playback, and the track name for a Sender. To change it, type in the **File name** field under the source in Options → Sources. The note under the field shows how the files will begin. Clear the field to go back to the default. A name belongs to the device, not to A or B: name system playback `Loop` and its files say `Loop` whether it records on A or on B. Characters that file names cannot hold (`\ / : * ? " < > |`) become spaces, and a name keeps at most 48 characters. VST3 and CLAP files carry no source name: `Backtracking_<date>_<time>_<length>s.wav`, with the tempo after the length, as in `_120bpm`, when the DAW reports one. With A and B recording, the two files end in `-A` and `-B`. **Delete old drag-and-drop files** also recognizes the names that earlier versions used.
 
-### Add-ons and multichannel sources (Windows desktop)
+### Add-ons (Windows desktop)
 
 An add-on is a separate program that Backtracking starts and captures audio from. An add-on can provide new audio sources, open files, and have its own settings and buttons. Add-on files end in `.btaddon`. Only the Windows desktop app hosts add-ons today; the macOS app and the plug-ins do not.
 
@@ -429,11 +443,21 @@ An add-on is a separate program that Backtracking starts and captures audio from
 - An add-on that opens files shows an **Open file…** button. You can also drop the file on a window.
 - A source that plays shows **Play** / **Pause**, **Stop**, and a position slider. The main window has a small play/pause button at the bottom left of the waveform.
 
-**Multichannel waveforms.** A source with more than two channels gets one waveform row per channel, labelled with the channel's name; 7.1.4 is twelve rows. Scroll with the mouse wheel when the rows do not fit. A selection runs across every channel. When a source has more than one channel group, for example channels and objects, a switch at the bottom left of the waveform chooses the group on show. Meters for multichannel sources offer Peak and VU, not LUFS. The more channels a source has, the less history fits in memory; the **Capture** page of Options shows how much is kept.
-
-**Export multichannel clips.** On the **Export** page of Options, **Multichannel sources** chooses between **One mono WAV per channel** and **One multichannel WAV**. Only the channel group on show is exported. The files begin like any other source's, with its name and the lane letter as described under [file names](#output-location-and-file-format). Each channel's file then ends in `-Ch01_channel name`, as in `Backtracking_Test tone_A_2026-11-17_09-05-00_12.4s-Ch01_L.wav`, so sorting by name puts the channels in order. An add-on's sources can be renamed in the **File name** field in Options → Sources too. Fades apply to every channel's file and to the multichannel WAV. Preview with `Space` plays mono and stereo sources only: a selection that covers a multichannel source does not play, and the status line says why. While editing A and B separately, a mono or stereo source in the other lane still previews.
-
 To write an add-on, see [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md).
+
+### Multichannel sources (Windows desktop)
+
+**Capture every channel of system, app or microphone audio.** When the device behind system playback, a single app or a microphone has more than two channels (5.1 or 7.1 speakers, say), **Channel route** in Options → Sources offers **All channels**. With it, every channel gets its own row, named after the Windows speaker layout (`FL`, `FR`, `FC`, `LFE`, and so on). A device with one or two channels does not offer it. If you chose it earlier and the device now has two channels, Backtracking captures it merged and says so under the source. A source with one or two channels stays one row, or L and R rows; it never becomes a multichannel lane.
+
+**Multichannel waveforms.** A source with more than two channels shows two rows on top, **L** and **R**: all its channels mixed to stereo, with a thin line below them. Under them each channel has its own row, labelled with the channel's name; 7.1.4 is L, R and twelve rows. Scroll with the mouse wheel when the rows do not fit. When a source has more than one channel group, for example channels and objects, a switch at the bottom left of the waveform chooses the group on show; L and R are always mixed from the channels group. Meters for multichannel sources offer Peak and VU, not LUFS. The more channels a source has, the less history fits in memory; the **Capture** page of Options shows how much is kept.
+
+**Hide silent channels.** With **Hide silent channels** on the **Capture** page of Options (on by default), system, app and microphone sources show under L and R only the channels that have sound: a channel has sound when any sample of it in the retained history is above -90 dBFS. When nothing but the front left and right has sound, only L and R show. A channel's row appears when it starts to have sound and goes once that sound has left the retained history. Add-on sources always show every channel. Hidden channels are still captured.
+
+**How L and R sound.** **L/R of multichannel sources** on the **Capture** page of Options is **Stereo** (the default) or **Binaural**. Stereo mixes each channel to the left and right by where its speaker stands. Binaural places each channel around your head at its speaker's direction, so on headphones you can hear which channel is where. The choice changes what preview and export sound like; the waveform stays the same.
+
+**Preview.** `Space` previews multichannel sources too: it plays the channels the selection covers, mixed as set above, and only the selected rows while editing separately. Objects that carry positions, such as the objects an add-on sends, move as their positions say and play binaurally, as they export.
+
+**Export multichannel clips.** On the **Export** page of Options, **Multichannel sources** chooses between **One mono WAV per channel** and **One multichannel WAV**. Only the channel group on show is exported. The files begin like any other source's, with its name and the lane letter as described under [file names](#output-location-and-file-format). Each channel's file then ends in `-Ch01_channel name`, as in `Backtracking_Test tone_A_2026-11-17_09-05-00_12.4s-Ch01_L.wav`, so sorting by name puts the channels in order. An add-on's sources can be renamed in the **File name** field in Options → Sources too. Fades apply to every channel's file and to the multichannel WAV.
 
 ### Save and restore settings
 
