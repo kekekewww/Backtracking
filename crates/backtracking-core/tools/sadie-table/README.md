@@ -17,5 +17,7 @@ cargo +1.100.0 clippy --manifest-path crates/backtracking-core/tools/sadie-table
 
 The input path may point to any copy of the pinned source. The tool refuses
 a different SHA-256, validates the envelope and records, ignores the 15
-appended aliases, compares two regular grids against the full measured set,
-and prints the output hash. It does not fetch data or play audio.
+appended aliases, fits the alignment delays and compares interpolation methods on a development
+set. It prints the three blend curves and prior model on the original held-out
+set, smoothness of the blended delays and ear norms on two orbits, the
+error bounds imposed by mirroring, and the output hash. It does not fetch data or play audio.

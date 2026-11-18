@@ -14,10 +14,11 @@ pub struct Direction {
 /// and LFE channels have no direction. Resolve before selecting a subset of channels.
 ///
 /// The 22.2-only names follow the nominal positions in ITU-R BS.2051-3 Tables 1 and 10.
-/// `FL`/`FR` remain at 30 degrees as specified for Backtracking, including in 22.2 groups.
+/// `FL`/`FR` are at 60 degrees when both front-centre speakers are present.
 /// Windows' additional `TC`, `TFC`, and `TBC` names use 90, 45, and 45 degree elevation.
 pub fn speaker_directions(labels: &[&str]) -> Vec<Option<Direction>> {
     let has = |name| labels.iter().any(|label| label.eq_ignore_ascii_case(name));
+    let front = if has("FLc") && has("FRc") { 60.0 } else { 30.0 };
     let surround = if (has("Lb") && has("Rb")) || (has("BL") && has("BR")) {
         90.0
     } else {
@@ -27,8 +28,10 @@ pub fn speaker_directions(labels: &[&str]) -> Vec<Option<Direction>> {
         .iter()
         .map(|label| {
             let (azimuth, elevation) = match label.to_ascii_lowercase().as_str() {
-                "fl" | "flc" => (-30.0, 0.0),
-                "fr" | "frc" => (30.0, 0.0),
+                "fl" => (-front, 0.0),
+                "fr" => (front, 0.0),
+                "flc" => (-30.0, 0.0),
+                "frc" => (30.0, 0.0),
                 "fc" => (0.0, 0.0),
                 "ls" => (-surround, 0.0),
                 "rs" => (surround, 0.0),
@@ -226,6 +229,14 @@ mod tests {
             for (label, actual) in labels.iter().zip(resolved) {
                 let wanted = if ["LFE", "LFE1", "LFE2", "Left Ear", "Right Ear"].contains(label) {
                     None
+                } else if labels.contains(&"FLc")
+                    && labels.contains(&"FRc")
+                    && matches!(*label, "FL" | "FR")
+                {
+                    Some(Direction {
+                        azimuth: if *label == "FL" { -60.0 } else { 60.0 },
+                        elevation: 0.0,
+                    })
                 } else if *label == "Ls" || *label == "Rs" {
                     let side = if *label == "Ls" { -1.0 } else { 1.0 };
                     Some(Direction {

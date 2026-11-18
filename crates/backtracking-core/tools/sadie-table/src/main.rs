@@ -1,5 +1,8 @@
 //! Offline reduction of the pinned SADIE II D1 OpenJOC asset. No network or dependencies.
 
+#[path = "../../../src/spatial/interpolation.rs"]
+mod interpolation;
+
 use std::{error::Error, f64::consts::PI, fs, io, path::Path};
 
 const INPUT_HASH: &str = "78d048a68f84d34051578c262e401e35baa0e718901f85349afe0232f985d4df";
@@ -192,18 +195,12 @@ fn ild(taps: &[f32]) -> f64 {
     10.0 * (energy(&taps[..TAPS]) / energy(&taps[TAPS..])).log10()
 }
 
-fn evaluate(grid: &Grid, rows: &[Row]) {
-    let mut squared = 0.0;
-    let mut reference_energy = 0.0;
-    let mut max: f64 = 0.0;
-    let mut itd_max = 0;
-    let mut itd_squared = 0.0;
-    let mut ild_max: f64 = 0.0;
-    let mut ild_squared = 0.0;
-    let frequencies = [
-        200.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 12000.0, 16000.0,
-    ];
-    let basis: Vec<Vec<(f64, f64)>> = frequencies
+const FREQUENCIES: [f64; 8] = [
+    200.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 12000.0, 16000.0,
+];
+
+fn basis() -> Vec<Vec<(f64, f64)>> {
+    FREQUENCIES
         .iter()
         .map(|frequency| {
             (0..TAPS)
@@ -213,18 +210,53 @@ fn evaluate(grid: &Grid, rows: &[Row]) {
                 })
                 .collect()
         })
-        .collect();
+        .collect()
+}
+
+fn db(taps: &[f32], wave: &[(f64, f64)]) -> f64 {
+    let (re, im) = taps
+        .iter()
+        .zip(wave)
+        .fold((0.0, 0.0), |(re, im), (&tap, &(c, s))| {
+            (re + tap as f64 * c, im + tap as f64 * s)
+        });
+    20.0 * re.hypot(im).max(0.001).log10()
+}
+
+fn angles(a: usize, e: usize, held_out: bool) -> (f64, f64) {
+    let (az, el) = if held_out {
+        (2.5, -82.5)
+    } else {
+        (1.35, -85.65)
+    };
+    (az + 5.0 * a as f64, el + 15.0 * e as f64)
+}
+
+fn evaluate(
+    name: &str,
+    rows: &[Row],
+    held_out: bool,
+    response: impl Fn(f64, f64) -> [f32; 2 * TAPS],
+) {
+    let mut squared = 0.0;
+    let mut reference_energy = 0.0;
+    let mut max: f64 = 0.0;
+    let mut itd_max = 0;
+    let mut itd_squared = 0.0;
+    let mut ild_max: f64 = 0.0;
+    let mut ild_squared = 0.0;
+    let basis = basis();
     let mut spectral_max: f64 = 0.0;
     let mut spectral_squared = 0.0;
     let mut count = 0;
-    // Common held-out directions for both grids. None is on either azimuth grid.
+    // Both sets sample the spaces between stored azimuths.
     for e in 0..12 {
         for a in 0..36 {
             for sign in [-1.0, 1.0] {
-                let azimuth = (2.5 + a as f64 * 5.0) * sign;
-                let elevation = -82.5 + e as f64 * 15.0;
+                let (azimuth, elevation) = angles(a, e, held_out);
+                let azimuth = sign * azimuth;
                 let (reference, _) = nearest(rows, direction(azimuth, elevation));
-                let actual = grid.at(azimuth, elevation);
+                let actual = response(azimuth, elevation);
                 for (&value, &expected) in actual.iter().zip(&reference.taps) {
                     let delta = value as f64 - expected as f64;
                     squared += delta * delta;
@@ -240,18 +272,9 @@ fn evaluate(grid: &Grid, rows: &[Row]) {
                 ild_squared += ild_error.powi(2);
                 for ear in 0..2 {
                     for wave in &basis {
-                        let magnitude = |taps: &[f32]| {
-                            let (re, im) = taps.iter().zip(wave).fold(
-                                (0.0, 0.0),
-                                |(re, im), (&tap, &(c, s))| {
-                                    (re + tap as f64 * c, im + tap as f64 * s)
-                                },
-                            );
-                            20.0 * re.hypot(im).max(0.001).log10()
-                        };
                         let range = ear * TAPS..(ear + 1) * TAPS;
                         let difference =
-                            magnitude(&actual[range.clone()]) - magnitude(&reference.taps[range]);
+                            db(&actual[range.clone()], wave) - db(&reference.taps[range], wave);
                         spectral_max = spectral_max.max(difference.abs());
                         spectral_squared += difference * difference;
                     }
@@ -260,32 +283,197 @@ fn evaluate(grid: &Grid, rows: &[Row]) {
             }
         }
     }
-    println!("grid {}x15: {count} held-out directions; tap max={max:.9}, RMS={:.9}, normalized RMS={:.9}; peak ITD max={itd_max} samples RMS={:.6}; energy ILD max={ild_max:.6} dB RMS={:.6} dB", grid.azimuth_step, (squared / (count * TAPS * 2) as f64).sqrt(), (squared / reference_energy).sqrt(), (itd_squared / count as f64).sqrt(), (ild_squared / count as f64).sqrt());
-    println!("grid {}x15: magnitude error at {frequencies:?} Hz, -60dB absolute floor: max={spectral_max:.6} dB RMS={:.6} dB", grid.azimuth_step, (spectral_squared / (count * 2 * frequencies.len()) as f64).sqrt());
+    println!("{name}: {count} directions held_out={held_out}; tap max={max:.9}, RMS={:.9}, normalized RMS={:.9}; peak ITD max={itd_max} samples RMS={:.6}; energy ILD max={ild_max:.6} dB RMS={:.6} dB", (squared / (count * TAPS * 2) as f64).sqrt(), (squared / reference_energy).sqrt(), (itd_squared / count as f64).sqrt(), (ild_squared / count as f64).sqrt());
+    println!("{name}: magnitude error at {FREQUENCIES:?} Hz, -60dB absolute floor: max={spectral_max:.6} dB RMS={:.6} dB", (spectral_squared / (count * 2 * FREQUENCIES.len()) as f64).sqrt());
 }
 
-fn write_grid(grid: &Grid, output: &Path) -> io::Result<()> {
-    let mut bytes = Vec::with_capacity(grid.rows.len() * TAPS * 2 * 4);
-    let peak = grid
-        .rows
-        .iter()
-        .flatten()
-        .map(|x| x.abs())
-        .fold(0.0, f32::max);
-    let mut max: f64 = 0.0;
+// Each ear carries its own f32 quantization step followed by 256 little-endian i16 taps.
+fn encode(rows: &[Row]) -> (Vec<u8>, Vec<f32>) {
+    let mut bytes = Vec::new();
+    let mut decoded = Vec::new();
+    let mut max_error = 0.0f32;
     let mut squared = 0.0;
-    for &tap in grid.rows.iter().flatten() {
-        bytes.extend_from_slice(&tap.to_le_bytes());
-        let encoded = (tap as f64 / peak as f64 * 32767.0).round();
-        let decoded = encoded * peak as f64 / 32767.0;
-        let error = tap as f64 - decoded;
-        max = max.max(error.abs());
-        squared += error * error;
+    for (e, &el) in interpolation::ELEVATIONS.iter().enumerate() {
+        let pole = e == 0 || e + 1 == interpolation::ELEVATIONS.len();
+        let columns = if pole { 1 } else { interpolation::AZIMUTHS };
+        for a in 0..columns {
+            let (source, _) = nearest(rows, direction((a * 5) as f64, el as f64));
+            let mut taps = source.taps;
+            if pole || a == 0 || a == interpolation::AZIMUTHS - 1 {
+                for t in 0..TAPS {
+                    let mid = 0.5 * (taps[t] + taps[t + TAPS]);
+                    taps[t] = mid;
+                    taps[t + TAPS] = mid;
+                }
+            }
+            for ear in taps.as_chunks::<TAPS>().0 {
+                let step = ear.iter().map(|v| v.abs()).fold(0.0, f32::max) / 32767.0;
+                bytes.extend(step.to_le_bytes());
+                for &v in ear {
+                    let q = (v / step).round() as i16;
+                    bytes.extend(q.to_le_bytes());
+                    let y = q as f32 * step;
+                    decoded.push(y);
+                    max_error = max_error.max((y - v).abs());
+                    squared += f64::from(y - v).powi(2);
+                }
+            }
+        }
     }
-    fs::write(output, &bytes)?;
-    println!("selected f32: {} bytes, lossless f32 encode/decode; alternative globally scaled i16 peak={peak:.9} max error={max:.12} RMS={:.12}, {} bytes plus scale", bytes.len(), (squared / (bytes.len() / 4) as f64).sqrt(), bytes.len() / 2);
-    println!("output SHA-256 {}", hex(&sha256(&bytes)));
-    Ok(())
+    println!(
+        "quantization max={max_error:.12} RMS={:.12}",
+        (squared / decoded.len() as f64).sqrt()
+    );
+    (bytes, decoded)
+}
+
+fn interpolated(samples: &[f32], delays: &[usize], az: f64, el: f64) -> [f32; TAPS * 2] {
+    let cell = interpolation::cell(az as f32, el as f32, 0);
+    let mut taps = [0.0; TAPS * 2];
+    for (ear, out) in taps.as_chunks_mut::<TAPS>().0.iter_mut().enumerate() {
+        interpolation::blend(&cell, ear ^ usize::from(az < 0.0), samples, delays, out);
+    }
+    taps
+}
+
+// Fit one delay per ear/node to the measured lags between neighbouring responses.
+// Consistent node delays make adjoining interpolation cells agree along shared edges.
+fn fit_delays(samples: &[f32]) -> Vec<usize> {
+    let count = samples.len() / TAPS;
+    let canonical = |k: usize| {
+        let r = k / 2;
+        if r == 0 || r + 1 == interpolation::DIRECTIONS || {
+            let a = (r - 1) % interpolation::AZIMUTHS;
+            a == 0 || a + 1 == interpolation::AZIMUTHS
+        } {
+            k & !1
+        } else {
+            k
+        }
+    };
+    let mut edges = vec![Vec::new(); count];
+    let mut connect = |i: usize, j: usize| {
+        let (i, j) = (canonical(i), canonical(j));
+        let a = &samples[i * TAPS..(i + 1) * TAPS];
+        let b = &samples[j * TAPS..(j + 1) * TAPS];
+        let energy = |ear: &[f32]| ear.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>();
+        let norm = (energy(a) * energy(b)).sqrt();
+        let (lag, corr) = (-16isize..=16)
+            .map(|lag| {
+                let x = lag.max(0) as usize;
+                let y = (-lag).max(0) as usize;
+                let dot: f64 = a[x..]
+                    .iter()
+                    .zip(&b[y..])
+                    .map(|(&v, &w)| f64::from(v) * f64::from(w))
+                    .sum();
+                (lag, dot / norm)
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap();
+        let w = corr.max(0.1).powi(4);
+        edges[i].push((j, lag as f64, w));
+        edges[j].push((i, -(lag as f64), w));
+    };
+    for e in 0..interpolation::ELEVATIONS.len() {
+        for a in 0..interpolation::AZIMUTHS {
+            let r = interpolation::row(e, a);
+            for ear in 0..2 {
+                if a > 0 && interpolation::row(e, a - 1) != r {
+                    connect(2 * r + ear, 2 * interpolation::row(e, a - 1) + ear);
+                }
+                if e > 0 {
+                    connect(2 * r + ear, 2 * interpolation::row(e - 1, a) + ear);
+                }
+            }
+        }
+    }
+    let mut d: Vec<_> = samples
+        .as_chunks::<TAPS>()
+        .0
+        .iter()
+        .map(|t| peak(t) as f64)
+        .collect();
+    for _ in 0..500 {
+        for (i, neighbors) in edges.iter().enumerate() {
+            if neighbors.is_empty() {
+                continue;
+            }
+            d[i] = neighbors
+                .iter()
+                .map(|&(j, lag, w)| w * (d[j] + lag))
+                .sum::<f64>()
+                / neighbors.iter().map(|&(_, _, w)| w).sum::<f64>();
+        }
+    }
+    (0..count)
+        .map(|k| d[canonical(k)].round() as usize)
+        .collect()
+}
+
+// For a mirrored model each signed pair must have opposite ITD and ILD.
+fn mirror_floor(rows: &[Row], held_out: bool) {
+    let mut itd = 0.0;
+    let mut level = 0.0;
+    let mut magnitude = 0.0;
+    let basis = basis();
+    for j in 0..12 {
+        for i in 0..36 {
+            let (a, e) = angles(i, j, held_out);
+            let responses = [a, -a].map(|az| &nearest(rows, direction(az, e)).0.taps);
+            let pair_itd = responses.map(|t| peak(&t[..TAPS]) - peak(&t[TAPS..]));
+            itd += (0.5 * f64::from(pair_itd[0] + pair_itd[1])).powi(2);
+            level += (0.5 * (ild(responses[0]) + ild(responses[1]))).powi(2);
+            for ear in 0..2 {
+                for wave in &basis {
+                    let opposite = 1 - ear;
+                    magnitude += (0.5
+                        * (db(&responses[0][ear * TAPS..(ear + 1) * TAPS], wave)
+                            - db(&responses[1][opposite * TAPS..(opposite + 1) * TAPS], wave)))
+                    .powi(2);
+                }
+            }
+        }
+    }
+    println!(
+        "mirror RMS lower bounds held_out={held_out}: ITD {:.6}, ILD {:.6}, magnitude {:.6}",
+        (itd / 432.0).sqrt(),
+        (level / 432.0).sqrt(),
+        (magnitude / (432.0 * 16.0)).sqrt()
+    );
+}
+
+// Compare the model parameters before fractional filtering or block crossfades.
+fn orbit_parameters(delays: &[f32], norms: &[f32], elevation: f32, smoothing: usize) {
+    let mut last = None;
+    let mut max_delay = 0.0f32;
+    let mut max_level = 0.0f32;
+    let mut worst = 0;
+    for step in 0..=375 {
+        let az = step as f32 * 360.0 / 375.0;
+        let az = if az > 180.0 { az - 360.0 } else { az };
+        let cell = interpolation::cell(az, elevation, smoothing);
+        let ears = |values: &[f32]| {
+            [0, 1].map(|ear| {
+                interpolation::weighted_value(&cell, ear ^ usize::from(az < 0.0), values)
+            })
+        };
+        let [dl, dr] = ears(delays);
+        let [nl, nr] = ears(norms);
+        let itd = dl - dr;
+        let ild = 20.0 * (nl / nr).log10();
+        if let Some((prev_itd, prev_ild)) = last {
+            let dt: f32 = itd - prev_itd;
+            let db: f32 = ild - prev_ild;
+            max_delay = max_delay.max(dt.abs());
+            if db.abs() > max_level {
+                max_level = db.abs();
+                worst = step - 1;
+            }
+        }
+        last = Some((itd, ild));
+    }
+    println!("elevation={elevation} smoothsteps={smoothing} max blended ITD step={max_delay:.6} samples, norm-only max ILD step={max_level:.6} dB at interval {worst}");
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -308,18 +496,97 @@ fn main() -> Result<(), Box<dyn Error>> {
         rows.len()
     );
     let measured = &rows[..MEASURED];
-    let coarse = Grid::new(measured, 15);
-    evaluate(&coarse, measured);
-    let selected = Grid::new(measured, 10);
-    evaluate(&selected, measured);
-    let right = selected.at(30.0, 0.0);
+    mirror_floor(measured, false);
+    let old = Grid::new(measured, 10);
+    let (mut table, samples) = encode(measured);
+    let peaks: Vec<_> = samples
+        .as_chunks::<TAPS>()
+        .0
+        .iter()
+        .map(|t| peak(t) as usize)
+        .collect();
+    let early: Vec<_> = samples
+        .as_chunks::<TAPS>()
+        .0
+        .iter()
+        .map(|ear| {
+            let energy = ear.iter().map(|t| t * t).sum::<f32>();
+            let mut sum = 0.0;
+            ear.iter()
+                .position(|t| {
+                    sum += t * t;
+                    sum >= energy * 0.05
+                })
+                .unwrap()
+        })
+        .collect();
+    let zero = vec![0; peaks.len()];
+    evaluate("W1-A", measured, false, |a, e| old.at(a, e));
+    for (name, delays) in [("raw", &zero), ("peak", &peaks), ("early", &early)] {
+        evaluate(name, measured, false, |a, e| {
+            interpolated(&samples, delays, a, e)
+        });
+    }
+    let fit = fit_delays(&samples);
+    let levels: Vec<_> = samples
+        .as_chunks::<TAPS>()
+        .0
+        .iter()
+        .map(|t| interpolation::level(t))
+        .collect();
+    let selected = |a: f64, e: f64, power| {
+        let cell = interpolation::cell(a as f32, e as f32, power);
+        let mut taps = [0.0; TAPS * 2];
+        for (ear, out) in taps.as_chunks_mut::<TAPS>().0.iter_mut().enumerate() {
+            let ch = ear ^ usize::from(a < 0.0);
+            interpolation::blend(&cell, ch, &samples, &fit, out);
+            interpolation::match_level(&cell, ch, &levels, out);
+        }
+        taps
+    };
+    let delay_values: Vec<_> = fit.iter().map(|&d| d as f32).collect();
+    for (name, power) in [
+        ("correlation", 0),
+        ("correlation smoothstep", 1),
+        ("correlation twice smoothstep", 2),
+    ] {
+        for elevation in [0.0, 30.0] {
+            orbit_parameters(&delay_values, &levels, elevation, power);
+        }
+        for held_out in [false, true] {
+            evaluate(name, measured, held_out, |a, e| selected(a, e, power));
+        }
+    }
+    let mut legacy_max = 0.0f32;
+    for e in 0..13 {
+        for a in 0..19 {
+            let az = (a * 10) as f64;
+            let el = (e * 15) as f64 - 90.0;
+            for (v, w) in selected(az, el, interpolation::SMOOTHSTEPS)
+                .into_iter()
+                .zip(old.at(az, el))
+            {
+                legacy_max = legacy_max.max((v - w).abs());
+            }
+        }
+    }
+    assert!(legacy_max < 0.0000145);
+    println!("maximum change from 247 legacy nodes: {legacy_max:.12}");
+    mirror_floor(measured, true);
+    evaluate("W1-A", measured, true, |a, e| old.at(a, e));
     println!(
-        "FR peak L={} R={}, energy ILD={:.6} dB",
-        peak(&right[..TAPS]),
-        peak(&right[TAPS..]),
-        ild(&right)
+        "runtime uses {} smoothstep passes per axis",
+        interpolation::SMOOTHSTEPS
     );
-    write_grid(&selected, Path::new(&arguments[1]))?;
+    for delay in fit {
+        table.push(u8::try_from(delay)?);
+    }
+    fs::write(Path::new(&arguments[1]), &table)?;
+    println!(
+        "{} output bytes, SHA-256 {}",
+        table.len(),
+        hex(&sha256(&table))
+    );
     Ok(())
 }
 

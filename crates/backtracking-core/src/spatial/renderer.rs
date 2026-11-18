@@ -97,9 +97,12 @@ impl BinauralSource {
         }
     }
 
-    fn gain(&self, frame: u64) -> f32 {
+    fn gain(&self, frame: u64, next_key: &mut usize) -> f32 {
         let Self::Moving(keys) = self else { return 1.0 };
-        let next = keys.partition_point(|key| key.frame <= frame);
+        while keys.get(*next_key).is_some_and(|key| key.frame <= frame) {
+            *next_key += 1;
+        }
+        let next = *next_key;
         if next == 0 {
             return 1.0;
         }
@@ -119,6 +122,7 @@ struct SourceState {
     selected: bool,
     history: Vec<f32>,
     cursor: usize,
+    next_key: usize,
     left: Vec<f32>,
     right: Vec<f32>,
     next_left: Vec<f32>,
@@ -134,6 +138,7 @@ impl SourceState {
             selected,
             history: vec![0.0; taps * 2],
             cursor: 0,
+            next_key: 0,
             left: vec![0.0; taps],
             right: vec![0.0; taps],
             next_left: vec![0.0; taps],
@@ -147,6 +152,10 @@ impl SourceState {
     fn reset(&mut self, model: &HeadModel, frame: u64) {
         self.history.fill(0.0);
         self.cursor = 0;
+        self.next_key = match &self.source {
+            BinauralSource::Moving(keys) => keys.partition_point(|key| key.frame <= frame),
+            BinauralSource::Fixed(_) => 0,
+        };
         model.filter(self.source.pose(frame).0, &mut self.left, &mut self.right);
         self.next_left.copy_from_slice(&self.left);
         self.next_right.copy_from_slice(&self.right);
@@ -287,7 +296,9 @@ impl BinauralRenderer {
                 }
                 for index in 0..count {
                     let sample = input[(offset + index) * channels + channel]
-                        * source.source.gain(self.position + index as u64);
+                        * source
+                            .source
+                            .gain(self.position + index as u64, &mut source.next_key);
                     let value = source.sample(sample, self.phase + index);
                     output[(offset + index) * 2] += value[0];
                     output[(offset + index) * 2 + 1] += value[1];
@@ -323,20 +334,59 @@ pub fn render_binaural(
     Ok(output)
 }
 
-// SSE2 is part of the x86-64 baseline. Four independent accumulators break the
-// dependency chain; the mirrored history makes every tap access contiguous.
+// Use wider multiply-accumulates when supported. Keep the SSE2 and scalar
+// paths for hosts without FMA and for other architectures.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,fma")]
+unsafe fn convolve_fma(history: &[f32], left: &[f32], right: &[f32]) -> [f32; 2] {
+    use std::arch::x86_64::*;
+    let taps = history.len().min(left.len()).min(right.len());
+    let mut l = [_mm256_setzero_ps(); 2];
+    let mut r = [_mm256_setzero_ps(); 2];
+    let mut index = 0;
+    while index + 16 <= taps {
+        for lane in 0..2 {
+            let i = index + lane * 8;
+            let h = _mm256_loadu_ps(history.as_ptr().add(i));
+            l[lane] = _mm256_fmadd_ps(h, _mm256_loadu_ps(left.as_ptr().add(i)), l[lane]);
+            r[lane] = _mm256_fmadd_ps(h, _mm256_loadu_ps(right.as_ptr().add(i)), r[lane]);
+        }
+        index += 16;
+    }
+    let sum = |a, b| {
+        let x = _mm256_add_ps(a, b);
+        let x = _mm_add_ps(_mm256_castps256_ps128(x), _mm256_extractf128_ps::<1>(x));
+        let x = _mm_add_ps(x, _mm_movehl_ps(x, x));
+        _mm_cvtss_f32(_mm_add_ss(x, _mm_shuffle_ps::<0x55>(x, x)))
+    };
+    let mut result = [sum(l[0], l[1]), sum(r[0], r[1])];
+    for i in index..taps {
+        result[0] += history[i] * left[i];
+        result[1] += history[i] * right[i];
+    }
+    result
+}
+
 #[cfg(target_arch = "x86_64")]
 fn convolve(history: &[f32], left: &[f32], right: &[f32]) -> [f32; 2] {
+    if is_x86_feature_detected!("fma") && is_x86_feature_detected!("avx") {
+        // SAFETY: both required CPU features are present.
+        return unsafe { convolve_fma(history, left, right) };
+    }
+    convolve_sse2(history, left, right)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn convolve_sse2(history: &[f32], left: &[f32], right: &[f32]) -> [f32; 2] {
     use std::arch::x86_64::*;
-    debug_assert_eq!(history.len(), left.len());
-    debug_assert_eq!(history.len(), right.len());
+    let taps = history.len().min(left.len()).min(right.len());
     // SAFETY: SSE2 is always available on x86-64. Each load lies within the slices;
     // unaligned loads are used, and scalar code handles any remaining taps.
     unsafe {
         let mut l = [_mm_setzero_ps(); 4];
         let mut r = [_mm_setzero_ps(); 4];
         let mut index = 0;
-        while index + 16 <= history.len() {
+        while index + 16 <= taps {
             for lane in 0..4 {
                 let i = index + lane * 4;
                 let h = _mm_loadu_ps(history.as_ptr().add(i));
@@ -356,7 +406,7 @@ fn convolve(history: &[f32], left: &[f32], right: &[f32]) -> [f32; 2] {
             _mm_add_ps(_mm_add_ps(r[0], r[1]), _mm_add_ps(r[2], r[3])),
         );
         let mut value = [ls.iter().sum(), rs.iter().sum()];
-        for i in index..history.len() {
+        for i in index..taps {
             value[0] += history[i] * left[i];
             value[1] += history[i] * right[i];
         }
@@ -372,4 +422,31 @@ fn convolve(history: &[f32], left: &[f32], right: &[f32]) -> [f32; 2] {
         value[1] += sample * right;
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn convolution_uses_the_common_prefix_of_unequal_slices() {
+        let history = [1.0; 37];
+        let left = [2.0; 37];
+        let right = [-3.0; 37];
+        for n in [0, 1, 15, 16, 17, 32, 35] {
+            for (h, l, r) in [(n, 36, 37), (37, n, 36), (36, 37, n)] {
+                let (h, l, r) = (&history[..h], &left[..l], &right[..r]);
+                let expected = [2.0 * n as f32, -3.0 * n as f32];
+                assert_eq!(convolve(h, l, r), expected);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    assert_eq!(convolve_sse2(h, l, r), expected);
+                    if is_x86_feature_detected!("avx") && is_x86_feature_detected!("fma") {
+                        // SAFETY: this host supports both target features.
+                        assert_eq!(unsafe { convolve_fma(h, l, r) }, expected);
+                    }
+                }
+            }
+        }
+    }
 }

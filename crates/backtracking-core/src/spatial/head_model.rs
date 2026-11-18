@@ -4,14 +4,15 @@ use super::{Direction, RenderError};
 
 const SOURCE_RATE: u32 = 48_000;
 const SOURCE_TAPS: usize = 256;
-const AZIMUTHS: usize = 19;
-const ELEVATIONS: usize = 13;
+#[path = "interpolation.rs"]
+mod interpolation;
+const EAR_BYTES: usize = 4 + SOURCE_TAPS * 2;
 const TABLE: &[u8] = include_bytes!("sadie-d1.bin");
 
 /// Number of stored directions; left-side directions reflect these right-side responses.
-pub const HEAD_MODEL_DIRECTIONS: usize = AZIMUTHS * ELEVATIONS;
+pub const HEAD_MODEL_DIRECTIONS: usize = interpolation::DIRECTIONS;
 /// Bytes embedded in the executable for the reduced 48 kHz head model.
-pub const HEAD_MODEL_TABLE_BYTES: usize = HEAD_MODEL_DIRECTIONS * 2 * SOURCE_TAPS * 4;
+pub const HEAD_MODEL_TABLE_BYTES: usize = HEAD_MODEL_DIRECTIONS * 2 * (EAR_BYTES + 1);
 
 /// A head model prepared for one sample rate, shareable between renderers with `Arc`.
 ///
@@ -21,6 +22,8 @@ pub struct HeadModel {
     sample_rate: u32,
     taps: usize,
     samples: Vec<f32>,
+    delays: Vec<usize>,
+    levels: Vec<f32>,
 }
 
 impl HeadModel {
@@ -29,9 +32,22 @@ impl HeadModel {
         if !(8_000..=384_000).contains(&sample_rate) {
             return Err(RenderError::InvalidSampleRate);
         }
-        let source: Vec<f32> = TABLE
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        let (records, delay_bytes) = TABLE.split_at(HEAD_MODEL_DIRECTIONS * 2 * EAR_BYTES);
+        let mut source = Vec::with_capacity(HEAD_MODEL_DIRECTIONS * 2 * SOURCE_TAPS);
+        for record in records.chunks_exact(EAR_BYTES) {
+            let scale = f32::from_le_bytes(record[..4].try_into().unwrap());
+            source.extend(
+                record[4..]
+                    .chunks_exact(2)
+                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 * scale),
+            );
+        }
+        let delays = delay_bytes
+            .iter()
+            .map(|&d| {
+                ((u64::from(d) * u64::from(sample_rate) + u64::from(SOURCE_RATE / 2))
+                    / u64::from(SOURCE_RATE)) as usize
+            })
             .collect();
         let taps = (SOURCE_TAPS as u64 * sample_rate as u64).div_ceil(SOURCE_RATE as u64) as usize;
         let samples = if sample_rate == SOURCE_RATE {
@@ -52,10 +68,16 @@ impl HeadModel {
             }
             result
         };
+        let levels = samples
+            .chunks_exact(taps)
+            .map(interpolation::level)
+            .collect();
         Ok(Self {
             sample_rate,
             taps,
             samples,
+            delays,
+            levels,
         })
     }
 
@@ -71,7 +93,9 @@ impl HeadModel {
     /// Owned sample storage and this value's fields, excluding the embedded source table.
     /// Allocator bookkeeping is not included.
     pub fn memory_bytes(&self) -> usize {
-        self.samples.capacity() * std::mem::size_of::<f32>() + std::mem::size_of::<Self>()
+        (self.samples.capacity() + self.levels.capacity()) * std::mem::size_of::<f32>()
+            + self.delays.capacity() * std::mem::size_of::<usize>()
+            + std::mem::size_of::<Self>()
     }
 
     /// Writes a response to two buffers of exactly `taps()` values. `None` is unfiltered.
@@ -94,37 +118,11 @@ impl HeadModel {
         } else if azimuth < -180.0 {
             azimuth += 360.0;
         }
-        let az = azimuth.abs() / 10.0;
-        let el = (direction.elevation.clamp(-90.0, 90.0) + 90.0) / 15.0;
-        let a0 = (az as usize).min(AZIMUTHS - 2);
-        let e0 = (el as usize).min(ELEVATIONS - 2);
-        let af = az - a0 as f32;
-        let ef = el - e0 as f32;
-        let rows = [
-            e0 * AZIMUTHS + a0,
-            e0 * AZIMUTHS + a0 + 1,
-            (e0 + 1) * AZIMUTHS + a0,
-            (e0 + 1) * AZIMUTHS + a0 + 1,
-        ];
-        let weights = [
-            (1.0 - af) * (1.0 - ef),
-            af * (1.0 - ef),
-            (1.0 - af) * ef,
-            af * ef,
-        ];
-        let (left, right) = if azimuth < 0.0 {
-            (right, left)
-        } else {
-            (left, right)
-        };
+        let cell = interpolation::cell(azimuth, direction.elevation, interpolation::SMOOTHSTEPS);
         for (ear, output) in [left, right].into_iter().enumerate() {
-            let offsets = rows.map(|row| (row * 2 + ear) * self.taps);
-            for (tap, output) in output.iter_mut().enumerate() {
-                *output = self.samples[offsets[0] + tap] * weights[0]
-                    + self.samples[offsets[1] + tap] * weights[1]
-                    + self.samples[offsets[2] + tap] * weights[2]
-                    + self.samples[offsets[3] + tap] * weights[3];
-            }
+            let ch = ear ^ usize::from(azimuth < 0.0);
+            interpolation::blend(&cell, ch, &self.samples, &self.delays, output);
+            interpolation::match_level(&cell, ch, &self.levels, output);
         }
     }
 }
@@ -190,7 +188,8 @@ mod tests {
         assert!(model.samples.iter().all(|tap| tap.is_finite()));
         assert_eq!(
             model.memory_bytes(),
-            HEAD_MODEL_TABLE_BYTES + std::mem::size_of::<HeadModel>()
+            HEAD_MODEL_DIRECTIONS * 2 * (SOURCE_TAPS * 4 + 4 + std::mem::size_of::<usize>())
+                + std::mem::size_of::<HeadModel>()
         );
         eprintln!(
             "head model: embedded={} bytes, rate=48000, owned={} bytes, taps={}",
@@ -198,6 +197,27 @@ mod tests {
             model.memory_bytes(),
             model.taps()
         );
+    }
+
+    #[test]
+    fn every_grid_node_returns_its_decoded_measurement() {
+        let model = HeadModel::new(SOURCE_RATE).unwrap();
+        for (e, &el) in interpolation::ELEVATIONS.iter().enumerate() {
+            for a in 0..interpolation::AZIMUTHS {
+                let row = interpolation::row(e, a);
+                let (left, right) = response(&model, (a * 5) as f32, el);
+                for (ear, out) in [left, right].iter().enumerate() {
+                    let start = (row * 2 + ear) * EAR_BYTES;
+                    let scale = f32::from_le_bytes(TABLE[start..start + 4].try_into().unwrap());
+                    for (&v, b) in out
+                        .iter()
+                        .zip(TABLE[start + 4..start + EAR_BYTES].chunks_exact(2))
+                    {
+                        assert_eq!(v, scale * i16::from_le_bytes([b[0], b[1]]) as f32);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

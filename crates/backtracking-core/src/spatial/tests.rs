@@ -498,3 +498,45 @@ fn invalid_buffers_and_source_definitions_are_rejected() {
     assert_eq!(renderer.position(), u64::MAX);
     assert_eq!(output, [7.0; 2]);
 }
+
+#[test]
+fn orbit_has_bounded_changes_in_interaural_level() {
+    // Identical isolated impulses sample the moving renderer every 0.96 degrees.
+    const PERIOD: usize = 512;
+    const STEPS: usize = 375;
+    for (elevation, bound) in [(0.0_f32, 0.82), (30.0, 0.95)] {
+        let (height, horizontal) = elevation.to_radians().sin_cos();
+        let keys = (0..=STEPS)
+            .map(|i| {
+                let angle = std::f32::consts::TAU * i as f32 / STEPS as f32;
+                key(
+                    (i * PERIOD) as u64,
+                    horizontal * angle.sin(),
+                    horizontal * angle.cos(),
+                    height,
+                )
+            })
+            .collect();
+        let mut impulses = vec![0.0; (STEPS + 1) * PERIOD];
+        for period in impulses.chunks_exact_mut(PERIOD) {
+            period[0] = 1.0;
+        }
+        let output = clip(&[BinauralSource::Moving(keys)], &impulses);
+        let levels: Vec<_> = output
+            .chunks_exact(2 * PERIOD)
+            .map(|period| 10.0 * (energy(period, 0) / energy(period, 1)).log10())
+            .collect();
+        assert!(levels.iter().all(|db| db.is_finite()));
+        assert!(levels[STEPS / 4] < -3.0 && levels[3 * STEPS / 4] > 3.0);
+        let steps: Vec<_> = levels.windows(2).map(|w| (w[0] - w[1]).abs()).collect();
+        let rms = (steps.iter().map(|v| v * v).sum::<f64>() / STEPS as f64).sqrt();
+        let (index, largest) = steps
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap();
+        eprintln!("orbit elevation {elevation}, ILD RMS step {rms:.6}, maximum {largest:.6} dB at interval {index}");
+        assert!(largest < bound, "maximum ILD step {largest} dB");
+    }
+}
