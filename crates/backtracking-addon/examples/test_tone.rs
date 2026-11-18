@@ -6,8 +6,8 @@
 
 use backtracking_addon::client::Client;
 use backtracking_addon::protocol::{
-    Action, AddonMessage, ChannelGroup, ChoiceOption, Format, HostMessage, MessageLevel, Setting,
-    SettingKind, Source,
+    Action, AddonMessage, ChannelGroup, ChannelPosition, ChoiceOption, Format, HostMessage,
+    MessageLevel, Setting, SettingKind, Source,
 };
 use backtracking_addon::{Error, Result};
 use serde_json::Value;
@@ -43,6 +43,7 @@ fn run() -> Result<()> {
     client.send(&tone.describe(&sender.id))?;
     let block_time = Duration::from_millis(10);
     let mut next_block = Instant::now();
+    let mut next_positions = 0_u64;
 
     loop {
         // Limit work per turn so a busy control connection cannot starve audio.
@@ -53,7 +54,9 @@ fn run() -> Result<()> {
             match message {
                 HostMessage::Quit => return Ok(()),
                 HostMessage::SelectFormat { source, format } => {
-                    if source != "main" || !matches!(format.as_str(), "stereo" | "5.1" | "7.1.4") {
+                    if source != "main"
+                        || !matches!(format.as_str(), "stereo" | "5.1" | "7.1.4" | "objects")
+                    {
                         report_error(&mut client, "Choose a format offered by source main.")?;
                         continue;
                     }
@@ -62,6 +65,7 @@ fn run() -> Result<()> {
                     // before describe tells the host to reconnect.
                     sender.set_channels(tone.labels().len())?;
                     client.send(&tone.describe(&sender.id))?;
+                    next_positions = 0;
                 }
                 HostMessage::SetSetting { key, value } => match tone.set_setting(&key, &value) {
                     Ok(()) => client.send(&tone.describe(&sender.id))?,
@@ -86,7 +90,22 @@ fn run() -> Result<()> {
         let now = Instant::now();
         if now >= next_block {
             let samples = tone.render();
-            sender.publish(monotonic_ns()?, &samples)?;
+            let time = monotonic_ns()?;
+            sender.publish(time, &samples)?;
+            if tone.format == "objects" && time >= next_positions {
+                // Full state, stamped with this audio packet's first frame. Keep an
+                // independent schedule so ten-millisecond packets average 31 updates/s.
+                client.send_positions("main", time, &object_positions(time))?;
+                next_positions = if next_positions == 0 {
+                    time
+                } else {
+                    next_positions
+                }
+                .saturating_add(1_000_000_000 / 31);
+                if next_positions <= time {
+                    next_positions = time.saturating_add(1_000_000_000 / 31);
+                }
+            }
             next_block += block_time;
             // Resume real-time pacing after a stall rather than emit old audio.
             if now.saturating_duration_since(next_block) >= block_time {
@@ -133,6 +152,7 @@ impl Tone {
             "7.1.4" => &[
                 "L", "R", "C", "LFE", "Ls", "Rs", "Lrs", "Rrs", "Ltf", "Rtf", "Ltr", "Rtr",
             ],
+            "objects" => &["L", "R", "Object 1", "Object 2"],
             _ => &["L", "R"],
         }
     }
@@ -165,20 +185,42 @@ impl Tone {
                 id: "main".into(),
                 name: "Test tone".into(),
                 sender: sender.into(),
-                formats: [("stereo", "Stereo"), ("5.1", "5.1"), ("7.1.4", "7.1.4")]
-                    .into_iter()
-                    .map(|(id, label)| Format {
-                        id: id.into(),
-                        label: label.into(),
-                    })
-                    .collect(),
+                formats: [
+                    ("stereo", "Stereo"),
+                    ("5.1", "5.1"),
+                    ("7.1.4", "7.1.4"),
+                    ("objects", "Stereo + 2 objects / 立體聲與兩個物件"),
+                ]
+                .into_iter()
+                .map(|(id, label)| Format {
+                    id: id.into(),
+                    label: label.into(),
+                })
+                .collect(),
                 format: self.format.clone(),
-                groups: Some(vec![ChannelGroup {
-                    id: "channels".into(),
-                    label: "Channels".into(),
-                    channels: self.labels().iter().map(|v| (*v).into()).collect(),
-                    positioned: false,
-                }]),
+                groups: Some(if self.format == "objects" {
+                    vec![
+                        ChannelGroup {
+                            id: "channels".into(),
+                            label: "Channels".into(),
+                            channels: vec!["L".into(), "R".into()],
+                            positioned: false,
+                        },
+                        ChannelGroup {
+                            id: "objects".into(),
+                            label: "Objects".into(),
+                            channels: vec!["Object 1".into(), "Object 2".into()],
+                            positioned: true,
+                        },
+                    ]
+                } else {
+                    vec![ChannelGroup {
+                        id: "channels".into(),
+                        label: "Channels".into(),
+                        channels: self.labels().iter().map(|v| (*v).into()).collect(),
+                        positioned: false,
+                    }]
+                }),
                 transport: None,
             }],
             settings: vec![
@@ -248,6 +290,17 @@ impl Tone {
         }
         samples
     }
+}
+
+// Stream indices count across groups: stereo is 0/1, objects are 2/3.
+// Object 1 circles clockwise at ear level once every four seconds. Using
+// the packet clock for the angle keeps position and audio together after a stall.
+fn object_positions(time: u64) -> [ChannelPosition; 2] {
+    let angle = (time % 4_000_000_000) as f64 / 4_000_000_000.0 * TAU;
+    [
+        ChannelPosition::new(2, 0.8 * angle.sin(), 0.8 * angle.cos(), 0.0),
+        ChannelPosition::new(3, -0.5, 0.5, 0.0),
+    ]
 }
 
 // Each peer has a bounded handshake and one pending packet. A reader that stops
@@ -509,4 +562,62 @@ fn monotonic_ns() -> Result<u64> {
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn monotonic_ns() -> Result<u64> {
     Err(Error::new("This example supports Windows, macOS and Linux"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn objects_format_declares_stereo_and_two_positioned_objects() {
+        let mut tone = Tone::new();
+        tone.format = "objects".into();
+        assert_eq!(tone.labels(), &["L", "R", "Object 1", "Object 2"]);
+        let AddonMessage::Describe { sources, .. } = tone.describe("ab-cd") else {
+            panic!("expected describe");
+        };
+        let groups = sources[0].groups.as_ref().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(!groups[0].positioned);
+        assert_eq!(groups[1].id, "objects");
+        assert!(groups[1].positioned);
+        assert_eq!(groups[1].channels, ["Object 1", "Object 2"]);
+    }
+
+    #[test]
+    fn object_positions_circle_every_four_seconds_and_keep_front_left_fixed() {
+        for (time, x, y) in [
+            (0, 0.0, 0.8),
+            (1_000_000_000, 0.8, 0.0),
+            (2_000_000_000, 0.0, -0.8),
+            (3_000_000_000, -0.8, 0.0),
+            (4_000_000_000, 0.0, 0.8),
+        ] {
+            let positions = object_positions(time);
+            assert_eq!(positions[0].channel, 2);
+            assert!((positions[0].x - x).abs() < 1e-12);
+            assert!((positions[0].y - y).abs() < 1e-12);
+            assert_eq!(positions[0].z, 0.0);
+            assert_eq!(positions[1], ChannelPosition::new(3, -0.5, 0.5, 0.0));
+        }
+    }
+
+    #[test]
+    fn objects_have_distinct_pitches() {
+        let mut tone = Tone::new();
+        tone.format = "objects".into();
+        let samples = tone.render();
+        assert_eq!(samples.len(), FRAMES * 4);
+        let crossings = |channel| {
+            samples
+                .chunks_exact(4)
+                .map(|frame| frame[channel])
+                .collect::<Vec<_>>()
+                .windows(2)
+                .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+                .count()
+        };
+        assert_eq!(crossings(2), 7); // 660 Hz over ten milliseconds.
+        assert_eq!(crossings(3), 8); // 770 Hz over ten milliseconds.
+    }
 }

@@ -173,7 +173,7 @@ fn example_handshakes_selects_surround_and_streams_six_distinct_channels() {
     );
     assert_eq!(
         initial["sources"][0]["formats"].as_array().unwrap().len(),
-        3
+        4
     );
     assert_eq!(initial["settings"].as_array().unwrap().len(), 3);
     assert_eq!(initial["actions"][0]["id"], "restart");
@@ -241,6 +241,50 @@ fn example_exits_and_removes_registration_when_host_disconnects() {
     tone.control.shutdown(std::net::Shutdown::Both).unwrap();
     tone.wait_for_exit();
     assert!(!registration.exists());
+}
+
+#[test]
+fn example_streams_full_object_positions_on_the_audio_clock() {
+    let mut tone = RunningTone::start();
+    assert_eq!(tone.receive()["type"], "describe");
+    tone.send(json!({"type":"select_format","source":"main","format":"objects"}));
+    let description = tone.receive();
+    assert_eq!(description["sources"][0]["format"], "objects");
+    assert_eq!(description["sources"][0]["groups"][1]["positioned"], true);
+    let sender = description["sources"][0]["sender"].as_str().unwrap();
+    let contents =
+        fs::read_to_string(tone.registrations().join(format!("{sender}.sender"))).unwrap();
+    let fields: Vec<_> = contents.split('\t').collect();
+    assert_eq!(&fields[1..4], &["1", "48000", "4"]);
+    let mut audio = TcpStream::connect(("127.0.0.1", fields[0].parse::<u16>().unwrap())).unwrap();
+    audio
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write!(audio, "A{sender}").unwrap();
+    let (audio_time, _) = read_packet(&mut audio, 4);
+    let positions = loop {
+        let message = tone.receive();
+        assert_eq!(message["type"], "positions");
+        if message["time"].as_u64().unwrap() >= audio_time {
+            break message;
+        }
+    };
+    let time = positions["time"].as_u64().unwrap();
+    assert!(time - audio_time < 100_000_000);
+    assert_eq!(positions["source"], "main");
+    let channels = positions["channels"].as_array().unwrap();
+    assert_eq!(channels.len(), 2);
+    assert_eq!(channels[0]["channel"], 2);
+    let angle = (time % 4_000_000_000) as f64 / 4_000_000_000.0 * std::f64::consts::TAU;
+    assert!((channels[0]["x"].as_f64().unwrap() - 0.8 * angle.sin()).abs() < 1e-12);
+    assert!((channels[0]["y"].as_f64().unwrap() - 0.8 * angle.cos()).abs() < 1e-12);
+    assert_eq!(channels[0]["z"], 0.0);
+    assert_eq!(channels[1]["channel"], 3);
+    assert_eq!(channels[1]["x"], -0.5);
+    assert_eq!(channels[1]["y"], 0.5);
+    assert_eq!(channels[1]["z"], 0.0);
+    tone.send(json!({"type":"quit"}));
+    tone.wait_for_exit();
 }
 
 fn read_packet(audio: &mut TcpStream, channels: usize) -> (u64, Vec<f32>) {

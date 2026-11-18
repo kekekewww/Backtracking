@@ -170,6 +170,15 @@ Sources (capability `source`):
 | `groups` | What the audio stream contains now: one or more groups of channels, in stream order. The channel counts of all groups add up to the Sender's channel count. Backtracking stacks one waveform per channel of the group on show and lets the user switch groups. Labels are up to 24 characters. A source without `groups` is treated as one group named "Channels" with numbered channels. |
 | `transport` | Optional. Present when the source plays something with a position. `state` is `playing`, `paused` or `stopped`. `position` and `duration` are seconds; `duration` may be absent for an endless source. |
 
+Each entry in `groups`:
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Stable within this source. |
+| `label` | The group name shown by the host, up to 24 characters. |
+| `channels` | Channel labels in stream order, up to 24 characters each. A group must have at least one channel. |
+| `positioned` | Optional boolean, default `false`. With `true`, the add-on sends `positions` for this group's channels. |
+
 Settings (capability `settings`): `kind` is `toggle` (boolean), `choice` (one of `options`, a
 string), `number` (with `min` ≤ `default` ≤ `max` and a `step` above zero, which is how far one
 click moves the value) or `text` (up to 200 characters). `key` is 1 to 40 characters of lower-case
@@ -187,6 +196,38 @@ The host ignores updates for unknown sources and sources whose latest `describe`
 ```json
 {"type":"transport","source":"main","state":"playing","position":13.0,"duration":60.0}
 ```
+
+**`positions`** gives the places of a source's positioned channels at one moment of its audio.
+
+```json
+{"type":"positions","source":"main","time":8123456789012,
+ "channels":[{"channel":12,"x":-0.5,"y":0.8,"z":0.0,"size":0.0,"gain":1.0}]}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `source` | The source id from `describe`. |
+| `time` | Nanoseconds on the clock of the Sender packets (section 5): the moment in the audio at which these positions hold. It may lie up to 5 seconds in the future. |
+| `channels` | Every positioned channel whose position is known, at most 64 entries. This is the full state, not a list of differences. |
+| `channel` | Zero-based index into the Sender stream, counted across groups. Must lie in a group with `positioned: true`. |
+| `x`, `y`, `z` | The listener is at 0, 0, 0. `x` runs from -1 (left wall) to 1 (right wall), `y` from -1 (back wall) to 1 (front wall), and `z` from -1 (floor) to 1 (ceiling); 0 is ear level. |
+| `size` | Optional, 0 to 1, default 0 (a point). Stored, not used by the renderer yet. |
+| `gain` | Optional linear level, default 1. The add-on has **not** already applied it to the audio. |
+
+Send one when anything changes, at most 50 per second per source, and at least one per second
+while the source plays. The host thins faster updates without stopping the add-on. A channel's
+position moves in a straight line from one update to the next. Before its first update it has no
+position.
+
+The host ignores messages for unknown sources or more than 5 seconds in the future. It drops
+entries outside a positioned group or with any number that is not finite, clamps `x`, `y`, `z`
+to -1 through 1, and clamps `size` to 0 through 1. These do not stop the add-on.
+
+Positions belong to the audio at `time`. Seeking, pausing and format changes need nothing
+special: stamp positions with the time that audio is heard. Rust authors can call
+`Client::send_positions(source, time, channels)` with `ChannelPosition` entries. The example's
+`objects` format shows a stereo group followed by two positioned objects, so their stream
+indices are 2 and 3.
 
 **`message`** shows one line next to the add-on on the Add-ons page, replacing the previous one.
 `level` is `info`, `warning` or `error`; `text` is up to 300 characters. An empty `text` clears it.
@@ -264,6 +305,8 @@ Backtracking aligns sources by these timestamps.
   extras (for example separate objects) as a setting that is off by default.
 - Keep `describe` truthful: the groups must match the stream at the moment it is sent. Re-register
   the Sender first, then send `describe`.
+- Send `positions` only when something changed, apart from the once-per-second update while
+  playing. Each message still contains the full known state.
 - Give audio threads priority over everything else you do, and back off background work under load.
 - Exit promptly on `quit` and when the connection closes.
 

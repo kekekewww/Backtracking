@@ -9,11 +9,13 @@ use std::time::{Duration, Instant};
 
 use backtracking_core::{
     CaptureError, CaptureState, ChannelRoute, ChannelRouting, DurationChoice, FrozenTrack,
+    FrozenPositionTrack,
     MeterReadings, SenderInfo, SenderReceiver, SynchronizedCapture, TimedPacket, WaveformView,
     discover_senders,
 };
 
-use crate::addons::{AddonHandle, AddonSnapshot, AddonState};
+use crate::addons::{AddonHandle, AddonPositions, AddonSnapshot, AddonState};
+use crate::addons::position_timeline::PositionTimeline;
 use crate::preferences::{
     Key, PreferenceWriter, Preferences, SourceGroupChoices, serialize_shown_groups,
     source_preference_key,
@@ -74,6 +76,7 @@ impl DisplayStamp {
         state.error.hash(&mut status);
         state.mode_error.hash(&mut status);
         state.statuses.hash(&mut status);
+        state.position_overflowed.hash(&mut status);
         for (lane, format) in state.formats.iter().enumerate() {
             format.as_ref().map(Arc::as_ptr).hash(&mut status);
             capture
@@ -413,6 +416,9 @@ type WaveformBuffers<'a> = (&'a mut [f32], &'a mut [f32]);
 pub(crate) struct EditSnapshot {
     /// The lanes of one frozen view. They share the capture's pages.
     pub(crate) snapshots: Arc<[FrozenTrack]>,
+    /// Position history by logical lane, shared with this view until live writes diverge.
+    #[allow(dead_code)] // Export and moving-source rendering consume this in the next wave.
+    pub(crate) positions: [FrozenPositionTrack; 2],
     pub(crate) bar_markers: Vec<u64>,
     pub(crate) generation: u64,
     /// Group metadata is frozen with the audio, before a later format change.
@@ -470,7 +476,13 @@ impl SourceStatus {
         let capture = state.capture.as_ref().map(SynchronizedCapture::capture);
         Self {
             formats: state.formats.clone(),
-            statuses: state.statuses.clone(),
+            statuses: std::array::from_fn(|lane| {
+                state.statuses[lane].clone().or_else(|| {
+                state.position_overflowed[lane].then(|| {
+                    "Position history was trimmed to its memory limit. / 位置歷史已依記憶體上限刪減。".into()
+                })
+            })
+            }),
             error: state.error.clone().or_else(|| state.mode_error.clone()),
             paused: state.is_paused(),
             recording: state.is_recording(),
@@ -994,6 +1006,10 @@ struct CaptureSession {
     sender_packet_at: Option<Instant>,
     addons: Option<AddonHandle>,
     addon_snapshot: Option<Arc<AddonSnapshot>>,
+    positions: [PositionTimeline; 2],
+    position_cursor: u64,
+    position_packet_ends: [Option<u64>; 2],
+    position_overflowed: [bool; 2],
     groups: [Vec<LaneGroup>; 2],
     shown_groups: SourceGroupChoices,
     history_budget_samples: usize,
@@ -1036,6 +1052,10 @@ impl CaptureSession {
             sender_packet_at: None,
             addons: None,
             addon_snapshot: None,
+            positions: std::array::from_fn(|_| PositionTimeline::default()),
+            position_cursor: 0,
+            position_packet_ends: [None; 2],
+            position_overflowed: [false; 2],
             groups: std::array::from_fn(|_| Vec::new()),
             shown_groups: SourceGroupChoices::new(),
             history_budget_samples: machine_history_budget_samples(),
@@ -1226,6 +1246,7 @@ impl CaptureSession {
 
     fn poll(&mut self) {
         self.refresh_addon_state();
+        self.refresh_positions();
         if self.paused {
             return;
         }
@@ -1325,6 +1346,57 @@ impl CaptureSession {
         self.apply_addon_snapshot(next);
     }
 
+    fn refresh_positions(&mut self) {
+        let Some(addons) = &self.addons else {
+            return;
+        };
+        let messages = addons.positions_since(&mut self.position_cursor);
+        if self.paused {
+            return;
+        }
+        for message in messages {
+            self.receive_positions(&message);
+        }
+    }
+
+    fn receive_positions(&mut self, message: &AddonPositions) {
+        if message.time < self.discard_before_ns {
+            return;
+        }
+        for lane in 0..2 {
+            let Some(settings) = &self.sources[lane] else {
+                continue;
+            };
+            let CaptureSource::Addon {
+                addon_id,
+                source_id,
+                ..
+            } = &settings.source
+            else {
+                continue;
+            };
+            if *addon_id != message.addon_id || *source_id != message.source_id {
+                continue;
+            }
+            let Some(source) = self.addon_source(&settings.source) else {
+                continue;
+            };
+            let channels = message
+                .channels
+                .iter()
+                .filter_map(|channel| {
+                    let mut channel = *channel;
+                    channel.channel =
+                        positioned_lane_channel(source, settings.route, channel.channel)?;
+                    Some(channel)
+                })
+                .collect::<Vec<_>>();
+            if !channels.is_empty() {
+                self.positions[lane].receive(message.time, channels);
+            }
+        }
+    }
+
     fn apply_addon_snapshot(&mut self, next: Arc<AddonSnapshot>) {
         if self
             .addon_snapshot
@@ -1379,6 +1451,21 @@ impl CaptureSession {
                         .is_some_and(|settings| settings.source.same_source(&source))
                         && self.formats[lane].is_some()
                     {
+                        let allowed = self.sources[lane]
+                            .as_ref()
+                            .and_then(|settings| {
+                                let source = self.addon_source(&settings.source)?;
+                                Some(
+                                    (0..64)
+                                        .filter_map(|channel| {
+                                            positioned_lane_channel(source, settings.route, channel)
+                                                .map(|channel| channel as usize)
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .unwrap_or_default();
+                        self.positions[lane].retain_channels(&allowed);
                         match self.groups_for_lane(lane) {
                             Ok(groups) => {
                                 self.groups[lane] = groups;
@@ -1757,6 +1844,7 @@ impl CaptureSession {
                     capture.capture_mut().pause();
                 }
                 self.capture = Some(capture);
+                self.clear_positions();
                 self.shape = Some(shape);
                 self.bump_generation();
             }
@@ -1766,6 +1854,7 @@ impl CaptureSession {
 
     fn reset_capture(&mut self) {
         self.capture = None;
+        self.clear_positions();
         self.shape = None;
         self.bump_generation();
     }
@@ -1773,6 +1862,14 @@ impl CaptureSession {
     fn bump_generation(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn clear_positions(&mut self) {
+        for positions in &mut self.positions {
+            positions.clear();
+        }
+        self.position_packet_ends = [None; 2];
+        self.position_overflowed = [false; 2];
     }
 
     fn shared_source_routes(&self) -> Option<([ChannelRoute; 2], usize)> {
@@ -1800,6 +1897,7 @@ impl CaptureSession {
         // cannot commit silence over queued data from the other device.
         for _ in 0..PACKET_QUEUE_CAPACITY {
             let mut found = false;
+            let mut position_packets = Vec::new();
             for input in &mut self.inputs {
                 let Some(packet) = input.stream.packet(&mut self.native, &mut self.bars) else {
                     continue;
@@ -1857,6 +1955,23 @@ impl CaptureSession {
                                 *status = Some(error.to_string());
                             }
                         }
+                    } else {
+                        for (lane, source) in self.sources.iter().enumerate() {
+                            if self.capture_lanes[lane].is_some()
+                                && source.as_ref().is_some_and(|source| {
+                                    source.source.same_source(&input.source)
+                                        && matches!(source.source, CaptureSource::Addon { .. })
+                                })
+                            {
+                                self.positions[lane].audio_packet(
+                                    timestamp_ns,
+                                    packet.frames - skip,
+                                    packet.sample_rate,
+                                    capture_rate,
+                                    capture.capture().frame_range(),
+                                );
+                            }
+                        }
                     }
                     continue;
                 }
@@ -1888,6 +2003,22 @@ impl CaptureSession {
                         )
                     {
                         self.statuses[lane] = Some(error.to_string());
+                    } else if !self.scratch.is_empty()
+                        && matches!(source.source, CaptureSource::Addon { .. })
+                    {
+                        let frames = packet.frames - skip;
+                        let end_time = timestamp_ns.saturating_add(
+                            (frames as u128 * 1_000_000_000 / u128::from(packet.sample_rate))
+                                as u64,
+                        );
+                        self.position_packet_ends[lane] = Some(end_time);
+                        position_packets.push((
+                            lane,
+                            timestamp_ns,
+                            frames,
+                            packet.sample_rate,
+                            end_time,
+                        ));
                     }
                 }
             }
@@ -1895,6 +2026,28 @@ impl CaptureSession {
                 break;
             }
             capture.drain(false);
+            // Independent inputs may hold a short resampling/jitter tail. Anchor
+            // each received packet against the same observed retained end.
+            let latest = self
+                .position_packet_ends
+                .iter()
+                .flatten()
+                .copied()
+                .max()
+                .unwrap_or(0);
+            let retained = capture.capture().frame_range();
+            for (lane, time, frames, rate, end_time) in position_packets {
+                let lag = (u128::from(latest.saturating_sub(end_time)) * u128::from(capture_rate)
+                    / 1_000_000_000) as u64;
+                let end = retained.end.saturating_sub(lag).max(retained.start);
+                self.positions[lane].audio_packet(
+                    time,
+                    frames,
+                    rate,
+                    capture_rate,
+                    retained.start..end,
+                );
+            }
         }
         if flush {
             capture.drain(true);
@@ -1908,6 +2061,11 @@ impl CaptureSession {
         }
         if capture.capture().revision() != before {
             self.revision = self.revision.wrapping_add(1);
+        }
+        let frames = capture.capture().frame_range();
+        for (lane, positions) in self.positions.iter_mut().enumerate() {
+            positions.retain_frames(frames.clone());
+            self.position_overflowed[lane] |= positions.take_overflowed();
         }
     }
 
@@ -1929,6 +2087,7 @@ impl CaptureSession {
             }
         }
         self.drain(true);
+        for positions in &mut self.positions { positions.stop_pending(); }
         for input in &mut self.inputs {
             input.stream.suspend();
         }
@@ -2006,6 +2165,7 @@ impl CaptureSession {
         let frames = capture.frame_range();
         Some(EditSnapshot {
             snapshots: self.snapshots(Some(frames.clone()))?,
+            positions: self.positions.each_ref().map(PositionTimeline::freeze),
             bar_markers: capture.bar_markers(frames),
             generation: self.generation,
             groups: self.groups.clone(),
@@ -2025,6 +2185,7 @@ impl CaptureSession {
             capture.reset_input();
             capture.capture_mut().clear();
         }
+        self.clear_positions();
         self.bump_generation();
     }
 
@@ -2036,6 +2197,12 @@ impl CaptureSession {
             capture.set_retention(retention);
             if capture.revision() != before {
                 self.revision = self.revision.wrapping_add(1);
+            }
+        }
+        if let Some(capture) = &self.capture {
+            let frames = capture.capture().frame_range();
+            for positions in &mut self.positions {
+                positions.retain_frames(frames.clone());
             }
         }
     }
@@ -2075,6 +2242,37 @@ impl CaptureSession {
         }
         drop(barriers);
         self.mode_error = None;
+    }
+}
+
+/// Positions use the captured lane's channel indices, after narrow source routing.
+fn positioned_lane_channel(
+    source: &backtracking_addon::protocol::Source,
+    route: ChannelRoute,
+    channel: u32,
+) -> Option<u32> {
+    let mut offset = 0;
+    let mut positioned = false;
+    for group in source.groups.iter().flatten() {
+        let end = offset + group.channels.len();
+        if (offset..end).contains(&(channel as usize)) {
+            positioned = group.positioned;
+        }
+        offset = end;
+    }
+    if !positioned {
+        return None;
+    }
+    if offset > 2 {
+        return Some(channel);
+    }
+    match route {
+        ChannelRoute::Merged => Some(channel),
+        ChannelRoute::Left if channel == 0 => Some(0),
+        ChannelRoute::Right if channel == 1 => Some(0),
+        // Mid and Side combine two positions into one sample; neither has a
+        // single source position. Center does not exist in a narrow stream.
+        _ => None,
     }
 }
 
@@ -2144,6 +2342,77 @@ mod tests {
             source_id: "main".into(),
             name: "Six channels".into(),
         }
+    }
+
+    #[test]
+    fn positioned_channels_follow_narrow_routes_and_native_wide_lanes() {
+        let mut snapshot = addon_fixture(AddonState::Running);
+        let source = &mut snapshot.addons[0].sources[0];
+        source.groups.as_mut().unwrap()[0].positioned = true;
+        assert_eq!(
+            positioned_lane_channel(source, ChannelRoute::Right, 5),
+            Some(5)
+        );
+        source.groups.as_mut().unwrap()[0].channels.truncate(2);
+        assert_eq!(
+            positioned_lane_channel(source, ChannelRoute::Right, 1),
+            Some(0)
+        );
+        assert_eq!(
+            positioned_lane_channel(source, ChannelRoute::Right, 0),
+            None
+        );
+        assert_eq!(
+            positioned_lane_channel(source, ChannelRoute::Left, 0),
+            Some(0)
+        );
+        assert_eq!(
+            positioned_lane_channel(source, ChannelRoute::Merged, 1),
+            Some(1)
+        );
+        assert_eq!(positioned_lane_channel(source, ChannelRoute::Mid, 0), None);
+        assert_eq!(positioned_lane_channel(source, ChannelRoute::Side, 1), None);
+    }
+
+    #[test]
+    fn removing_positioned_stops_new_states_but_keeps_frozen_history() {
+        use backtracking_addon::protocol::ChannelPosition;
+        let mut session = retained_addon_session();
+        let mut description = addon_fixture(AddonState::Running);
+        description.revision = 2;
+        description.addons[0].sources[0].groups.as_mut().unwrap()[0].positioned = true;
+        session.apply_addon_snapshot(Arc::new(description.clone()));
+        session.positions[0].audio_packet(1_000_000_000, 100, 1000, 1000, 0..100);
+        let mut message = AddonPositions {
+            sequence: 1,
+            addon_id: "test.addon".into(),
+            source_id: "main".into(),
+            time: 1_010_000_000,
+            channels: vec![ChannelPosition::new(2, -0.5, 0.5, 0.0)],
+        };
+        session.receive_positions(&message);
+        message.time = 2_010_000_000;
+        session.receive_positions(&message);
+        description.revision = 3;
+        description.addons[0].sources[0].groups.as_mut().unwrap()[0].channels[2] = "Renamed".into();
+        session.apply_addon_snapshot(Arc::new(description.clone()));
+        session.positions[0].audio_packet(2_000_000_000, 100, 1000, 1000, 0..200);
+        assert_eq!(
+            session.positions[0].freeze().len(),
+            2,
+            "label changes must preserve future states"
+        );
+        let frozen = session.positions[0].freeze();
+        description.revision = 4;
+        description.addons[0].sources[0].groups.as_mut().unwrap()[0].positioned = false;
+        session.apply_addon_snapshot(Arc::new(description));
+        message.time = 2_020_000_000;
+        session.receive_positions(&message);
+        assert_eq!(session.positions[0].freeze().len(), 2);
+        assert_eq!(frozen.len(), 2);
+        session.clear();
+        assert!(session.positions[0].freeze().is_empty());
+        assert_eq!(frozen.len(), 2);
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod export;
 mod fade;
 mod ffi;
 mod meter;
+mod positions;
 mod preview;
 mod preview_ffi;
 mod queue;
@@ -27,6 +28,7 @@ pub use export::{
 };
 pub use fade::{dragged_fades, fade_waveform_bins, FadeEnd, Fades};
 pub use meter::MeterReadings;
+pub use positions::{FrozenPositionTrack, Position, PositionKey, PositionTrack, MAX_POSITION_BYTES};
 pub use preview::{Preview, PreviewGate, PreviewSlot, SlotRender};
 pub use queue::{AudioQueue, TimedAudioQueue, TimedPacket};
 pub use sender::{

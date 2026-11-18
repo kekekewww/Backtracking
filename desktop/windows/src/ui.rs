@@ -5996,6 +5996,7 @@ mod tests {
             lanes: vec![0, 1],
             groups: std::array::from_fn(|_| Vec::new()),
             shown_groups: [None, None],
+            positions: std::array::from_fn(|_| backtracking_core::PositionTrack::new().freeze()),
             snapshots: vec![
                 FrozenTrack::from_interleaved(48000, 1, 100, &[0.1; 4]).unwrap(),
                 FrozenTrack::from_interleaved(48000, 1, second_first, &[-0.1; 4]).unwrap(),
@@ -6692,6 +6693,7 @@ mod tests {
                 ],
             ],
             shown_groups: [None, Some("objects".into())],
+            positions: std::array::from_fn(|_| backtracking_core::PositionTrack::new().freeze()),
         };
         let spec = SnapshotSpec {
             selection: None,
@@ -6738,6 +6740,7 @@ mod tests {
             bar_markers: Vec::new(),
             groups: [Vec::new(), Vec::new()],
             shown_groups: [None, None],
+            positions: std::array::from_fn(|_| backtracking_core::PositionTrack::new().freeze()),
         };
         let spec = SnapshotSpec {
             selection: None,

@@ -30,6 +30,7 @@ struct Request {
 #[derive(Serialize, Deserialize)]
 enum WireCommand {
     Snapshot,
+    Positions { after: u64 },
     Inspect(PathBuf),
     Install(PathBuf, [u8; 32]),
     Remove { id: String, delete_data: bool },
@@ -43,6 +44,10 @@ enum WireCommand {
 #[derive(Serialize, Deserialize)]
 enum ResponseData {
     Snapshot(AddonSnapshot),
+    Positions {
+        cursor: u64,
+        messages: Vec<AddonPositions>,
+    },
     Package(WirePackage),
     Inspected(WirePackage, [u8; 32]),
     Done,
@@ -151,6 +156,7 @@ pub(super) fn connect(root: PathBuf) -> Result<AddonManager, String> {
     let shared = Arc::new(Shared {
         snapshot: Mutex::new(Arc::new(snapshot)),
         callbacks: Mutex::new(Vec::new()),
+        positions: Mutex::new(PositionJournal::default()),
     });
     let worker_shared = shared.clone();
     let worker = thread::Builder::new()
@@ -230,10 +236,21 @@ fn serve_client(mut stream: TcpStream, handle: &AddonHandle, token: &str, stoppi
 fn dispatch(handle: &AddonHandle, command: WireCommand, stopping: &AtomicBool) -> Response {
     match command {
         WireCommand::Snapshot => Ok(ResponseData::Snapshot((*handle.snapshot()).clone())),
+        WireCommand::Positions { after } => {
+            let mut cursor = after;
+            let messages = handle
+                .positions_since(&mut cursor)
+                .into_iter()
+                .map(|message| (*message).clone())
+                .collect();
+            Ok(ResponseData::Positions { cursor, messages })
+        }
         WireCommand::Inspect(path) => await_reply(handle.inspect(path), stopping)
             .map(|reviewed| ResponseData::Inspected(reviewed.info.into(), reviewed.identity)),
-        WireCommand::Install(path, identity) => await_reply(handle.install(path, identity), stopping)
-            .map(|info| ResponseData::Package(info.into())),
+        WireCommand::Install(path, identity) => {
+            await_reply(handle.install(path, identity), stopping)
+                .map(|info| ResponseData::Package(info.into()))
+        }
         WireCommand::Remove { id, delete_data } => {
             await_reply(handle.remove(&id, delete_data), stopping).map(|()| ResponseData::Done)
         }
@@ -304,6 +321,8 @@ fn proxy(root: PathBuf, receiver: mpsc::Receiver<Command>, shared: Arc<Shared>) 
     let mut pending: Vec<JoinHandle<()>> = Vec::new();
     let mut queued = VecDeque::new();
     let mut refresh = Instant::now();
+    let mut position_cursor = 0;
+    let mut position_primary = None;
     loop {
         reap(&mut pending);
         let mut wait = refresh.saturating_duration_since(Instant::now());
@@ -347,7 +366,22 @@ fn proxy(root: PathBuf, receiver: mpsc::Receiver<Command>, shared: Arc<Shared>) 
         }
         if Instant::now() >= refresh {
             match remote_snapshot(&root, Some(&stopping)) {
-                Ok(snapshot) => publish(&shared, snapshot),
+                Ok(snapshot) => {
+                    publish(&shared, snapshot);
+                    if let Ok((cursor, messages)) = remote_positions(
+                        &root,
+                        position_cursor,
+                        &mut position_primary,
+                        Some(&stopping),
+                    ) {
+                        position_cursor = cursor;
+                        let mut journal =
+                            shared.positions.lock().unwrap_or_else(|e| e.into_inner());
+                        for message in messages {
+                            journal.push(message);
+                        }
+                    }
+                }
                 Err(error) => {
                     let mut snapshot = shared
                         .snapshot
@@ -483,11 +517,33 @@ fn remote_snapshot(root: &Path, stopping: Option<&AtomicBool>) -> Result<AddonSn
     }
 }
 
+fn remote_positions(
+    root: &Path,
+    mut after: u64,
+    primary: &mut Option<String>,
+    stopping: Option<&AtomicBool>,
+) -> Result<(u64, Vec<AddonPositions>), String> {
+    let endpoint = read_endpoint(root)?;
+    if primary.as_deref() != Some(endpoint.token.as_str()) {
+        after = 0;
+    }
+    match exchange(&endpoint, WireCommand::Positions { after }, stopping)? {
+        ResponseData::Positions { cursor, messages } => {
+            *primary = Some(endpoint.token);
+            Ok((cursor, messages))
+        }
+        _ => Err("The primary add-on host returned unexpected positions".into()),
+    }
+}
+
 fn exchange(endpoint: &Endpoint, command: WireCommand, stopping: Option<&AtomicBool>) -> Response {
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, endpoint.port));
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(500))
         .map_err(|e| e.to_string())?;
-    let timeout = if matches!(command, WireCommand::Snapshot) {
+    let timeout = if matches!(
+        command,
+        WireCommand::Snapshot | WireCommand::Positions { .. }
+    ) {
         NETWORK_TIMEOUT
     } else {
         COMMAND_TIMEOUT
@@ -754,8 +810,81 @@ mod tests {
         let shared = Arc::new(Shared {
             snapshot: Mutex::new(Arc::new(snapshot)),
             callbacks: Mutex::new(Vec::new()),
+            positions: Mutex::new(PositionJournal::default()),
         });
         (AddonHandle { commands, shared }, receiver)
+    }
+
+    #[test]
+    fn proxy_delivers_positions_to_independent_readers_without_changing_snapshot() {
+        let root = Directory::new();
+        let (primary_handle, _commands) = fake_host();
+        let primary = Bridge::start(&root.0, primary_handle.clone()).unwrap();
+        let secondary = connect(root.0.clone()).unwrap();
+        let revision = secondary.handle().snapshot().revision;
+        primary_handle
+            .shared
+            .positions
+            .lock()
+            .unwrap()
+            .push(AddonPositions {
+                sequence: 0,
+                addon_id: "com.example.test".into(),
+                source_id: "main".into(),
+                time: 123_000_000,
+                channels: vec![ChannelPosition::new(2, -0.5, 0.8, 0.0)],
+            });
+        let handle = secondary.handle();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut a = 0;
+        let first = loop {
+            let messages = handle.positions_since(&mut a);
+            if !messages.is_empty() {
+                break messages;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Timed out waiting for bridged positions"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        let mut b = 0;
+        let second = handle.positions_since(&mut b);
+        assert_eq!(first, second);
+        assert_eq!(first[0].time, 123_000_000);
+        assert_eq!(first[0].channels[0].channel, 2);
+        assert_eq!(handle.snapshot().revision, revision);
+        assert!(handle.positions_since(&mut a).is_empty());
+        let mut primary_cursor = 0;
+        assert_eq!(primary_handle.positions_since(&mut primary_cursor).len(), 1);
+        drop(primary);
+        let (restarted_handle, _restarted_commands) = fake_host();
+        restarted_handle
+            .shared
+            .positions
+            .lock()
+            .unwrap()
+            .push(AddonPositions {
+                sequence: 0,
+                addon_id: "com.example.test".into(),
+                source_id: "main".into(),
+                time: 456_000_000,
+                channels: vec![ChannelPosition::new(2, 0.5, 0.8, 0.0)],
+            });
+        let _restarted = Bridge::start(&root.0, restarted_handle).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let messages = handle.positions_since(&mut a);
+            if let Some(message) = messages.last() {
+                assert_eq!(message.time, 456_000_000);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Timed out waiting for restarted host's positions"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
