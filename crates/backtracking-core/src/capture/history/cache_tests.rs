@@ -82,7 +82,7 @@ fn extra_peaks_allocate_only_for_requested_channels_and_complete_blocks() {
     };
     let page = Page::from_samples(0, &audio(641, layout.channels), layout).unwrap();
     let cache = wide_cache(&page);
-    assert!(cache.get().is_none());
+    assert!(cache.native.get().is_none());
     // Existing left/right traces and sample-level requests need no new cache.
     for channel in 0..layout.channels {
         for frames in [1..15, 17..31, 640..641] {
@@ -95,9 +95,9 @@ fn extra_peaks_allocate_only_for_requested_channels_and_complete_blocks() {
     for channel in [0, 1, 2, 3] {
         read(&page, layout, channel, 0..641);
     }
-    assert!(cache.get().is_none());
+    assert!(cache.native.get().is_none());
     read(&page, layout, 13, 128..512);
-    let slots = cache.get().unwrap();
+    let slots = cache.native.get().unwrap();
     assert_eq!(slots.len(), 10);
     for (index, slot) in slots.iter().enumerate() {
         let peaks = slot.lock().unwrap();
@@ -135,7 +135,7 @@ fn a_short_standalone_page_reserves_only_its_actual_audio_length() {
         read(&page, layout, 11, 0..32),
         scan(&page, layout, 11, 0..32)
     );
-    let peaks = wide_cache(&page).get().unwrap()[9].lock().unwrap();
+    let peaks = wide_cache(&page).native.get().unwrap()[9].lock().unwrap();
     assert_eq!(peaks.fine.capacity(), 2);
     assert_eq!(peaks.coarse.capacity(), 0);
 }
@@ -152,13 +152,13 @@ fn open_page_prefixes_share_cold_caches_and_warmed_peak_storage() {
     let long = page.prefix(337, 12);
     assert!(Arc::ptr_eq(wide_cache(&page), wide_cache(&short)));
     assert!(Arc::ptr_eq(wide_cache(&short), wide_cache(&long)));
-    assert!(wide_cache(&page).get().is_none());
+    assert!(wide_cache(&page).native.get().is_none());
     assert_eq!(
         read(&short, layout, 11, 0..200),
         scan(&short, layout, 11, 0..200)
     );
     let (allocation, capacity) = {
-        let peaks = wide_cache(&short).get().unwrap()[9].lock().unwrap();
+        let peaks = wide_cache(&short).native.get().unwrap()[9].lock().unwrap();
         assert_eq!(peaks.fine.len(), 12);
         assert_eq!(peaks.coarse.len(), 1);
         (
@@ -171,7 +171,7 @@ fn open_page_prefixes_share_cold_caches_and_warmed_peak_storage() {
         scan(&long, layout, 11, 0..337)
     );
     {
-        let peaks = wide_cache(&page).get().unwrap()[9].lock().unwrap();
+        let peaks = wide_cache(&page).native.get().unwrap()[9].lock().unwrap();
         assert_eq!(peaks.fine.len(), 21);
         assert_eq!(peaks.coarse.len(), 2);
         assert_eq!((peaks.fine.as_ptr(), peaks.coarse.as_ptr()), allocation);
@@ -241,7 +241,7 @@ fn reset_reuses_unique_cache_capacity_but_detaches_shared_prefixes() {
     read(&page, layout, 11, 0..512);
     let owner = Arc::as_ptr(wide_cache(&page));
     let (allocation, capacity) = {
-        let peaks = wide_cache(&page).get().unwrap()[9].lock().unwrap();
+        let peaks = wide_cache(&page).native.get().unwrap()[9].lock().unwrap();
         (
             (peaks.fine.as_ptr(), peaks.coarse.as_ptr()),
             (peaks.fine.capacity(), peaks.coarse.capacity()),
@@ -250,7 +250,7 @@ fn reset_reuses_unique_cache_capacity_but_detaches_shared_prefixes() {
     page.reset(2_048);
     assert_eq!(Arc::as_ptr(wide_cache(&page)), owner);
     {
-        let peaks = wide_cache(&page).get().unwrap()[9].lock().unwrap();
+        let peaks = wide_cache(&page).native.get().unwrap()[9].lock().unwrap();
         assert!(peaks.fine.is_empty());
         assert!(peaks.coarse.is_empty());
         assert_eq!((peaks.fine.capacity(), peaks.coarse.capacity()), capacity);
@@ -266,9 +266,9 @@ fn reset_reuses_unique_cache_capacity_but_detaches_shared_prefixes() {
     let expected = scan(&prefix, layout, 11, 0..256);
     page.reset(4_096);
     assert!(!Arc::ptr_eq(wide_cache(&page), wide_cache(&prefix)));
-    assert!(wide_cache(&page).get().is_none());
+    assert!(wide_cache(&page).native.get().is_none());
     assert_eq!(read(&prefix, layout, 11, 0..256), expected);
-    let peaks = wide_cache(&prefix).get().unwrap()[9].lock().unwrap();
+    let peaks = wide_cache(&prefix).native.get().unwrap()[9].lock().unwrap();
     assert_eq!((peaks.fine.as_ptr(), peaks.coarse.as_ptr()), allocation);
 }
 

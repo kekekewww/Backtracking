@@ -2,13 +2,24 @@ use super::*;
 use backtracking_core::FrozenCapture;
 
 pub(super) type RenderedRange = (Range<u64>, Range<u64>, u32, Vec<u64>, u64);
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ChannelWaveform {
+    Native(usize),
+    // W3-A constructs these rows when the window displays a wide lane.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Pair(
+        backtracking_core::waveform::PairGroup,
+        backtracking_core::waveform::PairSide,
+    ),
+}
+
 type OwnedTrace = (Vec<f32>, Vec<f32>);
 
 #[derive(Clone, PartialEq)]
 struct View {
     generation: u64,
     lanes: [Option<usize>; 2],
-    channels: Vec<(usize, usize)>,
+    channels: Vec<(usize, ChannelWaveform)>,
     views: Vec<(usize, WaveformView)>,
     zoom: Option<Range<u64>>,
     sizes: Vec<(usize, usize)>,
@@ -74,7 +85,7 @@ impl ChannelWaveforms {
     pub(super) fn render(
         &mut self,
         state: &CaptureSession,
-        channels: &[(usize, usize)],
+        channels: &[(usize, ChannelWaveform)],
         views: &[(usize, WaveformView)],
         zoom: Option<Range<u64>>,
         traces: &mut [WaveformBuffers<'_>],
@@ -193,7 +204,7 @@ impl Work {
         }
         let mut channels = Vec::new();
         let mut views = Vec::new();
-        for (&(lane, channel), &(low_len, high_len)) in
+        for ((lane, channel), &(low_len, high_len)) in
             self.view.channels.iter().zip(&self.view.sizes)
         {
             if self.cancel.load(Ordering::Acquire) {
@@ -203,12 +214,19 @@ impl Work {
             if let Some(track) = self
                 .view
                 .lanes
-                .get(lane)
+                .get(*lane)
                 .copied()
                 .flatten()
                 .and_then(|lane| self.capture.track(lane))
             {
-                track.channel_waveform(channel, self.range.1.clone(), &mut low, &mut high);
+                match channel {
+                    ChannelWaveform::Native(index) => {
+                        track.channel_waveform(*index, self.range.1.clone(), &mut low, &mut high)
+                    }
+                    ChannelWaveform::Pair(group, side) => {
+                        track.pair_waveform(group, *side, self.range.1.clone(), &mut low, &mut high)
+                    }
+                };
             }
             channels.push((low, high));
         }

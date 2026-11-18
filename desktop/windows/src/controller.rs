@@ -26,6 +26,7 @@ mod waveform;
 mod waveform_tests;
 pub(crate) use layout::{LaneGroup, LaneMeterReadings};
 use layout::{combined_channels, lane_groups, lane_meter_readings, machine_history_budget_samples};
+pub(crate) use waveform::ChannelWaveform;
 use waveform::ChannelWaveforms;
 
 pub(crate) use crate::loopback::{CaptureSource, SENDER_MARK};
@@ -815,7 +816,22 @@ impl Controller {
         zoom: Option<Range<u64>>,
         traces: &mut [WaveformBuffers<'_>],
         view_traces: &mut [WaveformBuffers<'_>],
-    ) -> Option<(Range<u64>, Range<u64>, u32, Vec<u64>, u64)> {
+    ) -> Option<waveform::RenderedRange> {
+        let rows: Vec<_> = channels
+            .iter()
+            .map(|&(lane, index)| (lane, ChannelWaveform::Native(index)))
+            .collect();
+        self.try_render_rows(&rows, views, zoom, traces, view_traces)
+    }
+
+    pub(crate) fn try_render_rows(
+        &self,
+        channels: &[(usize, ChannelWaveform)],
+        views: &[(usize, WaveformView)],
+        zoom: Option<Range<u64>>,
+        traces: &mut [WaveformBuffers<'_>],
+        view_traces: &mut [WaveformBuffers<'_>],
+    ) -> Option<waveform::RenderedRange> {
         let state = try_lock(&self.state)?;
         #[cfg(test)]
         let locked_at = Instant::now();

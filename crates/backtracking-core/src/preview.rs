@@ -7,7 +7,10 @@
 //! changes the fades while it plays and asks it to stop.
 
 mod gate;
+mod selected;
 mod slot;
+pub use selected::PreviewLane;
+use selected::WideRender;
 
 use std::ops::Range;
 use std::ptr::NonNull;
@@ -27,6 +30,8 @@ const NOT_STOPPED: u64 = u64::MAX;
 /// Where one lane's frames land in the stereo preview, following the lane's exported WAV.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Placement {
+    Wide(usize),
+    Channel(usize, bool),
     /// A stereo WAV.
     Stereo,
     /// A mono WAV, heard from the middle.
@@ -57,6 +62,10 @@ impl Placement {
 
     fn place(self, frame: &[f32]) -> [f32; 2] {
         match self {
+            Self::Wide(_) => unreachable!("wide lanes are rendered in blocks"),
+            Self::Channel(index, true) => [frame[index]; 2],
+            Self::Channel(0, false) => [frame[0], 0.],
+            Self::Channel(_, false) => [0., frame[1]],
             Self::Stereo => [frame[0], frame[1]],
             Self::Centre => [frame[0], frame[0]],
             Self::Downmix => {
@@ -146,6 +155,7 @@ impl SnapshotRef {
 /// A selection being played back. See the module documentation.
 pub struct Preview {
     lanes: Vec<(Source, Placement)>,
+    wide: Option<WideRender>,
     /// The selection on the retained-audio timeline.
     frames: Range<u64>,
     sample_rate: u32,
@@ -200,29 +210,45 @@ impl Preview {
         force_mono: bool,
         fades: Fades,
     ) -> Option<Self> {
-        let sample_rate = sources.first()?.sample_rate();
-        if sources.len() > 2 || routes.len() < sources.len() || frames.is_empty() || sample_rate == 0 {
+        if routes.len() < sources.len() {
             return None;
         }
-        // The two lanes of a pair hold the same frames, or their WAVs cannot be exported.
-        if let [a, b] = &sources[..] {
-            if a.frame_range() != b.frame_range() {
-                return None;
-            }
+        let lanes = sources
+            .into_iter()
+            .zip(routes)
+            .map(|(source, &route)| {
+                let placement = Placement::new(route, source.channels(), force_mono)?;
+                Some((source, placement))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Self::prepared(lanes, None, frames, fades)
+    }
+
+    fn prepared(
+        lanes: Vec<(Source, Placement)>,
+        wide: Option<WideRender>,
+        frames: Range<u64>,
+        fades: Fades,
+    ) -> Option<Self> {
+        let first = &lanes.first()?.0;
+        let sample_rate = first.sample_rate();
+        let held = first.frame_range();
+        if lanes.len() > 2
+            || frames.is_empty()
+            || sample_rate == 0
+            || frames.start < held.start
+            || frames.end > held.end
+            || lanes
+                .iter()
+                .any(|(s, _)| s.sample_rate() != sample_rate || s.frame_range() != held)
+        {
+            return None;
         }
-        let lanes = sources.into_iter().zip(routes).map(|(source, &route)| {
-            let held = source.frame_range();
-            (source.sample_rate() == sample_rate
-                && frames.start >= held.start
-                && frames.end <= held.end)
-                .then_some(())?;
-            let placement = Placement::new(route, source.channels(), force_mono)?;
-            Some((source, placement))
-        }).collect::<Option<Vec<_>>>()?;
         let length = frames.end - frames.start;
         let fades = fades.fitted(length);
         Some(Self {
             lanes,
+            wide,
             frames,
             sample_rate,
             next: AtomicU64::new(0),
@@ -301,7 +327,19 @@ impl Preview {
     /// Renders up to `frames` stereo frames and hands each to `emit` with its index. Returns how
     /// many it rendered: fewer than asked once the selection or the stop ramp runs out.
     /// One thread renders a preview; others only read its position or change its settings.
-    pub fn render_with(&self, frames: usize, mut emit: impl FnMut(usize, [f32; 2])) -> usize {
+    pub fn render_with(&self, frames: usize, emit: impl FnMut(usize, [f32; 2])) -> usize {
+        match &self.wide {
+            Some(wide) => wide.render(|lanes| self.render_blocks(frames, emit, lanes)),
+            None => self.render_blocks(frames, emit, &mut []),
+        }
+    }
+
+    fn render_blocks(
+        &self,
+        frames: usize,
+        mut emit: impl FnMut(usize, [f32; 2]),
+        wide: &mut [selected::WideLane],
+    ) -> usize {
         let length = self.len();
         let mut position = self.next.load(Ordering::Relaxed);
         let fades = self.fades().fitted(length);
@@ -323,6 +361,10 @@ impl Preview {
             let count = (frames - written).min(BLOCK).min((end - position) as usize);
             let mut mixed = [[0.0f32; 2]; BLOCK];
             for (source, placement) in &self.lanes {
+                if let Placement::Wide(index) = placement {
+                    wide[*index].mix(source, self.frames.start + position, &mut mixed[..count]);
+                    continue;
+                }
                 let mut read = [0.0f32; BLOCK * 2];
                 // A placement exists only for one or two channels.
                 let channels = source.channels();

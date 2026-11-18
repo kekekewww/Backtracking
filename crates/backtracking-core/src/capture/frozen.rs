@@ -416,6 +416,31 @@ impl FrozenTrack {
         })
     }
 
+    /// Min/max bins of one ear of the stereo fold-down, including exact partial blocks.
+    pub fn pair_waveform(
+        &self,
+        group: &crate::waveform::PairGroup,
+        side: crate::waveform::PairSide,
+        frames: Range<u64>,
+        minimum: &mut [f32],
+        maximum: &mut [f32],
+    ) -> usize {
+        if self.channels() <= 2 || group.channels().end > self.channels() {
+            minimum.fill(0.);
+            maximum.fill(0.);
+            return 0;
+        }
+        waveform_bins(self.capture.clamp(frames), minimum, maximum, |range| {
+            history::pair::extrema(
+                self.capture.pages(range),
+                self.capture.layout,
+                self.lane,
+                group,
+                side,
+            )
+        })
+    }
+
     /// Copies the whole lane into one owned buffer.
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot_range(self.frame_range())
@@ -455,6 +480,43 @@ impl fmt::Debug for FrozenTrack {
             .field("channels", &self.channels.len())
             .field("frames", &self.capture.frames)
             .finish_non_exhaustive()
+    }
+}
+
+impl super::Capture {
+    /// Synchronous live query. The desktop worker uses a frozen view to keep the capture lock short.
+    pub fn track_pair_waveform_range(
+        &self,
+        lane: usize,
+        group: &crate::waveform::PairGroup,
+        side: crate::waveform::PairSide,
+        range: Range<u64>,
+        minimum: &mut [f32],
+        maximum: &mut [f32],
+    ) -> usize {
+        if !self
+            .track_channels(lane)
+            .is_some_and(|n| n > 2 && group.channels().end <= n)
+        {
+            minimum.fill(0.);
+            maximum.fill(0.);
+            return 0;
+        }
+        let held = self.frame_range();
+        waveform_bins(
+            range.start.max(held.start)..range.end.min(held.end),
+            minimum,
+            maximum,
+            |frames| {
+                history::pair::extrema(
+                    self.history.pages(frames),
+                    self.history.layout(),
+                    lane,
+                    group,
+                    side,
+                )
+            },
+        )
     }
 }
 

@@ -9,6 +9,7 @@ use crate::waveform::WaveformView;
 
 #[cfg(test)]
 mod cache_tests;
+pub(super) mod pair;
 
 const BASE_SECONDS: usize = 60;
 pub(super) const PEAK_FRAMES: usize = 128;
@@ -100,7 +101,13 @@ struct ChannelBlocks {
     coarse: Vec<Bounds>,
 }
 
-type ChannelPeaks = Arc<OnceLock<Box<[Mutex<ChannelBlocks>]>>>;
+#[derive(Default)]
+struct SharedPeaks {
+    native: OnceLock<Box<[Mutex<ChannelBlocks>]>>,
+    pairs: OnceLock<Box<[Mutex<Option<pair::PairBlocks>>; 2]>>,
+}
+
+type ChannelPeaks = Arc<SharedPeaks>;
 
 struct WidePeaks {
     traces: Vec<[Bounds; TRACES]>,
@@ -145,7 +152,7 @@ impl PagePeaks {
             Self::Wide(Box::new(WidePeaks {
                 traces,
                 capacity_frames,
-                channels: Arc::new(OnceLock::new()),
+                channels: Arc::new(SharedPeaks::default()),
             }))
         }
     }
@@ -167,7 +174,8 @@ impl PagePeaks {
     fn invalidate_channels(&mut self) {
         if let Self::Wide(wide) = self {
             if let Some(cache) = Arc::get_mut(&mut wide.channels) {
-                if let Some(channels) = cache.get_mut() {
+                cache.pairs.take();
+                if let Some(channels) = cache.native.get_mut() {
                     for channel in channels {
                         let blocks = channel.get_mut().unwrap_or_else(|error| error.into_inner());
                         blocks.fine.clear();
@@ -175,7 +183,7 @@ impl PagePeaks {
                     }
                 }
             } else {
-                wide.channels = Arc::new(OnceLock::new());
+                wide.channels = Arc::new(SharedPeaks::default());
             }
         }
     }
@@ -357,7 +365,7 @@ impl Page {
         let PagePeaks::Wide(wide) = &self.peaks else {
             unreachable!("extra channels have a wide cache");
         };
-        let channels = wide.channels.get_or_init(|| {
+        let channels = wide.channels.native.get_or_init(|| {
             (0..layout.extra_channels())
                 .map(|_| Mutex::new(ChannelBlocks::default()))
                 .collect()
@@ -578,7 +586,7 @@ impl History {
                 metadata += std::mem::size_of::<WidePeaks>()
                     + std::mem::size_of_val(&*wide.channels)
                     + 2 * std::mem::size_of::<usize>();
-                if let Some(channels) = wide.channels.get() {
+                if let Some(channels) = wide.channels.native.get() {
                     metadata += std::mem::size_of_val(&**channels);
                     for channel in channels {
                         let blocks = channel.lock().unwrap();
@@ -794,7 +802,7 @@ impl History {
             .map(move |(page, frames)| page.samples(frames, channels))
     }
 
-    fn pages(&self, range: Range<u64>) -> impl Iterator<Item = (&Page, Range<usize>)> {
+    pub(super) fn pages(&self, range: Range<u64>) -> impl Iterator<Item = (&Page, Range<usize>)> {
         let (sealed, open) = self.page_indices(&range);
         let pages = self
             .sealed

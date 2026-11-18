@@ -393,3 +393,50 @@ fn wide_waveform_capture_latency() {
         assert_eq!(silent, 0, "{channels} channels inserted a capture gap");
     }
 }
+
+#[test]
+fn worker_draws_pair_rows_with_native_rows_on_the_same_revision() {
+    use backtracking_core::{
+        spatial,
+        waveform::{PairGroup, PairSide},
+    };
+    let controller = mixed_waveform_controller();
+    let labels = ["FL", "FR", "FC"];
+    let group = PairGroup::new(1, &labels.map(str::to_string)).unwrap();
+    let rows = [
+        (0, ChannelWaveform::Pair(group.clone(), PairSide::Left)),
+        (0, ChannelWaveform::Pair(group, PairSide::Right)),
+        (1, ChannelWaveform::Native(0)),
+    ];
+    let mut expected = [0.; 2];
+    spatial::fold_down(
+        &[0.2, 0.3, 0.4],
+        &spatial::stereo_weights(&labels),
+        &mut expected,
+    )
+    .unwrap();
+    let mut outputs = [([9.; 3], [9.; 3]); 3];
+    let (waiting, release) = block_waveform_worker(&controller);
+    let request = |out: &mut [([f32; 3], [f32; 3]); 3]| {
+        let mut bufs = out.each_mut().map(|(lo, hi)| (&mut lo[..], &mut hi[..]));
+        controller.try_render_rows(&rows, &[], None, &mut bufs, &mut [])
+    };
+    assert!(request(&mut outputs).is_none());
+    waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(controller.state.try_lock().is_ok());
+    assert_eq!(outputs, [([9.; 3], [9.; 3]); 3]);
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(result) = request(&mut outputs) {
+            assert_eq!(result.4, 42);
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    for ((lo, hi), value) in outputs.into_iter().zip([expected[0], expected[1], -0.5]) {
+        assert_eq!(lo, [value; 3]);
+        assert_eq!(hi, lo);
+    }
+}
