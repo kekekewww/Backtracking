@@ -160,6 +160,7 @@ mod tests {
             id: id.into(),
             label: id.into(),
             channels: labels.iter().map(|label| (*label).into()).collect(),
+            positioned: false,
         }
     }
 

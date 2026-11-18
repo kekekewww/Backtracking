@@ -13,6 +13,8 @@ pub struct Client {
     settings: BTreeMap<String, Value>,
     data_dir: PathBuf,
     transport_updates: std::collections::VecDeque<Instant>,
+    /// When `positions` were sent in the last second, for each source.
+    position_updates: BTreeMap<String, std::collections::VecDeque<Instant>>,
 }
 
 impl Client {
@@ -88,6 +90,7 @@ impl Client {
                             settings,
                             data_dir,
                             transport_updates: std::collections::VecDeque::new(),
+                            position_updates: BTreeMap::new(),
                         })
                     }
                     HostMessage::Welcome { .. } => {
@@ -138,9 +141,48 @@ impl Client {
             self.wire.queue(line)?;
             self.transport_updates.push_back(now);
             Ok(())
+        } else if let AddonMessage::Positions {
+            source, channels, ..
+        } = message
+        {
+            if !channels.iter().all(protocol::ChannelPosition::is_finite) {
+                return Err(Error::new("Every number in positions must be finite"));
+            }
+            let now = Instant::now();
+            let sent = self.position_updates.entry(source.clone()).or_default();
+            while sent
+                .front()
+                .is_some_and(|time| now.duration_since(*time) >= Duration::from_secs(1))
+            {
+                sent.pop_front();
+            }
+            if sent.len() >= 50 {
+                return Err(Error::new(
+                    "Send at most 50 positions messages per second for one source",
+                ));
+            }
+            self.wire.queue(line)?;
+            sent.push_back(now);
+            Ok(())
         } else {
             self.wire.queue(line)
         }
+    }
+
+    /// Says where the channels of a source's positioned groups are at `time`, in nanoseconds
+    /// on the clock of the Sender packets: the moment in the audio at which the positions hold.
+    /// List every positioned channel whose position is known, not only the ones that moved.
+    pub fn send_positions(
+        &mut self,
+        source: &str,
+        time: u64,
+        channels: &[protocol::ChannelPosition],
+    ) -> Result<()> {
+        self.send(&AddonMessage::Positions {
+            source: source.into(),
+            time,
+            channels: channels.to_vec(),
+        })
     }
 
     /// Return immediately when no complete host message is available; also flush queued writes.

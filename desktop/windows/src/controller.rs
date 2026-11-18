@@ -813,10 +813,8 @@ impl Controller {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .render(&state, channels, views, zoom, traces, view_traces);
         #[cfg(test)]
-        self.channel_waveform_lock_ns.store(
-            locked_at.elapsed().as_nanos() as u64,
-            Ordering::Relaxed,
-        );
+        self.channel_waveform_lock_ns
+            .store(locked_at.elapsed().as_nanos() as u64, Ordering::Relaxed);
         rendered
     }
 
@@ -1358,9 +1356,7 @@ impl CaptureSession {
             let new = self.addon_source(&source);
             // Only a reopened stream can establish that its audio layout changed.
             let input_changed = match (old, new) {
-                (Some(old), Some(new)) => {
-                    old.sender != new.sender || old.format != new.format
-                }
+                (Some(old), Some(new)) => old.sender != new.sender || old.format != new.format,
                 (None, None) => false,
                 _ => true,
             };
@@ -2135,6 +2131,7 @@ mod tests {
                         channels: ["L", "R", "C", "LFE", "Ls", "Rs"]
                             .map(str::to_string)
                             .into(),
+                        positioned: false,
                     }]),
                 }],
             }],

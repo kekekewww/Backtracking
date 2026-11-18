@@ -1134,13 +1134,10 @@ impl Worker {
                 duration,
             } => {
                 if has_capability(&entry.info, Capability::Source) {
-                    let Some(source) = entry
-                        .info
-                        .sources
-                        .iter_mut()
-                        .find(|item| item.id == source) else {
-                            return Ok(());
-                        };
+                    let Some(source) = entry.info.sources.iter_mut().find(|item| item.id == source)
+                    else {
+                        return Ok(());
+                    };
                     if source.transport.is_none() {
                         return Ok(());
                     }
@@ -1165,6 +1162,8 @@ impl Worker {
                 entry.info.message = (!text.is_empty()).then_some(AddonNotice { level, text });
             }
             AddonMessage::Hello { .. } => return Err("hello may only be sent once".into()),
+            // Stored beside the audio once the position track exists.
+            AddonMessage::Positions { .. } => {}
             AddonMessage::Unknown => {}
         }
         Ok(())
@@ -1761,6 +1760,7 @@ mod tests {
                 id: "channels".into(),
                 label: "Channels".into(),
                 channels: vec!["L".into(), "R".into()],
+                positioned: false,
             }]),
             transport: Some(Transport {
                 state: TransportState::Playing,

@@ -177,6 +177,7 @@ impl Tone {
                     id: "channels".into(),
                     label: "Channels".into(),
                     channels: self.labels().iter().map(|v| (*v).into()).collect(),
+                    positioned: false,
                 }]),
                 transport: None,
             }],

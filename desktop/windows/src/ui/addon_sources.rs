@@ -979,6 +979,7 @@ mod tests {
                     "Ls".into(),
                     "Rs".into(),
                 ],
+                positioned: false,
             }]),
             transport: Some(Transport {
                 state: TransportState::Playing,
@@ -1278,6 +1279,7 @@ mod tests {
             id: "channels".into(),
             label: "Channels".into(),
             channels: vec!["L".into(), "R".into()],
+            positioned: false,
         }]);
         let mut sources = AddonSources::default();
         sources.snapshot = Arc::new(snapshot(vec![stereo]));

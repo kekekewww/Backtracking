@@ -38,6 +38,14 @@ pub enum AddonMessage {
         level: MessageLevel,
         text: String,
     },
+    /// Where the channels of positioned groups are at one moment of the audio.
+    Positions {
+        source: String,
+        /// Nanoseconds on the clock of the Sender packets.
+        time: u64,
+        #[serde(default)]
+        channels: Vec<ChannelPosition>,
+    },
     /// A later contract 1 message that this implementation ignores.
     #[serde(other)]
     Unknown,
@@ -111,6 +119,87 @@ pub struct ChannelGroup {
     pub id: String,
     pub label: String,
     pub channels: Vec<String>,
+    /// The add-on sends `positions` for the channels of this group.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positioned: bool,
+}
+
+/// One channel's place in the room. The listener is at 0, 0, 0. `x` runs from -1 (left wall)
+/// to 1 (right wall), `y` from -1 (back wall) to 1 (front wall), `z` from -1 (floor) to 1
+/// (ceiling). The host clamps values outside that range and drops an entry whose numbers are
+/// not finite; neither stops the add-on.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChannelPosition {
+    /// Zero-based index into the Sender stream, counted across groups.
+    pub channel: u32,
+    #[serde(deserialize_with = "number_or_nan")]
+    pub x: f64,
+    #[serde(deserialize_with = "number_or_nan")]
+    pub y: f64,
+    #[serde(deserialize_with = "number_or_nan")]
+    pub z: f64,
+    /// 0 is a point, 1 fills the room. Stored by the host, not rendered yet.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_number_or_nan"
+    )]
+    pub size: Option<f64>,
+    /// A linear level the add-on has not already applied to the audio. Absent means 1.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_number_or_nan"
+    )]
+    pub gain: Option<f64>,
+}
+
+impl ChannelPosition {
+    /// A point at `x`, `y`, `z` with no size and a gain of 1.
+    pub fn new(channel: u32, x: f64, y: f64, z: f64) -> Self {
+        Self {
+            channel,
+            x,
+            y,
+            z,
+            size: None,
+            gain: None,
+        }
+    }
+
+    /// Whether every number is finite. JSON cannot carry the others: they arrive as `null`.
+    pub fn is_finite(&self) -> bool {
+        [
+            Some(self.x),
+            Some(self.y),
+            Some(self.z),
+            self.size,
+            self.gain,
+        ]
+        .into_iter()
+        .flatten()
+        .all(f64::is_finite)
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// JSON has no NaN or infinity; serde_json writes them as `null`. Reading `null` back as NaN
+/// lets the host drop that one entry instead of failing the whole line.
+fn number_or_nan<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<f64, D::Error> {
+    Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or(f64::NAN))
+}
+
+fn optional_number_or_nan<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<f64>, D::Error> {
+    Ok(Some(
+        Option::<f64>::deserialize(deserializer)?.unwrap_or(f64::NAN),
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -229,6 +318,12 @@ impl AddonMessage {
                 }
             }
             Self::Message { text, .. } => text_limit("message.text", text, 300)?,
+            Self::Positions {
+                source, channels, ..
+            } => {
+                source_id("positions.source", source)?;
+                count_limit("positions.channels", channels.len(), 64)?;
+            }
             Self::Unknown => {}
         }
         Ok(())
@@ -535,6 +630,7 @@ mod tests {
             json!({"type":"describe","sources":[{"id":"main","name":"Tone","sender":"ab-1","formats":[{"id":"stereo","label":"Stereo"}],"format":"stereo","groups":[{"id":"channels","label":"Channels","channels":["L","R"]}],"transport":{"state":"playing","position":0}}],"settings":[{"key":"mute","label":"Mute","kind":"toggle","default":false},{"key":"level","label":"Level","kind":"choice","default":"-12","options":[{"value":"-12","label":"-12 dB"}]},{"key":"frequency","label":"Frequency","kind":"number","default":440,"min":20,"max":20000,"step":1},{"key":"title","label":"Title","kind":"text","default":""}],"actions":[{"id":"restart","label":"Restart"}]}),
             json!({"type":"transport","source":"main","state":"paused","position":3.0,"duration":60.0}),
             json!({"type":"message","level":"error","text":"No audio"}),
+            json!({"type":"positions","source":"main","time":8_123_456_789_012_u64,"channels":[{"channel":12,"x":-0.5,"y":0.8,"z":0.0,"size":0.0,"gain":1.0},{"channel":13,"x":1.0,"y":-1.0,"z":0.5}]}),
         ];
         for value in messages {
             let message = decode_addon(&serde_json::to_vec(&value).unwrap()).unwrap();
@@ -542,6 +638,59 @@ mod tests {
             assert_eq!(encoded.last(), Some(&b'\n'));
             assert_eq!(decode_addon(&encoded).unwrap(), message);
         }
+    }
+
+    #[test]
+    fn a_group_is_positioned_only_when_it_says_so() {
+        let plain: ChannelGroup =
+            serde_json::from_value(json!({"id":"channels","label":"Channels","channels":["L"]}))
+                .unwrap();
+        assert!(!plain.positioned);
+        // An older host reads the same bytes it always did.
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            json!({"id":"channels","label":"Channels","channels":["L"]})
+        );
+        let positioned: ChannelGroup = serde_json::from_value(
+            json!({"id":"objects","label":"Objects","channels":["Object 1"],"positioned":true}),
+        )
+        .unwrap();
+        assert!(positioned.positioned);
+        assert_eq!(
+            serde_json::to_value(&positioned).unwrap()["positioned"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn positions_carry_optional_size_and_gain_and_survive_numbers_json_cannot_hold() {
+        let line = br#"{"type":"positions","source":"main","time":5,"channels":[{"channel":2,"x":null,"y":0.5,"z":0,"gain":null},{"channel":3,"x":0.25,"y":0.5,"z":0}]}"#;
+        let AddonMessage::Positions {
+            source,
+            time,
+            channels,
+        } = decode_addon(line).unwrap()
+        else {
+            panic!("expected positions");
+        };
+        assert_eq!((source.as_str(), time), ("main", 5));
+        assert!(!channels[0].is_finite());
+        assert!(channels[1].is_finite());
+        assert_eq!(channels[1], ChannelPosition::new(3, 0.25, 0.5, 0.0));
+        assert_eq!((channels[1].size, channels[1].gain), (None, None));
+
+        let many = AddonMessage::Positions {
+            source: "main".into(),
+            time: 0,
+            channels: vec![ChannelPosition::new(0, 0.0, 0.0, 0.0); 65],
+        };
+        assert!(encode_addon(&many).is_err());
+        let bad_source = AddonMessage::Positions {
+            source: "not a source id".into(),
+            time: 0,
+            channels: Vec::new(),
+        };
+        assert!(encode_addon(&bad_source).is_err());
     }
 
     #[test]
