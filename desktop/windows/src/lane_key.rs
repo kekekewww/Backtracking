@@ -1,4 +1,5 @@
-//! A tap of the right Ctrl key on the recorder window, which separates lanes A and B.
+//! A tap of the right Ctrl key on the recorder window, which turns "Edit separately" on and
+//! off: while it is on, a drag selects only the rows it crosses.
 //!
 //! egui reports Ctrl without saying which side it is on, so the window's own key messages are
 //! read. A tap is Right Ctrl going down and coming up again soon, with nothing else pressed or
@@ -118,8 +119,16 @@ impl Drop for LaneKey {
 fn nothing_else_held() -> bool {
     let held = |key: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(key.0)) } < 0;
     ![
-        VK_SHIFT, VK_MENU, VK_LCONTROL, VK_LWIN, VK_RWIN, VK_LBUTTON, VK_RBUTTON, VK_MBUTTON,
-        VK_XBUTTON1, VK_XBUTTON2,
+        VK_SHIFT,
+        VK_MENU,
+        VK_LCONTROL,
+        VK_LWIN,
+        VK_RWIN,
+        VK_LBUTTON,
+        VK_RBUTTON,
+        VK_MBUTTON,
+        VK_XBUTTON1,
+        VK_XBUTTON2,
     ]
     .into_iter()
     .any(held)
@@ -136,7 +145,9 @@ unsafe extern "system" fn lane_key_message(
     if message == WM_NCDESTROY {
         unsafe { RemoveWindowSubclass(hwnd, Some(lane_key_message), id) };
     } else if let Some(shared) = unsafe { (data as *const Shared).as_ref() } {
-        let mut tap = Tap { pressed: shared.tap.get() };
+        let mut tap = Tap {
+            pressed: shared.tap.get(),
+        };
         // The tick count is a DWORD handed back as a LONG; its bits are the time.
         let time = unsafe { GetMessageTime() } as u32;
         // Set before the window handles the key, as that may run a frame at once.
@@ -169,7 +180,10 @@ mod tests {
 
     #[test]
     fn a_quick_press_of_right_ctrl_alone_is_a_tap() {
-        let press = [(WM_KEYDOWN, VK_CONTROL, EXTENDED, 0), (WM_KEYUP, VK_CONTROL, EXTENDED, 120)];
+        let press = [
+            (WM_KEYDOWN, VK_CONTROL, EXTENDED, 0),
+            (WM_KEYUP, VK_CONTROL, EXTENDED, 120),
+        ];
         assert_eq!(taps(&press, true), 1);
         // Held keys repeat their down message without ending the tap.
         let held = [
@@ -189,9 +203,15 @@ mod tests {
     #[test]
     fn left_ctrl_a_long_hold_and_ctrl_with_other_input_are_not_taps() {
         // Left Ctrl, and AltGr's own left Ctrl, are not extended keys.
-        let left = [(WM_KEYDOWN, VK_CONTROL, 0, 0), (WM_KEYUP, VK_CONTROL, 0, 100)];
+        let left = [
+            (WM_KEYDOWN, VK_CONTROL, 0, 0),
+            (WM_KEYUP, VK_CONTROL, 0, 100),
+        ];
         assert_eq!(taps(&left, true), 0);
-        let long = [(WM_KEYDOWN, VK_CONTROL, EXTENDED, 0), (WM_KEYUP, VK_CONTROL, EXTENDED, 900)];
+        let long = [
+            (WM_KEYDOWN, VK_CONTROL, EXTENDED, 0),
+            (WM_KEYUP, VK_CONTROL, EXTENDED, 900),
+        ];
         assert_eq!(taps(&long, true), 0);
         let long_wrapped = [
             (WM_KEYDOWN, VK_CONTROL, EXTENDED, u32::MAX - 449),
@@ -206,12 +226,18 @@ mod tests {
             (WM_MOUSEWHEEL, 0, 0, 50),
             (WM_KILLFOCUS, 0, 0, 50),
         ] {
-            let messages =
-                [(WM_KEYDOWN, VK_CONTROL, EXTENDED, 0), other, (WM_KEYUP, VK_CONTROL, EXTENDED, 100)];
+            let messages = [
+                (WM_KEYDOWN, VK_CONTROL, EXTENDED, 0),
+                other,
+                (WM_KEYUP, VK_CONTROL, EXTENDED, 100),
+            ];
             assert_eq!(taps(&messages, true), 0, "{other:?}");
         }
         // Shift, Alt, a Windows key or a mouse button already down.
-        let press = [(WM_KEYDOWN, VK_CONTROL, EXTENDED, 0), (WM_KEYUP, VK_CONTROL, EXTENDED, 100)];
+        let press = [
+            (WM_KEYDOWN, VK_CONTROL, EXTENDED, 0),
+            (WM_KEYUP, VK_CONTROL, EXTENDED, 100),
+        ];
         assert_eq!(taps(&press, false), 0);
         // A release without its press, as after the window gains focus with Ctrl down.
         assert_eq!(taps(&[(WM_KEYUP, VK_CONTROL, EXTENDED, 0)], true), 0);

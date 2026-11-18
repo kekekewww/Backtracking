@@ -136,6 +136,26 @@ impl Language {
         )
     }
 
+    /// The right-click menu's item for selecting rows on their own (Right Ctrl).
+    pub(crate) fn separate_rows(self) -> &'static str {
+        self.pick("Edit separately", "分開編輯")
+    }
+
+    pub(crate) fn editing_separately(self, on: bool) -> &'static str {
+        if on {
+            self.pick("Editing rows separately", "分開編輯各列")
+        } else {
+            self.pick("Editing all rows together", "一起編輯所有列")
+        }
+    }
+
+    pub(crate) fn separate_needs_rows(self) -> &'static str {
+        self.pick(
+            "Editing separately needs more than one row.",
+            "分開編輯需要一列以上的波形。",
+        )
+    }
+
     pub(crate) fn test_copy_startup(self) -> &'static str {
         self.pick(
             "A test copy does not change the Windows startup entry.",
@@ -844,7 +864,20 @@ mod tests {
                 language.wide_export_mode(true),
                 language.wide_export_mode(false)
             );
+            assert_ne!(
+                language.editing_separately(true),
+                language.editing_separately(false)
+            );
         }
+        for text in [
+            super::Language::separate_rows,
+            super::Language::separate_needs_rows,
+        ] {
+            assert_ne!(text(English), text(TraditionalChinese));
+            assert!(text(TraditionalChinese).chars().any(|c| c as u32 >= 0x3000));
+        }
+        assert_eq!(English.separate_rows(), "Edit separately");
+        assert_eq!(English.editing_separately(true), "Editing rows separately");
         assert_eq!(
             English.shorter_history(40, 279.0),
             "With 40 channels, memory holds the latest 4 minutes 39 seconds."

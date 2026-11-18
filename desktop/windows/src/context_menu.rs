@@ -33,7 +33,7 @@ impl WindowCommand {
         match self {
             Self::ToggleCapture => Some("Space"),
             Self::Clear => Some("Delete"),
-            // A tap, on its own; see `lane_key`.
+            // A tap, on its own; see `lane_key`. It turns "Edit separately" on and off.
             Self::SeparateLanes => Some("Right Ctrl"),
             // Saving has the global shortcut only; the Options window names its key.
             Self::SaveSnapshot
@@ -70,9 +70,11 @@ pub(crate) struct State {
     pub(crate) capture_controls: bool,
     pub(crate) waveform_only: bool,
     pub(crate) keep_on_top: bool,
-    /// Two sources record, so their lanes can be edited on their own.
-    pub(crate) two_lanes: bool,
-    pub(crate) separate_lanes: bool,
+    /// The window shows more than one row, so rows can be edited on their own.
+    pub(crate) several_rows: bool,
+    pub(crate) separate_rows: bool,
+    /// The item's words in the window's language ("Edit separately").
+    pub(crate) separate_label: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,18 +110,33 @@ pub(crate) fn entries(state: State) -> Vec<Entry> {
     };
     let capture = state.capture_controls;
     vec![
-        item(WindowCommand::ToggleCapture, state.transport.label(), false, capture),
+        item(
+            WindowCommand::ToggleCapture,
+            state.transport.label(),
+            false,
+            capture,
+        ),
         item(WindowCommand::Clear, "Clear", false, capture),
         item(WindowCommand::SaveSnapshot, "Save snapshot", false, capture),
         Entry::Separator,
         item(
             WindowCommand::SeparateLanes,
-            "Edit A and B separately",
-            state.two_lanes && state.separate_lanes,
-            state.two_lanes,
+            state.separate_label,
+            state.several_rows && state.separate_rows,
+            state.several_rows,
         ),
-        item(WindowCommand::WaveformOnly, "Show waveform only", state.waveform_only, true),
-        item(WindowCommand::KeepOnTop, "Keep on top", state.keep_on_top, true),
+        item(
+            WindowCommand::WaveformOnly,
+            "Show waveform only",
+            state.waveform_only,
+            true,
+        ),
+        item(
+            WindowCommand::KeepOnTop,
+            "Keep on top",
+            state.keep_on_top,
+            true,
+        ),
         Entry::Separator,
         item(WindowCommand::Options, "Options…", false, true),
         item(WindowCommand::Quit, "Quit", false, true),
@@ -213,8 +230,9 @@ mod tests {
             capture_controls: true,
             waveform_only: false,
             keep_on_top: false,
-            two_lanes: true,
-            separate_lanes: false,
+            several_rows: true,
+            separate_rows: false,
+            separate_label: "Edit separately",
         }
     }
 
@@ -246,7 +264,7 @@ mod tests {
                 "Clear\tDelete",
                 "Save snapshot",
                 "-",
-                "Edit A and B separately\tRight Ctrl",
+                "Edit separately\tRight Ctrl",
                 "Show waveform only",
                 "Keep on top",
                 "-",
@@ -267,7 +285,10 @@ mod tests {
                 transport,
                 ..state()
             });
-            assert_eq!(item(&entries, WindowCommand::ToggleCapture), (label, false, true));
+            assert_eq!(
+                item(&entries, WindowCommand::ToggleCapture),
+                (label, false, true)
+            );
         }
 
         let off = entries(state());
@@ -275,7 +296,10 @@ mod tests {
             item(&off, WindowCommand::WaveformOnly),
             ("Show waveform only", false, true)
         );
-        assert_eq!(item(&off, WindowCommand::KeepOnTop), ("Keep on top", false, true));
+        assert_eq!(
+            item(&off, WindowCommand::KeepOnTop),
+            ("Keep on top", false, true)
+        );
         let on = entries(State {
             waveform_only: true,
             keep_on_top: true,
@@ -291,7 +315,11 @@ mod tests {
             capture_controls: false,
             ..state()
         });
-        for command in [WindowCommand::ToggleCapture, WindowCommand::Clear, WindowCommand::SaveSnapshot] {
+        for command in [
+            WindowCommand::ToggleCapture,
+            WindowCommand::Clear,
+            WindowCommand::SaveSnapshot,
+        ] {
             assert!(!item(&entries, command).2, "{command:?}");
         }
         for command in [
@@ -306,14 +334,33 @@ mod tests {
     }
 
     #[test]
-    fn separate_lanes_needs_two_sources_and_shows_when_it_is_on() {
-        let label = "Edit A and B separately";
-        let on = entries(State { separate_lanes: true, ..state() });
+    fn edit_separately_needs_more_than_one_row_and_shows_when_it_is_on() {
+        let label = "Edit separately";
+        let on = entries(State {
+            separate_rows: true,
+            ..state()
+        });
         assert_eq!(item(&on, WindowCommand::SeparateLanes), (label, true, true));
         let off = entries(state());
-        assert_eq!(item(&off, WindowCommand::SeparateLanes), (label, false, true));
-        // One source, even split into left and right, has no lanes to separate.
-        let one = entries(State { two_lanes: false, separate_lanes: true, ..state() });
-        assert_eq!(item(&one, WindowCommand::SeparateLanes), (label, false, false));
+        assert_eq!(
+            item(&off, WindowCommand::SeparateLanes),
+            (label, false, true)
+        );
+        // One merged row has nothing to keep apart.
+        let one = entries(State {
+            several_rows: false,
+            separate_rows: true,
+            ..state()
+        });
+        assert_eq!(
+            item(&one, WindowCommand::SeparateLanes),
+            (label, false, false)
+        );
+        // The label is the window's own.
+        let other = entries(State {
+            separate_label: "分開編輯",
+            ..state()
+        });
+        assert_eq!(item(&other, WindowCommand::SeparateLanes).0, "分開編輯");
     }
 }

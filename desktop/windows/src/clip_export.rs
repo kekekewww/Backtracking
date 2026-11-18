@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use backtracking_core::{
-    ChannelRoute, Fades, FrozenTrack, TakeLabel, WavExportProfile,
+    ChannelExportMode, ChannelRoute, Fades, FrozenTrack, TakeLabel, WavExportProfile,
     export_channel_range_with_profile, export_labelled_tracks,
 };
 
@@ -21,10 +21,12 @@ pub(crate) struct ExportOptions {
     pub(crate) addons: Option<AddonHandle>,
 }
 
-/// Writes a frozen clip on a worker thread. Wide lanes use the selected group;
-/// mono and stereo retain the existing routing and file naming behavior.
+/// Writes a frozen clip on a worker thread. Wide lanes use the selected group; mono and stereo
+/// retain the existing routing and file naming behavior.
 /// `file_labels` names each track's files and `fades` ramp every file, wide lanes included.
 #[allow(clippy::too_many_arguments)]
+// The window writes through `export_clip_channels`; tests and the add-on checks call this.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn export_clip(
     output: &Path,
     tracks: &[FrozenTrack],
@@ -36,6 +38,37 @@ pub(crate) fn export_clip(
     file_labels: &[TakeLabel],
     options: &ExportOptions,
 ) -> io::Result<Vec<PathBuf>> {
+    export_clip_channels(
+        output,
+        tracks,
+        frames,
+        fades,
+        profile,
+        routes,
+        force_mono,
+        file_labels,
+        options,
+        &[None, None],
+    )
+}
+
+/// As `export_clip`, writing of each track only `channels`, when only some of a lane's rows
+/// were selected; `None` writes the lane as `export_clip` does. A wide lane writes the
+/// channels chosen in its export mode, and one side of a stereo lane chosen on its own is
+/// written as a mono file under the lane's own name.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn export_clip_channels(
+    output: &Path,
+    tracks: &[FrozenTrack],
+    frames: Range<usize>,
+    fades: Fades,
+    profile: WavExportProfile,
+    routes: &[ChannelRoute],
+    force_mono: bool,
+    file_labels: &[TakeLabel],
+    options: &ExportOptions,
+    channels: &[Option<Range<usize>>; 2],
+) -> io::Result<Vec<PathBuf>> {
     if tracks.is_empty()
         || tracks.len() > 2
         || routes.len() != tracks.len()
@@ -46,9 +79,26 @@ pub(crate) fn export_clip(
             "Invalid capture lanes",
         ));
     }
+    // The channels of a lane only some of whose rows were selected.
+    let mut narrowed = [None, None];
+    for (lane, track) in tracks.iter().enumerate() {
+        let Some(channels) = channels[lane].clone() else {
+            continue;
+        };
+        if channels.is_empty() || channels.end > track.channels() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The selected rows do not match this capture",
+            ));
+        }
+        if channels != (0..track.channels()) {
+            narrowed[lane] = Some(channels);
+        }
+    }
     let mut paths = Vec::new();
     let write = (|| {
-        if tracks.iter().all(|track| track.channels() <= 2) {
+        if tracks.iter().all(|track| track.channels() <= 2) && narrowed.iter().all(Option::is_none)
+        {
             paths = export_labelled_tracks(
                 output,
                 tracks,
@@ -65,8 +115,9 @@ pub(crate) fn export_clip(
             for (lane, track) in tracks.iter().enumerate() {
                 let files = if track.channels() > 2 {
                     let group = options.groups[lane].as_ref();
-                    let channels =
-                        group.map_or(0..track.channels(), |group| group.channels.clone());
+                    let channels = narrowed[lane].clone().unwrap_or_else(|| {
+                        group.map_or(0..track.channels(), |group| group.channels.clone())
+                    });
                     let mut labels: Vec<String> = (1..=track.channels())
                         .map(|channel| format!("Channel {channel}"))
                         .collect();
@@ -90,6 +141,19 @@ pub(crate) fn export_clip(
                         &labels,
                         profile,
                         options.wide_mode.export_mode(),
+                        fades,
+                        &file_labels[lane],
+                    )?
+                } else if let Some(channels) = narrowed[lane].clone() {
+                    // One side of a stereo lane: one mono file, named like the lane's own.
+                    export_channel_range_with_profile(
+                        output,
+                        track,
+                        frames.clone(),
+                        channels,
+                        &[],
+                        profile,
+                        ChannelExportMode::Multichannel,
                         fades,
                         &file_labels[lane],
                     )?
@@ -225,8 +289,10 @@ mod tests {
         let data = std::fs::read(&paths[0]).unwrap();
         assert_eq!(u16::from_le_bytes(data[22..24].try_into().unwrap()), 3);
         let samples: Vec<f32> = data[data.len() - 24..]
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&bytes| f32::from_le_bytes(bytes))
             .collect();
         assert_eq!(samples, [0.4, 0.5, 0.6, 0.5, 0.6, 0.7]);
     }
@@ -336,6 +402,90 @@ mod tests {
     }
 
     #[test]
+    fn selected_rows_write_only_their_channels_and_one_side_of_stereo_as_mono() {
+        let folder = Folder::new();
+        // Channel n holds n / 10 in every frame.
+        let wide = FrozenTrack::from_interleaved(
+            48_000,
+            6,
+            0,
+            &(0..4)
+                .flat_map(|_| (0..6).map(|channel| channel as f32 / 10.0))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let stereo = FrozenTrack::from_interleaved(48_000, 2, 0, &[0.25, -0.5].repeat(4)).unwrap();
+        let labels = [
+            TakeLabel::new("Tone", Some(backtracking_core::Lane::A)),
+            TakeLabel::new("Music", Some(backtracking_core::Lane::B)),
+        ];
+        let options = options();
+        // Channels 2 and 3 of the wide lane, which straddle the start of its "objects" group,
+        // and the right side of the stereo lane.
+        let paths = export_clip_channels(
+            &folder.0,
+            &[wide.clone(), stereo.clone()],
+            0..4,
+            Fades::NONE,
+            WavExportProfile::default(),
+            &[ChannelRoute::Merged; 2],
+            false,
+            &labels,
+            &options,
+            &[Some(2..4), Some(1..2)],
+        )
+        .unwrap();
+        let names = file_names(&paths);
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names[0].ends_with("-Ch03_Channel 3.wav"), "{names:?}");
+        assert!(names[1].ends_with("-Ch04_Object 1.wav"), "{names:?}");
+        assert!(names[2].starts_with("Backtracking_Music_B_2"), "{names:?}");
+        assert!(
+            names[2].ends_with("s.wav") && !names[2].contains("-Ch"),
+            "{names:?}"
+        );
+        for (path, value) in paths.iter().zip([0.2, 0.3, -0.5]) {
+            let data = std::fs::read(path).unwrap();
+            assert_eq!(u16::from_le_bytes(data[22..24].try_into().unwrap()), 1);
+            let last = f32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
+            assert_eq!(last, value);
+        }
+        // Both sides, or every channel, are the whole lane as before.
+        let whole = export_clip_channels(
+            &folder.0,
+            &[wide.clone(), stereo],
+            0..4,
+            Fades::NONE,
+            WavExportProfile::default(),
+            &[ChannelRoute::Merged; 2],
+            false,
+            &labels,
+            &options,
+            &[Some(0..6), Some(0..2)],
+        )
+        .unwrap();
+        assert_eq!(whole.len(), 4, "the objects group and one stereo file");
+        // Channels the track does not have are refused, and nothing is left behind.
+        let before = std::fs::read_dir(&folder.0).unwrap().count();
+        assert!(
+            export_clip_channels(
+                &folder.0,
+                std::slice::from_ref(&wide),
+                0..4,
+                Fades::NONE,
+                WavExportProfile::default(),
+                &[ChannelRoute::Merged],
+                false,
+                &[TakeLabel::default()],
+                &options,
+                &[Some(5..7), None],
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_dir(&folder.0).unwrap().count(), before);
+    }
+
+    #[test]
     fn fades_ramp_every_channel_of_a_wide_lane_in_either_wide_mode() {
         let folder = Folder::new();
         let frames = 10;
@@ -370,8 +520,10 @@ mod tests {
                 let data = std::fs::read(path).unwrap();
                 let channels = usize::from(u16::from_le_bytes(data[22..24].try_into().unwrap()));
                 let samples: Vec<f32> = data[data.len() - frames as usize * channels * 4..]
-                    .chunks_exact(4)
-                    .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&bytes| f32::from_le_bytes(bytes))
                     .collect();
                 for (frame, samples) in samples.chunks_exact(channels).enumerate() {
                     assert!(

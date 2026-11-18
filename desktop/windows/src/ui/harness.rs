@@ -9,8 +9,13 @@
 //!   `zoom=<seconds>` shows only that much; `select=<from>-<to>` selects that stretch, as a
 //!   drag would; `scroll=<lane>:<row>` scrolls a stacked lane (A is 0) to that row;
 //!   `group=<lane>:<group id>` shows another channel group.
-//!   `separate=<on|off>` edits lanes A and B on their own or together, as Right Ctrl does,
-//!   and `select-lane=<lane>` makes the next `select=` belong to that lane.
+//!   `separate=<on|off>` edits rows on their own or together, as Right Ctrl does.
+//!   `rows=<lane>:<first>-<last>` makes the next `select=` cover those rows of the lane, as a
+//!   drag from the first row to the last does; rows count from 1, top down, as in the row
+//!   tooltips, and `rows=A:10-B:1` runs from row 10 of lane A to row 1 of lane B.
+//!   `select-lane=<lane>` makes it cover every row of that lane. Both need `separate=on`.
+//!   `save=<folder>` saves the selection (or everything, without one) into that folder, through
+//!   the Save command's own code, waits until the files are written and lists them in the log.
 //!   `options=<page>[:<width>x<height>]` opens the Options window on that page (`actions`,
 //!   `capture`, `sources`, `appearance`, `export`, `addons`, `updates`), optionally at that
 //!   size, and makes the picture of the Options window instead of the main window.
@@ -39,7 +44,7 @@ use std::time::{Duration, Instant};
 use backtracking_addon::protocol::TransportCommand;
 use eframe::egui;
 
-use super::{OptionsSection, Recorder};
+use super::{OptionsSection, Recorder, RowSource, rows_between};
 
 pub(super) const SCREENSHOT: &str = "BACKTRACKING_TEST_SCREENSHOT";
 const SCREENSHOT_DELAY: &str = "BACKTRACKING_TEST_SCREENSHOT_DELAY_MS";
@@ -55,10 +60,15 @@ const SETTLE: Duration = Duration::from_millis(500);
 pub(super) enum Step {
     Zoom(f64),
     Select(f64, f64),
-    /// The lane a selection made after it belongs to, as if its drag started there.
+    /// Every row of a lane is what a selection made after it covers.
     SelectLane(usize),
-    /// Lanes A and B edited on their own, as Right Ctrl switches them.
+    /// The rows a selection made after it covers: from row `.1` of lane `.0` to row `.3` of
+    /// lane `.2`, counted from zero.
+    Rows(usize, usize, usize, usize),
+    /// Rows edited on their own, as Right Ctrl switches them.
     Separate(bool),
+    /// Saves as the Save command does, into this folder.
+    Save(PathBuf),
     Scroll(usize, usize),
     Group(usize, String),
     Options(OptionsSection, Option<egui::Vec2>),
@@ -84,6 +94,7 @@ impl Step {
                 | Self::Format(..)
                 | Self::Open(..)
                 | Self::Transport(..)
+                | Self::Save(_)
                 | Self::Wait(_)
         )
     }
@@ -178,6 +189,30 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                     Ok(Step::Select(number(from)?, number(to)?))
                 }
                 "select-lane" => Ok(Step::SelectLane(lane(value)?)),
+                "rows" => {
+                    let (first_lane, rows) = pair(step, value)?;
+                    let (first, last) = rows
+                        .split_once('-')
+                        .ok_or_else(|| format!("{step} needs <lane>:<first>-<last>"))?;
+                    let (last_lane, last) = match last.split_once(':') {
+                        Some((last_lane, last)) => (lane(last_lane)?, last),
+                        None => (lane(first_lane)?, last),
+                    };
+                    let row = |text: &str| {
+                        text.trim()
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|row| row.checked_sub(1))
+                            .ok_or_else(|| format!("{text} is not a row counted from 1"))
+                    };
+                    Ok(Step::Rows(
+                        lane(first_lane)?,
+                        row(first)?,
+                        last_lane,
+                        row(last)?,
+                    ))
+                }
+                "save" => Ok(Step::Save(PathBuf::from(value.trim()))),
                 "separate" => match value.trim() {
                     "on" => Ok(Step::Separate(true)),
                     "off" => Ok(Step::Separate(false)),
@@ -364,6 +399,30 @@ impl Harness {
         })
     }
 
+    /// Lists the files a save wrote in the log, with what their headers say.
+    pub(super) fn note_saved(&mut self, paths: &[PathBuf]) {
+        for path in paths {
+            let header = fs::read(path).ok().and_then(|bytes| wav_header(&bytes));
+            self.notes.push(match header {
+                Some(header) => format!(
+                    "saved {}: {} channels, {} Hz, {} bits, {} frames ({:.3} s)",
+                    path.display(),
+                    header.channels,
+                    header.rate,
+                    header.bits,
+                    header.frames,
+                    header.frames as f64 / f64::from(header.rate.max(1)),
+                ),
+                None => format!("saved {} (not a WAV file this can read)", path.display()),
+            });
+        }
+    }
+
+    /// Puts a line in the log.
+    pub(super) fn note(&mut self, text: String) {
+        self.notes.push(text);
+    }
+
     fn write_log(&self, picture: &io::Result<[usize; 2]>) {
         let mut log = String::new();
         match picture {
@@ -465,7 +524,12 @@ impl Recorder {
             // Dropped files are read in the next pass, and the manager answers after that.
             && harness.main_drops.is_empty()
             && harness.options_drops.is_empty()
-            && !self.addons_page.waiting();
+            && !self.addons_page.waiting()
+            // A `save=` waits for its files to be written.
+            && self.snapshot_save.is_none()
+            && self.pending_snapshot_saves.is_empty()
+            && self.pending_snapshot_reads.is_empty()
+            && self.pending_edit_save_reads.is_empty();
         if !settled {
             ctx.request_repaint_after(Duration::from_millis(50));
             return;
@@ -544,19 +608,47 @@ impl Recorder {
                 // As a finished drag does: freeze the audio, then keep the range.
                 self.begin_editing();
                 self.last_interaction = Instant::now();
-                let flags = self.flag_update(start..end, Some(self.selection_lane));
+                let flags = self.flag_update(start..end, self.selection_rows.clone());
                 self.apply_flags(flags);
                 self.selection = Some(start..end);
                 self.invalidate_export();
             }
-            &Step::SelectLane(lane) => self.selection_lane = lane,
+            &Step::SelectLane(lane) => {
+                let plan = self
+                    .lanes
+                    .iter()
+                    .find(|plan| plan.lane == lane)
+                    .ok_or("the window does not show that lane")?;
+                let last = plan.rows().checked_sub(1).ok_or("the lane has no rows")?;
+                let rows = rows_between(&self.lanes, plan.row(0), plan.row(last));
+                self.choose_test_rows(rows)?;
+            }
+            &Step::Rows(first_lane, first, last_lane, last) => {
+                let row = |lane: usize, row: usize| {
+                    self.lanes
+                        .iter()
+                        .find(|plan| plan.lane == lane)
+                        .filter(|plan| row < plan.rows())
+                        .map(|plan| plan.row(row))
+                        .ok_or_else(|| format!("the window has no row {} in that lane", row + 1))
+                };
+                let rows =
+                    rows_between(&self.lanes, row(first_lane, first)?, row(last_lane, last)?);
+                self.choose_test_rows(rows)?;
+            }
             &Step::Separate(on) => {
-                if !self.dual_source() {
-                    return Err("separate lanes need two sources".into());
+                if self.row_count() < 2 {
+                    return Err("editing separately needs more than one row".into());
                 }
-                if self.separate_lanes != on {
-                    self.toggle_separate_lanes();
+                if self.separate_rows != on {
+                    self.toggle_separate_rows();
                 }
+            }
+            Step::Save(folder) => {
+                fs::create_dir_all(folder)
+                    .map_err(|error| format!("{}: {error}", folder.display()))?;
+                self.save_snapshot_to(folder.clone());
+                ctx.request_repaint();
             }
             &Step::Scroll(lane, row) => self.scroll_lane_to(lane, row),
             Step::Group(lane, id) => self.show_group(*lane, id)?,
@@ -636,6 +728,22 @@ impl Recorder {
         Ok(())
     }
 
+    /// Makes `rows` what the next selection covers, as the drag that crossed them would. A
+    /// selection already made moves onto them.
+    fn choose_test_rows(&mut self, rows: Vec<RowSource>) -> Result<(), String> {
+        if !self.rows_separate() {
+            return Err("rows are chosen only with separate=on".into());
+        }
+        self.selection_rows = rows;
+        if let Some(selection) = self.selection.clone() {
+            let flags = self.flag_update(selection, self.selection_rows.clone());
+            self.apply_flags(flags);
+            self.stop_preview();
+            self.invalidate_export();
+        }
+        Ok(())
+    }
+
     /// The add-on and source id of the lane's add-on source.
     fn lane_addon_source(&self, lane: usize) -> Result<(String, String), String> {
         match self
@@ -653,6 +761,53 @@ impl Recorder {
             _ => Err("the lane has no add-on source".into()),
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WavHeader {
+    channels: u16,
+    rate: u32,
+    bits: u16,
+    frames: u64,
+}
+
+/// Reads the format and length of a RIFF or RF64 WAV file.
+fn wav_header(bytes: &[u8]) -> Option<WavHeader> {
+    let u16_at = |at: usize| Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+    let u64_at = |at: usize| Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?));
+    let riff = bytes.get(..4)?;
+    if (riff != b"RIFF" && riff != b"RF64") || bytes.get(8..12)? != b"WAVE" {
+        return None;
+    }
+    let (mut format, mut data, mut big_data) = (None, None, None);
+    let mut at = 12;
+    while at + 8 <= bytes.len() {
+        let id = &bytes[at..at + 4];
+        let size = u32_at(at + 4)? as usize;
+        match id {
+            b"fmt " => format = Some((u16_at(at + 10)?, u32_at(at + 12)?, u16_at(at + 22)?)),
+            b"ds64" => big_data = Some(u64_at(at + 16)?),
+            b"data" => {
+                data = Some(if size == u32::MAX as usize {
+                    big_data?
+                } else {
+                    size as u64
+                });
+                break;
+            }
+            _ => {}
+        }
+        at += 8 + size + size % 2;
+    }
+    let (channels, rate, bits) = format?;
+    let frame = u64::from(channels) * u64::from(bits / 8);
+    Some(WavHeader {
+        channels,
+        rate,
+        bits,
+        frames: data? / frame.max(1),
+    })
 }
 
 /// Encodes 8-bit RGB pixels as a PNG. Each row takes whichever of the None, Sub and Up filters
@@ -960,7 +1115,7 @@ mod tests {
                 }
             })
             .collect();
-        data.extend_from_slice(&data[..5000].to_vec());
+        data.extend_from_within(..5000);
         for input in [&data[..], &[][..], &[1, 2][..], &[9; 300][..]] {
             assert_eq!(inflate_fixed(&zlib(input)), input);
         }
@@ -1002,6 +1157,25 @@ mod tests {
                 Step::Select(3.0, 1.0)
             ]
         );
+        assert_eq!(
+            parse_steps(r"rows=A:3-5;rows=a:10-B:1;save=D:\out\rows").unwrap(),
+            [
+                Step::Rows(0, 2, 0, 4),
+                Step::Rows(0, 9, 1, 0),
+                Step::Save(PathBuf::from(r"D:\out\rows")),
+            ]
+        );
+        assert!(Step::Save(PathBuf::new()).waits());
+        assert!(!Step::Rows(0, 0, 0, 0).waits());
+        for bad in [
+            "rows=A:0-2",
+            "rows=A:3",
+            "rows=3-5",
+            "rows=A:1-C:2",
+            "rows=A:x-2",
+        ] {
+            assert!(parse_steps(bad).is_err(), "{bad}");
+        }
         assert!(parse_steps("separate=maybe").is_err());
         assert_eq!(parse_steps(" ").unwrap(), []);
         assert_eq!(
@@ -1082,6 +1256,34 @@ mod tests {
         ] {
             assert!(parse_steps(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn saved_files_are_read_back_from_their_wav_headers() {
+        let mut wav = b"RIFF\0\0\0\0WAVE".to_vec();
+        // An odd-sized chunk before the format is padded to an even length.
+        wav.extend_from_slice(b"LIST\x03\0\0\0abc\0");
+        wav.extend_from_slice(b"fmt \x10\0\0\0");
+        wav.extend_from_slice(&3u16.to_le_bytes());
+        wav.extend_from_slice(&6u16.to_le_bytes());
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend_from_slice(&(48_000u32 * 24).to_le_bytes());
+        wav.extend_from_slice(&24u16.to_le_bytes());
+        wav.extend_from_slice(&32u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(24u32 * 10).to_le_bytes());
+        wav.extend_from_slice(&[0; 240]);
+        assert_eq!(
+            wav_header(&wav),
+            Some(WavHeader {
+                channels: 6,
+                rate: 48_000,
+                bits: 32,
+                frames: 10
+            })
+        );
+        assert_eq!(wav_header(b"RIFF\0\0\0\0AVI "), None);
+        assert_eq!(wav_header(&wav[..40]), None, "no data chunk");
     }
 
     #[test]
