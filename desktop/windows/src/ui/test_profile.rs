@@ -13,6 +13,8 @@
 //!   instance accepts `5.1`, `7.1` or `7.1.4` followed by `:all` or `:stereo`.
 //! - `BACKTRACKING_TEST_FORMAT`: `stereo`, `5.1` or `7.1.4` (default) for the test tone.
 //! - `BACKTRACKING_TEST_LANE_B`: `off` (default), `sender` (the stereo Sender) or `tone`.
+//! - `BACKTRACKING_TEST_LANE_B_ROUTE`: `all` stores All channels as lane B's route, as a choice
+//!   kept from a wider device would be.
 //! - `BACKTRACKING_TEST_PREFERENCES`: `name=value` pairs separated by `;`, named like the files
 //!   in `Settings`, for example `split-waveform=1;history-seconds=600;meter-unit=LUFS`.
 //! - `BACKTRACKING_TEST_SENDER_SECONDS`: how long the Sender runs (default 40).
@@ -85,6 +87,8 @@ fn preference_key(name: &str) -> Option<Key> {
         "wide-lane-export-v1" => Key::WideExport,
         "show-second-lines" => Key::SecondsLines,
         "keep-quiet-sections" => Key::RetainSilence,
+        "hide-silent-channels" => Key::HideSilentChannels,
+        "multichannel-pair-render" => Key::PairRender,
         _ => return None,
     })
 }
@@ -379,6 +383,16 @@ fn seed_test_profile() {
         Ok("off") | Err(_) => None,
         Ok(other) => panic!("BACKTRACKING_TEST_LANE_B is off, sender, tone or atmos, not {other}"),
     };
+    // A stored All channels choice on a source of two channels, which falls back to Merged.
+    let lane_b = lane_b.map(
+        |settings| match std::env::var("BACKTRACKING_TEST_LANE_B_ROUTE") {
+            Ok(route) if route == "all" => SourceSettings {
+                route: ChannelRoute::AllChannels,
+                ..settings
+            },
+            _ => settings,
+        },
+    );
     let preferences = Preferences::in_data_root(&root);
     preferences
         .save(Key::CaptureSources, &serialize_sources(&[lane_a, lane_b]))

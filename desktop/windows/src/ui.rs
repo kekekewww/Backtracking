@@ -10,25 +10,29 @@ use std::time::{Duration, Instant};
 use crate::clip_export::{ExportOptions, export_clip_channels};
 use crate::context_menu::{self, WindowCommand};
 use crate::controller::{
-    CaptureSource, Controller, EditSnapshot, LaneGroup, LaneMeterReadings, SourceSettings,
+    CaptureSource, ChannelWaveform, Controller, EditSnapshot, LaneGroup, LaneMeterReadings,
+    SourceSettings,
 };
 use crate::file_drag;
 use crate::lane_key;
 use crate::playback::PreviewPlayer;
 use crate::preferences::{
-    BORDER_WIDTHS, DEFAULT_ACCENT, Key, MeterMode, PreferenceWriter, Preferences, Settings,
-    SourceNames, StatusMark, WideExportMode, serialize_sources, wav_sample_format_preference,
+    BORDER_WIDTHS, DEFAULT_ACCENT, Key, MeterMode, PairRender, PreferenceWriter, Preferences,
+    Settings, SourceNames, StatusMark, WideExportMode, serialize_sources,
+    wav_sample_format_preference,
 };
 use crate::snapshot_hotkey::{self, SnapshotHotkey};
 use crate::startup;
 use crate::tray::{self, Tray};
 use crate::updater::UpdateOptions;
 use crate::window_order;
+use backtracking_core::waveform::{PairGroup, PairSide, PreviewLane};
 use backtracking_core::{
     AutoResumeDelay, ChannelRoute, DurationChoice, Fades, FrozenTrack, Lane, Preview,
     SOURCE_NAME_LIMIT, TakeLabel, WavExportProfile, WaveformView, cleanup, file_name_source,
     waveform,
 };
+use backtracking_core::{FrozenPositionTrack, spatial::HeadModel};
 use backtracking_ui::{
     CENTER_LINE, FadeEnd, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, PLOT_BACKGROUND,
     RECORDING_DIM, RECORDING_LIT, TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES,
@@ -215,6 +219,10 @@ const PLAYHEAD_COLOR: Color32 = Color32::from_gray(245);
 const EDGE_SCROLL_STEP: Duration = Duration::from_millis(90);
 /// How strongly the accent draws the line between lanes A and B while they are separate.
 const LANE_DIVIDER_ALPHA: f32 = 0.7;
+/// The rule under a wide lane's L/R pair, fainter than the line between two lanes.
+const PAIR_DIVIDER: Color32 = Color32::from_rgba_premultiplied(22, 22, 22, 22);
+/// The backing behind a wide lane's L/R pair, a shade lighter than the plot.
+const PAIR_BACKING: Color32 = Color32::from_rgba_premultiplied(7, 7, 7, 7);
 /// The selected waveform takes the accent's complement when it differs by at least this much.
 const SELECTION_CONTRAST: u8 = 80;
 const PREPARING_WAV: &str = "Preparing WAV…";
@@ -506,6 +514,14 @@ struct Recorder {
     wav_profile: WavExportProfile,
     wav_force_mono: bool,
     wide_export: WideExportMode,
+    /// How the pair of a wide lane is played and exported.
+    pair_render: PairRender,
+    /// A system, application or microphone lane on All channels shows only its active rows.
+    hide_silent: bool,
+    /// What each logical lane knows of its active channels, while capture runs.
+    activity: [ChannelActivity; 2],
+    /// Head models for binaural preview, one per sample rate, made once and kept.
+    head_models: Vec<Arc<HeadModel>>,
     /// The names the user gave sources for their files.
     source_names: SourceNames,
     last_interaction: Instant,
@@ -529,6 +545,9 @@ struct Recorder {
     edit_request: Option<EditRequest>,
     edit_preview: Option<EditPreviewJob>,
     edit_preview_key: Option<EditPreviewKey>,
+    /// When the frozen view was asked for and when its audio arrived, until its first picture
+    /// is in; a test copy writes how long that took to its log.
+    edit_opening: Option<(Instant, Option<Instant>)>,
     pending_snapshot_reads: Vec<SnapshotRead>,
     pending_edit_save_reads: Vec<EditRequest>,
     export_requested: bool,
@@ -806,13 +825,24 @@ enum RowSource {
     View(usize, WaveformView),
     /// One channel of a lane wider than two channels: the lane, then the channel within it.
     Channel(usize, usize),
+    /// One side of the stereo fold-down of a wide lane's Channels group, drawn above its
+    /// channel rows. Its audio is never stored; it is made from the channels.
+    Pair(usize, PairSide),
 }
 
 impl RowSource {
     fn lane(self) -> usize {
         match self {
-            Self::View(lane, _) | Self::Channel(lane, _) => lane,
+            Self::View(lane, _) | Self::Channel(lane, _) | Self::Pair(lane, _) => lane,
         }
+    }
+
+    /// The pair rows of wide lane `lane`, top first.
+    fn pair(lane: usize) -> [Self; 2] {
+        [
+            Self::Pair(lane, PairSide::Left),
+            Self::Pair(lane, PairSide::Right),
+        ]
     }
 }
 
@@ -827,16 +857,35 @@ struct LanePlan {
 enum LaneKind {
     Views(Vec<WaveformView>),
     /// `lead` rows are drawn above the channel rows of `group` and are selected together, as
-    /// one. A lane has none yet; the L/R pair of a wide lane goes here. `groups` names every
-    /// group the lane can show, as (id, label), in the source's order.
+    /// one: the L/R pair of a wide lane, made from `pair`. `shown` holds the lane-native
+    /// channels of `group` that get a row, in order: all of them, or only the active ones while
+    /// silent rows are hidden. `groups` names every group the lane can show, as (id, label), in
+    /// the source's order.
     Stack {
         lead: Vec<RowSource>,
+        pair: Option<PairGroup>,
         group: LaneGroup,
+        shown: Vec<usize>,
         groups: Vec<(String, String)>,
     },
 }
 
 impl LanePlan {
+    /// A wide lane that shows every channel of `group`, with no rows above them.
+    #[cfg(test)]
+    fn stack(lane: usize, group: LaneGroup, groups: Vec<(String, String)>) -> Self {
+        Self {
+            lane,
+            kind: LaneKind::Stack {
+                lead: Vec::new(),
+                pair: None,
+                shown: group.channels.clone().collect(),
+                group,
+                groups,
+            },
+        }
+    }
+
     fn stacked(&self) -> bool {
         matches!(self.kind, LaneKind::Stack { .. })
     }
@@ -844,16 +893,25 @@ impl LanePlan {
     fn rows(&self) -> usize {
         match &self.kind {
             LaneKind::Views(views) => views.len(),
-            LaneKind::Stack { lead, group, .. } => lead.len() + group.channels.len(),
+            LaneKind::Stack { lead, shown, .. } => lead.len() + shown.len(),
         }
     }
 
     fn row(&self, row: usize) -> RowSource {
         match &self.kind {
             LaneKind::Views(views) => RowSource::View(self.lane, views[row]),
-            LaneKind::Stack { lead, group, .. } => lead.get(row).copied().unwrap_or_else(|| {
-                RowSource::Channel(self.lane, group.channels.start + row - lead.len())
-            }),
+            LaneKind::Stack { lead, shown, .. } => lead
+                .get(row)
+                .copied()
+                .unwrap_or_else(|| RowSource::Channel(self.lane, shown[row - lead.len()])),
+        }
+    }
+
+    /// The pair the lead rows are made from, when this lane has them.
+    fn pair_group(&self) -> Option<&PairGroup> {
+        match &self.kind {
+            LaneKind::Stack { pair, lead, .. } if !lead.is_empty() => pair.as_ref(),
+            _ => None,
         }
     }
 
@@ -868,8 +926,12 @@ impl LanePlan {
     /// The channel of the group on show that row `row` draws, counted within the group.
     fn group_channel(&self, row: usize) -> Option<(&LaneGroup, usize)> {
         match &self.kind {
-            LaneKind::Stack { lead, group, .. } => row
+            LaneKind::Stack {
+                lead, group, shown, ..
+            } => row
                 .checked_sub(lead.len())
+                .and_then(|index| shown.get(index))
+                .and_then(|&channel| channel.checked_sub(group.channels.start))
                 .filter(|&channel| channel < group.channels.len())
                 .map(|channel| (group, channel)),
             LaneKind::Views(_) => None,
@@ -896,17 +958,140 @@ fn group_on_show(
         .or_else(|| groups.first())
         .filter(|group| !group.channels.is_empty() && group.channels.end <= channels)
         .cloned()
-        .unwrap_or_else(|| LaneGroup {
-            id: String::new(),
-            label: String::new(),
-            channels: 0..channels,
-            labels: (1..=channels).map(|channel| channel.to_string()).collect(),
-        });
+        .unwrap_or_else(|| numbered_group(channels));
     let choices = groups
         .iter()
         .map(|group| (group.id.clone(), group.label.clone()))
         .collect();
     (group, choices)
+}
+
+/// Every channel of a lane, numbered from 1, for a lane whose groups do not fit it.
+fn numbered_group(channels: usize) -> LaneGroup {
+    LaneGroup {
+        id: String::new(),
+        label: String::new(),
+        channels: 0..channels,
+        labels: (1..=channels).map(|channel| channel.to_string()).collect(),
+    }
+}
+
+/// The group of positioned objects, by the name the export also goes by.
+fn is_objects(group: &LaneGroup) -> bool {
+    group.id.eq_ignore_ascii_case("objects") || group.label.eq_ignore_ascii_case("Objects")
+}
+
+/// The group the pair of a lane is made from: its first group that is not the objects, or
+/// every channel of the lane, numbered, when it has none that fits.
+fn channels_group(groups: &[LaneGroup], channels: usize) -> LaneGroup {
+    groups
+        .iter()
+        .find(|group| {
+            !is_objects(group) && !group.channels.is_empty() && group.channels.end <= channels
+        })
+        .cloned()
+        .unwrap_or_else(|| numbered_group(channels))
+}
+
+/// The pair of a lane, made from its Channels group; `None` when the group is too wide.
+fn pair_group(groups: &[LaneGroup], channels: usize) -> Option<PairGroup> {
+    let group = channels_group(groups, channels);
+    PairGroup::new(group.channels.start, &group.labels)
+}
+
+/// How often a lane that hides silent rows asks which of its channels are active.
+const ACTIVITY_INTERVAL: Duration = Duration::from_millis(250);
+/// A channel's row goes only once this many answers in a row have found it silent.
+const QUIET_ANSWERS: u8 = 2;
+
+/// What a wide lane knows of which channels have sound, to hide the rows of silent ones.
+#[derive(Clone, Debug, Default)]
+struct ChannelActivity {
+    /// The capture these answers are about.
+    generation: u64,
+    /// Channels that get a row, bit 0 for the lane's first native channel. `None` until the
+    /// first answer.
+    shown: Option<u64>,
+    /// By channel: how many answers in a row found it silent while it had a row.
+    quiet: Vec<u8>,
+    /// When the last answer was taken.
+    asked: Option<Instant>,
+}
+
+impl ChannelActivity {
+    /// Takes one answer, `active`. A channel gets its row from the first answer that finds it
+    /// active, and keeps it until `QUIET_ANSWERS` answers in a row find it silent, so a
+    /// channel at the edge of the history does not blink.
+    fn answer(&mut self, active: u64) {
+        let shown = self.shown.unwrap_or(0);
+        self.quiet.resize(64, 0);
+        let mut next = shown | active;
+        for (channel, quiet) in self.quiet.iter_mut().enumerate() {
+            let bit = 1 << channel;
+            if active & bit != 0 || shown & bit == 0 {
+                *quiet = 0;
+                continue;
+            }
+            *quiet += 1;
+            if *quiet >= QUIET_ANSWERS {
+                next &= !bit;
+                *quiet = 0;
+            }
+        }
+        self.shown = Some(next);
+    }
+}
+
+/// The channels of `group` that get a row: every one when `active` is `None`, else only the
+/// active ones, and none at all while no channel but the front left and right is active, which
+/// the pair already shows.
+fn shown_channels(group: &LaneGroup, active: Option<u64>) -> Vec<usize> {
+    let all = group.channels.clone();
+    let Some(active) = active else {
+        return all.collect();
+    };
+    let is_active = |channel: usize| channel < 64 && active & (1 << channel) != 0;
+    let front = |channel: usize| {
+        group
+            .labels
+            .get(channel - group.channels.start)
+            .is_some_and(|label| ["FL", "FR", "L", "R"].contains(&label.as_str()))
+    };
+    if !all
+        .clone()
+        .any(|channel| is_active(channel) && !front(channel))
+    {
+        return Vec::new();
+    }
+    all.filter(|&channel| is_active(channel)).collect()
+}
+
+/// Works out, off the window's thread, which channels of the lanes in `hiding` (by logical
+/// lane) are active in frozen `snapshots`.
+fn frozen_activity(
+    snapshots: &Arc<[FrozenTrack]>,
+    lanes: &[usize],
+    hiding: [bool; 2],
+) -> Option<JoinHandle<[Option<u64>; 2]>> {
+    if !hiding.contains(&true) {
+        return None;
+    }
+    let snapshots = Arc::clone(snapshots);
+    let lanes = lanes.to_vec();
+    thread::Builder::new()
+        .name("backtracking-frozen-activity".into())
+        .spawn(move || {
+            std::array::from_fn(|lane| {
+                let index = lanes.iter().position(|&held| held == lane)?;
+                let track = snapshots.get(index).filter(|_| hiding[lane])?;
+                Some(if track.channels() > 2 {
+                    track.active_channels()
+                } else {
+                    0
+                })
+            })
+        })
+        .ok()
 }
 
 /// The rows from `anchor` to `cursor`, both included, in drawing order across `lanes`. Rows
@@ -1042,8 +1227,14 @@ fn row_drag(
 struct RowExport {
     /// The one lane the rows lie in, or `None` when they lie in both.
     lane: Option<usize>,
-    /// By logical lane: the channels of the rows chosen, or `None` for the whole lane.
+    /// By logical lane: the channels of the rows chosen, or `None` for the whole lane. A pair
+    /// row is made from the whole lane's Channels group, so it writes the whole lane here.
     channels: [Option<Range<usize>>; 2],
+    /// By logical lane: the lane-native channels of the channel rows chosen, in order, or
+    /// `None` for the whole lane. Empty when only the pair is chosen.
+    native: [Option<Vec<usize>>; 2],
+    /// By logical lane: whether the pair (either of its rows) is chosen.
+    pair: [bool; 2],
 }
 
 /// What `rows` write, or `None` when no rows are named, which means every row.
@@ -1056,24 +1247,39 @@ fn row_export(rows: &[RowSource]) -> Option<RowExport> {
         [lane] => Some(*lane),
         _ => None,
     };
-    let channels = std::array::from_fn(|lane| {
-        let mut range: Option<Range<usize>> = None;
-        for row in rows.iter().filter(|row| row.lane() == lane) {
-            let channels = match *row {
-                RowSource::View(_, WaveformView::Left) => 0..1,
-                RowSource::View(_, WaveformView::Right) => 1..2,
+    let in_lane = |lane: usize| rows.iter().filter(move |row| row.lane() == lane);
+    let pair =
+        std::array::from_fn(|lane| in_lane(lane).any(|row| matches!(row, RowSource::Pair(..))));
+    let native: [Option<Vec<usize>>; 2] = std::array::from_fn(|lane| {
+        in_lane(lane).next()?;
+        let mut channels = Vec::new();
+        for row in in_lane(lane) {
+            match *row {
+                RowSource::View(_, WaveformView::Left) => channels.push(0),
+                RowSource::View(_, WaveformView::Right) => channels.push(1),
                 // A merged row is the whole lane.
                 RowSource::View(..) => return None,
-                RowSource::Channel(_, channel) => channel..channel + 1,
-            };
-            range = Some(match range {
-                Some(range) => range.start.min(channels.start)..range.end.max(channels.end),
-                None => channels,
-            });
+                RowSource::Channel(_, channel) => channels.push(channel),
+                RowSource::Pair(..) => {}
+            }
         }
-        range
+        channels.sort_unstable();
+        channels.dedup();
+        Some(channels)
     });
-    Some(RowExport { lane, channels })
+    let channels = std::array::from_fn(|lane| {
+        if pair[lane] {
+            return None;
+        }
+        let native = native[lane].as_ref()?;
+        Some(*native.first()?..native.last()? + 1)
+    });
+    Some(RowExport {
+        lane,
+        channels,
+        native,
+        pair,
+    })
 }
 
 /// The least width of the plot, and height of a lane, that take the compact transport.
@@ -1128,12 +1334,46 @@ struct FrozenEdit {
     /// room for less, what memory holds.
     retention_seconds: f32,
     export_options: ExportOptions,
-    /// Channel groups frozen with the audio, by logical lane.
+    /// Channel groups frozen with the audio, by logical lane: every group, not only the one on
+    /// show.
     groups: [Vec<LaneGroup>; 2],
     shown_groups: [Option<String>; 2],
+    /// Position tracks frozen with the audio, by logical lane.
+    positions: [FrozenPositionTrack; 2],
+    /// Which channels of each logical lane are active in the frozen audio, once known.
+    activity: [Option<u64>; 2],
+    /// The answer for `activity`, worked out off the window's thread.
+    activity_job: Option<JoinHandle<[Option<u64>; 2]>>,
 }
 
 impl FrozenEdit {
+    /// The rows `rows` choose, by snapshot (physical order): the lane-native channels of the
+    /// channel rows and whether the pair is chosen. No rows choose every row of every lane.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn row_choice(&self, rows: &[RowSource]) -> [RowChoice; 2] {
+        let chosen = row_export(rows);
+        std::array::from_fn(|index| match (chosen.as_ref(), self.lanes.get(index)) {
+            (Some(chosen), Some(&lane)) if lane < 2 => RowChoice {
+                channels: chosen.native[lane].clone(),
+                pair: chosen.pair[lane],
+            },
+            _ => RowChoice::default(),
+        })
+    }
+
+    /// Collects the frozen activity once it is worked out. True while it is still coming.
+    fn poll_activity(&mut self) -> bool {
+        if self
+            .activity_job
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+            && let Some(job) = self.activity_job.take()
+        {
+            self.activity = job.join().unwrap_or_default();
+        }
+        self.activity_job.is_some()
+    }
+
     fn track(&self, lane: usize) -> Option<&FrozenTrack> {
         self.lanes
             .iter()
@@ -1155,11 +1395,13 @@ struct EditRequest {
     saves: Vec<SnapshotSpec>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct EditPreviewKey {
     frames: Range<u64>,
     /// The rows on screen, in drawing order.
     rows: Vec<RowSource>,
+    /// By logical lane: what its pair rows are made from.
+    pairs: [Option<PairGroup>; 2],
     bins: usize,
 }
 
@@ -1259,6 +1501,7 @@ impl SnapshotSpec {
             &snapshot.lanes,
             &snapshot.groups,
         )
+        .map(|clip| clip.with_positions(&snapshot.positions))
     }
 
     /// `groups` are the channel groups frozen with the audio, by logical lane.
@@ -1344,6 +1587,17 @@ fn edit_preview(
                     );
                 }
                 RowSource::Channel(..) => {}
+                RowSource::Pair(lane, side) => {
+                    if let Some(group) = key.pairs.get(lane).and_then(Option::as_ref) {
+                        track.pair_waveform(
+                            group,
+                            side,
+                            key.frames.clone(),
+                            &mut peaks.low,
+                            &mut peaks.high,
+                        );
+                    }
+                }
             }
             peaks
         })
@@ -1561,6 +1815,23 @@ struct WavClip {
     export_options: ExportOptions,
     /// By snapshot: only these channels are written, when only some of a lane's rows are.
     channels: [Option<Range<usize>>; 2],
+    /// By snapshot: the rows chosen, as lane-native channels and the pair, for the export
+    /// call that writes the pair and sparse channels. `channels` above is what is written now.
+    #[cfg_attr(not(test), allow(dead_code))]
+    rows: [RowChoice; 2],
+    /// By snapshot: the position tracks frozen with the audio, when the clip was made from a
+    /// frozen view.
+    #[cfg_attr(not(test), allow(dead_code))]
+    positions: [Option<FrozenPositionTrack>; 2],
+}
+
+/// The rows of one lane a clip writes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RowChoice {
+    /// Lane-native channels of the channel rows chosen, in order; `None` for the whole lane.
+    channels: Option<Vec<usize>>,
+    /// Whether either pair row is chosen.
+    pair: bool,
 }
 
 impl WavClip {
@@ -1597,7 +1868,20 @@ impl WavClip {
             flags,
             export_options: ExportOptions::default(),
             channels: [None, None],
+            rows: Default::default(),
+            positions: [None, None],
         })
+    }
+
+    /// Hands the clip the position tracks frozen with its audio, by logical lane.
+    fn with_positions(mut self, positions: &[FrozenPositionTrack; 2]) -> Self {
+        self.positions = std::array::from_fn(|index| {
+            self.lanes
+                .get(index)
+                .and_then(|&lane| positions.get(lane))
+                .cloned()
+        });
+        self
     }
 
     /// Writes only `rows`, or every row when there are none: only the lanes they lie in, and
@@ -1615,6 +1899,10 @@ impl WavClip {
             self.format.lane = Some(lane);
         }
         for (index, &lane) in self.lanes.iter().enumerate() {
+            self.rows[index] = RowChoice {
+                channels: chosen.native[lane].clone(),
+                pair: chosen.pair[lane],
+            };
             let Some(channels) = chosen.channels.get(lane).cloned().flatten() else {
                 continue;
             };
@@ -1862,6 +2150,10 @@ impl Recorder {
             wav_profile: settings.wav_profile,
             wav_force_mono: settings.wav_force_mono,
             wide_export: settings.wide_export,
+            pair_render: settings.pair_render,
+            hide_silent: settings.hide_silent_channels,
+            activity: Default::default(),
+            head_models: Vec::new(),
             source_names: settings.source_names,
             last_interaction: Instant::now(),
             recording_started: None,
@@ -1878,6 +2170,7 @@ impl Recorder {
             edit_request: None,
             edit_preview: None,
             edit_preview_key: None,
+            edit_opening: None,
             pending_snapshot_reads: Vec::new(),
             pending_edit_save_reads: Vec::new(),
             export_requested: false,
@@ -2163,8 +2456,12 @@ impl Recorder {
     /// A short name for one row: its channel label, L or R, or its lane's letter.
     fn row_name(&self, row: RowSource) -> String {
         match row {
-            RowSource::View(_, WaveformView::Left) => "L".into(),
-            RowSource::View(_, WaveformView::Right) => "R".into(),
+            RowSource::View(_, WaveformView::Left) | RowSource::Pair(_, PairSide::Left) => {
+                "L".into()
+            }
+            RowSource::View(_, WaveformView::Right) | RowSource::Pair(_, PairSide::Right) => {
+                "R".into()
+            }
             RowSource::View(lane, _) => lane_name(lane).into(),
             RowSource::Channel(lane, channel) => {
                 let edit_groups = self.editing.as_ref().and_then(|edit| edit.groups.get(lane));
@@ -2190,7 +2487,7 @@ impl Recorder {
     /// last. With two sources a channel's name starts with its lane's letter.
     fn rows_name(&self, rows: &[RowSource]) -> String {
         let named = |row: RowSource| match row {
-            RowSource::Channel(lane, _) if self.dual_source() => {
+            RowSource::Channel(lane, _) | RowSource::Pair(lane, _) if self.dual_source() => {
                 format!("{} {}", lane_name(lane), self.row_name(row))
             }
             _ => self.row_name(row),
@@ -2248,6 +2545,7 @@ impl Recorder {
             retention_seconds: self.plot_retention_seconds(),
             saves: Vec::new(),
         });
+        self.edit_opening = Some((Instant::now(), None));
         self.live_revision = None;
         self.next_refresh = Instant::now();
     }
@@ -2308,6 +2606,11 @@ impl Recorder {
         let groups = snapshot.groups;
         let shown_groups = snapshot.shown_groups;
         let snapshots = snapshot.snapshots;
+        let activity_job = frozen_activity(
+            &snapshots,
+            &snapshot.lanes,
+            [0, 1].map(|lane| self.hides_silent_rows(lane)),
+        );
         let frames = snapshots[0].frame_range();
         if let Some(selection) = &mut self.selection {
             selection.start = selection.start.clamp(frames.start, frames.end);
@@ -2325,7 +2628,13 @@ impl Recorder {
             export_options,
             groups,
             shown_groups,
+            positions: snapshot.positions,
+            activity: [None; 2],
+            activity_job,
         });
+        if let Some((_, arrived)) = &mut self.edit_opening {
+            *arrived = Some(Instant::now());
+        }
         if self.message == PREPARING_SELECTION {
             self.message.clear();
         }
@@ -2437,22 +2746,16 @@ impl Recorder {
             .into();
             return;
         };
-        // Selected rows play the lanes they lie in; a wide lane still does not play.
-        let lane = self
-            .selected_rows()
-            .and_then(row_export)
-            .and_then(|chosen| chosen.lane);
-        let played = preview_tracks(&edit.snapshots, &edit.lanes, self.routes(), lane);
-        let preview = played.and_then(|(tracks, routes)| {
-            Preview::new(
-                tracks,
-                selection,
-                &routes[..tracks.len()],
-                self.wav_force_mono,
-                self.fades,
-            )
-            .ok_or(SELECTION_UNAVAILABLE)
-        });
+        // Selected rows play the lanes they lie in, and of those only their own channels.
+        let plan = preview_plan(
+            &edit.snapshots,
+            &edit.lanes,
+            &edit.groups,
+            &edit.shown_groups,
+            self.routes(),
+            self.selected_rows(),
+        );
+        let preview = plan.and_then(|parts| self.preview_of(&parts, selection));
         let preview = match preview {
             Ok(preview) => preview,
             Err(reason) => {
@@ -2465,6 +2768,97 @@ impl Recorder {
             Ok(player) => self.preview = Some(player),
             Err(error) => self.message = error,
         }
+    }
+
+    /// The preview of `parts` of the frozen view over `frames`. Mono and stereo lanes played
+    /// whole take the preview they always did; anything else takes the one that renders the
+    /// pair and plays chosen channels and moving objects as the export writes them.
+    fn preview_of(
+        &mut self,
+        parts: &[PreviewPart],
+        frames: Range<u64>,
+    ) -> Result<Preview, &'static str> {
+        let edit = self.editing.as_ref().ok_or(SELECTION_UNAVAILABLE)?;
+        let (first, last) = match (parts.first(), parts.last()) {
+            (Some(first), Some(last)) => (first.index, last.index),
+            _ => return Err(SELECTION_UNAVAILABLE),
+        };
+        if parts
+            .iter()
+            .all(|part| part.group.is_none() && part.selected.is_none())
+        {
+            let tracks = edit
+                .snapshots
+                .get(first..=last)
+                .ok_or(SELECTION_UNAVAILABLE)?;
+            let routes: Vec<_> = parts.iter().map(|part| part.route).collect();
+            return Preview::new(tracks, frames, &routes, self.wav_force_mono, self.fades)
+                .ok_or(SELECTION_UNAVAILABLE);
+        }
+        let positions: Vec<Option<&FrozenPositionTrack>> = parts
+            .iter()
+            .map(|part| {
+                let lane = *edit.lanes.get(part.index)?;
+                part.positions.then(|| edit.positions.get(lane)).flatten()
+            })
+            .collect();
+        // A binaural pair, or objects that move, need the head model of the lane's rate.
+        let binaural = self.pair_render.binaural();
+        let rate = parts.iter().find_map(|part| {
+            let track = edit.snapshots.get(part.index)?;
+            let moving = positions
+                .iter()
+                .zip(parts)
+                .filter(|(_, other)| other.index == part.index)
+                .any(|(positions, part)| {
+                    positions.is_some_and(|positions| moves_in(part, positions, &frames))
+                });
+            (part.group.is_some() && (binaural || moving)).then(|| track.sample_rate())
+        });
+        let snapshots = Arc::clone(&edit.snapshots);
+        let positions: Vec<Option<FrozenPositionTrack>> =
+            positions.into_iter().map(|track| track.cloned()).collect();
+        let model = match rate {
+            Some(rate) => Some(self.head_model(rate).ok_or(SELECTION_UNAVAILABLE)?),
+            None => None,
+        };
+        let lanes: Vec<PreviewLane<'_>> = parts
+            .iter()
+            .map(|part| {
+                Some(PreviewLane {
+                    track: snapshots.get(part.index)?,
+                    route: part.route,
+                    group: part.group.as_ref(),
+                    selected: part.selected.as_deref(),
+                })
+            })
+            .collect::<Option<_>>()
+            .ok_or(SELECTION_UNAVAILABLE)?;
+        let positions: [Option<&FrozenPositionTrack>; 2] =
+            std::array::from_fn(|index| positions.get(index).and_then(Option::as_ref));
+        Preview::with_positions(
+            &lanes,
+            frames,
+            model,
+            self.wav_force_mono,
+            self.fades,
+            &positions,
+        )
+        .ok_or(SELECTION_UNAVAILABLE)
+    }
+
+    /// The head model for binaural preview at `rate`, made the first time it is needed.
+    fn head_model(&mut self, rate: u32) -> Option<Arc<HeadModel>> {
+        if let Some(model) = self
+            .head_models
+            .iter()
+            .find(|model| model.sample_rate() == rate)
+        {
+            return Some(Arc::clone(model));
+        }
+        let model = Arc::new(HeadModel::new(rate).ok()?);
+        self.head_models.push(Arc::clone(&model));
+        Some(model)
     }
 
     fn stop_preview(&mut self) {
@@ -2585,8 +2979,15 @@ impl Recorder {
                 let trace = (peak.low.as_mut_slice(), peak.high.as_mut_slice());
                 match *row {
                     RowSource::Channel(lane, channel) => {
-                        channels.push((lane, channel));
+                        channels.push((lane, ChannelWaveform::Native(channel)));
                         channel_traces.push(trace);
+                    }
+                    RowSource::Pair(lane, side) => {
+                        // A pair row is only planned with its group; one without stays flat.
+                        if let Some(group) = self.lane_pair(lane) {
+                            channels.push((lane, ChannelWaveform::Pair(group.clone(), side)));
+                            channel_traces.push(trace);
+                        }
                     }
                     RowSource::View(lane, view) => {
                         views.push((lane, view));
@@ -2594,10 +2995,12 @@ impl Recorder {
                     }
                 }
             }
-            // Every row in a mixed view reads the same frozen audio and revision.
+            // Every row in a mixed view reads the same frozen audio and revision. The first
+            // draw of the pair over a long history takes the worker a while; until it is in,
+            // this returns nothing and the rows keep their last picture.
             if !channels.is_empty() {
                 self.controller
-                    .try_render_channel_waveforms(
+                    .try_render_rows(
                         &channels,
                         &views,
                         self.zoom_frames.clone(),
@@ -2703,7 +3106,12 @@ impl Recorder {
             // Add-on manager replies arrive without a repaint of their own.
             polling: self.source_list_worker.is_some()
                 || self.addons_page.waiting()
-                || self.addon_sources.waiting(),
+                || self.addon_sources.waiting()
+                // The frozen activity says which rows a frozen view shows.
+                || self
+                    .editing
+                    .as_ref()
+                    .is_some_and(|edit| edit.activity_job.is_some()),
             tray_retry: if self.options_in_taskbar || self.test_copy {
                 None
             } else if let Some(tray) = &self.tray {
@@ -2791,6 +3199,7 @@ impl Recorder {
         let key = EditPreviewKey {
             frames: visible,
             rows: self.visible_rows(),
+            pairs: [0, 1].map(|lane| self.lane_pair(lane).cloned()),
             bins: policy.bins,
         };
         if let Some(job) = &self.edit_preview
@@ -2815,6 +3224,23 @@ impl Recorder {
             self.seconds =
                 (key.frames.end - key.frames.start) as f32 / self.sample_rate.max(1) as f32;
             self.edit_preview_key = Some(key.clone());
+            if let Some((asked, Some(arrived))) = self.edit_opening.take()
+                && let Some(harness) = &mut self.harness
+            {
+                let pair = key
+                    .rows
+                    .iter()
+                    .any(|row| matches!(row, RowSource::Pair(..)));
+                harness.note(format!(
+                    "frozen view: audio in {:.1} ms after asking, first picture {:.1} ms after \
+                     that ({} rows, pair {}, {} frames shown)",
+                    arrived.duration_since(asked).as_secs_f64() * 1000.0,
+                    arrived.elapsed().as_secs_f64() * 1000.0,
+                    key.rows.len(),
+                    if pair { "drawn" } else { "absent" },
+                    key.frames.end - key.frames.start,
+                ));
+            }
         }
         if self.edit_preview_key.as_ref() == Some(&key) {
             return;
@@ -2876,12 +3302,20 @@ impl Recorder {
                                 .map(|group| group.id.as_str()),
                         ),
                     };
+                    let pair = pair_group(groups, channels);
                     let (group, groups) = group_on_show(groups, shown, channels);
+                    let shown = shown_channels(&group, self.active_channels(lane));
                     return LanePlan {
                         lane,
                         kind: LaneKind::Stack {
-                            lead: Vec::new(),
+                            lead: if pair.is_some() {
+                                RowSource::pair(lane).to_vec()
+                            } else {
+                                Vec::new()
+                            },
+                            pair,
                             group,
+                            shown,
                             groups,
                         },
                     };
@@ -2897,6 +3331,88 @@ impl Recorder {
                 }
             })
             .collect()
+    }
+
+    /// Whether lane `lane` hides the rows of its silent channels: a system, application or
+    /// microphone source wider than stereo, with the preference on. Add-ons say what they
+    /// carry, so their rows always show.
+    fn hides_silent_rows(&self, lane: usize) -> bool {
+        self.hide_silent
+            && self
+                .controller
+                .sources()
+                .get(lane)
+                .and_then(Option::as_ref)
+                .is_some_and(|settings| {
+                    matches!(
+                        settings.source,
+                        CaptureSource::System
+                            | CaptureSource::DefaultMicrophone
+                            | CaptureSource::Microphone { .. }
+                            | CaptureSource::Application { .. }
+                    )
+                })
+    }
+
+    /// The channels of `lane` that have a row while silent rows are hidden, or `None` when
+    /// they are not. A frozen view uses the activity of its own audio once it is worked out,
+    /// and until then the rows shown when it was frozen. Before the first answer only the pair
+    /// shows: rows then appear as their channels are found active, and the window never shows
+    /// a row of silence it takes away again a moment later.
+    fn active_channels(&self, lane: usize) -> Option<u64> {
+        if !self.hides_silent_rows(lane) {
+            return None;
+        }
+        let live = self.activity[lane].shown;
+        let frozen = self.editing.as_ref().and_then(|edit| edit.activity[lane]);
+        Some(frozen.or(live).unwrap_or(0))
+    }
+
+    /// Asks a few times a second which channels of each lane that hides silent rows are
+    /// active, while capture runs. The answer comes from the waveform worker and never makes
+    /// the window wait.
+    fn update_activity(&mut self) {
+        let hiding = [0, 1].map(|lane| self.hides_silent_rows(lane));
+        if let Some(edit) = &mut self.editing {
+            // Hiding turned on while the view is frozen: work out the frozen activity now.
+            if !edit.poll_activity()
+                && (0..2).any(|lane| {
+                    hiding[lane] && edit.activity[lane].is_none() && edit.lanes.contains(&lane)
+                })
+            {
+                edit.activity_job = frozen_activity(&edit.snapshots, &edit.lanes, hiding);
+            }
+            return;
+        }
+        if self.edit_request.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        let generation = self.controller.generation();
+        for lane in 0..2 {
+            if !self.hides_silent_rows(lane) {
+                self.activity[lane] = ChannelActivity::default();
+                continue;
+            }
+            let state = &mut self.activity[lane];
+            if state.generation != generation {
+                *state = ChannelActivity {
+                    generation,
+                    ..ChannelActivity::default()
+                };
+            }
+            if state
+                .asked
+                .is_some_and(|asked| now.duration_since(asked) < ACTIVITY_INTERVAL)
+            {
+                continue;
+            }
+            if let Some(active) = self.controller.try_active_channels(lane) {
+                let state = &mut self.activity[lane];
+                state.answer(active);
+                state.asked = Some(now);
+            }
+        }
     }
 
     /// Works out this pass's lanes. A lane whose rows changed starts again at its first row.
@@ -2932,6 +3448,14 @@ impl Recorder {
 
     fn stacked(&self) -> bool {
         self.lanes.iter().any(LanePlan::stacked)
+    }
+
+    /// The pair the L/R rows of logical lane `lane` are made from.
+    fn lane_pair(&self, lane: usize) -> Option<&PairGroup> {
+        self.lanes
+            .iter()
+            .find(|plan| plan.lane == lane)
+            .and_then(LanePlan::pair_group)
     }
 
     /// Where each lane's rows go in a plot area this high.
@@ -3003,9 +3527,20 @@ impl Recorder {
         let window = ctx.viewport_rect().size();
         let now = Instant::now();
         let specs: Vec<_> = self.lanes.iter().map(LanePlan::spec).collect();
+        let current = self.timeline_rect(self.plot_rect).height();
+        // Rows that appear later, as a hidden channel becomes active, grow the window further
+        // while the user has not resized it since it last grew. Rows that go never shrink it.
+        let regrow = match (stack::comfortable_height(&specs), self.growth) {
+            (Some(wanted), Some(growth)) => {
+                wanted > current + 0.5
+                    && (window.y - growth.after).abs() < 1.0
+                    && now >= growth.settles
+                    && growth.after < MAX_GROWN_WINDOW_HEIGHT - 0.5
+            }
+            _ => false,
+        };
         match (stack::comfortable_height(&specs), self.growth) {
-            (Some(wanted), None) => {
-                let current = self.timeline_rect(self.plot_rect).height();
+            (Some(wanted), growth) if growth.is_none() || regrow => {
                 let screen = frame
                     .winit_window()
                     .and_then(|window| window.current_monitor())
@@ -3014,8 +3549,11 @@ impl Recorder {
                     screen.min(MAX_GROWN_WINDOW_HEIGHT)
                 });
                 let target = (window.y + wanted - current).min(cap).max(window.y);
+                if growth.is_some() && target <= window.y + 0.5 {
+                    return;
+                }
                 self.growth = Some(WindowGrowth {
-                    before: window.y,
+                    before: growth.map_or(window.y, |growth| growth.before),
                     after: target,
                     settles: now + Duration::from_secs(1),
                 });
@@ -3139,9 +3677,16 @@ impl Recorder {
     }
 
     fn capture_problem(&self) -> Option<String> {
+        let language = Language::current();
         capture_problem(
-            self.controller.error(),
-            [0, 1].map(|lane| self.controller.source_status(lane)),
+            self.controller
+                .error()
+                .map(|error| language.source_message(error)),
+            [0, 1].map(|lane| {
+                self.controller
+                    .source_status(lane)
+                    .map(|status| language.source_message(status))
+            }),
             self.dual_source(),
         )
     }
@@ -3149,7 +3694,7 @@ impl Recorder {
     /// The status line under the waveform in the full window.
     fn status_text(&self) -> String {
         if let Some(error) = self.controller.error() {
-            return error.to_owned();
+            return Language::current().source_message(error).to_owned();
         }
         let paused = self.controller.is_paused();
         if self.edit_request.is_some() {
@@ -3829,6 +4374,40 @@ impl Recorder {
                 self.save_preference(Key::IdleResume, self.idle_resume.seconds().to_string());
             }
         });
+        self.multichannel_options(ui);
+    }
+
+    /// The settings for sources wider than stereo: which rows they show and how their L and R
+    /// sound.
+    fn multichannel_options(&mut self, ui: &mut egui::Ui) {
+        let language = Language::current();
+        ui.separator();
+        options_group_heading(ui, language.multichannel_group());
+        if ui
+            .checkbox(&mut self.hide_silent, language.hide_silent_field())
+            .changed()
+        {
+            self.save_preference(
+                Key::HideSilentChannels,
+                u8::from(self.hide_silent).to_string(),
+            );
+            self.live_revision = None;
+            self.next_refresh = Instant::now();
+        }
+        options_note(ui, language.hide_silent_note());
+        options_field(ui, language.pair_render_field(), |ui| {
+            if options_choice(
+                ui,
+                "pair-render",
+                &mut self.pair_render,
+                PairRender::ALL
+                    .into_iter()
+                    .map(|mode| (mode, language.pair_render(mode.binaural()).to_owned())),
+            ) {
+                self.save_preference(Key::PairRender, self.pair_render.preference());
+            }
+        });
+        options_note(ui, language.pair_render_note());
     }
 
     fn appearance_options(&mut self, ui: &mut egui::Ui) {
@@ -4156,23 +4735,36 @@ impl Recorder {
                         }
                     }
                     if let Some(settings) = settings.as_mut().filter(|_| show_route) {
+                        // All channels is listed only for a device that has more than two,
+                        // and, disabled, while it is the stored choice of one that has not.
+                        let routes: Vec<(ChannelRoute, bool)> = ChannelRoute::ALL
+                            .into_iter()
+                            .map(|route| {
+                                let available =
+                                    same_source && self.controller.route_available(lane, route);
+                                (route, available)
+                            })
+                            .filter(|&(route, available)| {
+                                route != ChannelRoute::AllChannels
+                                    || available
+                                    || settings.route == route
+                            })
+                            .collect();
                         options_field(ui, "Channel route", |ui| {
                             let width = options_control_width(ui);
                             egui::ComboBox::from_id_salt("route")
-                                .selected_text(settings.route.label())
+                                .selected_text(route_label(settings.route, language))
                                 .width(width)
-                                .height(options_menu_height(ui, ChannelRoute::ALL.len()))
+                                .height(options_menu_height(ui, routes.len()))
                                 .truncate()
                                 .show_ui(ui, |ui| {
                                     configure_options_menu(ui, width);
-                                    for route in ChannelRoute::ALL {
-                                        let enabled = same_source
-                                            && self.controller.route_available(lane, route);
+                                    for &(route, enabled) in &routes {
                                         ui.add_enabled_ui(enabled, |ui| {
                                             ui.selectable_value(
                                                 &mut settings.route,
                                                 route,
-                                                route.label(),
+                                                route_label(route, language),
                                             );
                                         });
                                     }
@@ -4202,7 +4794,7 @@ impl Recorder {
                         options_note(ui, format!("Files start with {prefix}"));
                     }
                     if !covered && let Some(status) = self.controller.source_status(lane) {
-                        options_note(ui, status);
+                        options_note(ui, language.source_message(status));
                     }
                     if lane == 0 {
                         ui.separator();
@@ -4750,7 +5342,8 @@ impl Recorder {
         };
         if let Some(edit) = &self.editing {
             if let Some(clip) = spec.clip(Arc::clone(&edit.snapshots), &edit.lanes, &edit.groups) {
-                self.pending_snapshot_saves.push_back(clip);
+                self.pending_snapshot_saves
+                    .push_back(clip.with_positions(&edit.positions));
             } else {
                 self.message = "The selected audio is unavailable.".into();
                 return;
@@ -4830,6 +5423,12 @@ impl Recorder {
         .and_then(|mut clip| {
             clip.export_options = self.export_options();
             clip.with_rows(&rows, &groups)
+        })
+        .map(|clip| match &self.editing {
+            Some(edit) if Arc::ptr_eq(&edit.snapshots, &clip.snapshots) => {
+                clip.with_positions(&edit.positions)
+            }
+            _ => clip,
         })
     }
 
@@ -5660,12 +6259,16 @@ impl Recorder {
         }
         let (index, row) = stack::row_at(&boxes, point.y - inner.top())?;
         let plan = self.lanes.get(index)?;
-        let (group, row) = plan.group_channel(row)?;
-        let label = group
-            .labels
-            .get(row)
-            .map_or_else(|| (row + 1).to_string(), Clone::clone);
-        let mut text = language.channel(row + 1, group.channels.len(), &label);
+        let mut text = if let RowSource::Pair(_, side) = plan.row(row) {
+            language.pair_row(side == PairSide::Left).to_owned()
+        } else {
+            let (group, row) = plan.group_channel(row)?;
+            let label = group
+                .labels
+                .get(row)
+                .map_or_else(|| (row + 1).to_string(), Clone::clone);
+            language.channel(row + 1, group.channels.len(), &label)
+        };
         if boxes[index].scrolls() {
             text.push('\n');
             text.push_str(language.scroll_hint());
@@ -5934,7 +6537,25 @@ impl Recorder {
                 );
                 let source = plan.row(index);
                 if !self.waveform_only {
+                    // The pair is set apart from the channel rows below it by a faint backing
+                    // and a rule, both fainter than the line between two lanes.
+                    if matches!(source, RowSource::Pair(..)) {
+                        painter.rect_filled(
+                            Rect::from_x_y_ranges(rect.left()..=audio.right(), row.y_range()),
+                            0.0,
+                            PAIR_BACKING,
+                        );
+                    }
                     painter.hline(row.x_range(), row.center().y, Stroke::new(1.0, CENTER_LINE));
+                    if source == RowSource::Pair(plan.lane, PairSide::Right)
+                        && index + 1 < lane_box.first + lane_box.shown
+                    {
+                        painter.hline(
+                            rect.left() + 1.0..=audio.right(),
+                            row.bottom(),
+                            Stroke::new(1.0, PAIR_DIVIDER),
+                        );
+                    }
                     // Mono and stereo lanes are labelled as before; a stacked lane names
                     // each channel.
                     let label = match (&plan.kind, source) {
@@ -6035,13 +6656,20 @@ impl Recorder {
         }
 
         let rate = f64::from(self.sample_rate.max(1));
-        let label = match self.gesture {
+        // The label in full, and the length alone for when the full label would cover a flag.
+        let labels = match self.gesture {
             Some(Gesture::Fade {
                 end: FadeEnd::In, ..
-            }) => Some(format!("Fade in {:.2} s", fades.fade_in as f64 / rate)),
+            }) => Some(vec![format!(
+                "Fade in {:.2} s",
+                fades.fade_in as f64 / rate
+            )]),
             Some(Gesture::Fade {
                 end: FadeEnd::Out, ..
-            }) => Some(format!("Fade out {:.2} s", fades.fade_out as f64 / rate)),
+            }) => Some(vec![format!(
+                "Fade out {:.2} s",
+                fades.fade_out as f64 / rate
+            )]),
             _ => {
                 // A length that covers some rows says which.
                 let rows = if selection.is_some() {
@@ -6053,23 +6681,41 @@ impl Recorder {
                     .or_else(|| full_preview.then_some(visible))
                     .map(|range| {
                         let seconds = (range.end - range.start) as f64 / rate;
+                        let length = format!("{seconds:.2} s");
                         match rows {
-                            Some(rows) => format!("{} · {seconds:.2} s", self.rows_name(rows)),
-                            None => format!("{seconds:.2} s"),
+                            Some(rows) => {
+                                vec![format!("{} · {length}", self.rows_name(rows)), length]
+                            }
+                            None => vec![length],
                         }
                     })
             }
         };
         if !self.waveform_only
-            && let Some(label) = label
+            && let Some(labels) = labels
         {
-            painter.text(
-                audio.right_top() - Vec2::new(8.0, 0.0),
-                egui::Align2::RIGHT_TOP,
-                label,
-                egui::FontId::monospace(11.0),
-                Color32::WHITE,
+            let flags: Vec<Rect> = self
+                .flag_marks(audio)
+                .into_iter()
+                .map(|(x, y, height, direction)| {
+                    Rect::from_two_pos(Pos2::new(x, y), Pos2::new(x + direction * 6.0, y + height))
+                        .expand(1.0)
+                })
+                .collect();
+            let font = egui::FontId::monospace(11.0);
+            let galleys: Vec<_> = labels
+                .into_iter()
+                .map(|label| painter.layout_no_wrap(label, font.clone(), Color32::WHITE))
+                .collect();
+            let (galley, place) = length_label_place(
+                audio,
+                &galleys
+                    .iter()
+                    .map(|galley| galley.size())
+                    .collect::<Vec<_>>(),
+                &flags,
             );
+            painter.galley(place, Arc::clone(&galleys[galley]), Color32::WHITE);
         }
     }
 
@@ -6178,6 +6824,26 @@ impl Recorder {
 
     fn paint_flags(&self, painter: &egui::Painter, audio: Rect) {
         let painter = painter.with_clip_rect(audio);
+        for (x, y, height, direction) in self.flag_marks(audio) {
+            painter.line_segment(
+                [Pos2::new(x, y), Pos2::new(x, y + height)],
+                Stroke::new(1.0, FLAG_COLOR),
+            );
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(x, y),
+                    Pos2::new(x + direction * 6.0, y + height * 0.28),
+                    Pos2::new(x, y + height * 0.56),
+                ],
+                FLAG_COLOR,
+                Stroke::NONE,
+            ));
+        }
+    }
+
+    /// Where the selection's flags stand in `audio`: the x of each pole, its top, its height
+    /// and which way its flag points.
+    fn flag_marks(&self, audio: Rect) -> Vec<(f32, f32, f32, f32)> {
         let visible = self.visible_frames.clone();
         let current = match self.gesture {
             Some(Gesture::Select { anchor, cursor, .. }) => {
@@ -6201,6 +6867,7 @@ impl Recorder {
                     .filter(|range| Some(*range) != accepted)
                     .map(|range| (range, current_area)),
             );
+        let mut marks = Vec::new();
         for (flags, area) in ranges {
             let flag_height = area.height().min(11.0);
             for (position, direction) in [(flags.start, 1.0), (flags.end, -1.0)] {
@@ -6210,22 +6877,10 @@ impl Recorder {
                 let x = audio.left() + fraction as f32 * audio.width();
                 let inset = (audio.width() * 0.25).min(0.25);
                 let x = x.clamp(audio.left() + inset, audio.right() - inset);
-                let y = area.top();
-                painter.line_segment(
-                    [Pos2::new(x, y), Pos2::new(x, y + flag_height)],
-                    Stroke::new(1.0, FLAG_COLOR),
-                );
-                painter.add(egui::Shape::convex_polygon(
-                    vec![
-                        Pos2::new(x, y),
-                        Pos2::new(x + direction * 6.0, y + flag_height * 0.28),
-                        Pos2::new(x, y + flag_height * 0.56),
-                    ],
-                    FLAG_COLOR,
-                    Stroke::NONE,
-                ));
+                marks.push((x, area.top(), flag_height, direction));
             }
         }
+        marks
     }
 
     fn paint_waveform(
@@ -6264,6 +6919,42 @@ impl Recorder {
         } else {
             paint_range(0.0..1.0, self.accent);
         }
+    }
+}
+
+/// Where the plot's length label goes so that it covers no flag (`flags`, their rectangles):
+/// which of the labels (`sizes`, longest first) and its top-left corner. The full label stays
+/// at the top right when it fits; else the shorter ones there, then the shortest at the top
+/// left, then the shortest at the top right just below the flags.
+fn length_label_place(audio: Rect, sizes: &[Vec2], flags: &[Rect]) -> (usize, Pos2) {
+    let clear = |rect: Rect| !flags.iter().any(|flag| flag.intersects(rect));
+    let top_right = |size: Vec2| Pos2::new(audio.right() - 8.0 - size.x, audio.top());
+    for (index, &size) in sizes.iter().enumerate() {
+        if clear(Rect::from_min_size(top_right(size), size)) {
+            return (index, top_right(size));
+        }
+    }
+    let shortest = sizes.len().saturating_sub(1);
+    let size = sizes.get(shortest).copied().unwrap_or_default();
+    let top_left = Pos2::new(audio.left() + 8.0, audio.top());
+    if clear(Rect::from_min_size(top_left, size)) {
+        return (shortest, top_left);
+    }
+    let below = flags
+        .iter()
+        .map(|flag| flag.max.y)
+        .fold(audio.top(), f32::max)
+        + 1.0;
+    let y = below.min(audio.bottom() - size.y).max(audio.top());
+    (shortest, Pos2::new(top_right(size).x, y))
+}
+
+/// What the Sources page calls `route`. The capture code's name for All channels holds both
+/// languages; the window shows its own.
+fn route_label(route: ChannelRoute, language: Language) -> &'static str {
+    match route {
+        ChannelRoute::AllChannels => language.all_channels(),
+        route => route.label(),
     }
 }
 
@@ -6589,6 +7280,7 @@ impl eframe::App for Recorder {
                     self.next_refresh = Instant::now();
                 }
                 self.plot_rect = plot;
+                self.update_activity();
                 self.update_lanes();
                 self.fit_window_to_rows(ui.ctx(), frame);
                 self.refresh_waveform();
@@ -6725,41 +7417,132 @@ impl Drop for Recorder {
 /// Shown when the frozen audio for a selection cannot be read or played.
 const SELECTION_UNAVAILABLE: &str = "The selected audio is unavailable.";
 
-/// What Space plays of a frozen selection: the snapshots, by the logical lanes they hold, and
-/// their routes. Separate rows that all lie in one lane play only that lane, `selected`. A lane wider
-/// than stereo has no stereo placement that is not a guess, so a selection that covers one is
-/// not played at all rather than heard as a wrong mix; the error says why.
-fn preview_tracks<'a>(
-    snapshots: &'a [FrozenTrack],
+/// One lane that Space plays.
+#[derive(Clone, Debug, PartialEq)]
+struct PreviewPart {
+    /// The lane's frozen snapshot, by its index.
+    index: usize,
+    route: ChannelRoute,
+    /// The group heard of a lane wider than stereo; `None` for a mono or stereo lane.
+    group: Option<PairGroup>,
+    /// The lane-native channels of `group`; empty for a mono or stereo lane.
+    channels: Range<usize>,
+    /// The lane-native channels heard; `None` for the whole group, or the whole narrow lane.
+    selected: Option<Vec<usize>>,
+    /// Whether the lane's frozen positions go with it, so objects move as they do on export.
+    positions: bool,
+}
+
+/// What Space plays of a frozen selection, lane by lane in snapshot order. `rows` are the rows
+/// chosen while rows are separate; `None` plays every lane whole. A mono or stereo lane plays
+/// as it always did, or one side of a split stereo lane alone. A wide lane plays the pair
+/// render of its rows: the whole Channels group for the pair, or for the whole lane while the
+/// Channels group is on show; the chosen channels of one group, with positions when they are
+/// objects; the whole group on show of a lane chosen whole. `groups` and `shown` are frozen
+/// with the audio, by logical lane.
+fn preview_plan(
+    snapshots: &[FrozenTrack],
     lanes: &[usize],
+    groups: &[Vec<LaneGroup>; 2],
+    shown: &[Option<String>; 2],
     routes: [ChannelRoute; 2],
-    selected: Option<usize>,
-) -> Result<(&'a [FrozenTrack], [ChannelRoute; 2]), &'static str> {
-    if lanes.len() != snapshots.len() {
+    rows: Option<&[RowSource]>,
+) -> Result<Vec<PreviewPart>, &'static str> {
+    if lanes.len() != snapshots.len() || lanes.iter().any(|&lane| lane > 1) {
         return Err(SELECTION_UNAVAILABLE);
     }
-    let played = match selected {
-        Some(lane) => {
-            let index = lanes
-                .iter()
-                .position(|&held| held == lane)
-                .ok_or(SELECTION_UNAVAILABLE)?;
-            index..index + 1
-        }
-        None => 0..snapshots.len(),
-    };
-    let tracks = &snapshots[played.clone()];
-    if tracks.iter().any(|track| track.channels() > 2) {
-        return Err(Language::current().no_wide_preview());
-    }
     let routes = physical_routes(routes, lanes);
-    let routes = std::array::from_fn(|index| {
-        routes
-            .get(played.start + index)
-            .copied()
-            .unwrap_or(ChannelRoute::Merged)
-    });
-    Ok((tracks, routes))
+    let chosen = rows.and_then(row_export);
+    let mut parts = Vec::new();
+    for (index, (track, &lane)) in snapshots.iter().zip(lanes).enumerate() {
+        let lane_rows: Option<Vec<RowSource>> = rows.map(|rows| {
+            rows.iter()
+                .copied()
+                .filter(|row| row.lane() == lane)
+                .collect()
+        });
+        if lane_rows.as_ref().is_some_and(Vec::is_empty) {
+            continue;
+        }
+        let channels = track.channels();
+        let native = chosen
+            .as_ref()
+            .and_then(|chosen| chosen.native[lane].clone());
+        let pair = chosen.as_ref().is_some_and(|chosen| chosen.pair[lane]);
+        let route = routes[index];
+        if channels <= 2 {
+            // Both sides, or a merged row, play the lane as it always played.
+            let selected = native.filter(|native| native.len() == 1 && channels == 2);
+            parts.push(PreviewPart {
+                index,
+                route,
+                group: None,
+                channels: 0..0,
+                selected,
+                positions: false,
+            });
+            continue;
+        }
+        let lane_groups = &groups[lane];
+        let whole = |group: LaneGroup| -> Result<PreviewPart, &'static str> {
+            Ok(PreviewPart {
+                index,
+                route,
+                group: Some(
+                    PairGroup::new(group.channels.start, &group.labels)
+                        .ok_or(SELECTION_UNAVAILABLE)?,
+                ),
+                positions: is_objects(&group),
+                channels: group.channels,
+                selected: None,
+            })
+        };
+        let part = match native {
+            // The lane chosen whole plays the group on show; the pair plays its Channels group.
+            None if !pair => whole(group_on_show(lane_groups, shown[lane].as_deref(), channels).0)?,
+            Some(native) if !pair && !native.is_empty() => {
+                let group = lane_groups
+                    .iter()
+                    .filter(|group| group.channels.end <= channels)
+                    .find(|group| {
+                        native
+                            .iter()
+                            .all(|channel| group.channels.contains(channel))
+                    })
+                    .cloned()
+                    .or_else(|| lane_groups.is_empty().then(|| numbered_group(channels)));
+                match group {
+                    Some(group) => PreviewPart {
+                        selected: Some(native),
+                        ..whole(group)?
+                    },
+                    // Rows of two groups at once play the pair.
+                    None => whole(channels_group(lane_groups, channels))?,
+                }
+            }
+            _ => whole(channels_group(lane_groups, channels))?,
+        };
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        return Err(SELECTION_UNAVAILABLE);
+    }
+    Ok(parts)
+}
+
+/// Whether `positions` move any of the channels `part` plays within `frames`, which makes its
+/// render binaural whatever the pair preference is.
+fn moves_in(part: &PreviewPart, positions: &FrozenPositionTrack, frames: &Range<u64>) -> bool {
+    if !part.positions {
+        return false;
+    }
+    let heard: Vec<usize> = match &part.selected {
+        Some(selected) => selected.clone(),
+        None => part.channels.clone().collect(),
+    };
+    heard
+        .into_iter()
+        .any(|channel| !positions.render_keys(channel, frames.clone()).is_empty())
 }
 
 /// What `source` is called in file names: the name the user gave it, or its own name when
@@ -7593,6 +8376,9 @@ mod tests {
                         export_options: ExportOptions::default(),
                         groups: Default::default(),
                         shown_groups: Default::default(),
+                        positions: no_positions(),
+                        activity: [None; 2],
+                        activity_job: None,
                     },
                     observed: observed.clone()
                 })
@@ -7723,6 +8509,7 @@ mod tests {
                 RowSource::View(0, WaveformView::Left),
                 RowSource::View(0, WaveformView::Right),
             ],
+            pairs: [None, None],
             bins: 2,
         };
         let peaks = edit_preview(&[stereo], &[0], &key);
@@ -8097,14 +8884,7 @@ mod tests {
 
     #[test]
     fn a_stacked_lane_draws_and_asks_for_each_channel_of_its_group_in_order() {
-        let plan = LanePlan {
-            lane: 1,
-            kind: LaneKind::Stack {
-                lead: Vec::new(),
-                group: group("objects", 12..28),
-                groups: Vec::new(),
-            },
-        };
+        let plan = LanePlan::stack(1, group("objects", 12..28), Vec::new());
         assert!(plan.stacked());
         assert_eq!(plan.rows(), 16);
         assert_eq!(plan.row(0), RowSource::Channel(1, 12));
@@ -8130,6 +8910,7 @@ mod tests {
             rows: (4..7)
                 .map(|channel| RowSource::Channel(0, channel))
                 .collect(),
+            pairs: [None, None],
             bins: 2,
         };
         let peaks = edit_preview(&[track], &[0], &key);
@@ -8284,14 +9065,26 @@ mod tests {
     }
 
     fn wide_plan(lane: usize, group: LaneGroup) -> LanePlan {
+        LanePlan::stack(lane, group, Vec::new())
+    }
+
+    /// A wide lane as the window plans it: the pair on top, then the channels of `group` in
+    /// `shown`.
+    fn paired_plan(lane: usize, group: LaneGroup, shown: Vec<usize>) -> LanePlan {
         LanePlan {
             lane,
             kind: LaneKind::Stack {
-                lead: Vec::new(),
+                lead: RowSource::pair(lane).to_vec(),
+                pair: PairGroup::new(group.channels.start, &group.labels),
                 group,
+                shown,
                 groups: Vec::new(),
             },
         }
+    }
+
+    fn no_positions() -> [FrozenPositionTrack; 2] {
+        std::array::from_fn(|_| backtracking_core::PositionTrack::new().freeze())
     }
 
     fn views_plan(lane: usize, views: &[WaveformView]) -> LanePlan {
@@ -8423,19 +9216,9 @@ mod tests {
 
     #[test]
     fn rows_in_front_of_a_lanes_channels_are_selected_as_one() {
-        // Stand-ins for the L/R pair a wide lane is to draw above its channel rows.
-        let lead = vec![
-            RowSource::View(0, WaveformView::Left),
-            RowSource::View(0, WaveformView::Right),
-        ];
-        let plan = LanePlan {
-            lane: 0,
-            kind: LaneKind::Stack {
-                lead: lead.clone(),
-                group: bed_group(),
-                groups: Vec::new(),
-            },
-        };
+        // The L/R pair a wide lane draws above its channel rows.
+        let lead = RowSource::pair(0).to_vec();
+        let plan = paired_plan(0, bed_group(), (0..12).collect());
         let a = |channel| RowSource::Channel(0, channel);
         assert_eq!(plan.rows(), 14);
         assert_eq!(
@@ -8451,6 +9234,334 @@ mod tests {
             [lead[0], lead[1], a(0), a(1)]
         );
         assert_eq!(rows_between(&lanes, a(1), a(0)), [a(0), a(1)]);
+    }
+
+    /// The labels Windows gives a 7.1 device.
+    fn windows_71() -> LaneGroup {
+        LaneGroup {
+            id: String::new(),
+            label: String::new(),
+            channels: 0..8,
+            labels: ["FL", "FR", "FC", "LFE", "Lb", "Rb", "Ls", "Rs"]
+                .map(str::to_owned)
+                .to_vec(),
+        }
+    }
+
+    #[test]
+    fn the_pair_tops_every_wide_lane_at_any_height_with_or_without_hidden_rows() {
+        let heights = [20.0, 47.0, 100.0, 167.0, 300.0, 559.0];
+        // Mono and stereo lanes get no pair: their one or two rows split the height as before.
+        for channels in [1usize, 2] {
+            let views = if channels == 1 {
+                vec![WaveformView::Merged]
+            } else {
+                vec![WaveformView::Left, WaveformView::Right]
+            };
+            let plan = views_plan(0, &views);
+            assert!(plan.pair_group().is_none());
+            for height in heights {
+                let lane = stack::lay_out(height, &[plan.spec()], &[0])[0];
+                assert_eq!((lane.rows, lane.shown), (channels, channels));
+                assert!((lane.row_height - height / channels as f32).abs() < 0.001);
+            }
+        }
+        for channels in [6usize, 12, 16, 40] {
+            let group = numbered_group(channels);
+            let every: Vec<usize> = (0..channels).collect();
+            let some: Vec<usize> = (0..channels).step_by(3).collect();
+            for shown in [every, some, Vec::new()] {
+                let plan = paired_plan(0, group.clone(), shown.clone());
+                let rows = 2 + shown.len();
+                assert_eq!(plan.rows(), rows);
+                assert!(plan.pair_group().is_some());
+                assert_eq!(plan.row(0), RowSource::Pair(0, PairSide::Left));
+                assert_eq!(plan.row(1), RowSource::Pair(0, PairSide::Right));
+                assert!(plan.group_channel(1).is_none());
+                for (index, &channel) in shown.iter().enumerate() {
+                    assert_eq!(plan.row(2 + index), RowSource::Channel(0, channel));
+                    assert_eq!(plan.group_channel(2 + index).unwrap().1, channel);
+                }
+                for height in heights {
+                    // Every row that fits at the least height shows; the rest scroll.
+                    let fits = ((height / stack::MIN_ROW_HEIGHT).floor() as usize).max(1);
+                    let expected = if rows as f32 * stack::MIN_ROW_HEIGHT > height {
+                        fits.min(rows)
+                    } else {
+                        rows
+                    };
+                    let lane = stack::lay_out(height, &[plan.spec()], &[0])[0];
+                    assert_eq!(
+                        (lane.rows, lane.shown, lane.first),
+                        (rows, expected, 0),
+                        "{channels} channels, {} shown, {height}",
+                        shown.len()
+                    );
+                    assert!((lane.height - height).abs() < 0.001);
+                    // The pair scrolls away with the lane, and the last row can be reached.
+                    let last = stack::lay_out(height, &[plan.spec()], &[rows])[0];
+                    assert_eq!(last.first + last.shown, rows);
+                    // A mono lane B below keeps its row.
+                    let both = [plan.clone(), views_plan(1, &[WaveformView::Merged])];
+                    let boxes =
+                        stack::lay_out(height, &both.each_ref().map(LanePlan::spec), &[0, 0]);
+                    assert_eq!(boxes[1].shown, 1);
+                    assert!(boxes[0].shown >= 1);
+                    assert_eq!(
+                        row_at_height(&both, &boxes, 0.0),
+                        Some(RowSource::Pair(0, PairSide::Left))
+                    );
+                }
+                // The window grows for the pair and the rows shown, never for hidden ones.
+                assert_eq!(
+                    stack::comfortable_height(&[plan.spec()]),
+                    Some(rows as f32 * stack::COMFORTABLE_ROW_HEIGHT)
+                );
+            }
+        }
+        // A lane too wide for the pair (more than 64 channels) has no pair rows.
+        assert!(pair_group(&[], 65).is_none());
+        assert!(pair_group(&[], 64).is_some());
+    }
+
+    #[test]
+    fn hidden_rows_follow_which_channels_are_active() {
+        const NONE: [usize; 0] = [];
+        let group = windows_71();
+        // Hiding off: every row.
+        assert_eq!(shown_channels(&group, None), (0..8).collect::<Vec<_>>());
+        // Nothing heard yet, or only front left and right: the pair alone.
+        assert_eq!(shown_channels(&group, Some(0)), NONE);
+        assert_eq!(shown_channels(&group, Some(0b11)), NONE);
+        assert_eq!(shown_channels(&group, Some(0b01)), NONE);
+        // Anything beyond them: every active channel, front left and right included.
+        assert_eq!(
+            shown_channels(&group, Some(0xff)),
+            (0..8).collect::<Vec<_>>()
+        );
+        assert_eq!(shown_channels(&group, Some(0b101)), [0, 2]);
+        assert_eq!(shown_channels(&group, Some(0b1000)), [3]);
+        assert_eq!(shown_channels(&group, Some(0b1100_0011)), [0, 1, 6, 7]);
+        // Bits past the lane's channels mean nothing.
+        assert_eq!(shown_channels(&group, Some(1 << 40)), NONE);
+        // Numbered channels have no front pair of their own.
+        let numbered = numbered_group(3);
+        assert_eq!(shown_channels(&numbered, Some(0b11)), [0, 1]);
+        // A group further into the lane counts its bits from the lane's first channel.
+        let later = group_with(12..14, &["Object 1", "Object 2"]);
+        assert_eq!(shown_channels(&later, Some(1 << 13)), [13]);
+        assert_eq!(shown_channels(&later, Some(0b11)), NONE);
+    }
+
+    fn group_with(channels: Range<usize>, labels: &[&str]) -> LaneGroup {
+        LaneGroup {
+            id: "objects".into(),
+            label: "Objects".into(),
+            channels,
+            labels: labels.iter().map(|&label| label.to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_row_appears_at_once_and_goes_only_after_two_silent_answers() {
+        let mut activity = ChannelActivity::default();
+        assert_eq!(activity.shown, None);
+        activity.answer(0b111);
+        assert_eq!(activity.shown, Some(0b111));
+        // One silent answer is not enough for channel 2 to lose its row; two are.
+        activity.answer(0b011);
+        assert_eq!(activity.shown, Some(0b111));
+        activity.answer(0b011);
+        assert_eq!(activity.shown, Some(0b011));
+        // Back at once.
+        activity.answer(0b111);
+        assert_eq!(activity.shown, Some(0b111));
+        // A channel that comes and goes every answer keeps its row.
+        for _ in 0..10 {
+            activity.answer(0b011);
+            assert_eq!(activity.shown, Some(0b111));
+            activity.answer(0b111);
+            assert_eq!(activity.shown, Some(0b111));
+        }
+        // Everything gone quiet: after two answers only the pair is left.
+        activity.answer(0);
+        activity.answer(0);
+        assert_eq!(activity.shown, Some(0));
+        // The top channel of a 64-channel lane works like any other.
+        activity.answer(1 << 63);
+        assert_eq!(activity.shown, Some(1 << 63));
+    }
+
+    #[test]
+    fn the_pair_is_one_unit_of_a_row_selection_and_is_kept_by_identity() {
+        let group = windows_71();
+        let pair = RowSource::pair(0);
+        let a = |channel| RowSource::Channel(0, channel);
+        // Rows of FC, Ls and Rs shown below the pair; the others are hidden.
+        let lanes = [
+            paired_plan(0, group.clone(), vec![2, 6, 7]),
+            views_plan(1, &[WaveformView::Left, WaveformView::Right]),
+        ];
+        for side in pair {
+            assert_eq!(rows_between(&lanes, side, side), pair);
+            assert_eq!(clip_rows(&lanes, true, None, Some(side)), pair);
+        }
+        assert_eq!(
+            rows_between(&lanes, pair[1], a(6)),
+            [pair[0], pair[1], a(2), a(6)]
+        );
+        assert_eq!(
+            rows_between(&lanes, a(7), pair[0]),
+            [pair[0], pair[1], a(2), a(6), a(7)]
+        );
+        // Into lane B, and from B back up into the pair.
+        let b_left = RowSource::View(1, WaveformView::Left);
+        assert_eq!(rows_between(&lanes, a(7), b_left), [a(7), b_left]);
+        assert_eq!(rows_between(&lanes, b_left, pair[1]).len(), 6);
+        // A press on either pair row takes the pair.
+        let boxes = stack::lay_out(140.0, &lanes.each_ref().map(LanePlan::spec), &[0, 0]);
+        let under = |y: f32| row_at_height(&lanes, &boxes, y).unwrap();
+        assert_eq!(rows_between(&lanes, under(5.0), under(5.0)), pair);
+        assert_eq!(rows_between(&lanes, under(25.0), under(25.0)), pair);
+        assert_eq!(under(45.0), a(2));
+        // A hidden row stands for itself; when more rows show, the selection keeps its audio.
+        assert_eq!(rows_between(&lanes, a(3), a(3)), [a(3)]);
+        let more = [paired_plan(0, group, vec![2, 3, 6, 7])];
+        let chosen = rows_between(&lanes, pair[0], a(6));
+        assert_eq!(
+            rows_between(&more, chosen[0], *chosen.last().unwrap()),
+            [pair[0], pair[1], a(2), a(3), a(6)]
+        );
+        // What the rows write and play: the pair, and the lane-native channels.
+        let export = row_export(&[pair[0], pair[1], a(6), a(2)]).unwrap();
+        assert_eq!(export.lane, Some(0));
+        assert_eq!(export.pair, [true, false]);
+        assert_eq!(export.native[0], Some(vec![2, 6]));
+        // Until the export call writes the pair, a pair writes its whole lane.
+        assert_eq!(export.channels, [None, None]);
+        let channels = row_export(&[a(6), a(2)]).unwrap();
+        assert_eq!(
+            (channels.pair, channels.channels[0].clone()),
+            ([false, false], Some(2..7))
+        );
+        let only_pair = row_export(&pair).unwrap();
+        assert_eq!(only_pair.native[0], Some(Vec::new()));
+        let right = row_export(&[RowSource::View(1, WaveformView::Right)]).unwrap();
+        assert_eq!(
+            (
+                right.lane,
+                right.native[1].clone(),
+                right.channels[1].clone()
+            ),
+            (Some(1), Some(vec![1]), Some(1..2))
+        );
+    }
+
+    #[test]
+    fn the_frozen_edit_names_the_chosen_rows_by_snapshot_for_the_export() {
+        let edit = |lanes: Vec<usize>| FrozenEdit {
+            snapshots: lanes.iter().map(|_| tone(8)).collect::<Vec<_>>().into(),
+            lanes,
+            bars: Vec::new(),
+            retention_seconds: 20.0,
+            export_options: ExportOptions::default(),
+            groups: [vec![windows_71()], Vec::new()],
+            shown_groups: Default::default(),
+            positions: no_positions(),
+            activity: [None; 2],
+            activity_job: None,
+        };
+        let pair = RowSource::pair(1);
+        let rows = [
+            pair[0],
+            pair[1],
+            RowSource::Channel(1, 5),
+            RowSource::Channel(1, 3),
+        ];
+        // Snapshot 0 holds lane B here, as it does when only B records.
+        let only_b = edit(vec![1]);
+        let choice = only_b.row_choice(&rows);
+        assert_eq!(
+            choice[0],
+            RowChoice {
+                channels: Some(vec![3, 5]),
+                pair: true
+            }
+        );
+        assert_eq!(choice[1], RowChoice::default());
+        let both = edit(vec![0, 1]);
+        let choice = both.row_choice(&rows);
+        assert_eq!(
+            (choice[0].clone(), choice[1].pair),
+            (RowChoice::default(), true)
+        );
+        // No rows chosen is every row of every lane.
+        assert_eq!(
+            both.row_choice(&[]),
+            [RowChoice::default(), RowChoice::default()]
+        );
+    }
+
+    #[test]
+    fn the_length_label_never_covers_a_flag() {
+        let audio = Rect::from_min_size(Pos2::new(28.0, 0.0), Vec2::new(470.0, 80.0));
+        let full = Vec2::new(150.0, 13.0);
+        let short = Vec2::new(50.0, 13.0);
+        let flag =
+            |x: f32| Rect::from_min_size(Pos2::new(x, 0.0), Vec2::new(7.0, 11.0)).expand(1.0);
+        // Flags far from the corner: the full label at the top right.
+        let (index, place) = length_label_place(audio, &[full, short], &[flag(60.0), flag(100.0)]);
+        assert_eq!(
+            (index, place),
+            (0, Pos2::new(audio.right() - 8.0 - 150.0, 0.0))
+        );
+        // An end flag under the full label: the length alone.
+        let (index, place) = length_label_place(audio, &[full, short], &[flag(60.0), flag(400.0)]);
+        assert_eq!((index, place.y), (1, 0.0));
+        // Under the short one too: the length alone at the top left.
+        let end = audio.right() - 30.0;
+        let (index, place) = length_label_place(audio, &[full, short], &[flag(200.0), flag(end)]);
+        assert_eq!((index, place), (1, Pos2::new(audio.left() + 8.0, 0.0)));
+        // Flags at both corners: the length alone below the flags.
+        let flags = [flag(audio.left() + 2.0), flag(end)];
+        let (index, place) = length_label_place(audio, &[full, short], &flags);
+        let label = Rect::from_min_size(place, short);
+        assert_eq!(index, 1);
+        assert!(flags.iter().all(|flag| !flag.intersects(label)));
+        assert!(audio.contains_rect(label));
+        // A fade label has only one form.
+        assert_eq!(length_label_place(audio, &[full], &[]).0, 0);
+    }
+
+    #[test]
+    fn the_frozen_pair_rows_are_the_fold_down_of_their_group() {
+        let track = numbered(12);
+        let group = bed_group();
+        let pair = PairGroup::new(0, &group.labels).unwrap();
+        let key = EditPreviewKey {
+            frames: 100..108,
+            rows: vec![
+                RowSource::Pair(0, PairSide::Left),
+                RowSource::Pair(0, PairSide::Right),
+                RowSource::Channel(0, 2),
+            ],
+            pairs: [Some(pair.clone()), None],
+            bins: 4,
+        };
+        let peaks = edit_preview(std::slice::from_ref(&track), &[0], &key);
+        for (row, side) in [PairSide::Left, PairSide::Right].into_iter().enumerate() {
+            let (mut low, mut high) = (vec![0.0; 4], vec![0.0; 4]);
+            track.pair_waveform(&pair, side, 100..108, &mut low, &mut high);
+            assert_eq!((&peaks[row].low, &peaks[row].high), (&low, &high));
+            assert!(high.iter().all(|&value| value > 0.0), "{side:?}");
+        }
+        assert_eq!(peaks[2].high, [0.03; 4]);
+        // Without its group a pair row stays flat rather than show other audio.
+        let lost = EditPreviewKey {
+            pairs: [None, None],
+            ..key
+        };
+        assert_eq!(edit_preview(&[track], &[0], &lost)[0].high, [0.0; 4]);
     }
 
     #[test]
@@ -8913,53 +10024,165 @@ mod tests {
     }
 
     #[test]
-    fn space_plays_mono_and_stereo_lanes_but_never_a_mix_of_a_wide_one() {
+    fn space_plays_mono_and_stereo_as_before_and_a_wide_lane_by_its_rows() {
         let routes = [ChannelRoute::Merged, ChannelRoute::Right];
-        let wide_reason = Language::current().no_wide_preview();
-        // 7.1.4 in A and stereo in B, edited together: nothing plays, and the reason is given.
-        let wide_and_stereo = [tone(12), tone(2)];
+        let objects = LaneGroup {
+            id: "objects".into(),
+            label: "Objects".into(),
+            channels: 12..14,
+            labels: vec!["Object 1".into(), "Object 2".into()],
+        };
+        let groups = [vec![bed_group(), objects.clone()], Vec::new()];
+        let on_show = [None, None];
+        let wide_and_stereo = [tone(14), tone(2)];
+        // A stereo lane B is captured merged; Right is the route of a mono one.
+        let merged = [ChannelRoute::Merged; 2];
+        let plan = |rows: Option<&[RowSource]>| {
+            preview_plan(&wide_and_stereo, &[0, 1], &groups, &on_show, merged, rows)
+        };
+        // Edited together: both lanes, A as its pair (the whole Channels group), B as before.
+        let together = plan(None).unwrap();
         assert_eq!(
-            preview_tracks(&wide_and_stereo, &[0, 1], routes, None).err(),
-            Some(wide_reason)
+            together,
+            [
+                PreviewPart {
+                    index: 0,
+                    route: ChannelRoute::Merged,
+                    group: PairGroup::new(0, &bed_group().labels),
+                    channels: 0..12,
+                    selected: None,
+                    positions: false,
+                },
+                PreviewPart {
+                    index: 1,
+                    route: ChannelRoute::Merged,
+                    group: None,
+                    channels: 0..0,
+                    selected: None,
+                    positions: false,
+                },
+            ]
         );
-        // Edited separately, B plays on its own with its own route; A still does not play.
-        let (tracks, played) = preview_tracks(&wide_and_stereo, &[0, 1], routes, Some(1)).unwrap();
+        // The pair, alone or with channel rows, plays the whole Channels group, of A only.
+        let pair = RowSource::pair(0);
+        assert_eq!(plan(Some(&pair)).unwrap(), together[..1]);
         assert_eq!(
-            (tracks.len(), tracks[0].channels(), played[0]),
-            (1, 2, ChannelRoute::Right)
+            plan(Some(&[pair[0], pair[1], RowSource::Channel(0, 2)])).unwrap(),
+            together[..1]
         );
+        // Channel rows play only their own channels, within their group.
+        let rows = [RowSource::Channel(0, 4), RowSource::Channel(0, 2)];
         assert_eq!(
-            preview_tracks(&wide_and_stereo, &[0, 1], routes, Some(0)).err(),
-            Some(wide_reason)
+            plan(Some(&rows)).unwrap(),
+            [PreviewPart {
+                selected: Some(vec![2, 4]),
+                ..together[0].clone()
+            }]
         );
-        // Mono and stereo play as on main, both lanes together.
-        let narrow = [tone(2), tone(1)];
-        let (tracks, played) = preview_tracks(&narrow, &[0, 1], routes, None).unwrap();
-        assert_eq!((tracks.len(), played), (2, routes));
-        let preview = Preview::new(
-            tracks,
-            101..105,
-            &played[..tracks.len()],
-            false,
-            Fades::NONE,
+        // Object rows play their group, with its positions.
+        let object_rows = [RowSource::Channel(0, 13)];
+        assert_eq!(
+            plan(Some(&object_rows)).unwrap(),
+            [PreviewPart {
+                index: 0,
+                route: ChannelRoute::Merged,
+                group: PairGroup::new(12, &objects.labels),
+                channels: 12..14,
+                selected: Some(vec![13]),
+                positions: true,
+            }]
         );
-        assert!(preview.is_some());
+        // Rows of two groups at once play the pair.
+        assert_eq!(
+            plan(Some(&[RowSource::Channel(0, 2), RowSource::Channel(0, 12)])).unwrap(),
+            together[..1]
+        );
+        // A lane chosen whole while Objects is on show plays every object, with positions.
+        let objects_on_show = [Some("objects".to_owned()), None];
+        let whole = preview_plan(
+            &wide_and_stereo,
+            &[0, 1],
+            &groups,
+            &objects_on_show,
+            merged,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                whole[0].channels.clone(),
+                whole[0].selected.clone(),
+                whole[0].positions
+            ),
+            (12..14, None, true)
+        );
+        // Only the R row of a split stereo lane: only R.
+        let right = [RowSource::View(1, WaveformView::Right)];
+        assert_eq!(
+            plan(Some(&right)).unwrap(),
+            [PreviewPart {
+                selected: Some(vec![1]),
+                ..together[1].clone()
+            }]
+        );
+        // Both of its rows: the lane as it always played.
+        assert_eq!(
+            plan(Some(&[RowSource::View(1, WaveformView::Left), right[0]])).unwrap(),
+            together[1..]
+        );
         // Only lane B recording: the one snapshot is B's, with B's route.
         let only_b = [tone(1)];
-        let (_, played) = preview_tracks(&only_b, &[1], routes, Some(1)).unwrap();
-        assert_eq!(played[0], ChannelRoute::Right);
-        assert!(preview_tracks(&only_b, &[1], routes, Some(0)).is_err());
-        // The preview itself refuses a wide lane, so nothing could play a wrong mix.
-        assert!(
-            Preview::new(
-                &[tone(12)],
-                101..105,
-                &[ChannelRoute::Merged],
-                false,
-                Fades::NONE
-            )
-            .is_none()
+        let played = preview_plan(&only_b, &[1], &groups, &on_show, routes, None).unwrap();
+        assert_eq!(
+            (played.len(), played[0].route, played[0].group.is_none()),
+            (1, ChannelRoute::Right, true)
         );
+        assert!(preview_plan(&only_b, &[1], &groups, &on_show, routes, Some(&pair)).is_err());
+        assert!(preview_plan(&only_b, &[0, 1], &groups, &on_show, routes, None).is_err());
+        // Every plan makes a preview the core accepts, in stereo and binaural; none is played.
+        let model = Arc::new(HeadModel::new(48_000).unwrap());
+        for (rows, model) in [
+            (None, None),
+            (Some(&pair[..]), None),
+            (Some(&pair[..]), Some(Arc::clone(&model))),
+            (Some(&rows[..]), None),
+            (Some(&rows[..]), Some(Arc::clone(&model))),
+            (Some(&object_rows[..]), None),
+            (Some(&right[..]), None),
+        ] {
+            let parts = plan(rows).unwrap();
+            let lanes: Vec<_> = parts
+                .iter()
+                .map(|part| PreviewLane {
+                    track: &wide_and_stereo[part.index],
+                    route: part.route,
+                    group: part.group.as_ref(),
+                    selected: part.selected.as_deref(),
+                })
+                .collect();
+            assert!(
+                Preview::with_positions(&lanes, 101..105, model, false, Fades::NONE, &[None; 2])
+                    .is_some(),
+                "{rows:?}"
+            );
+        }
+        // Mono and stereo played whole still take the preview they always did.
+        let narrow = [tone(2), tone(1)];
+        let parts = preview_plan(
+            &narrow,
+            &[0, 1],
+            &[Vec::new(), Vec::new()],
+            &on_show,
+            routes,
+            None,
+        )
+        .unwrap();
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.group.is_none() && part.selected.is_none())
+        );
+        assert!(Preview::new(&narrow, 101..105, &routes, false, Fades::NONE).is_some());
     }
 
     #[test]

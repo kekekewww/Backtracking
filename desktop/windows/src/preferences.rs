@@ -50,6 +50,37 @@ impl WideExportMode {
     }
 }
 
+/// How the L and R rows on top of a lane wider than stereo sound in preview and on export. The
+/// window draws them as the stereo fold-down either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PairRender {
+    /// Each channel goes to the left, the right or both by its label.
+    #[default]
+    Stereo,
+    /// Each channel is placed around the head by its direction.
+    Binaural,
+}
+
+impl PairRender {
+    pub(crate) const ALL: [Self; 2] = [Self::Stereo, Self::Binaural];
+
+    pub(crate) fn preference(self) -> &'static str {
+        match self {
+            Self::Stereo => "stereo",
+            Self::Binaural => "binaural",
+        }
+    }
+
+    pub(crate) fn from_preference(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.preference() == text)
+    }
+
+    /// What the export calls `pair_binaural`.
+    pub(crate) fn binaural(self) -> bool {
+        self == Self::Binaural
+    }
+}
+
 /// Source identity to the channel group last selected for that source.
 pub(crate) type SourceGroupChoices = BTreeMap<String, String>;
 
@@ -126,6 +157,7 @@ pub(crate) enum Key {
     WavSampleFormat,
     WavForceMono,
     WideExport,
+    PairRender,
     ShownGroups,
     Output,
     OutputCleanup,
@@ -165,6 +197,7 @@ impl Key {
             Self::WavSampleFormat => "wav-sample-format",
             Self::WavForceMono => "wav-force-mono",
             Self::WideExport => "wide-lane-export-v1",
+            Self::PairRender => "multichannel-pair-render",
             Self::ShownGroups => "shown-channel-groups-v1",
             Self::Output => "output-folder",
             // Absent or 0 keeps every file.
@@ -204,6 +237,7 @@ pub(crate) struct Settings {
     pub(crate) wav_profile: WavExportProfile,
     pub(crate) wav_force_mono: bool,
     pub(crate) wide_export: WideExportMode,
+    pub(crate) pair_render: PairRender,
     pub(crate) shown_groups: SourceGroupChoices,
     pub(crate) output: PathBuf,
     /// Days after which old exports in `output` are deleted; `None` keeps them.
@@ -252,6 +286,7 @@ impl Default for Settings {
             wav_profile: WavExportProfile::default(),
             wav_force_mono: false,
             wide_export: WideExportMode::default(),
+            pair_render: PairRender::default(),
             shown_groups: SourceGroupChoices::new(),
             output: directory.join("output"),
             output_cleanup: None,
@@ -346,6 +381,11 @@ impl Preferences {
             .read(Key::WideExport)
             .as_deref()
             .and_then(|value| WideExportMode::from_preference(value.trim()))
+            .unwrap_or_default();
+        settings.pair_render = self
+            .read(Key::PairRender)
+            .as_deref()
+            .and_then(|value| PairRender::from_preference(value.trim()))
             .unwrap_or_default();
         settings.shown_groups = self.load_shown_groups();
         if let Some(path) = self.read_absolute_path(Key::Output) {
@@ -1569,6 +1609,26 @@ mod tests {
         assert_eq!(
             preferences.read(Key::ShownGroups).as_deref(),
             Some("{invalid json")
+        );
+    }
+
+    #[test]
+    fn the_pair_render_defaults_to_stereo_and_keeps_what_it_cannot_read() {
+        let preferences = workspace_preferences("pair-render");
+        assert_eq!(preferences.load().pair_render, PairRender::Stereo);
+        assert!(!preferences.load().pair_render.binaural());
+        for mode in PairRender::ALL {
+            preferences
+                .save(Key::PairRender, mode.preference())
+                .unwrap();
+            assert_eq!(preferences.load().pair_render, mode);
+        }
+        assert!(preferences.load().pair_render.binaural());
+        preferences.save(Key::PairRender, "surround").unwrap();
+        assert_eq!(preferences.load().pair_render, PairRender::Stereo);
+        assert_eq!(
+            preferences.read(Key::PairRender).as_deref(),
+            Some("surround")
         );
     }
 

@@ -32,6 +32,11 @@
 //!   one. A test copy refuses `open=` (and any other way to open a file) unless the add-on's
 //!   `play_through_speakers` setting is known to be off, so a test makes no sound; use
 //!   `set=<add-on id>:play_through_speakers=false` first.
+//!   `pair=<stereo|binaural>` sets how the L/R pair of a wide lane sounds, and
+//!   `hide-silent=<on|off>` whether system, application and microphone lanes hide the rows of
+//!   silent channels, as their Options controls do (for this run only). `preview-plan` writes
+//!   to the log what Space would play of the selection and whether it could be prepared; it
+//!   never plays it.
 //!
 //! The picture is `<file.png>`; `<file.png>.log` gets the frame times and any problem.
 
@@ -45,6 +50,7 @@ use backtracking_addon::protocol::TransportCommand;
 use eframe::egui;
 
 use super::{OptionsSection, Recorder, RowSource, rows_between};
+use crate::preferences::PairRender;
 
 pub(super) const SCREENSHOT: &str = "BACKTRACKING_TEST_SCREENSHOT";
 const SCREENSHOT_DELAY: &str = "BACKTRACKING_TEST_SCREENSHOT_DELAY_MS";
@@ -82,6 +88,12 @@ pub(super) enum Step {
     Open(String, PathBuf),
     Transport(usize, TransportCommand, Option<f64>),
     Wait(u64),
+    /// How the pair of a wide lane sounds.
+    Pair(PairRender),
+    /// Whether lanes that may hide silent rows do.
+    HideSilent(bool),
+    /// Logs what Space would play, without playing it.
+    PreviewPlan,
 }
 
 impl Step {
@@ -96,6 +108,7 @@ impl Step {
                 | Self::Transport(..)
                 | Self::Save(_)
                 | Self::Wait(_)
+                | Self::PreviewPlan
         )
     }
 }
@@ -161,6 +174,9 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
             if step == "install" {
                 return Ok(Step::Install);
             }
+            if step == "preview-plan" {
+                return Ok(Step::PreviewPlan);
+            }
             let (name, value) = step
                 .split_once('=')
                 .ok_or_else(|| format!("no '=' in {step}"))?;
@@ -218,6 +234,14 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                     "off" => Ok(Step::Separate(false)),
                     other => Err(format!("{other} is not on or off")),
                 },
+                "hide-silent" => match value.trim() {
+                    "on" => Ok(Step::HideSilent(true)),
+                    "off" => Ok(Step::HideSilent(false)),
+                    other => Err(format!("{other} is not on or off")),
+                },
+                "pair" => PairRender::from_preference(value.trim())
+                    .map(Step::Pair)
+                    .ok_or_else(|| format!("{value} is not stereo or binaural")),
                 "scroll" => {
                     let (lane_text, row) = pair(step, value)?;
                     let row = row
@@ -724,8 +748,66 @@ impl Recorder {
                     harness.hold = Duration::from_millis(*milliseconds);
                 }
             }
+            &Step::Pair(render) => self.pair_render = render,
+            &Step::HideSilent(on) => {
+                self.hide_silent = on;
+                self.live_revision = None;
+                ctx.request_repaint();
+            }
+            Step::PreviewPlan => {
+                let note = self.describe_preview();
+                if let Some(harness) = self.harness.as_mut() {
+                    harness.notes.push(note);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// What Space would play now, for the log: the plan lane by lane, and whether the preview
+    /// could be prepared. The preview made is dropped unplayed.
+    fn describe_preview(&mut self) -> String {
+        let Some(selection) = self.selection.clone() else {
+            return "preview: no selection".into();
+        };
+        let Some(edit) = self.editing.as_ref() else {
+            return "preview: the selection is not frozen".into();
+        };
+        let plan = super::preview_plan(
+            &edit.snapshots,
+            &edit.lanes,
+            &edit.groups,
+            &edit.shown_groups,
+            self.routes(),
+            self.selected_rows(),
+        );
+        let parts = match plan {
+            Ok(parts) => parts,
+            Err(error) => return format!("preview: {error}"),
+        };
+        let described: Vec<String> = parts
+            .iter()
+            .map(|part| {
+                format!(
+                    "snapshot {} route {:?} group {:?} selected {:?} positions {}",
+                    part.index, part.route, part.channels, part.selected, part.positions
+                )
+            })
+            .collect();
+        let prepared = match self.preview_of(&parts, selection.clone()) {
+            Ok(preview) => {
+                drop(preview);
+                "prepared, not played"
+            }
+            Err(error) => error,
+        };
+        format!(
+            "preview of {}..{} ({:?}): {}; {prepared}",
+            selection.start,
+            selection.end,
+            self.pair_render,
+            described.join("; ")
+        )
     }
 
     /// Makes `rows` what the next selection covers, as the drag that crossed them would. A
@@ -1177,6 +1259,22 @@ mod tests {
             assert!(parse_steps(bad).is_err(), "{bad}");
         }
         assert!(parse_steps("separate=maybe").is_err());
+        assert_eq!(
+            parse_steps("pair=binaural; hide-silent=off; pair=stereo;hide-silent=on;preview-plan")
+                .unwrap(),
+            [
+                Step::Pair(PairRender::Binaural),
+                Step::HideSilent(false),
+                Step::Pair(PairRender::Stereo),
+                Step::HideSilent(true),
+                Step::PreviewPlan,
+            ]
+        );
+        assert!(Step::PreviewPlan.waits());
+        assert!(!Step::Pair(PairRender::Binaural).waits());
+        for bad in ["pair=surround", "pair", "hide-silent=yes"] {
+            assert!(parse_steps(bad).is_err(), "{bad}");
+        }
         assert_eq!(parse_steps(" ").unwrap(), []);
         assert_eq!(
             parse_steps(

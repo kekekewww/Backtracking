@@ -9,6 +9,13 @@ use std::sync::OnceLock;
 use backtracking_addon::manifest::{Capability, OpenFiles};
 use backtracking_addon::protocol::MessageLevel;
 
+/// Lines the capture code (`controller.rs`) writes in both languages at once, word for word.
+/// A test checks that the capture code still writes them so.
+const BILINGUAL_FALLBACK_TO_MERGED: &str =
+    "All channels is unavailable. Using Merged. / 目前無法擷取所有聲道，已改用合併聲道。";
+const BILINGUAL_POSITIONS_TRIMMED: &str =
+    "Position history was trimmed to its memory limit. / 位置歷史已依記憶體上限刪減。";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Language {
     English,
@@ -74,12 +81,88 @@ impl Language {
         )
     }
 
-    /// Space on a selection that covers a lane wider than stereo, which is not played.
-    pub(crate) fn no_wide_preview(self) -> &'static str {
+    /// The tooltip of one of the two rows on top of a lane wider than stereo.
+    pub(crate) fn pair_row(self, left: bool) -> &'static str {
+        if left {
+            self.pick(
+                "L: the left side of all channels mixed to stereo",
+                "L：所有聲道混成立體聲後的左聲道",
+            )
+        } else {
+            self.pick(
+                "R: the right side of all channels mixed to stereo",
+                "R：所有聲道混成立體聲後的右聲道",
+            )
+        }
+    }
+
+    /// The Options group that holds the settings for lanes wider than stereo.
+    pub(crate) fn multichannel_group(self) -> &'static str {
+        self.pick("Multichannel sources", "多聲道來源")
+    }
+
+    pub(crate) fn pair_render_field(self) -> &'static str {
+        self.pick("L/R of multichannel sources", "多聲道來源的 L/R")
+    }
+
+    pub(crate) fn pair_render(self, binaural: bool) -> &'static str {
+        if binaural {
+            self.pick("Binaural", "雙耳")
+        } else {
+            self.pick("Stereo", "立體聲")
+        }
+    }
+
+    pub(crate) fn pair_render_note(self) -> &'static str {
         self.pick(
-            "Preview plays mono and stereo sources only.",
-            "試聽只播放單聲道與立體聲來源。",
+            "How L and R sound in preview and on export. Binaural places each channel around \
+             your head, for headphones. The waveform is the same either way.",
+            "L 與 R 在試聽和匯出時的聲音。「雙耳」會把每個聲道放在頭部周圍的位置，適合用耳機聆聽。兩種方式的波形都相同。",
         )
+    }
+
+    pub(crate) fn hide_silent_field(self) -> &'static str {
+        self.pick("Hide silent channels", "隱藏無聲的聲道")
+    }
+
+    pub(crate) fn hide_silent_note(self) -> &'static str {
+        self.pick(
+            "System, application and microphone sources show below L and R only the channels \
+             that have sound. Add-on sources show every channel.",
+            "系統、應用程式與麥克風來源在 L 與 R 下方只顯示有聲音的聲道。附加元件來源會顯示所有聲道。",
+        )
+    }
+
+    /// The Sources page's route that captures every channel of a device.
+    pub(crate) fn all_channels(self) -> &'static str {
+        self.pick("All channels", "所有聲道")
+    }
+
+    /// A stored All channels choice on a device with two channels or fewer.
+    pub(crate) fn all_channels_fallback(self) -> &'static str {
+        self.pick(
+            "All channels is unavailable. Using Merged.",
+            "目前無法擷取所有聲道，已改用合併聲道。",
+        )
+    }
+
+    /// Shown once per history when a lane's position track reached its memory limit.
+    pub(crate) fn positions_trimmed(self) -> &'static str {
+        self.pick(
+            "Position history was trimmed to its memory limit.",
+            "位置歷史已依記憶體上限刪減。",
+        )
+    }
+
+    /// A source message from the capture code in this language. The capture code writes the
+    /// messages it has no catalog for in both languages on one line; those it knows are
+    /// replaced by this language's own words, and others are left as they are.
+    pub(crate) fn source_message(self, message: &str) -> &str {
+        match message {
+            BILINGUAL_FALLBACK_TO_MERGED => self.all_channels_fallback(),
+            BILINGUAL_POSITIONS_TRIMMED => self.positions_trimmed(),
+            _ => message,
+        }
     }
 
     /// Under the history setting, when wide lanes leave room for less than was asked for.
@@ -856,7 +939,8 @@ mod tests {
         for language in [English, TraditionalChinese] {
             assert!(!language.scroll_hint().is_empty());
             assert!(!language.no_loudness().is_empty());
-            assert!(!language.no_wide_preview().is_empty());
+            assert_ne!(language.pair_row(true), language.pair_row(false));
+            assert_ne!(language.pair_render(true), language.pair_render(false));
             assert!(!language.wide_export_field().is_empty());
             assert!(!language.wide_export_note().is_empty());
             assert!(!language.test_copy_startup().is_empty());
@@ -872,6 +956,14 @@ mod tests {
         for text in [
             super::Language::separate_rows,
             super::Language::separate_needs_rows,
+            super::Language::multichannel_group,
+            super::Language::pair_render_field,
+            super::Language::pair_render_note,
+            super::Language::hide_silent_field,
+            super::Language::hide_silent_note,
+            super::Language::all_channels,
+            super::Language::all_channels_fallback,
+            super::Language::positions_trimmed,
         ] {
             assert_ne!(text(English), text(TraditionalChinese));
             assert!(text(TraditionalChinese).chars().any(|c| c as u32 >= 0x3000));
@@ -889,6 +981,41 @@ mod tests {
         assert_eq!(English.channel(3, 12, "C"), "Channel 3 of 12: C");
         assert_eq!(TraditionalChinese.show_group("Objects"), "顯示Objects");
         assert_ne!(English.scroll_hint(), TraditionalChinese.scroll_hint());
+    }
+
+    #[test]
+    fn lines_the_capture_code_writes_in_both_languages_show_in_one() {
+        // The capture code still writes these lines word for word.
+        let controller = include_str!("../controller.rs");
+        for line in [
+            super::BILINGUAL_FALLBACK_TO_MERGED,
+            super::BILINGUAL_POSITIONS_TRIMMED,
+        ] {
+            let (english, chinese) = line.split_once(" / ").unwrap();
+            assert!(controller.contains(english), "{english}");
+            assert!(controller.contains(chinese), "{chinese}");
+        }
+        assert_eq!(
+            English.source_message(super::BILINGUAL_POSITIONS_TRIMMED),
+            "Position history was trimmed to its memory limit."
+        );
+        assert_eq!(
+            TraditionalChinese.source_message(super::BILINGUAL_POSITIONS_TRIMMED),
+            "位置歷史已依記憶體上限刪減。"
+        );
+        assert_eq!(
+            English.source_message(super::BILINGUAL_FALLBACK_TO_MERGED),
+            "All channels is unavailable. Using Merged."
+        );
+        assert_eq!(
+            TraditionalChinese.source_message(super::BILINGUAL_FALLBACK_TO_MERGED),
+            "目前無法擷取所有聲道，已改用合併聲道。"
+        );
+        // Anything else is left as it came.
+        assert_eq!(
+            English.source_message("Add-on is stopped"),
+            "Add-on is stopped"
+        );
     }
 
     #[test]
