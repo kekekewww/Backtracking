@@ -9,6 +9,8 @@
 //!   capture something too.
 //!
 //! Settings, all optional:
+//! - `BACKTRACKING_TEST_SYSTEM_FORMAT`: select System with All channels in lane A. A test
+//!   instance accepts `5.1`, `7.1` or `7.1.4` followed by `:all` or `:stereo`.
 //! - `BACKTRACKING_TEST_FORMAT`: `stereo`, `5.1` or `7.1.4` (default) for the test tone.
 //! - `BACKTRACKING_TEST_LANE_B`: `off` (default), `sender` (the stereo Sender) or `tone`.
 //! - `BACKTRACKING_TEST_PREFERENCES`: `name=value` pairs separated by `;`, named like the files
@@ -345,6 +347,12 @@ fn seed_test_profile() {
         route: ChannelRoute::Merged,
     };
     let lane_a = match std::env::var("BACKTRACKING_TEST_LANE_A").as_deref() {
+        _ if std::env::var_os("BACKTRACKING_TEST_SYSTEM_FORMAT").is_some() => {
+            Some(SourceSettings {
+                source: CaptureSource::System,
+                route: ChannelRoute::AllChannels,
+            })
+        }
         Ok("tone") => Some(tone.clone()),
         Ok("atmos") => Some(atmos.clone()),
         Ok("off") => None,

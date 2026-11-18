@@ -31,6 +31,7 @@ pub(crate) struct PositionTimeline {
     waiting_audio: VecDeque<Mapping>,
     retained_end: u64,
     passed_time: u64,
+    clock_floor: u64,
     overflowed: bool,
     warned: bool,
 }
@@ -44,6 +45,7 @@ impl Default for PositionTimeline {
             waiting_audio: VecDeque::new(),
             retained_end: 0,
             passed_time: 0,
+            clock_floor: 0,
             overflowed: false,
             warned: false,
         }
@@ -57,11 +59,16 @@ impl PositionTimeline {
             self.overflowed = true;
         }
         self.pending.push_back(Pending { time, channels });
-        self.resolve();
+        if !self.mappings.is_empty() {
+            self.resolve();
+        }
     }
 
     /// The packet's final frame is anchored to the retained capture's end.
     /// This re-anchors after gaps instead of extending an offset through them.
+    // Compatibility for callers which have only packet-end observations.
+    // The desktop capture worker uses resolve_capture for both clock modes.
+    #[allow(dead_code)]
     pub(crate) fn audio_packet(
         &mut self,
         time: u64,
@@ -159,6 +166,45 @@ impl PositionTimeline {
         }
     }
 
+    fn insert(track: &mut PositionTrack, frame: u64, channels: Vec<ChannelPosition>) {
+        for channel in channels {
+            track.insert(
+                channel.channel as usize,
+                PositionKey {
+                    frame,
+                    position: Position {
+                        x: channel.x,
+                        y: channel.y,
+                        z: channel.z,
+                        size: channel.size.unwrap_or(0.0),
+                        gain: channel.gain.unwrap_or(1.0),
+                    },
+                },
+            );
+        }
+    }
+
+    pub(crate) fn resolve_capture(
+        &mut self,
+        capture: &backtracking_core::SynchronizedCapture,
+        lane: usize,
+    ) {
+        self.pending.retain_mut(
+            |message| match capture.retained_frame_at(lane, message.time) {
+                std::task::Poll::Ready(Some(frame)) => {
+                    Self::insert(
+                        &mut self.track,
+                        frame,
+                        std::mem::take(&mut message.channels),
+                    );
+                    false
+                }
+                std::task::Poll::Ready(None) => false,
+                std::task::Poll::Pending => true,
+            },
+        );
+    }
+
     fn resolve(&mut self) {
         let mut waiting = VecDeque::new();
         while let Some(pending) = self.pending.pop_front() {
@@ -171,21 +217,7 @@ impl PositionTimeline {
                     + ((u128::from(pending.time - mapping.time)
                         * u128::from(mapping.end_frame - mapping.first_frame))
                         / u128::from(mapping.end_time - mapping.time)) as u64;
-                for channel in pending.channels {
-                    self.track.insert(
-                        channel.channel as usize,
-                        PositionKey {
-                            frame,
-                            position: Position {
-                                x: channel.x,
-                                y: channel.y,
-                                z: channel.z,
-                                size: channel.size.unwrap_or(0.0),
-                                gain: channel.gain.unwrap_or(1.0),
-                            },
-                        },
-                    );
-                }
+                Self::insert(&mut self.track, frame, pending.channels);
             } else if pending.time >= self.passed_time {
                 waiting.push_back(pending);
             }
@@ -194,8 +226,14 @@ impl PositionTimeline {
         self.pending = waiting;
     }
 
+    pub(crate) fn clock_evicted_before(&mut self, first: u64) {
+        self.clock_floor = self.clock_floor.max(first);
+        self.overflowed = true;
+    }
+
     pub(crate) fn retain_frames(&mut self, frames: Range<u64>) {
-        self.track.retain_frames(frames.clone());
+        self.track
+            .retain_frames(frames.start.max(self.clock_floor)..frames.end);
         while self
             .mappings
             .front()
@@ -226,6 +264,29 @@ impl PositionTimeline {
     }
 
     pub(crate) fn freeze(&self) -> FrozenPositionTrack {
+        // Normal retention keeps a preceding key to interpolate across the window
+        // edge. A clock eviction also drops that key from the exported view.
+        if self.clock_floor > 0
+            && (0..64).any(|ch| {
+                !self
+                    .track
+                    .channel_positions(ch, 0..self.clock_floor)
+                    .is_empty()
+            })
+        {
+            let mut mapped = PositionTrack::with_memory_limit(TRACK_BYTES);
+            for channel in 0..64 {
+                for key in self
+                    .track
+                    .channel_positions(channel, self.clock_floor..u64::MAX)
+                {
+                    if key.frame >= self.clock_floor {
+                        mapped.insert(channel, key);
+                    }
+                }
+            }
+            return mapped.freeze();
+        }
         self.track.freeze()
     }
 
@@ -245,6 +306,60 @@ mod tests {
 
     fn update() -> Vec<ChannelPosition> {
         vec![ChannelPosition::new(2, -0.5, 0.5, 0.0)]
+    }
+
+    #[test]
+    fn nine_minute_late_position_is_frozen_on_its_original_audio() {
+        use backtracking_core::{DurationChoice, SynchronizedCapture};
+        let mut capture =
+            SynchronizedCapture::new(1000, 1, None, DurationChoice::Minutes10).unwrap();
+        capture.enable_frame_clock(0).unwrap();
+        for i in 0..54002 {
+            let time = i * 10_000_000 + i % 2 * 250_000;
+            capture
+                .push_native_interleaved(time, &[0.2; 10], false)
+                .unwrap();
+        }
+        let mut timeline = PositionTimeline::default();
+        let channels = update();
+        let channel = channels[0].channel as usize;
+        timeline.receive(14_250_000, channels);
+        timeline.resolve_capture(&capture, 0);
+        assert_eq!(
+            timeline.freeze().channel_positions(channel, 0..540020)[0].frame,
+            14
+        );
+    }
+
+    #[test]
+    fn clock_eviction_drops_resolved_and_late_keys_and_warns_once() {
+        use backtracking_core::{DurationChoice, SynchronizedCapture};
+        let mut capture =
+            SynchronizedCapture::new(1000, 1, None, DurationChoice::Minutes10).unwrap();
+        capture.enable_frame_clock(0).unwrap();
+        let mut timeline = PositionTimeline::default();
+        for i in 0..64003 {
+            let time = i * 1_000_000 + i % 2 * 125_000;
+            capture
+                .push_native_interleaved(time, &[0.25], false)
+                .unwrap();
+            if i == 0 || i == 5 {
+                timeline.receive(time, update());
+                timeline.resolve_capture(&capture, 0);
+            }
+        }
+        let first = capture.take_frame_clock_eviction(0).unwrap();
+        timeline.clock_evicted_before(first);
+        timeline.receive(1_125_000, update());
+        timeline.resolve_capture(&capture, 0);
+        timeline.retain_frames(capture.capture().frame_range());
+        assert!(timeline.pending.is_empty());
+        let snapshot = timeline.freeze();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot.channel_positions(2, 0..64003)[0].frame, 5);
+        assert!(timeline.take_overflowed());
+        timeline.clock_evicted_before(first);
+        assert!(!timeline.take_overflowed());
     }
 
     #[test]

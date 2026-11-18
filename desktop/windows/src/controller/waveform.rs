@@ -50,10 +50,17 @@ struct Pending {
     cancel: Arc<AtomicBool>,
 }
 
+// Keep the original inline waveform request in the bounded channel.
+#[allow(clippy::large_enum_variant)]
+enum WaveformJob {
+    Render(Work),
+    Activity(Box<dyn FnOnce() + Send>),
+}
+
 /// Only one request can own frozen pages. A changed view waits for cancellation
 /// before pinning another snapshot, so rapid scrolling cannot queue histories.
 pub(super) struct ChannelWaveforms {
-    requests: mpsc::SyncSender<Work>,
+    requests: mpsc::SyncSender<WaveformJob>,
     pending: Option<Pending>,
     #[cfg(test)]
     pub(super) before_render: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -61,14 +68,18 @@ pub(super) struct ChannelWaveforms {
 
 impl ChannelWaveforms {
     pub(super) fn new(ui: Arc<UiLink>) -> io::Result<Self> {
-        let (requests, work) = mpsc::sync_channel::<Work>(1);
+        let (requests, work) = mpsc::sync_channel::<WaveformJob>(1);
         thread::Builder::new()
             .name("channel waveforms".into())
             .spawn(move || {
                 while let Ok(work) = work.recv() {
-                    let result = work.result.clone();
-                    let rendered = work.render();
-                    let _ = result.send(rendered);
+                    match work {
+                        WaveformJob::Render(work) => {
+                            let result = work.result.clone();
+                            let _ = result.send(work.render());
+                        }
+                        WaveformJob::Activity(job) => job(),
+                    }
                     if let Some(repaint) = ui.repaint.get() {
                         repaint();
                     }
@@ -80,6 +91,12 @@ impl ChannelWaveforms {
             #[cfg(test)]
             before_render: None,
         })
+    }
+
+    pub(super) fn try_queue(&self, job: impl FnOnce() + Send + 'static) -> bool {
+        self.requests
+            .try_send(WaveformJob::Activity(Box::new(job)))
+            .is_ok()
     }
 
     pub(super) fn render(
@@ -175,7 +192,7 @@ impl ChannelWaveforms {
             #[cfg(test)]
             before_render: self.before_render.clone(),
         };
-        if self.requests.try_send(request).is_ok() {
+        if self.requests.try_send(WaveformJob::Render(request)).is_ok() {
             self.pending = Some(Pending {
                 view,
                 result: receive,

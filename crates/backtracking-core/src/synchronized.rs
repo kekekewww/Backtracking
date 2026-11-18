@@ -25,16 +25,18 @@ pub enum ChannelRoute {
     Side = 4,
     #[default]
     Merged = 5,
+    AllChannels = 7,
 }
 
 impl ChannelRoute {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Left,
         Self::Right,
         Self::Center,
         Self::Mid,
         Self::Side,
         Self::Merged,
+        Self::AllChannels,
     ];
 
     pub const fn from_code(value: u32) -> Option<Self> {
@@ -45,6 +47,7 @@ impl ChannelRoute {
             3 => Some(Self::Mid),
             4 => Some(Self::Side),
             5 => Some(Self::Merged),
+            7 => Some(Self::AllChannels),
             _ => None,
         }
     }
@@ -57,6 +60,7 @@ impl ChannelRoute {
             Self::Mid => "Mid",
             Self::Side => "Side",
             Self::Merged => "Merged",
+            Self::AllChannels => "All channels / 所有聲道",
         }
     }
 
@@ -64,6 +68,7 @@ impl ChannelRoute {
     /// Other routes use the original channel layout, with L/R in positions 0/1.
     pub fn output_channels(self, native: usize, center: Option<usize>) -> Option<usize> {
         match self {
+            Self::AllChannels if (3..=64).contains(&native) => Some(native),
             Self::Left if native >= 1 => Some(1),
             Self::Right | Self::Mid | Self::Side if native >= 2 => Some(1),
             Self::Center if center.is_some_and(|index| index < native) => Some(1),
@@ -86,7 +91,7 @@ impl ChannelRoute {
         if samples.len() % native != 0 {
             return Err(CaptureError::IncompleteFrame);
         }
-        if self == Self::Merged {
+        if matches!(self, Self::Merged | Self::AllChannels) {
             if channels != native {
                 return Err(CaptureError::InvalidChannelCount);
             }
@@ -99,14 +104,14 @@ impl ChannelRoute {
             Self::Center => frame[center.expect("validated center")],
             Self::Mid => frame[0] * 0.5 + frame[1] * 0.5,
             Self::Side => frame[0] * 0.5 - frame[1] * 0.5,
-            Self::Merged => unreachable!(),
+            Self::Merged | Self::AllChannels => unreachable!(),
         }));
         Ok(())
     }
 }
 
-/// A legacy route or all native source channels. Keeping this separate from
-/// `ChannelRoute` preserves exhaustive matches in existing clients and its C ABI.
+/// A device route or an unconditional native pass-through. Code 6 retains its
+/// original native meaning for callers using the ChannelRouting wire format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelRouting {
     Routed(ChannelRoute),
@@ -209,7 +214,279 @@ impl Clock {
     }
 }
 
+// A packet, or consecutive packets with the same source clock, projected onto
+// the capture grid. origin is fractional because independently clocked inputs
+// are resampled before the gate. Each input sample maps like a bar marker.
+#[derive(Clone, Copy)]
+struct ClockSpan {
+    time: u64,
+    origin: f64,
+    grid_per_input: f64,
+    samples: u32,
+    rate: u32,
+}
+
+impl ClockSpan {
+    fn time_at(self, sample: u32) -> u64 {
+        self.time
+            .saturating_add(u64::from(sample) * 1_000_000_000 / u64::from(self.rate))
+    }
+
+    fn grid_at(self, sample: u32) -> f64 {
+        self.origin + f64::from(sample) * self.grid_per_input
+    }
+
+    fn frame_at(self, sample: u32) -> u64 {
+        ceil_grid(self.grid_at(sample))
+    }
+
+    fn first_at_or_after(self, frame: u64) -> u32 {
+        let mut i = (((frame as f64 - 1. - self.origin) / self.grid_per_input + 1.).floor() as u32)
+            .min(self.samples);
+        while i > 0 && self.frame_at(i - 1) >= frame {
+            i -= 1;
+        }
+        while i < self.samples && self.frame_at(i) < frame {
+            i += 1;
+        }
+        i
+    }
+
+    fn slice(self, grid: std::ops::Range<u64>, destination: u64) -> Option<Self> {
+        let first = self.first_at_or_after(grid.start);
+        let end = self.first_at_or_after(grid.end);
+        (first < end).then(|| Self {
+            time: self.time_at(first),
+            origin: (self.grid_at(first) - grid.start as f64) + destination as f64,
+            samples: end - first,
+            ..self
+        })
+    }
+
+    fn merge(&mut self, next: Self) -> bool {
+        let Some(total) = self.samples.checked_add(next.samples) else {
+            return false;
+        };
+        // One ns accommodates integer packet timestamps. Check both ends so a
+        // small frequency correction cannot accumulate into a displaced frame.
+        if self.rate != next.rate
+            || self.time_at(self.samples).abs_diff(next.time) > 1
+            || (self.grid_at(self.samples) - next.origin).abs() > 1e-7
+            || (self.grid_at(total) - next.grid_at(next.samples)).abs() > 1e-7
+        {
+            return false;
+        }
+        self.samples = total;
+        true
+    }
+
+    fn lookup(self, time: u64) -> Option<u64> {
+        if time < self.time || time >= self.time_at(self.samples) {
+            return None;
+        }
+        let i = ((u128::from(time - self.time + 1) * u128::from(self.rate) - 1) / NANOS_PER_SECOND)
+            as u32;
+        Some(self.frame_at(i))
+    }
+}
+
+// Retained stretches occupy the front, and current gate pre-roll occupies the
+// tail in its own frame coordinates. Both draw from one fixed allocation.
+const CLOCK_ENTRIES: usize = 64_000;
+struct FrameClock {
+    spans: VecDeque<ClockSpan>,
+    kept: usize,
+    quiet_end: u64,
+    quiet_limit: u64,
+    latest: u64,
+    discarded_before: u64,
+    unordered: bool,
+    overflowed: bool,
+    break_next: bool,
+}
+
+impl FrameClock {
+    fn new(quiet_limit: usize) -> Result<Self, CaptureError> {
+        let mut spans = VecDeque::new();
+        spans
+            .try_reserve_exact(CLOCK_ENTRIES)
+            .map_err(|_| CaptureError::AllocationFailed)?;
+        Ok(Self {
+            spans,
+            kept: 0,
+            quiet_end: 0,
+            quiet_limit: quiet_limit as u64,
+            latest: 0,
+            discarded_before: 0,
+            unordered: false,
+            overflowed: false,
+            break_next: false,
+        })
+    }
+
+    fn trim_retained(&mut self, first: u64) {
+        while self.kept > 0 && self.spans[0].frame_at(self.spans[0].samples - 1) < first {
+            self.spans.pop_front();
+            self.kept -= 1;
+        }
+    }
+
+    fn trim_quiet(&mut self, first: u64) {
+        while let Some(span) = self.spans.get(self.kept).copied() {
+            let n = span.first_at_or_after(first);
+            if n > 0 {
+                self.discarded_before = self.discarded_before.max(span.time_at(n));
+            }
+            if n < span.samples {
+                break;
+            }
+            self.spans.remove(self.kept);
+        }
+    }
+
+    fn discard_quiet(&mut self) {
+        self.trim_quiet(u64::MAX);
+        self.quiet_end = 0;
+        self.break_next = true;
+    }
+
+    fn promote_quiet(&mut self, frame: u64, pre_roll: usize) {
+        let count = self.quiet_end.min(pre_roll as u64);
+        let first = self.quiet_end - count;
+        self.trim_quiet(first);
+        for span in self.spans.iter_mut().skip(self.kept) {
+            *span = span
+                .slice(first..self.quiet_end, frame - count)
+                .expect("retained pre-roll");
+            self.unordered |= span.time < self.latest;
+            self.latest = self.latest.max(span.time_at(span.samples));
+        }
+        self.kept = self.spans.len();
+        self.quiet_end = 0;
+    }
+
+    fn append(&mut self, span: ClockSpan, kept: bool, new_stretch: bool) {
+        if kept {
+            self.unordered |= span.time < self.latest;
+            self.latest = self.latest.max(span.time_at(span.samples));
+        }
+        let same_region = kept || self.spans.len() > self.kept;
+        let boundary = std::mem::take(&mut self.break_next) || new_stretch;
+        if !boundary && same_region && self.spans.back_mut().is_some_and(|last| last.merge(span)) {
+            return;
+        }
+        if self.spans.len() == CLOCK_ENTRIES {
+            let oldest = self.spans.pop_front().expect("full clock");
+            self.discarded_before = self.discarded_before.max(oldest.time_at(oldest.samples));
+            self.kept = self.kept.saturating_sub(1);
+            self.overflowed = true;
+        }
+        self.spans.push_back(span);
+        if kept {
+            self.kept += 1;
+        }
+    }
+
+    fn record(
+        &mut self,
+        source: Option<ClockSpan>,
+        grid: std::ops::Range<u64>,
+        retained: Option<(u64, usize)>,
+        limit: u64,
+    ) {
+        if let Some((first, pre_roll)) = retained {
+            let end = first + (grid.end - grid.start);
+            self.trim_retained(end.saturating_sub(limit));
+            let opening = self.quiet_end != 0;
+            if opening {
+                self.promote_quiet(first, pre_roll);
+            }
+            if let Some(span) = source.and_then(|s| s.slice(grid, first)) {
+                self.append(span, true, opening);
+            }
+        } else {
+            let start = self.quiet_end;
+            self.quiet_end += grid.end - grid.start;
+            self.trim_quiet(self.quiet_end.saturating_sub(self.quiet_limit));
+            if let Some(span) = source.and_then(|s| s.slice(grid, start)) {
+                self.append(span, false, false);
+            }
+            self.trim_quiet(self.quiet_end.saturating_sub(self.quiet_limit));
+        }
+    }
+
+    fn lookup(&self, time: u64) -> Option<u64> {
+        if time >= self.latest || self.kept == 0 {
+            return None;
+        }
+        if self.unordered {
+            self.spans
+                .range(..self.kept)
+                .rev()
+                .find_map(|span| span.lookup(time))
+        } else {
+            let mut lo = 0;
+            let mut hi = self.kept;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if self.spans[mid].time <= time {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo.checked_sub(1).and_then(|i| self.spans[i].lookup(time))
+        }
+    }
+}
+
+// Batch the gate's decisions into runs. No clock record is written per sample.
+fn push_timed(
+    capture: &mut Capture,
+    clocks: &mut [Option<Box<FrameClock>>; 2],
+    sources: [Option<ClockSpan>; 2],
+    grid: u64,
+    samples: &[f32],
+    bars: &[usize],
+) -> Result<(), CaptureError> {
+    let limit = capture.effective_retention_frames() as u64;
+    let mut record = |first: usize, end: usize, retained: Option<(u64, usize)>| {
+        for (clock, source) in clocks.iter_mut().zip(sources) {
+            if let Some(clock) = clock {
+                clock.record(
+                    source,
+                    grid + first as u64..grid + end as u64,
+                    retained,
+                    limit,
+                );
+            }
+        }
+    };
+    let mut first = 0;
+    let mut end = 0;
+    let mut run = None;
+    let result = capture.push_observed(samples, bars, |offset, retained| {
+        if end == 0
+            || retained.is_some() != run.is_some()
+            || retained.is_some_and(|(_, pre)| pre > 0)
+        {
+            if end != 0 {
+                record(first, end, run);
+            }
+            first = offset;
+            run = retained;
+        }
+        end = offset + 1;
+    });
+    if end > first {
+        record(first, end, run);
+    }
+    result
+}
+
 struct Packet {
+    timestamp_ns: u64,
+    source_rate: u32,
     start: u64,
     end: u64,
     origin: f64,
@@ -226,6 +503,15 @@ struct Packet {
 }
 
 impl Packet {
+    fn clock_span(&self) -> ClockSpan {
+        ClockSpan {
+            time: self.timestamp_ns,
+            origin: self.origin,
+            grid_per_input: 1. / self.step,
+            samples: self.input_frames as u32,
+            rate: self.source_rate,
+        }
+    }
     fn append_context(&mut self, following: &[f32], channels: usize) -> bool {
         let limit = (self.prefix_frames + self.input_frames + self.context_frames) * channels;
         let need = limit - self.samples.len();
@@ -356,6 +642,7 @@ pub struct SynchronizedCapture {
     scratch: Vec<f32>,
     bar_scratch: Vec<usize>,
     capture_error: Option<CaptureError>,
+    clocks: [Option<Box<FrameClock>>; 2],
 }
 
 impl SynchronizedCapture {
@@ -400,7 +687,52 @@ impl SynchronizedCapture {
             scratch: Vec::with_capacity(DRAIN_FRAMES * (a_channels + b_channels.unwrap_or(0))),
             bar_scratch: Vec::new(),
             capture_error: None,
+            clocks: [None, None],
         })
+    }
+
+    /// Enable the bounded timestamp index on a positioned lane or trim its expired entries.
+    /// The record pool is reserved once before accepting packets.
+    pub fn enable_frame_clock(&mut self, lane: usize) -> Result<(), CaptureError> {
+        if self.lanes.get(lane).and_then(Option::as_ref).is_none() {
+            return Err(CaptureError::InvalidChannelCount);
+        }
+        if let Some(clock) = &mut self.clocks[lane] {
+            clock.trim_retained(self.capture.frame_range().start);
+        } else {
+            self.clocks[lane] = Some(Box::new(FrameClock::new(self.capture.pre_roll_capacity())?));
+        }
+        Ok(())
+    }
+
+    /// After a budget eviction, return the first frame still covered by this lane.
+    /// A monitor can trim previously resolved positions and publish a history notice.
+    pub fn take_frame_clock_eviction(&mut self, lane: usize) -> Option<u64> {
+        let clock = self.clocks.get_mut(lane)?.as_mut()?;
+        if !std::mem::take(&mut clock.overflowed) {
+            return None;
+        }
+        let history = self.capture.frame_range();
+        Some(if clock.kept == 0 {
+            history.end
+        } else {
+            clock.spans[0].frame_at(0).max(history.start)
+        })
+    }
+
+    /// Map a source timestamp to retained audio, accounting for resampling and the gate.
+    pub fn retained_frame_at(&self, lane: usize, time_ns: u64) -> std::task::Poll<Option<u64>> {
+        use std::task::Poll;
+        let Some(clock) = self.clocks.get(lane).and_then(Option::as_ref) else {
+            return Poll::Ready(None);
+        };
+        if let Some(frame) = clock.lookup(time_ns) {
+            Poll::Ready(self.capture.frame_range().contains(&frame).then_some(frame))
+        } else if time_ns < clock.latest.max(clock.discarded_before) {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
     }
 
     pub fn capture(&self) -> &Capture {
@@ -432,6 +764,9 @@ impl SynchronizedCapture {
     }
 
     pub fn reset_input(&mut self) {
+        for clock in self.clocks.iter_mut().flatten() {
+            clock.discard_quiet();
+        }
         for lane in self.lanes.iter_mut().flatten() {
             lane.reset();
         }
@@ -466,9 +801,17 @@ impl SynchronizedCapture {
         if frames == 0 {
             return Ok(());
         }
+        if discontinuity {
+            for clock in self.clocks.iter_mut().flatten() {
+                clock.break_next = true;
+            }
+        }
         if let Some(end_ns) = self.native_end_ns {
             let gap_ns = timestamp_ns.saturating_sub(end_ns);
             if discontinuity || gap_ns > NATIVE_TIMESTAMP_JITTER_NS {
+                // Synthetic gap frames have no Sender timestamp. Keep only real
+                // pre-roll that still fits after the gap.
+
                 let gap_frames = ((u128::from(gap_ns) * u128::from(self.sample_rate)
                     + NANOS_PER_SECOND / 2)
                     / NANOS_PER_SECOND)
@@ -497,12 +840,24 @@ impl SynchronizedCapture {
                     let mut remaining =
                         gap_frames.min(frames_for_ms(self.sample_rate, GAP_TAIL_MS));
                     let have_gap = remaining != 0;
+
                     self.scratch.clear();
                     self.scratch.resize(DRAIN_FRAMES * channels, 0.);
                     while remaining > 0 {
                         let count = remaining.min(DRAIN_FRAMES as u64) as usize;
-                        self.capture
-                            .push_interleaved(&self.scratch[..count * channels])?;
+                        let samples = &self.scratch[..count * channels];
+                        if self.clocks.iter().any(Option::is_some) {
+                            push_timed(
+                                &mut self.capture,
+                                &mut self.clocks,
+                                [None; 2],
+                                0,
+                                samples,
+                                &[],
+                            )?;
+                        } else {
+                            self.capture.push_interleaved(samples)?;
+                        }
                         remaining -= count as u64;
                     }
                     if have_gap {
@@ -511,8 +866,26 @@ impl SynchronizedCapture {
                 }
             }
         }
-        self.capture
-            .push_interleaved_with_markers(interleaved, source_block_offset_of_bars)?;
+        if self.clocks.iter().any(Option::is_some) {
+            let source = ClockSpan {
+                time: timestamp_ns,
+                origin: 0.,
+                grid_per_input: 1.,
+                samples: u32::try_from(frames).map_err(|_| CaptureError::BufferTooLarge)?,
+                rate: self.sample_rate,
+            };
+            push_timed(
+                &mut self.capture,
+                &mut self.clocks,
+                [Some(source); 2],
+                0,
+                interleaved,
+                source_block_offset_of_bars,
+            )?;
+        } else {
+            self.capture
+                .push_interleaved_with_markers(interleaved, source_block_offset_of_bars)?;
+        }
         let duration_ns = (frames as u128 * NANOS_PER_SECOND / u128::from(self.sample_rate))
             .min(u128::from(u64::MAX)) as u64;
         self.native_end_ns = Some(timestamp_ns.saturating_add(duration_ns));
@@ -675,6 +1048,8 @@ impl SynchronizedCapture {
             .collect();
         let waiting_after_gap = std::mem::take(&mut lane.waiting_after_gap);
         lane.packets.push_back(Packet {
+            timestamp_ns,
+            source_rate,
             start: first,
             end,
             origin,
@@ -779,7 +1154,12 @@ impl SynchronizedCapture {
                         self.capture_error = Some(error);
                     }
                 } else {
-                    self.push_block(cursor, cursor + gap_tail, fade_frames);
+                    let tail_end = cursor + gap_tail;
+                    while cursor < tail_end {
+                        let end = tail_end.min(cursor + DRAIN_FRAMES as u64);
+                        self.push_block(cursor, end, fade_frames);
+                        cursor = end;
+                    }
                 }
                 cursor = gap_end;
             } else {
@@ -792,6 +1172,47 @@ impl SynchronizedCapture {
     }
 
     fn push_block(&mut self, start: u64, end: u64, fade_frames: u64) {
+        if self.clocks.iter().all(Option::is_none) {
+            self.render_block(start, end, fade_frames, None);
+            return;
+        }
+        let mut cursor = start;
+        while cursor < end {
+            let mut boundary = end;
+            let mut sources = [None; 2];
+            for (i, lane) in self.lanes.iter_mut().enumerate() {
+                if self.clocks[i].is_none() {
+                    continue;
+                }
+                if let Some(lane) = lane {
+                    lane.discard_before(cursor);
+                    if let Some(packet) = lane.packets.front() {
+                        if cursor < packet.start {
+                            boundary = boundary.min(packet.start);
+                        } else {
+                            if cursor == packet.start && packet.fade_in {
+                                if let Some(clock) = &mut self.clocks[i] {
+                                    clock.break_next = true;
+                                }
+                            }
+                            boundary = boundary.min(packet.end);
+                            sources[i] = Some(packet.clock_span());
+                        }
+                    }
+                }
+            }
+            self.render_block(cursor, boundary, fade_frames, Some(sources));
+            cursor = boundary;
+        }
+    }
+
+    fn render_block(
+        &mut self,
+        start: u64,
+        end: u64,
+        fade_frames: u64,
+        sources: Option<[Option<ClockSpan>; 2]>,
+    ) {
         self.scratch.clear();
         self.bar_scratch.clear();
         for frame in start..end {
@@ -803,11 +1224,20 @@ impl SynchronizedCapture {
                 self.bar_scratch.push((frame - start) as usize);
             }
         }
-        // Each lane appends exactly its configured channel count to every frame.
-        if let Err(error) = self
-            .capture
-            .push_interleaved_with_markers(&self.scratch, &self.bar_scratch)
-        {
+        let result = if let Some(sources) = sources {
+            push_timed(
+                &mut self.capture,
+                &mut self.clocks,
+                sources,
+                start,
+                &self.scratch,
+                &self.bar_scratch,
+            )
+        } else {
+            self.capture
+                .push_interleaved_with_markers(&self.scratch, &self.bar_scratch)
+        };
+        if let Err(error) = result {
             self.capture_error = Some(error);
         }
     }
@@ -833,8 +1263,234 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "release packet ingest timings"]
+    fn stereo_capture_packet_cost() {
+        for timed in [false, true] {
+            let mut capture =
+                SynchronizedCapture::new(48_000, 2, None, DurationChoice::Seconds10).unwrap();
+            if timed {
+                capture.enable_frame_clock(0).unwrap();
+            }
+            let packet: Vec<_> = (0..960).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
+            let mut ns = 0;
+            let mut batches = Vec::new();
+            for batch in 0..8 {
+                let start = std::time::Instant::now();
+                for _ in 0..2_000 {
+                    capture
+                        .push_native_interleaved(ns, std::hint::black_box(&packet), false)
+                        .unwrap();
+                    ns += 10_000_000;
+                }
+                if batch != 0 {
+                    batches.push(start.elapsed().as_secs_f64() * 1e6 / 2000.);
+                }
+            }
+            batches.sort_by(f64::total_cmp);
+            eprintln!(
+                "clock={timed}, median {:.3} us per native stereo 480-frame packet",
+                batches[3]
+            );
+        }
+    }
+
+    #[test]
+    fn clock_budget_evicts_only_the_oldest_and_reports_once() {
+        let mut capture =
+            SynchronizedCapture::new(1000, 1, None, DurationChoice::Minutes10).unwrap();
+        capture.enable_frame_clock(0).unwrap();
+        for i in 0..CLOCK_ENTRIES as u64 + 3 {
+            capture
+                .push_native_interleaved(i * 1_000_000 + i % 2 * 125_000, &[0.25], false)
+                .unwrap();
+        }
+        assert_eq!(capture.capture().frame_range().start, 0);
+        assert_eq!(
+            capture.retained_frame_at(0, 0),
+            std::task::Poll::Ready(None)
+        );
+        assert_eq!(
+            capture.retained_frame_at(0, 3_125_000),
+            std::task::Poll::Ready(Some(3))
+        );
+        assert_eq!(capture.take_frame_clock_eviction(0), Some(3));
+        assert_eq!(capture.take_frame_clock_eviction(0), None);
+    }
+
+    #[test]
+    #[ignore = "clock storage for ten minutes of packet ingestion"]
+    fn frame_clock_storage() {
+        for mode in ["steady", "gated", "jitter"] {
+            let (rate, packets) = if mode == "jitter" {
+                (1000, 54_002)
+            } else {
+                (48_000, 60_000)
+            };
+            let mut capture =
+                SynchronizedCapture::new(rate, 1, None, DurationChoice::Minutes10).unwrap();
+            capture.enable_frame_clock(0).unwrap();
+            let loud = vec![0.25; (rate / 100) as usize];
+            let quiet = vec![0.; loud.len()];
+            for i in 0..packets {
+                let time = i * 10_000_000 + if mode == "jitter" { i % 2 * 250_000 } else { 0 };
+                let samples = if mode == "gated" && i % 100 >= 50 {
+                    &quiet
+                } else {
+                    &loud
+                };
+                capture
+                    .push_native_interleaved(time, samples, false)
+                    .unwrap();
+            }
+            let clock = capture.clocks[0].as_ref().unwrap();
+            let overhead =
+                std::mem::size_of::<FrameClock>() + std::mem::size_of::<Option<Box<FrameClock>>>();
+            let bytes = std::mem::size_of::<ClockSpan>();
+            let reserved = overhead + clock.spans.capacity() * bytes;
+            eprintln!(
+                "{mode}: records={} ({} retained), used={} reserved={reserved} bytes",
+                clock.spans.len(),
+                clock.kept,
+                overhead + clock.spans.len() * bytes
+            );
+            assert!(reserved <= 2 * 1024 * 1024);
+            assert!(!clock.overflowed);
+            if mode == "steady" {
+                assert_eq!(clock.kept, 1);
+            }
+            if mode == "gated" {
+                assert!((600..=1200).contains(&clock.kept));
+            }
+            if mode == "jitter" {
+                assert_eq!(clock.kept, 54002);
+                assert_eq!(
+                    capture.retained_frame_at(0, 14_250_000),
+                    std::task::Poll::Ready(Some(14))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn independent_clock_maps_the_drifting_source_bar() {
+        use std::task::Poll;
+        let mut capture =
+            SynchronizedCapture::new(48000, 1, Some(1), DurationChoice::Seconds10).unwrap();
+        capture.enable_frame_clock(0).unwrap();
+        let mut time = 0;
+        for packet in 0..200 {
+            let first = packet * 10_002_000;
+            let bars: &[usize] = if packet == 177 {
+                time = first + 173 * 1_000_000_000u64 / 44100;
+                &[173]
+            } else {
+                &[]
+            };
+            capture
+                .push_with_markers(0, first, 44100, &[0.25; 441], false, bars)
+                .unwrap();
+            capture
+                .push(1, packet * 10_000_000, 48000, &[0.1; 480])
+                .unwrap();
+            capture.drain(false);
+        }
+        capture.drain(true);
+        let bars = capture.capture().bar_markers(0..u64::MAX);
+        assert_eq!(bars.len(), 1);
+        assert_eq!(
+            capture.retained_frame_at(0, time),
+            Poll::Ready(Some(bars[0]))
+        );
+    }
+
+    #[test]
+    fn gate_closing_inside_packet_keeps_only_retained_timestamps() {
+        use std::task::Poll;
+        let mut capture =
+            SynchronizedCapture::new(1000, 1, None, DurationChoice::Seconds10).unwrap();
+        capture.enable_frame_clock(0).unwrap();
+        capture
+            .push_native_interleaved(0, &[0.25; 5], false)
+            .unwrap();
+        capture
+            .push_native_interleaved_with_markers(5_000_000, &[0.; 240], false, &[149, 150, 220])
+            .unwrap();
+        capture
+            .push_native_interleaved(245_000_000, &[0.5; 5], false)
+            .unwrap();
+        assert_eq!(
+            capture.retained_frame_at(0, 154_000_000),
+            Poll::Ready(Some(154))
+        );
+        assert_eq!(capture.retained_frame_at(0, 155_000_000), Poll::Ready(None));
+        assert_eq!(
+            capture.retained_frame_at(0, 225_000_000),
+            Poll::Ready(Some(175))
+        );
+        assert_eq!(capture.capture().bar_markers(0..u64::MAX), [154, 175]);
+    }
+
+    #[test]
+    fn retained_clock_survives_nine_minutes_of_jittery_packets() {
+        let mut capture =
+            SynchronizedCapture::new(1000, 1, None, DurationChoice::Minutes10).unwrap();
+        capture.enable_frame_clock(0).unwrap();
+        for i in 0..54002 {
+            let time = i * 10_000_000 + i % 2 * 250_000;
+            capture
+                .push_native_interleaved_with_markers(
+                    time,
+                    &[0.2; 10],
+                    false,
+                    if i == 1 { &[4] } else { &[] },
+                )
+                .unwrap();
+        }
+        let bars = capture.capture().bar_markers(0..u64::MAX);
+        assert_eq!(bars, [14]);
+        assert_eq!(
+            capture.retained_frame_at(0, 14_250_000),
+            std::task::Poll::Ready(Some(14))
+        );
+    }
+
+    #[test]
+    fn frame_counted_sender_is_exact_and_one_ms_jitter_fades_packet_edges() {
+        for jitter in [false, true] {
+            let mut capture =
+                SynchronizedCapture::new(48000, 1, Some(1), DurationChoice::Seconds10).unwrap();
+            let packet: Vec<_> = (0..480).map(|i| 0.2 + i as f32 / 1000.).collect();
+            for i in 0..20 {
+                let time = i * 10_000_000;
+                capture
+                    .push(
+                        0,
+                        time + if jitter { i % 2 * 1_000_000 } else { 0 },
+                        48000,
+                        &packet,
+                    )
+                    .unwrap();
+                capture.push(1, time, 48000, &[0.3; 480]).unwrap();
+                capture.drain(false);
+            }
+            capture.drain(true);
+            let audio = capture.capture().track_snapshot(0).unwrap().samples;
+            if jitter {
+                for i in 1..19 {
+                    let start = i * 480 + 48;
+                    assert_eq!(audio[start], 0.);
+                    assert_eq!(audio[start + 100], packet[100]);
+                    assert_eq!(audio[start + 479], 0.);
+                }
+            } else {
+                assert_eq!(audio, packet.repeat(20));
+            }
+        }
+    }
+
+    #[test]
     fn native_routing_preserves_every_channel_and_legacy_codes() {
-        for (code, route) in ChannelRoute::ALL.into_iter().enumerate() {
+        for (code, route) in ChannelRoute::ALL[..6].iter().copied().enumerate() {
             let routing = ChannelRouting::Routed(route);
             assert_eq!(route as u32, code as u32);
             assert_eq!(ChannelRoute::from_code(code as u32), Some(route));
@@ -850,7 +1506,12 @@ mod tests {
         assert_eq!(ChannelRouting::from_code(6), Some(ChannelRouting::Native));
         assert_eq!(ChannelRouting::Native.code(), 6);
         assert_eq!(ChannelRouting::Native.label(), "Native");
-        assert_eq!(ChannelRouting::from_code(7), None);
+        let all = ChannelRouting::Routed(ChannelRoute::AllChannels);
+        assert_eq!(all.code(), 7);
+        assert_eq!(ChannelRouting::from_code(7), Some(all));
+        assert_eq!(all.output_channels(2, None), None);
+        assert_eq!(all.output_channels(8, None), Some(8));
+        assert_eq!(ChannelRouting::from_code(8), None);
 
         let mut routed = Vec::new();
         for channels in [1, 2, 12, 64] {

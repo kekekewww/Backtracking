@@ -114,6 +114,7 @@ pub(crate) enum Key {
     History,
     IdleResume,
     RetainSilence,
+    HideSilentChannels,
     Transparency,
     Accent,
     Meter,
@@ -151,6 +152,7 @@ impl Key {
             Self::History => "history-seconds",
             // The old preference used 0 for Off.
             Self::IdleResume => "idle-resume-delay-seconds",
+            Self::HideSilentChannels => "hide-silent-channels",
             Self::RetainSilence => "retain-silence",
             Self::Transparency => "transparency-percent",
             Self::Accent => "theme-color",
@@ -190,6 +192,7 @@ impl Key {
 pub(crate) struct Settings {
     pub(crate) history: DurationChoice,
     pub(crate) idle_resume: AutoResumeDelay,
+    pub(crate) hide_silent_channels: bool,
     pub(crate) retain_silence: bool,
     pub(crate) transparency: u8,
     pub(crate) accent: [u8; 3],
@@ -231,6 +234,7 @@ impl Default for Settings {
         Self {
             history: DurationChoice::Seconds20,
             idle_resume: AutoResumeDelay::default(),
+            hide_silent_channels: true,
             retain_silence: false,
             transparency: 0,
             accent: DEFAULT_ACCENT,
@@ -307,6 +311,7 @@ impl Preferences {
         {
             settings.idle_resume = delay;
         }
+        settings.hide_silent_channels = self.read_number::<u8>(Key::HideSilentChannels) != Some(0);
         settings.retain_silence = self.read_number::<u8>(Key::RetainSilence) == Some(1);
         if let Some(percent @ (0 | 25 | 50 | 75 | 100)) = self.read_number(Key::Transparency) {
             settings.transparency = percent;
@@ -1203,6 +1208,27 @@ mod tests {
         )
         .unwrap();
         println!("{result}");
+    }
+
+    #[test]
+    fn silent_channel_preference_and_all_channels_route_round_trip() {
+        let store = workspace_preferences("hide-silent-channels");
+        assert!(store.load().hide_silent_channels);
+        store.save(Key::HideSilentChannels, "0").unwrap();
+        assert!(!store.load().hide_silent_channels);
+        store.save(Key::HideSilentChannels, "1").unwrap();
+        assert!(store.load().hide_silent_channels);
+        let lanes = [
+            Some(SourceSettings {
+                source: CaptureSource::System,
+                route: ChannelRoute::AllChannels,
+            }),
+            None,
+        ];
+        store
+            .save(Key::CaptureSources, &serialize_sources(&lanes))
+            .unwrap();
+        assert_eq!(store.load().sources, lanes);
     }
 
     #[test]

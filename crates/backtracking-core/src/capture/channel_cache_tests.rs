@@ -363,3 +363,71 @@ fn channel_cache_standalone_pages_match_nonfinite_and_sample_level_scans() {
     check_range(None, &track, &flat, 63, 0..u64::MAX, (23, 19));
     check_range(None, &track, &flat, 64, 0..u64::MAX, (23, 19));
 }
+
+#[test]
+fn activity_uses_retained_edges_open_pages_and_frozen_audio() {
+    let mut capture =
+        Capture::new_tracks_with_budget(1000, 4, None, DurationChoice::Seconds10, 4000).unwrap();
+    capture.set_retain_silence(true);
+    let mut samples = vec![0.; 1001 * 4];
+    samples[0] = 0.1;
+    samples[5] = -0.000032;
+    samples[6] = -0.000031;
+    samples[4003] = 0.2;
+    capture.push_interleaved(&samples).unwrap();
+    assert_eq!(capture.active_channels(0), 0b1010);
+    let frozen = capture.freeze().track(0).unwrap();
+    capture.push_interleaved(&[0.; 4]).unwrap();
+    assert_eq!(capture.active_channels(0), 0b1000);
+    assert_eq!(frozen.active_channels(), 0b1010);
+}
+
+#[test]
+#[ignore = "ten minutes of wide retained audio"]
+fn activity_benchmark() {
+    for width in [1, 2] {
+        let mut capture = Capture::new(48000, width, DurationChoice::Seconds10).unwrap();
+        capture.push_interleaved(&vec![0.1; 480 * width]).unwrap();
+        let now = std::time::Instant::now();
+        for _ in 0..1_000_000 {
+            std::hint::black_box(std::hint::black_box(&capture).active_channels(0));
+        }
+        eprintln!(
+            "narrow width {width}: {} ns/query; cache bytes {:?}",
+            now.elapsed().as_nanos() as f64 / 1e6,
+            capture.history.channel_cache_bytes()
+        );
+        assert_eq!(capture.history.channel_cache_bytes(), (0, 0));
+    }
+    for width in [8, 12, 32] {
+        let rate = 48000;
+        let count = rate as usize * 600;
+        let mut capture = Capture::new_tracks_with_budget(
+            rate,
+            width,
+            None,
+            DurationChoice::Minutes10,
+            count * width,
+        )
+        .unwrap();
+        capture.set_retain_silence(true);
+        let mut packet = vec![0.; 800 * width];
+        packet[0] = 0.1;
+        for _ in 0..count / 800 {
+            capture.push_interleaved(&packet).unwrap();
+        }
+        assert_eq!(capture.frame_range(), 0..count as u64);
+        let now = std::time::Instant::now();
+        let expected = 1;
+        assert_eq!(capture.active_channels(0), expected);
+        let cold = now.elapsed();
+        let now = std::time::Instant::now();
+        for _ in 0..100 {
+            assert_eq!(std::hint::black_box(&capture).active_channels(0), expected);
+        }
+        eprintln!(
+            "{width} channels, 600 s, 48 kHz: cold {cold:?}, warm {:?}",
+            now.elapsed() / 100
+        );
+    }
+}

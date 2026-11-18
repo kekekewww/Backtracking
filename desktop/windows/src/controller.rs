@@ -212,7 +212,7 @@ enum Stream {
 }
 
 impl Stream {
-    fn open(source: CaptureSource, wake: DataWake) -> Result<Self, String> {
+    fn open(source: CaptureSource, wake: DataWake, all_channels: bool) -> Result<Self, String> {
         match source {
             CaptureSource::Sender { id, .. } => {
                 let receiver = SenderReceiver::connect(&id).map_err(|error| error.to_string())?;
@@ -227,7 +227,7 @@ impl Stream {
                     error: None,
                 })
             }
-            _ => Loopback::start(source, wake).map(Self::Wasapi),
+            _ => Loopback::start(source, wake, all_channels).map(Self::Wasapi),
         }
     }
 
@@ -334,6 +334,13 @@ impl Stream {
 
 type Sources = [Option<SourceSettings>; 2];
 
+fn requests_all_channels(sources: &Sources, source: &CaptureSource) -> bool {
+    sources
+        .iter()
+        .flatten()
+        .any(|lane| lane.source.same_source(source) && lane.route == ChannelRoute::AllChannels)
+}
+
 /// The entries every source list starts with: system audio and the default microphone.
 const FIXED_SOURCES: usize = 2;
 
@@ -391,11 +398,19 @@ fn is_sender(source: &CaptureSource) -> bool {
     )
 }
 
+fn effective_route(format: &Format, route: ChannelRoute) -> ChannelRoute {
+    if route == ChannelRoute::AllChannels && format.channels <= 2 {
+        ChannelRoute::Merged
+    } else {
+        route
+    }
+}
+
 fn capture_channels(source: &CaptureSource, format: &Format, route: ChannelRoute) -> Option<usize> {
     if is_sender(source) && format.channels > 2 {
         ChannelRouting::Native.output_channels(format.channels, None)
     } else {
-        format.route_channels(route)
+        format.route_channels(effective_route(format, route))
     }
 }
 
@@ -409,7 +424,7 @@ fn route_samples(
     if is_sender(source) && format.channels > 2 {
         let _ = ChannelRouting::Native.route_interleaved(samples, format.channels, None, output);
     } else {
-        format.route(route, samples, output);
+        format.route(effective_route(format, route), samples, output);
     }
 }
 type WaveformBuffers<'a> = (&'a mut [f32], &'a mut [f32]);
@@ -505,6 +520,21 @@ impl SourceStatus {
     }
 }
 
+#[derive(Default)]
+struct ActivityRead {
+    generation: u64,
+    mask: Option<(u64, u64)>, // capture revision and active-channel bits
+    pending: Option<mpsc::Receiver<Option<ActivityResult>>>,
+    #[cfg(test)]
+    worker_time: Duration,
+}
+struct ActivityResult {
+    revision: u64,
+    mask: u64,
+    #[cfg(test)]
+    worker_time: Duration,
+}
+
 pub(crate) struct Controller {
     sources: Sources,
     retention: DurationChoice,
@@ -518,6 +548,7 @@ pub(crate) struct Controller {
     shown_groups: SourceGroupChoices,
     group_preferences: Option<PreferenceWriter>,
     channel_waveforms: Mutex<ChannelWaveforms>,
+    activity: Mutex<[ActivityRead; 2]>,
     #[cfg(test)]
     channel_waveform_lock_ns: std::sync::atomic::AtomicU64,
 }
@@ -583,6 +614,7 @@ impl Controller {
             shown_groups: SourceGroupChoices::new(),
             group_preferences: None,
             channel_waveforms,
+            activity: Default::default(),
             #[cfg(test)]
             channel_waveform_lock_ns: std::sync::atomic::AtomicU64::new(0),
         })
@@ -695,10 +727,84 @@ impl Controller {
             .and_then(PreferenceWriter::poll_error)
     }
 
+    /// Returns the newest completed mask for the displayed generation. Freezing
+    /// pages and building cold channel peaks both happen on the waveform worker.
+    #[allow(dead_code)] // Used by the wide-lane row filter in the next UI wave.
+    pub(crate) fn try_active_channels(&self, lane: usize) -> Option<u64> {
+        if self.track_channels(lane)? <= 2 {
+            return Some(0);
+        }
+        let generation = self.source_status.generation;
+        let mut reads = self.activity.try_lock().ok()?;
+        let read = reads.get_mut(lane)?;
+        if read.generation != generation {
+            *read = ActivityRead {
+                generation,
+                ..Default::default()
+            };
+        }
+        if let Some(pending) = &read.pending {
+            match pending.try_recv() {
+                Ok(Some(result)) => {
+                    read.mask = Some((result.revision, result.mask));
+                    #[cfg(test)]
+                    {
+                        read.worker_time = result.worker_time;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => return read.mask.map(|(_, mask)| mask),
+                _ => {}
+            }
+            read.pending = None;
+        }
+        let last = read.mask.map(|(_, mask)| mask);
+        if read
+            .mask
+            .is_some_and(|(rev, _)| rev >= self.source_status.revision)
+        {
+            return last;
+        }
+        if let Ok(worker) = self.channel_waveforms.try_lock() {
+            let (send, result) = mpsc::channel();
+            let state = Arc::downgrade(&self.state);
+            if worker.try_queue(move || {
+                let result = (|| {
+                    let state = state.upgrade()?;
+                    let state = lock(&state);
+                    if state.generation != generation {
+                        return None;
+                    }
+                    let revision = state.revision;
+                    let physical = state.capture_lanes[lane]?;
+                    let track = state.capture.as_ref()?.capture().freeze().track(physical)?;
+                    drop(state);
+                    #[cfg(test)]
+                    let start = Instant::now();
+                    let mask = track.active_channels();
+                    Some(ActivityResult {
+                        revision,
+                        mask,
+                        #[cfg(test)]
+                        worker_time: start.elapsed(),
+                    })
+                })();
+                let _ = send.send(result);
+            }) {
+                read.pending = Some(result);
+            }
+        }
+        last
+    }
+
     pub(crate) fn route_available(&self, lane: usize, route: ChannelRoute) -> bool {
         if self
-            .track_channels(lane)
-            .is_some_and(|channels| channels > 2)
+            .sources
+            .get(lane)
+            .and_then(Option::as_ref)
+            .is_some_and(|s| is_sender(&s.source))
+            && self
+                .track_channels(lane)
+                .is_some_and(|channels| channels > 2)
         {
             return route == ChannelRoute::Merged;
         }
@@ -708,10 +814,13 @@ impl Controller {
             .get(lane)
             .and_then(Option::as_ref)
         {
+            if route == ChannelRoute::AllChannels {
+                return format.offers_all_channels();
+            }
             return format.route_channels(route).is_some();
         }
         // Until a source opens, avoid rejecting a saved route that the device may support.
-        route != ChannelRoute::Center
+        !matches!(route, ChannelRoute::Center | ChannelRoute::AllChannels)
     }
 
     pub(crate) fn source_status(&self, lane: usize) -> Option<&str> {
@@ -1024,7 +1133,6 @@ struct CaptureSession {
     addon_snapshot: Option<Arc<AddonSnapshot>>,
     positions: [PositionTimeline; 2],
     position_cursor: u64,
-    position_packet_ends: [Option<u64>; 2],
     position_overflowed: [bool; 2],
     groups: [Vec<LaneGroup>; 2],
     shown_groups: SourceGroupChoices,
@@ -1070,7 +1178,6 @@ impl CaptureSession {
             addon_snapshot: None,
             positions: std::array::from_fn(|_| PositionTimeline::default()),
             position_cursor: 0,
-            position_packet_ends: [None; 2],
             position_overflowed: [false; 2],
             groups: std::array::from_fn(|_| Vec::new()),
             shown_groups: SourceGroupChoices::new(),
@@ -1215,23 +1322,22 @@ impl CaptureSession {
                     (None, None) => false,
                     _ => true,
                 });
-        self.sources = sources;
+        let previous_sources = std::mem::replace(&mut self.sources, sources);
         if !settings_changed {
             return;
         }
 
-        self.inputs.retain(|input| {
+        let keep_input = |source: &CaptureSource| {
             self.sources
                 .iter()
                 .flatten()
-                .any(|lane| lane.source.same_source(&input.source))
-        });
-        self.pending.retain(|pending| {
-            self.sources
-                .iter()
-                .flatten()
-                .any(|lane| lane.source.same_source(&pending.source))
-        });
+                .any(|lane| lane.source.same_source(source))
+                && (!matches!(source, CaptureSource::Application { .. })
+                    || requests_all_channels(&previous_sources, source)
+                        == requests_all_channels(&self.sources, source))
+        };
+        self.inputs.retain(|input| keep_input(&input.source));
+        self.pending.retain(|pending| keep_input(&pending.source));
         self.discard_before_ns = now_ns();
         for input in &mut self.inputs {
             input
@@ -1367,9 +1473,6 @@ impl CaptureSession {
             return;
         };
         let messages = addons.positions_since(&mut self.position_cursor);
-        if self.paused {
-            return;
-        }
         for message in messages {
             self.receive_positions(&message);
         }
@@ -1408,7 +1511,21 @@ impl CaptureSession {
                 })
                 .collect::<Vec<_>>();
             if !channels.is_empty() {
+                let clock = self.capture.as_ref().zip(self.capture_lanes[lane]);
+                if self.paused
+                    && !clock.is_some_and(|(capture, physical)| {
+                        matches!(
+                            capture.retained_frame_at(physical, message.time),
+                            std::task::Poll::Ready(Some(_))
+                        )
+                    })
+                {
+                    continue;
+                }
                 self.positions[lane].receive(message.time, channels);
+                if let Some((capture, physical)) = clock {
+                    self.positions[lane].resolve_capture(capture, physical);
+                }
             }
         }
     }
@@ -1482,6 +1599,13 @@ impl CaptureSession {
                             })
                             .unwrap_or_default();
                         self.positions[lane].retain_channels(&allowed);
+                        if !allowed.is_empty()
+                            && let Some(physical) = self.capture_lanes[lane]
+                            && let Some(capture) = &mut self.capture
+                            && let Err(error) = capture.enable_frame_clock(physical)
+                        {
+                            self.error = Some(error.to_string());
+                        }
                         match self.groups_for_lane(lane) {
                             Ok(groups) => {
                                 self.groups[lane] = groups;
@@ -1603,8 +1727,14 @@ impl CaptureSession {
         {
             return Ok(self.groups[lane].clone());
         }
-        let native_groups = lane_groups(self.addon_source(&settings.source), format.channels)?;
+        let mut native_groups = lane_groups(self.addon_source(&settings.source), format.channels)?;
         if channels == format.channels {
+            if channels > 2
+                && !is_sender(&settings.source)
+                && let Some(labels) = format.speaker_labels()
+            {
+                native_groups[0].labels = labels;
+            }
             return Ok(native_groups);
         }
         // Mono/stereo routing keeps its existing behavior; group coordinates describe its output.
@@ -1644,6 +1774,7 @@ impl CaptureSession {
                 }
             };
             let (sender, result) = mpsc::sync_channel(1);
+            let all_channels = requests_all_channels(&self.sources, &source);
             let wake = Arc::clone(&self.wake);
             match thread::Builder::new()
                 .name("backtracking-source-open".into())
@@ -1652,7 +1783,7 @@ impl CaptureSession {
                     // queued or, after a panic, its sender is gone.
                     let _wake = WakeOnDrop(Arc::clone(&wake));
                     let sender = sender;
-                    let _ = sender.send(Stream::open(selected, wake));
+                    let _ = sender.send(Stream::open(selected, wake, all_channels));
                 }) {
                 Ok(_) => self.pending.push(PendingInput { source, result }),
                 Err(error) => self.set_source_status(&source, error.to_string()),
@@ -1678,17 +1809,17 @@ impl CaptureSession {
                         self.set_source_status(&source, error);
                         continue;
                     }
-                    let sender_layout_changed = is_sender(&source)
-                        && self.sources.iter().enumerate().any(|(lane, settings)| {
-                            settings
+                    let layout_changed = self.sources.iter().enumerate().any(|(lane, settings)| {
+                        settings
+                            .as_ref()
+                            .is_some_and(|settings| settings.source.same_source(&source))
+                            && self.formats[lane]
                                 .as_ref()
-                                .is_some_and(|settings| settings.source.same_source(&source))
-                                && self.formats[lane].as_ref().is_some_and(|old| {
-                                    old.channels != stream.format().channels
-                                        || old.sample_rate != stream.format().sample_rate
-                                })
-                        });
-                    if sender_layout_changed {
+                                .is_some_and(|old| old.shape() != stream.format().shape())
+                    });
+                    if layout_changed
+                        && (is_sender(&source) || requests_all_channels(&self.sources, &source))
+                    {
                         // Independent lanes use a common output rate. A native rate change still
                         // starts a new history even when that common output shape is unchanged.
                         self.reset_capture();
@@ -1730,11 +1861,13 @@ impl CaptureSession {
     fn update_error(&mut self) {
         let active = self.sources.iter().enumerate().any(|(lane, settings)| {
             settings.as_ref().is_some_and(|settings| {
-                self.statuses[lane].is_none()
-                    && self
-                        .inputs
-                        .iter()
-                        .any(|input| input.source.same_source(&settings.source))
+                matches!(
+                    self.statuses[lane].as_deref(),
+                    None | Some(FALLBACK_TO_MERGED)
+                ) && self
+                    .inputs
+                    .iter()
+                    .any(|input| input.source.same_source(&settings.source))
             })
         });
         self.error = if active || !self.pending.is_empty() {
@@ -1750,6 +1883,20 @@ impl CaptureSession {
                 })
                 .find_map(|(status, _)| status.clone())
         };
+    }
+
+    fn positioned_lanes(&self) -> [Option<usize>; 2] {
+        std::array::from_fn(|lane| {
+            let settings = self.sources[lane].as_ref()?;
+            let source = self.addon_source(&settings.source)?;
+            source
+                .groups
+                .as_ref()?
+                .iter()
+                .any(|group| group.positioned)
+                .then_some(self.capture_lanes[lane])
+                .flatten()
+        })
     }
 
     fn configure_capture(&mut self) {
@@ -1855,6 +2002,13 @@ impl CaptureSession {
         }
         match capture {
             Ok(mut capture) => {
+                for physical in self.positioned_lanes().into_iter().flatten() {
+                    if let Err(error) = capture.enable_frame_clock(physical) {
+                        self.error = Some(error.to_string());
+                        self.reset_capture();
+                        return;
+                    }
+                }
                 capture.set_retain_silence(self.retain_silence);
                 if self.paused {
                     capture.capture_mut().pause();
@@ -1884,7 +2038,6 @@ impl CaptureSession {
         for positions in &mut self.positions {
             positions.clear();
         }
-        self.position_packet_ends = [None; 2];
         self.position_overflowed = [false; 2];
     }
 
@@ -1913,7 +2066,6 @@ impl CaptureSession {
         // cannot commit silence over queued data from the other device.
         for _ in 0..PACKET_QUEUE_CAPACITY {
             let mut found = false;
-            let mut position_packets = Vec::new();
             for input in &mut self.inputs {
                 let Some(packet) = input.stream.packet(&mut self.native, &mut self.bars) else {
                     continue;
@@ -1958,6 +2110,7 @@ impl CaptureSession {
                             }
                         }
                     } else {
+                        let routes = routes.map(|route| effective_route(format, route));
                         format.route_tracks(&routes[..count], samples, &mut self.scratch);
                     }
                     if let Err(error) = capture.push_native_interleaved_with_markers(
@@ -1969,23 +2122,6 @@ impl CaptureSession {
                         for (lane, status) in self.statuses.iter_mut().enumerate() {
                             if self.capture_lanes[lane].is_some() {
                                 *status = Some(error.to_string());
-                            }
-                        }
-                    } else {
-                        for (lane, source) in self.sources.iter().enumerate() {
-                            if self.capture_lanes[lane].is_some()
-                                && source.as_ref().is_some_and(|source| {
-                                    source.source.same_source(&input.source)
-                                        && matches!(source.source, CaptureSource::Addon { .. })
-                                })
-                            {
-                                self.positions[lane].audio_packet(
-                                    timestamp_ns,
-                                    packet.frames - skip,
-                                    packet.sample_rate,
-                                    capture_rate,
-                                    capture.capture().frame_range(),
-                                );
                             }
                         }
                     }
@@ -2019,22 +2155,6 @@ impl CaptureSession {
                         )
                     {
                         self.statuses[lane] = Some(error.to_string());
-                    } else if !self.scratch.is_empty()
-                        && matches!(source.source, CaptureSource::Addon { .. })
-                    {
-                        let frames = packet.frames - skip;
-                        let end_time = timestamp_ns.saturating_add(
-                            (frames as u128 * 1_000_000_000 / u128::from(packet.sample_rate))
-                                as u64,
-                        );
-                        self.position_packet_ends[lane] = Some(end_time);
-                        position_packets.push((
-                            lane,
-                            timestamp_ns,
-                            frames,
-                            packet.sample_rate,
-                            end_time,
-                        ));
                     }
                 }
             }
@@ -2042,28 +2162,6 @@ impl CaptureSession {
                 break;
             }
             capture.drain(false);
-            // Independent inputs may hold a short resampling/jitter tail. Anchor
-            // each received packet against the same observed retained end.
-            let latest = self
-                .position_packet_ends
-                .iter()
-                .flatten()
-                .copied()
-                .max()
-                .unwrap_or(0);
-            let retained = capture.capture().frame_range();
-            for (lane, time, frames, rate, end_time) in position_packets {
-                let lag = (u128::from(latest.saturating_sub(end_time)) * u128::from(capture_rate)
-                    / 1_000_000_000) as u64;
-                let end = retained.end.saturating_sub(lag).max(retained.start);
-                self.positions[lane].audio_packet(
-                    time,
-                    frames,
-                    rate,
-                    capture_rate,
-                    retained.start..end,
-                );
-            }
         }
         if flush {
             capture.drain(true);
@@ -2080,6 +2178,12 @@ impl CaptureSession {
         }
         let frames = capture.capture().frame_range();
         for (lane, positions) in self.positions.iter_mut().enumerate() {
+            if let Some(physical) = self.capture_lanes[lane] {
+                positions.resolve_capture(capture, physical);
+                if let Some(first) = capture.take_frame_clock_eviction(physical) {
+                    positions.clock_evicted_before(first);
+                }
+            }
             positions.retain_frames(frames.clone());
             self.position_overflowed[lane] |= positions.take_overflowed();
         }
@@ -2207,11 +2311,16 @@ impl CaptureSession {
 
     fn set_retention(&mut self, retention: DurationChoice) {
         self.retention = retention;
+        let lanes = self.positioned_lanes();
         if let Some(capture) = &mut self.capture {
-            let capture = capture.capture_mut();
-            let before = capture.revision();
-            capture.set_retention(retention);
-            if capture.revision() != before {
+            let before = capture.capture().revision();
+            capture.capture_mut().set_retention(retention);
+            for physical in lanes.into_iter().flatten() {
+                if let Err(error) = capture.enable_frame_clock(physical) {
+                    self.error = Some(error.to_string());
+                }
+            }
+            if capture.capture().revision() != before {
                 self.revision = self.revision.wrapping_add(1);
             }
         }
@@ -2292,7 +2401,13 @@ fn positioned_lane_channel(
     }
 }
 
+const FALLBACK_TO_MERGED: &str =
+    "All channels is unavailable. Using Merged. / 目前無法擷取所有聲道，已改用合併聲道。";
+
 fn missing_channel(format: &Format, route: ChannelRoute) -> Option<String> {
+    if effective_route(format, route) != route {
+        return Some(FALLBACK_TO_MERGED.into());
+    }
     format
         .route_channels(route)
         .is_none()
@@ -2357,6 +2472,166 @@ mod tests {
             addon_id: "test.addon".into(),
             source_id: "main".into(),
             name: "Six channels".into(),
+        }
+    }
+
+    fn activity_fixture(width: usize, rate: u32, seconds: usize, warm_peaks: bool) -> Controller {
+        let mut controller = Controller::new().unwrap();
+        let mut capture = SynchronizedCapture::new_with_budget(
+            rate,
+            width,
+            None,
+            DurationChoice::Minutes10,
+            rate as usize * width * seconds,
+        )
+        .unwrap();
+        capture.set_retain_silence(true);
+        let frames = rate as usize / 10;
+        let mut packet = vec![0.; frames * width];
+        packet[0] = 0.25;
+        for i in 0..seconds * 10 {
+            capture
+                .push_native_interleaved(i as u64 * 100_000_000, &packet, false)
+                .unwrap();
+        }
+        if warm_peaks {
+            let track = capture.capture().freeze().track(0).unwrap();
+            let start = Instant::now();
+            for i in 0..width {
+                std::hint::black_box(track.channel_extrema(i, track.frame_range()));
+            }
+            eprintln!("built all native peaks in {:?}", start.elapsed());
+        }
+        let mut state = lock(&controller.state);
+        state.capture = Some(capture);
+        state.shape = Some((rate, width, None));
+        state.capture_lanes = [Some(0), None];
+        state.revision = 1;
+        controller.source_status = SourceStatus::from_session(&state);
+        drop(state);
+        controller
+    }
+
+    #[test]
+    fn activity_keeps_last_mask_while_waveform_worker_refreshes() {
+        let mut controller = activity_fixture(8, 8000, 1, false);
+        let (wake, ready) = mpsc::channel();
+        controller.set_repaint(Arc::new(move || {
+            let _ = wake.send(());
+        }));
+        let state = lock(&controller.state);
+        assert_eq!(controller.try_active_channels(0), None);
+        drop(state);
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(controller.try_active_channels(0), Some(1));
+        let mut state = lock(&controller.state);
+        let capture = state.capture.as_mut().unwrap();
+        let mut frame = [0.; 8];
+        frame[4] = 0.1;
+        capture
+            .push_native_interleaved(1_000_000_000, &frame, false)
+            .unwrap();
+        state.revision += 1;
+        controller.source_status = SourceStatus::from_session(&state);
+        assert_eq!(controller.try_active_channels(0), Some(1));
+        drop(state);
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(controller.try_active_channels(0), Some(17));
+        let mut state = lock(&controller.state);
+        state.generation += 1;
+        controller.source_status = SourceStatus::from_session(&state);
+        assert_eq!(controller.try_active_channels(0), None);
+    }
+
+    #[test]
+    #[ignore = "full-history waveform worker activity and window latency"]
+    fn activity_worker_cost() {
+        for (width, warm) in [(8, false), (12, false), (32, false), (12, true)] {
+            let controller = activity_fixture(width, 48000, 600, warm);
+            let (wake, ready) = mpsc::channel();
+            controller.set_repaint(Arc::new(move || {
+                let _ = wake.send(());
+            }));
+            let start = Instant::now();
+            assert_eq!(controller.try_active_channels(0), None);
+            let enqueue = start.elapsed();
+            ready.recv_timeout(Duration::from_secs(120)).unwrap();
+            assert_eq!(controller.try_active_channels(0), Some(1));
+            let start = Instant::now();
+            for _ in 0..10000 {
+                assert_eq!(controller.try_active_channels(0), Some(1));
+            }
+            let cached = start.elapsed() / 10000;
+            let reads = controller.activity.lock().unwrap();
+            eprintln!(
+                "width={width} existing_peaks={warm} window_enqueue={enqueue:?} worker={:?} window_cached={cached:?}",
+                reads[0].worker_time
+            );
+        }
+    }
+
+    #[test]
+    fn saved_native_route_follows_reopened_stereo_format() {
+        let source = CaptureSource::System;
+        let route = ChannelRoute::AllChannels;
+        let wide = Format::sender(48000, 8);
+        let stereo = Format::sender(48000, 2);
+        assert_eq!(capture_channels(&source, &wide, route), Some(8));
+        assert_eq!(capture_channels(&source, &stereo, route), Some(2));
+        assert!(missing_capture_channel(&source, &wide, route).is_none());
+        assert!(
+            missing_capture_channel(&source, &stereo, route)
+                .unwrap()
+                .contains("Merged")
+        );
+        let mut result = Vec::new();
+        route_samples(&source, &stereo, route, &[0.25, -0.5], &mut result);
+        assert_eq!(result, [0.25, -0.5]);
+    }
+
+    #[test]
+    fn reopening_the_same_system_source_reconfigures_the_capture() {
+        let mut session = CaptureSession::new();
+        session.paused = false;
+        session.history_budget_samples = 48000;
+        session.sources = [
+            Some(SourceSettings {
+                source: CaptureSource::System,
+                route: ChannelRoute::AllChannels,
+            }),
+            None,
+        ];
+        for width in [8, 2, 8] {
+            session.inputs.clear();
+            let (tx, result) = mpsc::sync_channel(1);
+            tx.send(Ok(Stream::Sender {
+                receiver: None,
+                format: Arc::new(Format::sender(48000, width)),
+                id: String::new(),
+                error: None,
+            }))
+            .unwrap();
+            session.pending.push(PendingInput {
+                source: CaptureSource::System,
+                result,
+            });
+            let before = session.generation;
+            session.poll_pending();
+            assert!(session.generation > before);
+            session.update_error();
+            assert!(session.error.is_none());
+            let capture = session.capture.as_mut().unwrap();
+            assert_eq!(capture.capture().track_channels(0), Some(width));
+            capture
+                .push_native_interleaved(0, &vec![0.25; width * 10], false)
+                .unwrap();
+            assert_eq!(capture.capture().frame_range(), 0..10);
+            assert_eq!(
+                session.statuses[0]
+                    .as_deref()
+                    .is_some_and(|s| s.contains("Merged")),
+                width == 2
+            );
         }
     }
 
@@ -2627,6 +2902,86 @@ mod tests {
             reopen_retained_sender(&mut session, rate, channels);
             assert!(session.generation > generation);
             assert!(retained_samples(&session).iter().all(Vec::is_empty));
+        }
+    }
+
+    #[test]
+    fn two_sender_connections_keep_counted_packets_and_fade_jittered_joins() {
+        for jitter in [false, true] {
+            let mut session = CaptureSession::new();
+            session.paused = false;
+            session.history_budget_samples = 48000;
+            session.discard_before_ns = 0;
+            let mut endpoints: [backtracking_core::SenderEndpoint; 2] =
+                std::array::from_fn(|lane| {
+                    let mut endpoint = backtracking_core::SenderEndpoint::new().unwrap();
+                    endpoint.update("Packet clock test", true, 48000, 1);
+                    let source = CaptureSource::Sender {
+                        id: endpoint.id().into(),
+                        name: "Packet clock test".into(),
+                    };
+                    let stream = Stream::open(source.clone(), Arc::new(|| {}), false).unwrap();
+                    session.formats[lane] = Some(Arc::clone(stream.format()));
+                    session.sources[lane] = Some(SourceSettings {
+                        source: source.clone(),
+                        route: ChannelRoute::Merged,
+                    });
+                    session.inputs.push(Input { source, stream });
+                    endpoint
+                });
+            session.configure_capture();
+            let samples: Vec<_> = (0..480).map(|i| 0.2 + i as f32 / 1000.).collect();
+            for i in 0..20 {
+                for (lane, endpoint) in endpoints.iter_mut().enumerate() {
+                    let time = 1_000_000_000
+                        + i * 10_000_000
+                        + if jitter && lane == 0 {
+                            i % 2 * 1_000_000
+                        } else {
+                            0
+                        };
+                    endpoint
+                        .publish("Packet clock test", 48000, 1, time, &samples, &[])
+                        .unwrap();
+                }
+                session.drain(false);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while session
+                .capture
+                .as_ref()
+                .unwrap()
+                .capture()
+                .frame_range()
+                .end
+                < 19 * 480
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "last Sender packet was not received"
+                );
+                std::thread::yield_now();
+                session.drain(false);
+            }
+            session.drain(true);
+            let audio = session
+                .capture
+                .as_ref()
+                .unwrap()
+                .capture()
+                .track_snapshot(0)
+                .unwrap()
+                .samples;
+            if jitter {
+                for i in 1..19 {
+                    let start = i * 480 + 48;
+                    assert_eq!(audio[start], 0.);
+                    assert_eq!(audio[start + 100], samples[100]);
+                    assert_eq!(audio[start + 479], 0.);
+                }
+            } else {
+                assert_eq!(audio, samples.repeat(20));
+            }
         }
     }
 

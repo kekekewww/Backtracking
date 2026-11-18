@@ -110,6 +110,7 @@ struct SharedPeaks {
 type ChannelPeaks = Arc<SharedPeaks>;
 
 struct WidePeaks {
+    activity: [OnceLock<u64>; 2],
     traces: Vec<[Bounds; TRACES]>,
     capacity_frames: usize,
     // Prefix copies share this even before its first read. Only complete blocks
@@ -150,6 +151,7 @@ impl PagePeaks {
             Self::Traces(traces)
         } else {
             Self::Wide(Box::new(WidePeaks {
+                activity: Default::default(),
                 traces,
                 capacity_frames,
                 channels: Arc::new(SharedPeaks::default()),
@@ -162,6 +164,7 @@ impl PagePeaks {
         match self {
             Self::Traces(_) => Self::Traces(traces),
             Self::Wide(wide) => Self::Wide(Box::new(WidePeaks {
+                activity: Default::default(),
                 traces,
                 capacity_frames: wide.capacity_frames,
                 channels: Arc::clone(&wide.channels),
@@ -173,6 +176,7 @@ impl PagePeaks {
     /// allocated vectors when no frozen prefix still shares them.
     fn invalidate_channels(&mut self) {
         if let Self::Wide(wide) = self {
+            wide.activity = Default::default();
             if let Some(cache) = Arc::get_mut(&mut wide.channels) {
                 cache.pairs.take();
                 if let Some(channels) = cache.native.get_mut() {
@@ -470,6 +474,43 @@ pub(super) fn channel_extrema<'a>(
         page.channel_extrema(layout, channel, frames, &mut bounds);
     }
     bounds.result()
+}
+
+pub(super) fn active_channels<'a>(
+    pages: impl Iterator<Item = (&'a Page, Range<usize>)>,
+    layout: Layout,
+    track: Range<usize>,
+) -> u64 {
+    if track.len() <= 2 {
+        return 0;
+    }
+    let full = u64::MAX >> (64 - track.len());
+    let mut active = 0;
+    for (page, frames) in pages {
+        let PagePeaks::Wide(wide) = &page.peaks else {
+            unreachable!()
+        };
+        let bounds_mask = || {
+            let mut mask = 0;
+            for (i, channel) in track.clone().enumerate() {
+                let mut bounds = Bounds::EMPTY;
+                page.channel_extrema(layout, channel, frames.clone(), &mut bounds);
+                if bounds.min < -3.16e-5 || bounds.max > 3.16e-5 {
+                    mask |= 1 << i;
+                }
+            }
+            mask
+        };
+        active |= if frames == (0..layout.page_frames) {
+            *wide.activity[usize::from(track.start != 0)].get_or_init(bounds_mask)
+        } else {
+            bounds_mask()
+        };
+        if active == full {
+            break;
+        }
+    }
+    active
 }
 
 /// Splits `interleaved` into pages of their own, for audio that never was in a history.
@@ -871,6 +912,10 @@ impl History {
 
     pub(super) fn extrema(&self, trace: usize, range: Range<u64>) -> (f32, f32) {
         extrema(self.pages(range), self.layout, trace)
+    }
+
+    pub(super) fn active_channels(&self, track: Range<usize>) -> u64 {
+        active_channels(self.pages(self.frame_range()), self.layout, track)
     }
 
     pub(super) fn channel_extrema(&self, channel: usize, range: Range<u64>) -> (f32, f32) {

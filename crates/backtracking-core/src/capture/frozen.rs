@@ -258,6 +258,15 @@ pub struct FrozenTrack {
 }
 
 impl FrozenTrack {
+    /// Active native channels over this track's retained range.
+    pub fn active_channels(&self) -> u64 {
+        history::active_channels(
+            self.capture.pages(self.frame_range()),
+            self.capture.layout,
+            self.channels.clone(),
+        )
+    }
+
     /// Copies `interleaved` into a single-lane view. See [`FrozenCapture::from_interleaved`].
     pub fn from_interleaved(
         sample_rate: u32,
