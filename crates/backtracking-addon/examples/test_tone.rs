@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const ADDON_ID: &str = "com.example.test-tone";
 const RATE: u32 = 48_000;
 const FRAMES: usize = 480; // Ten milliseconds, even for the twelve-channel format.
+const BLOCK_NS: u64 = FRAMES as u64 * 1_000_000_000 / RATE as u64;
 
 fn main() {
     if let Err(error) = run() {
@@ -44,6 +45,11 @@ fn run() -> Result<()> {
     let block_time = Duration::from_millis(10);
     let mut next_block = Instant::now();
     let mut next_positions = 0_u64;
+    // The time of the next packet's first frame. It is read from the clock when
+    // the stream starts or restarts and counted in frames from there, so that
+    // packet times, and the positions stamped with them, do not jitter with
+    // how late this thread happened to wake up.
+    let mut packet_time: Option<u64> = None;
 
     loop {
         // Limit work per turn so a busy control connection cannot starve audio.
@@ -66,6 +72,7 @@ fn run() -> Result<()> {
                     sender.set_channels(tone.labels().len())?;
                     client.send(&tone.describe(&sender.id))?;
                     next_positions = 0;
+                    packet_time = None;
                 }
                 HostMessage::SetSetting { key, value } => match tone.set_setting(&key, &value) {
                     Ok(()) => client.send(&tone.describe(&sender.id))?,
@@ -90,7 +97,11 @@ fn run() -> Result<()> {
         let now = Instant::now();
         if now >= next_block {
             let samples = tone.render();
-            let time = monotonic_ns()?;
+            let time = match packet_time {
+                Some(time) => time,
+                None => monotonic_ns()?,
+            };
+            packet_time = Some(time.saturating_add(BLOCK_NS));
             sender.publish(time, &samples)?;
             if tone.format == "objects" && time >= next_positions {
                 // Full state, stamped with this audio packet's first frame. Keep an
@@ -110,6 +121,8 @@ fn run() -> Result<()> {
             // Resume real-time pacing after a stall rather than emit old audio.
             if now.saturating_duration_since(next_block) >= block_time {
                 next_block = now + block_time;
+                // Audio was skipped, so the next packet starts a new stretch.
+                packet_time = None;
             }
         }
         thread::sleep(

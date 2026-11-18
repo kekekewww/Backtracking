@@ -297,7 +297,11 @@ Changing only groups or channel labels updates the display without clearing audi
 Backtracking 0.2.0 and earlier list only 1- and 2-channel Senders.
 
 **Timing.** Publish audio at the pace it should be heard, stamped with the time it is heard.
-Backtracking aligns sources by these timestamps.
+Backtracking aligns sources by these timestamps. Read the clock when a stretch of audio starts
+(the first packet, and the first after a gap or a format change) and count frames from there:
+each later packet's time is the previous packet's time plus its length. A clock read for every
+packet moves with how late the add-on's thread woke up, and `positions` stamped with such
+times move with it. The example does it this way.
 
 ## 6. Being a good guest
 
