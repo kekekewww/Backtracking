@@ -915,9 +915,8 @@ impl Controller {
         self.source_status.history_budget_samples
     }
 
-    /// Pins the visible audio, then renders requested rows off the capture and UI
-    /// threads. Pending work leaves every bin untouched. The last field is the
-    /// rendered revision, which can precede the newest capture revision.
+    /// `try_render_rows` for native channels only, as the tests ask for them.
+    #[cfg(test)]
     pub(crate) fn try_render_channel_waveforms(
         &self,
         channels: &[(usize, usize)],
@@ -933,6 +932,9 @@ impl Controller {
         self.try_render_rows(&rows, views, zoom, traces, view_traces)
     }
 
+    /// Pins the visible audio, then renders requested rows off the capture and UI
+    /// threads. Pending work leaves every bin untouched. The last field is the
+    /// rendered revision, which can precede the newest capture revision.
     pub(crate) fn try_render_rows(
         &self,
         channels: &[(usize, ChannelWaveform)],

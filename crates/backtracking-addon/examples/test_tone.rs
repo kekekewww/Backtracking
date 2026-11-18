@@ -202,7 +202,7 @@ impl Tone {
                     ("stereo", "Stereo"),
                     ("5.1", "5.1"),
                     ("7.1.4", "7.1.4"),
-                    ("objects", "Stereo + 2 objects / 立體聲與兩個物件"),
+                    ("objects", "Stereo + 2 objects"),
                 ]
                 .into_iter()
                 .map(|(id, label)| Format {

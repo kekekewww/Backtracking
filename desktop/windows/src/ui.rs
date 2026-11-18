@@ -1094,6 +1094,31 @@ fn frozen_activity(
         .ok()
 }
 
+/// The name of `rows` in drawing order: one row, or the first and last, each named by `name`
+/// except the pair. With `dual`, a channel's or pair's name starts with its lane's letter.
+fn rows_label(rows: &[RowSource], dual: bool, name: impl Fn(RowSource) -> String) -> String {
+    let short = |row: RowSource| match row {
+        RowSource::Pair(..) => "L/R".to_owned(),
+        _ => name(row),
+    };
+    let named = |row: RowSource| match row {
+        RowSource::Channel(lane, _) | RowSource::Pair(lane, _) if dual => {
+            format!("{} {}", lane_name(lane), short(row))
+        }
+        _ => short(row),
+    };
+    match rows {
+        [] => String::new(),
+        [row] => named(*row),
+        // The pair alone.
+        [RowSource::Pair(lane, _), RowSource::Pair(other, _)] if lane == other => named(rows[0]),
+        [first, .., last] if first.lane() == last.lane() => {
+            format!("{}–{}", named(*first), short(*last))
+        }
+        [first, .., last] => format!("{}–{}", named(*first), named(*last)),
+    }
+}
+
 /// The rows from `anchor` to `cursor`, both included, in drawing order across `lanes`. Rows
 /// selected together come whole. A row that is not drawn any more stands for itself alone.
 fn rows_between(lanes: &[LanePlan], anchor: RowSource, cursor: RowSource) -> Vec<RowSource> {
@@ -2484,22 +2509,11 @@ impl Recorder {
     }
 
     /// What the selection's label and the status line call `rows`: one row, or the first and
-    /// last. With two sources a channel's name starts with its lane's letter.
+    /// last. The two pair rows are always chosen together and are called "L/R", which a
+    /// channel labelled L or R beside them cannot be mistaken for. With two sources a
+    /// channel's name starts with its lane's letter.
     fn rows_name(&self, rows: &[RowSource]) -> String {
-        let named = |row: RowSource| match row {
-            RowSource::Channel(lane, _) | RowSource::Pair(lane, _) if self.dual_source() => {
-                format!("{} {}", lane_name(lane), self.row_name(row))
-            }
-            _ => self.row_name(row),
-        };
-        match rows {
-            [] => String::new(),
-            [row] => named(*row),
-            [first, .., last] if first.lane() == last.lane() => {
-                format!("{}–{}", named(*first), self.row_name(*last))
-            }
-            [first, .., last] => format!("{}–{}", named(*first), named(*last)),
-        }
+        rows_label(rows, self.dual_source(), |row| self.row_name(row))
     }
 
     fn current_snapshots(&self) -> Option<Arc<[FrozenTrack]>> {
@@ -9455,6 +9469,35 @@ mod tests {
             ),
             (Some(1), Some(vec![1]), Some(1..2))
         );
+    }
+
+    #[test]
+    fn a_selection_names_the_pair_apart_from_channels_labelled_l_and_r() {
+        // A lane whose first two channels are themselves called L and R, as an add-on's are.
+        let name = |row: RowSource| match row {
+            RowSource::Pair(_, PairSide::Left) | RowSource::Channel(_, 0) => "L".to_owned(),
+            RowSource::Pair(_, PairSide::Right) | RowSource::Channel(_, 1) => "R".to_owned(),
+            RowSource::Channel(_, channel) => format!("C{channel}"),
+            RowSource::View(lane, _) => lane_name(lane).to_owned(),
+        };
+        let pair = RowSource::pair(0);
+        let a = |channel| RowSource::Channel(0, channel);
+        assert_eq!(rows_label(&pair, false, name), "L/R");
+        assert_eq!(
+            rows_label(&[pair[0], pair[1], a(0), a(1)], false, name),
+            "L/R–R"
+        );
+        assert_eq!(rows_label(&[a(0), a(1)], false, name), "L–R");
+        assert_eq!(rows_label(&[a(1)], false, name), "R");
+        // With two sources the lane's letter comes first, once for rows of one lane.
+        assert_eq!(rows_label(&pair, true, name), "A L/R");
+        assert_eq!(
+            rows_label(&[pair[0], pair[1], a(0), a(2)], true, name),
+            "A L/R–C2"
+        );
+        let b = RowSource::pair(1);
+        assert_eq!(rows_label(&[a(2), b[0], b[1]], true, name), "A C2–B L/R");
+        assert_eq!(rows_label(&[], false, name), "");
     }
 
     #[test]

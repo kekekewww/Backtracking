@@ -13,7 +13,9 @@
 //!   `rows=<lane>:<first>-<last>` makes the next `select=` cover those rows of the lane, as a
 //!   drag from the first row to the last does; rows count from 1, top down, as in the row
 //!   tooltips, and `rows=A:10-B:1` runs from row 10 of lane A to row 1 of lane B.
-//!   `select-lane=<lane>` makes it cover every row of that lane. Both need `separate=on`.
+//!   `select-lane=<lane>` makes it cover every row of that lane. Both need `separate=on`, and
+//!   both wait until the steps before them have settled, so they count the rows a `group=`
+//!   or `hide-silent=` before them leaves on screen.
 //!   `save=<folder>` saves the selection (or everything, without one) into that folder, through
 //!   the Save command's own code, waits until the files are written and lists them in the log.
 //!   `options=<page>[:<width>x<height>]` opens the Options window on that page (`actions`,
@@ -109,6 +111,10 @@ impl Step {
                 | Self::Save(_)
                 | Self::Wait(_)
                 | Self::PreviewPlan
+                // Rows are counted in the lanes as drawn, so a `group=` or `hide-silent=`
+                // before them has to reach the screen first.
+                | Self::Rows(..)
+                | Self::SelectLane(_)
         )
     }
 }
@@ -1248,7 +1254,9 @@ mod tests {
             ]
         );
         assert!(Step::Save(PathBuf::new()).waits());
-        assert!(!Step::Rows(0, 0, 0, 0).waits());
+        // Rows are counted as drawn, so they wait for a group switch before them.
+        assert!(Step::Rows(0, 0, 0, 0).waits());
+        assert!(Step::SelectLane(0).waits());
         for bad in [
             "rows=A:0-2",
             "rows=A:3",
