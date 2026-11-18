@@ -11,6 +11,7 @@ pub(crate) struct LaneGroup {
     pub(crate) label: String,
     pub(crate) channels: Range<usize>,
     pub(crate) labels: Vec<String>,
+    pub(crate) positioned: bool,
 }
 
 pub(crate) fn lane_groups(
@@ -45,6 +46,7 @@ pub(crate) fn lane_groups(
                 label: group.label.clone(),
                 channels: offset..end,
                 labels: group.channels.clone(),
+                positioned: group.positioned,
             };
             offset = end;
             Ok(result)
@@ -56,6 +58,7 @@ fn numbered_group(id: &str, label: &str, channels: usize) -> LaneGroup {
     LaneGroup {
         id: id.into(),
         label: label.into(),
+        positioned: false,
         channels: 0..channels,
         labels: (1..=channels)
             .map(|channel| format!("Channel {channel}"))
@@ -168,9 +171,14 @@ mod tests {
     fn explicit_groups_keep_stream_ranges_and_labels() {
         let source = source(Some(vec![
             group("bed", &["L", "R", "C", "LFE", "Ls", "Rs"]),
-            group("objects", &["Object 1", "Object 2"]),
+            ChannelGroup {
+                positioned: true,
+                ..group("sources", &["Object 1", "Object 2"])
+            },
         ]));
         let groups = lane_groups(Some(&source), 8).unwrap();
+        assert!(!groups[0].positioned);
+        assert!(groups[1].positioned);
         assert_eq!(groups[0].channels, 0..6);
         assert_eq!(groups[1].channels, 6..8);
         assert_eq!(groups[1].labels, ["Object 1", "Object 2"]);

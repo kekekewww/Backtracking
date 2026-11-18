@@ -50,17 +50,28 @@ struct Pending {
     cancel: Arc<AtomicBool>,
 }
 
-// Keep the original inline waveform request in the bounded channel.
-#[allow(clippy::large_enum_variant)]
-enum WaveformJob {
-    Render(Work),
-    Activity(Box<dyn FnOnce() + Send>),
+fn worker<T: Send + 'static>(
+    name: &str,
+    ui: Arc<UiLink>,
+    run: impl Fn(T) + Send + 'static,
+) -> io::Result<mpsc::SyncSender<T>> {
+    let (sender, jobs) = mpsc::sync_channel(1);
+    thread::Builder::new().name(name.into()).spawn(move || {
+        for job in jobs {
+            run(job);
+            if let Some(repaint) = ui.repaint.get() {
+                repaint();
+            }
+        }
+    })?;
+    Ok(sender)
 }
 
-/// Only one request can own frozen pages. A changed view waits for cancellation
+/// Only one render request can own frozen pages. A changed view waits for cancellation
 /// before pinning another snapshot, so rapid scrolling cannot queue histories.
 pub(super) struct ChannelWaveforms {
-    requests: mpsc::SyncSender<WaveformJob>,
+    requests: mpsc::SyncSender<Work>,
+    activity: mpsc::SyncSender<Box<dyn FnOnce() + Send>>,
     pending: Option<Pending>,
     #[cfg(test)]
     pub(super) before_render: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -68,25 +79,16 @@ pub(super) struct ChannelWaveforms {
 
 impl ChannelWaveforms {
     pub(super) fn new(ui: Arc<UiLink>) -> io::Result<Self> {
-        let (requests, work) = mpsc::sync_channel::<WaveformJob>(1);
-        thread::Builder::new()
-            .name("channel waveforms".into())
-            .spawn(move || {
-                while let Ok(work) = work.recv() {
-                    match work {
-                        WaveformJob::Render(work) => {
-                            let result = work.result.clone();
-                            let _ = result.send(work.render());
-                        }
-                        WaveformJob::Activity(job) => job(),
-                    }
-                    if let Some(repaint) = ui.repaint.get() {
-                        repaint();
-                    }
-                }
-            })?;
+        let requests = worker("channel waveforms", ui.clone(), |work: Work| {
+            let result = work.result.clone();
+            let _ = result.send(work.render());
+        })?;
+        let activity = worker("channel activity", ui, |job: Box<dyn FnOnce() + Send>| {
+            job()
+        })?;
         Ok(Self {
             requests,
+            activity,
             pending: None,
             #[cfg(test)]
             before_render: None,
@@ -94,9 +96,7 @@ impl ChannelWaveforms {
     }
 
     pub(super) fn try_queue(&self, job: impl FnOnce() + Send + 'static) -> bool {
-        self.requests
-            .try_send(WaveformJob::Activity(Box::new(job)))
-            .is_ok()
+        self.activity.try_send(Box::new(job)).is_ok()
     }
 
     pub(super) fn render(
@@ -192,7 +192,7 @@ impl ChannelWaveforms {
             #[cfg(test)]
             before_render: self.before_render.clone(),
         };
-        if self.requests.try_send(WaveformJob::Render(request)).is_ok() {
+        if self.requests.try_send(request).is_ok() {
             self.pending = Some(Pending {
                 view,
                 result: receive,

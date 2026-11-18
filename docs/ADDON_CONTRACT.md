@@ -245,6 +245,9 @@ position.
 The host ignores messages for unknown sources or more than 5 seconds in the future. It drops
 entries outside a positioned group or with any number that is not finite, clamps `x`, `y`, `z`
 to -1 through 1, and clamps `size` to 0 through 1. These do not stop the add-on.
+JSON has no NaN or Infinity, so a line that contains them is not JSON and closes the
+connection like any other. Python's `json.dumps` writes them unless `allow_nan=False`; send
+`null` for a value you do not know, and that entry is dropped.
 
 Positions belong to the audio at `time`. Seeking, pausing and format changes need nothing
 special: stamp positions with the time that audio is heard. Rust authors can call

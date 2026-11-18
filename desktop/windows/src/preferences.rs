@@ -1032,7 +1032,9 @@ mod tests {
             writer.save(Key::History, "600").unwrap();
             queued.send(writer).unwrap();
         });
-        let result = queue.recv_timeout(Duration::from_millis(100));
+        // save does no I/O. A save waiting for the sink cannot finish until we release it below.
+        // The timeout gives the enqueue thread time to run on a busy machine.
+        let result = queue.recv_timeout(Duration::from_secs(10));
         let returned_while_disk_busy = result.is_ok();
         release.send(()).unwrap();
         ui.join().unwrap();

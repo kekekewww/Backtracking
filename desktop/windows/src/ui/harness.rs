@@ -691,7 +691,11 @@ impl Recorder {
                 // As a finished drag does: freeze the audio, then keep the range.
                 self.begin_editing();
                 self.last_interaction = Instant::now();
-                let flags = self.flag_update(start..end, self.selection_rows.clone());
+                let flags = self.flag_update(
+                    start..end,
+                    self.selection_rows.clone(),
+                    self.selection_whole,
+                );
                 self.apply_flags(flags);
                 self.selection = Some(start..end);
                 self.invalidate_export();
@@ -931,9 +935,10 @@ impl Recorder {
         if !self.rows_separate() {
             return Err("rows are chosen only with separate=on".into());
         }
-        self.selection_rows = rows;
+        self.choose_rows(rows);
         if let Some(selection) = self.selection.clone() {
-            let flags = self.flag_update(selection, self.selection_rows.clone());
+            let flags =
+                self.flag_update(selection, self.selection_rows.clone(), self.selection_whole);
             self.apply_flags(flags);
             self.stop_preview();
             self.invalidate_export();

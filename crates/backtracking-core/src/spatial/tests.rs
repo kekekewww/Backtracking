@@ -590,3 +590,10 @@ fn common_spellings_of_a_speaker_resolve_to_the_same_place() {
     // A name nobody knows still has no direction and feeds both sides.
     assert_eq!(speaker_directions(&["Object 1"]), [None]);
 }
+
+#[test]
+fn padded_lfe_labels_keep_half_weight_in_both_channels() {
+    for label in [" LFE ", "\tlFe1", "lfe2 "] {
+        assert_eq!(super::stereo_weights(&[label]), [[0.5, 0.5]]);
+    }
+}

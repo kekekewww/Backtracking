@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, value::RawValue};
 
 use crate::{Error, Result};
 
@@ -493,9 +493,89 @@ pub fn encode_addon(message: &AddonMessage) -> Result<Vec<u8>> {
 }
 
 pub fn decode_addon(line: &[u8]) -> Result<AddonMessage> {
+    // Read raw fields so even a number outside f64's range can be discarded on its own.
+    if let Ok(fields) = decode::<RawFields>(line) {
+        if fields
+            .get("type")
+            .and_then(|kind| serde_json::from_str::<String>(kind.get()).ok())
+            .as_deref()
+            == Some("positions")
+        {
+            return Ok(decode_positions(&fields).unwrap_or(AddonMessage::Unknown));
+        }
+    }
     let message: AddonMessage = decode(line)?;
     message.validate()?;
     Ok(message)
+}
+
+type RawFields<'a> = BTreeMap<String, &'a RawValue>;
+
+fn decode_positions(fields: &RawFields<'_>) -> Option<AddonMessage> {
+    let source = serde_json::from_str::<String>(fields.get("source")?.get()).ok()?;
+    source_id("positions.source", &source).ok()?;
+    let time = whole_number(fields.get("time")?)?;
+    let entries: Vec<&RawValue> = match fields.get("channels") {
+        Some(array) => serde_json::from_str(array.get()).ok()?,
+        None => Vec::new(),
+    };
+    if entries.len() > 64 {
+        return None;
+    }
+    let channels = entries.into_iter().filter_map(decode_position).collect();
+    Some(AddonMessage::Positions {
+        source,
+        time,
+        channels,
+    })
+}
+
+fn decode_position(entry: &RawValue) -> Option<ChannelPosition> {
+    let fields: RawFields = serde_json::from_str(entry.get()).ok()?;
+    let finite = |raw: &&RawValue| raw.get().parse::<f64>().ok().filter(|n| n.is_finite());
+    let optional = |name: &str| match fields.get(name) {
+        Some(raw) => finite(raw).map(Some),
+        None => Some(None),
+    };
+    Some(ChannelPosition {
+        channel: u32::try_from(whole_number(fields.get("channel")?)?).ok()?,
+        x: finite(fields.get("x")?)?,
+        y: finite(fields.get("y")?)?,
+        z: finite(fields.get("z")?)?,
+        size: optional("size")?,
+        gain: optional("gain")?,
+    })
+}
+
+// Check the decimal digits directly. An f64 would round fractional frames and
+// timestamps near u64::MAX before we could check that they are whole and in range.
+fn whole_number(raw: &RawValue) -> Option<u64> {
+    let text = raw.get();
+    if let Ok(integer) = text.parse::<u64>() {
+        return Some(integer);
+    }
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let (mantissa, exponent) = unsigned.split_once(['e', 'E']).unwrap_or((unsigned, "0"));
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{integer}{fraction}");
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return Some(0);
+    }
+    if text.starts_with('-') {
+        return None;
+    }
+    let coefficient = significant.trim_end_matches('0');
+    let zeros = significant.len() - coefficient.len();
+    let shift = exponent
+        .parse::<i64>()
+        .ok()?
+        .checked_add(zeros as i64)?
+        .checked_sub(fraction.len() as i64)?;
+    coefficient
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(10u64.checked_pow(shift.try_into().ok()?)?)
 }
 
 pub fn encode_host(message: &HostMessage) -> Result<Vec<u8>> {
@@ -518,7 +598,7 @@ fn encode(message: &impl Serialize) -> Result<Vec<u8>> {
     Ok(line)
 }
 
-fn decode<T: for<'de> Deserialize<'de>>(line: &[u8]) -> Result<T> {
+fn decode<'de, T: Deserialize<'de>>(line: &'de [u8]) -> Result<T> {
     let terminated = line.last() == Some(&b'\n');
     if line.len().saturating_add(usize::from(!terminated)) > MAX_LINE_BYTES {
         return invalid("message exceeds the 65,536-byte line limit, including newline");
@@ -663,6 +743,76 @@ mod tests {
     }
 
     #[test]
+    fn malformed_positions_drop_only_bad_entries() {
+        let good = r#"{"channel":2.0,"x":1,"y":0,"z":0}"#;
+        for bad in [
+            "null",
+            "1",
+            "[]",
+            "{}",
+            r#"{"channel":"2","x":0,"y":0,"z":0}"#,
+            r#"{"channel":-1,"x":0,"y":0,"z":0}"#,
+            r#"{"channel":4294967296,"x":0,"y":0,"z":0}"#,
+            r#"{"channel":2.00000000000000001,"x":0,"y":0,"z":0}"#,
+            r#"{"channel":2,"x":1e400,"y":0,"z":0}"#,
+            r#"{"channel":2,"x":null,"y":0,"z":0}"#,
+            r#"{"channel":2,"x":"0.5","y":0,"z":0}"#,
+            r#"{"channel":2,"x":0,"y":0}"#,
+            r#"{"channel":2,"x":0,"y":0,"z":0,"gain":null}"#,
+            r#"{"channel":2,"x":0,"y":0,"z":0,"size":false}"#,
+        ] {
+            let line = format!(
+                r#"{{"type":"positions","source":"main","time":8123456789012.0,"channels":[{bad},{good}]}}"#
+            );
+            assert_eq!(
+                decode_addon(line.as_bytes()).unwrap(),
+                AddonMessage::Positions {
+                    source: "main".into(),
+                    time: 8123456789012,
+                    channels: vec![ChannelPosition::new(2, 1., 0., 0.)],
+                },
+                "{bad}"
+            );
+        }
+        for token in ["NaN", "Infinity"] {
+            let line = format!(r#"{{"type":"positions","x":{token}}}"#);
+            assert!(decode_addon(line.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_positions_ignore_invalid_envelopes() {
+        for fields in [
+            r#""time":0"#,
+            r#""source":"bad id","time":0"#,
+            r#""source":"main""#,
+            r#""source":"main","time":-1"#,
+            r#""source":"main","time":1.5"#,
+            r#""source":"main","time":18446744073709551616"#,
+            r#""source":"main","time":0,"channels":null"#,
+            &format!(
+                r#""source":"main","time":0,"channels":[{}]"#,
+                ["null"; 65].join(",")
+            ),
+        ] {
+            let line = format!(r#"{{"type":"positions",{fields}}}"#);
+            assert_eq!(
+                decode_addon(line.as_bytes()).unwrap(),
+                AddonMessage::Unknown
+            );
+        }
+        let line = br#"{"type":"positions","source":"main","time":184467440737095516150e-1}"#;
+        assert_eq!(
+            decode_addon(line).unwrap(),
+            AddonMessage::Positions {
+                source: "main".into(),
+                time: u64::MAX,
+                channels: vec![],
+            }
+        );
+    }
+
+    #[test]
     fn positions_carry_optional_size_and_gain_and_survive_numbers_json_cannot_hold() {
         let line = br#"{"type":"positions","source":"main","time":5,"channels":[{"channel":2,"x":null,"y":0.5,"z":0,"gain":null},{"channel":3,"x":0.25,"y":0.5,"z":0}]}"#;
         let AddonMessage::Positions {
@@ -674,10 +824,7 @@ mod tests {
             panic!("expected positions");
         };
         assert_eq!((source.as_str(), time), ("main", 5));
-        assert!(!channels[0].is_finite());
-        assert!(channels[1].is_finite());
-        assert_eq!(channels[1], ChannelPosition::new(3, 0.25, 0.5, 0.0));
-        assert_eq!((channels[1].size, channels[1].gain), (None, None));
+        assert_eq!(channels, [ChannelPosition::new(3, 0.25, 0.5, 0.0)]);
 
         let many = AddonMessage::Positions {
             source: "main".into(),

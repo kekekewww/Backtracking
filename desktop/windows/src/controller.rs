@@ -728,7 +728,7 @@ impl Controller {
     }
 
     /// Returns the newest completed mask for the displayed generation. Freezing
-    /// pages and building cold channel peaks both happen on the waveform worker.
+    /// pages and building cold channel peaks both happen on the activity worker.
     #[allow(dead_code)] // Used by the wide-lane row filter in the next UI wave.
     pub(crate) fn try_active_channels(&self, lane: usize) -> Option<u64> {
         if self.track_channels(lane)? <= 2 {

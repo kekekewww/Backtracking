@@ -280,7 +280,11 @@ impl PositionTrack {
 
     /// Clear positions and reset the once-per-history overflow notification.
     pub fn clear(&mut self) {
-        *self = Self::with_memory_limit(self.memory_limit);
+        if !self.is_empty() {
+            self.data = Arc::new(Storage::default());
+        }
+        self.overflow_pending = false;
+        self.overflow_reported = false;
     }
 
     /// Freeze without copying keys. Later writes copy only their touched pages.
@@ -479,6 +483,19 @@ mod tests {
         for frame in 0..1024 {
             track.insert(0, key(frame));
         }
+        assert!(track.take_overflowed());
+    }
+
+    #[test]
+    fn empty_history_keeps_empty_position_storage() {
+        let mut track = PositionTrack::with_memory_limit(0);
+        track.insert(0, key(10));
+        assert!(track.is_empty());
+        let empty = track.freeze();
+        track.retain_frames(10..10);
+        assert!(Arc::ptr_eq(&track.data, &empty.data));
+        assert!(!track.take_overflowed());
+        track.insert(0, key(11));
         assert!(track.take_overflowed());
     }
 

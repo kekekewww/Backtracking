@@ -95,6 +95,7 @@ fn canonical(label: &str) -> String {
 }
 
 pub(crate) fn is_lfe(label: &str) -> bool {
+    let label = label.trim();
     ["LFE", "LFE1", "LFE2"]
         .iter()
         .any(|name| label.eq_ignore_ascii_case(name))

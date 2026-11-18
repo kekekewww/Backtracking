@@ -440,3 +440,45 @@ fn worker_draws_pair_rows_with_native_rows_on_the_same_revision() {
         assert_eq!(hi, lo);
     }
 }
+
+#[test]
+fn blocked_activity_allows_a_waveform_answer() {
+    let controller = mixed_waveform_controller();
+    let (started, waiting) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let (answer, answered) = mpsc::channel();
+    assert!(
+        controller
+            .channel_waveforms
+            .lock()
+            .unwrap()
+            .try_queue(move || {
+                started.send(()).unwrap();
+                if released.recv().is_ok() {
+                    let _ = answer.send(42);
+                }
+            })
+    );
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (mut low, mut high) = ([0.; 8], [0.; 8]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if controller
+            .try_render_channel_waveforms(
+                &[(0, 3)],
+                &[],
+                None,
+                &mut [(&mut low, &mut high)],
+                &mut [],
+            )
+            .is_some()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "render waited for activity");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(high, [0.4; 8]);
+    release.send(()).unwrap();
+    assert_eq!(answered.recv_timeout(Duration::from_secs(5)).unwrap(), 42);
+}

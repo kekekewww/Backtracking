@@ -572,6 +572,9 @@ struct Recorder {
     /// crossed. Kept by identity, and kept while the mode is off so that turning it on narrows
     /// the selection to them. Empty covers every row.
     selection_rows: Vec<RowSource>,
+    /// By logical lane: whether `selection_rows` held every row of that lane when the
+    /// selection was made. Such a lane is saved and dragged out whole.
+    selection_whole: [bool; 2],
     /// The row a drag-out without a selection takes while rows are separate.
     drag_row: Option<RowSource>,
     /// While a drag selecting rows is past the edge of a lane that scrolls, when that lane
@@ -972,15 +975,16 @@ fn group_on_show(
 fn numbered_group(channels: usize) -> LaneGroup {
     LaneGroup {
         id: String::new(),
+        positioned: false,
         label: String::new(),
         channels: 0..channels,
         labels: (1..=channels).map(|channel| channel.to_string()).collect(),
     }
 }
 
-/// The group of positioned objects, by the name the export also goes by.
+/// The add-on declares whether this group supplies object positions.
 fn is_objects(group: &LaneGroup) -> bool {
-    group.id.eq_ignore_ascii_case("objects") || group.label.eq_ignore_ascii_case("Objects")
+    group.positioned
 }
 
 /// The group the pair of a lane is made from: its first group that is not the objects, or
@@ -1307,6 +1311,81 @@ fn lanes_chosen_whole(lanes: &[LanePlan], rows: &[RowSource]) -> [bool; 2] {
     })
 }
 
+/// Takes this pass's lanes, `planned`, in place of `lanes`, and starts a lane whose group
+/// changed at its first row again. Returns the lanes it replaced, or `None` when they stay.
+/// While a pointer gesture on the waveform is in progress (`gesture`), every lane keeps the
+/// rows it had when the gesture began; what changed meanwhile, such as an activity answer,
+/// shows once it ends.
+fn take_plans(
+    lanes: &mut Vec<LanePlan>,
+    first_row: &mut [usize; 2],
+    planned: Vec<LanePlan>,
+    gesture: bool,
+) -> Option<Vec<LanePlan>> {
+    if gesture || planned == *lanes {
+        return None;
+    }
+    for plan in &planned {
+        let same = lanes
+            .iter()
+            .find(|old| old.lane == plan.lane)
+            .is_some_and(|old| match (&old.kind, &plan.kind) {
+                (LaneKind::Stack { group: old, .. }, LaneKind::Stack { group: new, .. }) => {
+                    old.id == new.id && old.channels == new.channels
+                }
+                _ => false,
+            });
+        if !same {
+            first_row[plan.lane] = 0;
+        }
+    }
+    Some(std::mem::replace(lanes, planned))
+}
+
+/// Carries the rows of a selection, `rows`, from lanes drawn as `old` to lanes drawn as `new`.
+/// A lane the selection held whole (`whole`, by logical lane) stays whole as its rows appear
+/// or go, and covers every row it draws now. Once it shows another group it keeps only the
+/// rows it held, as every selection does across a group switch. Rows of other lanes stay
+/// exactly as they are.
+fn carry_rows(
+    old: &[LanePlan],
+    new: &[LanePlan],
+    rows: &[RowSource],
+    whole: &mut [bool; 2],
+) -> Vec<RowSource> {
+    fn kind(lanes: &[LanePlan], lane: usize) -> Option<&LaneKind> {
+        lanes
+            .iter()
+            .find(|plan| plan.lane == lane)
+            .map(|plan| &plan.kind)
+    }
+    for (lane, whole) in whole.iter_mut().enumerate() {
+        let same = match (kind(old, lane), kind(new, lane)) {
+            (
+                Some(LaneKind::Stack { group: old, .. }),
+                Some(LaneKind::Stack { group: new, .. }),
+            ) => old.id == new.id && old.channels == new.channels,
+            (Some(LaneKind::Views(_)), Some(LaneKind::Views(_))) => true,
+            _ => false,
+        };
+        *whole &= same;
+    }
+    let mut carried = Vec::with_capacity(rows.len());
+    for plan in new {
+        if whole.get(plan.lane).copied().unwrap_or(false) && plan.rows() > 0 {
+            carried.extend((0..plan.rows()).map(|row| plan.row(row)));
+        } else {
+            carried.extend(rows.iter().filter(|row| row.lane() == plan.lane));
+        }
+    }
+    // Rows of a lane not drawn now stay as they were.
+    carried.extend(
+        rows.iter()
+            .filter(|row| new.iter().all(|plan| plan.lane != row.lane())),
+    );
+    carried
+}
+
 /// What the export call writes of one wide or narrow snapshot, worked out on the export
 /// worker. `groups` are all the lane's groups frozen with the audio, `shown` the group on show
 /// when the clip was made, and `active` the lane's active channels in the frozen audio when the
@@ -1420,6 +1499,77 @@ struct WindowGrowth {
 
 /// The tallest a window grows by itself for stacked rows, in points.
 const MAX_GROWN_WINDOW_HEIGHT: f32 = 560.0;
+
+/// What the window does for its rows in one pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WindowFit {
+    Stay,
+    /// Grows to this height, so the rows of a stacked lane need not scroll.
+    Grow(f32),
+    /// Goes back to the height it had before it grew.
+    Restore(f32),
+}
+
+/// What a window `window` points tall does for lanes laid out as `specs`, which have `current`
+/// points of it, and what it then remembers in `growth`. It grows once when a lane starts
+/// stacking rows, and again for rows that appear later while the user has not resized it
+/// since it last grew; rows that go never shrink it. It goes back when no lane stacks any
+/// more, unless the user resized it meanwhile. `cap` is the tallest it may grow to, asked only
+/// when it grows. While the user drags the window (`window_drag`), or a pointer gesture on the
+/// waveform is in progress (`gesture`), it stays as it is.
+#[allow(clippy::too_many_arguments)]
+fn fit_window(
+    specs: &[stack::LaneRows],
+    current: f32,
+    window: f32,
+    growth: &mut Option<WindowGrowth>,
+    now: Instant,
+    window_drag: bool,
+    gesture: bool,
+    cap: impl FnOnce() -> f32,
+) -> WindowFit {
+    if window_drag || gesture {
+        return WindowFit::Stay;
+    }
+    let wanted = stack::comfortable_height(specs);
+    let regrow = match (wanted, *growth) {
+        (Some(wanted), Some(grown)) => {
+            wanted > current + 0.5
+                && (window - grown.after).abs() < 1.0
+                && now >= grown.settles
+                && grown.after < MAX_GROWN_WINDOW_HEIGHT - 0.5
+        }
+        _ => false,
+    };
+    match (wanted, *growth) {
+        (Some(wanted), grown) if grown.is_none() || regrow => {
+            let target = (window + wanted - current).min(cap()).max(window);
+            if grown.is_some() && target <= window + 0.5 {
+                return WindowFit::Stay;
+            }
+            *growth = Some(WindowGrowth {
+                before: grown.map_or(window, |grown| grown.before),
+                after: target,
+                settles: now + Duration::from_secs(1),
+            });
+            if target > window + 0.5 {
+                WindowFit::Grow(target)
+            } else {
+                WindowFit::Stay
+            }
+        }
+        (None, Some(grown)) => {
+            *growth = None;
+            let untouched = (window - grown.after).abs() < 1.0 || now < grown.settles;
+            if untouched && grown.after > grown.before + 0.5 {
+                WindowFit::Restore(grown.before)
+            } else {
+                WindowFit::Stay
+            }
+        }
+        _ => WindowFit::Stay,
+    }
+}
 
 /// The meter's number for a lane. Loudness is not measured for lanes wider than stereo.
 fn meter_value(mode: MeterMode, readings: LaneMeterReadings) -> Option<f32> {
@@ -1725,6 +1875,8 @@ struct FlagUpdate {
     /// The rows the flags were left on, which a selection taken back from them covers while
     /// rows are edited separately. Empty marks every row.
     rows: Vec<RowSource>,
+    /// By logical lane: whether `rows` held every row of that lane when the flags were left.
+    whole: [bool; 2],
 }
 
 fn snapshot_source(
@@ -2366,6 +2518,7 @@ impl Recorder {
             selection: None,
             separate_rows: false,
             selection_rows: Vec::new(),
+            selection_whole: [false; 2],
             drag_row: None,
             edge_scroll: None,
             lane_key: None,
@@ -2837,14 +2990,26 @@ impl Recorder {
         }
     }
 
-    fn flag_update(&mut self, frames: Range<u64>, rows: Vec<RowSource>) -> FlagUpdate {
+    fn flag_update(
+        &mut self,
+        frames: Range<u64>,
+        rows: Vec<RowSource>,
+        whole: [bool; 2],
+    ) -> FlagUpdate {
         self.flag_order += 1;
         FlagUpdate {
             generation: self.generation,
             order: self.flag_order,
             frames,
             rows,
+            whole,
         }
+    }
+
+    /// Makes `rows` the rows the selection covers, and notes which lanes they hold whole.
+    fn choose_rows(&mut self, rows: Vec<RowSource>) {
+        self.selection_whole = lanes_chosen_whole(&self.lanes, &rows);
+        self.selection_rows = rows;
     }
 
     fn apply_flags(&mut self, flags: FlagUpdate) {
@@ -3537,8 +3702,8 @@ impl Recorder {
     }
 
     /// Asks a few times a second which channels of each lane that hides silent rows are
-    /// active, while capture runs. The answer comes from the waveform worker and never makes
-    /// the window wait.
+    /// active, while capture runs. The answer comes from the channel activity worker and never
+    /// makes the window wait.
     fn update_activity(&mut self) {
         let hiding = [0, 1].map(|lane| self.hides_silent_rows(lane));
         if let Some(edit) = &mut self.editing {
@@ -3583,27 +3748,26 @@ impl Recorder {
         }
     }
 
-    /// Works out this pass's lanes. A lane whose rows changed starts again at its first row.
+    /// Works out this pass's lanes. A lane whose group changed starts again at its first row.
+    /// A pointer gesture on the waveform keeps the rows it began with until it ends. The
+    /// selection and the flags keep their rows across the change (`carry_rows`).
     fn update_lanes(&mut self) {
-        let lanes = self.lane_plans();
-        if lanes != self.lanes {
-            for plan in &lanes {
-                let same = self
-                    .lanes
-                    .iter()
-                    .find(|old| old.lane == plan.lane)
-                    .is_some_and(|old| match (&old.kind, &plan.kind) {
-                        (
-                            LaneKind::Stack { group: old, .. },
-                            LaneKind::Stack { group: new, .. },
-                        ) => old.id == new.id && old.channels == new.channels,
-                        _ => false,
-                    });
-                if !same {
-                    self.lane_first_row[plan.lane] = 0;
-                }
+        let planned = self.lane_plans();
+        if let Some(old) = take_plans(
+            &mut self.lanes,
+            &mut self.lane_first_row,
+            planned,
+            self.gesture.is_some(),
+        ) {
+            self.selection_rows = carry_rows(
+                &old,
+                &self.lanes,
+                &self.selection_rows,
+                &mut self.selection_whole,
+            );
+            if let Some(flags) = &mut self.flags {
+                flags.rows = carry_rows(&old, &self.lanes, &flags.rows, &mut flags.whole);
             }
-            self.lanes = lanes;
             self.live_revision = None;
             self.next_refresh = Instant::now();
         }
@@ -3686,63 +3850,48 @@ impl Recorder {
         result
     }
 
-    /// Grows the window once when a lane starts stacking rows, so they need not scroll, and
-    /// puts it back when no lane stacks any more unless the user resized it meanwhile.
+    /// Grows the window when a lane stacks rows, so they need not scroll, and puts it back when
+    /// no lane stacks any more unless the user resized it meanwhile (`fit_window`).
     fn fit_window_to_rows(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        if !self.auto_grow || self.waveform_only || self.window_drag.is_some() {
+        if !self.auto_grow || self.waveform_only {
             return;
         }
         let window = ctx.viewport_rect().size();
-        let now = Instant::now();
         let specs: Vec<_> = self.lanes.iter().map(LanePlan::spec).collect();
         let current = self.timeline_rect(self.plot_rect).height();
-        // Rows that appear later, as a hidden channel becomes active, grow the window further
-        // while the user has not resized it since it last grew. Rows that go never shrink it.
-        let regrow = match (stack::comfortable_height(&specs), self.growth) {
-            (Some(wanted), Some(growth)) => {
-                wanted > current + 0.5
-                    && (window.y - growth.after).abs() < 1.0
-                    && now >= growth.settles
-                    && growth.after < MAX_GROWN_WINDOW_HEIGHT - 0.5
-            }
-            _ => false,
-        };
-        match (stack::comfortable_height(&specs), self.growth) {
-            (Some(wanted), growth) if growth.is_none() || regrow => {
-                let screen = frame
-                    .winit_window()
-                    .and_then(|window| window.current_monitor())
-                    .map(|monitor| monitor.size().height as f32 / ctx.pixels_per_point() * 0.85);
-                let cap = screen.map_or(MAX_GROWN_WINDOW_HEIGHT, |screen| {
+        let (window_drag, gesture) = (self.window_drag.is_some(), self.gesture.is_some());
+        let cap = || {
+            frame
+                .winit_window()
+                .and_then(|window| window.current_monitor())
+                .map(|monitor| monitor.size().height as f32 / ctx.pixels_per_point() * 0.85)
+                .map_or(MAX_GROWN_WINDOW_HEIGHT, |screen| {
                     screen.min(MAX_GROWN_WINDOW_HEIGHT)
-                });
-                let target = (window.y + wanted - current).min(cap).max(window.y);
-                if growth.is_some() && target <= window.y + 0.5 {
-                    return;
+                })
+        };
+        match fit_window(
+            &specs,
+            current,
+            window.y,
+            &mut self.growth,
+            Instant::now(),
+            window_drag,
+            gesture,
+            cap,
+        ) {
+            WindowFit::Stay => {}
+            WindowFit::Grow(height) => {
+                let size = Vec2::new(window.x, height);
+                // A test copy stays where it was put, off every screen.
+                if !self.test_copy {
+                    fit_expanded_window(ctx, frame, size);
                 }
-                self.growth = Some(WindowGrowth {
-                    before: growth.map_or(window.y, |growth| growth.before),
-                    after: target,
-                    settles: now + Duration::from_secs(1),
-                });
-                if target > window.y + 0.5 {
-                    let size = Vec2::new(window.x, target);
-                    // A test copy stays where it was put, off every screen.
-                    if !self.test_copy {
-                        fit_expanded_window(ctx, frame, size);
-                    }
-                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
-                }
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
             }
-            (None, Some(growth)) => {
-                self.growth = None;
-                let untouched = (window.y - growth.after).abs() < 1.0 || now < growth.settles;
-                if untouched && growth.after > growth.before + 0.5 {
-                    let size = Vec2::new(window.x, growth.before).max(min_window_size(false));
-                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
-                }
+            WindowFit::Restore(height) => {
+                let size = Vec2::new(window.x, height).max(min_window_size(false));
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
             }
-            _ => {}
         }
     }
 
@@ -5498,8 +5647,14 @@ impl Recorder {
             .filter(|_| has_selection)
             .map(<[RowSource]>::to_vec)
             .unwrap_or_default();
+        // A lane the selection held whole when it was made is saved whole.
+        let whole = if rows.is_empty() {
+            [false; 2]
+        } else {
+            self.selection_whole
+        };
         let spec = SnapshotSpec {
-            whole: lanes_chosen_whole(&self.lanes, &rows),
+            whole,
             selection: self.selection.clone(),
             fades: if has_selection {
                 self.fades
@@ -5508,7 +5663,7 @@ impl Recorder {
             },
             output,
             format: self.clip_format(None),
-            flags: (!has_selection).then(|| self.flag_update(0..0, Vec::new())),
+            flags: (!has_selection).then(|| self.flag_update(0..0, Vec::new(), [false; 2])),
             export_options: self.export_options(),
             // Separate rows save the selection's own rows, and every row without a selection.
             rows,
@@ -5567,8 +5722,15 @@ impl Recorder {
                 .then_some(self.selection_rows.as_slice()),
             self.drag_row,
         );
+        // A lane the selection held whole when it was made is dragged out whole; without a
+        // selection, the row the drag took is the lane whole when it is all the lane shows.
+        let whole = if self.selection.is_some() {
+            self.selection_whole
+        } else {
+            lanes_chosen_whole(&self.lanes, &rows)
+        };
         let flags = if self.selection.is_none() {
-            Some(self.flag_update(snapshots.first()?.frame_range(), rows.clone()))
+            Some(self.flag_update(snapshots.first()?.frame_range(), rows.clone(), whole))
         } else {
             None
         };
@@ -5597,7 +5759,7 @@ impl Recorder {
             clip.export_options = self.export_options();
             clip.with_rows(&rows, &groups)
         })
-        .map(|clip| clip.whole_lanes(lanes_chosen_whole(&self.lanes, &rows)))
+        .map(|clip| clip.whole_lanes(whole))
         .map(|clip| match &self.editing {
             Some(edit) if Arc::ptr_eq(&edit.snapshots, &clip.snapshots) => {
                 clip.with_positions(&edit.positions)
@@ -5877,16 +6039,17 @@ impl Recorder {
                 if let Some(flags) = resize.and(self.flags.as_ref()).filter(|_| !resizing) {
                     // One taken back from flags covers the rows they were left on.
                     self.selection_rows = flags.rows.clone();
+                    self.selection_whole = flags.whole;
                 } else if !resizing {
                     // A new selection covers the rows its drag crosses, from the one it starts
                     // in, whenever rows are separate.
                     let boxes = self.lane_boxes(audio.height());
                     if let Some(row) = row_at_height(&self.lanes, &boxes, position.y - audio.top())
                     {
-                        self.selection_rows = rows_between(&self.lanes, row, row);
+                        self.choose_rows(rows_between(&self.lanes, row, row));
                         rows = Some((row, row));
                     } else {
-                        self.selection_rows.clear();
+                        self.choose_rows(Vec::new());
                     }
                 }
                 self.edge_scroll = None;
@@ -5944,7 +6107,7 @@ impl Recorder {
             }) = self.gesture
             {
                 let at = self.drag_across_rows(audio_rect, position.y, at);
-                self.selection_rows = rows_between(&self.lanes, anchor, at);
+                self.choose_rows(rows_between(&self.lanes, anchor, at));
                 // A pointer held still past the edge keeps the lane scrolling.
                 if let Some(next) = self.edge_scroll {
                     ui.ctx()
@@ -5985,7 +6148,11 @@ impl Recorder {
                 } => {
                     let range = anchor.min(cursor)..anchor.max(cursor);
                     if moved && !range.is_empty() {
-                        let flags = self.flag_update(range.clone(), self.selection_rows.clone());
+                        let flags = self.flag_update(
+                            range.clone(),
+                            self.selection_rows.clone(),
+                            self.selection_whole,
+                        );
                         self.apply_flags(flags);
                         // A resized selection keeps the ramps at its flags; a new one has none.
                         self.fades = if resizing {
@@ -8930,12 +9097,14 @@ mod tests {
                 vec![
                     LaneGroup {
                         id: "bed".into(),
+                        positioned: false,
                         label: "Bed".into(),
                         channels: 0..2,
                         labels: vec!["L".into(), "R".into()],
                     },
                     LaneGroup {
                         id: "objects".into(),
+                        positioned: true,
                         label: "Objects".into(),
                         channels: 2..6,
                         labels: vec![
@@ -9036,6 +9205,7 @@ mod tests {
     fn group(id: &str, channels: Range<usize>) -> LaneGroup {
         LaneGroup {
             id: id.into(),
+            positioned: false,
             label: id.to_uppercase(),
             labels: channels
                 .clone()
@@ -9243,6 +9413,7 @@ mod tests {
     fn bed_group() -> LaneGroup {
         LaneGroup {
             id: "7.1.4".into(),
+            positioned: false,
             label: "7.1.4".into(),
             channels: 0..12,
             labels: BED_714.iter().map(|&label| label.to_owned()).collect(),
@@ -9425,6 +9596,7 @@ mod tests {
     fn windows_71() -> LaneGroup {
         LaneGroup {
             id: String::new(),
+            positioned: false,
             label: String::new(),
             channels: 0..8,
             labels: ["FL", "FR", "FC", "LFE", "Lb", "Rb", "Ls", "Rs"]
@@ -9541,6 +9713,7 @@ mod tests {
     fn group_with(channels: Range<usize>, labels: &[&str]) -> LaneGroup {
         LaneGroup {
             id: "objects".into(),
+            positioned: true,
             label: "Objects".into(),
             channels,
             labels: labels.iter().map(|&label| label.to_owned()).collect(),
@@ -9844,6 +10017,7 @@ mod tests {
     fn selected_rows_stay_the_same_rows_across_scrolling_and_a_group_switch() {
         let objects = LaneGroup {
             id: "objects".into(),
+            positioned: true,
             label: "Objects".into(),
             channels: 12..16,
             labels: (1..=4).map(|object| format!("Object {object}")).collect(),
@@ -10236,6 +10410,7 @@ mod tests {
         let routes = [ChannelRoute::Merged, ChannelRoute::Right];
         let objects = LaneGroup {
             id: "objects".into(),
+            positioned: true,
             label: "Objects".into(),
             channels: 12..14,
             labels: vec!["Object 1".into(), "Object 2".into()],
@@ -10453,6 +10628,7 @@ mod tests {
         ];
         let bed = LaneGroup {
             id: "7.1.4".into(),
+            positioned: false,
             label: "7.1.4".into(),
             channels: 0..12,
             labels: labels.iter().map(|&label| label.to_owned()).collect(),
@@ -10509,6 +10685,7 @@ mod tests {
     fn objects_group(channels: Range<usize>) -> LaneGroup {
         LaneGroup {
             id: "objects".into(),
+            positioned: true,
             label: "Objects".into(),
             labels: (1..=channels.len())
                 .map(|object| format!("Object {object}"))
@@ -10606,6 +10783,7 @@ mod tests {
         // the pair while nothing but the front left and right is active.
         let system = LaneGroup {
             id: String::new(),
+            positioned: false,
             label: String::new(),
             channels: 0..8,
             labels: SYSTEM_71.iter().map(|&label| label.to_owned()).collect(),
@@ -10786,6 +10964,7 @@ mod tests {
 
         let system = LaneGroup {
             id: String::new(),
+            positioned: false,
             label: String::new(),
             channels: 0..8,
             labels: SYSTEM_71.iter().map(|&label| label.to_owned()).collect(),
@@ -10906,6 +11085,7 @@ mod tests {
         .unwrap();
         let bed = LaneGroup {
             id: "channels".into(),
+            positioned: false,
             label: "Channels".into(),
             channels: 0..8,
             labels: SYSTEM_71.iter().map(|&label| label.to_owned()).collect(),
@@ -10936,6 +11116,212 @@ mod tests {
             lanes_chosen_whole(&pair_only, &RowSource::pair(0)),
             [true, false]
         );
+    }
+
+    fn system_group() -> LaneGroup {
+        LaneGroup {
+            id: String::new(),
+            positioned: false,
+            label: String::new(),
+            channels: 0..8,
+            labels: SYSTEM_71.iter().map(|&label| label.to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_drag_keeps_the_rows_it_began_with_and_the_window_its_size_until_it_ends() {
+        let system = system_group();
+        // A 7.1 system lane that hides silent rows, as an activity answer plans it.
+        let plan = |active: u64| {
+            vec![paired_plan(
+                0,
+                system.clone(),
+                shown_channels(&system, Some(active)),
+            )]
+        };
+        let specs = |lanes: &[LanePlan]| lanes.iter().map(LanePlan::spec).collect::<Vec<_>>();
+        // The drag begins on the pair and the front four channels. The window grew for them a
+        // while ago, and the user has not resized it since.
+        let began = plan(0b1111);
+        let answered = plan(0b100_1111);
+        assert_ne!(began, answered);
+        let mut lanes = began.clone();
+        let mut first_row = [0; 2];
+        let now = Instant::now();
+        let later = now + Duration::from_secs(2);
+        let window = 300.0;
+        let current = stack::comfortable_height(&specs(&began)).unwrap();
+        let mut growth = Some(WindowGrowth {
+            before: 144.0,
+            after: window,
+            settles: now,
+        });
+        // The frozen view's answer lands while the drag is in progress: Ls has sound too. Every
+        // pass works it out, and every lane keeps the rows the drag began with, so the rows
+        // under the pointer stay where they are and the window does not grow.
+        for _ in 0..3 {
+            assert_eq!(
+                take_plans(&mut lanes, &mut first_row, answered.clone(), true),
+                None
+            );
+            assert_eq!(lanes, began);
+            let fit = fit_window(
+                &specs(&lanes),
+                current,
+                window,
+                &mut growth,
+                later,
+                false,
+                true,
+                || MAX_GROWN_WINDOW_HEIGHT,
+            );
+            assert_eq!(fit, WindowFit::Stay);
+            assert_eq!(growth.map(|growth| growth.after), Some(window));
+        }
+        // The drag ends: the answer shows, and the window grows by the new row.
+        assert_eq!(
+            take_plans(&mut lanes, &mut first_row, answered.clone(), false),
+            Some(began.clone())
+        );
+        assert_eq!(lanes, answered);
+        assert_eq!(first_row, [0; 2]);
+        let wanted = stack::comfortable_height(&specs(&answered)).unwrap();
+        let fit = fit_window(
+            &specs(&lanes),
+            current,
+            window,
+            &mut growth,
+            later,
+            false,
+            false,
+            || MAX_GROWN_WINDOW_HEIGHT,
+        );
+        assert_eq!(fit, WindowFit::Grow(window + wanted - current));
+
+        // A row that appeared just before the drag began waits for the window to settle from
+        // growing. The drag holds that growth too, until it ends.
+        let mut growth = Some(WindowGrowth {
+            before: 144.0,
+            after: window,
+            settles: now + Duration::from_millis(500),
+        });
+        for (window_drag, gesture) in [(false, true), (true, false)] {
+            let fit = fit_window(
+                &specs(&answered),
+                current,
+                window,
+                &mut growth,
+                later,
+                window_drag,
+                gesture,
+                || MAX_GROWN_WINDOW_HEIGHT,
+            );
+            assert_eq!(fit, WindowFit::Stay, "{window_drag} {gesture}");
+            assert_eq!(growth.map(|growth| growth.after), Some(window));
+        }
+        let fit = fit_window(
+            &specs(&answered),
+            current,
+            window,
+            &mut growth,
+            later,
+            false,
+            false,
+            || MAX_GROWN_WINDOW_HEIGHT,
+        );
+        assert_eq!(fit, WindowFit::Grow(window + wanted - current));
+    }
+
+    #[test]
+    fn a_lane_selected_whole_stays_whole_as_its_rows_appear_or_go() {
+        use crate::preferences::WideExportMode;
+
+        let system = system_group();
+        let plan = |shown: Vec<usize>| vec![paired_plan(0, system.clone(), shown)];
+        // What a save or drag-out of `rows` writes from `track`, a lane that hides silent rows.
+        let saved = |track: FrozenTrack, rows: &[RowSource], whole: [bool; 2]| {
+            let format = ClipFormat {
+                names: ["System audio".into(), String::new()],
+                hide_silent: [true, false],
+                ..ClipFormat::unnamed([ChannelRoute::AllChannels; 2], false)
+            };
+            let mut clip = WavClip::new(
+                vec![track].into(),
+                &[0],
+                None,
+                Fades::NONE,
+                clip_folder("whole-rows"),
+                format,
+                None,
+            )
+            .unwrap();
+            clip.export_options.groups = [Some(system.clone()), None];
+            clip.export_options.wide_mode = WideExportMode::MonoFiles;
+            let clip = clip
+                .with_rows(rows, &[vec![system.clone()], Vec::new()])
+                .unwrap()
+                .whole_lanes(whole);
+            written_names(clip).0
+        };
+
+        // Every row is selected while the lane shows the pair, the centre and the LFE.
+        let made = plan(vec![2, 3]);
+        let every = rows_between(&made, made[0].row(0), made[0].row(3));
+        let mut whole = lanes_chosen_whole(&made, &every);
+        assert_eq!(whole, [true, false]);
+        // Then Ls is found active and its row appears. The lane stays whole and covers it.
+        let appeared = plan(vec![2, 3, 6]);
+        let rows = carry_rows(&made, &appeared, &every, &mut whole);
+        assert_eq!(whole, [true, false]);
+        assert_eq!(
+            rows,
+            rows_between(&appeared, appeared[0].row(0), appeared[0].row(4))
+        );
+        // Saved whole: every active channel, Ls included, and the pair.
+        assert_eq!(
+            saved(system_71(&[2, 3, 6]), &rows, whole),
+            [
+                "-Ch03_FC.wav",
+                "-Ch04_LFE.wav",
+                "-Ch07_Ls.wav",
+                "-Stereo.wav"
+            ]
+        );
+        // A row that goes leaves the lane whole too.
+        let went = plan(vec![2]);
+        let rows = carry_rows(&appeared, &went, &rows, &mut whole);
+        assert_eq!(whole, [true, false]);
+        assert_eq!(rows, rows_between(&went, went[0].row(0), went[0].row(2)));
+
+        // A selection of some rows keeps exactly those, even once they are all the lane shows:
+        // the pair, FL and FR, after FC goes and with it every row but the pair.
+        let made = plan(vec![0, 1, 2]);
+        let some = rows_between(&made, made[0].row(0), made[0].row(3));
+        let mut whole = lanes_chosen_whole(&made, &some);
+        assert_eq!(whole, [false, false]);
+        let pair_only = plan(Vec::new());
+        let rows = carry_rows(&made, &pair_only, &some, &mut whole);
+        assert_eq!(whole, [false, false]);
+        assert_eq!(rows, some);
+        assert_eq!(
+            saved(system_71(&[0, 1]), &rows, whole),
+            ["-Ch01_FL.wav", "-Ch02_FR.wav", "-Stereo.wav"]
+        );
+
+        // Another group on show keeps a lane held whole to the rows it held, as every
+        // selection is kept across a group switch, and switching back does not widen it.
+        let objects = objects_group(12..16);
+        let bed = [wide_plan(0, bed_group())];
+        let shown_objects = [wide_plan(0, objects)];
+        let all_bed = rows_between(&bed, bed[0].row(0), bed[0].row(11));
+        let mut whole = lanes_chosen_whole(&bed, &all_bed);
+        assert_eq!(whole, [true, false]);
+        let rows = carry_rows(&bed, &shown_objects, &all_bed, &mut whole);
+        assert_eq!(whole, [false, false]);
+        assert_eq!(rows, all_bed);
+        let rows = carry_rows(&shown_objects, &bed, &rows, &mut whole);
+        assert_eq!(whole, [false, false]);
+        assert_eq!(rows, all_bed);
     }
 
     #[test]

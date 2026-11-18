@@ -180,7 +180,7 @@ fn invalid_selection() -> io::Error {
 }
 
 fn objects(group: &LaneGroup) -> bool {
-    group.id.eq_ignore_ascii_case("objects") || group.label.eq_ignore_ascii_case("Objects")
+    group.positioned
 }
 
 enum Audio {
@@ -731,6 +731,7 @@ mod tests {
         ];
         let group = LaneGroup {
             id: if moving { "objects" } else { "channels" }.into(),
+            positioned: moving,
             label: String::new(),
             channels: 0..width,
             labels: (0..width)
@@ -819,6 +820,7 @@ mod tests {
         let positions = moving_positions(1..3, tone.frames);
         let group = LaneGroup {
             id: "objects".into(),
+            positioned: true,
             label: "Objects".into(),
             channels: 1..4,
             labels: vec!["Moving 1".into(), "Moving 2".into(), "Unknown".into()],
@@ -926,13 +928,15 @@ mod tests {
         let folder = Folder::new();
         let bed = LaneGroup {
             id: "channels".into(),
-            label: String::new(),
+            positioned: false,
+            label: "Objects".into(),
             channels: 0..3,
             labels: vec!["FL".into(), "FC".into(), "FR".into()],
         };
         let objects = LaneGroup {
-            id: "objects".into(),
-            label: String::new(),
+            id: "sources".into(),
+            positioned: true,
+            label: "Sources".into(),
             channels: 3..5,
             labels: vec!["Object A".into(), "Object B".into()],
         };
@@ -988,6 +992,15 @@ mod tests {
                     )
                     .unwrap();
                     assert_eq!(result.objects_in_mono, fallback);
+                    if has_position && mode == WideExportMode::BinauralMix {
+                        assert!(result.paths.iter().any(|path| {
+                            path.file_name()
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                                .ends_with("-Mix-Binaural.wav")
+                        }));
+                    }
                     let count = match mode {
                         WideExportMode::MonoFiles | WideExportMode::BinauralFiles => selected,
                         WideExportMode::Multichannel => usize::from(selected > 0),
@@ -1042,6 +1055,7 @@ mod tests {
         let track = FrozenTrack::from_interleaved(48000, 3, 763, &raw).unwrap();
         let group = LaneGroup {
             id: "bed".into(),
+            positioned: false,
             label: String::new(),
             channels: 0..3,
             labels: ["FL", "FR", "FC"].map(str::to_owned).into(),
@@ -1098,6 +1112,7 @@ mod tests {
                 .unwrap();
         let group = LaneGroup {
             id: "objects".into(),
+            positioned: true,
             label: "Objects".into(),
             channels: 2..4,
             labels: vec!["First".into(), "Second".into()],
@@ -1137,6 +1152,7 @@ mod tests {
             FrozenTrack::from_interleaved(48000, 3, 0, &[0., 0.25, -0.125].repeat(1024)).unwrap();
         let bed = LaneGroup {
             id: "channels".into(),
+            positioned: false,
             label: String::new(),
             channels: 0..3,
             labels: ["FL", "FR", "FC"].map(str::to_owned).into(),
@@ -1234,6 +1250,7 @@ mod tests {
             groups: [
                 Some(LaneGroup {
                     id: "objects".into(),
+                    positioned: true,
                     label: "Objects".into(),
                     channels: 3..6,
                     labels: vec!["Object 1".into(), "Object 2".into(), "Object 3".into()],
@@ -1318,6 +1335,7 @@ mod tests {
         let mut options = options();
         options.groups[1] = Some(LaneGroup {
             id: "bad".into(),
+            positioned: false,
             label: String::new(),
             channels: 5..8,
             labels: vec!["A".into(), "B".into(), "C".into()],

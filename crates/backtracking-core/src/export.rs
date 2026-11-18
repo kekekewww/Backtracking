@@ -2131,7 +2131,6 @@ mod tests {
 
     #[test]
     fn paired_exports_share_one_free_name_and_carry_the_tempo() {
-        let dir = test_dir("pair-names");
         let profile = WavExportProfile::default();
         let a = Snapshot {
             sample_rate: 48_000,
@@ -2139,9 +2138,9 @@ mod tests {
             samples: vec![0.5; 24_000],
             first_frame: 0,
         };
-        let export = |lanes: usize, tempo| {
+        let export = |dir: &Path, lanes: usize, tempo| {
             export_routed_tracks_with_tempo(
-                &dir,
+                dir,
                 &vec![a.clone(); lanes],
                 0..24_000,
                 profile,
@@ -2153,19 +2152,20 @@ mod tests {
         };
         // Unnamed lanes, as the plug-in exports them, keep the letter at the end of the name.
         let take_name = |seconds, tempo| format!("Backtracking_{}", dated_take(seconds, tempo));
+        // Exercise a discarded attempt even when both exports finish in the same second.
+        let mut force_retry = true;
         loop {
+            let dir = test_dir("pair-names");
             let take = take_name(0.5, Some(174.0));
             assert!(take.ends_with("_0.5s_174bpm"), "{take}");
             assert_take_shape(&take, "0.5s");
-            if dir.join(format!("{take}-B.wav")).exists() {
-                continue;
-            }
             // Only lane B of the first name is taken: the pair must not be split across names.
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join(format!("{take}-B.wav")), b"keep").unwrap();
-            let pair = export(2, 174.0);
-            let single = export(1, 92.5);
-            if take_name(0.5, Some(174.0)) != take {
+            let pair = export(&dir, 2, 174.0);
+            let single = export(&dir, 1, 92.5);
+            if std::mem::take(&mut force_retry) || take_name(0.5, Some(174.0)) != take {
+                fs::remove_dir_all(&dir).unwrap();
                 continue;
             }
             assert_eq!(file_name(&pair[0]), format!("{take}_2-A.wav"));
@@ -2177,9 +2177,9 @@ mod tests {
             );
             let single = file_name(&single[0]);
             assert!(single.ends_with("_0.5s_92.5bpm.wav"), "{single}");
+            fs::remove_dir_all(dir).unwrap();
             break;
         }
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

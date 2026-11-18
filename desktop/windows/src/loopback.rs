@@ -665,11 +665,23 @@ impl Drop for MixFormat {
     }
 }
 
+fn process_shape_changed(
+    all_channels: bool,
+    opened: Option<(u32, usize, u32)>,
+    current: Option<(u32, usize, u32)>,
+) -> bool {
+    all_channels && current.is_some() && current != opened
+}
+
 enum SourceBinding {
     DefaultRender(String),
     DefaultCapture(String),
     Microphone(String),
-    Process(RunningProcess, Option<(u32, usize, u32)>),
+    Process {
+        process: RunningProcess,
+        all_channels: bool,
+        opened: Option<(u32, usize, u32)>,
+    },
 }
 
 struct WasapiStream {
@@ -716,7 +728,11 @@ impl WasapiStream {
                 (
                     client,
                     format,
-                    SourceBinding::Process(process, device_shape),
+                    SourceBinding::Process {
+                        process,
+                        all_channels,
+                        opened: device_shape,
+                    },
                     None,
                     Some(event),
                 )
@@ -826,15 +842,21 @@ impl WasapiStream {
     fn verify_source(&self) -> Result<(), String> {
         let enumerator = self.enumerator.as_ref();
         match &self.binding {
-            SourceBinding::Process(process, shape) => {
-                let current = default_render_mix()
-                    .and_then(|mix| unsafe { Format::parse(mix.0) }.ok())
-                    .map(|f| f.shape());
-                if current != *shape {
-                    return Err(FORMAT_CHANGED.into());
-                }
+            SourceBinding::Process {
+                process,
+                all_channels,
+                opened,
+            } => {
                 if !process.running() {
                     return Err("應用程式已結束，等待重新啟動".into());
+                }
+                if *all_channels {
+                    let current = default_render_mix()
+                        .and_then(|mix| unsafe { Format::parse(mix.0) }.ok())
+                        .map(|f| f.shape());
+                    if process_shape_changed(*all_channels, *opened, current) {
+                        return Err(FORMAT_CHANGED.into());
+                    }
                 }
             }
             SourceBinding::DefaultRender(id) | SourceBinding::DefaultCapture(id) => {
@@ -861,12 +883,12 @@ impl WasapiStream {
                         .GetDevice(&HSTRING::from(id.as_str()))
                 }
                 .map_err(|error| audio_error("等待已選取的麥克風重新連線", error))?;
-                self.verify_format(&device)?;
                 let state = unsafe { device.GetState() }
                     .map_err(|error| audio_error("無法讀取麥克風狀態", error))?;
                 if state != DEVICE_STATE_ACTIVE {
                     return Err("等待已選取的麥克風重新連線".into());
                 }
+                self.verify_format(&device)?;
             }
         }
         Ok(())
@@ -1585,6 +1607,26 @@ fn endpoint_id(device: &IMMDevice) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_reconnect_depends_on_route_and_successful_shape_read() {
+        let opened = Some((48_000, 2, 3));
+        for current in [
+            Some((44_100, 2, 3)),
+            Some((48_000, 6, 3)),
+            Some((48_000, 2, 9)),
+        ] {
+            assert!(!process_shape_changed(false, opened, current));
+            assert!(process_shape_changed(true, opened, current));
+            assert!(process_shape_changed(true, None, current));
+            assert!(!process_shape_changed(false, None, current));
+        }
+        for route in [false, true] {
+            assert!(!process_shape_changed(route, opened, opened));
+            assert!(!process_shape_changed(route, opened, None));
+            assert!(!process_shape_changed(route, None, None));
+        }
+    }
 
     #[test]
     fn activation_blob_borrows_boxed_params_until_the_last_completion_reference_drops() {

@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn positions_null_numbers_do_not_close_the_connection() {
+    fn malformed_positions_do_not_close_the_connection() {
         use std::io::Write;
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let mut peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -524,11 +524,18 @@ mod tests {
             id: "com.example.test-tone".into(),
             wire: Wire::new(stream).unwrap(),
         };
-        peer.write_all(b"{\"type\":\"positions\",\"source\":\"main\",\"time\":0,\"channels\":[{\"channel\":2,\"x\":null,\"y\":0,\"z\":0},{\"channel\":3,\"x\":-2,\"y\":2,\"z\":0,\"size\":null}]}\n{\"type\":\"message\",\"level\":\"info\",\"text\":\"Still running\"}\n").unwrap();
+        let lines = [
+            r#"{"type":"positions","time":-1}"#,
+            r#"{"type":"positions","source":"main","time":0,"channels":[{"channel":2,"x":null,"y":0,"z":0},{"channel":3,"x":-2,"y":2,"z":0,"size":null}]}"#,
+            r#"{"type":"message","level":"info","text":"Still running"}"#,
+        ];
+        for line in lines {
+            writeln!(peer, "{line}").unwrap();
+        }
         let mut filter = PositionFilter::default();
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut received = 0;
-        while received < 2 && Instant::now() < deadline {
+        while received < 3 && Instant::now() < deadline {
             match connection.try_recv().unwrap() {
                 Some(AddonMessage::Positions { time, channels, .. }) => {
                     assert!(filter
@@ -541,11 +548,12 @@ mod tests {
                     assert_eq!(text, "Still running");
                     received += 1;
                 }
+                Some(AddonMessage::Unknown) if received == 0 => received += 1,
                 Some(_) => panic!("unexpected message"),
                 None => std::thread::yield_now(),
             }
         }
-        assert_eq!(received, 2);
+        assert_eq!(received, 3);
         assert!(!connection.is_disconnected());
     }
 
