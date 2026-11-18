@@ -8,6 +8,7 @@ mod preview;
 mod preview_ffi;
 mod queue;
 mod sender;
+pub mod spatial;
 mod synchronized;
 mod track_ffi;
 pub mod waveform;
