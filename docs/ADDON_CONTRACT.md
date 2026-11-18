@@ -212,7 +212,7 @@ The host ignores updates for unknown sources and sources whose latest `describe`
 | `channel` | Zero-based index into the Sender stream, counted across groups. Must lie in a group with `positioned: true`. |
 | `x`, `y`, `z` | The listener is at 0, 0, 0. `x` runs from -1 (left wall) to 1 (right wall), `y` from -1 (back wall) to 1 (front wall), and `z` from -1 (floor) to 1 (ceiling); 0 is ear level. |
 | `size` | Optional, 0 to 1, default 0 (a point). Stored, not used by the renderer yet. |
-| `gain` | Optional linear level, default 1. The add-on has **not** already applied it to the audio. |
+| `gain` | Optional linear level, default 1. The add-on has **not** already applied it to the audio. For rendering and exported positions, the host clamps gain to 0 through 4 (+12 dB). |
 
 Send one when anything changes, at most 50 per second per source, and at least one per second
 while the source plays. The host thins faster updates without stopping the add-on. A channel's

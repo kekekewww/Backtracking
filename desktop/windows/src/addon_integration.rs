@@ -401,7 +401,17 @@ fn test_tone_child() {
         &options,
     )
     .unwrap();
-    assert_eq!(files.len(), 6);
+    // A whole wide lane writes its channels and, last, the L/R file.
+    assert_eq!(files.len(), 7);
+    assert!(
+        files[6]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("-Stereo.wav"),
+        "the whole lane's last file is its stereo pair: {:?}",
+        files[6]
+    );
     let captured = track.snapshot_range(visible.clone()).unwrap();
     for (channel, (file, label)) in files.iter().zip(&group.labels).enumerate() {
         assert!(

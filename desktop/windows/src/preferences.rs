@@ -8,8 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{
-    AutoResumeDelay, ChannelExportMode, ChannelRoute, DurationChoice, WavExportProfile,
-    WavSampleFormat,
+    AutoResumeDelay, ChannelRoute, DurationChoice, WavExportProfile, WavSampleFormat,
 };
 
 use crate::controller::{CaptureSource, SourceSettings};
@@ -23,24 +22,26 @@ pub(crate) const DEFAULT_ACCENT: [u8; 3] = [103, 231, 181];
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum WideExportMode {
     #[default]
+    BinauralFiles,
+    BinauralMix,
     MonoFiles,
     Multichannel,
 }
 
 impl WideExportMode {
-    pub(crate) const ALL: [Self; 2] = [Self::MonoFiles, Self::Multichannel];
+    pub(crate) const ALL: [Self; 4] = [
+        Self::BinauralFiles,
+        Self::MonoFiles,
+        Self::Multichannel,
+        Self::BinauralMix,
+    ];
 
     pub(crate) fn preference(self) -> &'static str {
         match self {
+            Self::BinauralFiles => "binaural-files",
+            Self::BinauralMix => "binaural-mix",
             Self::MonoFiles => "mono-files",
             Self::Multichannel => "multichannel",
-        }
-    }
-
-    pub(crate) fn export_mode(self) -> ChannelExportMode {
-        match self {
-            Self::MonoFiles => ChannelExportMode::MonoFiles,
-            Self::Multichannel => ChannelExportMode::Multichannel,
         }
     }
 
@@ -1480,7 +1481,7 @@ mod tests {
         assert_eq!(old.history, DurationChoice::Minutes10);
         assert!(old.wav_force_mono);
         assert_eq!(old.wav_profile.sample_format, WavSampleFormat::Pcm24);
-        assert_eq!(old.wide_export, WideExportMode::MonoFiles);
+        assert_eq!(old.wide_export, WideExportMode::BinauralFiles);
         assert!(old.shown_groups.is_empty());
 
         let groups = SourceGroupChoices::from([
@@ -1533,7 +1534,7 @@ mod tests {
         preferences.save(Key::WideExport, "future-mode").unwrap();
         preferences.save(Key::ShownGroups, "{invalid json").unwrap();
         let loaded = preferences.load();
-        assert_eq!(loaded.wide_export, WideExportMode::MonoFiles);
+        assert_eq!(loaded.wide_export, WideExportMode::BinauralFiles);
         assert!(loaded.shown_groups.is_empty());
         assert_eq!(
             preferences.read(Key::WideExport).as_deref(),
@@ -1542,14 +1543,6 @@ mod tests {
         assert_eq!(
             preferences.read(Key::ShownGroups).as_deref(),
             Some("{invalid json")
-        );
-        assert_eq!(
-            WideExportMode::MonoFiles.export_mode(),
-            ChannelExportMode::MonoFiles
-        );
-        assert_eq!(
-            WideExportMode::Multichannel.export_mode(),
-            ChannelExportMode::Multichannel
         );
     }
 

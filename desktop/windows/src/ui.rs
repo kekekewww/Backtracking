@@ -8579,7 +8579,7 @@ mod tests {
             &selected,
             &[vec![groups[0][1].clone(), groups[0][0].clone()], Vec::new()],
             Fades::NONE,
-            Default::default(),
+            crate::preferences::WideExportMode::MonoFiles,
         );
         let names: Vec<_> = files.iter().map(|file| file.name.as_str()).collect();
         assert_eq!(names.len(), 3, "{names:?}");
@@ -8758,7 +8758,7 @@ mod tests {
             &selected,
             &[vec![bed_group()], Vec::new()],
             fades,
-            Default::default(),
+            crate::preferences::WideExportMode::MonoFiles,
         );
         assert_eq!(files.len(), 3);
         for (file, level) in files.iter().zip([0.03, 0.04, 0.05]) {
@@ -8828,7 +8828,7 @@ mod tests {
             "Backtracking-drag-row-{}-{nonce}",
             std::process::id()
         ));
-        let clip = WavClip::new(
+        let mut clip = WavClip::new(
             Arc::clone(&pair),
             &[0, 1],
             None,
@@ -8838,6 +8838,8 @@ mod tests {
             None,
         )
         .unwrap();
+        // This test reads the row's own samples, so it asks for mono files.
+        clip.export_options.wide_mode = crate::preferences::WideExportMode::MonoFiles;
         let files = clip
             .with_rows(&rows, &groups)
             .unwrap()
@@ -9041,6 +9043,7 @@ mod tests {
             )
             .unwrap();
             clip.export_options.groups = [Some(bed.clone()), None];
+            clip.export_options.wide_mode = crate::preferences::WideExportMode::MonoFiles;
             let files = clip.write(false).unwrap();
             files
                 .paths
@@ -9049,9 +9052,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         // A selection of A covers all twelve of its rows: one file per channel, after A's
-        // source and letter, then the channel.
+        // source and letter, then the channel; and last the lane's L/R file.
         let a = file_names(Some(0));
-        assert_eq!(a.len(), 12, "{a:?}");
+        assert_eq!(a.len(), 13, "{a:?}");
+        assert!(a[12].ends_with("-Stereo.wav"), "{a:?}");
         for ((name, label), channel) in a.iter().zip(labels).zip(1..) {
             assert!(name.starts_with("Backtracking_Test tone_A_2"), "{name}");
             assert!(
@@ -9067,7 +9071,7 @@ mod tests {
             "{b:?}"
         );
         // Together, both lanes are written.
-        assert_eq!(file_names(None).len(), 13);
+        assert_eq!(file_names(None).len(), 14);
         std::fs::remove_dir_all(folder).unwrap();
     }
 }

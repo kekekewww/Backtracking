@@ -23,16 +23,33 @@ impl Preview {
         force_mono: bool,
         fades: Fades,
     ) -> Option<Self> {
+        Self::with_positions(lanes, frames, model, force_mono, fades, &[None, None])
+    }
+
+    /// Each group is the group being auditioned. Frozen tracks use lane-native indices.
+    pub fn with_positions(
+        lanes: &[PreviewLane<'_>],
+        frames: Range<u64>,
+        model: Option<Arc<HeadModel>>,
+        force_mono: bool,
+        fades: Fades,
+        positions: &[Option<&crate::FrozenPositionTrack>; 2],
+    ) -> Option<Self> {
         if lanes.is_empty() || lanes.len() > 2 {
             return None;
         }
         let mut sources = Vec::new();
         let mut wide = Vec::new();
-        for lane in lanes {
+        for (lane_index, lane) in lanes.iter().enumerate() {
             let width = lane.track.channels();
             let placement = if width > 2 {
                 let index = wide.len();
-                wide.push(WideLane::new(lane, model.as_ref(), frames.start)?);
+                wide.push(WideLane::new(
+                    lane,
+                    model.as_ref(),
+                    frames.clone(),
+                    positions[lane_index],
+                )?);
                 Placement::Wide(index)
             } else {
                 match lane.selected {
@@ -56,6 +73,34 @@ impl Preview {
     }
 }
 
+impl crate::FrozenPositionTrack {
+    /// Absolute renderer keys, including one neighbor beyond each end for interpolation.
+    pub fn render_keys(&self, channel: usize, frames: Range<u64>) -> Vec<spatial::PositionKey> {
+        if frames.is_empty() {
+            return Vec::new();
+        }
+        let mut keys = self.channel_positions(channel, frames.start..u64::MAX);
+        let count = keys.partition_point(|k| k.frame < frames.end);
+        if count == 0 {
+            return Vec::new();
+        }
+        keys.truncate(count + 1);
+        keys.into_iter()
+            .map(|key| {
+                let p = key.position;
+                spatial::PositionKey {
+                    frame: key.frame,
+                    x: p.x as f32,
+                    y: p.y as f32,
+                    z: p.z as f32,
+                    size: p.size as f32,
+                    gain: p.gain.clamp(0., 4.) as f32,
+                }
+            })
+            .collect()
+    }
+}
+
 enum Render {
     Stereo(Vec<[f32; 2]>),
     Binaural(BinauralRenderer),
@@ -68,7 +113,12 @@ pub(super) struct WideLane {
 }
 
 impl WideLane {
-    fn new(lane: &PreviewLane<'_>, model: Option<&Arc<HeadModel>>, first: u64) -> Option<Self> {
+    fn new(
+        lane: &PreviewLane<'_>,
+        model: Option<&Arc<HeadModel>>,
+        frames: Range<u64>,
+        positions: Option<&crate::FrozenPositionTrack>,
+    ) -> Option<Self> {
         let group = lane.group?;
         let range = group.channels();
         if range.end > lane.track.channels() {
@@ -85,18 +135,46 @@ impl WideLane {
         let selected = lane
             .selected
             .map(|channels| channels.iter().map(|c| c - range.start).collect::<Vec<_>>());
+        let moving = positions.map(|p| {
+            range
+                .clone()
+                .enumerate()
+                .map(|(i, channel)| {
+                    if selected.as_ref().is_none_or(|indices| indices.contains(&i)) {
+                        p.render_keys(channel, frames.clone())
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        let has_positions = moving
+            .as_ref()
+            .is_some_and(|tracks| tracks.iter().any(|keys| !keys.is_empty()));
+        let model = match model {
+            Some(model) => Some(Arc::clone(model)),
+            None if has_positions => Some(Arc::new(HeadModel::new(lane.track.sample_rate()).ok()?)),
+            None => None,
+        };
         let render = if let Some(model) = model {
             if model.sample_rate() != lane.track.sample_rate() {
                 return None;
             }
             let labels: Vec<_> = group.labels.iter().map(String::as_str).collect();
+            let mut tracks = moving.into_iter().flatten();
             let sources: Vec<_> = spatial::speaker_directions(&labels)
                 .into_iter()
-                .map(BinauralSource::Fixed)
+                .map(|direction| {
+                    let keys = tracks.next().unwrap_or_default();
+                    if keys.is_empty() {
+                        BinauralSource::Fixed(direction)
+                    } else {
+                        BinauralSource::Moving(keys)
+                    }
+                })
                 .collect();
             Render::Binaural(
-                BinauralRenderer::new(Arc::clone(model), &sources, selected.as_deref(), first)
-                    .ok()?,
+                BinauralRenderer::new(model, &sources, selected.as_deref(), frames.start).ok()?,
             )
         } else {
             let mut weights = group.weights.to_vec();
@@ -174,6 +252,40 @@ impl WideRender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renderer_keys_keep_both_neighbors_and_bound_gain_before_conversion() {
+        use crate::{Position, PositionKey, PositionTrack};
+        let mut track = PositionTrack::new();
+        for (frame, gain) in [(100, -100.), (200, f64::MAX), (300, 2.)] {
+            track.insert(
+                5,
+                PositionKey {
+                    frame,
+                    position: Position {
+                        x: 0.5,
+                        y: -1.,
+                        z: 0.125,
+                        size: 0.25,
+                        gain,
+                    },
+                },
+            );
+        }
+        let track = track.freeze();
+        let keys = track.render_keys(5, 130..175);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            keys.iter().map(|k| (k.frame, k.gain)).collect::<Vec<_>>(),
+            [(100, 0.), (200, 4.)]
+        );
+        assert_eq!(
+            (keys[1].x, keys[1].y, keys[1].z, keys[1].size),
+            (0.5, -1., 0.125, 0.25)
+        );
+        assert!(track.render_keys(5, 5..100).is_empty());
+        assert!(track.render_keys(4, 100..300).is_empty());
+    }
 
     fn group() -> PairGroup {
         PairGroup::new(1, &["FL".into(), "FR".into(), "FC".into(), "LFE".into()]).unwrap()
