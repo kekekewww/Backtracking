@@ -179,6 +179,29 @@ Each entry in `groups`:
 | `channels` | Channel labels in stream order, up to 24 characters each. A group must have at least one channel. |
 | `positioned` | Optional boolean, default `false`. With `true`, the add-on sends `positions` for this group's channels. |
 
+**Channel labels and where they are heard.** Backtracking shows a label as it is. It also reads
+it as a speaker name, to fold a group down to its L/R rows and to place each channel around the
+listener in binaural preview and export. Case and spaces around the name do not matter.
+
+| Speaker | Labels | Placed at |
+| --- | --- | --- |
+| Front left, right | `FL` `FR`, `L` `R`, `Left` `Right` | 30° left and right (60° when the group also has `FLc` `FRc`) |
+| Front centre | `FC`, `C`, `Center`, `Centre` | straight ahead |
+| Low frequency | `LFE`, `LFE1`, `LFE2` | no place: both ears, quieter |
+| Side surround | `Ls` `Rs`, `Lss` `Rss`, `SL` `SR` | 110° (90° when the group also has a back pair) |
+| Back | `Lb` `Rb`, `Lrs` `Rrs`, `Lsr` `Rsr`, `BL` `BR` | 135° |
+| Wide | `Lw` `Rw` | 60° |
+| Front centre pair | `FLc` `FRc`, `Lc` `Rc` | 30° |
+| Back centre | `BC`, `Cs` | behind |
+| Top front | `TFL` `TFR`, `Ltf` `Rtf`, `Lfh` `Rfh` | 45° to the side, 45° up |
+| Top middle | `Ltm` `Rtm`, `Lts` `Rts`, `TSL` `TSR` | 90° to the side, 60° up |
+| Top back | `TBL` `TBR`, `Ltr` `Rtr`, `Ltb` `Rtb`, `Lrh` `Rrh` | 135° to the side, 45° up |
+
+The 22.2 names of ITU-R BS.2051 system H (`SiL`, `TpFL`, `TpC`, `BtFC` and the others) are known
+as well. A label Backtracking does not know has no place: the channel is heard equally in both
+ears and feeds both L/R rows. Channels of a `positioned` group take their place from `positions`
+instead, whatever their labels.
+
 Settings (capability `settings`): `kind` is `toggle` (boolean), `choice` (one of `options`, a
 string), `number` (with `min` ≤ `default` ≤ `max` and a `step` above zero, which is how far one
 click moves the value) or `text` (up to 200 characters). `key` is 1 to 40 characters of lower-case

@@ -17,17 +17,14 @@ pub struct Direction {
 /// `FL`/`FR` are at 60 degrees when both front-centre speakers are present.
 /// Windows' additional `TC`, `TFC`, and `TBC` names use 90, 45, and 45 degree elevation.
 pub fn speaker_directions(labels: &[&str]) -> Vec<Option<Direction>> {
-    let has = |name| labels.iter().any(|label| label.eq_ignore_ascii_case(name));
-    let front = if has("FLc") && has("FRc") { 60.0 } else { 30.0 };
-    let surround = if (has("Lb") && has("Rb")) || (has("BL") && has("BR")) {
-        90.0
-    } else {
-        110.0
-    };
-    labels
+    let names: Vec<String> = labels.iter().map(|label| canonical(label)).collect();
+    let has = |name: &str| names.iter().any(|label| label == name);
+    let front = if has("flc") && has("frc") { 60.0 } else { 30.0 };
+    let surround = if has("lb") && has("rb") { 90.0 } else { 110.0 };
+    names
         .iter()
         .map(|label| {
-            let (azimuth, elevation) = match label.to_ascii_lowercase().as_str() {
+            let (azimuth, elevation) = match label.as_str() {
                 "fl" => (-front, 0.0),
                 "fr" => (front, 0.0),
                 "flc" => (-30.0, 0.0),
@@ -69,6 +66,34 @@ pub fn speaker_directions(labels: &[&str]) -> Vec<Option<Direction>> {
         .collect()
 }
 
+/// The name this module knows a speaker by: lower case, with the other common spellings of
+/// the same speaker folded onto one. `L`, `R`, `C` are the fronts; `Lrs`/`Rrs` (and `BL`/`BR`,
+/// `Lsr`/`Rsr`) the back pair; `Lss`/`Rss` (and `SL`/`SR`) the side surrounds; `Lc`/`Rc` the
+/// front-centre pair; `Cs` the back centre; the height spellings map onto the top speakers.
+fn canonical(label: &str) -> String {
+    let lower = label.trim().to_ascii_lowercase();
+    let known = match lower.as_str() {
+        "l" | "left" => "fl",
+        "r" | "right" => "fr",
+        "c" | "center" | "centre" => "fc",
+        "lc" => "flc",
+        "rc" => "frc",
+        "lss" | "sl" => "ls",
+        "rss" | "sr" => "rs",
+        "lrs" | "lsr" | "bl" => "lb",
+        "rrs" | "rsr" | "br" => "rb",
+        "cs" => "bc",
+        "lfh" | "ltf" => "tfl",
+        "rfh" | "rtf" => "tfr",
+        "lts" | "tsl" => "ltm",
+        "rts" | "tsr" => "rtm",
+        "lrh" | "ltb" | "ltr" => "tbl",
+        "rrh" | "rtb" | "rtr" => "tbr",
+        _ => return lower,
+    };
+    known.to_owned()
+}
+
 pub(crate) fn is_lfe(label: &str) -> bool {
     ["LFE", "LFE1", "LFE2"]
         .iter()
@@ -90,7 +115,7 @@ pub fn stereo_weights(labels: &[&str]) -> Vec<[f32; 2]> {
             if is_lfe(label) {
                 return [0.5, 0.5];
             }
-            match label.to_ascii_lowercase().as_str() {
+            match canonical(label).as_str() {
                 "fl" => [1.0, 0.0],
                 "fr" => [0.0, 1.0],
                 "ls" | "lb" | "bl" | "lw" | "flc" | "sil" | "tfl" | "ltf" | "ltm" | "tbl"

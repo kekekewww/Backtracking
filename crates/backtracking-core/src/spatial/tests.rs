@@ -540,3 +540,53 @@ fn orbit_has_bounded_changes_in_interaural_level() {
         assert!(largest < bound, "maximum ILD step {largest} dB");
     }
 }
+
+#[test]
+fn common_spellings_of_a_speaker_resolve_to_the_same_place() {
+    // The names the example add-on uses for 7.1.4, beside the names of S5.
+    let dolby = [
+        "L", "R", "C", "LFE", "Lss", "Rss", "Lrs", "Rrs", "Ltf", "Rtf", "Ltr", "Rtr",
+    ];
+    let plain = [
+        "FL", "FR", "FC", "LFE", "Ls", "Rs", "Lb", "Rb", "TFL", "TFR", "TBL", "TBR",
+    ];
+    assert_eq!(speaker_directions(&dolby), speaker_directions(&plain));
+    assert_eq!(stereo_weights(&dolby), stereo_weights(&plain));
+    let directions = speaker_directions(&dolby);
+    assert_eq!(directions[0].unwrap().azimuth, -30.0);
+    assert_eq!(directions[1].unwrap().azimuth, 30.0);
+    assert_eq!(directions[2].unwrap().azimuth, 0.0);
+    assert!(directions[3].is_none(), "LFE has no direction");
+    // With a back pair present the side surrounds sit at 90 degrees, however it is spelled.
+    assert_eq!(directions[4].unwrap().azimuth, -90.0);
+    assert_eq!(directions[6].unwrap().azimuth, -135.0);
+    assert_eq!(
+        speaker_directions(&["L", "R", "Ls", "Rs"])[2].unwrap().azimuth,
+        -110.0
+    );
+    // Other spellings of the same speakers, in any case and with stray spaces.
+    for (a, b) in [
+        ("left", "FL"),
+        (" Right ", "FR"),
+        ("Centre", "FC"),
+        ("SL", "Ls"),
+        ("BR", "Rb"),
+        ("Rsr", "Rb"),
+        ("Lc", "FLc"),
+        ("Cs", "BC"),
+        ("Lfh", "TFL"),
+        ("Rrh", "TBR"),
+        ("Lts", "Ltm"),
+    ] {
+        assert_eq!(
+            speaker_directions(&[a]),
+            speaker_directions(&[b]),
+            "{a} and {b}"
+        );
+        assert_eq!(stereo_weights(&[a]), stereo_weights(&[b]), "{a} and {b}");
+    }
+    // Front left and right fold to their own side only.
+    assert_eq!(stereo_weights(&["L", "R"]), [[1.0, 0.0], [0.0, 1.0]]);
+    // A name nobody knows still has no direction and feeds both sides.
+    assert_eq!(speaker_directions(&["Object 1"]), [None]);
+}
