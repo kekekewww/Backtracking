@@ -1,0 +1,13 @@
+{
+  "contract": 1,
+  "id": "com.example.test-tone",
+  "name": "Test tone",
+  "version": "0.1.0",
+  "author": "Backtracking contributors",
+  "description": "Plays a different sine wave on each channel in Stereo, 5.1 or 7.1.4.",
+  "license": "Apache-2.0",
+  "capabilities": ["source", "settings", "actions"],
+  "run": {
+    "windows-x86_64": { "program": "bin/test-tone.exe", "args": [] }
+  }
+}

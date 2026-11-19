@@ -1,10 +1,18 @@
-use std::{collections::VecDeque, ops::Range, sync::Arc};
+use std::{
+    collections::VecDeque,
+    ops::{Deref, DerefMut, Range},
+    sync::{Arc, Mutex, OnceLock},
+};
 
-use super::{CaptureError, MAX_BUFFER_SAMPLES};
+use super::CaptureError;
 use crate::waveform::WaveformView;
+
+#[cfg(test)]
+mod cache_tests;
 
 const BASE_SECONDS: usize = 60;
 pub(super) const PEAK_FRAMES: usize = 128;
+const CHANNEL_PEAK_FRAMES: usize = 16;
 const TRACES: usize = 7;
 
 #[derive(Clone, Copy)]
@@ -49,6 +57,28 @@ pub(super) struct Layout {
 }
 
 impl Layout {
+    fn extra_channels(self) -> usize {
+        self.a_channels.saturating_sub(2) + (self.channels - self.a_channels).saturating_sub(2)
+    }
+
+    /// The first two channels of each lane already have left/right peak traces.
+    fn channel_trace(self, channel: usize) -> Result<usize, usize> {
+        let (lane, local, preceding) = if channel < self.a_channels {
+            (0, channel, 0)
+        } else {
+            (
+                1,
+                channel - self.a_channels,
+                self.a_channels.saturating_sub(2),
+            )
+        };
+        if local < 2 {
+            Ok(2 + lane * 3 + local)
+        } else {
+            Err(preceding + local - 2)
+        }
+    }
+
     /// The waveform trace of one lane's view. Trace zero spans every channel.
     pub(super) fn trace(lane: usize, view: WaveformView) -> usize {
         1 + lane * 3 + view as usize
@@ -64,19 +94,106 @@ impl Layout {
     }
 }
 
+#[derive(Default)]
+struct ChannelBlocks {
+    fine: Vec<Bounds>,
+    coarse: Vec<Bounds>,
+}
+
+type ChannelPeaks = Arc<OnceLock<Box<[Mutex<ChannelBlocks>]>>>;
+
+struct WidePeaks {
+    traces: Vec<[Bounds; TRACES]>,
+    capacity_frames: usize,
+    // Prefix copies share this even before its first read. Only complete blocks
+    // are stored, so appending can extend it without changing a frozen prefix.
+    channels: ChannelPeaks,
+}
+
+// Vec's unused capacity values let this enum fit in the original Vec's space.
+// Mono/stereo lanes keep the original allocation and peak-building path.
+enum PagePeaks {
+    Traces(Vec<[Bounds; TRACES]>),
+    Wide(Box<WidePeaks>),
+}
+
+impl Deref for PagePeaks {
+    type Target = Vec<[Bounds; TRACES]>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Traces(traces) => traces,
+            Self::Wide(wide) => &wide.traces,
+        }
+    }
+}
+
+impl DerefMut for PagePeaks {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Traces(traces) => traces,
+            Self::Wide(wide) => &mut wide.traces,
+        }
+    }
+}
+
+impl PagePeaks {
+    fn new(traces: Vec<[Bounds; TRACES]>, layout: Layout, capacity_frames: usize) -> Self {
+        if layout.extra_channels() == 0 {
+            Self::Traces(traces)
+        } else {
+            Self::Wide(Box::new(WidePeaks {
+                traces,
+                capacity_frames,
+                channels: Arc::new(OnceLock::new()),
+            }))
+        }
+    }
+
+    fn prefix(&self, blocks: usize) -> Self {
+        let traces = self[..blocks].to_vec();
+        match self {
+            Self::Traces(_) => Self::Traces(traces),
+            Self::Wide(wide) => Self::Wide(Box::new(WidePeaks {
+                traces,
+                capacity_frames: wide.capacity_frames,
+                channels: Arc::clone(&wide.channels),
+            })),
+        }
+    }
+
+    /// Samples are about to change. Keep frozen caches intact, and reuse the
+    /// allocated vectors when no frozen prefix still shares them.
+    fn invalidate_channels(&mut self) {
+        if let Self::Wide(wide) = self {
+            if let Some(cache) = Arc::get_mut(&mut wide.channels) {
+                if let Some(channels) = cache.get_mut() {
+                    for channel in channels {
+                        let blocks = channel.get_mut().unwrap_or_else(|error| error.into_inner());
+                        blocks.fine.clear();
+                        blocks.coarse.clear();
+                    }
+                }
+            } else {
+                wide.channels = Arc::new(OnceLock::new());
+            }
+        }
+    }
+}
+
 /// Up to one second of interleaved audio and its peak cache.
 pub(super) struct Page {
     first_frame: u64,
     samples: Vec<f32>,
-    peaks: Vec<[Bounds; TRACES]>,
+    peaks: PagePeaks,
 }
 
 impl Page {
-    fn new(page_frames: usize, channels: usize) -> Result<Self, CaptureError> {
+    fn new(page_frames: usize, layout: Layout) -> Result<Self, CaptureError> {
         let mut samples = Vec::new();
         let mut peaks = Vec::new();
         samples
-            .try_reserve_exact(page_frames * channels)
+            .try_reserve_exact(page_frames * layout.channels)
             .map_err(|_| CaptureError::AllocationFailed)?;
         peaks
             .try_reserve_exact(page_frames / PEAK_FRAMES)
@@ -84,13 +201,17 @@ impl Page {
         Ok(Self {
             first_frame: 0,
             samples,
-            peaks,
+            peaks: PagePeaks::new(peaks, layout, page_frames),
         })
     }
 
     /// A page sized for exactly `samples`, with its peak cache filled in.
-    fn from_samples(first_frame: u64, samples: &[f32], layout: Layout) -> Result<Self, CaptureError> {
-        let mut page = Self::new(samples.len() / layout.channels, layout.channels)?;
+    fn from_samples(
+        first_frame: u64,
+        samples: &[f32],
+        layout: Layout,
+    ) -> Result<Self, CaptureError> {
+        let mut page = Self::new(samples.len() / layout.channels, layout)?;
         page.first_frame = first_frame;
         page.samples.extend_from_slice(samples);
         for block in 0..page.frames(layout.channels) / PEAK_FRAMES {
@@ -101,12 +222,14 @@ impl Page {
     }
 
     fn reset(&mut self, first_frame: u64) {
+        self.peaks.invalidate_channels();
         self.first_frame = first_frame;
         self.samples.clear();
         self.peaks.clear();
     }
 
-    /// Both pages were reserved for the same layout, so this does not allocate.
+    /// Sample and trace buffers have room for the same layout. A channel cache
+    /// still shared with a frozen prefix is detached by reset.
     fn copy_from(&mut self, page: &Self) {
         self.reset(page.first_frame);
         self.samples.extend_from_slice(&page.samples);
@@ -118,7 +241,7 @@ impl Page {
         Self {
             first_frame: self.first_frame,
             samples: self.samples[..frames * channels].to_vec(),
-            peaks: self.peaks[..frames / PEAK_FRAMES].to_vec(),
+            peaks: self.peaks.prefix(frames / PEAK_FRAMES),
         }
     }
 
@@ -196,6 +319,114 @@ impl Page {
             bounds.add(view.sample(&frame[track.clone()]));
         }
     }
+
+    fn scan_channel(
+        &self,
+        channels: usize,
+        channel: usize,
+        frames: Range<usize>,
+        bounds: &mut Bounds,
+    ) {
+        for frame in self.samples(frames, channels).chunks_exact(channels) {
+            bounds.add(frame[channel]);
+        }
+    }
+
+    fn channel_extrema(
+        &self,
+        layout: Layout,
+        channel: usize,
+        frames: Range<usize>,
+        bounds: &mut Bounds,
+    ) {
+        let cache_channel = match layout.channel_trace(channel) {
+            Ok(trace) => {
+                self.extrema(layout, trace, frames, bounds);
+                return;
+            }
+            Err(channel) => channel,
+        };
+        // Fine blocks limit expensive strided edge reads to 30 samples per bin.
+        // Coarse blocks keep long ranges from visiting every fine block.
+        let first_block = frames.start.div_ceil(CHANNEL_PEAK_FRAMES);
+        let last_block = frames.end / CHANNEL_PEAK_FRAMES;
+        if first_block >= last_block {
+            self.scan_channel(layout.channels, channel, frames, bounds);
+            return;
+        }
+        let PagePeaks::Wide(wide) = &self.peaks else {
+            unreachable!("extra channels have a wide cache");
+        };
+        let channels = wide.channels.get_or_init(|| {
+            (0..layout.extra_channels())
+                .map(|_| Mutex::new(ChannelBlocks::default()))
+                .collect()
+        });
+        let mut peaks = channels[cache_channel]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let complete_blocks = self.frames(layout.channels) / CHANNEL_PEAK_FRAMES;
+        if peaks.fine.len() < complete_blocks {
+            // Reserve once per requested channel/page. Reads, never appends,
+            // build the blocks that have arrived since the last read.
+            if peaks.fine.capacity() == 0 {
+                peaks
+                    .fine
+                    .reserve_exact(wide.capacity_frames / CHANNEL_PEAK_FRAMES);
+                peaks
+                    .coarse
+                    .reserve_exact(wide.capacity_frames / PEAK_FRAMES);
+            }
+            for block in peaks.fine.len()..complete_blocks {
+                let mut peak = Bounds::EMPTY;
+                self.scan_channel(
+                    layout.channels,
+                    channel,
+                    block * CHANNEL_PEAK_FRAMES..(block + 1) * CHANNEL_PEAK_FRAMES,
+                    &mut peak,
+                );
+                peaks.fine.push(peak);
+            }
+            let ratio = PEAK_FRAMES / CHANNEL_PEAK_FRAMES;
+            for block in peaks.coarse.len()..complete_blocks / ratio {
+                let mut peak = Bounds::EMPTY;
+                for &fine in &peaks.fine[block * ratio..(block + 1) * ratio] {
+                    peak.combine(fine);
+                }
+                peaks.coarse.push(peak);
+            }
+        }
+        self.scan_channel(
+            layout.channels,
+            channel,
+            frames.start..first_block * CHANNEL_PEAK_FRAMES,
+            bounds,
+        );
+        let ratio = PEAK_FRAMES / CHANNEL_PEAK_FRAMES;
+        let first_coarse = first_block.div_ceil(ratio);
+        let last_coarse = last_block / ratio;
+        if first_coarse < last_coarse {
+            for &peak in &peaks.fine[first_block..first_coarse * ratio] {
+                bounds.combine(peak);
+            }
+            for &peak in &peaks.coarse[first_coarse..last_coarse] {
+                bounds.combine(peak);
+            }
+            for &peak in &peaks.fine[last_coarse * ratio..last_block] {
+                bounds.combine(peak);
+            }
+        } else {
+            for &peak in &peaks.fine[first_block..last_block] {
+                bounds.combine(peak);
+            }
+        }
+        self.scan_channel(
+            layout.channels,
+            channel,
+            last_block * CHANNEL_PEAK_FRAMES..frames.end,
+            bounds,
+        );
+    }
 }
 
 /// Pairs each page with the frames of `range` it holds.
@@ -219,6 +450,20 @@ pub(super) fn extrema<'a>(
     bounds.result()
 }
 
+/// Reads one channel, using shared page peaks for complete blocks and samples at
+/// the edges. Extra channel peaks are built lazily, outside the capture path.
+pub(super) fn channel_extrema<'a>(
+    pages: impl Iterator<Item = (&'a Page, Range<usize>)>,
+    layout: Layout,
+    channel: usize,
+) -> (f32, f32) {
+    let mut bounds = Bounds::EMPTY;
+    for (page, frames) in pages {
+        page.channel_extrema(layout, channel, frames, &mut bounds);
+    }
+    bounds.result()
+}
+
 /// Splits `interleaved` into pages of their own, for audio that never was in a history.
 pub(super) fn pages_from_interleaved(
     first_frame: u64,
@@ -227,7 +472,11 @@ pub(super) fn pages_from_interleaved(
 ) -> Result<Arc<[Arc<Page>]>, CaptureError> {
     let mut pages = Vec::new();
     pages
-        .try_reserve_exact(interleaved.len().div_ceil(layout.page_frames * layout.channels))
+        .try_reserve_exact(
+            interleaved
+                .len()
+                .div_ceil(layout.page_frames * layout.channels),
+        )
         .map_err(|_| CaptureError::AllocationFailed)?;
     for (index, samples) in interleaved
         .chunks(layout.page_frames * layout.channels)
@@ -267,6 +516,7 @@ pub(super) struct History {
     /// The page being written. It follows the sealed pages and is never shared.
     open: Option<Page>,
     free: Vec<Page>,
+    base_pages: usize,
     layout: Layout,
     start: u64,
     end: u64,
@@ -277,24 +527,27 @@ impl History {
         page_frames: usize,
         channels: usize,
         a_channels: usize,
+        budget_frames: usize,
     ) -> Result<Self, CaptureError> {
+        let page_frames = page_frames.min(budget_frames);
         page_frames
             .checked_mul(channels)
-            .and_then(|samples| samples.checked_mul(BASE_SECONDS))
-            .filter(|&samples| samples <= MAX_BUFFER_SAMPLES)
             .ok_or(CaptureError::BufferTooLarge)?;
-        let free = (0..BASE_SECONDS)
-            .map(|_| Page::new(page_frames, channels))
+        let base_pages = BASE_SECONDS.min(budget_frames / page_frames);
+        let layout = Layout {
+            page_frames,
+            channels,
+            a_channels,
+        };
+        let free = (0..base_pages)
+            .map(|_| Page::new(page_frames, layout))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             sealed: VecDeque::new(),
             open: None,
             free,
-            layout: Layout {
-                page_frames,
-                channels,
-                a_channels,
-            },
+            base_pages,
+            layout,
             start: 0,
             end: 0,
         })
@@ -307,6 +560,35 @@ impl History {
     #[cfg(test)]
     pub(super) fn allocated_frames(&self) -> usize {
         (self.active_pages() + self.free.len()) * self.layout.page_frames
+    }
+
+    /// Requested allocation bytes, excluding allocator headers and existing traces.
+    #[cfg(test)]
+    pub(super) fn channel_cache_bytes(&self) -> (usize, usize) {
+        let mut metadata = 0;
+        let mut payload = 0;
+        for page in self
+            .sealed
+            .iter()
+            .map(|page| &**page)
+            .chain(self.open.iter())
+            .chain(&self.free)
+        {
+            if let PagePeaks::Wide(wide) = &page.peaks {
+                metadata += std::mem::size_of::<WidePeaks>()
+                    + std::mem::size_of_val(&*wide.channels)
+                    + 2 * std::mem::size_of::<usize>();
+                if let Some(channels) = wide.channels.get() {
+                    metadata += std::mem::size_of_val(&**channels);
+                    for channel in channels {
+                        let blocks = channel.lock().unwrap();
+                        payload += (blocks.fine.capacity() + blocks.coarse.capacity())
+                            * std::mem::size_of::<Bounds>();
+                    }
+                }
+            }
+        }
+        (metadata, payload)
     }
 
     /// The address of every sealed page holding retained audio, oldest first.
@@ -339,7 +621,7 @@ impl History {
     fn spare_page(&mut self) -> Result<Page, CaptureError> {
         match self.free.pop() {
             Some(page) => Ok(page),
-            None => Page::new(self.layout.page_frames, self.layout.channels),
+            None => Page::new(self.layout.page_frames, self.layout),
         }
     }
 
@@ -383,7 +665,8 @@ impl History {
         if gain == 1.0 {
             page.samples.extend_from_slice(frame);
         } else {
-            page.samples.extend(frame.iter().map(|&sample| sample * gain));
+            page.samples
+                .extend(frame.iter().map(|&sample| sample * gain));
         }
         self.end += 1;
         let frames = page.samples.len() / channels;
@@ -406,7 +689,9 @@ impl History {
         frames: u64,
         retained_frames: usize,
     ) -> Result<(), CaptureError> {
-        self.end.checked_add(frames).ok_or(CaptureError::BufferTooLarge)?;
+        self.end
+            .checked_add(frames)
+            .ok_or(CaptureError::BufferTooLarge)?;
         let skipped = frames.saturating_sub(retained_frames as u64);
         if skipped != 0 {
             // The retained zero suffix will immediately reuse these pages;
@@ -430,7 +715,8 @@ impl History {
             let page = self.open.as_mut().expect("capacity was reserved");
             let previous_frames = page.samples.len() / channels;
             let count = remaining.min((page_frames - previous_frames) as u64) as usize;
-            page.samples.resize((previous_frames + count) * channels, 0.0);
+            page.samples
+                .resize((previous_frames + count) * channels, 0.0);
             let completed_blocks = (previous_frames + count) / PEAK_FRAMES;
             while page.peaks.len() < completed_blocks {
                 let block = page.peaks.len();
@@ -473,7 +759,7 @@ impl History {
         // The oldest active page can be partly retained. Only free whole unused pages.
         let target = retained_frames
             .div_ceil(self.layout.page_frames)
-            .max(BASE_SECONDS);
+            .max(self.base_pages);
         self.free
             .truncate(target.saturating_sub(self.active_pages()));
     }
@@ -486,7 +772,11 @@ impl History {
 
     /// The sealed pages holding part of `range`, and whether the open page holds the rest.
     fn page_indices(&self, range: &Range<u64>) -> (Range<usize>, bool) {
-        let first = self.sealed.front().map(|page| &**page).or(self.open.as_ref());
+        let first = self
+            .sealed
+            .front()
+            .map(|page| &**page)
+            .or(self.open.as_ref());
         let Some(first) = first else {
             return (0..0, false);
         };
@@ -550,6 +840,7 @@ impl History {
             .range_mut(sealed)
             .map(|page| Arc::get_mut(page).expect("the faded pages are not shared"));
         for page in sealed.chain(self.open.as_mut().filter(|_| open)) {
+            page.peaks.invalidate_channels();
             let start = start.saturating_sub(page.first_frame) as usize;
             for (offset, frame) in page
                 .samples
@@ -572,5 +863,9 @@ impl History {
 
     pub(super) fn extrema(&self, trace: usize, range: Range<u64>) -> (f32, f32) {
         extrema(self.pages(range), self.layout, trace)
+    }
+
+    pub(super) fn channel_extrema(&self, channel: usize, range: Range<u64>) -> (f32, f32) {
+        channel_extrema(self.pages(range), self.layout, channel)
     }
 }

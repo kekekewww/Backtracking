@@ -14,20 +14,25 @@ pub mod waveform;
 
 pub use capture::{
     Capture, CaptureError, CaptureState, DurationChoice, FrozenCapture, FrozenTrack, Snapshot,
+    DEFAULT_MAX_BUFFER_SAMPLES,
 };
 pub use export::{
-    export_labelled_tracks, export_routed_tracks_with_fades, export_routed_tracks_with_profile,
-    export_routed_tracks_with_tempo, export_routed_wav_with_profile, export_tracks_with_profile,
-    export_wav, export_wav_with_profile, file_name_source, is_export_file_name, write_wav,
-    write_wav_with_profile, Lane, TakeLabel, TrackAudio, WavExportProfile, WavSampleFormat,
-    SOURCE_NAME_LIMIT,
+    export_channel_range_with_profile, export_labelled_tracks, export_routed_tracks_with_fades,
+    export_routed_tracks_with_profile, export_routed_tracks_with_tempo,
+    export_routed_wav_with_profile, export_tracks_with_profile, export_wav,
+    export_wav_with_profile, file_name_source, is_export_file_name, write_wav,
+    write_wav_with_profile, ChannelExportMode, Lane, TakeLabel, TrackAudio, WavExportProfile,
+    WavSampleFormat, SOURCE_NAME_LIMIT,
 };
 pub use fade::{dragged_fades, fade_waveform_bins, FadeEnd, Fades};
 pub use meter::MeterReadings;
 pub use preview::{Preview, PreviewGate, PreviewSlot, SlotRender};
 pub use queue::{AudioQueue, TimedAudioQueue, TimedPacket};
-pub use sender::{capture_clock_ns, discover_senders, discover_snapshot_targets, new_sender_id, request_sender_snapshot, SenderEndpoint, SenderInfo, SenderPacket, SenderReceiver};
-pub use synchronized::{ChannelRoute, SynchronizedCapture};
+pub use sender::{
+    capture_clock_ns, discover_senders, discover_snapshot_targets, new_sender_id,
+    request_sender_snapshot, SenderEndpoint, SenderInfo, SenderPacket, SenderReceiver,
+};
+pub use synchronized::{ChannelRoute, ChannelRouting, SynchronizedCapture};
 pub use waveform::WaveformView;
 
 use std::time::Duration;
@@ -86,7 +91,10 @@ mod tests {
     #[test]
     fn auto_resume_off_is_stored_as_zero_and_never_resumes() {
         for choice in AutoResumeDelay::ALL {
-            assert_eq!(AutoResumeDelay::from_seconds(choice.seconds()), Some(choice));
+            assert_eq!(
+                AutoResumeDelay::from_seconds(choice.seconds()),
+                Some(choice)
+            );
         }
         assert_eq!(AutoResumeDelay::from_seconds(0), Some(AutoResumeDelay::Off));
         assert_eq!(AutoResumeDelay::Off.seconds(), 0);
@@ -94,10 +102,16 @@ mod tests {
         assert_eq!(AutoResumeDelay::default(), AutoResumeDelay::Seconds10);
 
         assert_eq!(AutoResumeDelay::Off.delay(), None);
-        assert_eq!(AutoResumeDelay::Off.remaining(Duration::from_secs(3_600)), None);
+        assert_eq!(
+            AutoResumeDelay::Off.remaining(Duration::from_secs(3_600)),
+            None
+        );
         let ten = AutoResumeDelay::Seconds10;
         assert_eq!(ten.delay(), Some(Duration::from_secs(10)));
-        assert_eq!(ten.remaining(Duration::from_secs(3)), Some(Duration::from_secs(7)));
+        assert_eq!(
+            ten.remaining(Duration::from_secs(3)),
+            Some(Duration::from_secs(7))
+        );
         assert_eq!(ten.remaining(Duration::from_secs(10)), Some(Duration::ZERO));
         assert_eq!(ten.remaining(Duration::from_secs(60)), Some(Duration::ZERO));
     }

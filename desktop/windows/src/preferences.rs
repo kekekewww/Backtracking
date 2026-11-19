@@ -1,20 +1,56 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{
-    AutoResumeDelay, ChannelRoute, DurationChoice, WavExportProfile, WavSampleFormat,
+    AutoResumeDelay, ChannelExportMode, ChannelRoute, DurationChoice, WavExportProfile,
+    WavSampleFormat,
 };
 
 use crate::controller::{CaptureSource, SourceSettings};
+use crate::data_paths::DataPaths;
 
 const MAX_VALUE_BYTES: u64 = 128 * 1024;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 pub(crate) const DEFAULT_ACCENT: [u8; 3] = [103, 231, 181];
+
+/// Export choice for lanes wider than stereo. Existing mono/stereo choices are separate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WideExportMode {
+    #[default]
+    MonoFiles,
+    Multichannel,
+}
+
+impl WideExportMode {
+    pub(crate) const ALL: [Self; 2] = [Self::MonoFiles, Self::Multichannel];
+
+    pub(crate) fn preference(self) -> &'static str {
+        match self {
+            Self::MonoFiles => "mono-files",
+            Self::Multichannel => "multichannel",
+        }
+    }
+
+    pub(crate) fn export_mode(self) -> ChannelExportMode {
+        match self {
+            Self::MonoFiles => ChannelExportMode::MonoFiles,
+            Self::Multichannel => ChannelExportMode::Multichannel,
+        }
+    }
+
+    fn from_preference(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.preference() == text)
+    }
+}
+
+/// Source identity to the channel group last selected for that source.
+pub(crate) type SourceGroupChoices = BTreeMap<String, String>;
 
 /// When the capture status mark is shown: the light in the toolbar and the mark on a bare
 /// waveform.
@@ -87,6 +123,8 @@ pub(crate) enum Key {
     WavSampleRate,
     WavSampleFormat,
     WavForceMono,
+    WideExport,
+    ShownGroups,
     Output,
     OutputCleanup,
     SavedSnapshots,
@@ -123,6 +161,8 @@ impl Key {
             Self::WavSampleRate => "wav-sample-rate",
             Self::WavSampleFormat => "wav-sample-format",
             Self::WavForceMono => "wav-force-mono",
+            Self::WideExport => "wide-lane-export-v1",
+            Self::ShownGroups => "shown-channel-groups-v1",
             Self::Output => "output-folder",
             // Absent or 0 keeps every file.
             Self::OutputCleanup => "output-folder-cleanup-days",
@@ -159,6 +199,8 @@ pub(crate) struct Settings {
     pub(crate) source_names: SourceNames,
     pub(crate) wav_profile: WavExportProfile,
     pub(crate) wav_force_mono: bool,
+    pub(crate) wide_export: WideExportMode,
+    pub(crate) shown_groups: SourceGroupChoices,
     pub(crate) output: PathBuf,
     /// Days after which old exports in `output` are deleted; `None` keeps them.
     pub(crate) output_cleanup: Option<u16>,
@@ -204,6 +246,8 @@ impl Default for Settings {
             source_names: SourceNames::default(),
             wav_profile: WavExportProfile::default(),
             wav_force_mono: false,
+            wide_export: WideExportMode::default(),
+            shown_groups: SourceGroupChoices::new(),
             output: directory.join("output"),
             output_cleanup: None,
             saved_output: directory.join("saved"),
@@ -232,13 +276,19 @@ pub(crate) struct Preferences {
 
 impl Preferences {
     pub(crate) fn for_current_user() -> Self {
-        let directory = ["LOCALAPPDATA", "APPDATA"]
-            .into_iter()
-            .filter_map(std::env::var_os)
-            .map(PathBuf::from)
-            .find(|path| path.is_absolute())
-            .map(|path| path.join("Backtracking").join("Settings"));
+        let directory = DataPaths::for_current_user()
+            .ok()
+            .map(|paths| paths.settings());
         Self { directory }
+    }
+
+    /// Use the same injected app data root as the add-on manager and capture sources.
+    pub(crate) fn in_data_root(root: impl AsRef<Path>) -> Self {
+        Self {
+            directory: DataPaths::new(root.as_ref().to_path_buf())
+                .ok()
+                .map(|paths| paths.settings()),
+        }
     }
 
     pub(crate) fn load(&self) -> Settings {
@@ -286,6 +336,12 @@ impl Preferences {
                 _ => WavSampleFormat::Float32,
             };
         settings.wav_force_mono = self.read_number::<u8>(Key::WavForceMono) == Some(1);
+        settings.wide_export = self
+            .read(Key::WideExport)
+            .as_deref()
+            .and_then(|value| WideExportMode::from_preference(value.trim()))
+            .unwrap_or_default();
+        settings.shown_groups = self.load_shown_groups();
         if let Some(path) = self.read_absolute_path(Key::Output) {
             settings.output = path;
         }
@@ -327,9 +383,9 @@ impl Preferences {
         if let Some(interval @ (1 | 5 | 10)) = self.read_number(Key::SecondsInterval) {
             settings.second_interval = interval;
         }
-        settings.snapshot_target = self.read(Key::SnapshotTarget).filter(|id| {
-            !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control)
-        });
+        settings.snapshot_target = self
+            .read(Key::SnapshotTarget)
+            .filter(|id| !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control));
         settings.window_position = self.read(Key::WindowPosition).and_then(|value| {
             let mut parts = value.split_whitespace();
             let x = parts.next()?.parse().ok()?;
@@ -337,6 +393,13 @@ impl Preferences {
             parts.next().is_none().then_some([x, y])
         });
         settings
+    }
+
+    pub(crate) fn load_shown_groups(&self) -> SourceGroupChoices {
+        self.read(Key::ShownGroups)
+            .as_deref()
+            .and_then(parse_shown_groups)
+            .unwrap_or_default()
     }
 
     fn read_number<T: std::str::FromStr>(&self, key: Key) -> Option<T> {
@@ -376,7 +439,10 @@ impl Preferences {
 
     pub(crate) fn save(&self, key: Key, value: &str) -> io::Result<()> {
         self.validate_save(value)?;
-        let directory = self.directory.as_ref().expect("validated preferences directory");
+        let directory = self
+            .directory
+            .as_ref()
+            .expect("validated preferences directory");
         fs::create_dir_all(directory)?;
         let target = directory.join(key.filename());
         // Only replace this preference, leaving concurrent changes to the others intact.
@@ -495,11 +561,14 @@ impl PreferenceWriter {
     /// remain available for a later flush retry; newer values replace them.
     pub(crate) fn flush(&self) -> io::Result<()> {
         let (reply, result) = mpsc::sync_channel(1);
-        self.commands.send(PreferenceCommand::Flush(reply)).map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "settings worker is closed")
-        })?;
+        self.commands
+            .send(PreferenceCommand::Flush(reply))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "settings worker is closed"))?;
         result.recv().map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "settings worker stopped before flushing")
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "settings worker stopped before flushing",
+            )
         })?
     }
 
@@ -511,7 +580,9 @@ impl PreferenceWriter {
         let mut failed: Vec<FailedPreference> = Vec::new();
         loop {
             let Ok(first) = requests.recv() else {
-                return failed.first().map_or(Ok(()), |failure| Err(failure.error()));
+                return failed
+                    .first()
+                    .map_or(Ok(()), |failure| Err(failure.error()));
             };
             let mut pending = Vec::new();
             let mut flush = None;
@@ -520,9 +591,13 @@ impl PreferenceWriter {
             let deadline = Instant::now() + PREFERENCE_COALESCE_WINDOW;
             while flush.is_none() && !shutdown {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() { break; }
+                if remaining.is_zero() {
+                    break;
+                }
                 match requests.recv_timeout(remaining) {
-                    Ok(command) => absorb_preference(command, &mut pending, &mut flush, &mut shutdown),
+                    Ok(command) => {
+                        absorb_preference(command, &mut pending, &mut flush, &mut shutdown)
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                     Err(mpsc::RecvTimeoutError::Disconnected) => shutdown = true,
                 }
@@ -530,9 +605,13 @@ impl PreferenceWriter {
             // Values already queued while the previous disk write was slow
             // belong to this batch even if a scheduling delay used the window.
             for _ in 0..MAX_QUEUED_PREFERENCE_DRAIN {
-                if flush.is_some() || shutdown { break; }
+                if flush.is_some() || shutdown {
+                    break;
+                }
                 match requests.try_recv() {
-                    Ok(command) => absorb_preference(command, &mut pending, &mut flush, &mut shutdown),
+                    Ok(command) => {
+                        absorb_preference(command, &mut pending, &mut flush, &mut shutdown)
+                    }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => shutdown = true,
                 }
@@ -563,11 +642,15 @@ impl PreferenceWriter {
                 }
             }
             if let Some(reply) = flush {
-                let result = failed.first().map_or(Ok(()), |failure| Err(failure.error()));
+                let result = failed
+                    .first()
+                    .map_or(Ok(()), |failure| Err(failure.error()));
                 let _ = reply.send(result);
             }
             if shutdown {
-                return failed.first().map_or(Ok(()), |failure| Err(failure.error()));
+                return failed
+                    .first()
+                    .map_or(Ok(()), |failure| Err(failure.error()));
             }
         }
     }
@@ -695,7 +778,23 @@ pub(crate) fn serialize_sources(sources: &[Option<SourceSettings>; 2]) -> String
                 format!("{route}\tapp\t{}\t{}", encode_text(path), encode_text(name))
             }
             CaptureSource::Sender { id, name } => {
-                format!("{route}\tsender\t{}\t{}", encode_text(id), encode_text(name))
+                format!(
+                    "{route}\tsender\t{}\t{}",
+                    encode_text(id),
+                    encode_text(name)
+                )
+            }
+            CaptureSource::Addon {
+                addon_id,
+                source_id,
+                name,
+            } => {
+                format!(
+                    "{route}\taddon\t{}\t{}\t{}",
+                    encode_text(addon_id),
+                    encode_text(source_id),
+                    encode_text(name)
+                )
             }
         }
     }
@@ -725,6 +824,32 @@ fn parse_sources(value: &str) -> Option<[Option<SourceSettings>; 2]> {
                 id: decode_text(fields.next()?)?,
                 name: decode_text(fields.next()?)?,
             },
+            "addon" => {
+                let addon_id = decode_text(fields.next()?)?;
+                let source_id = decode_text(fields.next()?)?;
+                backtracking_addon::manifest::validate_id(&addon_id).ok()?;
+                if source_id.len() > 64
+                    || !source_id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                    })
+                {
+                    return None;
+                }
+                let encoded_name = fields.next()?;
+                let name = if encoded_name.is_empty() {
+                    String::new()
+                } else {
+                    decode_text(encoded_name)?
+                };
+                if name.chars().count() > 120 || name.chars().any(char::is_control) {
+                    return None;
+                }
+                CaptureSource::Addon {
+                    addon_id,
+                    source_id,
+                    name,
+                }
+            }
             _ => return None,
         };
         fields
@@ -741,6 +866,38 @@ fn parse_sources(value: &str) -> Option<[Option<SourceSettings>; 2]> {
             Some(parse_slot(b)?)
         },
     ])
+}
+
+/// Names may change, so only stable source identifiers appear in this key.
+pub(crate) fn source_preference_key(source: &CaptureSource) -> String {
+    match source {
+        CaptureSource::System => "system".into(),
+        CaptureSource::DefaultMicrophone => "default-mic".into(),
+        CaptureSource::Microphone { id, .. } => format!("mic:{}", encode_text(id)),
+        CaptureSource::Application { path, .. } => {
+            format!("app:{}", encode_text(&path.to_lowercase()))
+        }
+        CaptureSource::Sender { id, .. } => format!("sender:{}", encode_text(id)),
+        CaptureSource::Addon {
+            addon_id,
+            source_id,
+            ..
+        } => {
+            format!("addon:{}:{}", encode_text(addon_id), encode_text(source_id))
+        }
+    }
+}
+
+pub(crate) fn serialize_shown_groups(choices: &SourceGroupChoices) -> String {
+    serde_json::to_string(choices).expect("string map can be encoded as JSON")
+}
+
+fn parse_shown_groups(value: &str) -> Option<SourceGroupChoices> {
+    let choices: SourceGroupChoices = serde_json::from_str(value).ok()?;
+    choices
+        .keys()
+        .all(|source| !source.is_empty() && !source.chars().any(char::is_control))
+        .then_some(choices)
 }
 
 fn encode_text(value: &str) -> String {
@@ -785,12 +942,18 @@ mod tests {
 
     fn workspace_preferences(label: &str) -> Preferences {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap().to_path_buf();
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
         Preferences {
-            directory: Some(workspace.join("target/preference-writer-tests").join(format!(
-                "{label}-{}-{sequence}", std::process::id()
-            ))),
+            directory: Some(
+                workspace
+                    .join("target/preference-writer-tests")
+                    .join(format!("{label}-{}-{sequence}", std::process::id())),
+            ),
         }
     }
 
@@ -801,15 +964,17 @@ mod tests {
         let (entered, entering) = mpsc::sync_channel(1);
         let (release, released) = mpsc::sync_channel(1);
         let mut first = true;
-        let writer = PreferenceWriter::with_sink(workspace_preferences("slow"), move |key, value| {
-            if first {
-                first = false;
-                entered.send(()).unwrap();
-                released.recv().unwrap();
-            }
-            observed.lock().unwrap().push((key, value.to_owned()));
-            Ok(())
-        }).unwrap();
+        let writer =
+            PreferenceWriter::with_sink(workspace_preferences("slow"), move |key, value| {
+                if first {
+                    first = false;
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                }
+                observed.lock().unwrap().push((key, value.to_owned()));
+                Ok(())
+            })
+            .unwrap();
         writer.save(Key::Accent, "initial").unwrap();
         entering.recv().unwrap();
         let (queued, queue) = mpsc::sync_channel(1);
@@ -828,27 +993,38 @@ mod tests {
         assert!(returned_while_disk_busy, "enqueue waited for the disk sink");
         let writer = result.unwrap();
         writer.flush().unwrap();
-        assert_eq!(*writes.lock().unwrap(), [
-            (Key::Accent, "initial".into()),
-            (Key::Transparency, "25".into()),
-            (Key::History, "600".into()),
-        ]);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            [
+                (Key::Accent, "initial".into()),
+                (Key::Transparency, "25".into()),
+                (Key::History, "600".into()),
+            ]
+        );
     }
 
     #[test]
     fn failed_disk_writes_are_reported_and_flush_preserves_the_latest_retry() {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&writes);
-        let writer = PreferenceWriter::with_sink(workspace_preferences("errors"), move |key, value| {
-            observed.lock().unwrap().push((key, value.to_owned()));
-            if value == "10" {
-                Err(io::Error::new(io::ErrorKind::PermissionDenied, "simulated disk denial"))
-            } else {
-                Ok(())
-            }
-        }).unwrap();
+        let writer =
+            PreferenceWriter::with_sink(workspace_preferences("errors"), move |key, value| {
+                observed.lock().unwrap().push((key, value.to_owned()));
+                if value == "10" {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "simulated disk denial",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
         writer.save(Key::History, "10").unwrap();
-        assert_eq!(writer.flush().unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            writer.flush().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
         let mut errors = 0;
         while let Some(error) = writer.poll_error() {
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -860,28 +1036,40 @@ mod tests {
         assert!(writer.poll_error().is_none());
         let writes = writes.lock().unwrap();
         assert_eq!(writes.last(), Some(&(Key::History, "600".into())));
-        assert!(writes[..writes.len() - 1].iter().all(|write| write == &(Key::History, "10".into())));
+        assert!(
+            writes[..writes.len() - 1]
+                .iter()
+                .all(|write| write == &(Key::History, "10".into()))
+        );
     }
 
     #[test]
     fn flush_barrier_does_not_wait_for_saves_queued_after_it() {
         let (late, late_started) = mpsc::sync_channel(1);
         let (release, released) = mpsc::sync_channel(1);
-        let writer = PreferenceWriter::with_sink(workspace_preferences("barrier"), move |_, value| {
-            if value == "600" {
-                late.send(()).unwrap();
-                released.recv().unwrap();
-            }
-            Ok(())
-        }).unwrap();
+        let writer =
+            PreferenceWriter::with_sink(workspace_preferences("barrier"), move |_, value| {
+                if value == "600" {
+                    late.send(()).unwrap();
+                    released.recv().unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
         writer.save(Key::History, "10").unwrap();
         let (barrier, result) = mpsc::sync_channel(1);
-        writer.commands.send(PreferenceCommand::Flush(barrier)).unwrap();
+        writer
+            .commands
+            .send(PreferenceCommand::Flush(barrier))
+            .unwrap();
         writer.save(Key::History, "600").unwrap();
         late_started.recv().unwrap();
         let completed_before_late_write = result.recv_timeout(Duration::from_millis(100));
         release.send(()).unwrap();
-        assert!(completed_before_late_write.is_ok(), "flush crossed its queue barrier");
+        assert!(
+            completed_before_late_write.is_ok(),
+            "flush crossed its queue barrier"
+        );
         completed_before_late_write.unwrap().unwrap();
         writer.flush().unwrap();
     }
@@ -897,12 +1085,19 @@ mod tests {
             if sink_writable.load(Ordering::Relaxed) {
                 Ok(())
             } else {
-                Err(io::Error::new(io::ErrorKind::PermissionDenied, "simulated disk denial"))
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "simulated disk denial",
+                ))
             }
-        }).unwrap();
+        })
+        .unwrap();
         writer.save(Key::History, "600").unwrap();
         for _ in 0..2 {
-            assert_eq!(writer.flush().unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                writer.flush().unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
             let mut errors = 0;
             while let Some(error) = writer.poll_error() {
                 assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -925,9 +1120,15 @@ mod tests {
             writer.save(Key::IdleResume, "5").unwrap();
             writer.save(Key::History, "30").unwrap();
         }
-        let reloaded = Preferences { directory: preferences.directory.clone() }.load();
+        let reloaded = Preferences {
+            directory: preferences.directory.clone(),
+        }
+        .load();
         assert_eq!(reloaded.history, DurationChoice::Seconds30);
-        assert_eq!(reloaded.idle_resume, AutoResumeDelay::from_seconds(5).unwrap());
+        assert_eq!(
+            reloaded.idle_resume,
+            AutoResumeDelay::from_seconds(5).unwrap()
+        );
     }
 
     #[test]
@@ -935,11 +1136,19 @@ mod tests {
         assert!(PreferenceWriter::new(Preferences { directory: None }).is_err());
         let writes = Arc::new(Mutex::new(0));
         let observed = Arc::clone(&writes);
-        let writer = PreferenceWriter::with_sink(workspace_preferences("validation"), move |_, _| {
-            *observed.lock().unwrap() += 1;
-            Ok(())
-        }).unwrap();
-        assert_eq!(writer.save(Key::History, &"x".repeat(MAX_VALUE_BYTES as usize + 1)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let writer =
+            PreferenceWriter::with_sink(workspace_preferences("validation"), move |_, _| {
+                *observed.lock().unwrap() += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            writer
+                .save(Key::History, &"x".repeat(MAX_VALUE_BYTES as usize + 1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
         writer.flush().unwrap();
         assert_eq!(*writes.lock().unwrap(), 0);
     }
@@ -948,24 +1157,34 @@ mod tests {
     #[ignore = "diagnostic durable writes in the workspace; not a reboot or GUI latency test"]
     fn preference_save_latency_probe() {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap().to_path_buf();
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let output = workspace.join("target/preference-perf-probe");
         fs::create_dir_all(&output).unwrap();
         let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
         let run = output.join(format!("run-{}-{sequence}", std::process::id()));
         let mut fresh = Vec::new();
         for index in 0..8 {
-            let preferences = Preferences { directory: Some(run.join(format!("fresh-{index}"))) };
+            let preferences = Preferences {
+                directory: Some(run.join(format!("fresh-{index}"))),
+            };
             let started = std::time::Instant::now();
             preferences.save(Key::History, "600").unwrap();
             fresh.push(started.elapsed().as_secs_f64() * 1000.0);
         }
-        let preferences = Preferences { directory: Some(run.join("existing")) };
+        let preferences = Preferences {
+            directory: Some(run.join("existing")),
+        };
         preferences.save(Key::History, "600").unwrap();
         let mut warm = Vec::new();
         for index in 0..64 {
             let started = std::time::Instant::now();
-            preferences.save(Key::History, if index % 2 == 0 { "10" } else { "600" }).unwrap();
+            preferences
+                .save(Key::History, if index % 2 == 0 { "10" } else { "600" })
+                .unwrap();
             warm.push(started.elapsed().as_secs_f64() * 1000.0);
         }
         assert_eq!(preferences.load().history, DurationChoice::Minutes10);
@@ -977,7 +1196,11 @@ mod tests {
             "fresh_directory_first_save_ms": fresh,
             "existing_directory_history_replace_ms": warm,
         });
-        fs::write(run.join("synchronous-save-results.json"), serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+        fs::write(
+            run.join("synchronous-save-results.json"),
+            serde_json::to_vec_pretty(&result).unwrap(),
+        )
+        .unwrap();
         println!("{result}");
     }
 
@@ -992,7 +1215,14 @@ mod tests {
         writer.flush().unwrap();
         assert!(preferences.load().retain_silence);
         assert_eq!(preferences.read(Key::RetainSilence).as_deref(), Some("1"));
-        assert!(preferences.directory.as_ref().unwrap().join("retain-silence").is_file());
+        assert!(
+            preferences
+                .directory
+                .as_ref()
+                .unwrap()
+                .join("retain-silence")
+                .is_file()
+        );
 
         writer.save(Key::RetainSilence, "0").unwrap();
         writer.flush().unwrap();
@@ -1007,14 +1237,18 @@ mod tests {
         assert_eq!(preferences.load().idle_resume, AutoResumeDelay::Seconds10);
 
         let writer = PreferenceWriter::new(preferences.clone()).unwrap();
-        writer.save(Key::IdleResume, &AutoResumeDelay::Off.seconds().to_string()).unwrap();
+        writer
+            .save(Key::IdleResume, &AutoResumeDelay::Off.seconds().to_string())
+            .unwrap();
         writer.flush().unwrap();
         // The file keeps the value older versions wrote for this choice.
         assert_eq!(preferences.read(Key::IdleResume).as_deref(), Some("0"));
         assert_eq!(preferences.load().idle_resume, AutoResumeDelay::Off);
 
         for choice in AutoResumeDelay::ALL {
-            preferences.save(Key::IdleResume, &choice.seconds().to_string()).unwrap();
+            preferences
+                .save(Key::IdleResume, &choice.seconds().to_string())
+                .unwrap();
             assert_eq!(preferences.load().idle_resume, choice);
         }
         preferences.save(Key::IdleResume, "3").unwrap();
@@ -1030,7 +1264,9 @@ mod tests {
         assert_eq!(settings.waveform_border_width, 1);
 
         for mark in StatusMark::ALL {
-            preferences.save(Key::StatusMark, mark.preference()).unwrap();
+            preferences
+                .save(Key::StatusMark, mark.preference())
+                .unwrap();
             assert_eq!(preferences.load().status_mark, mark);
         }
         preferences.save(Key::StatusMark, "sometimes").unwrap();
@@ -1040,7 +1276,11 @@ mod tests {
             preferences.save(key, "0").unwrap();
             let settings = preferences.load();
             assert_eq!(
-                if key == Key::ShowTitle { settings.show_title } else { settings.show_meters },
+                if key == Key::ShowTitle {
+                    settings.show_title
+                } else {
+                    settings.show_meters
+                },
                 shown
             );
             preferences.save(key, "1").unwrap();
@@ -1049,7 +1289,9 @@ mod tests {
         assert!(settings.show_title && settings.show_meters);
 
         for width in BORDER_WIDTHS {
-            preferences.save(Key::WaveformBorderWidth, &width.to_string()).unwrap();
+            preferences
+                .save(Key::WaveformBorderWidth, &width.to_string())
+                .unwrap();
             assert_eq!(preferences.load().waveform_border_width, width);
         }
         for stored in ["0", "5", "wide"] {
@@ -1064,7 +1306,9 @@ mod tests {
         assert_eq!(preferences.load().output_cleanup, None);
 
         for days in backtracking_core::cleanup::AGE_CHOICES {
-            preferences.save(Key::OutputCleanup, &days.to_string()).unwrap();
+            preferences
+                .save(Key::OutputCleanup, &days.to_string())
+                .unwrap();
             assert_eq!(preferences.load().output_cleanup, Some(days));
         }
         // Off is stored as 0. Anything else unexpected must never start deleting files.
@@ -1176,6 +1420,33 @@ mod tests {
     }
 
     #[test]
+    fn each_addon_source_keeps_its_own_file_name_after_reload() {
+        let addon = |addon_id: &str, source_id: &str, name: &str| CaptureSource::Addon {
+            addon_id: addon_id.into(),
+            source_id: source_id.into(),
+            name: name.into(),
+        };
+        let mut names = SourceNames::default();
+        assert!(names.set(&addon("atmos", "bed", "Atmos bed"), "Dolby bed"));
+        assert!(names.set(&addon("tone", "bed", "Test tone"), "Tone"));
+        // The add-on can rename its source; the name the user gave stays with the source.
+        assert_eq!(
+            names.get(&addon("atmos", "bed", "Renamed")),
+            Some("Dolby bed")
+        );
+        assert_eq!(names.get(&addon("atmos", "objects", "Atmos bed")), None);
+        assert_eq!(names.get(&addon("tone", "bed", "Test tone")), Some("Tone"));
+        assert_eq!(names.get(&CaptureSource::System), None);
+
+        let preferences = workspace_preferences("addon-source-names");
+        preferences
+            .save(Key::SourceNames, &names.serialize())
+            .unwrap();
+        assert_eq!(preferences.load().source_names, names);
+        fs::remove_dir_all(preferences.directory.unwrap()).unwrap();
+    }
+
+    #[test]
     fn same_name_sender_choices_keep_separate_ids_after_reload() {
         let sources = ["sender-one", "sender-two"].map(|id| {
             Some(SourceSettings {
@@ -1187,5 +1458,173 @@ mod tests {
             })
         });
         assert_eq!(parse_sources(&serialize_sources(&sources)), Some(sources));
+    }
+
+    #[test]
+    fn wide_export_and_group_choices_round_trip_without_changing_legacy_preferences() {
+        let preferences = workspace_preferences("wide-export-old-folder");
+        preferences.save(Key::History, "600").unwrap();
+        preferences
+            .save(Key::CaptureSources, "0\tsystem\noff")
+            .unwrap();
+        preferences.save(Key::WavForceMono, "1").unwrap();
+        preferences.save(Key::WavSampleFormat, "pcm24").unwrap();
+        let folder = preferences.directory.as_ref().unwrap();
+        fs::write(
+            folder.join("older-version-unknown-option"),
+            "leave this alone",
+        )
+        .unwrap();
+
+        let old = preferences.load();
+        assert_eq!(old.history, DurationChoice::Minutes10);
+        assert!(old.wav_force_mono);
+        assert_eq!(old.wav_profile.sample_format, WavSampleFormat::Pcm24);
+        assert_eq!(old.wide_export, WideExportMode::MonoFiles);
+        assert!(old.shown_groups.is_empty());
+
+        let groups = SourceGroupChoices::from([
+            (source_preference_key(&CaptureSource::System), String::new()),
+            (
+                source_preference_key(&CaptureSource::Addon {
+                    addon_id: "com.example.decoder".into(),
+                    source_id: "main".into(),
+                    name: "Decoder".into(),
+                }),
+                "objects".into(),
+            ),
+        ]);
+        let writer = PreferenceWriter::new(preferences.clone()).unwrap();
+        writer
+            .save(Key::WideExport, WideExportMode::Multichannel.preference())
+            .unwrap();
+        writer
+            .save(Key::ShownGroups, &serialize_shown_groups(&groups))
+            .unwrap();
+        writer.flush().unwrap();
+        let loaded = preferences.load();
+        assert_eq!(loaded.wide_export, WideExportMode::Multichannel);
+        assert_eq!(loaded.shown_groups, groups);
+        assert_eq!(loaded.sources, old.sources);
+        assert_eq!(loaded.history, old.history);
+        assert_eq!(loaded.wav_profile, old.wav_profile);
+        assert_eq!(loaded.wav_force_mono, old.wav_force_mono);
+        assert_eq!(
+            fs::read_to_string(folder.join("capture-sources")).unwrap(),
+            "0\tsystem\noff"
+        );
+        assert_eq!(
+            fs::read_to_string(folder.join("older-version-unknown-option")).unwrap(),
+            "leave this alone"
+        );
+        assert!(folder.join("wide-lane-export-v1").is_file());
+        assert!(folder.join("shown-channel-groups-v1").is_file());
+    }
+
+    #[test]
+    fn invalid_new_preferences_use_safe_defaults_and_leave_saved_values_intact() {
+        let preferences = workspace_preferences("wide-export-invalid");
+        for mode in WideExportMode::ALL {
+            preferences
+                .save(Key::WideExport, mode.preference())
+                .unwrap();
+            assert_eq!(preferences.load().wide_export, mode);
+        }
+        preferences.save(Key::WideExport, "future-mode").unwrap();
+        preferences.save(Key::ShownGroups, "{invalid json").unwrap();
+        let loaded = preferences.load();
+        assert_eq!(loaded.wide_export, WideExportMode::MonoFiles);
+        assert!(loaded.shown_groups.is_empty());
+        assert_eq!(
+            preferences.read(Key::WideExport).as_deref(),
+            Some("future-mode")
+        );
+        assert_eq!(
+            preferences.read(Key::ShownGroups).as_deref(),
+            Some("{invalid json")
+        );
+        assert_eq!(
+            WideExportMode::MonoFiles.export_mode(),
+            ChannelExportMode::MonoFiles
+        );
+        assert_eq!(
+            WideExportMode::Multichannel.export_mode(),
+            ChannelExportMode::Multichannel
+        );
+    }
+
+    #[test]
+    fn addon_sources_round_trip_by_pair_and_do_not_store_sender_instances() {
+        let sources = ["main", "objects"].map(|source_id| {
+            Some(SourceSettings {
+                source: CaptureSource::Addon {
+                    addon_id: "com.example.decoder".into(),
+                    source_id: source_id.into(),
+                    name: "音訊來源".into(),
+                },
+                route: ChannelRoute::Merged,
+            })
+        });
+        let preferences = workspace_preferences("addon-sources");
+        let stored = serialize_sources(&sources);
+        assert!(stored.contains("\taddon\t"));
+        assert!(!stored.contains("\tsender\t"));
+        preferences.save(Key::CaptureSources, &stored).unwrap();
+        assert_eq!(preferences.load().sources, sources);
+
+        let unnamed = [
+            Some(SourceSettings {
+                source: CaptureSource::Addon {
+                    addon_id: "com.example.decoder".into(),
+                    source_id: "main".into(),
+                    name: String::new(),
+                },
+                route: ChannelRoute::Merged,
+            }),
+            None,
+        ];
+        assert_eq!(parse_sources(&serialize_sources(&unnamed)), Some(unnamed));
+    }
+
+    #[test]
+    fn source_group_identity_ignores_names_and_keeps_source_pairs_separate() {
+        let source = |addon_id: &str, source_id: &str, name: &str| CaptureSource::Addon {
+            addon_id: addon_id.into(),
+            source_id: source_id.into(),
+            name: name.into(),
+        };
+        let key = source_preference_key(&source("com.example.a", "main", "First name"));
+        assert_eq!(
+            key,
+            source_preference_key(&source("com.example.a", "main", "New name"))
+        );
+        assert_ne!(
+            key,
+            source_preference_key(&source("com.example.b", "main", "First name"))
+        );
+        assert_ne!(
+            key,
+            source_preference_key(&source("com.example.a", "objects", "First name"))
+        );
+        let groups = SourceGroupChoices::from([(key, "物件".into())]);
+        assert_eq!(
+            parse_shown_groups(&serialize_shown_groups(&groups)),
+            Some(groups)
+        );
+    }
+
+    #[test]
+    fn injected_preference_root_uses_settings_subfolder() {
+        let parent = workspace_preferences("injected-root");
+        let root = parent.directory.unwrap();
+        let preferences = Preferences::in_data_root(&root);
+        preferences.save(Key::WideExport, "multichannel").unwrap();
+        assert!(root.join("Settings/wide-lane-export-v1").is_file());
+        assert_eq!(preferences.load().wide_export, WideExportMode::Multichannel);
+        assert!(
+            Preferences::in_data_root("relative")
+                .save(Key::WideExport, "mono-files")
+                .is_err()
+        );
     }
 }

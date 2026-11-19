@@ -1,0 +1,29 @@
+[package]
+name = "backtracking-addon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+description = "Manifest, packages and local messages for Backtracking add-ons"
+
+[features]
+default = []
+install = ["dep:zip"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = { version = "4.6.1", default-features = false, features = ["deflate"], optional = true }
+
+[[bin]]
+name = "btaddon-pack"
+path = "src/bin/btaddon-pack.rs"
+required-features = ["install"]
+
+[[example]]
+name = "test_tone"
+path = "examples/test_tone.rs"
+
+
+# Keep this crate standalone even in a checkout nested in another workspace.
+[workspace]

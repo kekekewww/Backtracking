@@ -189,6 +189,26 @@ Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift
 
 **檔名**。桌面版以來源名稱為 WAV 命名。同時擷取 A 和 B 時為 `Backtracking_<名稱>_A_<日期>_<時間>_<長度>s.wav` 與 `Backtracking_<名稱>_B_…`；只有一個來源時不加 A／B，例如 `Backtracking_Spotify_2026-11-17_09-05-00_12.4s.wav`。分開編輯 A 和 B 時單獨匯出的一軌仍標示 A 或 B。名稱預設為來源清單中的裝置或 App 名稱，不含 `.exe` 等副檔名；系統播放為 `System audio`，Sender 為音軌名稱。要改名時，在 Options → Sources 該來源下方的 **File name** 欄位輸入，欄位下方會顯示檔名的開頭；清空欄位即恢復預設。名稱屬於裝置而不是 A／B：把系統播放命名為 `Loop` 後，不論它在 A 還是 B 擷取，檔名都使用 `Loop`。檔名不能使用的字元（`\ / : * ? " < > |`）會改成空格，名稱最多保留 48 個字元。VST3／CLAP 的檔名不含來源名稱，為 `Backtracking_<日期>_<時間>_<長度>s.wav`，DAW 提供速度時在長度後加上 BPM，例如 `_120bpm`；擷取 A 和 B 時，兩個檔案分別以 `-A`、`-B` 結尾。**Delete old drag-and-drop files** 也認得舊版的檔名。
 
+### 附加元件與多聲道來源（Windows 桌面版）
+
+附加元件（add-on）是獨立的程式，Backtracking 會啟動它並擷取它送出的音訊。附加元件可以提供新的音訊來源、開啟檔案、有自己的設定與按鈕。附加元件檔案的副檔名是 `.btaddon`。目前只有 Windows 桌面版支援，macOS 桌面版與插件尚未支援。
+
+**安裝。** 把 `.btaddon` 檔拖到 Backtracking 視窗，或在 Options 的 **Add-ons** 頁按 **Install from file…**。Backtracking 先顯示確認畫面：名稱、版本、作者、它會執行的程式、解壓後的大小，以及它要求的功能。按 **Install** 之前不會寫入任何東西。附加元件是以你的權限執行的程式，沒有沙箱，請只安裝你信任的附加元件。裝好後它會立刻啟動，之後每次開啟 Backtracking 也會啟動。
+
+**管理。** **Add-ons** 頁列出每個附加元件的狀態、最新訊息、設定與按鈕。取消勾選 **Enabled** 可停用。**Remove…** 會移除程式，並可選擇一併刪除它保存的資料。附加元件裝在 `%LOCALAPPDATA%\Backtracking\addons`，它的資料在 `%LOCALAPPDATA%\Backtracking\addon-data`。
+
+**使用附加元件的來源。** 附加元件提供的來源會出現在 Options 的 **Sources** 頁的 **Audio source** 清單。選了這種來源後：
+
+- **Format** 取代 **Channel route**，列出這個附加元件提供的格式（例如 Stereo、5.1、7.1.4）。一到兩個聲道的格式仍可選擇聲道路徑。
+- 能開啟檔案的附加元件會多一個 **Open file…** 按鈕，也可以直接把檔案拖到視窗上。
+- 能播放的來源會有 **Play**／**Pause**、**Stop** 和位置滑桿，主視窗的波形左下角也有一個播放／暫停按鈕。
+
+**多聲道波形。** 超過兩個聲道的來源，每個聲道各佔一列波形並標上聲道名稱；7.1.4 就是 12 列。列數放不下時可用滾輪捲動。框選會橫跨所有聲道。來源若有多個聲道群組（例如聲道與物件），波形左下角可切換目前顯示的群組。多聲道來源的音量表只有 Peak 與 VU，沒有 LUFS。聲道越多，記憶體能保留的歷史越短；實際保留的長度會顯示在 Options 的 **Capture** 頁。
+
+**匯出多聲道片段。** 在 Options 的 **Export** 頁用 **Multichannel sources** 選擇 **One mono WAV per channel**（每個聲道一個單聲道 WAV）或 **One multichannel WAV**（一個多聲道 WAV）。只會匯出目前顯示的聲道群組。檔名開頭與其他來源相同，依[檔名](#輸出位置與檔案規格)的規則包含來源名稱與 A／B；每個聲道的檔案再加上 `-Ch01_聲道名稱`，例如 `Backtracking_Test tone_A_2026-11-17_09-05-00_12.4s-Ch01_L.wav`，依名稱排序即為聲道順序。附加元件的來源同樣可在 Options → Sources 的 **File name** 欄位改名。淡入淡出會套用到每個聲道的檔案與多聲道 WAV。按 `Space` 試聽只播放單聲道與立體聲來源：選區涵蓋多聲道來源時不會播放，狀態列會說明原因；分開編輯 A 和 B 時，仍可試聽另一軌的單聲道或立體聲來源。
+
+想自己寫附加元件，請看 [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md)。
+
 ### 保存與還原設定
 
 Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續錄、主題色、背景透明度、音量表模式、WAV 匯出設定、兩個資料夾、置頂、只顯示波形的設定及各來源的檔名，下次開啟時還原。分開編輯 A 和 B 不保存，每次開啟都是關閉。
@@ -394,6 +414,26 @@ Snapshot saves and drag-and-drop exports use the current WAV settings. Any sampl
 Enable **Export every file as mono** to export each WAV in mono. Stereo Merged and stereo plug-in captures average the left and right channels. Side exports the captured Side signal. A and B still export as individual files. The option defaults to Off. The rolling history lives in memory, so export any clips you need before closing the app or removing the plug-in.
 
 **File names**. The desktop apps name each WAV after its source. With A and B recording, the files are `Backtracking_<name>_A_<date>_<time>_<length>s.wav` and `Backtracking_<name>_B_…`. With one source the letter is left out, as in `Backtracking_Spotify_2026-11-17_09-05-00_12.4s.wav`. A lane exported on its own while editing A and B separately keeps its letter. The name defaults to the device or app name in the source list, without an extension such as `.exe`: `System audio` for system playback, and the track name for a Sender. To change it, type in the **File name** field under the source in Options → Sources. The note under the field shows how the files will begin. Clear the field to go back to the default. A name belongs to the device, not to A or B: name system playback `Loop` and its files say `Loop` whether it records on A or on B. Characters that file names cannot hold (`\ / : * ? " < > |`) become spaces, and a name keeps at most 48 characters. VST3 and CLAP files carry no source name: `Backtracking_<date>_<time>_<length>s.wav`, with the tempo after the length, as in `_120bpm`, when the DAW reports one. With A and B recording, the two files end in `-A` and `-B`. **Delete old drag-and-drop files** also recognizes the names that earlier versions used.
+
+### Add-ons and multichannel sources (Windows desktop)
+
+An add-on is a separate program that Backtracking starts and captures audio from. An add-on can provide new audio sources, open files, and have its own settings and buttons. Add-on files end in `.btaddon`. Only the Windows desktop app hosts add-ons today; the macOS app and the plug-ins do not.
+
+**Install.** Drop a `.btaddon` file on a Backtracking window, or press **Install from file…** on the **Add-ons** page of Options. Backtracking first shows a confirmation: the name, version, author, the program it will run, its unpacked size, and what it asks for. Nothing is written before you press **Install**. An add-on is a program that runs with your own permissions and is not sandboxed, so install only add-ons you trust. Once installed it starts at once, and again each time Backtracking starts.
+
+**Manage.** The **Add-ons** page lists each add-on with its state, its latest message, its settings, and its buttons. Clear **Enabled** to turn one off. **Remove…** removes the program and offers to delete the data it saved as well. Add-ons are installed in `%LOCALAPPDATA%\Backtracking\addons`; their data is in `%LOCALAPPDATA%\Backtracking\addon-data`.
+
+**Use an add-on's source.** Sources that add-ons provide appear in the **Audio source** list on the **Sources** page of Options. With such a source selected:
+
+- **Format** takes the place of **Channel route** and lists the formats the add-on offers, for example Stereo, 5.1, or 7.1.4. Formats with one or two channels keep the channel route as well.
+- An add-on that opens files shows an **Open file…** button. You can also drop the file on a window.
+- A source that plays shows **Play** / **Pause**, **Stop**, and a position slider. The main window has a small play/pause button at the bottom left of the waveform.
+
+**Multichannel waveforms.** A source with more than two channels gets one waveform row per channel, labelled with the channel's name; 7.1.4 is twelve rows. Scroll with the mouse wheel when the rows do not fit. A selection runs across every channel. When a source has more than one channel group, for example channels and objects, a switch at the bottom left of the waveform chooses the group on show. Meters for multichannel sources offer Peak and VU, not LUFS. The more channels a source has, the less history fits in memory; the **Capture** page of Options shows how much is kept.
+
+**Export multichannel clips.** On the **Export** page of Options, **Multichannel sources** chooses between **One mono WAV per channel** and **One multichannel WAV**. Only the channel group on show is exported. The files begin like any other source's, with its name and the lane letter as described under [file names](#output-location-and-file-format). Each channel's file then ends in `-Ch01_channel name`, as in `Backtracking_Test tone_A_2026-11-17_09-05-00_12.4s-Ch01_L.wav`, so sorting by name puts the channels in order. An add-on's sources can be renamed in the **File name** field in Options → Sources too. Fades apply to every channel's file and to the multichannel WAV. Preview with `Space` plays mono and stereo sources only: a selection that covers a multichannel source does not play, and the status line says why. While editing A and B separately, a mono or stereo source in the other lane still previews.
+
+To write an add-on, see [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md).
 
 ### Save and restore settings
 
