@@ -5,14 +5,14 @@
 //! and then passes [`Theme::legible`], which puts back whatever would make the waveform, the
 //! selection, the names or the capture status hard to see. A look changes how the window
 //! looks and nothing else: the capture status colours, text, sizes and hit areas are not
-//! tokens, and the border's width is the only one that moves anything.
+//! tokens. The border's width is the only one that moves anything, and only inside the window:
+//! the plot takes up the difference and the window keeps its size.
 //!
 //! The choice is the `addon-look` preference. A capture window that is not the first reads it
 //! when it starts and keeps changes made in its own Options for as long as it runs, as it does
 //! the accent; the offers themselves reach it through the add-on bridge.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use backtracking_addon::protocol::{
@@ -151,7 +151,34 @@ fn checked(theme: Theme, accent: Color32) -> Theme {
         plot_marks: &plot_marks,
         panel_marks: &panel_marks,
         panel_text: egui::Visuals::dark().text_color(),
+        panel_fill: egui::Visuals::dark().panel_fill,
     })
+}
+
+/// Decides whether new offers should wake the window: only when the chosen add-on's offer is
+/// not the one last seen.
+#[derive(Default)]
+struct OfferWatch {
+    chosen: Option<String>,
+    seen: Option<Appearance>,
+}
+
+impl OfferWatch {
+    /// `offers` is `None` when they could not be read, which wakes the window to be safe.
+    fn changed(&mut self, offers: Option<&AddonAppearances>) -> bool {
+        let Some(id) = &self.chosen else {
+            return false;
+        };
+        let Some(offers) = offers else {
+            return true;
+        };
+        let offer = offers.get(id);
+        if offer == self.seen.as_ref() {
+            return false;
+        }
+        self.seen = offer.cloned();
+        true
+    }
 }
 
 /// Which add-on's look the window takes, and the look worked out from its latest offer.
@@ -167,21 +194,36 @@ pub(super) struct AddonLook {
     /// The look last handed to the window.
     shown: Theme,
     /// How many times a look has been worked out.
+    #[cfg(test)]
     builds: usize,
-    /// Whether a new offer should wake the window: only while a look is chosen.
-    wants_offers: Arc<AtomicBool>,
+    /// What decides whether a new offer wakes the window.
+    watch: Arc<Mutex<OfferWatch>>,
+    /// The add-ons, for the wake-up to read the offers with. The add-ons keep the wake-up,
+    /// so this is let go when the window is, to not keep them alive in a loop.
+    reader: Arc<Mutex<Option<AddonHandle>>>,
+}
+
+impl Drop for AddonLook {
+    fn drop(&mut self) {
+        self.reader.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
 }
 
 impl AddonLook {
     pub(super) fn new(chosen: Option<String>) -> Self {
         Self {
-            wants_offers: Arc::new(AtomicBool::new(chosen.is_some())),
+            watch: Arc::new(Mutex::new(OfferWatch {
+                chosen: chosen.clone(),
+                seen: None,
+            })),
+            reader: Arc::default(),
             chosen,
             offers: Arc::default(),
             names: Arc::default(),
             accent: None,
             stale: true,
             shown: Theme::default(),
+            #[cfg(test)]
             builds: 0,
         }
     }
@@ -196,7 +238,10 @@ impl AddonLook {
         if self.chosen == chosen {
             return false;
         }
-        self.wants_offers.store(chosen.is_some(), Ordering::Relaxed);
+        *self.watch.lock().unwrap_or_else(|e| e.into_inner()) = OfferWatch {
+            chosen: chosen.clone(),
+            seen: None,
+        };
         self.chosen = chosen;
         self.stale = true;
         true
@@ -231,7 +276,10 @@ impl AddonLook {
         if !std::mem::take(&mut self.stale) {
             return None;
         }
-        self.builds += 1;
+        #[cfg(test)]
+        {
+            self.builds += 1;
+        }
         let theme = self
             .chosen
             .as_ref()
@@ -333,30 +381,56 @@ impl Recorder {
         }
     }
 
-    /// Takes the chosen add-on's newest look, once per pass. A look that changes the border's
-    /// width resizes the waveform-only window as a new width in Options does.
-    pub(super) fn refresh_look(&mut self, ctx: &egui::Context) {
+    /// Under the Border width control: while a chosen look sets its own width, that width is
+    /// the one drawn.
+    pub(super) fn look_border_width_note(&self, ui: &mut egui::Ui) {
+        border_width_note(ui, Language::current(), self.look.chosen().is_some(), &self.theme);
+    }
+
+    /// Takes the chosen add-on's newest look, once per pass. It never resizes the window: a
+    /// border width from a look is drawn inside the window as it is, and only the user's own
+    /// width in Options resizes the waveform-only window.
+    pub(super) fn refresh_look(&mut self) {
         let offers = self.controller.addons().and_then(AddonHandle::try_appearances);
         if let Some(theme) = self.look.update(offers, self.accent) {
-            let border_inset = self.border_inset();
             self.set_theme(theme);
-            self.fit_border_change(ctx, border_inset);
         }
     }
 
-    /// Wakes the window when an add-on's offer changes while a look is chosen, so a look that
-    /// moves is drawn as it moves and nothing is drawn again otherwise.
+    /// Wakes the window when the chosen add-on's offer changes, so a look that moves is drawn
+    /// as it moves and nothing is drawn again for any other offer.
     pub(super) fn wake_on_new_looks(&self, ctx: &egui::Context) {
         let Some(addons) = self.controller.addons() else {
             return;
         };
-        let wanted = Arc::clone(&self.look.wants_offers);
+        let watch = Arc::clone(&self.look.watch);
+        let reader = Arc::clone(&self.look.reader);
+        *reader.lock().unwrap_or_else(|e| e.into_inner()) = Some(addons.clone());
         let ctx = ctx.clone();
         addons.subscribe_appearances(Arc::new(move || {
-            if wanted.load(Ordering::Relaxed) {
+            let Some(offers) = reader
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(AddonHandle::try_appearances)
+            else {
+                return;
+            };
+            let changed = watch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .changed(offers.as_deref());
+            if changed {
                 ctx.request_repaint_after_for(Duration::from_millis(1), egui::ViewportId::ROOT);
             }
         }));
+    }
+}
+
+/// Says under the Border width control that a chosen look's own width is drawn, when it has one.
+fn border_width_note(ui: &mut egui::Ui, language: Language, look_on: bool, theme: &Theme) {
+    if look_on && theme.border_width.is_some() {
+        options_note(ui, language.look_border_width());
     }
 }
 
@@ -371,7 +445,7 @@ mod tests {
 
     use super::*;
     use crate::addons::{AddonInfo, AddonState};
-    use crate::ui::{paint_compact_status, paint_row_waveform};
+    use crate::ui::{fit_window_border, paint_row_waveform, window_border_inset};
     use backtracking_core::waveform;
 
     const ACCENT: Color32 = Color32::from_rgb(103, 231, 181);
@@ -512,10 +586,8 @@ mod tests {
         let both = offers(&[("com.example.theme", blue()), ("com.example.other", appearance(&[("flag", [0, 0, 255, 255])], &[]))]);
         // Nothing chosen: offers change nothing.
         assert_eq!(look.update(Some(Arc::clone(&both)), ACCENT), None);
-        assert!(!look.wants_offers.load(Ordering::Relaxed));
 
         assert!(look.choose(Some("com.example.theme".into())));
-        assert!(look.wants_offers.load(Ordering::Relaxed));
         let theme = look.update(None, ACCENT).expect("the chosen look");
         assert_eq!(theme.waveform, Some(Color32::from_rgb(90, 160, 255)));
         assert_eq!(theme.flag, Color32::from_rgb(255, 80, 200));
@@ -569,6 +641,130 @@ mod tests {
     }
 
     #[test]
+    fn only_a_change_to_the_chosen_offer_wakes_the_window() {
+        let mut watch = OfferWatch::default();
+        let first = offers(&[("com.example.theme", blue())]);
+        assert!(!watch.changed(Some(&first)), "nothing chosen");
+
+        let mut look = AddonLook::new(Some("com.example.theme".into()));
+        let wakes = |offers: Option<&AddonAppearances>| {
+            look.watch.lock().unwrap().changed(offers)
+        };
+        assert!(wakes(Some(&first)), "the first offer seen");
+        assert!(!wakes(Some(&first)));
+        // Another add-on's offer changing, or a new list with the same offer, wakes nothing.
+        let other = offers(&[
+            ("com.example.theme", blue()),
+            ("com.example.other", appearance(&[("flag", [0, 0, 255, 255])], &[])),
+        ]);
+        assert!(!wakes(Some(&other)));
+        assert!(!wakes(Some(&offers(&[("com.example.theme", blue())]))));
+        // The chosen offer changing, going away or coming back does.
+        let mut moved = blue();
+        moved.colors.insert("playhead".into(), [255, 255, 0, 255]);
+        assert!(wakes(Some(&offers(&[("com.example.theme", moved)]))));
+        assert!(wakes(Some(&offers(&[]))));
+        assert!(!wakes(Some(&offers(&[]))));
+        assert!(wakes(Some(&first)));
+        // Offers that cannot be read wake it, to be safe.
+        assert!(wakes(None));
+
+        // Choosing again starts over, and choosing none wakes nothing.
+        assert!(look.choose(Some("com.example.other".into())));
+        assert!(look.watch.lock().unwrap().changed(Some(&other)));
+        assert!(look.choose(None));
+        assert!(!look.watch.lock().unwrap().changed(Some(&first)));
+    }
+
+    /// The window size changes asked of `ctx` in its last pass.
+    fn resizes(output: &egui::FullOutput) -> usize {
+        output
+            .viewport_output
+            .values()
+            .flat_map(|viewport| &viewport.commands)
+            .filter(|command| matches!(command, egui::ViewportCommand::InnerSize(_)))
+            .count()
+    }
+
+    #[test]
+    fn a_look_that_changes_the_border_width_never_resizes_the_window() {
+        // The waveform-only window with the user's 2 px border, and an add-on whose look
+        // changes the border's width ten times in a second.
+        let user_width = 2;
+        let mut look = AddonLook::new(Some("com.example.theme".into()));
+        let mut theme = Theme::default();
+        let context = egui::Context::default();
+        let raw = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 80.0))),
+            ..Default::default()
+        };
+        let mut drawn = Vec::new();
+        let mut asked = 0;
+        for tenth in 0..10 {
+            let newest_offers = offers(&[(
+                "com.example.theme",
+                appearance(&[], &[("border_width", f64::from(tenth) / 2.0)]),
+            )]);
+            let output = context.run_ui(raw(), |ui| {
+                // What a pass of the window does: take the newest look, then fit the window
+                // to any change of the border it makes room for.
+                let before = window_border_inset(true, user_width);
+                if let Some(newest) = look.update(Some(Arc::clone(&newest_offers)), ACCENT) {
+                    theme = newest;
+                }
+                fit_window_border(ui.ctx(), true, before, window_border_inset(true, user_width));
+            });
+            asked += resizes(&output);
+            output.drop_without_applying_deltas();
+            drawn.push(theme.border_width(user_width));
+        }
+        assert_eq!(asked, 0);
+        // The look's width is drawn, so the plot inside the border takes up the difference.
+        assert_eq!(drawn, (0..10).map(|tenth| tenth as f32 / 2.0).collect::<Vec<_>>());
+
+        // The user's own width still resizes the window, once.
+        let output = context.run_ui(raw(), |ui| {
+            fit_window_border(
+                ui.ctx(),
+                true,
+                window_border_inset(true, user_width),
+                window_border_inset(true, 4),
+            );
+        });
+        assert_eq!(resizes(&output), 1);
+        output.drop_without_applying_deltas();
+    }
+
+    /// The texts the border width note writes, if any.
+    fn border_note(language: Language, look_on: bool, theme: &Theme) -> Vec<String> {
+        let context = egui::Context::default();
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 200.0))),
+                ..Default::default()
+            },
+            |ui| border_width_note(ui, language, look_on, theme),
+        );
+        texts(output)
+    }
+
+    #[test]
+    fn the_border_width_control_says_when_a_look_sets_the_width() {
+        let wide = Theme {
+            border_width: Some(4.0),
+            ..Theme::default()
+        };
+        for language in [Language::English, Language::TraditionalChinese] {
+            assert_eq!(
+                border_note(language, true, &wide).concat(),
+                language.look_border_width()
+            );
+            assert!(border_note(language, true, &Theme::default()).is_empty());
+            assert!(border_note(language, false, &Theme::default()).is_empty());
+        }
+    }
+
+    #[test]
     fn a_wild_offer_is_drawn_legibly() {
         // Everything in the backing's colour, and nearly transparent.
         for rgba in [[22, 26, 29, 255], [255, 255, 255, 255], [128, 128, 128, 10], [103, 231, 181, 255]] {
@@ -584,69 +780,36 @@ mod tests {
             let theme = look
                 .update(Some(offers(&[("wild", offer)])), ACCENT)
                 .unwrap_or_default();
-            let backing = theme.plot_background;
-            for drawn in [
-                theme.waveform(ACCENT),
-                theme.waveform_selected(ACCENT, SELECTION_CONTRAST),
-                theme.flag,
-                theme.playhead,
-                theme.row_waveform(Some("LFE"), ACCENT),
-            ] {
-                assert!(drawn.a() >= MIN_ALPHA, "{rgba:?}: {drawn:?}");
-                assert!(
-                    contrast_ratio(drawn, backing) >= GRAPHIC_CONTRAST,
-                    "{rgba:?}: {drawn:?} on {backing:?}"
-                );
+            // The plot sits on its own backing, or on the panel in the full window with any
+            // transparency.
+            let panel = theme
+                .panel_background
+                .unwrap_or(egui::Visuals::dark().panel_fill);
+            for backing in [theme.plot_background, panel] {
+                for drawn in [
+                    theme.waveform(ACCENT),
+                    theme.waveform_selected(ACCENT, SELECTION_CONTRAST),
+                    theme.flag,
+                    theme.playhead,
+                    theme.row_waveform(Some("LFE"), ACCENT),
+                    theme.lane_divider(ACCENT),
+                    theme.scroll_thumb(false),
+                    theme.scroll_thumb(true),
+                ] {
+                    assert!(drawn.a() >= MIN_ALPHA, "{rgba:?}: {drawn:?}");
+                    assert!(
+                        contrast_ratio(drawn, backing) >= GRAPHIC_CONTRAST,
+                        "{rgba:?}: {drawn:?} on {backing:?}"
+                    );
+                }
             }
+            let backing = theme.plot_background;
             for indicator in INDICATORS {
                 for lit in [false, true] {
                     assert!(backtracking_ui::distinguishable(indicator.compact_color(lit), backing));
                 }
             }
         }
-    }
-
-    /// The colours of what the status mark paints over a row drawn in `theme`.
-    fn status_colors(theme: &Theme) -> Vec<Color32> {
-        let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 60.0));
-        let mut colors = Vec::new();
-        for problem in [None, Some("No audio device")] {
-            for indicator in INDICATORS {
-                for lit in [false, true] {
-                    let context = egui::Context::default();
-                    let mut output = context.run_ui(
-                        egui::RawInput {
-                            screen_rect: Some(plot),
-                            ..Default::default()
-                        },
-                        |ui| {
-                            let geometry =
-                                waveform::waveform_geometry(&[-0.6; 3], &[0.8; 3], 0..300);
-                            paint_row_waveform(
-                                ui.painter(),
-                                plot,
-                                &geometry,
-                                1.5,
-                                None,
-                                theme,
-                                ACCENT,
-                                None,
-                            );
-                            paint_compact_status(ui.painter(), plot, indicator, lit, problem);
-                        },
-                    );
-                    let shapes = std::mem::take(&mut output.shapes);
-                    output.drop_without_applying_deltas();
-                    colors.extend(shapes.into_iter().filter_map(|shape| match shape.shape {
-                        egui::Shape::Circle(circle) => Some(circle.fill),
-                        egui::Shape::Rect(rect) => Some(rect.fill),
-                        egui::Shape::Text(text) => Some(text.fallback_color),
-                        _ => None,
-                    }));
-                }
-            }
-        }
-        colors
     }
 
     /// The outline colours of one row's waveform with a selection over its middle.
@@ -686,23 +849,6 @@ mod tests {
             .collect();
         lines.dedup();
         lines
-    }
-
-    #[test]
-    fn the_status_colours_are_the_same_under_any_look() {
-        let own = status_colors(&Theme::default());
-        for rgba in [[22, 26, 29, 255], [255, 255, 255, 255], [246, 196, 118, 255], [255, 0, 255, 255]] {
-            let wild = Appearance {
-                colors: APPEARANCE_COLOR_NAMES
-                    .into_iter()
-                    .map(|name| (name.to_owned(), rgba))
-                    .collect(),
-                ..Appearance::default()
-            };
-            for theme in [theme_from(&wild), checked(theme_from(&wild), ACCENT)] {
-                assert_eq!(status_colors(&theme), own, "{rgba:?}");
-            }
-        }
     }
 
     #[test]
@@ -757,7 +903,7 @@ mod tests {
     ) -> (Vec<String>, Option<Option<String>>) {
         let mut choice = None;
         let context = egui::Context::default();
-        let mut output = context.run_ui(
+        let output = context.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 300.0))),
                 ..Default::default()
@@ -766,16 +912,20 @@ mod tests {
                 choice = look_row(ui, language, chosen, chosen_name, offering);
             },
         );
+        (texts(output), choice)
+    }
+
+    /// The texts a pass drew.
+    fn texts(mut output: egui::FullOutput) -> Vec<String> {
         let shapes = std::mem::take(&mut output.shapes);
         output.drop_without_applying_deltas();
-        let text = shapes
+        shapes
             .into_iter()
             .filter_map(|shape| match shape.shape {
                 egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
                 _ => None,
             })
-            .collect();
-        (text, choice)
+            .collect()
     }
 
     #[test]

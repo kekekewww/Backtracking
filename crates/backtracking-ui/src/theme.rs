@@ -325,6 +325,9 @@ pub struct Legibility<'a> {
     pub panel_marks: &'a [Color32],
     /// The colour of the window's own text on the panel.
     pub panel_text: Color32,
+    /// The panel's colour where a look leaves it alone. In the full window with any
+    /// transparency the plot has no backing of its own and sits on the panel.
+    pub panel_fill: Color32,
 }
 
 /// A token [`Theme::legible`] can put back to the window's own value.
@@ -340,10 +343,14 @@ enum Token {
     RowLabel,
     ChipText,
     ChipBackground,
+    ChipCurrent,
+    PreviewHighlight,
+    LaneDivider,
+    ScrollThumb,
 }
 
 /// The first token that is set (`true`), which is the one a failed pair blames.
-fn blame<const N: usize>(candidates: [(bool, Token); N]) -> Option<Token> {
+fn blame(candidates: impl IntoIterator<Item = (bool, Token)>) -> Option<Token> {
     candidates
         .into_iter()
         .find_map(|(set, token)| set.then_some(token))
@@ -357,10 +364,12 @@ impl Theme {
     ///
     /// A pair fails when it is short of [`GRAPHIC_CONTRAST`], [`TEXT_CONTRAST`], [`MIN_ALPHA`]
     /// or [`MARK_DISTANCE`], or when the selection is not apart from the waveform as
-    /// [`selected_waveform_color`] asks. A failed pair puts back the token the look set that
-    /// is drawn on top (the waveform before the plot's backing), and the pairs are checked
-    /// again until every one the look has a part in passes. Pairs made only of the window's
-    /// own values, such as the user's accent on the usual backing, are not checked.
+    /// [`selected_waveform_color`] asks. What the plot draws is checked on both backings it
+    /// can sit on: its own and the panel's. A failed pair puts back the token the look set
+    /// that is drawn on top (the waveform before a backing), and the pairs are checked again
+    /// until every one the look has a part in passes. Pairs made only of the window's own
+    /// values, such as the user's accent on the usual backing, are not checked. The centre
+    /// line, the guide lines and the border are decoration and are not checked.
     pub fn legible(mut self, needs: &Legibility) -> Self {
         self.plot_background = opaque(self.plot_background);
         self.panel_background = self.panel_background.map(opaque);
@@ -392,88 +401,146 @@ impl Theme {
             Token::RowLabel => self.row_label = own.row_label,
             Token::ChipText => self.chip_text = own.chip_text,
             Token::ChipBackground => self.chip_background = own.chip_background,
+            Token::ChipCurrent => self.chip_current = own.chip_current,
+            Token::PreviewHighlight => self.preview_highlight = own.preview_highlight,
+            Token::LaneDivider => self.lane_divider = own.lane_divider,
+            Token::ScrollThumb => self.scroll_thumb = own.scroll_thumb,
         }
     }
 
     /// The token to put back for the first pair that fails, if any does.
+    ///
+    /// The plot sits on its own backing, and in the full window with any transparency on the
+    /// panel's instead, so what is drawn on it has to read on both. A pair that fails on a
+    /// backing blames what the look drew on top first, then that backing.
     fn illegible(&self, needs: &Legibility) -> Option<Token> {
         use Token::*;
         let own = Self::default();
-        let backing = self.plot_background;
-        let backing_set = backing != own.plot_background;
-        let graphic = |color: Color32| {
-            color.a() >= MIN_ALPHA && contrast_ratio(over(color, backing), backing) >= GRAPHIC_CONTRAST
+        let plot = self.plot_background;
+        let plot_set = plot != own.plot_background;
+        let panel = self.panel_background.unwrap_or(needs.panel_fill);
+        let panel_set = self.panel_background.is_some();
+        let backings = [(plot, plot_set, PlotBackground), (panel, panel_set, PanelBackground)];
+        // The first token to blame when `reads` fails on a backing: one of `drawn` that the
+        // look set, else that backing if the look set it.
+        let on_backings = |reads: &dyn Fn(Color32) -> bool, drawn: &[(bool, Token)]| {
+            backings.iter().find_map(|(backing, set, token)| {
+                if reads(*backing) {
+                    return None;
+                }
+                blame(drawn.iter().cloned().chain([(*set, token.clone())]))
+            })
+        };
+        let graphic = |color: Color32, backing: Color32| {
+            color.a() >= MIN_ALPHA
+                && contrast_ratio(over(color, backing), backing) >= GRAPHIC_CONTRAST
         };
         let text = |color: Color32, behind: Color32| {
             contrast_ratio(over(color, behind), behind) >= TEXT_CONTRAST
         };
-        let distinct = |a: Color32, b: Color32| {
+        let distinct = |a: Color32, b: Color32, backing: Color32| {
             apart(over(a, backing), over(b, backing), needs.selection_contrast)
         };
-
         let marks_lost = |behind: Color32, marks: &[Color32]| {
             marks.iter().any(|&mark| !distinguishable(mark, behind))
         };
-        if marks_lost(backing, needs.plot_marks)
-            && let Some(token) = blame([(backing_set, PlotBackground)])
-        {
-            return Some(token);
+
+        // The capture status mark is drawn on the plot's own backing, the status light and
+        // the window's text on the panel.
+        if plot_set && marks_lost(plot, needs.plot_marks) {
+            return Some(PlotBackground);
         }
+        if panel_set && (marks_lost(panel, needs.panel_marks) || !text(needs.panel_text, panel)) {
+            return Some(PanelBackground);
+        }
+
         let waveform = self.waveform(needs.accent);
-        if !graphic(waveform)
-            && let Some(token) = blame([(self.waveform.is_some(), Waveform), (backing_set, PlotBackground)])
-        {
+        let waveform_set = self.waveform.is_some();
+        if let Some(token) = on_backings(&|b| graphic(waveform, b), &[(waveform_set, Waveform)]) {
             return Some(token);
         }
         let selected = self.waveform_selected(needs.accent, needs.selection_contrast);
-        if !(graphic(selected) && distinct(selected, waveform))
-            && let Some(token) = blame([
-                (self.waveform_selected.is_some(), WaveformSelected),
-                (self.waveform.is_some(), Waveform),
-                (backing_set, PlotBackground),
-            ])
-        {
+        if let Some(token) = on_backings(
+            &|b| graphic(selected, b) && distinct(selected, waveform, b),
+            &[(self.waveform_selected.is_some(), WaveformSelected), (waveform_set, Waveform)],
+        ) {
             return Some(token);
         }
-        if let Some(label) = self
-            .row_colors
-            .iter()
-            .find(|&(_, &color)| !(graphic(color) && distinct(color, selected)))
-            .map(|(label, _)| label)
-        {
-            return Some(Row(label.clone()));
+        for (label, &color) in &self.row_colors {
+            let reads = |b| graphic(color, b) && distinct(color, selected, b);
+            if backings.iter().any(|(backing, ..)| !reads(*backing)) {
+                return Some(Row(label.clone()));
+            }
         }
         for (color, own_color, token) in [
             (self.flag, own.flag, Flag),
             (self.playhead, own.playhead, Playhead),
         ] {
-            if !graphic(color)
-                && let Some(token) = blame([(color != own_color, token), (backing_set, PlotBackground)])
+            if let Some(token) = on_backings(&|b| graphic(color, b), &[(color != own_color, token)]) {
+                return Some(token);
+            }
+        }
+        if let Some(token) = on_backings(
+            &|b| text(self.row_label, b),
+            &[(self.row_label != own.row_label, RowLabel)],
+        ) {
+            return Some(token);
+        }
+
+        // The group switch: its names on its backing, and white for the current group and
+        // the one under the pointer.
+        let chip_background_set = self.chip_background != own.chip_background;
+        let chip_current_set = self.chip_current.is_some();
+        let chip_current = self.chip_current(needs.accent);
+        if let Some(token) = on_backings(
+            &|b| text(self.chip_text, over(self.chip_background, b)),
+            &[
+                (self.chip_text != own.chip_text, ChipText),
+                (chip_background_set, ChipBackground),
+            ],
+        ) {
+            return Some(token);
+        }
+        for (backing, ..) in &backings {
+            let switch = over(self.chip_background, *backing);
+            let current = over(chip_current, switch);
+            if !text(Color32::WHITE, switch)
+                && let Some(token) = blame([(chip_background_set, ChipBackground)])
+            {
+                return Some(token);
+            }
+            if !(text(Color32::WHITE, current)
+                && apart(current, switch, needs.selection_contrast))
+                && let Some(token) = blame([
+                    (chip_current_set, ChipCurrent),
+                    (chip_background_set, ChipBackground),
+                ])
             {
                 return Some(token);
             }
         }
-        if !text(self.row_label, backing)
-            && let Some(token) = blame([
-                (self.row_label != own.row_label, RowLabel),
-                (backing_set, PlotBackground),
-            ])
+
+        // Highlights and lines a look may colour, judged only when it does.
+        if let Some(highlight) = self.preview_highlight
+            && (highlight.a() < MIN_ALPHA
+                || backings
+                    .iter()
+                    .any(|(backing, ..)| !distinct(highlight, waveform, *backing)))
         {
-            return Some(token);
+            return Some(PreviewHighlight);
         }
-        if !text(self.chip_text, over(self.chip_background, backing))
-            && let Some(token) = blame([
-                (self.chip_text != own.chip_text, ChipText),
-                (self.chip_background != own.chip_background, ChipBackground),
-                (backing_set, PlotBackground),
-            ])
+        if let Some(divider) = self.lane_divider
+            && backings.iter().any(|(backing, ..)| !graphic(divider, *backing))
         {
-            return Some(token);
+            return Some(LaneDivider);
         }
-        if let Some(panel) = self.panel_background
-            && (marks_lost(panel, needs.panel_marks) || !text(needs.panel_text, panel))
+        if self.scroll_thumb.is_some()
+            && backings.iter().any(|(backing, ..)| {
+                !(graphic(self.scroll_thumb(false), *backing)
+                    && graphic(self.scroll_thumb(true), *backing))
+            })
         {
-            return Some(PanelBackground);
+            return Some(ScrollThumb);
         }
         None
     }
@@ -739,7 +806,144 @@ mod tests {
             plot_marks: &PLOT_MARKS,
             panel_marks: &PANEL_MARKS,
             panel_text: Color32::from_gray(140),
+            panel_fill: PANEL_FILL,
         }
+    }
+
+    /// Both backings the plot can sit on: its own, and the panel in the full window with any
+    /// transparency.
+    fn backings(theme: &Theme) -> [Color32; 2] {
+        [theme.plot_background, theme.panel_background.unwrap_or(PANEL_FILL)]
+    }
+
+    /// Whether `color` is drawn visibly and with graphic contrast on every backing.
+    fn reads_on_both(theme: &Theme, color: Color32) -> bool {
+        color.a() >= MIN_ALPHA
+            && backings(theme)
+                .into_iter()
+                .all(|backing| contrast_ratio(over(color, backing), backing) >= GRAPHIC_CONTRAST)
+    }
+
+    #[test]
+    fn a_white_panel_cannot_hide_what_the_plot_draws_on_it() {
+        let theme = Theme {
+            panel_background: Some(Color32::WHITE),
+            ..Theme::default()
+        };
+        // The window's own playhead on white is about 1.09 : 1.
+        assert!(!theme.is_legible(&needs(ACCENT)));
+        let theme = theme.legible(&needs(ACCENT));
+        assert!(theme.is_legible(&needs(ACCENT)));
+        assert_eq!(theme.panel_background, None);
+        for drawn in [theme.playhead, theme.flag, theme.waveform(ACCENT)] {
+            assert!(reads_on_both(&theme, drawn), "{drawn:?}");
+        }
+        // A panel that keeps everything readable stays, and so do the lines that read on it.
+        let dark = Theme {
+            panel_background: Some(Color32::from_rgb(10, 14, 40)),
+            playhead: Color32::from_rgb(250, 250, 120),
+            ..Theme::default()
+        };
+        assert_eq!(dark.clone().legible(&needs(ACCENT)), dark);
+    }
+
+    #[test]
+    fn a_light_plot_with_dark_lines_reads_on_the_dark_panel_too() {
+        let theme = Theme {
+            plot_background: Color32::WHITE,
+            waveform: Some(Color32::from_rgb(20, 20, 20)),
+            waveform_selected: Some(Color32::from_rgb(200, 0, 0)),
+            flag: Color32::from_rgb(40, 0, 0),
+            playhead: Color32::BLACK,
+            row_label: Color32::BLACK,
+            ..Theme::default()
+        };
+        // Each reads on white, which is the plot's own backing.
+        assert!(contrast_ratio(Color32::from_rgb(20, 20, 20), Color32::WHITE) > 10.0);
+        let theme = theme.legible(&needs(ACCENT));
+        assert!(theme.is_legible(&needs(ACCENT)), "{theme:?}");
+        for drawn in [
+            theme.waveform(ACCENT),
+            theme.waveform_selected(ACCENT, 80),
+            theme.flag,
+            theme.playhead,
+        ] {
+            assert!(reads_on_both(&theme, drawn), "{drawn:?}");
+        }
+        for backing in backings(&theme) {
+            assert!(contrast_ratio(over(theme.row_label, backing), backing) >= TEXT_CONTRAST);
+        }
+    }
+
+    #[test]
+    fn a_drag_highlight_must_be_visible_and_apart_from_the_waveform() {
+        for highlight in [
+            Color32::from_rgba_unmultiplied(200, 60, 60, 40),
+            Color32::from_rgb(100, 228, 178),
+        ] {
+            let theme = Theme {
+                preview_highlight: Some(highlight),
+                ..Theme::default()
+            };
+            assert_eq!(theme.legible(&needs(ACCENT)).preview_highlight, None, "{highlight:?}");
+        }
+        let kept = Theme {
+            preview_highlight: Some(Color32::from_rgb(60, 30, 90)),
+            ..Theme::default()
+        };
+        assert_eq!(kept.clone().legible(&needs(ACCENT)), kept);
+    }
+
+    #[test]
+    fn the_group_switchs_white_names_and_current_group_stay_readable() {
+        // White on a light current group.
+        let theme = Theme {
+            chip_current: Some(Color32::from_gray(230)),
+            ..Theme::default()
+        };
+        assert_eq!(theme.legible(&needs(ACCENT)).chip_current, None);
+        // White on a light switch, where the pointer is.
+        let theme = Theme {
+            chip_background: Color32::from_gray(235),
+            chip_text: Color32::BLACK,
+            ..Theme::default()
+        };
+        let theme = theme.legible(&needs(ACCENT));
+        assert_eq!(theme.chip_background, Theme::default().chip_background);
+        // The current group lost on the switch.
+        let theme = Theme {
+            chip_current: Some(Color32::from_rgb(4, 6, 8)),
+            ..Theme::default()
+        };
+        assert_eq!(theme.legible(&needs(ACCENT)).chip_current, None);
+        let kept = Theme {
+            chip_current: Some(Color32::from_rgb(20, 60, 160)),
+            ..Theme::default()
+        };
+        assert_eq!(kept.clone().legible(&needs(ACCENT)), kept);
+    }
+
+    #[test]
+    fn the_lane_divider_and_scroll_thumb_must_read_on_both_backings() {
+        for color in [
+            Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+            PLOT_BACKGROUND,
+            PANEL_FILL,
+        ] {
+            let theme = Theme {
+                lane_divider: Some(color),
+                scroll_thumb: Some(color),
+                ..Theme::default()
+            }
+            .legible(&needs(ACCENT));
+            assert_eq!((theme.lane_divider, theme.scroll_thumb), (None, None), "{color:?}");
+        }
+        let kept = Theme {
+            lane_divider: Some(Color32::from_rgb(200, 120, 255)),
+            scroll_thumb: Some(Color32::from_gray(150)),
+            ..Theme::default()
+        };
+        assert_eq!(kept.clone().legible(&needs(ACCENT)), kept);
     }
 
     /// A dark blue backing that keeps every plot mark apart, with the accent and its
@@ -907,7 +1111,8 @@ mod tests {
         assert_eq!(theme.row_label, Theme::default().row_label);
         assert_eq!(theme.chip_text, Theme::default().chip_text);
         // A group switch backing that hides the window's own names goes; one that keeps a
-        // look's names readable stays.
+        // look's names readable stays. A light switch never does: the current group's name
+        // and the one under the pointer are white.
         let theme = Theme {
             chip_background: Color32::from_gray(180),
             ..Theme::default()
@@ -915,8 +1120,9 @@ mod tests {
         .legible(&needs(ACCENT));
         assert_eq!(theme.chip_background, Theme::default().chip_background);
         let readable = Theme {
-            chip_background: Color32::from_gray(230),
-            chip_text: Color32::from_gray(20),
+            // Dark, and apart from the current group's muted accent.
+            chip_background: Color32::from_rgb(130, 10, 30),
+            chip_text: Color32::from_gray(210),
             ..Theme::default()
         };
         assert_eq!(readable.clone().legible(&needs(ACCENT)), readable);
@@ -1005,28 +1211,37 @@ mod tests {
                 let needs = needs(accent);
                 let theme = all_one_colour(color).legible(&needs);
                 assert!(theme.is_legible(&needs), "{color:?} with accent {accent:?}: {theme:?}");
-                // Spelled out: what the look still sets stands out from the backing, and so does
-                // all that is drawn on a backing of the look's.
+                // Spelled out: what the look still sets stands out from both backings the plot
+                // can sit on, and so does all that is drawn on a backing of the look's.
                 let own = Theme::default();
-                let backing = theme.plot_background;
-                let backing_set = backing != own.plot_background;
-                let drawn = [
-                    (theme.waveform.is_some(), theme.waveform(accent)),
-                    (theme.waveform_selected.is_some(), theme.waveform_selected(accent, 80)),
-                    (theme.flag != own.flag, theme.flag),
-                    (theme.playhead != own.playhead, theme.playhead),
-                ]
-                .into_iter()
-                .chain(theme.row_colors.values().map(|&row| (true, row)));
-                for (set, drawn) in drawn {
-                    if set || backing_set {
-                        assert!(drawn.a() >= MIN_ALPHA);
-                        assert!(contrast_ratio(over(drawn, backing), backing) >= GRAPHIC_CONTRAST);
+                for (backing, backing_set) in [
+                    (theme.plot_background, theme.plot_background != own.plot_background),
+                    (theme.panel_background.unwrap_or(PANEL_FILL), theme.panel_background.is_some()),
+                ] {
+                    let drawn = [
+                        (theme.waveform.is_some(), theme.waveform(accent)),
+                        (theme.waveform_selected.is_some(), theme.waveform_selected(accent, 80)),
+                        (theme.flag != own.flag, theme.flag),
+                        (theme.playhead != own.playhead, theme.playhead),
+                    ]
+                    .into_iter()
+                    .chain(theme.row_colors.values().map(|&row| (true, row)))
+                    .chain(theme.lane_divider.map(|divider| (true, divider)))
+                    .chain(theme.scroll_thumb.map(|thumb| (true, thumb)));
+                    for (set, drawn) in drawn {
+                        if set || backing_set {
+                            assert!(drawn.a() >= MIN_ALPHA);
+                            assert!(
+                                contrast_ratio(over(drawn, backing), backing) >= GRAPHIC_CONTRAST,
+                                "{drawn:?} on {backing:?}"
+                            );
+                        }
+                    }
+                    if theme.row_label != own.row_label || backing_set {
+                        assert!(contrast_ratio(over(theme.row_label, backing), backing) >= TEXT_CONTRAST);
                     }
                 }
-                if theme.row_label != own.row_label || backing_set {
-                    assert!(contrast_ratio(over(theme.row_label, backing), backing) >= TEXT_CONTRAST);
-                }
+                let backing = theme.plot_background;
                 for mark in PLOT_MARKS {
                     assert!(distinguishable(mark, backing) || backing == PLOT_BACKGROUND);
                 }

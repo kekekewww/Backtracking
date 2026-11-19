@@ -316,6 +316,14 @@ impl Language {
         )
     }
 
+    /// Under the Border width control while the chosen look sets its own width.
+    pub(crate) fn look_border_width(self) -> &'static str {
+        self.pick(
+            "The chosen look sets its own width, which is used while that look is on.",
+            "目前選用的外觀有自己的寬度，使用該外觀期間以它為準。",
+        )
+    }
+
     /// The chosen add-on is not running or offers no look; the choice is kept.
     pub(crate) fn look_not_offered(self, addon: &str) -> String {
         match self {
@@ -1278,6 +1286,7 @@ mod tests {
             super::Language::look_field,
             super::Language::look_none,
             super::Language::look_none_offered,
+            super::Language::look_border_width,
         ]
         .into_iter()
         .map(|text| {

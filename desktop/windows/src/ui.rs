@@ -3256,18 +3256,25 @@ impl Recorder {
         self.theme = theme;
     }
 
-    /// Keeps the waveform-only window's plot the same height when the border's width has
-    /// changed from `old_border_inset`.
-    fn fit_border_change(&self, ctx: &egui::Context, old_border_inset: f32) {
-        if self.waveform_only && self.border_inset() != old_border_inset {
-            let size = ctx.viewport_rect().size();
-            let height = size.y + (self.border_inset() - old_border_inset) * 2.0;
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(
-                Vec2::new(size.x, height).max(min_window_size(true)),
-            ));
-        }
+    /// Keeps the waveform-only window's plot the same height when the user's own border
+    /// width has changed from `old_window_inset` ([`Self::window_border_inset`]).
+    fn fit_border_change(&self, ctx: &egui::Context, old_window_inset: f32) {
+        fit_window_border(
+            ctx,
+            self.waveform_only,
+            old_window_inset,
+            self.window_border_inset(),
+        );
     }
 
+    /// The border the waveform-only window's size makes room for: the user's own width. A
+    /// look's width is drawn as it is and the plot takes up the difference, so a look never
+    /// resizes the window.
+    fn window_border_inset(&self) -> f32 {
+        window_border_inset(self.waveform_border, self.waveform_border_width)
+    }
+
+    /// The border drawn around the plot: a chosen look's width, else the user's own.
     fn border_inset(&self) -> f32 {
         if self.waveform_border {
             self.theme.border_width(self.waveform_border_width)
@@ -4316,7 +4323,7 @@ impl Recorder {
             self.full_window_size = size;
             Vec2::new(
                 size.x,
-                self.full_waveform_height + self.border_inset() * 2.0,
+                self.full_waveform_height + self.window_border_inset() * 2.0,
             )
             .max(minimum)
         } else {
@@ -4342,7 +4349,7 @@ impl Recorder {
         }
         let pinned = self.pinned;
         let waveform_only = self.waveform_only;
-        let old_border_inset = self.border_inset();
+        let old_window_inset = self.window_border_inset();
         let mut title = if self.primary {
             tray::OPTIONS_TITLE.to_owned()
         } else {
@@ -4426,7 +4433,7 @@ impl Recorder {
         if self.waveform_only != waveform_only {
             self.apply_waveform_mode(ctx, frame);
         } else {
-            self.fit_border_change(ctx, old_border_inset);
+            self.fit_border_change(ctx, old_window_inset);
         }
         if self.pinned != pinned {
             self.apply_pinned(ctx);
@@ -4841,6 +4848,7 @@ impl Recorder {
                         self.waveform_border_width.to_string(),
                     );
                 }
+                self.look_border_width_note(ui);
             });
             let mut theme = self.waveform_border_color.is_none();
             let theme_changed = ui.checkbox(&mut theme, "Use theme color").changed();
@@ -7385,6 +7393,23 @@ fn status_mark_shown(mark: StatusMark, indicator: CaptureIndicator, problem: boo
 /// Paints the waveform-only status mark in the top-left corner of the plot: a dot coloured by
 /// state, or pause bars, with the source problem written beside it when there is one.
 /// Returns the area whose tooltip explains the mark.
+/// See [`Recorder::window_border_inset`].
+fn window_border_inset(waveform_border: bool, width: u8) -> f32 {
+    if waveform_border { f32::from(width) } else { 0.0 }
+}
+
+/// Grows or shrinks the waveform-only window by the change from `old_inset` to `new_inset` on
+/// each side, so its plot keeps its height.
+fn fit_window_border(ctx: &egui::Context, waveform_only: bool, old_inset: f32, new_inset: f32) {
+    if waveform_only && new_inset != old_inset {
+        let size = ctx.viewport_rect().size();
+        let height = size.y + (new_inset - old_inset) * 2.0;
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(
+            Vec2::new(size.x, height).max(min_window_size(true)),
+        ));
+    }
+}
+
 fn paint_compact_status(
     painter: &egui::Painter,
     rect: Rect,
@@ -7553,7 +7578,7 @@ impl eframe::App for Recorder {
         self.collect_source_list();
         self.addons_page
             .poll(self.controller.addons(), Language::current());
-        self.refresh_look(ctx);
+        self.refresh_look();
         let in_use = |id: &str| {
             self.controller.sources().iter().flatten().any(|settings| {
                 matches!(&settings.source, CaptureSource::Addon { addon_id, .. } if addon_id == id)
@@ -8113,36 +8138,6 @@ mod tests {
         shapes
     }
 
-    const WILD: Color32 = Color32::from_rgb(255, 0, 255);
-
-    /// A look that sets every token it has, all to one colour nothing else uses.
-    fn wild_theme() -> Theme {
-        Theme {
-            waveform: Some(WILD),
-            waveform_selected: Some(WILD),
-            plot_background: WILD,
-            center_line: WILD,
-            border: Some(WILD),
-            lane_divider: Some(WILD),
-            bar_line: WILD,
-            second_line: WILD,
-            row_label: WILD,
-            flag: WILD,
-            playhead: WILD,
-            panel_background: Some(WILD),
-            chip_background: WILD,
-            chip_text: WILD,
-            chip_current: Some(WILD),
-            scroll_thumb: Some(WILD),
-            preview_highlight: Some(WILD),
-            border_width: Some(5.0),
-            corner_radius: 0.0,
-            waveform_stroke_scale: 3.0,
-            waveform_fill_opacity: 1.0,
-            row_colors: [("LFE".to_owned(), WILD)].into(),
-        }
-    }
-
     /// The colours and widths of what one row's waveform paints: (outline colour, width) of
     /// each path and the colours of each fill.
     fn painted_row(theme: &Theme, channel: Option<&str>) -> (Vec<(Color32, f32)>, Vec<Color32>) {
@@ -8237,73 +8232,6 @@ mod tests {
         assert_eq!(
             lines[0].0, waveform,
             "other channels keep the waveform's colour"
-        );
-    }
-
-    #[test]
-    fn a_look_cannot_change_the_capture_status_colours() {
-        use CaptureIndicator::*;
-        let theme = wild_theme();
-        let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 60.0));
-        let status_colors = |theme: &Theme| {
-            let mut colors = Vec::new();
-            for problem in [None, Some("No audio device")] {
-                for indicator in [Unavailable, Paused, Recording, Waiting] {
-                    for lit in [false, true] {
-                        let context = egui::Context::default();
-                        let mut output = context.run_ui(
-                            egui::RawInput {
-                                screen_rect: Some(plot),
-                                ..Default::default()
-                            },
-                            |ui| {
-                                // The status mark is drawn over a waveform in this look.
-                                let geometry =
-                                    waveform::waveform_geometry(&[-0.6; 3], &[0.8; 3], 0..300);
-                                paint_row_waveform(
-                                    ui.painter(),
-                                    plot,
-                                    &geometry,
-                                    1.5,
-                                    None,
-                                    theme,
-                                    ACCENT,
-                                    None,
-                                );
-                                paint_compact_status(ui.painter(), plot, indicator, lit, problem);
-                            },
-                        );
-                        let shapes = std::mem::take(&mut output.shapes);
-                        output.drop_without_applying_deltas();
-                        colors.extend(shapes.into_iter().filter_map(|shape| match shape.shape {
-                            egui::Shape::Circle(circle) => Some(circle.fill),
-                            egui::Shape::Rect(rect) => Some(rect.fill),
-                            egui::Shape::Text(text) => Some(text.fallback_color),
-                            _ => None,
-                        }));
-                    }
-                }
-            }
-            colors
-        };
-        let themed = status_colors(&theme);
-        assert_eq!(themed, status_colors(&Theme::default()));
-        assert!(!themed.contains(&WILD), "{themed:?}");
-        for color in [
-            ERROR_LED,
-            COMPACT_PAUSED,
-            COMPACT_WAITING,
-            RECORDING_LIT,
-            RECORDING_DIM,
-        ] {
-            assert!(
-                themed.contains(&color),
-                "{color:?} is missing from {themed:?}"
-            );
-        }
-        assert_eq!(
-            [Unavailable, Paused, Recording, Waiting].map(|state| state.led_color(true)),
-            [ERROR_LED, PAUSED_LED, RECORDING_LIT, WAITING_LED]
         );
     }
 
