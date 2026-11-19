@@ -218,6 +218,13 @@ enum WavChannelMap {
 
 impl WavChannelMap {
     fn from_route(route: ChannelRoute, channels: usize, force_mono: bool) -> io::Result<Self> {
+        // All channels keeps every captured channel, as Merged does. A device that offered more
+        // than two channels when the route was chosen may give one or two now; its audio is
+        // then captured merged, and must be written the same way.
+        let route = match route {
+            ChannelRoute::AllChannels => ChannelRoute::Merged,
+            route => route,
+        };
         match (route, channels, force_mono) {
             (ChannelRoute::Merged, 2, true) => Ok(Self::Downmix),
             (ChannelRoute::Merged, 1..=64, false) => Ok(Self::Unchanged),
@@ -2305,6 +2312,9 @@ mod tests {
             ),
             (ChannelRoute::Merged, 1, &mono[..], 1, &mono[..]),
             (ChannelRoute::Merged, 2, &stereo[..], 2, &stereo[..]),
+            // All channels chosen on a wider device that now gives one or two channels.
+            (ChannelRoute::AllChannels, 1, &mono[..], 1, &mono[..]),
+            (ChannelRoute::AllChannels, 2, &stereo[..], 2, &stereo[..]),
         ] {
             let path = export_routed_wav_with_profile(
                 &dir,
