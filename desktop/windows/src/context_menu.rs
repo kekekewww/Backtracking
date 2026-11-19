@@ -249,7 +249,7 @@ pub(crate) fn show(window: &Window, entries: &[Entry]) -> Option<WindowCommand> 
 #[cfg(test)]
 mod tests {
     use super::{Entry, State, Transport, WindowCommand};
-    use crate::hotkeys::{Action, Binding, Hotkeys, Key, Modifiers};
+    use crate::hotkeys::{Action, Hotkeys};
 
     fn state() -> State {
         State {
@@ -263,7 +263,8 @@ mod tests {
         }
     }
 
-    /// Names each command's first binding, as the recorder window does in English.
+    /// Names each command's first binding. The recorder window names them through the Hotkeys
+    /// page (`ui::menu_entries`), which its own tests check.
     fn shortcuts(hotkeys: &Hotkeys) -> impl Fn(WindowCommand) -> Option<String> + '_ {
         |command| {
             hotkeys
@@ -314,65 +315,6 @@ mod tests {
                 "Keep on top",
                 "-",
                 "Options…",
-                "Quit",
-            ]
-        );
-    }
-
-    #[test]
-    fn menu_shortcuts_follow_changed_and_cleared_bindings() {
-        let ctrl = Modifiers {
-            ctrl: true,
-            ..Modifiers::NONE
-        };
-        let mut hotkeys = Hotkeys::defaults();
-        hotkeys.clear(Action::ToggleCapture);
-        hotkeys
-            .set(
-                Action::Clear,
-                &[
-                    Binding::Chord {
-                        key: Key::K,
-                        modifiers: ctrl,
-                    },
-                    Binding::Chord {
-                        key: Key::Delete,
-                        modifiers: Modifiers::NONE,
-                    },
-                ],
-            )
-            .unwrap();
-        hotkeys
-            .set(
-                Action::SeparateLanes,
-                &[Binding::Chord {
-                    key: Key::E,
-                    modifiers: Modifiers::NONE,
-                }],
-            )
-            .unwrap();
-        hotkeys
-            .set(
-                Action::OpenOptions,
-                &[Binding::Chord {
-                    key: Key::Comma,
-                    modifiers: ctrl,
-                }],
-            )
-            .unwrap();
-        assert_eq!(
-            texts(&super::entries(state(), shortcuts(&hotkeys))),
-            [
-                "Pause",
-                // The menu names the first of two.
-                "Clear\tCtrl + K",
-                "Save snapshot",
-                "-",
-                "Edit separately\tE",
-                "Show waveform only",
-                "Keep on top",
-                "-",
-                "Options…\tCtrl + ,",
                 "Quit",
             ]
         );

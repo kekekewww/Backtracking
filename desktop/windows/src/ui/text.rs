@@ -314,6 +314,14 @@ impl Language {
         )
     }
 
+    /// Only the main window keeps settings; another capture window's changes end with it.
+    pub(crate) fn hotkeys_this_window_only(self) -> &'static str {
+        self.pick(
+            "Changes made here apply to this window only and are not kept.",
+            "在這裡所做的變更只套用到這個視窗，且不會保存。",
+        )
+    }
+
     pub(crate) fn hotkeys_system_wide(self) -> &'static str {
         self.pick("System-wide", "全系統")
     }
@@ -409,22 +417,11 @@ impl Language {
                 Self::English => format!("Windows cannot use {key} for a system-wide shortcut."),
                 Self::TraditionalChinese => format!("Windows 無法把 {key} 用於全系統快速鍵。"),
             },
-            BindingError::Reserved(ReservedShortcut::BareTab | ReservedShortcut::BareEnter) => self
-                .pick(
-                    "Tab and Enter on their own move between buttons and press them.",
-                    "單獨的 Tab 與 Enter 用於在按鈕間移動及按下按鈕。",
-                )
-                .to_owned(),
-            BindingError::Reserved(_) => self
-                .pick(
-                    "Windows keeps this shortcut for itself.",
-                    "Windows 保留了這個快速鍵。",
-                )
-                .to_owned(),
+            BindingError::Reserved(shortcut) => self.reserved_shortcut(shortcut).to_owned(),
             BindingError::GlobalNeedsModifier => self
                 .pick(
-                    "A system-wide shortcut needs Ctrl, Shift or Alt.",
-                    "全系統快速鍵需要搭配 Ctrl、Shift 或 Alt。",
+                    "A system-wide shortcut needs Ctrl, Alt or Win.",
+                    "全系統快速鍵需要搭配 Ctrl、Alt 或 Win。",
                 )
                 .to_owned(),
             BindingError::GlobalRightCtrlTap => self
@@ -448,11 +445,47 @@ impl Language {
         }
     }
 
-    pub(crate) fn hotkey_clipboard_keys(self) -> &'static str {
-        self.pick(
-            "The copy, cut and paste keys cannot be used.",
-            "複製、剪下與貼上的按鍵無法使用。",
-        )
+    /// Why a shortcut that Windows, the window or the page keeps cannot be used.
+    fn reserved_shortcut(self, shortcut: ReservedShortcut) -> &'static str {
+        use ReservedShortcut as R;
+        match shortcut {
+            R::AltF4 | R::CtrlAltDelete | R::WinL => self.pick(
+                "Windows keeps this shortcut for itself.",
+                "Windows 保留了這個快速鍵。",
+            ),
+            R::BareTab | R::BareEnter => self.pick(
+                "Tab and Enter on their own move between buttons and press them.",
+                "單獨的 Tab 與 Enter 用於在按鈕間移動及按下按鈕。",
+            ),
+            R::AltGr => self.pick(
+                "Ctrl + Alt with this key types a character on some keyboards.",
+                "在部分鍵盤上，Ctrl + Alt 加這個鍵會輸入字元。",
+            ),
+            R::ZoomIn | R::ZoomOut | R::ZoomReset => self.pick(
+                "The window itself uses this shortcut to zoom.",
+                "視窗本身用這個快速鍵縮放畫面。",
+            ),
+            R::ShiftTab => self.pick(
+                "The window itself uses Shift + Tab to move back between buttons.",
+                "視窗本身用 Shift + Tab 在按鈕間往回移動。",
+            ),
+            R::WindowWinModifier => self.pick(
+                "The Windows key works only in the system-wide shortcut.",
+                "Win 鍵只能用於全系統快速鍵。",
+            ),
+            R::RightCtrlTap => self.pick(
+                "A tap of Right Ctrl works only for Edit separately.",
+                "輕按右 Ctrl 只能用於分開編輯。",
+            ),
+            R::Clipboard => self.pick(
+                "The copy, cut and paste keys cannot be used.",
+                "複製、剪下與貼上的按鍵無法使用。",
+            ),
+            R::DuplicateBinding => self.pick(
+                "This action already has this shortcut.",
+                "這個動作已經有這組快速鍵。",
+            ),
+        }
     }
 
     pub(crate) fn could_not_register(self, error: &str) -> String {
@@ -489,7 +522,10 @@ impl Language {
             ),
             (
                 self.pick("Mouse wheel", "滑鼠滾輪"),
-                self.pick("Zoom", "縮放"),
+                self.pick(
+                    "Zoom; over the side margins of a track whose rows do not fit, scroll its rows",
+                    "縮放；在列數放不下的軌道左右邊緣（含捲軸）上則捲動該軌的列",
+                ),
             ),
             (
                 self.pick("Middle-drag", "按住中鍵拖曳"),
@@ -1459,7 +1495,7 @@ mod tests {
             super::Language::hotkeys_reset_all,
             super::Language::hotkey_right_ctrl,
             super::Language::hotkey_recording_note,
-            super::Language::hotkey_clipboard_keys,
+            super::Language::hotkeys_this_window_only,
             super::Language::mouse_heading,
         ]
         .into_iter()
@@ -1476,21 +1512,92 @@ mod tests {
                 TraditionalChinese.hotkey_action(action).to_owned(),
             ));
         }
+        use ReservedShortcut as R;
+        let reserved = [
+            R::AltF4,
+            R::CtrlAltDelete,
+            R::BareTab,
+            R::BareEnter,
+            R::WinL,
+            R::AltGr,
+            R::ZoomIn,
+            R::ZoomOut,
+            R::ZoomReset,
+            R::ShiftTab,
+            R::WindowWinModifier,
+            R::RightCtrlTap,
+            R::Clipboard,
+            R::DuplicateBinding,
+        ];
         for error in [
             BindingError::TooManyBindings,
             BindingError::KeyRequired,
             BindingError::GlobalNeedsModifier,
             BindingError::GlobalRightCtrlTap,
             BindingError::UnsupportedGlobalKey(Key::F12),
-            BindingError::Reserved(ReservedShortcut::AltF4),
-            BindingError::Reserved(ReservedShortcut::BareTab),
             BindingError::Conflict(Action::Clear),
-        ] {
+        ]
+        .into_iter()
+        .chain(reserved.map(BindingError::Reserved))
+        {
             pairs.push((
                 English.hotkey_problem(error),
                 TraditionalChinese.hotkey_problem(error),
             ));
         }
+        // Only the keys Windows itself keeps say so; every other reason says its own.
+        for language in [English, TraditionalChinese] {
+            let windows = language.hotkey_problem(BindingError::Reserved(R::AltF4));
+            for shortcut in [R::CtrlAltDelete, R::WinL] {
+                assert_eq!(
+                    language.hotkey_problem(BindingError::Reserved(shortcut)),
+                    windows
+                );
+            }
+            let own: Vec<String> = [
+                R::BareTab,
+                R::AltGr,
+                R::ZoomIn,
+                R::ShiftTab,
+                R::WindowWinModifier,
+                R::RightCtrlTap,
+                R::Clipboard,
+                R::DuplicateBinding,
+            ]
+            .map(|shortcut| language.hotkey_problem(BindingError::Reserved(shortcut)))
+            .into();
+            for (index, text) in own.iter().enumerate() {
+                assert_ne!(*text, windows, "{index}");
+                assert!(!own[..index].contains(text), "{text}");
+            }
+            for zoom in [R::ZoomOut, R::ZoomReset] {
+                assert_eq!(
+                    language.hotkey_problem(BindingError::Reserved(zoom)),
+                    own[2]
+                );
+            }
+        }
+        assert_eq!(
+            English.hotkey_problem(BindingError::GlobalNeedsModifier),
+            "A system-wide shortcut needs Ctrl, Alt or Win."
+        );
+        assert_eq!(
+            TraditionalChinese.hotkey_problem(BindingError::GlobalNeedsModifier),
+            "全系統快速鍵需要搭配 Ctrl、Alt 或 Win。"
+        );
+        assert_eq!(
+            English.hotkey_problem(BindingError::Reserved(R::AltGr)),
+            "Ctrl + Alt with this key types a character on some keyboards."
+        );
+        assert_eq!(
+            English.hotkey_problem(BindingError::Reserved(R::RightCtrlTap)),
+            "A tap of Right Ctrl works only for Edit separately."
+        );
+        // A bare cancel key now conflicts with any chord on its key, and says whose it is.
+        assert_eq!(
+            English.hotkey_problem(BindingError::Conflict(Action::CancelSelection)),
+            "Already used by Cancel selection."
+        );
         for ((english_gesture, english), (chinese_gesture, chinese)) in English
             .mouse_gestures()
             .into_iter()

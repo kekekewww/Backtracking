@@ -324,11 +324,11 @@ pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
             // A test copy leaves the shortcut, the tray, the startup entry and updates to the
             // installed app.
             if primary && !test_copy {
-                match SnapshotHotkey::start(context.egui_ctx.clone()) {
-                    Ok(hotkey) => {
-                        recorder.hotkey = Some(hotkey);
-                        recorder.apply_global_hotkeys();
-                    }
+                // Only the saved chords are registered, so a default the user moved or cleared
+                // is never taken from other apps, not even for a moment.
+                let initial = recorder.hotkeys.global_bindings();
+                match SnapshotHotkey::start_with(context.egui_ctx.clone(), initial) {
+                    Ok(hotkey) => recorder.hotkey = Some(hotkey),
                     Err(error) => recorder.hotkey_error = Some(error.to_string()),
                 }
             }
@@ -853,6 +853,17 @@ fn key_effect(command: WindowCommand, has_selection: bool) -> KeyEffect {
 /// The command a tap of Right Ctrl runs, if the Hotkeys page gave it one.
 fn tap_command(hotkeys: &Hotkeys) -> Option<WindowCommand> {
     WindowCommand::for_action(hotkeys.find_binding(Scope::Window, Binding::RightCtrlTap)?)
+}
+
+/// The right-click menu, each item naming its command's first key as the Hotkeys page does.
+fn menu_entries(
+    state: context_menu::State,
+    language: Language,
+    hotkeys: &Hotkeys,
+) -> Vec<context_menu::Entry> {
+    context_menu::entries(state, |command| {
+        hotkeys_page::shortcut_label(language, hotkeys, command.action())
+    })
 }
 
 fn history_label(value: DurationChoice) -> String {
@@ -2607,26 +2618,9 @@ impl Recorder {
         }
     }
 
-    /// Registers the system-wide shortcut the settings hold. Only the main window has one.
-    fn apply_global_hotkeys(&mut self) {
-        if let Some(hotkey) = &self.hotkey
-            && let Err(error) = hotkey.set_bindings(self.hotkeys.global_bindings())
-        {
-            self.hotkey_error = Some(error.to_string());
-        }
-    }
-
     /// Keeps what the Hotkeys page changed. It is in use already.
     fn save_hotkeys(&mut self) {
         self.save_preference(Key::Hotkeys, self.hotkeys.to_json());
-    }
-
-    /// A row of the Hotkeys page records only while the page is in front of the user.
-    fn end_hotkey_recording_away_from_page(&mut self) {
-        if !(self.options_open && self.options_section == OptionsSection::Hotkeys) {
-            let global = hotkeys_page::global(self.hotkey.as_ref());
-            self.hotkeys_page.stop_recording(global);
-        }
     }
 
     fn save_preference(&mut self, key: Key, value: impl AsRef<str>) {
@@ -4200,10 +4194,7 @@ impl Recorder {
             self.open_options(ctx);
             return;
         };
-        let language = Language::current();
-        let entries = context_menu::entries(self.menu_state(), |command| {
-            hotkeys_page::shortcut_label(language, &self.hotkeys, command.action())
-        });
+        let entries = menu_entries(self.menu_state(), Language::current(), &self.hotkeys);
         let command = context_menu::show(window, &entries);
         // The menu ran its own message loop. Time spent reading it is not idle time.
         self.last_interaction = Instant::now();
@@ -4408,9 +4399,6 @@ impl Recorder {
             .is_some_and(|window| window_is_hidden(window))
         {
             self.options_focus_requested = true;
-            // The Options window is not on screen, so no row can be recording.
-            self.hotkeys_page
-                .stop_recording(hotkeys_page::global(self.hotkey.as_ref()));
             return;
         }
         let pinned = self.pinned;
@@ -7828,7 +7816,10 @@ impl eframe::App for Recorder {
         }
         addons_page::paint_drop_hint(ui.ctx(), self.accent, Language::current());
         self.draw_options_window(ui.ctx(), frame);
-        self.end_hotkey_recording_away_from_page();
+        // A row of the Hotkeys page records only while this pass drew the page: not on another
+        // page, nor with the Options window closed or hidden.
+        self.hotkeys_page
+            .end_pass(hotkeys_page::global(self.hotkey.as_ref()));
         // Drawing can start a gesture, an export or the recording blink.
         self.watch_pin(frame, Instant::now());
         self.schedule_wake(ui.ctx(), frame);
@@ -8138,6 +8129,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::hotkeys::{BindingError, ReservedShortcut};
 
     fn painted_waveform(
         minimum: &[f32],
@@ -8904,16 +8896,112 @@ mod tests {
         );
         // Replaced, the tap does nothing.
         assert_eq!(tap_command(&hotkeys), None);
-        // Given to another action, the tap runs that one.
+        // Only Edit separately can have the tap; another action is refused and keeps its keys.
+        for action in [Action::KeepOnTop, Action::CancelSelection] {
+            let before = hotkeys.clone();
+            assert_eq!(
+                hotkeys.set(action, &[Binding::RightCtrlTap]),
+                Err(BindingError::Reserved(ReservedShortcut::RightCtrlTap)),
+                "{action:?}"
+            );
+            assert_eq!(hotkeys, before);
+            assert_eq!(tap_command(&hotkeys), None);
+        }
+        // Back on Edit separately, as its second binding, the tap runs it again.
         hotkeys
-            .set(Action::KeepOnTop, &[Binding::RightCtrlTap])
+            .set(
+                Action::SeparateLanes,
+                &[chord(Modifiers::NONE, K::E), Binding::RightCtrlTap],
+            )
             .unwrap();
-        assert_eq!(tap_command(&hotkeys), Some(WindowCommand::KeepOnTop));
-        hotkeys.clear(Action::KeepOnTop);
+        assert_eq!(tap_command(&hotkeys), Some(WindowCommand::SeparateLanes));
+    }
+
+    /// The menu's texts as `context_menu::show` writes them.
+    fn menu_texts(language: Language, hotkeys: &Hotkeys) -> Vec<String> {
+        let state = context_menu::State {
+            transport: context_menu::Transport::Pause,
+            capture_controls: true,
+            waveform_only: false,
+            keep_on_top: false,
+            several_rows: true,
+            separate_rows: false,
+            separate_label: "Edit separately",
+        };
+        menu_entries(state, language, hotkeys)
+            .iter()
+            .map(|entry| match entry {
+                context_menu::Entry::Separator => "-".to_owned(),
+                context_menu::Entry::Item {
+                    label,
+                    shortcut: Some(shortcut),
+                    ..
+                } => format!("{label}	{shortcut}"),
+                context_menu::Entry::Item { label, .. } => (*label).to_owned(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn menu_shortcuts_follow_changed_and_cleared_bindings() {
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::NONE
+        };
+        let defaults = [
+            "Pause	Space",
+            "Clear	Delete",
+            "Save snapshot",
+            "-",
+            "Edit separately	Right Ctrl",
+            "Show waveform only",
+            "Keep on top",
+            "-",
+            "Options…",
+            "Quit",
+        ];
+        for language in [Language::English, Language::TraditionalChinese] {
+            assert_eq!(menu_texts(language, &Hotkeys::defaults()), defaults);
+        }
+        let mut hotkeys = Hotkeys::defaults();
+        hotkeys.clear(Action::ToggleCapture);
         hotkeys
-            .set(Action::CancelSelection, &[Binding::RightCtrlTap])
+            .set(
+                Action::Clear,
+                &[
+                    chord(ctrl, crate::hotkeys::Key::K),
+                    chord(Modifiers::NONE, crate::hotkeys::Key::Delete),
+                ],
+            )
             .unwrap();
-        assert_eq!(tap_command(&hotkeys), None);
+        hotkeys
+            .set(
+                Action::SeparateLanes,
+                &[chord(Modifiers::NONE, crate::hotkeys::Key::E)],
+            )
+            .unwrap();
+        hotkeys
+            .set(
+                Action::OpenOptions,
+                &[chord(ctrl, crate::hotkeys::Key::Comma)],
+            )
+            .unwrap();
+        assert_eq!(
+            menu_texts(Language::English, &hotkeys),
+            [
+                "Pause",
+                // The menu names the first of two.
+                "Clear	Ctrl + K",
+                "Save snapshot",
+                "-",
+                "Edit separately	E",
+                "Show waveform only",
+                "Keep on top",
+                "-",
+                "Options…	Ctrl + ,",
+                "Quit",
+            ]
+        );
     }
 
     #[test]

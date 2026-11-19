@@ -12,7 +12,8 @@ use eframe::egui;
 use super::addons_page::problem_line;
 use super::text::Language;
 use crate::hotkeys::{
-    Action, Binding, BindingError, GlobalBinding, Hotkeys, Key, MAX_BINDINGS, Modifiers, Scope,
+    Action, Binding, BindingError, GlobalBinding, Hotkeys, Key, MAX_BINDINGS, Modifiers,
+    ReservedShortcut, Scope,
 };
 use crate::snapshot_hotkey::SnapshotHotkey;
 
@@ -339,7 +340,6 @@ pub(super) fn take_recorded(events: &mut Vec<egui::Event>) -> Option<Recorded> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Problem {
     Binding(BindingError),
-    ClipboardKey,
     /// The system-wide shortcut's worker could not be asked.
     Unavailable(String),
 }
@@ -348,7 +348,6 @@ impl Problem {
     fn text(&self, language: Language) -> String {
         match self {
             Self::Binding(error) => language.hotkey_problem(*error),
-            Self::ClipboardKey => language.hotkey_clipboard_keys().to_owned(),
             Self::Unavailable(error) => language.could_not_register(error),
         }
     }
@@ -360,11 +359,22 @@ impl Problem {
 pub(super) struct HotkeysPage {
     recording: Option<Slot>,
     problem: Option<(Action, Problem)>,
+    /// Whether the page was drawn since the last `end_pass`.
+    shown: bool,
 }
 
 impl HotkeysPage {
     pub(super) fn is_recording(&self) -> bool {
         self.recording.is_some()
+    }
+
+    /// Ends the window's pass. A row records only while the page is on screen, so when this
+    /// pass did not draw the page (another page, a closed or hidden Options window), recording
+    /// stops here.
+    pub(super) fn end_pass(&mut self, global: Option<&dyn GlobalShortcut>) {
+        if !std::mem::take(&mut self.shown) {
+            self.stop_recording(global);
+        }
     }
 
     /// Ends recording without a change and lets the system-wide shortcut work again. Every way
@@ -449,7 +459,10 @@ impl HotkeysPage {
                     Err(error) => self.problem = Some((slot.action, Problem::Binding(error))),
                 }
             }
-            Recorded::ClipboardKey => self.problem = Some((slot.action, Problem::ClipboardKey)),
+            Recorded::ClipboardKey => {
+                let error = BindingError::Reserved(ReservedShortcut::Clipboard);
+                self.problem = Some((slot.action, Problem::Binding(error)));
+            }
         }
         // A new system-wide chord is set while released, and registers once on resume.
         self.stop_recording(global);
@@ -470,8 +483,7 @@ impl HotkeysPage {
         } else {
             bindings.push(binding);
         }
-        // The same binding twice is one binding.
-        bindings.dedup();
+        // The same binding twice is refused, and the row says so.
         let _ = self.set_bindings(slot.action, &bindings, hotkeys, global);
     }
 
@@ -510,8 +522,8 @@ impl HotkeysPage {
     }
 
     /// Draws the page and does what the user asked. True when the bindings changed and need
-    /// saving. `system_wide` shows the system-wide shortcut, which only the main window has;
-    /// `global_error` is why Windows refused it.
+    /// saving. `primary` is the main window, which has the system-wide shortcut and keeps
+    /// changes; `global_error` is why Windows refused the shortcut.
     pub(super) fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -519,9 +531,10 @@ impl HotkeysPage {
         hotkeys: &mut Hotkeys,
         global: Option<&dyn GlobalShortcut>,
         global_error: Option<&str>,
-        system_wide: bool,
+        primary: bool,
     ) -> bool {
-        let edits = self.draw(ui, language, hotkeys, global_error, system_wide);
+        self.shown = true;
+        let edits = self.draw(ui, language, hotkeys, global_error, primary);
         let mut changed = false;
         for edit in edits {
             changed |= self.apply(edit, hotkeys, global);
@@ -535,12 +548,15 @@ impl HotkeysPage {
         language: Language,
         hotkeys: &Hotkeys,
         global_error: Option<&str>,
-        system_wide: bool,
+        primary: bool,
     ) -> Vec<Edit> {
         let defaults = Hotkeys::defaults();
         let mut edits = Vec::new();
+        if !primary {
+            options_note(ui, language.hotkeys_this_window_only());
+        }
         options_note(ui, language.hotkeys_explained());
-        if system_wide {
+        if primary {
             options_group_heading(ui, language.hotkeys_system_wide());
             options_note(ui, language.hotkeys_system_wide_note());
             self.row(
@@ -891,16 +907,25 @@ mod tests {
             hotkeys.bindings(Action::OpenOptions),
             [chord(ALT, Key::O), chord(Modifiers::NONE, Key::F6)]
         );
-        // The same chord in both slots is one binding.
+        // The same chord in both slots is refused: both stay, and the row says why.
         page.apply(Edit::Record(target), &mut hotkeys, Some(&global));
-        page.recorded(
+        assert!(!page.recorded(
             Recorded::Chord(Modifiers::NONE, Key::F6),
             &mut hotkeys,
             Some(&global),
-        );
+        ));
         assert_eq!(
             hotkeys.bindings(Action::OpenOptions),
-            [chord(Modifiers::NONE, Key::F6)]
+            [chord(ALT, Key::O), chord(Modifiers::NONE, Key::F6)]
+        );
+        assert_eq!(
+            page.problem
+                .as_ref()
+                .map(|(at, problem)| (*at, problem.text(English))),
+            Some((
+                Action::OpenOptions,
+                English.hotkey_problem(BindingError::Reserved(ReservedShortcut::DuplicateBinding))
+            ))
         );
         assert_eq!(
             global.take(),
@@ -979,7 +1004,8 @@ mod tests {
         );
         assert!(!page.is_recording());
         assert_eq!(global.take(), ["suspend", "resume"]);
-        // Leaving the page or closing the window ends it the same way, once.
+        // Stopping twice resumes once. Leaving the page and closing the window have their own
+        // tests, through `end_pass`.
         page.apply(Edit::Record(target), &mut hotkeys, Some(&global));
         page.stop_recording(Some(&global));
         page.stop_recording(Some(&global));
@@ -1037,7 +1063,13 @@ mod tests {
         );
         page.apply(Edit::Record(slot(Action::Quit, 0)), &mut hotkeys, None);
         page.recorded(Recorded::ClipboardKey, &mut hotkeys, None);
-        assert_eq!(page.problem, Some((Action::Quit, Problem::ClipboardKey)));
+        assert_eq!(
+            page.problem,
+            Some((
+                Action::Quit,
+                Problem::Binding(BindingError::Reserved(ReservedShortcut::Clipboard))
+            ))
+        );
         assert!(hotkeys.bindings(Action::Quit).is_empty());
         // Starting again clears the note.
         page.apply(Edit::Record(slot(Action::Quit, 0)), &mut hotkeys, None);
@@ -1190,31 +1222,57 @@ mod tests {
         assert_eq!(take_recorded(&mut Vec::new()), None);
     }
 
-    /// Runs one headless frame of the page.
-    fn frame(
+    /// Every text a pass laid out, in the order it was painted.
+    fn laid_out(output: &egui::FullOutput) -> Vec<String> {
+        fn walk(shape: &egui::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, texts)),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    /// Runs one headless pass of the recorder window, in the order `Recorder::ui` runs it: the
+    /// Options window draws the Hotkeys page only when `on_page`, else another page or nothing,
+    /// then the pass ends. Returns whether the bindings changed and what was laid out.
+    fn pass(
         page: &mut HotkeysPage,
         hotkeys: &mut Hotkeys,
         language: Language,
+        global: Option<&dyn GlobalShortcut>,
         global_error: Option<&str>,
-    ) -> bool {
+        primary: bool,
+        on_page: bool,
+    ) -> (bool, Vec<String>) {
         let mut changed = false;
-        egui::Context::default()
-            .run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(640.0, 1400.0),
-                    )),
-                    ..Default::default()
-                },
-                |ui| {
-                    backtracking_ui::options_list(ui, |ui| {
-                        changed = page.show(ui, language, hotkeys, None, global_error, true);
-                    });
-                },
-            )
-            .drop_without_applying_deltas();
-        changed
+        let output = egui::Context::default().run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 1400.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                backtracking_ui::options_list(ui, |ui| {
+                    if on_page {
+                        changed = page.show(ui, language, hotkeys, global, global_error, primary);
+                    } else {
+                        options_note(ui, "Another page");
+                    }
+                });
+            },
+        );
+        page.end_pass(global);
+        let texts = laid_out(&output);
+        output.drop_without_applying_deltas();
+        (changed, texts)
     }
 
     #[test]
@@ -1222,23 +1280,215 @@ mod tests {
         let mut page = HotkeysPage::default();
         let mut hotkeys = Hotkeys::defaults();
         for language in [English, TraditionalChinese] {
-            assert!(!frame(&mut page, &mut hotkeys, language, None));
-            assert!(!frame(&mut page, &mut hotkeys, language, Some("busy")));
+            let (changed, texts) = pass(
+                &mut page,
+                &mut hotkeys,
+                language,
+                None,
+                Some("busy"),
+                true,
+                true,
+            );
+            assert!(!changed);
+            let global_key = match language {
+                English => "Alt + the key left of 1",
+                TraditionalChinese => "Alt + 1 左邊的鍵",
+            };
+            let busy = language.could_not_register("busy");
+            for wanted in [
+                language.hotkeys_explained(),
+                language.hotkeys_system_wide(),
+                language.hotkey_action(Action::SaveSnapshotGlobal),
+                global_key,
+                language.hotkeys_in_window(),
+                language.hotkey_action(Action::ToggleCapture),
+                "Space",
+                language.hotkey_action(Action::Quit),
+                language.hotkey_not_set(),
+                &busy,
+                language.hotkeys_reset_all(),
+                language.mouse_heading(),
+            ] {
+                assert!(
+                    texts.iter().any(|text| text == wanted),
+                    "{language:?} lays out {wanted:?}: {texts:?}"
+                );
+            }
+            // The main window keeps its changes, so it does not warn about them.
+            assert!(
+                !texts
+                    .iter()
+                    .any(|text| text == language.hotkeys_this_window_only())
+            );
+
+            // Another capture window has no system-wide shortcut and says its changes end
+            // with it, first thing on the page.
+            let (_, texts) = pass(&mut page, &mut hotkeys, language, None, None, false, true);
+            assert_eq!(texts[0], language.hotkeys_this_window_only());
+            for absent in [
+                language.hotkeys_system_wide(),
+                language.hotkey_action(Action::SaveSnapshotGlobal),
+            ] {
+                assert!(!texts.iter().any(|text| text == absent), "{absent}");
+            }
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text == language.hotkeys_in_window())
+            );
         }
+        // A recording row and a refused change are drawn in either language.
         hotkeys.clear(Action::Clear);
         page.apply(
             Edit::Record(slot(Action::SeparateLanes, 0)),
             &mut hotkeys,
             None,
         );
-        page.problem = Some((
-            Action::SeparateLanes,
-            Problem::Binding(BindingError::Conflict(Action::Quit)),
-        ));
         for language in [English, TraditionalChinese] {
-            assert!(!frame(&mut page, &mut hotkeys, language, Some("busy")));
+            page.problem = Some((
+                Action::SeparateLanes,
+                Problem::Binding(BindingError::Conflict(Action::Quit)),
+            ));
+            let (changed, texts) = pass(
+                &mut page,
+                &mut hotkeys,
+                language,
+                None,
+                Some("busy"),
+                true,
+                true,
+            );
+            assert!(!changed);
+            let conflict = language.hotkey_problem(BindingError::Conflict(Action::Quit));
+            for wanted in [
+                language.hotkey_press_keys(),
+                language.hotkey_recording_note(),
+                language.hotkey_right_ctrl(),
+                &conflict,
+            ] {
+                assert!(texts.iter().any(|text| text == wanted), "{wanted:?}");
+            }
         }
         assert!(page.is_recording(), "drawing alone changes nothing");
         assert!(hotkeys.bindings(Action::Clear).is_empty());
+    }
+
+    #[test]
+    fn only_the_edit_separately_row_offers_the_right_ctrl_tap() {
+        let mut hotkeys = Hotkeys::defaults();
+        for action in [
+            Action::KeepOnTop,
+            Action::CancelSelection,
+            Action::SaveSnapshotGlobal,
+        ] {
+            let mut page = HotkeysPage::default();
+            page.apply(Edit::Record(slot(action, 0)), &mut hotkeys, None);
+            let (_, texts) = pass(&mut page, &mut hotkeys, English, None, None, true, true);
+            assert!(page.is_recording());
+            assert!(
+                !texts.iter().any(|text| text == English.hotkey_right_ctrl()),
+                "{action:?}"
+            );
+        }
+        // And the model refuses the tap for any other action, should one be asked for.
+        let mut page = HotkeysPage::default();
+        page.apply(Edit::Record(slot(Action::KeepOnTop, 0)), &mut hotkeys, None);
+        assert!(!page.apply(
+            Edit::RightCtrl(slot(Action::KeepOnTop, 0)),
+            &mut hotkeys,
+            None
+        ));
+        assert_eq!(
+            page.problem
+                .as_ref()
+                .map(|(at, problem)| (*at, problem.text(English))),
+            Some((
+                Action::KeepOnTop,
+                "A tap of Right Ctrl works only for Edit separately.".into()
+            ))
+        );
+        assert_eq!(hotkeys, Hotkeys::defaults());
+    }
+
+    #[test]
+    fn moving_to_another_page_ends_recording_and_resumes_the_global_shortcut_once() {
+        let global = FakeGlobal::default();
+        let mut page = HotkeysPage::default();
+        let mut hotkeys = Hotkeys::defaults();
+        page.apply(
+            Edit::Record(slot(Action::ToggleCapture, 0)),
+            &mut hotkeys,
+            Some(&global),
+        );
+        assert_eq!(global.take(), ["suspend"]);
+        // While the page is drawn, its row keeps recording.
+        for _ in 0..2 {
+            pass(
+                &mut page,
+                &mut hotkeys,
+                English,
+                Some(&global),
+                None,
+                true,
+                true,
+            );
+            assert!(page.is_recording());
+        }
+        assert!(global.take().is_empty());
+        // A pass that draws another page ends it.
+        for _ in 0..2 {
+            pass(
+                &mut page,
+                &mut hotkeys,
+                English,
+                Some(&global),
+                None,
+                true,
+                false,
+            );
+            assert!(!page.is_recording());
+        }
+        assert_eq!(global.take(), ["resume"]);
+        assert_eq!(hotkeys, Hotkeys::defaults());
+    }
+
+    #[test]
+    fn closing_or_hiding_the_options_window_ends_recording_and_resumes_once() {
+        let global = FakeGlobal::default();
+        let mut page = HotkeysPage::default();
+        let mut hotkeys = Hotkeys::defaults();
+        page.apply(
+            Edit::Record(slot(Action::Quit, 0)),
+            &mut hotkeys,
+            Some(&global),
+        );
+        pass(
+            &mut page,
+            &mut hotkeys,
+            English,
+            Some(&global),
+            None,
+            true,
+            true,
+        );
+        assert_eq!(global.take(), ["suspend"]);
+        // A closed or hidden Options window draws nothing, and the pass still ends.
+        page.end_pass(Some(&global));
+        assert!(!page.is_recording());
+        assert_eq!(global.take(), ["resume"]);
+        page.end_pass(Some(&global));
+        assert!(global.take().is_empty());
+        // Opened again, the page starts idle and records only when asked.
+        pass(
+            &mut page,
+            &mut hotkeys,
+            English,
+            Some(&global),
+            None,
+            true,
+            true,
+        );
+        assert!(!page.is_recording());
+        assert!(global.take().is_empty());
     }
 }
