@@ -65,6 +65,7 @@ use winit::{
 mod addon_sources;
 mod addons_page;
 mod harness;
+mod look;
 mod stack;
 #[cfg(test)]
 mod test_profile;
@@ -72,6 +73,7 @@ mod text;
 
 use addon_sources::AddonSources;
 use addons_page::{AddonsPage, PageRequest};
+use look::AddonLook;
 use stack::LaneBox;
 use text::Language;
 
@@ -308,6 +310,7 @@ pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
                 // A delayed request runs one pass. An immediate one runs two.
                 repaint.request_repaint_after_for(Duration::from_millis(1), egui::ViewportId::ROOT);
             }));
+            recorder.wake_on_new_looks(&context.egui_ctx);
             recorder.options_in_taskbar = show_options_on_start;
             if show_options_on_start {
                 recorder.open_options(&context.egui_ctx);
@@ -505,6 +508,8 @@ struct Recorder {
     saved_accent: Color32,
     /// How the plot looks, beyond what the user's own choices above decide.
     theme: Theme,
+    /// The add-on whose look `theme` is, when the user chose one.
+    look: AddonLook,
     meter_modes: [MeterMode; 2],
     split_waveform: bool,
     wav_profile: WavExportProfile,
@@ -2472,6 +2477,7 @@ impl Recorder {
             accent: accent_color(settings.accent),
             saved_accent: accent_color(settings.accent),
             theme: Theme::default(),
+            look: AddonLook::new(settings.addon_look),
             meter_modes: [settings.meter_mode, settings.meter_b_mode],
             split_waveform: settings.split_waveform,
             wav_profile: settings.wav_profile,
@@ -3246,9 +3252,20 @@ impl Recorder {
 
     /// Draws the plot with `theme` from the next frame on. The user's own choices of accent,
     /// border and transparency keep applying where the theme leaves them.
-    #[allow(dead_code)] // The add-on that supplies a look calls this; nothing does yet.
     fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+    }
+
+    /// Keeps the waveform-only window's plot the same height when the border's width has
+    /// changed from `old_border_inset`.
+    fn fit_border_change(&self, ctx: &egui::Context, old_border_inset: f32) {
+        if self.waveform_only && self.border_inset() != old_border_inset {
+            let size = ctx.viewport_rect().size();
+            let height = size.y + (self.border_inset() - old_border_inset) * 2.0;
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(
+                Vec2::new(size.x, height).max(min_window_size(true)),
+            ));
+        }
     }
 
     fn border_inset(&self) -> f32 {
@@ -4408,12 +4425,8 @@ impl Recorder {
         });
         if self.waveform_only != waveform_only {
             self.apply_waveform_mode(ctx, frame);
-        } else if self.waveform_only && self.border_inset() != old_border_inset {
-            let size = ctx.viewport_rect().size();
-            let height = size.y + (self.border_inset() - old_border_inset) * 2.0;
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(
-                Vec2::new(size.x, height).max(min_window_size(true)),
-            ));
+        } else {
+            self.fit_border_change(ctx, old_border_inset);
         }
         if self.pinned != pinned {
             self.apply_pinned(ctx);
@@ -4746,6 +4759,7 @@ impl Recorder {
             }
         });
         self.accent_settings(ui);
+        self.addon_look_settings(ui);
         ui.separator();
         options_group_heading(ui, "Show");
         if ui
@@ -7539,6 +7553,7 @@ impl eframe::App for Recorder {
         self.collect_source_list();
         self.addons_page
             .poll(self.controller.addons(), Language::current());
+        self.refresh_look(ctx);
         let in_use = |id: &str| {
             self.controller.sources().iter().flatten().any(|settings| {
                 matches!(&settings.source, CaptureSource::Addon { addon_id, .. } if addon_id == id)
@@ -8734,27 +8749,20 @@ mod tests {
         );
 
         // In waveform-only mode colour alone has to tell the four states apart, in both halves
-        // of the recording blink, against the dark plot.
+        // of the recording blink, against the dark plot. A look's plot backing is held to the
+        // same test (`Theme::legible`).
         let plot = Color32::from_rgb(22, 26, 29);
-        let distance = |a: Color32, b: Color32| {
-            a.to_array()
-                .into_iter()
-                .zip(b.to_array())
-                .take(3)
-                .map(|(a, b)| u32::from(a.abs_diff(b)))
-                .sum::<u32>()
-        };
         for lit in [false, true] {
             let colors =
                 [Unavailable, Paused, Recording, Waiting].map(|state| state.compact_color(lit));
             for (index, color) in colors.iter().enumerate() {
                 assert!(
-                    distance(*color, plot) >= 90,
+                    backtracking_ui::distinguishable(*color, plot),
                     "{color:?} is lost on the plot"
                 );
                 for other in &colors[index + 1..] {
                     assert!(
-                        distance(*color, *other) >= 90,
+                        backtracking_ui::distinguishable(*color, *other),
                         "{color:?} is too close to {other:?}"
                     );
                 }

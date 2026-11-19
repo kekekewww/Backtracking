@@ -176,6 +176,7 @@ pub(crate) enum Key {
     SecondsInterval,
     SnapshotTarget,
     WindowPosition,
+    AddonLook,
 }
 
 impl Key {
@@ -218,6 +219,8 @@ impl Key {
             Self::SecondsInterval => "second-line-interval",
             Self::SnapshotTarget => "snapshot-target",
             Self::WindowPosition => "window-position",
+            // The id of the add-on whose look is on; absent or empty is the app's own look.
+            Self::AddonLook => "addon-look",
         }
     }
 }
@@ -257,6 +260,8 @@ pub(crate) struct Settings {
     pub(crate) second_interval: u8,
     pub(crate) snapshot_target: Option<String>,
     pub(crate) window_position: Option<[i32; 2]>,
+    /// The add-on whose look the window takes while it offers one.
+    pub(crate) addon_look: Option<String>,
 }
 
 impl Default for Settings {
@@ -305,6 +310,7 @@ impl Default for Settings {
             second_interval: 5,
             snapshot_target: None,
             window_position: None,
+            addon_look: None,
         }
     }
 }
@@ -438,6 +444,10 @@ impl Preferences {
             let y = parts.next()?.parse().ok()?;
             parts.next().is_none().then_some([x, y])
         });
+        settings.addon_look = self
+            .read(Key::AddonLook)
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control));
         settings
     }
 
@@ -1271,6 +1281,38 @@ mod tests {
             .save(Key::CaptureSources, &serialize_sources(&lanes))
             .unwrap();
         assert_eq!(store.load().sources, lanes);
+    }
+
+    #[test]
+    fn the_chosen_addon_look_round_trips_and_none_clears_it() {
+        let preferences = workspace_preferences("addon-look");
+        assert_eq!(Settings::default().addon_look, None);
+        assert_eq!(preferences.load().addon_look, None);
+
+        let writer = PreferenceWriter::new(preferences.clone()).unwrap();
+        writer.save(Key::AddonLook, "com.example.theme").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(
+            preferences.load().addon_look.as_deref(),
+            Some("com.example.theme")
+        );
+        assert!(
+            preferences
+                .directory
+                .as_ref()
+                .unwrap()
+                .join("addon-look")
+                .is_file()
+        );
+        // Choosing None writes an empty file.
+        writer.save(Key::AddonLook, "").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(preferences.load().addon_look, None);
+        for bad in ["  ", "a
+b", &"x".repeat(129)] {
+            preferences.save(Key::AddonLook, bad).unwrap();
+            assert_eq!(preferences.load().addon_look, None, "{bad:?}");
+        }
     }
 
     #[test]

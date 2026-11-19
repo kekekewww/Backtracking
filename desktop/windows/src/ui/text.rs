@@ -299,6 +299,35 @@ impl Language {
         )
     }
 
+    // The look an add-on offers, chosen on the Appearance page.
+
+    pub(crate) fn look_field(self) -> &'static str {
+        self.pick("Look from add-on", "附加元件的外觀")
+    }
+
+    pub(crate) fn look_none(self) -> &'static str {
+        self.pick("None", "無")
+    }
+
+    pub(crate) fn look_none_offered(self) -> &'static str {
+        self.pick(
+            "No running add-on offers a look.",
+            "目前沒有執行中的附加元件提供外觀。",
+        )
+    }
+
+    /// The chosen add-on is not running or offers no look; the choice is kept.
+    pub(crate) fn look_not_offered(self, addon: &str) -> String {
+        match self {
+            Self::English => format!(
+                "{addon} is not offering a look right now. Backtracking shows its own look until it does."
+            ),
+            Self::TraditionalChinese => {
+                format!("{addon} 目前沒有提供外觀。在它提供之前，Backtracking 使用自己的外觀。")
+            }
+        }
+    }
+
     // The Add-ons page and the screen shown before an install.
 
     pub(crate) fn addons_section(self) -> &'static str {
@@ -1241,6 +1270,34 @@ mod tests {
             TraditionalChinese.size_in_files(2048, 3),
             "3 個檔案，共 2.0 KB"
         );
+    }
+
+    #[test]
+    fn every_look_text_exists_in_both_languages_and_differs() {
+        let pairs = [
+            super::Language::look_field,
+            super::Language::look_none,
+            super::Language::look_none_offered,
+        ]
+        .into_iter()
+        .map(|text| {
+            (
+                text(English).to_owned(),
+                text(TraditionalChinese).to_owned(),
+            )
+        })
+        .chain([(
+            English.look_not_offered("Example appearance"),
+            TraditionalChinese.look_not_offered("Example appearance"),
+        )]);
+        for (english, chinese) in pairs {
+            assert!(!english.is_empty() && !chinese.is_empty());
+            assert_ne!(english, chinese);
+            assert!(chinese.chars().any(|c| c as u32 >= 0x3000), "{chinese}");
+        }
+        assert_eq!(English.look_field(), "Look from add-on");
+        assert!(English.look_not_offered("Example appearance").starts_with("Example appearance "));
+        assert!(TraditionalChinese.look_not_offered("Example appearance").starts_with("Example appearance "));
     }
 
     #[test]

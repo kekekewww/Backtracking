@@ -1468,7 +1468,18 @@ mod tests {
             capability_lines(English, &manifest("", "")),
             ["Nothing beyond running its program."]
         );
-        for capability in ["source", "open-files", "settings", "actions", "clips"] {
+        assert_eq!(
+            capability_lines(English, &manifest(r#""appearance""#, "")),
+            ["Offer colors and line styles for the window, which you can turn on in Options"]
+        );
+        for capability in [
+            "source",
+            "open-files",
+            "settings",
+            "actions",
+            "clips",
+            "appearance",
+        ] {
             let extra = if capability == "open-files" {
                 r#","open_files":{"description":"Files","extensions":["wav"]}"#
             } else {
