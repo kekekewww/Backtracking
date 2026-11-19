@@ -24,6 +24,7 @@ installing and offers nothing else to the add-on.
 | `settings` | Declare settings. Backtracking draws them, stores the values and sends changes. |
 | `actions` | Declare named buttons. Backtracking shows them and tells the add-on when one is pressed. |
 | `clips` | Be told the paths of every clip Backtracking exports. |
+| `appearance` | Offer colors and a few drawing values that the user can choose to apply. |
 
 An add-on runs with the user's own permissions and is not sandboxed. The capabilities describe
 what Backtracking does for the add-on, not what the program is able to do on the computer. The
@@ -133,8 +134,8 @@ default. If the token, id or contract number is wrong the host answers
 
 ### 4.2 Add-on to host
 
-**`describe`** replaces everything the host knows about the add-on. Send it after `welcome` and
-again whenever any part changes. Omitted lists count as empty.
+**`describe`** replaces the add-on's lists of sources, settings and actions. Send it after
+`welcome` and again whenever any of those lists changes. Omitted lists count as empty.
 
 ```json
 {"type":"describe",
@@ -254,6 +255,69 @@ special: stamp positions with the time that audio is heard. Rust authors can cal
 `Client::send_positions(source, time, channels)` with `ChannelPosition` entries. The example's
 `objects` format shows a stereo group followed by two positioned objects, so their stream
 indices are 2 and 3.
+
+**`appearance`** offers a set of drawing values with the `appearance` capability.
+Backtracking draws the app. An appearance can change only the drawing values listed here.
+Backtracking controls capture, selection, export, files, shortcuts, layout, text content and
+status indicators. Backtracking may ignore a value that would make the waveform or selection hard
+to see.
+
+Appearance is off until the user chooses an add-on in Options > Appearance. The user can choose
+at most one add-on's appearance. Backtracking uses its own look when the user turns the appearance
+off or the chosen add-on has no offer.
+
+```json
+{"type":"appearance",
+ "colors":{"waveform":"#67e7b5","border":"#ffffff80"},
+ "numbers":{"border_width":2},
+ "rows":{"LFE":"#ff8800","Ltf":"#88ccff"}}
+```
+
+Each message replaces the add-on's entire offer. Every map is optional and missing entries use the
+app's own look. Send `{"type":"appearance"}` or empty maps to clear the offer. Backtracking
+keeps the offer in memory while the add-on is running and clears it when the add-on stops.
+
+`colors` values are `#rrggbb` (opaque) or `#rrggbbaa` (with alpha). Hex digits may be
+upper- or lower-case.
+
+| Color name | What it colors |
+| --- | --- |
+| `waveform` | The waveform. |
+| `waveform_selected` | The selected part of the waveform. |
+| `plot_background` | The background behind the waveform. |
+| `center_line` | The center line of a waveform row. |
+| `border` | The border around the plot. |
+| `lane_divider` | The divider between lanes. |
+| `bar_line` | The line marking a musical bar. |
+| `second_line` | The line marking a second. |
+| `row_label` | The channel label text. |
+| `flag` | The flag in the plot. |
+| `playhead` | The playhead line. |
+| `panel_background` | The panel background. |
+| `chip_background` | The background of a chip. |
+| `chip_text` | The text of a chip. |
+| `chip_current` | The current chip's highlight. |
+| `scroll_thumb` | The scrollbar thumb. |
+| `preview_highlight` | The highlight for previewed audio. |
+
+Backtracking clamps `numbers` to these inclusive ranges and drops values that are not finite.
+
+| Number name | Range | Meaning |
+| --- | --- | --- |
+| `border_width` | 0 to 8 | Width of the plot border. |
+| `corner_radius` | 0 to 16 | Radius of rounded corners. |
+| `waveform_stroke_scale` | 0.5 to 3 | Multiplier for the waveform stroke width. |
+| `waveform_fill_opacity` | 0 to 1 | Opacity of the waveform fill. |
+
+`rows` gives waveform colors by channel label. Use the source's channel labels, each 1 to 24
+characters. Row colors have the same format as `colors`. Backtracking keeps up to 64 valid
+entries and drops the rest.
+
+Backtracking drops unknown color and number names and individual invalid entries. A message with
+a map supplied in the wrong form is ignored. Send at most 10 `appearance` messages in any
+one-second period per add-on. Backtracking silently drops excess messages and ignores messages
+from add-ons without the capability. Rust add-ons can use `Client::send_appearance(&appearance)`,
+which returns an error if called faster than the limit.
 
 **`message`** shows one line next to the add-on on the Add-ons page, replacing the previous one.
 `level` is `info`, `warning` or `error`; `text` is up to 300 characters. An empty `text` clears it.

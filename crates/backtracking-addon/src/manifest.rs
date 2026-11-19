@@ -15,6 +15,7 @@ pub enum Capability {
     Settings,
     Actions,
     Clips,
+    Appearance,
 }
 
 /// File types accepted by an add-on with the `open-files` capability.
@@ -63,6 +64,21 @@ impl Manifest {
             return Err(Error::new(
                 "addon.json open_files must be an object when open-files is declared, and otherwise must be omitted",
             ));
+        }
+        if let Some(capabilities) = object
+            .get("capabilities")
+            .and_then(serde_json::Value::as_array)
+        {
+            for capability in capabilities {
+                if let Some(name) = capability
+                    .as_str()
+                    .filter(|_| Capability::deserialize(capability).is_err())
+                {
+                    return Err(Error::new(format!(
+                        "Unknown add-on capability {name:?}. A newer Backtracking is needed."
+                    )));
+                }
+            }
         }
         let manifest: Self = serde_json::from_str(input)
             .map_err(|error| Error::new(format!("Cannot read addon.json: {error}")))?;
@@ -298,13 +314,21 @@ mod tests {
         assert!(parse(&value).is_ok());
         value["homepage"] = json!("https://example.com");
         value["license"] = json!("MIT");
-        value["capabilities"] = json!(["source", "open-files", "settings", "actions", "clips"]);
+        value["capabilities"] = json!([
+            "source",
+            "open-files",
+            "settings",
+            "actions",
+            "clips",
+            "appearance"
+        ]);
         value["open_files"] = json!({"description":"Audio files","extensions":["wav","flac1"]});
         value["run"][current_platform().unwrap()] = json!({"program":"bin/tone"});
         let manifest = parse(&value).unwrap();
         assert!(manifest.current_run().unwrap().args.is_empty());
         assert_eq!(manifest.current_run().unwrap().program, "bin/tone");
-        assert_eq!(manifest.capabilities.len(), 5);
+        assert_eq!(manifest.capabilities.len(), 6);
+        assert!(manifest.capabilities.contains(&Capability::Appearance));
         value["name"] = json!("音".repeat(80));
         value["author"] = json!("a".repeat(80));
         value["version"] = json!("v".repeat(32));
@@ -370,6 +394,17 @@ mod tests {
             value[field] = replacement;
             assert!(parse(&value).is_err(), "accepted {field}: {}", value[field]);
         }
+    }
+
+    #[test]
+    fn unknown_capability_names_the_requirement_for_a_newer_backtracking() {
+        let mut value = valid();
+        value["capabilities"] = json!(["appearance", "future-feature"]);
+        let error = parse(&value).unwrap_err().to_string();
+        assert!(
+            error.contains("future-feature") && error.contains("newer Backtracking is needed"),
+            "{error}"
+        );
     }
 
     #[test]
