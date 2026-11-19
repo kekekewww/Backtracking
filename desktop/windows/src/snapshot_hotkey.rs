@@ -50,11 +50,20 @@ pub(crate) struct SnapshotHotkey {
 
 impl SnapshotHotkey {
     pub(crate) fn start(context: Context) -> io::Result<Self> {
-        Self::start_with(context, WindowsHotkeys)
+        Self::start_with(context, Hotkeys::defaults().global_bindings())
     }
 
-    fn start_with(
+    /// Starts the worker with the configured bindings, including an empty configuration.
+    pub(crate) fn start_with(
         context: Context,
+        initial: [Option<GlobalBinding>; MAX_BINDINGS],
+    ) -> io::Result<Self> {
+        Self::start_with_platform(context, initial, WindowsHotkeys)
+    }
+
+    fn start_with_platform(
+        context: Context,
+        initial: [Option<GlobalBinding>; MAX_BINDINGS],
         mut platform: impl HotkeyPlatform + Send + 'static,
     ) -> io::Result<Self> {
         let (sender, events) = mpsc::channel();
@@ -73,12 +82,17 @@ impl SnapshotHotkey {
                         context.request_repaint_of(ViewportId::ROOT);
                     }
                 };
-                let mut state = Worker::new();
+                let mut state = Worker::new(initial);
                 let mut message = MSG::default();
                 // Make the thread's message queue before its first registration.
                 let _ =
                     unsafe { PeekMessageW(&mut message, None, WM_HOTKEY, WM_HOTKEY, PM_NOREMOVE) };
                 let handles = [HANDLE(worker_wake.as_raw_handle())];
+                if !worker_stop.load(Ordering::Relaxed)
+                    && let Some(result) = state.reconcile(&mut platform, true)
+                {
+                    publish(Event::Availability(result));
+                }
                 while !worker_stop.load(Ordering::Relaxed) {
                     for command in pending.try_iter() {
                         if let Some(result) = state.apply(command, &mut platform) {
@@ -123,15 +137,8 @@ impl SnapshotHotkey {
         self.events.try_recv().ok()
     }
 
-    /// Replaces the global shortcut with one binding or disables it with None.
-    #[allow(dead_code)] // used by the Hotkeys page
-    pub(crate) fn set_binding(&self, binding: Option<GlobalBinding>) -> io::Result<()> {
-        self.set_bindings([binding, None])
-    }
-
     /// Applies both alternatives together. A suspended worker applies them on resume.
     /// Availability reports Windows' result once the change has been applied.
-    #[allow(dead_code)] // used by the Hotkeys page
     pub(crate) fn set_bindings(
         &self,
         bindings: [Option<GlobalBinding>; MAX_BINDINGS],
@@ -140,13 +147,11 @@ impl SnapshotHotkey {
     }
 
     /// Requests release of the registrations during shortcut capture.
-    #[allow(dead_code)] // used by the Hotkeys page
     pub(crate) fn suspend(&self) -> io::Result<()> {
         self.send(Command::Suspend)
     }
 
     /// Requests registration of the current bindings after capture ends.
-    #[allow(dead_code)] // used by the Hotkeys page
     pub(crate) fn resume(&self) -> io::Result<()> {
         self.send(Command::Resume)
     }
@@ -197,9 +202,9 @@ struct Worker {
 }
 
 impl Worker {
-    fn new() -> Self {
+    fn new(bindings: [Option<GlobalBinding>; MAX_BINDINGS]) -> Self {
         Self {
-            bindings: Hotkeys::defaults().global_bindings(),
+            bindings,
             suspended: false,
             registrations: Default::default(),
         }
@@ -358,7 +363,7 @@ mod tests {
         Err("Windows did not report the registration result".into())
     }
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Operation {
         Map(u32),
         Register(i32, HOT_KEY_MODIFIERS, u32),
@@ -371,6 +376,7 @@ mod tests {
         refuse_key: Option<u32>,
         refuse_release: bool,
         operations: Vec<Operation>,
+        observed_registrations: Option<Sender<Operation>>,
     }
 
     impl HotkeyPlatform for FakePlatform {
@@ -380,8 +386,11 @@ mod tests {
         }
 
         fn register(&mut self, id: i32, binding: ResolvedBinding) -> Result<(), String> {
-            self.operations
-                .push(Operation::Register(id, binding.modifiers, binding.key));
+            let operation = Operation::Register(id, binding.modifiers, binding.key);
+            self.operations.push(operation);
+            if let Some(observer) = &self.observed_registrations {
+                observer.send(operation).unwrap();
+            }
             if self.refuse_key == Some(binding.key) {
                 return Err("already registered".into());
             }
@@ -413,9 +422,38 @@ mod tests {
         ((virtual_key << 16) | modifiers.0) as isize
     }
 
+    fn startup_registrations(initial: [Option<GlobalBinding>; MAX_BINDINGS]) -> Vec<Operation> {
+        let (observer, observations) = mpsc::channel();
+        let platform = FakePlatform {
+            observed_registrations: Some(observer),
+            ..FakePlatform::default()
+        };
+        let hotkey =
+            SnapshotHotkey::start_with_platform(Context::default(), initial, platform).unwrap();
+        assert_eq!(registration(&hotkey), Ok(()));
+        drop(hotkey);
+        observations.into_iter().collect()
+    }
+
+    #[test]
+    fn startup_registers_only_the_initial_bindings() {
+        assert_eq!(
+            startup_registrations([Some(ctrl(Key::S)), Some(ctrl(Key::Q))]),
+            [
+                Operation::Register(1, MOD_CONTROL | MOD_NOREPEAT, 0x53),
+                Operation::Register(2, MOD_CONTROL | MOD_NOREPEAT, 0x51),
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_never_registers_a_shortcut_when_initial_bindings_are_empty() {
+        assert!(startup_registrations([None; MAX_BINDINGS]).is_empty());
+    }
+
     #[test]
     fn changing_and_clearing_the_binding_releases_the_old_registration() {
-        let mut worker = Worker::new();
+        let mut worker = Worker::new(Hotkeys::defaults().global_bindings());
         let mut platform = FakePlatform::default();
         assert_eq!(worker.refresh(&mut platform), Some(Ok(())));
         assert_eq!(
@@ -453,7 +491,7 @@ mod tests {
 
     #[test]
     fn suspend_releases_both_bindings_and_resume_uses_the_latest_edit() {
-        let mut worker = Worker::new();
+        let mut worker = Worker::new([None; MAX_BINDINGS]);
         let mut platform = FakePlatform::default();
         let bindings = [Some(ctrl(Key::S)), Some(ctrl(Key::Q))];
         assert_eq!(
@@ -488,7 +526,7 @@ mod tests {
 
     #[test]
     fn layout_updates_only_reregister_a_changed_scan_code_mapping() {
-        let mut worker = Worker::new();
+        let mut worker = Worker::new(Hotkeys::defaults().global_bindings());
         let mut platform = FakePlatform {
             mapped_key: 0xc0,
             ..FakePlatform::default()
@@ -534,7 +572,7 @@ mod tests {
 
     #[test]
     fn a_failed_registration_reports_the_reason_and_can_be_retried() {
-        let mut worker = Worker::new();
+        let mut worker = Worker::new([None; MAX_BINDINGS]);
         let mut platform = FakePlatform {
             refuse_key: Some(0x53),
             ..FakePlatform::default()
@@ -560,7 +598,7 @@ mod tests {
 
     #[test]
     fn a_failed_release_is_reported_and_blocks_dispatch_until_released() {
-        let mut worker = Worker::new();
+        let mut worker = Worker::new([None; MAX_BINDINGS]);
         let mut platform = FakePlatform::default();
         assert_eq!(
             worker.apply(Command::Set([Some(ctrl(Key::S)), None]), &mut platform),
@@ -587,16 +625,21 @@ mod tests {
             refuse_key: Some(0x53),
             ..FakePlatform::default()
         };
-        let hotkey = SnapshotHotkey::start_with(Context::default(), platform).unwrap();
+        let hotkey = SnapshotHotkey::start_with_platform(
+            Context::default(),
+            Hotkeys::defaults().global_bindings(),
+            platform,
+        )
+        .unwrap();
         assert_eq!(registration(&hotkey), Ok(()));
-        hotkey.set_binding(Some(ctrl(Key::S))).unwrap();
+        hotkey.set_bindings([Some(ctrl(Key::S)), None]).unwrap();
         assert_eq!(registration(&hotkey), Err("already registered".into()));
         hotkey.suspend().unwrap();
         assert_eq!(registration(&hotkey), Ok(()));
-        hotkey.set_binding(Some(ctrl(Key::Q))).unwrap();
+        hotkey.set_bindings([Some(ctrl(Key::Q)), None]).unwrap();
         hotkey.resume().unwrap();
         assert_eq!(registration(&hotkey), Ok(()));
-        hotkey.set_binding(None).unwrap();
+        hotkey.set_bindings([None; MAX_BINDINGS]).unwrap();
         assert_eq!(registration(&hotkey), Ok(()));
     }
 

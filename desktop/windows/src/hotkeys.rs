@@ -120,6 +120,14 @@ impl Modifiers {
         alt: true,
         ..Self::NONE
     };
+    const CTRL: Self = Self {
+        ctrl: true,
+        ..Self::NONE
+    };
+    const SHIFT: Self = Self {
+        shift: true,
+        ..Self::NONE
+    };
     const WIN: Self = Self {
         win: true,
         ..Self::NONE
@@ -238,6 +246,29 @@ pub(crate) enum Key {
     KeyLeftOf1 = 0x100,
 }
 
+impl Key {
+    fn is_altgr_character(self) -> bool {
+        let code = self as u16;
+        (win::VK_A.0..=win::VK_Z.0).contains(&code)
+            || (win::VK_0.0..=win::VK_9.0).contains(&code)
+            || matches!(
+                self,
+                Self::Backtick
+                    | Self::Minus
+                    | Self::Equals
+                    | Self::OpenBracket
+                    | Self::CloseBracket
+                    | Self::Backslash
+                    | Self::Semicolon
+                    | Self::Quote
+                    | Self::Comma
+                    | Self::Period
+                    | Self::Slash
+                    | Self::KeyLeftOf1
+            )
+    }
+}
+
 impl fmt::Display for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match *self {
@@ -316,6 +347,40 @@ impl Binding {
         Err(BindingError::Reserved(shortcut))
     }
 
+    fn check_window(self, action: Action) -> Result<(), BindingError> {
+        self.check_reserved()?;
+        let Self::Chord { modifiers, key } = self else {
+            return if action == Action::SeparateLanes {
+                Ok(())
+            } else {
+                Err(BindingError::Reserved(ReservedShortcut::RightCtrlTap))
+            };
+        };
+        let shortcut = match (modifiers, key) {
+            (Modifiers { win: true, .. }, _) => ReservedShortcut::WindowWinModifier,
+            (Modifiers { ctrl: true, .. }, Key::Equals) => ReservedShortcut::ZoomIn,
+            (Modifiers { ctrl: true, .. }, Key::Minus) => ReservedShortcut::ZoomOut,
+            (Modifiers { ctrl: true, .. }, Key::Digit0) => ReservedShortcut::ZoomReset,
+            (Modifiers::SHIFT, Key::Tab) => ReservedShortcut::ShiftTab,
+            // egui-winit emits clipboard events in place of these key presses.
+            (Modifiers::CTRL, Key::C | Key::X | Key::V)
+            | (Modifiers { shift: true, .. }, Key::Delete | Key::Insert)
+            | (Modifiers { ctrl: true, .. }, Key::Insert) => ReservedShortcut::Clipboard,
+            _ => return Ok(()),
+        };
+        Err(BindingError::Reserved(shortcut))
+    }
+
+    fn bare_key_matches(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (
+                Self::Chord { modifiers: Modifiers::NONE, key: bare },
+                Self::Chord { key, .. },
+            ) if bare == key
+        )
+    }
+
     /// Validates a global binding and supplies the arguments for RegisterHotKey.
     /// Windows decides whether the chord is available in the current session.
     pub(crate) fn to_win32(self) -> Result<GlobalBinding, BindingError> {
@@ -323,8 +388,11 @@ impl Binding {
             return Err(BindingError::GlobalRightCtrlTap);
         };
         self.check_reserved()?;
-        if modifiers.is_empty() {
+        if !(modifiers.ctrl || modifiers.alt || modifiers.win) {
             return Err(BindingError::GlobalNeedsModifier);
+        }
+        if modifiers == Modifiers::CTRL_ALT && key.is_altgr_character() {
+            return Err(BindingError::Reserved(ReservedShortcut::AltGr));
         }
         let key = match key {
             // RegisterHotKey reserves F12 for the debugger.
@@ -372,6 +440,15 @@ pub(crate) enum ReservedShortcut {
     BareTab,
     BareEnter,
     WinL,
+    AltGr,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    ShiftTab,
+    WindowWinModifier,
+    RightCtrlTap,
+    Clipboard,
+    DuplicateBinding,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -440,6 +517,11 @@ impl Hotkeys {
         if bindings.len() > MAX_BINDINGS {
             return Err(BindingError::TooManyBindings);
         }
+        if let [first, second] = bindings
+            && first == second
+        {
+            return Err(BindingError::Reserved(ReservedShortcut::DuplicateBinding));
+        }
         for &binding in bindings {
             self.check_binding(action, binding)?;
         }
@@ -456,12 +538,10 @@ impl Hotkeys {
     }
 
     /// Restoring one action can conflict with another action that uses its default.
-    #[allow(dead_code)] // used by the Hotkeys page
     pub(crate) fn reset(&mut self, action: Action) -> Result<(), BindingError> {
         self.set(action, action.default_bindings())
     }
 
-    #[allow(dead_code)] // used by the Hotkeys page
     pub(crate) fn reset_all(&mut self) {
         *self = Self::defaults();
     }
@@ -472,23 +552,34 @@ impl Hotkeys {
         action: Action,
         binding: Binding,
     ) -> Result<(), BindingError> {
-        match action.scope() {
+        let scope = action.scope();
+        match scope {
             Scope::Global => {
                 binding.to_win32()?;
             }
-            Scope::Window => binding.check_reserved()?,
+            Scope::Window => binding.check_window(action)?,
         }
-        if let Some((&holder, _)) = self
-            .bindings
-            .iter()
-            .find(|(other, bindings)| **other != action && bindings.contains(&binding))
-        {
-            return Err(BindingError::Conflict(holder));
+        for (&other, bindings) in &self.bindings {
+            if other == action {
+                continue;
+            }
+            let conflicts = bindings.iter().any(|&existing| {
+                existing == binding
+                    // A bare cancel key matches any modifiers in the recorder window.
+                    || (scope == other.scope()
+                        && match (action, other) {
+                            (Action::CancelSelection, _) => binding.bare_key_matches(existing),
+                            (_, Action::CancelSelection) => existing.bare_key_matches(binding),
+                            _ => false,
+                        })
+            });
+            if conflicts {
+                return Err(BindingError::Conflict(other));
+            }
         }
         Ok(())
     }
 
-    #[allow(dead_code)] // used by the Hotkeys page
     pub(crate) fn find(&self, scope: Scope, modifiers: Modifiers, key: Key) -> Option<Action> {
         self.find_binding(scope, Binding::Chord { key, modifiers })
     }
@@ -511,7 +602,6 @@ impl Hotkeys {
         })
     }
 
-    #[allow(dead_code)] // used by the Hotkeys page
     pub(crate) fn to_json(&self) -> String {
         let bindings: BTreeMap<_, _> = Action::ALL
             .into_iter()
@@ -605,6 +695,10 @@ mod tests {
         alt: true,
         ..Modifiers::NONE
     };
+    const SHIFT: Modifiers = Modifiers {
+        shift: true,
+        ..Modifiers::NONE
+    };
 
     fn bare(key: Key) -> Binding {
         Binding::Chord {
@@ -615,6 +709,15 @@ mod tests {
 
     fn chord(modifiers: Modifiers, key: Key) -> Binding {
         Binding::Chord { modifiers, key }
+    }
+
+    fn load_overrides(overrides: &[(Action, &[Binding])]) -> Hotkeys {
+        let bindings: BTreeMap<_, _> = overrides
+            .iter()
+            .map(|&(action, bindings)| (action.id(), bindings))
+            .collect();
+        let document = serde_json::json!({"version": 1, "bindings": bindings});
+        Hotkeys::from_json(&document.to_string()).unwrap()
     }
 
     #[test]
@@ -684,6 +787,8 @@ mod tests {
         let action = Action::SaveSnapshotGlobal;
         for (binding, error) in [
             (bare(Key::Q), BindingError::GlobalNeedsModifier),
+            (chord(SHIFT, Key::Q), BindingError::GlobalNeedsModifier),
+            (chord(SHIFT, Key::F6), BindingError::GlobalNeedsModifier),
             (Binding::RightCtrlTap, BindingError::GlobalRightCtrlTap),
             (
                 chord(CTRL, Key::F12),
@@ -699,7 +804,7 @@ mod tests {
             ALT,
             Modifiers {
                 shift: true,
-                ..Modifiers::NONE
+                ..CTRL
             },
             Modifiers {
                 win: true,
@@ -709,6 +814,42 @@ mod tests {
             assert_eq!(model.set(action, &[chord(modifiers, Key::Q)]), Ok(()));
         }
         assert_eq!(model.set(Action::OpenOptions, &[bare(Key::F12)]), Ok(()));
+    }
+
+    #[test]
+    fn altgr_character_chords_cannot_be_global() {
+        let ctrl_alt = Modifiers { alt: true, ..CTRL };
+        for key in [
+            Key::Q,
+            Key::Digit0,
+            Key::Slash,
+            Key::Equals,
+            Key::KeyLeftOf1,
+        ] {
+            assert_eq!(
+                chord(ctrl_alt, key).to_win32(),
+                Err(BindingError::Reserved(ReservedShortcut::AltGr)),
+                "{key}"
+            );
+        }
+        for key in [Key::F6, Key::ArrowLeft] {
+            assert!(chord(ctrl_alt, key).to_win32().is_ok(), "{key}");
+        }
+        for modifiers in [
+            Modifiers {
+                shift: true,
+                ..ctrl_alt
+            },
+            Modifiers {
+                win: true,
+                ..ctrl_alt
+            },
+        ] {
+            assert!(chord(modifiers, Key::Q).to_win32().is_ok());
+        }
+        Hotkeys::defaults()
+            .set(Action::OpenOptions, &[chord(ctrl_alt, Key::Q)])
+            .unwrap();
     }
 
     #[test]
@@ -762,6 +903,104 @@ mod tests {
     }
 
     #[test]
+    fn window_zoom_chords_are_reserved_even_with_shift_or_alt() {
+        let mut model = Hotkeys::defaults();
+        for (key, reserved) in [
+            (Key::Equals, ReservedShortcut::ZoomIn),
+            (Key::Minus, ReservedShortcut::ZoomOut),
+            (Key::Digit0, ReservedShortcut::ZoomReset),
+        ] {
+            for (shift, alt) in [(false, false), (true, false), (false, true), (true, true)] {
+                let binding = chord(Modifiers { shift, alt, ..CTRL }, key);
+                assert_eq!(
+                    model.set(Action::OpenOptions, &[binding]),
+                    Err(BindingError::Reserved(reserved)),
+                    "{binding}"
+                );
+            }
+            model.set(Action::OpenOptions, &[chord(ALT, key)]).unwrap();
+            assert!(chord(CTRL, key).to_win32().is_ok());
+        }
+    }
+
+    #[test]
+    fn shift_tab_is_reserved_for_focus_navigation() {
+        let mut model = Hotkeys::defaults();
+        assert_eq!(
+            model.set(Action::OpenOptions, &[chord(SHIFT, Key::Tab)]),
+            Err(BindingError::Reserved(ReservedShortcut::ShiftTab))
+        );
+        let ctrl_shift = Modifiers {
+            shift: true,
+            ..CTRL
+        };
+        model
+            .set(Action::OpenOptions, &[chord(ctrl_shift, Key::Tab)])
+            .unwrap();
+    }
+
+    #[test]
+    fn win_modifier_is_only_accepted_for_global_shortcuts() {
+        let mut model = Hotkeys::defaults();
+        let binding = chord(Modifiers { win: true, ..CTRL }, Key::F6);
+        assert_eq!(
+            model.set(Action::ToggleCapture, &[binding]),
+            Err(BindingError::Reserved(ReservedShortcut::WindowWinModifier))
+        );
+        model.set(Action::SaveSnapshotGlobal, &[binding]).unwrap();
+    }
+
+    #[test]
+    fn only_separate_lanes_accepts_a_right_ctrl_tap() {
+        let mut model = Hotkeys::defaults();
+        model.clear(Action::SeparateLanes);
+        for action in Action::ALL {
+            let expected = match action {
+                Action::SeparateLanes => Ok(()),
+                Action::SaveSnapshotGlobal => Err(BindingError::GlobalRightCtrlTap),
+                _ => Err(BindingError::Reserved(ReservedShortcut::RightCtrlTap)),
+            };
+            assert_eq!(
+                model.set(action, &[Binding::RightCtrlTap]),
+                expected,
+                "{action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_shortcuts_cannot_be_bound_in_the_window() {
+        let mut model = Hotkeys::defaults();
+        let ctrl_shift = Modifiers {
+            shift: true,
+            ..CTRL
+        };
+        for binding in [
+            chord(CTRL, Key::C),
+            chord(CTRL, Key::X),
+            chord(CTRL, Key::V),
+            chord(SHIFT, Key::Delete),
+            chord(CTRL, Key::Insert),
+            chord(SHIFT, Key::Insert),
+            chord(ctrl_shift, Key::Delete),
+            chord(Modifiers { alt: true, ..CTRL }, Key::Insert),
+            chord(Modifiers { alt: true, ..SHIFT }, Key::Insert),
+        ] {
+            assert_eq!(
+                model.set(Action::OpenOptions, &[binding]),
+                Err(BindingError::Reserved(ReservedShortcut::Clipboard)),
+                "{binding}"
+            );
+        }
+        for key in [Key::C, Key::X, Key::V] {
+            model
+                .set(Action::OpenOptions, &[chord(ctrl_shift, key)])
+                .unwrap();
+            assert!(chord(CTRL, key).to_win32().is_ok());
+        }
+    }
+
+    #[test]
     fn conflicting_edits_name_the_existing_action_regardless_of_scope() {
         let mut model = Hotkeys::defaults();
         let binding = chord(CTRL, Key::S);
@@ -782,11 +1021,74 @@ mod tests {
             model.set(Action::SaveSnapshot, &[binding]),
             Err(BindingError::Conflict(Action::SaveSnapshotGlobal))
         );
-        assert_eq!(
-            model.set(Action::Quit, &[Binding::RightCtrlTap]),
-            Err(BindingError::Conflict(Action::SeparateLanes))
-        );
         assert_eq!(model.set(Action::SaveSnapshotGlobal, &[binding]), Ok(()));
+    }
+
+    #[test]
+    fn a_window_chord_conflicts_with_a_bare_cancel_key() {
+        let mut model = Hotkeys::defaults();
+        let binding = chord(CTRL, Key::Backspace);
+        let expected = Err(BindingError::Conflict(Action::CancelSelection));
+        assert_eq!(model.check_binding(Action::Clear, binding), expected);
+        assert_eq!(model.set(Action::Clear, &[binding]), expected);
+        assert_eq!(model.bindings(Action::Clear), &[bare(Key::Delete)]);
+        assert_eq!(model.set(Action::SaveSnapshotGlobal, &[binding]), Ok(()));
+    }
+
+    #[test]
+    fn assigning_a_bare_cancel_key_conflicts_with_existing_window_chords() {
+        let mut model = Hotkeys::defaults();
+        model
+            .set(Action::OpenOptions, &[chord(CTRL, Key::F6)])
+            .unwrap();
+        let binding = bare(Key::F6);
+        let expected = Err(BindingError::Conflict(Action::OpenOptions));
+        assert_eq!(
+            model.check_binding(Action::CancelSelection, binding),
+            expected
+        );
+        assert_eq!(model.set(Action::CancelSelection, &[binding]), expected);
+
+        // A modified cancel chord matches only those modifiers.
+        assert_eq!(
+            model.set(Action::CancelSelection, &[chord(ALT, Key::F6)]),
+            Ok(())
+        );
+        assert_eq!(
+            model.set(Action::CancelSelection, &[chord(CTRL, Key::F6)]),
+            expected
+        );
+
+        model.clear(Action::OpenOptions);
+        model
+            .set(Action::SaveSnapshotGlobal, &[chord(CTRL, Key::F6)])
+            .unwrap();
+        assert_eq!(model.set(Action::CancelSelection, &[binding]), Ok(()));
+    }
+
+    #[test]
+    fn duplicate_bindings_leave_the_action_unchanged() {
+        let mut model = Hotkeys::defaults();
+        let defaults = model.clone();
+        for (action, binding) in [
+            (Action::ToggleCapture, chord(CTRL, Key::F6)),
+            (Action::SeparateLanes, Binding::RightCtrlTap),
+            (Action::SaveSnapshotGlobal, chord(CTRL, Key::F6)),
+        ] {
+            assert_eq!(
+                model.set(action, &[binding, binding]),
+                Err(BindingError::Reserved(ReservedShortcut::DuplicateBinding)),
+                "{action:?}"
+            );
+            assert_eq!(model, defaults);
+        }
+        assert_eq!(
+            model.set(
+                Action::ToggleCapture,
+                &[chord(CTRL, Key::F6), chord(ALT, Key::F6)]
+            ),
+            Ok(())
+        );
     }
 
     #[test]
@@ -889,6 +1191,67 @@ mod tests {
         assert_eq!(model.bindings(Action::ToggleCapture), &[bare(Key::Space)]);
         assert_eq!(model.bindings(Action::Clear), &[bare(Key::Delete)]);
         assert_eq!(model.bindings(Action::OpenOptions), &[bare(Key::F6)]);
+    }
+
+    #[test]
+    fn loading_detects_conflicts_with_bare_cancel_keys_in_either_order() {
+        let model = load_overrides(&[(Action::Clear, &[chord(CTRL, Key::Backspace)])]);
+        assert_eq!(model, Hotkeys::defaults());
+
+        let cancel = bare(Key::F6);
+        let modified = chord(CTRL, Key::F6);
+        let model = load_overrides(&[
+            (Action::CancelSelection, &[cancel]),
+            (Action::OpenOptions, &[modified]),
+        ]);
+        assert_eq!(model.bindings(Action::CancelSelection), &[cancel]);
+        assert!(model.bindings(Action::OpenOptions).is_empty());
+
+        let model = load_overrides(&[
+            (Action::ToggleCapture, &[modified]),
+            (Action::CancelSelection, &[cancel]),
+        ]);
+        assert_eq!(model.bindings(Action::ToggleCapture), &[modified]);
+        assert_eq!(
+            model.bindings(Action::CancelSelection),
+            &[bare(Key::Escape), bare(Key::Backspace)]
+        );
+    }
+
+    #[test]
+    fn loading_rejects_invalid_and_duplicate_alternatives_per_action() {
+        let valid = chord(CTRL, Key::F8);
+        let unrelated = bare(Key::F7);
+        let global = Action::SaveSnapshotGlobal;
+        let window = Action::ToggleCapture;
+        let win = Modifiers {
+            win: true,
+            ..Modifiers::NONE
+        };
+        let defaults = Hotkeys::defaults();
+        for (action, invalid) in [
+            (global, chord(SHIFT, Key::Q)),
+            (global, chord(Modifiers { alt: true, ..CTRL }, Key::Q)),
+            (window, chord(CTRL, Key::Equals)),
+            (window, chord(SHIFT, Key::Tab)),
+            (window, chord(win, Key::F6)),
+            (window, chord(CTRL, Key::C)),
+            (window, Binding::RightCtrlTap),
+            (window, valid),
+        ] {
+            let model = load_overrides(&[
+                (Action::SeparateLanes, &[]),
+                (action, &[valid, invalid]),
+                (Action::OpenOptions, &[unrelated]),
+            ]);
+            assert_eq!(
+                model.bindings(action),
+                defaults.bindings(action),
+                "{invalid}"
+            );
+            assert_eq!(model.bindings(Action::OpenOptions), &[unrelated]);
+            assert!(model.bindings(Action::SeparateLanes).is_empty());
+        }
     }
 
     #[test]
