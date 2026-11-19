@@ -34,6 +34,7 @@ use windows::Win32::System::Variant::VT_BLOB;
 use windows::core::{Error, GUID, HRESULT, HSTRING, Interface, PCWSTR, Ref, implement};
 
 mod sources;
+mod synthetic;
 mod timing;
 pub(crate) use sources::{CaptureSource, SENDER_MARK};
 use sources::{OwnedHandle, RunningProcess, target_process};
@@ -349,7 +350,11 @@ pub(crate) struct Loopback {
 
 impl Loopback {
     /// `data_wake` runs on the capture thread after it queued packets or an error.
-    pub(crate) fn start(source: CaptureSource, data_wake: DataWake) -> Result<Self, String> {
+    pub(crate) fn start(
+        source: CaptureSource,
+        data_wake: DataWake,
+        all_channels: bool,
+    ) -> Result<Self, String> {
         let (commands, command_reader) = mpsc::channel();
         let (errors_writer, errors) = mpsc::channel();
         let (startup_writer, startup) = mpsc::sync_channel(1);
@@ -360,6 +365,7 @@ impl Loopback {
             .spawn(move || {
                 capture_thread(
                     source,
+                    all_channels,
                     command_reader,
                     &thread_wake,
                     startup_writer,
@@ -472,13 +478,21 @@ pub(crate) fn resolved_process_id_for_test(path: &str) -> Result<u32, String> {
 
 fn capture_thread(
     source: CaptureSource,
+    all_channels: bool,
     commands: mpsc::Receiver<Command>,
     wake: &Signal,
     startup: mpsc::SyncSender<Result<Started, String>>,
     errors: mpsc::Sender<String>,
     data_wake: DataWake,
 ) {
-    let mut stream = match WasapiStream::open(source) {
+    if matches!(source, CaptureSource::System)
+        && crate::startup::test_instance().is_some()
+        && let Ok(spec) = std::env::var("BACKTRACKING_TEST_SYSTEM_FORMAT")
+    {
+        synthetic::run(&spec, commands, startup, data_wake);
+        return;
+    }
+    let mut stream = match WasapiStream::open(source, all_channels) {
         Ok(stream) => stream,
         Err(error) => {
             let _ = startup.send(Err(error));
@@ -651,11 +665,23 @@ impl Drop for MixFormat {
     }
 }
 
+fn process_shape_changed(
+    all_channels: bool,
+    opened: Option<(u32, usize, u32)>,
+    current: Option<(u32, usize, u32)>,
+) -> bool {
+    all_channels && current.is_some() && current != opened
+}
+
 enum SourceBinding {
     DefaultRender(String),
     DefaultCapture(String),
     Microphone(String),
-    Process(RunningProcess),
+    Process {
+        process: RunningProcess,
+        all_channels: bool,
+        opened: Option<(u32, usize, u32)>,
+    },
 }
 
 struct WasapiStream {
@@ -680,16 +706,33 @@ struct WasapiStream {
 }
 
 impl WasapiStream {
-    fn open(source: CaptureSource) -> Result<Self, String> {
+    fn open(source: CaptureSource, all_channels: bool) -> Result<Self, String> {
         let apartment = Apartment::initialize()?;
         let (client, format, binding, enumerator, event) = match source {
             CaptureSource::Application { path, .. } => {
                 let process = target_process(&path)?;
-                let (client, format, event) = open_process_client(process.id)?;
+                let mix = default_render_mix();
+                let device_shape = mix
+                    .as_ref()
+                    .and_then(|m| unsafe { Format::parse(m.0) }.ok())
+                    .map(|f| f.shape());
+                let wide = mix
+                    .filter(|_| device_shape.is_some_and(|s| s.1 > 2))
+                    .and_then(|mix| process_format(process.id, mix.0).ok());
+                let available = wide.is_some();
+                let (client, mut format, event) = match wide {
+                    Some(stream) if all_channels => stream,
+                    _ => open_process_client(process.id)?,
+                };
+                format.process_wide_available = available;
                 (
                     client,
                     format,
-                    SourceBinding::Process(process),
+                    SourceBinding::Process {
+                        process,
+                        all_channels,
+                        opened: device_shape,
+                    },
                     None,
                     Some(event),
                 )
@@ -787,12 +830,33 @@ impl WasapiStream {
         unsafe { self.client.Start() }.map_err(|error| audio_error("無法開始擷取音訊", error))
     }
 
+    fn verify_format(&self, device: &IMMDevice) -> Result<(), String> {
+        let mix = endpoint_mix(device)?;
+        let format = unsafe { Format::parse(mix.0) }?;
+        if format.shape() != self.format.shape() {
+            return Err(FORMAT_CHANGED.into());
+        }
+        Ok(())
+    }
+
     fn verify_source(&self) -> Result<(), String> {
         let enumerator = self.enumerator.as_ref();
         match &self.binding {
-            SourceBinding::Process(process) => {
+            SourceBinding::Process {
+                process,
+                all_channels,
+                opened,
+            } => {
                 if !process.running() {
                     return Err("應用程式已結束，等待重新啟動".into());
+                }
+                if *all_channels {
+                    let current = default_render_mix()
+                        .and_then(|mix| unsafe { Format::parse(mix.0) }.ok())
+                        .map(|f| f.shape());
+                    if process_shape_changed(*all_channels, *opened, current) {
+                        return Err(FORMAT_CHANGED.into());
+                    }
                 }
             }
             SourceBinding::DefaultRender(id) | SourceBinding::DefaultCapture(id) => {
@@ -807,6 +871,7 @@ impl WasapiStream {
                         .GetDefaultAudioEndpoint(flow, eConsole)
                 }
                 .map_err(|error| audio_error("找不到 Windows 預設音訊裝置", error))?;
+                self.verify_format(&current)?;
                 if endpoint_id(&current)? != *id {
                     return Err("Windows 預設音訊裝置已切換，正在重新連線".into());
                 }
@@ -823,6 +888,7 @@ impl WasapiStream {
                 if state != DEVICE_STATE_ACTIVE {
                     return Err("等待已選取的麥克風重新連線".into());
                 }
+                self.verify_format(&device)?;
             }
         }
         Ok(())
@@ -1140,6 +1206,63 @@ fn open_device_client(
     ))
 }
 
+fn float_wave(channels: u16, mask: u32) -> WAVEFORMATEXTENSIBLE {
+    WAVEFORMATEXTENSIBLE {
+        Format: WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_EXTENSIBLE,
+            nChannels: channels,
+            nSamplesPerSec: 48_000,
+            nAvgBytesPerSec: 48_000 * u32::from(channels) * 4,
+            nBlockAlign: channels * 4,
+            wBitsPerSample: 32,
+            cbSize: (size_of::<WAVEFORMATEXTENSIBLE>() - size_of::<WAVEFORMATEX>()) as u16,
+        },
+        Samples: windows::Win32::Media::Audio::WAVEFORMATEXTENSIBLE_0 {
+            wValidBitsPerSample: 32,
+        },
+        dwChannelMask: mask,
+        SubFormat: SUBTYPE_IEEE_FLOAT,
+    }
+}
+
+fn process_format(
+    pid: u32,
+    native: NonNull<WAVEFORMATEX>,
+) -> Result<(IAudioClient, Format, OwnedHandle), String> {
+    let client = activate_process(pid)?;
+    let flags = AUDCLNT_STREAMFLAGS_LOOPBACK
+        | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+    unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, native.as_ptr(), None) }
+        .map_err(|e| audio_error("Initialize process loopback", e))?;
+    let event = OwnedHandle(
+        unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
+            .map_err(|e| audio_error("CreateEvent", e))?,
+    );
+    unsafe { client.SetEventHandle(event.0) }.map_err(|e| audio_error("SetEventHandle", e))?;
+    Ok((client, unsafe { Format::parse(native) }?, event))
+}
+
+fn default_render_mix() -> Option<MixFormat> {
+    let device = unsafe {
+        endpoint_enumerator()
+            .ok()?
+            .GetDefaultAudioEndpoint(eRender, eConsole)
+    }
+    .ok()?;
+    endpoint_mix(&device).ok()
+}
+
+fn endpoint_mix(device: &IMMDevice) -> Result<MixFormat, String> {
+    let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
+        .map_err(|e| audio_error("Activate endpoint", e))?;
+    let wave = unsafe { client.GetMixFormat() }.map_err(|e| audio_error("GetMixFormat", e))?;
+    Ok(MixFormat(NonNull::new(wave).ok_or("Missing mix format")?))
+}
+
+const FORMAT_CHANGED: &str = "Audio format changed. Reconnecting. / 音訊格式已變更，正在重新連線。";
+
 fn open_process_client(pid: u32) -> Result<(IAudioClient, Format, OwnedHandle), String> {
     let mut last_error = None;
     // Prefer float so 32-bit capture stays lossless. Retry with Microsoft's documented
@@ -1198,6 +1321,8 @@ pub(crate) fn now_ns() -> u64 {
 pub(crate) struct Format {
     pub(crate) sample_rate: u32,
     pub(crate) channels: usize,
+    channel_mask: u32,
+    process_wide_available: bool,
     frame_bytes: usize,
     sample_bytes: usize,
     encoding: Encoding,
@@ -1236,10 +1361,19 @@ impl Encoding {
 }
 
 impl Format {
+    pub(crate) fn offers_all_channels(&self) -> bool {
+        self.channels > 2 || self.process_wide_available
+    }
+
+    pub(crate) fn shape(&self) -> (u32, usize, u32) {
+        (self.sample_rate, self.channels, self.channel_mask)
+    }
     pub(crate) fn sender(sample_rate: u32, channels: usize) -> Self {
         Self {
             sample_rate,
             channels,
+            channel_mask: 0,
+            process_wide_available: false,
             frame_bytes: channels * size_of::<f32>(),
             sample_bytes: size_of::<f32>(),
             encoding: Encoding::Float32,
@@ -1314,6 +1448,8 @@ impl Format {
         Ok(Self {
             sample_rate,
             channels,
+            channel_mask: mask,
+            process_wide_available: false,
             frame_bytes,
             sample_bytes,
             encoding,
@@ -1324,8 +1460,27 @@ impl Format {
         })
     }
 
+    pub(crate) fn speaker_labels(&self) -> Option<Vec<String>> {
+        const NAMES: [&str; 18] = [
+            "FL", "FR", "FC", "LFE", "Lb", "Rb", "FLc", "FRc", "BC", "Ls", "Rs", "TpC", "TFL",
+            "TpFC", "TFR", "TBL", "TpBC", "TBR",
+        ];
+        (self.channel_mask.count_ones() as usize == self.channels).then(|| {
+            (0..32)
+                .filter(|bit| self.channel_mask & (1 << bit) != 0)
+                .enumerate()
+                .map(|(i, bit)| {
+                    NAMES
+                        .get(bit)
+                        .map_or_else(|| format!("Channel {}", i + 1), |s| s.to_string())
+                })
+                .collect()
+        })
+    }
+
     pub(crate) fn route_channels(&self, route: ChannelRoute) -> Option<usize> {
         match route {
+            ChannelRoute::AllChannels => (self.channels > 2).then_some(self.channels),
             ChannelRoute::Left => self.left.map(|_| 1),
             ChannelRoute::Right => self.right.map(|_| 1),
             ChannelRoute::Center => self.center.map(|_| 1),
@@ -1355,7 +1510,9 @@ impl Format {
         output: &mut Vec<f32>,
     ) {
         output.clear();
-        if routes == [ChannelRoute::Merged] && self.stereo_mix.is_empty() {
+        if (routes == [ChannelRoute::Merged] && self.stereo_mix.is_empty())
+            || routes == [ChannelRoute::AllChannels]
+        {
             output.extend_from_slice(input);
             return;
         }
@@ -1368,6 +1525,7 @@ impl Format {
             let sample = |index: Option<usize>| index.map_or(0.0, |index| frame[index]);
             for &route in routes {
                 match route {
+                    ChannelRoute::AllChannels => output.extend_from_slice(frame),
                     ChannelRoute::Left => output.push(sample(self.left)),
                     ChannelRoute::Right => output.push(sample(self.right)),
                     ChannelRoute::Center => output.push(sample(self.center)),
@@ -1449,6 +1607,26 @@ fn endpoint_id(device: &IMMDevice) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_reconnect_depends_on_route_and_successful_shape_read() {
+        let opened = Some((48_000, 2, 3));
+        for current in [
+            Some((44_100, 2, 3)),
+            Some((48_000, 6, 3)),
+            Some((48_000, 2, 9)),
+        ] {
+            assert!(!process_shape_changed(false, opened, current));
+            assert!(process_shape_changed(true, opened, current));
+            assert!(process_shape_changed(true, None, current));
+            assert!(!process_shape_changed(false, None, current));
+        }
+        for route in [false, true] {
+            assert!(!process_shape_changed(route, opened, opened));
+            assert!(!process_shape_changed(route, opened, None));
+            assert!(!process_shape_changed(route, None, None));
+        }
+    }
 
     #[test]
     fn activation_blob_borrows_boxed_params_until_the_last_completion_reference_drops() {
@@ -1954,21 +2132,164 @@ mod tests {
     }
 
     fn native_format(channels: u16, mask: u32) -> Format {
-        let mut native = WAVEFORMATEXTENSIBLE {
-            Format: WAVEFORMATEX {
-                wFormatTag: WAVE_FORMAT_EXTENSIBLE,
-                nChannels: channels,
-                nSamplesPerSec: 48_000,
-                nAvgBytesPerSec: 48_000 * u32::from(channels) * 4,
-                nBlockAlign: channels * 4,
-                wBitsPerSample: 32,
-                cbSize: (size_of::<WAVEFORMATEXTENSIBLE>() - size_of::<WAVEFORMATEX>()) as u16,
-            },
-            dwChannelMask: mask,
-            SubFormat: SUBTYPE_IEEE_FLOAT,
-            ..Default::default()
-        };
+        let mut native = float_wave(channels, mask);
         unsafe { Format::parse(NonNull::from(&mut native).cast()).unwrap() }
+    }
+
+    #[test]
+    #[ignore = "opens a process loopback client on the silent test process"]
+    fn wide_process_open() {
+        let _apt = Apartment::initialize().unwrap();
+        for (channels, mask) in [(6, 0x60f), (8, 0x63f)] {
+            for extensible in [true, false] {
+                for pcm in [true, false] {
+                    let mut wave = float_wave(channels, mask);
+                    if pcm {
+                        wave.SubFormat = SUBTYPE_PCM;
+                        wave.Samples.wValidBitsPerSample = 16;
+                        wave.Format.wBitsPerSample = 16;
+                        wave.Format.nBlockAlign = channels * 2;
+                        wave.Format.nAvgBytesPerSec = 48000 * u32::from(channels) * 2;
+                    }
+                    if !extensible {
+                        wave.Format.wFormatTag = if pcm {
+                            WAVE_FORMAT_PCM
+                        } else {
+                            WAVE_FORMAT_IEEE_FLOAT
+                        };
+                        wave.Format.cbSize = 0;
+                    }
+                    match process_format(std::process::id(), NonNull::from(&mut wave).cast()) {
+                        Ok((client, _, _event)) => {
+                            let _: IAudioCaptureClient = unsafe { client.GetService() }.unwrap();
+                            unsafe {
+                                client.Start().unwrap();
+                                client.Stop().unwrap();
+                            }
+                            eprintln!("{channels} channels ext={extensible} pcm={pcm}: opened");
+                        }
+                        Err(err) => {
+                            eprintln!("{channels} channels ext={extensible} pcm={pcm}: {err}")
+                        }
+                    }
+                }
+            }
+        }
+        let (client, format, _event) = open_process_client(std::process::id()).unwrap();
+        unsafe {
+            client.Start().unwrap();
+            client.Stop().unwrap();
+        }
+        eprintln!("Control opened with {} channels", format.channels);
+    }
+
+    #[test]
+    fn native_route_preserves_each_decoded_sample_and_mask_order() {
+        for (width, mask, names) in [
+            (6, 0x60f, "FL FR FC LFE Ls Rs"),
+            (8, 0x63f, "FL FR FC LFE Lb Rb Ls Rs"),
+            (12, 0x2d63f, "FL FR FC LFE Lb Rb Ls Rs TFL TFR TBL TBR"),
+            (8, 3, ""),
+            (32, 0, ""),
+        ] {
+            for (subtype, bits) in [
+                (SUBTYPE_IEEE_FLOAT, 32),
+                (SUBTYPE_IEEE_FLOAT, 64),
+                (SUBTYPE_PCM, 8),
+                (SUBTYPE_PCM, 16),
+                (SUBTYPE_PCM, 24),
+                (SUBTYPE_PCM, 32),
+            ] {
+                let mut native = float_wave(width, mask);
+                native.SubFormat = subtype;
+                native.Format.wBitsPerSample = bits;
+                native.Samples.wValidBitsPerSample = bits;
+                native.Format.nBlockAlign = width * (bits / 8);
+                native.Format.nAvgBytesPerSec = 48000 * u32::from(native.Format.nBlockAlign);
+                let format = unsafe { Format::parse(NonNull::from(&mut native).cast()).unwrap() };
+                assert_eq!(format.speaker_labels().unwrap_or_default().join(" "), names);
+                let mut expected = Vec::new();
+                let mut bytes = Vec::new();
+                for index in 0..width * 3 {
+                    let signed = i32::from(index) - 48;
+                    let value = signed as f32 / 128.;
+                    expected.push(value);
+                    match (subtype, bits) {
+                        (SUBTYPE_IEEE_FLOAT, 32) => bytes.extend(value.to_le_bytes()),
+                        (SUBTYPE_IEEE_FLOAT, 64) => bytes.extend(f64::from(value).to_le_bytes()),
+                        (SUBTYPE_PCM, 8) => bytes.push((128 + signed) as u8),
+                        (SUBTYPE_PCM, 16) => bytes.extend(((signed << 8) as i16).to_le_bytes()),
+                        (SUBTYPE_PCM, 24) => {
+                            bytes.extend_from_slice(&(signed << 16).to_le_bytes()[..3])
+                        }
+                        (SUBTYPE_PCM, 32) => bytes.extend((signed << 24).to_le_bytes()),
+                        _ => unreachable!(),
+                    }
+                }
+                let mut samples = vec![0.; expected.len()];
+                format.decode(&bytes, &mut samples);
+                let mut routed = Vec::new();
+                format.route(ChannelRoute::AllChannels, &samples, &mut routed);
+                assert_eq!(routed, expected);
+                format.route_tracks(
+                    &[ChannelRoute::Left, ChannelRoute::AllChannels],
+                    &samples,
+                    &mut routed,
+                );
+                for (output, frame) in routed
+                    .chunks_exact(width as usize + 1)
+                    .zip(expected.chunks_exact(width as usize))
+                {
+                    assert_eq!(output[0], frame[0]);
+                    assert_eq!(&output[1..], frame);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "stereo device packet microbenchmark"]
+    fn stereo_device_packet_cost() {
+        let format = native_format(2, 3);
+        let queue = TimedAudioQueue::new(48000, PACKET_QUEUE_CAPACITY, 2);
+        let mut clock = PacketClock::new(48000);
+        let bytes: Vec<u8> = (0..960)
+            .flat_map(|i| (i as f32 / 1024.).to_le_bytes())
+            .collect();
+        let mut samples = vec![0.; 960];
+        let mut popped = Vec::with_capacity(960);
+        let mut routed = Vec::with_capacity(960);
+        let mut measured = Vec::new();
+        let mut start = 0u64;
+        for batch in 0..8 {
+            let begun = Instant::now();
+            for _ in 0..20000 {
+                format.decode(std::hint::black_box(&bytes), &mut samples);
+                let time = 1_000_000_000 + start * 1_000_000_000 / 48000;
+                let stamp = clock.timestamp(start, 480, Some(time), false, || time);
+                assert_eq!(
+                    queue.push_interleaved_with_discontinuity(
+                        stamp.timestamp_ns,
+                        48000,
+                        &samples,
+                        stamp.discontinuity
+                    ),
+                    480
+                );
+                queue.pop(&mut popped).unwrap();
+                format.route(ChannelRoute::Merged, &popped, &mut routed);
+                std::hint::black_box(&routed);
+                start += 480;
+            }
+            if batch != 0 {
+                measured.push(begun.elapsed().as_secs_f64() * 1e6 / 20000.);
+            }
+        }
+        measured.sort_by(f64::total_cmp);
+        eprintln!(
+            "stereo float decode, clock, queue and route: {:.3} us per 480-frame packet",
+            measured[3]
+        );
     }
 
     #[test]

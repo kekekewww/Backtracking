@@ -284,10 +284,20 @@ fn channel_cache_benchmark_redraw() {
 #[test]
 #[ignore = "release-mode capture throughput benchmark"]
 fn channel_cache_benchmark_capture_path() {
+    benchmark_capture_widths(&[2, 12, 40]);
+}
+
+#[test]
+#[ignore = "alternating narrow capture throughput comparisons"]
+fn narrow_capture_cost() {
+    benchmark_capture_widths(&[1, 2]);
+}
+
+fn benchmark_capture_widths(widths: &[usize]) {
     const BATCH_SECONDS: usize = 10;
     println!("capture: 48 kHz, 256-frame chunks, median of {REPEATS} ten-second batches");
     println!("channels,viewed,median_ms_per_audio_second,p99_chunk_us,max_chunk_us");
-    for channels in [2, 12, 40] {
+    for &channels in widths {
         for viewed in [false, true] {
             let mut capture = Capture::new_with_budget(
                 RATE as u32,

@@ -9,18 +9,19 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use backtracking_addon::host::{Connection, Host, HostEvent};
+use backtracking_addon::host::{Connection, Host, HostEvent, PositionFilter};
 use backtracking_addon::manifest::{Capability, Manifest, validate_id};
 use backtracking_addon::package::{self, PackageInfo};
 use backtracking_addon::protocol::{
-    Action, AddonMessage, HostMessage, MessageLevel, Setting, SettingKind, Source, Transport,
-    TransportCommand,
+    Action, AddonMessage, ChannelPosition, HostMessage, MessageLevel, Setting, SettingKind, Source,
+    Transport, TransportCommand,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 mod bridge;
+pub(crate) mod position_timeline;
 mod process;
 mod startup;
 use process::{AddonProcess, random_token};
@@ -32,6 +33,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RESTART_WINDOW: Duration = Duration::from_secs(60);
 const STATE_FILE: &str = "addon-host-v1.json";
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_POSITION_BYTES: usize = 1024 * 1024;
 
 pub(crate) type AddonReply<T> = mpsc::Receiver<Result<T, String>>;
 pub(crate) type ChangeCallback = Arc<dyn Fn() + Send + Sync>;
@@ -100,9 +102,67 @@ impl AddonSnapshot {
     }
 }
 
+/// One accepted full state, stamped on the Sender clock. Readers have separate cursors.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AddonPositions {
+    pub(crate) sequence: u64,
+    pub(crate) addon_id: String,
+    pub(crate) source_id: String,
+    pub(crate) time: u64,
+    pub(crate) channels: Vec<ChannelPosition>,
+}
+
+impl AddonPositions {
+    fn memory_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.addon_id.capacity()
+            + self.source_id.capacity()
+            + self.channels.capacity() * size_of::<ChannelPosition>()
+            + size_of::<Arc<Self>>()
+            + 2 * size_of::<usize>()
+    }
+}
+
+#[derive(Default)]
+struct PositionJournal {
+    sequence: u64,
+    bytes: usize,
+    messages: VecDeque<Arc<AddonPositions>>,
+}
+
+impl PositionJournal {
+    fn push(&mut self, mut message: AddonPositions) {
+        self.sequence = self.sequence.saturating_add(1);
+        message.sequence = self.sequence;
+        self.bytes += message.memory_bytes();
+        self.messages.push_back(Arc::new(message));
+        while self.bytes > MAX_POSITION_BYTES {
+            let Some(oldest) = self.messages.pop_front() else {
+                break;
+            };
+            self.bytes -= oldest.memory_bytes();
+        }
+    }
+
+    fn since(&self, cursor: &mut u64) -> Vec<Arc<AddonPositions>> {
+        if *cursor > self.sequence {
+            *cursor = 0;
+        }
+        let result = self
+            .messages
+            .iter()
+            .filter(|message| message.sequence > *cursor)
+            .cloned()
+            .collect();
+        *cursor = self.sequence;
+        result
+    }
+}
+
 struct Shared {
     snapshot: Mutex<Arc<AddonSnapshot>>,
     callbacks: Mutex<Vec<ChangeCallback>>,
+    positions: Mutex<PositionJournal>,
 }
 
 /// A handle may be retained by capture and export workers after a UI window closes.
@@ -113,6 +173,16 @@ pub(crate) struct AddonHandle {
 }
 
 impl AddonHandle {
+    /// Read accepted positions without consuming another lane or window's updates.
+    /// A reader which falls behind the bounded journal resumes at its oldest state.
+    pub(crate) fn positions_since(&self, cursor: &mut u64) -> Vec<Arc<AddonPositions>> {
+        self.shared
+            .positions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .since(cursor)
+    }
+
     /// Use on the UI thread; keep the previous snapshot when publication is in progress.
     pub(crate) fn try_snapshot(&self) -> Option<Arc<AddonSnapshot>> {
         self.shared
@@ -280,6 +350,7 @@ impl AddonManager {
                 ..AddonSnapshot::default()
             })),
             callbacks: Mutex::new(Vec::new()),
+            positions: Mutex::new(PositionJournal::default()),
         });
         Self {
             handle: AddonHandle { commands, shared },
@@ -298,6 +369,7 @@ impl AddonManager {
         let shared = Arc::new(Shared {
             snapshot: Mutex::new(Arc::new(AddonSnapshot::default())),
             callbacks: Mutex::new(Vec::new()),
+            positions: Mutex::new(PositionJournal::default()),
         });
         let worker_state = Worker::new(data_root.clone(), host, shared.clone())?;
         let worker = thread::Builder::new()
@@ -405,6 +477,7 @@ struct Entry {
     info: AddonInfo,
     runtime: Option<Runtime>,
     restarts: RestartPolicy,
+    position_filter: PositionFilter,
 }
 
 impl Entry {
@@ -427,10 +500,12 @@ impl Entry {
             },
             runtime: None,
             restarts: RestartPolicy::default(),
+            position_filter: PositionFilter::default(),
         }
     }
 
     fn clear_description(&mut self) {
+        self.position_filter.clear();
         self.info.sources.clear();
         self.info.settings.clear();
         self.info.actions.clear();
@@ -1124,6 +1199,7 @@ impl Worker {
                     runtime.described = true;
                 }
                 entry.info.sources = sources;
+                entry.position_filter.retain_sources(&entry.info.sources);
                 entry.info.settings = settings;
                 entry.info.actions = actions;
             }
@@ -1134,13 +1210,10 @@ impl Worker {
                 duration,
             } => {
                 if has_capability(&entry.info, Capability::Source) {
-                    let Some(source) = entry
-                        .info
-                        .sources
-                        .iter_mut()
-                        .find(|item| item.id == source) else {
-                            return Ok(());
-                        };
+                    let Some(source) = entry.info.sources.iter_mut().find(|item| item.id == source)
+                    else {
+                        return Ok(());
+                    };
                     if source.transport.is_none() {
                         return Ok(());
                     }
@@ -1165,6 +1238,39 @@ impl Worker {
                 entry.info.message = (!text.is_empty()).then_some(AddonNotice { level, text });
             }
             AddonMessage::Hello { .. } => return Err("hello may only be sent once".into()),
+            AddonMessage::Positions {
+                source,
+                time,
+                channels,
+            } => {
+                if !has_capability(&entry.info, Capability::Source) {
+                    return Ok(());
+                }
+                let Some(source_description) =
+                    entry.info.sources.iter().find(|item| item.id == source)
+                else {
+                    return Ok(());
+                };
+                if let Some(channels) = entry.position_filter.accept(
+                    source_description,
+                    time,
+                    backtracking_core::capture_clock_ns(),
+                    Instant::now(),
+                    channels,
+                ) {
+                    self.shared
+                        .positions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(AddonPositions {
+                            sequence: 0,
+                            addon_id: id.into(),
+                            source_id: source,
+                            time,
+                            channels,
+                        });
+                }
+            }
             AddonMessage::Unknown => {}
         }
         Ok(())
@@ -1761,6 +1867,7 @@ mod tests {
                 id: "channels".into(),
                 label: "Channels".into(),
                 channels: vec!["L".into(), "R".into()],
+                positioned: false,
             }]),
             transport: Some(Transport {
                 state: TransportState::Playing,
@@ -1793,8 +1900,202 @@ mod tests {
         let shared = Arc::new(Shared {
             snapshot: Mutex::new(Arc::new(AddonSnapshot::default())),
             callbacks: Mutex::new(Vec::new()),
+            positions: Mutex::new(PositionJournal::default()),
         });
         Worker::new(root.to_owned(), Host::bind("test").unwrap(), shared).unwrap()
+    }
+
+    fn position_message(time: u64) -> AddonPositions {
+        AddonPositions {
+            sequence: 0,
+            addon_id: "com.example.test".into(),
+            source_id: "main".into(),
+            time,
+            channels: vec![ChannelPosition::new(0, 0.5, 0.5, 0.0)],
+        }
+    }
+
+    #[test]
+    fn position_journal_is_bounded_and_readers_do_not_consume_each_others_updates() {
+        let mut journal = PositionJournal::default();
+        for time in 0..20_000 {
+            journal.push(position_message(time));
+        }
+        assert!(journal.bytes <= MAX_POSITION_BYTES);
+        assert!(journal.messages.front().unwrap().time > 0);
+        assert_eq!(journal.messages.back().unwrap().time, 19_999);
+        let (mut a, mut b) = (0, 0);
+        let first = journal.since(&mut a);
+        let second = journal.since(&mut b);
+        assert_eq!((a, b), (20_000, 20_000));
+        assert_eq!(first, second);
+        assert!(Arc::ptr_eq(&first[0], &second[0]));
+        assert!(journal.since(&mut a).is_empty());
+        journal.push(position_message(20_000));
+        assert_eq!(journal.since(&mut a)[0].time, 20_000);
+        assert_eq!(journal.since(&mut b)[0].time, 20_000);
+    }
+
+    #[test]
+    fn positions_ignore_unknown_sources_and_invalid_entries_without_changing_addon_state() {
+        let dir = TestDir::new();
+        let mut worker = worker(&dir.0);
+        let mut info = info(vec![Capability::Source]);
+        info.sources[0].groups.as_mut().unwrap().push(ChannelGroup {
+            id: "objects".into(),
+            label: "Objects".into(),
+            channels: vec!["Object 1".into(), "Object 2".into()],
+            positioned: true,
+        });
+        let id = info.id.clone();
+        let mut entry = Entry::from_manifest(id.clone(), Ok(info.manifest.clone().unwrap()), true);
+        entry.info = info;
+        worker.entries.insert(id.clone(), entry);
+        let time = backtracking_core::capture_clock_ns();
+        for source in ["unknown", "main"] {
+            let mut invalid = ChannelPosition::new(3, f64::NAN, 0.0, 0.0);
+            invalid.gain = Some(f64::INFINITY);
+            let mut clamped = ChannelPosition::new(2, -5.0, 4.0, 2.0);
+            clamped.size = Some(5.0);
+            worker
+                .receive(
+                    &id,
+                    AddonMessage::Positions {
+                        source: source.into(),
+                        time,
+                        channels: vec![
+                            ChannelPosition::new(0, 0.0, 0.0, 0.0),
+                            invalid,
+                            ChannelPosition::new(63, 0.0, 0.0, 0.0),
+                            clamped,
+                        ],
+                    },
+                )
+                .unwrap();
+        }
+        let mut cursor = 0;
+        let positions = worker.shared.positions.lock().unwrap().since(&mut cursor);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].channels.len(), 1);
+        let channel = &positions[0].channels[0];
+        assert_eq!(
+            (
+                channel.channel,
+                channel.x,
+                channel.y,
+                channel.z,
+                channel.size
+            ),
+            (2, -1.0, 1.0, 1.0, Some(1.0))
+        );
+        assert_eq!(worker.entries[&id].info.state, AddonState::Running);
+        assert_eq!(worker.shared.snapshot.lock().unwrap().revision, 0);
+    }
+
+    #[test]
+    fn positions_require_capability_and_flood_is_thinned_without_stopping_addon() {
+        let dir = TestDir::new();
+        let mut worker = worker(&dir.0);
+        let mut info = info(vec![Capability::Source]);
+        info.sources[0].groups.as_mut().unwrap()[0].positioned = true;
+        let id = info.id.clone();
+        let mut entry = Entry::from_manifest(id.clone(), Ok(info.manifest.clone().unwrap()), true);
+        entry.info = info;
+        worker.entries.insert(id.clone(), entry);
+        let time = backtracking_core::capture_clock_ns();
+        for _ in 0..60 {
+            worker
+                .receive(
+                    &id,
+                    AddonMessage::Positions {
+                        source: "main".into(),
+                        time,
+                        channels: vec![ChannelPosition::new(0, 0.0, 1.0, 0.0)],
+                    },
+                )
+                .unwrap();
+        }
+        let mut cursor = 0;
+        assert_eq!(
+            worker
+                .shared
+                .positions
+                .lock()
+                .unwrap()
+                .since(&mut cursor)
+                .len(),
+            50
+        );
+        worker
+            .entries
+            .get_mut(&id)
+            .unwrap()
+            .info
+            .manifest
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .clear();
+        worker
+            .receive(
+                &id,
+                AddonMessage::Positions {
+                    source: "main".into(),
+                    time,
+                    channels: vec![ChannelPosition::new(0, 0.0, 1.0, 0.0)],
+                },
+            )
+            .unwrap();
+        assert!(
+            worker
+                .shared
+                .positions
+                .lock()
+                .unwrap()
+                .since(&mut cursor)
+                .is_empty()
+        );
+        assert_eq!(worker.entries[&id].info.state, AddonState::Running);
+        worker.entries.get_mut(&id).unwrap().clear_description();
+        assert!(worker.entries[&id].info.sources.is_empty());
+    }
+
+    #[test]
+    fn positions_receive_cost_for_sixteen_objects() {
+        let dir = TestDir::new();
+        let mut worker = worker(&dir.0);
+        let mut info = info(vec![Capability::Source]);
+        info.sources[0].groups.as_mut().unwrap()[0].channels =
+            (1..=16).map(|object| format!("Object {object}")).collect();
+        info.sources[0].groups.as_mut().unwrap()[0].positioned = true;
+        let id = info.id.clone();
+        let mut entry = Entry::from_manifest(id.clone(), Ok(info.manifest.clone().unwrap()), true);
+        entry.info = info;
+        worker.entries.insert(id.clone(), entry);
+        let mut elapsed = Duration::ZERO;
+        for _ in 0..200 {
+            // Reset between batches outside the measurement so every measured
+            // state goes through the accepted-message path, not flood thinning.
+            worker.entries.get_mut(&id).unwrap().position_filter.clear();
+            for _ in 0..50 {
+                let message = AddonMessage::Positions {
+                    source: "main".into(),
+                    time: backtracking_core::capture_clock_ns(),
+                    channels: (0..16)
+                        .map(|channel| ChannelPosition::new(channel, 0.5, 0.5, 0.0))
+                        .collect(),
+                };
+                let started = Instant::now();
+                worker.receive(&id, message).unwrap();
+                elapsed += started.elapsed();
+            }
+        }
+        println!(
+            "positions manager receive: 10000 accepted messages, 16 objects; {:.3} us/message; journal {} accounted bytes",
+            elapsed.as_secs_f64() * 1_000_000.0 / 10_000.0,
+            worker.shared.positions.lock().unwrap().bytes
+        );
+        assert_eq!(worker.shared.positions.lock().unwrap().sequence, 10_000);
     }
 
     #[test]
@@ -1809,6 +2110,7 @@ mod tests {
                 info,
                 runtime: None,
                 restarts: RestartPolicy::default(),
+                position_filter: PositionFilter::default(),
             },
         );
         worker
@@ -1870,6 +2172,7 @@ mod tests {
                 info,
                 runtime: None,
                 restarts: RestartPolicy::default(),
+                position_filter: PositionFilter::default(),
             },
         );
         let results: Vec<_> = ["unknown", "main"]
@@ -1922,6 +2225,7 @@ mod tests {
                     restart_after_stop: false,
                 }),
                 restarts: RestartPolicy::default(),
+                position_filter: PositionFilter::default(),
             },
         );
         worker.shutting_down = true;
@@ -1947,6 +2251,7 @@ mod tests {
                 shared: Arc::new(Shared {
                     snapshot: Mutex::new(Arc::new(AddonSnapshot::default())),
                     callbacks: Mutex::new(Vec::new()),
+                    positions: Mutex::new(PositionJournal::default()),
                 }),
             },
             worker: Some(worker),
@@ -2368,6 +2673,7 @@ mod tests {
         let shared = Arc::new(Shared {
             snapshot: Mutex::new(Arc::new(AddonSnapshot::default())),
             callbacks: Mutex::new(Vec::new()),
+            positions: Mutex::new(PositionJournal::default()),
         });
         let (commands, _receive) = mpsc::channel();
         let handle = AddonHandle {

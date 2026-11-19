@@ -1,0 +1,10 @@
+[package]
+name = "sadie-table"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Keep this offline data preparation tool outside every parent workspace.
+[workspace]
+
+[dependencies]

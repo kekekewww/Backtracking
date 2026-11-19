@@ -310,6 +310,10 @@ impl Capture {
         self.push_interleaved_with_markers(samples, &[])
     }
 
+    pub(crate) fn pre_roll_capacity(&self) -> usize {
+        self.pre_roll.capacity_frames
+    }
+
     pub fn retain_silence(&self) -> bool {
         self.retain_silence
     }
@@ -357,8 +361,9 @@ impl Capture {
         };
         let result = self
             .retain_frames(
-                std::iter::repeat(zero.as_slice()).take(prefix as usize),
+                std::iter::repeat_n(zero.as_slice(), prefix as usize),
                 &[],
+                |_, _| {},
             )
             .and_then(|()| {
                 self.history
@@ -415,6 +420,15 @@ impl Capture {
         samples: &[f32],
         source_block_offset_of_bars: &[usize],
     ) -> Result<(), CaptureError> {
+        self.push_observed(samples, source_block_offset_of_bars, |_, _| {})
+    }
+
+    pub(crate) fn push_observed(
+        &mut self,
+        samples: &[f32],
+        bars: &[usize],
+        observe: impl FnMut(usize, Option<(u64, usize)>),
+    ) -> Result<(), CaptureError> {
         let frames = samples.chunks_exact(self.channels);
         if !frames.remainder().is_empty() {
             return Err(CaptureError::IncompleteFrame);
@@ -429,7 +443,7 @@ impl Capture {
             meter.begin_block(now);
         }
         let previous_end = self.history.total_frames();
-        let result = self.retain_frames(frames, source_block_offset_of_bars);
+        let result = self.retain_frames(frames, bars, observe);
         if self.history.total_frames() != previous_end {
             self.revision = self.revision.wrapping_add(1);
             self.prune_bars();
@@ -446,6 +460,7 @@ impl Capture {
         &mut self,
         frames: impl Iterator<Item = &'a [f32]>,
         source_block_offset_of_bars: &[usize],
+        mut observe: impl FnMut(usize, Option<(u64, usize)>),
     ) -> Result<(), CaptureError> {
         let mut bars = source_block_offset_of_bars.iter().copied().peekable();
         for (offset, frame) in frames.enumerate() {
@@ -464,6 +479,7 @@ impl Capture {
                 let retained_frame = self.history.total_frames();
                 self.join_fade
                     .push(&mut self.history, frame, self.join_fade_frames)?;
+                observe(offset, Some((retained_frame, 0)));
                 if bar_here {
                     self.bar_markers.push_back(retained_frame);
                 }
@@ -481,11 +497,13 @@ impl Capture {
                 continue;
             }
 
+            let mut committed_pre_roll = 0;
             if self.state == CaptureState::Waiting {
                 if peak < OPEN_LEVEL {
                     if bar_here {
                         self.pending_bars.push_back(self.pre_roll.total_frames);
                     }
+                    observe(offset, None);
                     self.pre_roll.push(frame);
                     let pre_roll_start =
                         self.pre_roll.total_frames - self.pre_roll.len_frames as u64;
@@ -504,6 +522,7 @@ impl Capture {
                 let pre_roll_start = self.pre_roll.total_frames - self.pre_roll.len_frames as u64;
                 let retained_start = self.history.total_frames();
                 let pre_roll_frames = self.pre_roll.len_frames;
+                committed_pre_roll = pre_roll_frames;
                 for (offset, pending_frame) in first
                     .chunks_exact(self.channels)
                     .chain(second.chunks_exact(self.channels))
@@ -530,6 +549,7 @@ impl Capture {
             let retained_frame = self.history.total_frames();
             self.join_fade
                 .push(&mut self.history, frame, self.join_fade_frames)?;
+            observe(offset, Some((retained_frame, committed_pre_roll)));
             if bar_here {
                 self.bar_markers.push_back(retained_frame);
             }
@@ -647,6 +667,15 @@ impl Capture {
 
     pub fn track_channels(&self, lane: usize) -> Option<usize> {
         self.track_range(lane).map(|range| range.len())
+    }
+
+    /// Active native channels in a wide lane, bit zero for its first channel.
+    /// Returns zero for a missing or narrow lane.
+    pub fn active_channels(&self, lane: usize) -> u64 {
+        let Some(track) = self.track_range(lane) else {
+            return 0;
+        };
+        self.history.active_channels(track)
     }
 
     /// Changes whenever the retained samples change.

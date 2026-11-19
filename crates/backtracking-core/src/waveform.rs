@@ -1,7 +1,12 @@
 use std::ops::Range;
 
 mod geometry;
-pub use geometry::{EnvelopeColumn, SamplePoint, WaveformGeometry, minimum_zoom_frames, waveform_geometry};
+mod pair;
+pub use crate::preview::PreviewLane;
+pub use geometry::{
+    minimum_zoom_frames, waveform_geometry, EnvelopeColumn, SamplePoint, WaveformGeometry,
+};
+pub use pair::{PairGroup, PairSide};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u32)]

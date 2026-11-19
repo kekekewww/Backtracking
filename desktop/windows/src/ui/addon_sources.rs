@@ -979,6 +979,7 @@ mod tests {
                     "Ls".into(),
                     "Rs".into(),
                 ],
+                positioned: false,
             }]),
             transport: Some(Transport {
                 state: TransportState::Playing,
@@ -1278,6 +1279,7 @@ mod tests {
             id: "channels".into(),
             label: "Channels".into(),
             channels: vec!["L".into(), "R".into()],
+            positioned: false,
         }]);
         let mut sources = AddonSources::default();
         sources.snapshot = Arc::new(snapshot(vec![stereo]));
@@ -1295,5 +1297,25 @@ mod tests {
         assert!(!draw_lane(&mut sources, Some(2)).show_route);
         sources.snapshot = Arc::new(snapshot(Vec::new()));
         assert!(!draw_lane(&mut sources, Some(2)).show_route);
+    }
+
+    #[test]
+    fn positioned_sources_are_excluded_from_the_pair_even_when_the_bed_is_named_objects() {
+        use crate::ui::{LaneGroup, channels_group};
+        let sources = LaneGroup {
+            id: "sources".into(),
+            positioned: true,
+            label: "Sources".into(),
+            channels: 0..2,
+            labels: vec!["A".into(), "B".into()],
+        };
+        let bed = LaneGroup {
+            id: "ordinary".into(),
+            positioned: false,
+            label: "Objects".into(),
+            channels: 2..4,
+            labels: vec!["L".into(), "R".into()],
+        };
+        assert_eq!(channels_group(&[sources, bed.clone()], 4), bed);
     }
 }

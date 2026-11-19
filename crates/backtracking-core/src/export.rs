@@ -385,6 +385,56 @@ impl<'p> WavFile<'p> {
     }
 }
 
+impl WavExportProfile {
+    /// Write a create-new WAV from consecutive capture-rate blocks. A single resampling
+    /// worker reads overlapping windows, so retain their overlap without rewinding the FIR.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_rendered(
+        self,
+        path: &Path,
+        sample_rate: u32,
+        channels: usize,
+        frames: usize,
+        fades: Fades,
+        render: impl FnMut(usize, &mut [f32]) -> io::Result<()> + Send,
+    ) -> io::Result<()> {
+        let state = std::sync::Mutex::new((0usize, Vec::<f32>::new(), render));
+        let read = |first: usize, output: &mut [f32]| {
+            let mut state = state
+                .lock()
+                .map_err(|_| io::Error::other("render worker stopped"))?;
+            let (start, window, render) = &mut *state;
+            let end = *start + window.len() / channels;
+            if first < *start || first > end {
+                return Err(invalid_tracks());
+            }
+            window.drain(..(first - *start) * channels);
+            *start = first;
+            let cached = window.len();
+            if output.len() > cached {
+                window.resize(output.len(), 0.);
+                render(end, &mut window[cached..])?;
+                fades.apply(&mut window[cached..], channels, end as u64, frames as u64);
+            }
+            output.copy_from_slice(&window[..output.len()]);
+            Ok(())
+        };
+        let clip = Clip {
+            sample_rate,
+            channels,
+            frames,
+            whole_frames: true,
+            read: &read,
+        };
+        WavFile::create(path, &clip, self, WavChannelMap::Unchanged)?.write(&clip, 1)
+    }
+
+    /// Concurrent file renders may use this many single-threaded writers.
+    pub fn worker_limit(self) -> usize {
+        resampling_threads()
+    }
+}
+
 /// Creates the output directory if needed and saves a uniquely named clip.
 pub fn export_wav(
     output_dir: &Path,
@@ -690,6 +740,20 @@ impl TakeLabel {
         }
     }
 
+    /// Stems for successive attempts to claim the files of one take.
+    pub fn stems(&self, frames: usize, sample_rate: u32) -> impl Iterator<Item = String> + '_ {
+        let take = dated_take(clip_seconds(frames, sample_rate), None);
+        (1..=u32::MAX).map(move |attempt| self.file_stem(&take, attempt))
+    }
+
+    pub fn channel_suffix(channel: usize, label: &str) -> String {
+        format!(
+            "-Ch{:02}_{}",
+            channel + 1,
+            channel_file_label(label, channel)
+        )
+    }
+
     /// The file name without `.wav` for attempt `attempt` at writing `take`, a [`dated_take`].
     fn file_stem(&self, take: &str, attempt: u32) -> String {
         let stem = self.file_prefix() + &numbered_take(take, attempt);
@@ -763,11 +827,21 @@ fn dated_take_at(time: TakeTime, seconds: f64, tempo_bpm: Option<f64>) -> String
 /// `-ChNN_<label>` of one channel of a wide lane. Housekeeping asks before it removes
 /// anything, so a file the user put in an export folder is never touched.
 pub fn is_export_file_name(name: &str) -> bool {
+    if let Some(stem) = name.strip_suffix("-Positions.json") {
+        return is_take_stem(stem);
+    }
     let Some(stem) = name.strip_suffix(".wav") else {
         return false;
     };
     // A source's name may hold "-Ch" itself, so the channel can start at any of them.
     is_take_stem(stem)
+        || ["-Stereo", "-Binaural", "-Mix-Binaural"]
+            .iter()
+            .any(|suffix| stem.strip_suffix(suffix).is_some_and(is_take_stem))
+        || stem.strip_suffix("_binaural").is_some_and(|stem| {
+            stem.match_indices("-Ch")
+                .any(|(i, _)| is_channel_suffix(&stem[i + 3..]) && is_take_stem(&stem[..i]))
+        })
         || stem
             .match_indices("-Ch")
             .any(|(index, _)| is_channel_suffix(&stem[index + 3..]) && is_take_stem(&stem[..index]))
@@ -1742,6 +1816,41 @@ mod tests {
 
     static NEXT_EXPORT: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn narrow_export_reference() {
+        let dir = test_dir("narrow-reference");
+        // Hashes of the complete files written by the pre-spatial export path.
+        for (width, expected) in [(1, 0x48b50d87718600bcu64), (2, 0x3215bea1a0ff641bu64)] {
+            let samples = noise(951, 811 * width);
+            let track = FrozenTrack::from_interleaved(48000, width, 10, &samples).unwrap();
+            let paths = export_labelled_tracks(
+                &dir,
+                &[track],
+                7..799,
+                WavExportProfile::default(),
+                &[ChannelRoute::Merged],
+                false,
+                None,
+                Fades::new(3, 5),
+                &[TakeLabel::default()],
+            )
+            .unwrap();
+            let wav = fs::read(&paths[0]).unwrap();
+            let hash = wav.iter().fold(0xcbf29ce484222325u64, |hash, &byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            });
+            assert_eq!(hash, expected);
+            if let Some(reference) = std::env::var_os("W3B_REFERENCE") {
+                assert_eq!(
+                    wav,
+                    fs::read(PathBuf::from(reference).join(format!("reference-{width}.bin")))
+                        .unwrap()
+                );
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn test_dir(label: &str) -> PathBuf {
         let serial = NEXT_EXPORT.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
@@ -2022,7 +2131,6 @@ mod tests {
 
     #[test]
     fn paired_exports_share_one_free_name_and_carry_the_tempo() {
-        let dir = test_dir("pair-names");
         let profile = WavExportProfile::default();
         let a = Snapshot {
             sample_rate: 48_000,
@@ -2030,9 +2138,9 @@ mod tests {
             samples: vec![0.5; 24_000],
             first_frame: 0,
         };
-        let export = |lanes: usize, tempo| {
+        let export = |dir: &Path, lanes: usize, tempo| {
             export_routed_tracks_with_tempo(
-                &dir,
+                dir,
                 &vec![a.clone(); lanes],
                 0..24_000,
                 profile,
@@ -2044,19 +2152,20 @@ mod tests {
         };
         // Unnamed lanes, as the plug-in exports them, keep the letter at the end of the name.
         let take_name = |seconds, tempo| format!("Backtracking_{}", dated_take(seconds, tempo));
+        // Exercise a discarded attempt even when both exports finish in the same second.
+        let mut force_retry = true;
         loop {
+            let dir = test_dir("pair-names");
             let take = take_name(0.5, Some(174.0));
             assert!(take.ends_with("_0.5s_174bpm"), "{take}");
             assert_take_shape(&take, "0.5s");
-            if dir.join(format!("{take}-B.wav")).exists() {
-                continue;
-            }
             // Only lane B of the first name is taken: the pair must not be split across names.
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join(format!("{take}-B.wav")), b"keep").unwrap();
-            let pair = export(2, 174.0);
-            let single = export(1, 92.5);
-            if take_name(0.5, Some(174.0)) != take {
+            let pair = export(&dir, 2, 174.0);
+            let single = export(&dir, 1, 92.5);
+            if std::mem::take(&mut force_retry) || take_name(0.5, Some(174.0)) != take {
+                fs::remove_dir_all(&dir).unwrap();
                 continue;
             }
             assert_eq!(file_name(&pair[0]), format!("{take}_2-A.wav"));
@@ -2068,9 +2177,9 @@ mod tests {
             );
             let single = file_name(&single[0]);
             assert!(single.ends_with("_0.5s_92.5bpm.wav"), "{single}");
+            fs::remove_dir_all(dir).unwrap();
             break;
         }
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

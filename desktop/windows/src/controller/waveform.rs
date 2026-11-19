@@ -2,13 +2,24 @@ use super::*;
 use backtracking_core::FrozenCapture;
 
 pub(super) type RenderedRange = (Range<u64>, Range<u64>, u32, Vec<u64>, u64);
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ChannelWaveform {
+    Native(usize),
+    // W3-A constructs these rows when the window displays a wide lane.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Pair(
+        backtracking_core::waveform::PairGroup,
+        backtracking_core::waveform::PairSide,
+    ),
+}
+
 type OwnedTrace = (Vec<f32>, Vec<f32>);
 
 #[derive(Clone, PartialEq)]
 struct View {
     generation: u64,
     lanes: [Option<usize>; 2],
-    channels: Vec<(usize, usize)>,
+    channels: Vec<(usize, ChannelWaveform)>,
     views: Vec<(usize, WaveformView)>,
     zoom: Option<Range<u64>>,
     sizes: Vec<(usize, usize)>,
@@ -39,10 +50,28 @@ struct Pending {
     cancel: Arc<AtomicBool>,
 }
 
-/// Only one request can own frozen pages. A changed view waits for cancellation
+fn worker<T: Send + 'static>(
+    name: &str,
+    ui: Arc<UiLink>,
+    run: impl Fn(T) + Send + 'static,
+) -> io::Result<mpsc::SyncSender<T>> {
+    let (sender, jobs) = mpsc::sync_channel(1);
+    thread::Builder::new().name(name.into()).spawn(move || {
+        for job in jobs {
+            run(job);
+            if let Some(repaint) = ui.repaint.get() {
+                repaint();
+            }
+        }
+    })?;
+    Ok(sender)
+}
+
+/// Only one render request can own frozen pages. A changed view waits for cancellation
 /// before pinning another snapshot, so rapid scrolling cannot queue histories.
 pub(super) struct ChannelWaveforms {
     requests: mpsc::SyncSender<Work>,
+    activity: mpsc::SyncSender<Box<dyn FnOnce() + Send>>,
     pending: Option<Pending>,
     #[cfg(test)]
     pub(super) before_render: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -50,31 +79,30 @@ pub(super) struct ChannelWaveforms {
 
 impl ChannelWaveforms {
     pub(super) fn new(ui: Arc<UiLink>) -> io::Result<Self> {
-        let (requests, work) = mpsc::sync_channel::<Work>(1);
-        thread::Builder::new()
-            .name("channel waveforms".into())
-            .spawn(move || {
-                while let Ok(work) = work.recv() {
-                    let result = work.result.clone();
-                    let rendered = work.render();
-                    let _ = result.send(rendered);
-                    if let Some(repaint) = ui.repaint.get() {
-                        repaint();
-                    }
-                }
-            })?;
+        let requests = worker("channel waveforms", ui.clone(), |work: Work| {
+            let result = work.result.clone();
+            let _ = result.send(work.render());
+        })?;
+        let activity = worker("channel activity", ui, |job: Box<dyn FnOnce() + Send>| {
+            job()
+        })?;
         Ok(Self {
             requests,
+            activity,
             pending: None,
             #[cfg(test)]
             before_render: None,
         })
     }
 
+    pub(super) fn try_queue(&self, job: impl FnOnce() + Send + 'static) -> bool {
+        self.activity.try_send(Box::new(job)).is_ok()
+    }
+
     pub(super) fn render(
         &mut self,
         state: &CaptureSession,
-        channels: &[(usize, usize)],
+        channels: &[(usize, ChannelWaveform)],
         views: &[(usize, WaveformView)],
         zoom: Option<Range<u64>>,
         traces: &mut [WaveformBuffers<'_>],
@@ -193,7 +221,7 @@ impl Work {
         }
         let mut channels = Vec::new();
         let mut views = Vec::new();
-        for (&(lane, channel), &(low_len, high_len)) in
+        for ((lane, channel), &(low_len, high_len)) in
             self.view.channels.iter().zip(&self.view.sizes)
         {
             if self.cancel.load(Ordering::Acquire) {
@@ -203,12 +231,19 @@ impl Work {
             if let Some(track) = self
                 .view
                 .lanes
-                .get(lane)
+                .get(*lane)
                 .copied()
                 .flatten()
                 .and_then(|lane| self.capture.track(lane))
             {
-                track.channel_waveform(channel, self.range.1.clone(), &mut low, &mut high);
+                match channel {
+                    ChannelWaveform::Native(index) => {
+                        track.channel_waveform(*index, self.range.1.clone(), &mut low, &mut high)
+                    }
+                    ChannelWaveform::Pair(group, side) => {
+                        track.pair_waveform(group, *side, self.range.1.clone(), &mut low, &mut high)
+                    }
+                };
             }
             channels.push((low, high));
         }

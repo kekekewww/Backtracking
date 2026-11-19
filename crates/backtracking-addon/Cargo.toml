@@ -12,7 +12,7 @@ install = ["dep:zip"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 zip = { version = "4.6.1", default-features = false, features = ["deflate"], optional = true }
 
 [[bin]]

@@ -9,8 +9,15 @@
 //!   `zoom=<seconds>` shows only that much; `select=<from>-<to>` selects that stretch, as a
 //!   drag would; `scroll=<lane>:<row>` scrolls a stacked lane (A is 0) to that row;
 //!   `group=<lane>:<group id>` shows another channel group.
-//!   `separate=<on|off>` edits lanes A and B on their own or together, as Right Ctrl does,
-//!   and `select-lane=<lane>` makes the next `select=` belong to that lane.
+//!   `separate=<on|off>` edits rows on their own or together, as Right Ctrl does.
+//!   `rows=<lane>:<first>-<last>` makes the next `select=` cover those rows of the lane, as a
+//!   drag from the first row to the last does; rows count from 1, top down, as in the row
+//!   tooltips, and `rows=A:10-B:1` runs from row 10 of lane A to row 1 of lane B.
+//!   `select-lane=<lane>` makes it cover every row of that lane. Both need `separate=on`, and
+//!   both wait until the steps before them have settled, so they count the rows a `group=`
+//!   or `hide-silent=` before them leaves on screen.
+//!   `save=<folder>` saves the selection (or everything, without one) into that folder, through
+//!   the Save command's own code, waits until the files are written and lists them in the log.
 //!   `options=<page>[:<width>x<height>]` opens the Options window on that page (`actions`,
 //!   `capture`, `sources`, `appearance`, `export`, `addons`, `updates`), optionally at that
 //!   size, and makes the picture of the Options window instead of the main window.
@@ -27,6 +34,20 @@
 //!   one. A test copy refuses `open=` (and any other way to open a file) unless the add-on's
 //!   `play_through_speakers` setting is known to be off, so a test makes no sound; use
 //!   `set=<add-on id>:play_through_speakers=false` first.
+//!   `pair=<stereo|binaural>` sets how the L/R pair of a wide lane sounds, and
+//!   `hide-silent=<on|off>` whether system, application and microphone lanes hide the rows of
+//!   silent channels, as their Options controls do (for this run only). `preview-plan` writes
+//!   to the log what Space would play of the selection and whether it could be prepared; it
+//!   never plays it.
+//!   `export-mode=<binaural-files|mono-files|multichannel|binaural-mix>` chooses how the lanes
+//!   wider than stereo are exported, as the Export page's Multichannel sources list does (for
+//!   this run only), once the steps before it have settled, and `open-export-mode` shows that
+//!   list open on the Options window.
+//!   `drag-prepare=<folder>` writes the files a drag-out of the selection (or of the row the
+//!   steps chose, or everything) would carry, through the drag's own code, waits until they are
+//!   written, copies them into that folder and lists them in the log. The drag itself, which
+//!   Windows runs, is not done; the selection stays, so a `save=` after it writes the same
+//!   audio.
 //!
 //! The picture is `<file.png>`; `<file.png>.log` gets the frame times and any problem.
 
@@ -39,7 +60,8 @@ use std::time::{Duration, Instant};
 use backtracking_addon::protocol::TransportCommand;
 use eframe::egui;
 
-use super::{OptionsSection, Recorder};
+use super::{OptionsSection, Recorder, RowSource, rows_between};
+use crate::preferences::{PairRender, WideExportMode};
 
 pub(super) const SCREENSHOT: &str = "BACKTRACKING_TEST_SCREENSHOT";
 const SCREENSHOT_DELAY: &str = "BACKTRACKING_TEST_SCREENSHOT_DELAY_MS";
@@ -55,10 +77,15 @@ const SETTLE: Duration = Duration::from_millis(500);
 pub(super) enum Step {
     Zoom(f64),
     Select(f64, f64),
-    /// The lane a selection made after it belongs to, as if its drag started there.
+    /// Every row of a lane is what a selection made after it covers.
     SelectLane(usize),
-    /// Lanes A and B edited on their own, as Right Ctrl switches them.
+    /// The rows a selection made after it covers: from row `.1` of lane `.0` to row `.3` of
+    /// lane `.2`, counted from zero.
+    Rows(usize, usize, usize, usize),
+    /// Rows edited on their own, as Right Ctrl switches them.
     Separate(bool),
+    /// Saves as the Save command does, into this folder.
+    Save(PathBuf),
     Scroll(usize, usize),
     Group(usize, String),
     Options(OptionsSection, Option<egui::Vec2>),
@@ -72,6 +99,18 @@ pub(super) enum Step {
     Open(String, PathBuf),
     Transport(usize, TransportCommand, Option<f64>),
     Wait(u64),
+    /// How the pair of a wide lane sounds.
+    Pair(PairRender),
+    /// Whether lanes that may hide silent rows do.
+    HideSilent(bool),
+    /// Logs what Space would play, without playing it.
+    PreviewPlan,
+    /// How lanes wider than stereo are exported.
+    ExportMode(WideExportMode),
+    /// Shows the Multichannel sources list open on the Options window.
+    OpenExportMode,
+    /// Writes what a drag-out would carry and copies it into this folder.
+    DragPrepare(PathBuf),
 }
 
 impl Step {
@@ -84,7 +123,16 @@ impl Step {
                 | Self::Format(..)
                 | Self::Open(..)
                 | Self::Transport(..)
+                | Self::Save(_)
+                | Self::DragPrepare(_)
+                // A drag being prepared is written in the mode it began with.
+                | Self::ExportMode(_)
                 | Self::Wait(_)
+                | Self::PreviewPlan
+                // Rows are counted in the lanes as drawn, so a `group=` or `hide-silent=`
+                // before them has to reach the screen first.
+                | Self::Rows(..)
+                | Self::SelectLane(_)
         )
     }
 }
@@ -150,6 +198,12 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
             if step == "install" {
                 return Ok(Step::Install);
             }
+            if step == "preview-plan" {
+                return Ok(Step::PreviewPlan);
+            }
+            if step == "open-export-mode" {
+                return Ok(Step::OpenExportMode);
+            }
             let (name, value) = step
                 .split_once('=')
                 .ok_or_else(|| format!("no '=' in {step}"))?;
@@ -178,11 +232,53 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                     Ok(Step::Select(number(from)?, number(to)?))
                 }
                 "select-lane" => Ok(Step::SelectLane(lane(value)?)),
+                "rows" => {
+                    let (first_lane, rows) = pair(step, value)?;
+                    let (first, last) = rows
+                        .split_once('-')
+                        .ok_or_else(|| format!("{step} needs <lane>:<first>-<last>"))?;
+                    let (last_lane, last) = match last.split_once(':') {
+                        Some((last_lane, last)) => (lane(last_lane)?, last),
+                        None => (lane(first_lane)?, last),
+                    };
+                    let row = |text: &str| {
+                        text.trim()
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|row| row.checked_sub(1))
+                            .ok_or_else(|| format!("{text} is not a row counted from 1"))
+                    };
+                    Ok(Step::Rows(
+                        lane(first_lane)?,
+                        row(first)?,
+                        last_lane,
+                        row(last)?,
+                    ))
+                }
+                "save" => Ok(Step::Save(PathBuf::from(value.trim()))),
+                "drag-prepare" => Ok(Step::DragPrepare(PathBuf::from(value.trim()))),
+                "export-mode" => WideExportMode::ALL
+                    .into_iter()
+                    .find(|mode| mode.preference() == value.trim())
+                    .map(Step::ExportMode)
+                    .ok_or_else(|| {
+                        format!(
+                            "{value} is not binaural-files, mono-files, multichannel or binaural-mix"
+                        )
+                    }),
                 "separate" => match value.trim() {
                     "on" => Ok(Step::Separate(true)),
                     "off" => Ok(Step::Separate(false)),
                     other => Err(format!("{other} is not on or off")),
                 },
+                "hide-silent" => match value.trim() {
+                    "on" => Ok(Step::HideSilent(true)),
+                    "off" => Ok(Step::HideSilent(false)),
+                    other => Err(format!("{other} is not on or off")),
+                },
+                "pair" => PairRender::from_preference(value.trim())
+                    .map(Step::Pair)
+                    .ok_or_else(|| format!("{value} is not stereo or binaural")),
                 "scroll" => {
                     let (lane_text, row) = pair(step, value)?;
                     let row = row
@@ -272,6 +368,8 @@ pub(super) struct Harness {
     options_shot: Option<mpsc::SyncSender<PictureResult>>,
     /// Extra time the last step asked for before the next one.
     hold: Duration,
+    /// A `drag-prepare=` waits for the drag's files and copies them here.
+    drag_copy: Option<PathBuf>,
 }
 
 impl Harness {
@@ -361,7 +459,32 @@ impl Harness {
             options_drops: Vec::new(),
             options_shot: None,
             hold: Duration::ZERO,
+            drag_copy: None,
         })
+    }
+
+    /// Lists the files a save wrote in the log, with what their headers say.
+    pub(super) fn note_saved(&mut self, paths: &[PathBuf]) {
+        for path in paths {
+            let header = fs::read(path).ok().and_then(|bytes| wav_header(&bytes));
+            self.notes.push(match header {
+                Some(header) => format!(
+                    "saved {}: {} channels, {} Hz, {} bits, {} frames ({:.3} s)",
+                    path.display(),
+                    header.channels,
+                    header.rate,
+                    header.bits,
+                    header.frames,
+                    header.frames as f64 / f64::from(header.rate.max(1)),
+                ),
+                None => format!("saved {} (not a WAV file this can read)", path.display()),
+            });
+        }
+    }
+
+    /// Puts a line in the log.
+    pub(super) fn note(&mut self, text: String) {
+        self.notes.push(text);
     }
 
     fn write_log(&self, picture: &io::Result<[usize; 2]>) {
@@ -459,13 +582,37 @@ impl Recorder {
             return;
         };
         let options_picture = harness.options_picture;
+        // A `drag-prepare=` copies the drag's files once they are written.
+        if harness.drag_copy.is_some()
+            && self.export.is_none()
+            && !self.export_requested
+            && self.edit_request.is_none()
+        {
+            let folder = harness.drag_copy.take();
+            if let Some(folder) = folder {
+                self.copy_drag_files(&folder);
+            }
+            ctx.request_repaint();
+            return;
+        }
+        let Some(harness) = self.harness.as_mut() else {
+            return;
+        };
         let settled = now.duration_since(applied) >= SETTLE + harness.hold
             && self.edit_request.is_none()
             && self.edit_preview.is_none()
             // Dropped files are read in the next pass, and the manager answers after that.
             && harness.main_drops.is_empty()
             && harness.options_drops.is_empty()
-            && !self.addons_page.waiting();
+            && !self.addons_page.waiting()
+            // A `save=` waits for its files to be written.
+            && self.snapshot_save.is_none()
+            && self.pending_snapshot_saves.is_empty()
+            && self.pending_snapshot_reads.is_empty()
+            && self.pending_edit_save_reads.is_empty()
+            // A `drag-prepare=` waits for the drag's files.
+            && self.export.is_none()
+            && !self.export_requested;
         if !settled {
             ctx.request_repaint_after(Duration::from_millis(50));
             return;
@@ -544,19 +691,51 @@ impl Recorder {
                 // As a finished drag does: freeze the audio, then keep the range.
                 self.begin_editing();
                 self.last_interaction = Instant::now();
-                let flags = self.flag_update(start..end, Some(self.selection_lane));
+                let flags = self.flag_update(
+                    start..end,
+                    self.selection_rows.clone(),
+                    self.selection_whole,
+                );
                 self.apply_flags(flags);
                 self.selection = Some(start..end);
                 self.invalidate_export();
             }
-            &Step::SelectLane(lane) => self.selection_lane = lane,
+            &Step::SelectLane(lane) => {
+                let plan = self
+                    .lanes
+                    .iter()
+                    .find(|plan| plan.lane == lane)
+                    .ok_or("the window does not show that lane")?;
+                let last = plan.rows().checked_sub(1).ok_or("the lane has no rows")?;
+                let rows = rows_between(&self.lanes, plan.row(0), plan.row(last));
+                self.choose_test_rows(rows)?;
+            }
+            &Step::Rows(first_lane, first, last_lane, last) => {
+                let row = |lane: usize, row: usize| {
+                    self.lanes
+                        .iter()
+                        .find(|plan| plan.lane == lane)
+                        .filter(|plan| row < plan.rows())
+                        .map(|plan| plan.row(row))
+                        .ok_or_else(|| format!("the window has no row {} in that lane", row + 1))
+                };
+                let rows =
+                    rows_between(&self.lanes, row(first_lane, first)?, row(last_lane, last)?);
+                self.choose_test_rows(rows)?;
+            }
             &Step::Separate(on) => {
-                if !self.dual_source() {
-                    return Err("separate lanes need two sources".into());
+                if self.row_count() < 2 {
+                    return Err("editing separately needs more than one row".into());
                 }
-                if self.separate_lanes != on {
-                    self.toggle_separate_lanes();
+                if self.separate_rows != on {
+                    self.toggle_separate_rows();
                 }
+            }
+            Step::Save(folder) => {
+                fs::create_dir_all(folder)
+                    .map_err(|error| format!("{}: {error}", folder.display()))?;
+                self.save_snapshot_to(folder.clone());
+                ctx.request_repaint();
             }
             &Step::Scroll(lane, row) => self.scroll_lane_to(lane, row),
             Step::Group(lane, id) => self.show_group(*lane, id)?,
@@ -632,6 +811,137 @@ impl Recorder {
                     harness.hold = Duration::from_millis(*milliseconds);
                 }
             }
+            &Step::Pair(render) => {
+                self.pair_render = render;
+                self.invalidate_export();
+            }
+            &Step::ExportMode(mode) => {
+                self.wide_export = mode;
+                self.invalidate_export();
+            }
+            Step::OpenExportMode => {
+                self.force_wide_export_menu = true;
+                ctx.request_repaint();
+            }
+            Step::DragPrepare(folder) => {
+                fs::create_dir_all(folder)
+                    .map_err(|error| format!("{}: {error}", folder.display()))?;
+                // As a drag past the window's edge does: freeze, then write the clip.
+                self.invalidate_export();
+                self.start_export();
+                if let Some(harness) = self.harness.as_mut() {
+                    harness.drag_copy = Some(folder.clone());
+                }
+                ctx.request_repaint();
+            }
+            &Step::HideSilent(on) => {
+                self.hide_silent = on;
+                self.live_revision = None;
+                ctx.request_repaint();
+            }
+            Step::PreviewPlan => {
+                let note = self.describe_preview();
+                if let Some(harness) = self.harness.as_mut() {
+                    harness.notes.push(note);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Copies the files a drag-out would carry into `folder` and lists them in the log, with
+    /// the status line the drag would leave. The drag's own files are removed as usual when the
+    /// prepared drag is dropped.
+    fn copy_drag_files(&mut self, folder: &Path) {
+        let Some(file) = self.exported.as_ref() else {
+            let note = format!("drag-prepare: nothing was prepared ({})", self.message);
+            if let Some(harness) = self.harness.as_mut() {
+                harness.note(note);
+            }
+            return;
+        };
+        let mut copied = Vec::new();
+        let mut notes = Vec::new();
+        for path in &file.paths {
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let target = folder.join(name);
+            match fs::copy(path, &target) {
+                Ok(_) => copied.push(target),
+                Err(error) => notes.push(format!("drag-prepare: {}: {error}", path.display())),
+            }
+        }
+        let status = file.saved_message(super::Language::current(), false);
+        if let Some(harness) = self.harness.as_mut() {
+            harness.note(format!("drag-prepare: {} files", file.paths.len()));
+            harness.note_saved(&copied);
+            for note in notes {
+                harness.note(note);
+            }
+            harness.note(format!("drag status would be: {status}"));
+        }
+    }
+
+    /// What Space would play now, for the log: the plan lane by lane, and whether the preview
+    /// could be prepared. The preview made is dropped unplayed.
+    fn describe_preview(&mut self) -> String {
+        let Some(selection) = self.selection.clone() else {
+            return "preview: no selection".into();
+        };
+        let Some(edit) = self.editing.as_ref() else {
+            return "preview: the selection is not frozen".into();
+        };
+        let plan = super::preview_plan(
+            &edit.snapshots,
+            &edit.lanes,
+            &edit.groups,
+            &edit.shown_groups,
+            self.routes(),
+            self.selected_rows(),
+        );
+        let parts = match plan {
+            Ok(parts) => parts,
+            Err(error) => return format!("preview: {error}"),
+        };
+        let described: Vec<String> = parts
+            .iter()
+            .map(|part| {
+                format!(
+                    "snapshot {} route {:?} group {:?} selected {:?} positions {}",
+                    part.index, part.route, part.channels, part.selected, part.positions
+                )
+            })
+            .collect();
+        let prepared = match self.preview_of(&parts, selection.clone()) {
+            Ok(preview) => {
+                drop(preview);
+                "prepared, not played"
+            }
+            Err(error) => error,
+        };
+        format!(
+            "preview of {}..{} ({:?}): {}; {prepared}",
+            selection.start,
+            selection.end,
+            self.pair_render,
+            described.join("; ")
+        )
+    }
+
+    /// Makes `rows` what the next selection covers, as the drag that crossed them would. A
+    /// selection already made moves onto them.
+    fn choose_test_rows(&mut self, rows: Vec<RowSource>) -> Result<(), String> {
+        if !self.rows_separate() {
+            return Err("rows are chosen only with separate=on".into());
+        }
+        self.choose_rows(rows);
+        if let Some(selection) = self.selection.clone() {
+            let flags =
+                self.flag_update(selection, self.selection_rows.clone(), self.selection_whole);
+            self.apply_flags(flags);
+            self.stop_preview();
+            self.invalidate_export();
         }
         Ok(())
     }
@@ -653,6 +963,53 @@ impl Recorder {
             _ => Err("the lane has no add-on source".into()),
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WavHeader {
+    channels: u16,
+    rate: u32,
+    bits: u16,
+    frames: u64,
+}
+
+/// Reads the format and length of a RIFF or RF64 WAV file.
+fn wav_header(bytes: &[u8]) -> Option<WavHeader> {
+    let u16_at = |at: usize| Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+    let u64_at = |at: usize| Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?));
+    let riff = bytes.get(..4)?;
+    if (riff != b"RIFF" && riff != b"RF64") || bytes.get(8..12)? != b"WAVE" {
+        return None;
+    }
+    let (mut format, mut data, mut big_data) = (None, None, None);
+    let mut at = 12;
+    while at + 8 <= bytes.len() {
+        let id = &bytes[at..at + 4];
+        let size = u32_at(at + 4)? as usize;
+        match id {
+            b"fmt " => format = Some((u16_at(at + 10)?, u32_at(at + 12)?, u16_at(at + 22)?)),
+            b"ds64" => big_data = Some(u64_at(at + 16)?),
+            b"data" => {
+                data = Some(if size == u32::MAX as usize {
+                    big_data?
+                } else {
+                    size as u64
+                });
+                break;
+            }
+            _ => {}
+        }
+        at += 8 + size + size % 2;
+    }
+    let (channels, rate, bits) = format?;
+    let frame = u64::from(channels) * u64::from(bits / 8);
+    Some(WavHeader {
+        channels,
+        rate,
+        bits,
+        frames: data? / frame.max(1),
+    })
 }
 
 /// Encodes 8-bit RGB pixels as a PNG. Each row takes whichever of the None, Sub and Up filters
@@ -960,7 +1317,7 @@ mod tests {
                 }
             })
             .collect();
-        data.extend_from_slice(&data[..5000].to_vec());
+        data.extend_from_within(..5000);
         for input in [&data[..], &[][..], &[1, 2][..], &[9; 300][..]] {
             assert_eq!(inflate_fixed(&zlib(input)), input);
         }
@@ -1002,7 +1359,68 @@ mod tests {
                 Step::Select(3.0, 1.0)
             ]
         );
+        assert_eq!(
+            parse_steps(r"rows=A:3-5;rows=a:10-B:1;save=D:\out\rows").unwrap(),
+            [
+                Step::Rows(0, 2, 0, 4),
+                Step::Rows(0, 9, 1, 0),
+                Step::Save(PathBuf::from(r"D:\out\rows")),
+            ]
+        );
+        assert!(Step::Save(PathBuf::new()).waits());
+        // Rows are counted as drawn, so they wait for a group switch before them.
+        assert!(Step::Rows(0, 0, 0, 0).waits());
+        assert!(Step::SelectLane(0).waits());
+        for bad in [
+            "rows=A:0-2",
+            "rows=A:3",
+            "rows=3-5",
+            "rows=A:1-C:2",
+            "rows=A:x-2",
+        ] {
+            assert!(parse_steps(bad).is_err(), "{bad}");
+        }
         assert!(parse_steps("separate=maybe").is_err());
+        assert_eq!(
+            parse_steps("pair=binaural; hide-silent=off; pair=stereo;hide-silent=on;preview-plan")
+                .unwrap(),
+            [
+                Step::Pair(PairRender::Binaural),
+                Step::HideSilent(false),
+                Step::Pair(PairRender::Stereo),
+                Step::HideSilent(true),
+                Step::PreviewPlan,
+            ]
+        );
+        assert!(Step::PreviewPlan.waits());
+        assert!(!Step::Pair(PairRender::Binaural).waits());
+        for bad in ["pair=surround", "pair", "hide-silent=yes"] {
+            assert!(parse_steps(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            parse_steps(
+                "export-mode=binaural-files;export-mode=mono-files; export-mode=multichannel;\
+                 export-mode=binaural-mix;open-export-mode;drag-prepare=D:\\a b"
+            )
+            .unwrap(),
+            [
+                Step::ExportMode(WideExportMode::BinauralFiles),
+                Step::ExportMode(WideExportMode::MonoFiles),
+                Step::ExportMode(WideExportMode::Multichannel),
+                Step::ExportMode(WideExportMode::BinauralMix),
+                Step::OpenExportMode,
+                Step::DragPrepare(PathBuf::from("D:\\a b")),
+            ]
+        );
+        assert!(Step::ExportMode(WideExportMode::MonoFiles).waits());
+        assert!(Step::DragPrepare(PathBuf::new()).waits());
+        for bad in [
+            "export-mode=mono",
+            "export-mode",
+            "export-mode=Multichannel",
+        ] {
+            assert!(parse_steps(bad).is_err(), "{bad}");
+        }
         assert_eq!(parse_steps(" ").unwrap(), []);
         assert_eq!(
             parse_steps(
@@ -1082,6 +1500,34 @@ mod tests {
         ] {
             assert!(parse_steps(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn saved_files_are_read_back_from_their_wav_headers() {
+        let mut wav = b"RIFF\0\0\0\0WAVE".to_vec();
+        // An odd-sized chunk before the format is padded to an even length.
+        wav.extend_from_slice(b"LIST\x03\0\0\0abc\0");
+        wav.extend_from_slice(b"fmt \x10\0\0\0");
+        wav.extend_from_slice(&3u16.to_le_bytes());
+        wav.extend_from_slice(&6u16.to_le_bytes());
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend_from_slice(&(48_000u32 * 24).to_le_bytes());
+        wav.extend_from_slice(&24u16.to_le_bytes());
+        wav.extend_from_slice(&32u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(24u32 * 10).to_le_bytes());
+        wav.extend_from_slice(&[0; 240]);
+        assert_eq!(
+            wav_header(&wav),
+            Some(WavHeader {
+                channels: 6,
+                rate: 48_000,
+                bits: 32,
+                frames: 10
+            })
+        );
+        assert_eq!(wav_header(b"RIFF\0\0\0\0AVI "), None);
+        assert_eq!(wav_header(&wav[..40]), None, "no data chunk");
     }
 
     #[test]

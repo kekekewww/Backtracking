@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::null;
 use std::sync::Arc;
 
+use backtracking_core::waveform;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
 use windows_sys::Win32::System::Memory::{
@@ -72,6 +73,16 @@ const SIMPLIFIED_CHINESE: &str = "msyh.ttc";
 const JAPANESE: &str = "YuGothM.ttc";
 const KOREAN: &str = "malgun.ttf";
 
+/// The bold file Windows ships beside each fallback. The app's bold face covers Latin only,
+/// so without these a heading in Chinese, Japanese or Korean is drawn in the regular weight.
+const BOLD: [(&str, &str); 5] = [
+    (SEGOE, "segoeuib.ttf"),
+    (TRADITIONAL_CHINESE, "msjhbd.ttc"),
+    (SIMPLIFIED_CHINESE, "msyhbd.ttc"),
+    (JAPANESE, "YuGothB.ttc"),
+    (KOREAN, "malgunbd.ttf"),
+];
+
 /// The font files to fall back on, most wanted first.
 ///
 /// Chinese, Japanese and Korean share many characters but draw them differently, so the
@@ -107,19 +118,39 @@ fn fonts_folder() -> PathBuf {
 }
 
 /// Appends every installed fallback font to the end of every family in `fonts`, so the
-/// app's own typefaces still draw whatever they can.
+/// app's own typefaces still draw whatever they can. The app's bold family gets each
+/// font's bold file where Windows has one.
 pub fn add_system_font_fallbacks(fonts: &mut egui::FontDefinitions) {
     let folder = fonts_folder();
-    for file in candidates(unsafe { GetUserDefaultUILanguage() }) {
-        let Some(mapped) = MappedFile::open(&folder.join(file)) else {
-            continue;
-        };
+    let bold_family = egui::FontFamily::Name(waveform::HINT_BOLD_FAMILY.into());
+    let wants_bold = fonts.families.contains_key(&bold_family);
+    let mut map = |file: &str| {
+        let mapped = MappedFile::open(&folder.join(file))?;
         let name = format!("system-{file}");
         fonts
             .font_data
             .insert(name.clone(), Arc::new(egui::FontData::from_blob(Arc::new(mapped), 0)));
-        for family in fonts.families.values_mut() {
-            family.push(name.clone());
+        Some(name)
+    };
+    let mut added = Vec::new();
+    for file in candidates(unsafe { GetUserDefaultUILanguage() }) {
+        let Some(regular) = map(file) else {
+            continue;
+        };
+        let bold = BOLD
+            .iter()
+            .find(|(of, _)| *of == file)
+            .filter(|_| wants_bold)
+            .and_then(|(_, bold)| map(bold));
+        added.push((regular, bold));
+    }
+    for (family, names) in &mut fonts.families {
+        for (regular, bold) in &added {
+            let name = match bold {
+                Some(bold) if *family == bold_family => bold,
+                _ => regular,
+            };
+            names.push(name.clone());
         }
     }
 }
@@ -187,6 +218,38 @@ mod tests {
             assert_eq!(after[..before.len()], before[..], "{family:?}");
             assert!(after[before.len()..].contains(&segoe), "{family:?}");
             assert!(after[before.len()..].iter().all(|name| name.starts_with("system-")));
+        }
+    }
+
+    #[test]
+    fn the_bold_family_falls_back_on_bold_files_and_no_other_family_does() {
+        let mut fonts = egui::FontDefinitions::default();
+        let bold = egui::FontFamily::Name(waveform::HINT_BOLD_FAMILY.into());
+        fonts.families.insert(bold.clone(), Vec::new());
+        let own = fonts.families[&egui::FontFamily::Proportional].len();
+        add_system_font_fallbacks(&mut fonts);
+
+        let proportional = &fonts.families[&egui::FontFamily::Proportional][own..];
+        let names = &fonts.families[&bold];
+        // One fallback for each regular one, in the same order of languages.
+        assert_eq!(names.len(), proportional.len());
+        for (name, regular) in names.iter().zip(proportional) {
+            let file = &regular["system-".len()..];
+            let (_, bold_file) = BOLD.iter().find(|(of, _)| of == &file).unwrap();
+            if fonts_folder().join(bold_file).exists() {
+                assert_eq!(name, &format!("system-{bold_file}"));
+            } else {
+                assert_eq!(name, regular);
+            }
+        }
+        for (family, names) in &fonts.families {
+            if *family != bold {
+                let bold_names = BOLD.map(|(_, file)| format!("system-{file}"));
+                assert!(
+                    names.iter().all(|name| !bold_names.contains(name)),
+                    "{family:?}"
+                );
+            }
         }
     }
 }

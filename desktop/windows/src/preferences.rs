@@ -8,8 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use backtracking_core::{
-    AutoResumeDelay, ChannelExportMode, ChannelRoute, DurationChoice, WavExportProfile,
-    WavSampleFormat,
+    AutoResumeDelay, ChannelRoute, DurationChoice, WavExportProfile, WavSampleFormat,
 };
 
 use crate::controller::{CaptureSource, SourceSettings};
@@ -23,29 +22,62 @@ pub(crate) const DEFAULT_ACCENT: [u8; 3] = [103, 231, 181];
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum WideExportMode {
     #[default]
+    BinauralFiles,
+    BinauralMix,
     MonoFiles,
     Multichannel,
 }
 
 impl WideExportMode {
-    pub(crate) const ALL: [Self; 2] = [Self::MonoFiles, Self::Multichannel];
+    pub(crate) const ALL: [Self; 4] = [
+        Self::BinauralFiles,
+        Self::MonoFiles,
+        Self::Multichannel,
+        Self::BinauralMix,
+    ];
 
     pub(crate) fn preference(self) -> &'static str {
         match self {
+            Self::BinauralFiles => "binaural-files",
+            Self::BinauralMix => "binaural-mix",
             Self::MonoFiles => "mono-files",
             Self::Multichannel => "multichannel",
         }
     }
 
-    pub(crate) fn export_mode(self) -> ChannelExportMode {
+    fn from_preference(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.preference() == text)
+    }
+}
+
+/// How the L and R rows on top of a lane wider than stereo sound in preview and on export. The
+/// window draws them as the stereo fold-down either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PairRender {
+    /// Each channel goes to the left, the right or both by its label.
+    #[default]
+    Stereo,
+    /// Each channel is placed around the head by its direction.
+    Binaural,
+}
+
+impl PairRender {
+    pub(crate) const ALL: [Self; 2] = [Self::Stereo, Self::Binaural];
+
+    pub(crate) fn preference(self) -> &'static str {
         match self {
-            Self::MonoFiles => ChannelExportMode::MonoFiles,
-            Self::Multichannel => ChannelExportMode::Multichannel,
+            Self::Stereo => "stereo",
+            Self::Binaural => "binaural",
         }
     }
 
-    fn from_preference(text: &str) -> Option<Self> {
+    pub(crate) fn from_preference(text: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|mode| mode.preference() == text)
+    }
+
+    /// What the export calls `pair_binaural`.
+    pub(crate) fn binaural(self) -> bool {
+        self == Self::Binaural
     }
 }
 
@@ -113,6 +145,7 @@ pub(crate) enum Key {
     History,
     IdleResume,
     RetainSilence,
+    HideSilentChannels,
     Transparency,
     Accent,
     Meter,
@@ -124,6 +157,7 @@ pub(crate) enum Key {
     WavSampleFormat,
     WavForceMono,
     WideExport,
+    PairRender,
     ShownGroups,
     Output,
     OutputCleanup,
@@ -150,6 +184,7 @@ impl Key {
             Self::History => "history-seconds",
             // The old preference used 0 for Off.
             Self::IdleResume => "idle-resume-delay-seconds",
+            Self::HideSilentChannels => "hide-silent-channels",
             Self::RetainSilence => "retain-silence",
             Self::Transparency => "transparency-percent",
             Self::Accent => "theme-color",
@@ -162,6 +197,7 @@ impl Key {
             Self::WavSampleFormat => "wav-sample-format",
             Self::WavForceMono => "wav-force-mono",
             Self::WideExport => "wide-lane-export-v1",
+            Self::PairRender => "multichannel-pair-render",
             Self::ShownGroups => "shown-channel-groups-v1",
             Self::Output => "output-folder",
             // Absent or 0 keeps every file.
@@ -189,6 +225,7 @@ impl Key {
 pub(crate) struct Settings {
     pub(crate) history: DurationChoice,
     pub(crate) idle_resume: AutoResumeDelay,
+    pub(crate) hide_silent_channels: bool,
     pub(crate) retain_silence: bool,
     pub(crate) transparency: u8,
     pub(crate) accent: [u8; 3],
@@ -200,6 +237,7 @@ pub(crate) struct Settings {
     pub(crate) wav_profile: WavExportProfile,
     pub(crate) wav_force_mono: bool,
     pub(crate) wide_export: WideExportMode,
+    pub(crate) pair_render: PairRender,
     pub(crate) shown_groups: SourceGroupChoices,
     pub(crate) output: PathBuf,
     /// Days after which old exports in `output` are deleted; `None` keeps them.
@@ -230,6 +268,7 @@ impl Default for Settings {
         Self {
             history: DurationChoice::Seconds20,
             idle_resume: AutoResumeDelay::default(),
+            hide_silent_channels: true,
             retain_silence: false,
             transparency: 0,
             accent: DEFAULT_ACCENT,
@@ -247,6 +286,7 @@ impl Default for Settings {
             wav_profile: WavExportProfile::default(),
             wav_force_mono: false,
             wide_export: WideExportMode::default(),
+            pair_render: PairRender::default(),
             shown_groups: SourceGroupChoices::new(),
             output: directory.join("output"),
             output_cleanup: None,
@@ -306,6 +346,7 @@ impl Preferences {
         {
             settings.idle_resume = delay;
         }
+        settings.hide_silent_channels = self.read_number::<u8>(Key::HideSilentChannels) != Some(0);
         settings.retain_silence = self.read_number::<u8>(Key::RetainSilence) == Some(1);
         if let Some(percent @ (0 | 25 | 50 | 75 | 100)) = self.read_number(Key::Transparency) {
             settings.transparency = percent;
@@ -340,6 +381,11 @@ impl Preferences {
             .read(Key::WideExport)
             .as_deref()
             .and_then(|value| WideExportMode::from_preference(value.trim()))
+            .unwrap_or_default();
+        settings.pair_render = self
+            .read(Key::PairRender)
+            .as_deref()
+            .and_then(|value| PairRender::from_preference(value.trim()))
             .unwrap_or_default();
         settings.shown_groups = self.load_shown_groups();
         if let Some(path) = self.read_absolute_path(Key::Output) {
@@ -986,7 +1032,9 @@ mod tests {
             writer.save(Key::History, "600").unwrap();
             queued.send(writer).unwrap();
         });
-        let result = queue.recv_timeout(Duration::from_millis(100));
+        // save does no I/O. A save waiting for the sink cannot finish until we release it below.
+        // The timeout gives the enqueue thread time to run on a busy machine.
+        let result = queue.recv_timeout(Duration::from_secs(10));
         let returned_while_disk_busy = result.is_ok();
         release.send(()).unwrap();
         ui.join().unwrap();
@@ -1202,6 +1250,27 @@ mod tests {
         )
         .unwrap();
         println!("{result}");
+    }
+
+    #[test]
+    fn silent_channel_preference_and_all_channels_route_round_trip() {
+        let store = workspace_preferences("hide-silent-channels");
+        assert!(store.load().hide_silent_channels);
+        store.save(Key::HideSilentChannels, "0").unwrap();
+        assert!(!store.load().hide_silent_channels);
+        store.save(Key::HideSilentChannels, "1").unwrap();
+        assert!(store.load().hide_silent_channels);
+        let lanes = [
+            Some(SourceSettings {
+                source: CaptureSource::System,
+                route: ChannelRoute::AllChannels,
+            }),
+            None,
+        ];
+        store
+            .save(Key::CaptureSources, &serialize_sources(&lanes))
+            .unwrap();
+        assert_eq!(store.load().sources, lanes);
     }
 
     #[test]
@@ -1480,7 +1549,7 @@ mod tests {
         assert_eq!(old.history, DurationChoice::Minutes10);
         assert!(old.wav_force_mono);
         assert_eq!(old.wav_profile.sample_format, WavSampleFormat::Pcm24);
-        assert_eq!(old.wide_export, WideExportMode::MonoFiles);
+        assert_eq!(old.wide_export, WideExportMode::BinauralFiles);
         assert!(old.shown_groups.is_empty());
 
         let groups = SourceGroupChoices::from([
@@ -1533,7 +1602,7 @@ mod tests {
         preferences.save(Key::WideExport, "future-mode").unwrap();
         preferences.save(Key::ShownGroups, "{invalid json").unwrap();
         let loaded = preferences.load();
-        assert_eq!(loaded.wide_export, WideExportMode::MonoFiles);
+        assert_eq!(loaded.wide_export, WideExportMode::BinauralFiles);
         assert!(loaded.shown_groups.is_empty());
         assert_eq!(
             preferences.read(Key::WideExport).as_deref(),
@@ -1543,13 +1612,25 @@ mod tests {
             preferences.read(Key::ShownGroups).as_deref(),
             Some("{invalid json")
         );
+    }
+
+    #[test]
+    fn the_pair_render_defaults_to_stereo_and_keeps_what_it_cannot_read() {
+        let preferences = workspace_preferences("pair-render");
+        assert_eq!(preferences.load().pair_render, PairRender::Stereo);
+        assert!(!preferences.load().pair_render.binaural());
+        for mode in PairRender::ALL {
+            preferences
+                .save(Key::PairRender, mode.preference())
+                .unwrap();
+            assert_eq!(preferences.load().pair_render, mode);
+        }
+        assert!(preferences.load().pair_render.binaural());
+        preferences.save(Key::PairRender, "surround").unwrap();
+        assert_eq!(preferences.load().pair_render, PairRender::Stereo);
         assert_eq!(
-            WideExportMode::MonoFiles.export_mode(),
-            ChannelExportMode::MonoFiles
-        );
-        assert_eq!(
-            WideExportMode::Multichannel.export_mode(),
-            ChannelExportMode::Multichannel
+            preferences.read(Key::PairRender).as_deref(),
+            Some("surround")
         );
     }
 

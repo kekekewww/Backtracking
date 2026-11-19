@@ -8,13 +8,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use backtracking_addon::package;
-use backtracking_core::{ChannelRoute, Fades, TakeLabel, WavExportProfile};
+use backtracking_core::{ChannelRoute, Fades, PositionKey, TakeLabel, WavExportProfile};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
 use crate::addons::{AddonHandle, AddonManager, AddonState};
-use crate::clip_export::{ExportOptions, export_clip};
-use crate::controller::{CaptureSource, Controller, SourceSettings};
+use crate::clip_export::{ExportOptions, RowExport, export_rows};
+use crate::controller::{CaptureSource, Controller, EditSnapshot, SourceSettings};
 use crate::preferences::WideExportMode;
 
 const ADDON_ID: &str = "com.example.test-tone";
@@ -271,7 +271,7 @@ fn test_tone_child() {
     let mut controller = Controller::with_addons(handle.clone()).unwrap();
     controller.set_sources([
         Some(SourceSettings {
-            source,
+            source: source.clone(),
             route: ChannelRoute::Merged,
         }),
         None,
@@ -389,7 +389,8 @@ fn test_tone_child() {
         wide_mode: WideExportMode::MonoFiles,
         addons: Some(handle.clone()),
     };
-    let files = export_clip(
+    // The whole lane, as the window writes it: every channel and the pair.
+    let files = export_rows(
         &root.join("exports"),
         &snapshot.snapshots,
         (visible.start - range.start) as usize..(visible.end - range.start) as usize,
@@ -399,9 +400,27 @@ fn test_tone_child() {
         false,
         &[TakeLabel::default()],
         &options,
+        &[
+            RowExport {
+                pair: true,
+                ..RowExport::default()
+            },
+            RowExport::default(),
+        ],
     )
-    .unwrap();
-    assert_eq!(files.len(), 6);
+    .unwrap()
+    .paths;
+    // A whole wide lane writes its channels and, last, the L/R file.
+    assert_eq!(files.len(), 7);
+    assert!(
+        files[6]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("-Stereo.wav"),
+        "the whole lane's last file is its stereo pair: {:?}",
+        files[6]
+    );
     let captured = track.snapshot_range(visible.clone()).unwrap();
     for (channel, (file, label)) in files.iter().zip(&group.labels).enumerate() {
         assert!(
@@ -419,6 +438,8 @@ fn test_tone_child() {
             .collect();
         check_mono_wav(file, &expected);
     }
+
+    check_positioned_objects(&handle, &root, &mut controller, &source);
 
     command(handle.set_enabled(ADDON_ID, false));
     wait_for(
@@ -559,6 +580,157 @@ fn test_tone_child() {
     );
     drop(restarted);
     eprintln!("desktop add-on end-to-end checks passed");
+}
+
+fn check_positioned_objects(
+    handle: &AddonHandle,
+    root: &Path,
+    controller: &mut Controller,
+    source: &CaptureSource,
+) {
+    command(handle.select_format(ADDON_ID, "main", "objects"));
+    wait_running(handle, "objects");
+    let settings = SourceSettings {
+        source: source.clone(),
+        route: ChannelRoute::Merged,
+    };
+    controller.set_sources([Some(settings.clone()), Some(settings.clone())]);
+    let secondary = AddonManager::connect_existing(root.to_path_buf()).unwrap();
+    let mut remote = Controller::with_addons(secondary.handle()).unwrap();
+    remote.set_sources([Some(settings.clone()), Some(settings.clone())]);
+    remote.set_watching(false);
+    remote.resume();
+    wait_for(
+        || {
+            controller.poll();
+            remote.poll();
+            (0..2).all(|lane| {
+                controller.track_channels(lane) == Some(4) && remote.track_channels(lane) == Some(4)
+            })
+        },
+        "positioned objects reach both lanes in both capture windows",
+    );
+
+    let local = wait_circle_snapshot(controller);
+    let remote_snapshot = wait_circle_snapshot(&remote);
+    let local_keys = check_circle_snapshot(&local, "primary");
+    check_circle_snapshot(&remote_snapshot, "secondary");
+
+    // A retained edit must keep its positions after live audio is cleared.
+    controller.pause();
+    controller.clear();
+    assert!(
+        controller
+            .request_edit_snapshot()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        local.positions[0].channel_positions(2, local.snapshots[0].frame_range()),
+        local_keys,
+        "clearing live capture changed the frozen position track"
+    );
+    drop(remote);
+    drop(secondary);
+
+    // Later lifecycle checks deliberately keep the previously selected format.
+    controller.set_sources([Some(settings), None]);
+    command(handle.select_format(ADDON_ID, "main", "5.1"));
+    wait_running(handle, "5.1");
+    controller.resume();
+    wait_for(
+        || {
+            controller.poll();
+            controller.track_channels(0) == Some(6)
+        },
+        "six-channel format resumes after the positioned example",
+    );
+}
+
+fn wait_circle_snapshot(controller: &Controller) -> EditSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(snapshot) = controller
+            .request_edit_snapshot()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            && snapshot.snapshots.len() == 2
+            && snapshot.snapshots[0].channels() == 4
+        {
+            let track = &snapshot.snapshots[0];
+            let keys = snapshot.positions[0].channel_positions(2, track.frame_range());
+            if keys.len() >= 100
+                && keys.last().unwrap().frame - keys[0].frame
+                    >= u64::from(track.sample_rate()) * 42 / 10
+            {
+                return snapshot;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "positioned example did not retain a full circle"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn check_circle_snapshot(snapshot: &EditSnapshot, window: &str) -> Vec<PositionKey> {
+    let track = &snapshot.snapshots[0];
+    let frames = track.frame_range();
+    let keys = snapshot.positions[0].channel_positions(2, frames.clone());
+    assert_eq!(
+        keys,
+        snapshot.positions[1].channel_positions(2, frames.clone()),
+        "one message must reach both lanes of the {window} window"
+    );
+    assert!(
+        snapshot.positions[0]
+            .channel_positions(0, frames.clone())
+            .is_empty()
+    );
+    for key in &keys {
+        let position = key.position;
+        let radius = (position.x * position.x + position.y * position.y).sqrt();
+        assert!(
+            (radius - 0.8).abs() < 0.000_01,
+            "wrong circle radius in {window}: {radius}"
+        );
+        assert_eq!((position.z, position.size, position.gain), (0.0, 0.0, 1.0));
+    }
+    let fixed = snapshot.positions[0].channel_positions(3, frames);
+    assert!(!fixed.is_empty(), "fixed object missing in {window}");
+    for key in fixed {
+        assert_eq!(
+            (key.position.x, key.position.y, key.position.z),
+            (-0.5, 0.5, 0.0)
+        );
+    }
+    // Unwrap the observed angles instead of assuming the first update starts
+    // at a cardinal point: the example uses the monotonic Sender clock.
+    let turns: f64 = keys
+        .windows(2)
+        .map(|pair| {
+            let angle = |key: &PositionKey| key.position.x.atan2(key.position.y);
+            (angle(&pair[1]) - angle(&pair[0])).rem_euclid(std::f64::consts::TAU)
+        })
+        .sum();
+    assert!(
+        turns > std::f64::consts::TAU,
+        "less than one complete circle in {window}"
+    );
+    let elapsed =
+        (keys.last().unwrap().frame - keys[0].frame) as f64 / f64::from(track.sample_rate());
+    let period = elapsed * std::f64::consts::TAU / turns;
+    assert!(
+        (period - 4.0).abs() < 0.06,
+        "wrong circle period in {window}: {period} seconds"
+    );
+    eprintln!(
+        "{window} frozen positions: {} updates, circle period {period:.6} seconds",
+        keys.len()
+    );
+    keys
 }
 
 fn check_mono_wav(path: &Path, expected: &[f32]) {
