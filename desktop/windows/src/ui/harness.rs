@@ -19,8 +19,17 @@
 //!   `save=<folder>` saves the selection (or everything, without one) into that folder, through
 //!   the Save command's own code, waits until the files are written and lists them in the log.
 //!   `options=<page>[:<width>x<height>]` opens the Options window on that page (`actions`,
-//!   `capture`, `sources`, `appearance`, `export`, `addons`, `updates`), optionally at that
-//!   size, and makes the picture of the Options window instead of the main window.
+//!   `hotkeys`, `capture`, `sources`, `appearance`, `export`, `addons`, `updates`), optionally
+//!   at that size, and makes the picture of the Options window instead of the main window.
+//!   `bind=<action id>:<binding>[,<binding>]` gives a shortcut action (named as in the
+//!   `hotkeys-v1` settings file, `toggle-capture` say) those bindings through the Hotkeys
+//!   page's own code, and keeps them as the page does; `bind=<action id>:none` clears it. A
+//!   binding is modifiers and a key joined by `+`, the key named as in that file:
+//!   `ctrl+shift+s`, `space`, `alt+key-left-of-1`, `f6`, or `right-ctrl-tap`.
+//!   `key=<binding>` presses and releases those keys on the main window, through its input as
+//!   a real key press arrives, once the steps before it have settled; `key=right-ctrl-tap` is a
+//!   tap of Right Ctrl. A test copy's window never has the keyboard, and a selection's cancel
+//!   keys are read only while it does, so they do nothing here.
 //!   `drop=<file>` drops a file on the main window and `drop-options=<file>` on the Options
 //!   window: the file reaches egui's input as a dropped file, as one from Explorer does.
 //!   `remove=<add-on id>` opens the question that comes before removing that add-on.
@@ -60,7 +69,8 @@ use std::time::{Duration, Instant};
 use backtracking_addon::protocol::TransportCommand;
 use eframe::egui;
 
-use super::{OptionsSection, Recorder, RowSource, rows_between};
+use super::{OptionsSection, Recorder, RowSource, hotkeys_page, rows_between};
+use crate::hotkeys::{Action, Binding};
 use crate::preferences::{PairRender, WideExportMode};
 
 pub(super) const SCREENSHOT: &str = "BACKTRACKING_TEST_SCREENSHOT";
@@ -111,6 +121,10 @@ pub(super) enum Step {
     OpenExportMode,
     /// Writes what a drag-out would carry and copies it into this folder.
     DragPrepare(PathBuf),
+    /// Gives a shortcut action these bindings, as the Hotkeys page does.
+    Bind(Action, Vec<Binding>),
+    /// Presses these keys on the main window, or taps Right Ctrl.
+    Key(Binding),
 }
 
 impl Step {
@@ -133,6 +147,8 @@ impl Step {
                 // before them has to reach the screen first.
                 | Self::Rows(..)
                 | Self::SelectLane(_)
+                // Each press gets frames of its own, after what it acts on.
+                | Self::Key(_)
         )
     }
 }
@@ -341,6 +357,22 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                         .map_err(|error| format!("{json} is not a JSON value: {error}"))?;
                     Ok(Step::Set(id.trim().to_owned(), key.trim().to_owned(), json))
                 }
+                "bind" => {
+                    let (id, bindings) = value
+                        .split_once(':')
+                        .ok_or_else(|| format!("{step} needs <action id>:<binding>"))?;
+                    let action = hotkeys_page::parse_action(id)?;
+                    let bindings = if bindings.trim() == "none" {
+                        Vec::new()
+                    } else {
+                        bindings
+                            .split(',')
+                            .map(hotkeys_page::parse_binding)
+                            .collect::<Result<_, _>>()?
+                    };
+                    Ok(Step::Bind(action, bindings))
+                }
+                "key" => Ok(Step::Key(hotkeys_page::parse_binding(value)?)),
                 other => Err(format!("unknown step {other}")),
             }
         })
@@ -364,6 +396,10 @@ pub(super) struct Harness {
     options_size: Option<egui::Vec2>,
     main_drops: Vec<PathBuf>,
     options_drops: Vec<PathBuf>,
+    /// Key presses and releases a `key=` step hands the main window.
+    main_keys: Vec<egui::Event>,
+    /// Taps of Right Ctrl a `key=right-ctrl-tap` step made, for the window to take.
+    taps: usize,
     /// Waits for the Options window's next pass to take its picture.
     options_shot: Option<mpsc::SyncSender<PictureResult>>,
     /// Extra time the last step asked for before the next one.
@@ -378,11 +414,20 @@ impl Harness {
         self.options_size
     }
 
-    /// Hands files the steps dropped on the main window to egui, in its raw input.
+    /// Hands files the steps dropped on the main window, and keys they pressed, to egui, in its
+    /// raw input.
     pub(super) fn drop_on_main(&mut self, input: &mut egui::RawInput) {
         for path in self.main_drops.drain(..) {
             input.dropped_files.push(Arc::new(DroppedForTest(path)));
         }
+        input.events.append(&mut self.main_keys);
+    }
+
+    /// Whether a step tapped Right Ctrl since the last call, as `lane_key` reports a tap.
+    pub(super) fn take_tap(&mut self) -> bool {
+        let tapped = self.taps > 0;
+        self.taps = self.taps.saturating_sub(1);
+        tapped
     }
 
     /// Hands files the steps dropped on the Options window to its input, before it is read.
@@ -457,6 +502,8 @@ impl Harness {
             notes,
             main_drops: Vec::new(),
             options_drops: Vec::new(),
+            main_keys: Vec::new(),
+            taps: 0,
             options_shot: None,
             hold: Duration::ZERO,
             drag_copy: None,
@@ -603,6 +650,7 @@ impl Recorder {
             && self.edit_preview.is_none()
             // Dropped files are read in the next pass, and the manager answers after that.
             && harness.main_drops.is_empty()
+            && harness.main_keys.is_empty()
             && harness.options_drops.is_empty()
             && !self.addons_page.waiting()
             // A `save=` waits for its files to be written.
@@ -837,6 +885,29 @@ impl Recorder {
             &Step::HideSilent(on) => {
                 self.hide_silent = on;
                 self.live_revision = None;
+                ctx.request_repaint();
+            }
+            Step::Bind(action, bindings) => {
+                let global = hotkeys_page::global(self.hotkey.as_ref());
+                let result =
+                    self.hotkeys_page
+                        .set_bindings(*action, bindings, &mut self.hotkeys, global);
+                result.map_err(|error| super::Language::current().hotkey_problem(error))?;
+                self.save_hotkeys();
+                ctx.request_repaint();
+            }
+            &Step::Key(binding) => {
+                let harness = self.harness.as_mut().ok_or("the harness has finished")?;
+                match binding {
+                    Binding::RightCtrlTap => harness.taps += 1,
+                    Binding::Chord { modifiers, key } => {
+                        for pressed in [true, false] {
+                            harness
+                                .main_keys
+                                .push(hotkeys_page::key_event(modifiers, key, pressed));
+                        }
+                    }
+                }
                 ctx.request_repaint();
             }
             Step::PreviewPlan => {
@@ -1497,6 +1568,64 @@ mod tests {
             "options=plugins",
             "options=addons:820",
             "options=addons:20x20",
+        ] {
+            assert!(parse_steps(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn hotkey_steps_name_an_action_and_keys_as_the_settings_file_does() {
+        use crate::hotkeys::{Key, Modifiers};
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::NONE
+        };
+        let bare = |key| Binding::Chord {
+            key,
+            modifiers: Modifiers::NONE,
+        };
+        assert_eq!(
+            parse_steps(
+                "options=hotkeys; bind=toggle-capture:f6;bind=cancel-selection:escape, ctrl+backspace;\
+                 bind=clear:none;key=f6;key=right-ctrl-tap;key=Alt+key-left-of-1"
+            )
+            .unwrap(),
+            [
+                Step::Options(OptionsSection::Hotkeys, None),
+                Step::Bind(Action::ToggleCapture, vec![bare(Key::F6)]),
+                Step::Bind(
+                    Action::CancelSelection,
+                    vec![
+                        bare(Key::Escape),
+                        Binding::Chord {
+                            key: Key::Backspace,
+                            modifiers: ctrl
+                        }
+                    ]
+                ),
+                Step::Bind(Action::Clear, Vec::new()),
+                Step::Key(bare(Key::F6)),
+                Step::Key(Binding::RightCtrlTap),
+                Step::Key(Binding::Chord {
+                    key: Key::KeyLeftOf1,
+                    modifiers: Modifiers {
+                        alt: true,
+                        ..Modifiers::NONE
+                    }
+                }),
+            ]
+        );
+        // A press acts on what came before it; a binding changes nothing that has to settle.
+        assert!(Step::Key(bare(Key::F6)).waits());
+        assert!(!Step::Bind(Action::Quit, Vec::new()).waits());
+        for bad in [
+            "bind=toggle-capture",
+            "bind=toggle:f6",
+            "bind=quit:ctrl+",
+            "bind=quit:f6,",
+            "key=banana",
+            "key=",
+            "key=hyper+a",
         ] {
             assert!(parse_steps(bad).is_err(), "{bad}");
         }

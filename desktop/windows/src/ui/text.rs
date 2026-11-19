@@ -1,4 +1,5 @@
-//! Words for the stacked channel view and the Add-ons page, in English and Traditional Chinese.
+//! Words for the stacked channel view, the Add-ons page and the Hotkeys page, in English and
+//! Traditional Chinese.
 //!
 //! The rest of the window is written in English only and has no language setting yet, so the
 //! window uses English. A test copy (see `startup::test_instance`) can be started with
@@ -9,6 +10,7 @@ use std::sync::OnceLock;
 use backtracking_addon::manifest::{Capability, OpenFiles};
 use backtracking_addon::protocol::MessageLevel;
 
+use crate::hotkeys::{Action, BindingError, ReservedShortcut};
 use crate::preferences::WideExportMode;
 
 /// Lines the capture code (`controller.rs`) writes in both languages at once, word for word.
@@ -297,6 +299,207 @@ impl Language {
             "A test copy does not change the Windows startup entry.",
             "測試用的程式不會變更 Windows 開機啟動設定。",
         )
+    }
+
+    // The Hotkeys page of Options.
+
+    pub(crate) fn hotkeys_section(self) -> &'static str {
+        self.pick("Hotkeys", "快速鍵")
+    }
+
+    pub(crate) fn hotkeys_explained(self) -> &'static str {
+        self.pick(
+            "Click a shortcut, then press the keys you want. Changes apply at once.",
+            "按一下快速鍵，再按下想用的按鍵。變更會立即生效。",
+        )
+    }
+
+    pub(crate) fn hotkeys_system_wide(self) -> &'static str {
+        self.pick("System-wide", "全系統")
+    }
+
+    pub(crate) fn hotkeys_system_wide_note(self) -> &'static str {
+        self.pick(
+            "Works while another app is in front.",
+            "其他程式在前景時也有效。",
+        )
+    }
+
+    pub(crate) fn hotkeys_in_window(self) -> &'static str {
+        self.pick("In the Backtracking window", "在 Backtracking 視窗中")
+    }
+
+    pub(crate) fn hotkeys_in_window_note(self) -> &'static str {
+        self.pick(
+            "These work while the Backtracking window is in front. With a selection, the key \
+             that pauses plays the selection and the key that clears cancels it.",
+            "這些按鍵在 Backtracking 視窗位於前景時有效。有選區時，暫停的按鍵改為試聽選區，清除的按鍵改為取消選區。",
+        )
+    }
+
+    /// A shortcut's action on the Hotkeys page and in its notes.
+    pub(crate) fn hotkey_action(self, action: Action) -> &'static str {
+        match action {
+            Action::SaveSnapshotGlobal => {
+                self.pick("Save snapshot from anywhere", "從任何地方儲存快照")
+            }
+            Action::ToggleCapture => self.pick("Pause or resume capture", "暫停或繼續擷取"),
+            Action::Clear => self.pick("Clear capture", "清除擷取內容"),
+            Action::CancelSelection => self.pick("Cancel selection", "取消選取"),
+            Action::SeparateLanes => self.separate_rows(),
+            Action::SaveSnapshot => self.pick("Save snapshot", "儲存快照"),
+            Action::WaveformOnly => self.pick("Show waveform only", "只顯示波形"),
+            Action::KeepOnTop => self.pick("Keep on top", "保持在最上層"),
+            Action::OpenOptions => self.pick("Open Options", "開啟 Options"),
+            Action::Quit => self.pick("Quit", "結束"),
+        }
+    }
+
+    /// How a binding names the key left of 1, which is a different key on other layouts.
+    pub(crate) fn key_left_of_1(self) -> &'static str {
+        self.pick("the key left of 1", "1 左邊的鍵")
+    }
+
+    pub(crate) fn hotkey_not_set(self) -> &'static str {
+        self.pick("Not set", "未設定")
+    }
+
+    pub(crate) fn hotkey_press_keys(self) -> &'static str {
+        self.pick("Press keys…", "請按下按鍵…")
+    }
+
+    /// The button that records a second shortcut for the same action.
+    pub(crate) fn hotkey_add(self) -> &'static str {
+        self.pick("Add another", "再新增一組")
+    }
+
+    pub(crate) fn hotkey_clear(self) -> &'static str {
+        self.pick("Clear", "清除")
+    }
+
+    pub(crate) fn hotkey_reset(self) -> &'static str {
+        self.pick("Reset", "重設")
+    }
+
+    pub(crate) fn hotkeys_reset_all(self) -> &'static str {
+        self.pick("Reset all", "全部重設")
+    }
+
+    /// A tap of Right Ctrl cannot be recorded as a key press, so it is offered as a button.
+    pub(crate) fn hotkey_right_ctrl(self) -> &'static str {
+        self.pick("Use a tap of Right Ctrl", "改用輕按右 Ctrl")
+    }
+
+    pub(crate) fn hotkey_recording_note(self) -> &'static str {
+        self.pick(
+            "Press the new keys. Escape stops without a change, so Escape itself comes back \
+             only with Reset.",
+            "按下新的按鍵。按 Esc 會停止且不變更，因此 Esc 本身只能用「重設」恢復。",
+        )
+    }
+
+    /// Why a shortcut was refused. The old one stays.
+    pub(crate) fn hotkey_problem(self, error: BindingError) -> String {
+        match error {
+            BindingError::Conflict(other) => match self {
+                Self::English => format!("Already used by {}.", self.hotkey_action(other)),
+                Self::TraditionalChinese => format!("已用於「{}」。", self.hotkey_action(other)),
+            },
+            BindingError::UnsupportedGlobalKey(key) => match self {
+                Self::English => format!("Windows cannot use {key} for a system-wide shortcut."),
+                Self::TraditionalChinese => format!("Windows 無法把 {key} 用於全系統快速鍵。"),
+            },
+            BindingError::Reserved(ReservedShortcut::BareTab | ReservedShortcut::BareEnter) => self
+                .pick(
+                    "Tab and Enter on their own move between buttons and press them.",
+                    "單獨的 Tab 與 Enter 用於在按鈕間移動及按下按鈕。",
+                )
+                .to_owned(),
+            BindingError::Reserved(_) => self
+                .pick(
+                    "Windows keeps this shortcut for itself.",
+                    "Windows 保留了這個快速鍵。",
+                )
+                .to_owned(),
+            BindingError::GlobalNeedsModifier => self
+                .pick(
+                    "A system-wide shortcut needs Ctrl, Shift or Alt.",
+                    "全系統快速鍵需要搭配 Ctrl、Shift 或 Alt。",
+                )
+                .to_owned(),
+            BindingError::GlobalRightCtrlTap => self
+                .pick(
+                    "A tap of Right Ctrl works only in the Backtracking window.",
+                    "輕按右 Ctrl 只在 Backtracking 視窗中有效。",
+                )
+                .to_owned(),
+            BindingError::TooManyBindings => self
+                .pick(
+                    "An action can have two shortcuts at most.",
+                    "每個動作最多只能有兩組快速鍵。",
+                )
+                .to_owned(),
+            BindingError::KeyRequired => self
+                .pick(
+                    "Press a key together with the modifiers.",
+                    "請在修飾鍵之外再按一個鍵。",
+                )
+                .to_owned(),
+        }
+    }
+
+    pub(crate) fn hotkey_clipboard_keys(self) -> &'static str {
+        self.pick(
+            "The copy, cut and paste keys cannot be used.",
+            "複製、剪下與貼上的按鍵無法使用。",
+        )
+    }
+
+    pub(crate) fn could_not_register(self, error: &str) -> String {
+        match self {
+            Self::English => format!("Could not register the shortcut: {error}"),
+            Self::TraditionalChinese => format!("無法註冊快速鍵：{error}"),
+        }
+    }
+
+    pub(crate) fn mouse_heading(self) -> &'static str {
+        self.pick("Mouse (fixed)", "滑鼠（無法變更）")
+    }
+
+    /// The mouse gestures of the Backtracking window and what each does. They cannot be changed.
+    pub(crate) fn mouse_gestures(self) -> [(&'static str, &'static str); 6] {
+        [
+            (
+                self.pick("Ctrl + drag", "Ctrl + 拖曳"),
+                self.pick("Free selection", "自由框選"),
+            ),
+            (
+                self.pick("Shift + drag", "Shift + 拖曳"),
+                self.pick(
+                    "Selection that snaps to flags, bar lines or seconds lines",
+                    "吸附旗標、小節線或秒數線的框選",
+                ),
+            ),
+            (
+                self.pick("Alt + drag", "Alt + 拖曳"),
+                self.pick(
+                    "Move the window; on a selection's flag, fade that end",
+                    "移動視窗；在選區旗標上則調整該端的淡化",
+                ),
+            ),
+            (
+                self.pick("Mouse wheel", "滑鼠滾輪"),
+                self.pick("Zoom", "縮放"),
+            ),
+            (
+                self.pick("Middle-drag", "按住中鍵拖曳"),
+                self.pick("Pan while zoomed in", "放大時平移"),
+            ),
+            (
+                self.pick("Right-click", "按右鍵"),
+                self.pick("Open the menu", "開啟選單"),
+            ),
+        ]
     }
 
     // The Add-ons page and the screen shown before an install.
@@ -1234,6 +1437,105 @@ mod tests {
         assert_eq!(
             TraditionalChinese.size_in_files(2048, 3),
             "3 個檔案，共 2.0 KB"
+        );
+    }
+
+    #[test]
+    fn every_hotkey_text_exists_in_both_languages_and_differs() {
+        use crate::hotkeys::{Action, BindingError, Key, ReservedShortcut};
+        let mut pairs: Vec<(String, String)> = [
+            super::Language::hotkeys_section,
+            super::Language::hotkeys_explained,
+            super::Language::hotkeys_system_wide,
+            super::Language::hotkeys_system_wide_note,
+            super::Language::hotkeys_in_window,
+            super::Language::hotkeys_in_window_note,
+            super::Language::key_left_of_1,
+            super::Language::hotkey_not_set,
+            super::Language::hotkey_press_keys,
+            super::Language::hotkey_add,
+            super::Language::hotkey_clear,
+            super::Language::hotkey_reset,
+            super::Language::hotkeys_reset_all,
+            super::Language::hotkey_right_ctrl,
+            super::Language::hotkey_recording_note,
+            super::Language::hotkey_clipboard_keys,
+            super::Language::mouse_heading,
+        ]
+        .into_iter()
+        .map(|text| {
+            (
+                text(English).to_owned(),
+                text(TraditionalChinese).to_owned(),
+            )
+        })
+        .collect();
+        for action in Action::ALL {
+            pairs.push((
+                English.hotkey_action(action).to_owned(),
+                TraditionalChinese.hotkey_action(action).to_owned(),
+            ));
+        }
+        for error in [
+            BindingError::TooManyBindings,
+            BindingError::KeyRequired,
+            BindingError::GlobalNeedsModifier,
+            BindingError::GlobalRightCtrlTap,
+            BindingError::UnsupportedGlobalKey(Key::F12),
+            BindingError::Reserved(ReservedShortcut::AltF4),
+            BindingError::Reserved(ReservedShortcut::BareTab),
+            BindingError::Conflict(Action::Clear),
+        ] {
+            pairs.push((
+                English.hotkey_problem(error),
+                TraditionalChinese.hotkey_problem(error),
+            ));
+        }
+        for ((english_gesture, english), (chinese_gesture, chinese)) in English
+            .mouse_gestures()
+            .into_iter()
+            .zip(TraditionalChinese.mouse_gestures())
+        {
+            pairs.push((english_gesture.to_owned(), chinese_gesture.to_owned()));
+            pairs.push((english.to_owned(), chinese.to_owned()));
+        }
+        pairs.push((
+            English.could_not_register("x"),
+            TraditionalChinese.could_not_register("x"),
+        ));
+        for (english, chinese) in &pairs {
+            assert!(!english.is_empty() && !chinese.is_empty());
+            assert_ne!(english, chinese);
+            assert!(chinese.chars().any(|c| c as u32 >= 0x3000), "{chinese}");
+        }
+        // Every action has its own name, so a conflict names one action only.
+        let names = Action::ALL.map(|action| English.hotkey_action(action));
+        for (index, name) in names.iter().enumerate() {
+            assert!(!names[..index].contains(name), "{name}");
+        }
+        // The names the right-click menu already uses are kept.
+        assert_eq!(
+            English.hotkey_action(Action::SeparateLanes),
+            "Edit separately"
+        );
+        assert_eq!(
+            TraditionalChinese.hotkey_action(Action::SeparateLanes),
+            "分開編輯"
+        );
+        assert_eq!(English.hotkey_action(Action::Quit), "Quit");
+        assert_eq!(English.hotkey_action(Action::KeepOnTop), "Keep on top");
+        assert_eq!(
+            English.hotkey_problem(BindingError::Conflict(Action::Clear)),
+            "Already used by Clear capture."
+        );
+        assert_eq!(
+            TraditionalChinese.hotkey_problem(BindingError::Conflict(Action::Clear)),
+            "已用於「清除擷取內容」。"
+        );
+        // The Actions page said this before the Hotkeys page existed.
+        assert_eq!(
+            English.could_not_register("busy"),
+            "Could not register the shortcut: busy"
         );
     }
 
