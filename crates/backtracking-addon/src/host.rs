@@ -1,6 +1,8 @@
 //! Nonblocking host listener and authenticated add-on connections.
-use crate::protocol::{self, AddonMessage, ChannelPosition, HostMessage, Source};
-use crate::transport::Wire;
+use crate::protocol::{
+    self, AddonMessage, ChannelPosition, HostMessage, Source, MAX_APPEARANCE_MESSAGES_PER_SECOND,
+};
+use crate::transport::{below_rate_limit, Wire};
 use crate::{Error, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
@@ -39,6 +41,7 @@ pub enum HostEvent {
 pub struct Connection {
     id: String,
     wire: Wire,
+    appearance_updates: VecDeque<Instant>,
 }
 
 /// Bounds and validates position updates independently for each declared source.
@@ -62,12 +65,7 @@ impl PositionFilter {
             return None;
         }
         let received = self.received.entry(source.id.clone()).or_default();
-        while received.front().is_some_and(|previous| {
-            received_at.saturating_duration_since(*previous) >= Duration::from_secs(1)
-        }) {
-            received.pop_front();
-        }
-        if received.len() >= 50 {
+        if !below_rate_limit(received, received_at, 50) {
             return None;
         }
         received.push_back(received_at);
@@ -243,6 +241,7 @@ impl Host {
                         events.push(HostEvent::Connected(Connection {
                             id,
                             wire: pending.wire,
+                            appearance_updates: VecDeque::new(),
                         }));
                         continue;
                     }
@@ -314,6 +313,7 @@ impl Connection {
     }
 
     /// Receive at most one message, or return immediately when none is ready.
+    /// Excess appearance updates are ignored as `AddonMessage::Unknown`.
     pub fn try_recv(&mut self) -> Result<Option<AddonMessage>> {
         let Some(line) = self.wire.receive()? else {
             return Ok(None);
@@ -325,6 +325,17 @@ impl Connection {
                 return Err(e);
             }
         };
+        if matches!(message, AddonMessage::Appearance(_)) {
+            let now = Instant::now();
+            if !below_rate_limit(
+                &mut self.appearance_updates,
+                now,
+                MAX_APPEARANCE_MESSAGES_PER_SECOND,
+            ) {
+                return Ok(Some(AddonMessage::Unknown));
+            }
+            self.appearance_updates.push_back(now);
+        }
         Ok(Some(message))
     }
 
@@ -523,6 +534,7 @@ mod tests {
         let mut connection = Connection {
             id: "com.example.test-tone".into(),
             wire: Wire::new(stream).unwrap(),
+            appearance_updates: VecDeque::new(),
         };
         let lines = [
             r#"{"type":"positions","time":-1}"#,

@@ -229,3 +229,120 @@ fn client_refuses_fifth_transport_update_in_one_second() {
     }
     worker.join().unwrap();
 }
+
+fn raw_peer(host: &mut Host, id: &str) -> (TcpStream, Connection) {
+    host.expect_addon(id, "secret", BTreeMap::new()).unwrap();
+    let mut peer = TcpStream::connect(("127.0.0.1", host.port())).unwrap();
+    let hello = json!({"type":"hello","contract":1,"token":"secret","id":id,"version":"1"});
+    writeln!(peer, "{hello}").unwrap();
+    let connection = wait_connected(host);
+    (peer, connection)
+}
+
+fn receive_next(connection: &mut Connection) -> AddonMessage {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(message) = connection.try_recv().unwrap() {
+            return message;
+        }
+        assert!(!connection.is_disconnected(), "add-on disconnected");
+        assert!(Instant::now() < deadline, "add-on message did not arrive");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn malformed_appearance_envelopes_leave_the_connection_open() {
+    let mut host = Host::bind("test").unwrap();
+    let (mut peer, mut connection) = raw_peer(&mut host, "com.example.theme");
+    writeln!(peer, r#"{{"type":"appearance","rows":null}}"#).unwrap();
+    assert_eq!(receive_next(&mut connection), AddonMessage::Unknown);
+
+    let good = json!({"type":"appearance","colors":{"waveform":"#67e7b5"}});
+    writeln!(peer, "{good}").unwrap();
+    let message = receive_next(&mut connection);
+    let encoded = backtracking_addon::protocol::encode_addon(&message).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
+        good
+    );
+    assert!(!connection.is_disconnected());
+}
+
+#[test]
+fn host_thins_appearance_floods_per_addon_and_recovers_after_one_second() {
+    let mut host = Host::bind("test").unwrap();
+    let (mut first, mut first_connection) = raw_peer(&mut host, "com.example.one");
+    let (mut second, mut second_connection) = raw_peer(&mut host, "com.example.two");
+    let update = "{\"type\":\"appearance\"}\n";
+    let marker = "{\"type\":\"message\",\"level\":\"info\",\"text\":\"done\"}\n";
+    let burst = update.repeat(11) + marker;
+    first.write_all(burst.as_bytes()).unwrap();
+    second.write_all(burst.as_bytes()).unwrap();
+    for connection in [&mut first_connection, &mut second_connection] {
+        let mut updates = 0;
+        loop {
+            match receive_next(connection) {
+                AddonMessage::Unknown => {}
+                AddonMessage::Message { text, .. } => {
+                    assert_eq!(text, "done");
+                    break;
+                }
+                _ => updates += 1,
+            }
+        }
+        assert_eq!(updates, 10);
+        assert!(!connection.is_disconnected());
+    }
+
+    std::thread::sleep(Duration::from_secs(1));
+    first.write_all(update.as_bytes()).unwrap();
+    assert_ne!(receive_next(&mut first_connection), AddonMessage::Unknown);
+}
+
+#[test]
+fn client_refuses_the_eleventh_appearance_update_in_a_rolling_second() {
+    use backtracking_addon::protocol::decode_addon;
+
+    let mut host = Host::bind("test").unwrap();
+    host.expect_addon("com.example.theme", "secret", BTreeMap::new())
+        .unwrap();
+    let port = host.port();
+    let worker = std::thread::spawn(move || {
+        let mut client = Client::connect(
+            port,
+            "secret",
+            std::env::temp_dir(),
+            "com.example.theme",
+            "1",
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        let update =
+            decode_addon(br##"{"type":"appearance","colors":{"waveform":"#67e7b5"}}"##).unwrap();
+        for _ in 0..10 {
+            client.send(&update).unwrap();
+        }
+        let error = client.send(&update).unwrap_err().to_string();
+        assert!(error.contains("10 appearance"), "{error}");
+        assert!(!client.is_disconnected());
+
+        std::thread::sleep(Duration::from_secs(1));
+        client.send(&update).unwrap();
+        client
+            .send(&AddonMessage::Message {
+                level: MessageLevel::Info,
+                text: "still connected".into(),
+            })
+            .unwrap();
+    });
+    let mut connection = wait_connected(&mut host);
+    for _ in 0..11 {
+        assert_ne!(receive_next(&mut connection), AddonMessage::Unknown);
+    }
+    assert!(matches!(
+        receive_next(&mut connection),
+        AddonMessage::Message { text, .. } if text == "still connected"
+    ));
+    worker.join().unwrap();
+}

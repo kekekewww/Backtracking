@@ -1,9 +1,11 @@
 //! A synchronous connection helper for add-on authors.
-use crate::protocol::{self, AddonMessage, HostMessage};
-use crate::transport::Wire;
+use crate::protocol::{
+    self, AddonMessage, Appearance, HostMessage, MAX_APPEARANCE_MESSAGES_PER_SECOND,
+};
+use crate::transport::{below_rate_limit, Wire};
 use crate::{Error, Result};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -12,9 +14,10 @@ pub struct Client {
     wire: Wire,
     settings: BTreeMap<String, Value>,
     data_dir: PathBuf,
-    transport_updates: std::collections::VecDeque<Instant>,
+    transport_updates: VecDeque<Instant>,
     /// When `positions` were sent in the last second, for each source.
-    position_updates: BTreeMap<String, std::collections::VecDeque<Instant>>,
+    position_updates: BTreeMap<String, VecDeque<Instant>>,
+    appearance_updates: VecDeque<Instant>,
 }
 
 impl Client {
@@ -89,8 +92,9 @@ impl Client {
                             wire,
                             settings,
                             data_dir,
-                            transport_updates: std::collections::VecDeque::new(),
+                            transport_updates: VecDeque::new(),
                             position_updates: BTreeMap::new(),
+                            appearance_updates: VecDeque::new(),
                         })
                     }
                     HostMessage::Welcome { .. } => {
@@ -126,47 +130,44 @@ impl Client {
 
     pub fn send(&mut self, message: &AddonMessage) -> Result<()> {
         let line = protocol::encode_addon(message)?;
-        if matches!(message, AddonMessage::Transport { .. }) {
-            let now = Instant::now();
-            while self
-                .transport_updates
-                .front()
-                .is_some_and(|time| now.duration_since(*time) >= Duration::from_secs(1))
-            {
-                self.transport_updates.pop_front();
+        let (updates, limit, description) = match message {
+            AddonMessage::Transport { .. } => (
+                &mut self.transport_updates,
+                4,
+                "transport messages per second",
+            ),
+            AddonMessage::Positions {
+                source, channels, ..
+            } => {
+                if !channels.iter().all(protocol::ChannelPosition::is_finite) {
+                    return Err(Error::new("Every number in positions must be finite"));
+                }
+                (
+                    self.position_updates.entry(source.clone()).or_default(),
+                    50,
+                    "positions messages per second for one source",
+                )
             }
-            if self.transport_updates.len() >= 4 {
-                return Err(Error::new("Send at most 4 transport messages per second"));
-            }
-            self.wire.queue(line)?;
-            self.transport_updates.push_back(now);
-            Ok(())
-        } else if let AddonMessage::Positions {
-            source, channels, ..
-        } = message
-        {
-            if !channels.iter().all(protocol::ChannelPosition::is_finite) {
-                return Err(Error::new("Every number in positions must be finite"));
-            }
-            let now = Instant::now();
-            let sent = self.position_updates.entry(source.clone()).or_default();
-            while sent
-                .front()
-                .is_some_and(|time| now.duration_since(*time) >= Duration::from_secs(1))
-            {
-                sent.pop_front();
-            }
-            if sent.len() >= 50 {
-                return Err(Error::new(
-                    "Send at most 50 positions messages per second for one source",
-                ));
-            }
-            self.wire.queue(line)?;
-            sent.push_back(now);
-            Ok(())
-        } else {
-            self.wire.queue(line)
+            AddonMessage::Appearance(_) => (
+                &mut self.appearance_updates,
+                MAX_APPEARANCE_MESSAGES_PER_SECOND,
+                "appearance messages per second",
+            ),
+            _ => return self.wire.queue(line),
+        };
+        let now = Instant::now();
+        if !below_rate_limit(updates, now, limit) {
+            return Err(Error::new(format!("Send at most {limit} {description}")));
         }
+        self.wire.queue(line)?;
+        updates.push_back(now);
+        Ok(())
+    }
+
+    /// Replace this add-on's appearance offer. An empty appearance clears it.
+    /// Declare the `appearance` capability and send at most ten updates per second.
+    pub fn send_appearance(&mut self, appearance: &Appearance) -> Result<()> {
+        self.send(&AddonMessage::Appearance(appearance.clone()))
     }
 
     /// Says where the channels of a source's positioned groups are at `time`, in nanoseconds

@@ -13,8 +13,8 @@ use backtracking_addon::host::{Connection, Host, HostEvent, PositionFilter};
 use backtracking_addon::manifest::{Capability, Manifest, validate_id};
 use backtracking_addon::package::{self, PackageInfo};
 use backtracking_addon::protocol::{
-    Action, AddonMessage, ChannelPosition, HostMessage, MessageLevel, Setting, SettingKind, Source,
-    Transport, TransportCommand,
+    Action, AddonMessage, Appearance, ChannelPosition, HostMessage, MessageLevel, Setting,
+    SettingKind, Source, Transport, TransportCommand,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -159,10 +159,73 @@ impl PositionJournal {
     }
 }
 
+/// The current appearance offers, keyed by add-on id.
+pub(crate) type AddonAppearances = BTreeMap<String, Appearance>;
+
+#[derive(Default)]
+struct Published {
+    snapshot: Arc<AddonSnapshot>,
+    appearances: Arc<AddonAppearances>,
+}
+
+#[derive(Default)]
 struct Shared {
-    snapshot: Mutex<Arc<AddonSnapshot>>,
+    published: Mutex<Published>,
     callbacks: Mutex<Vec<ChangeCallback>>,
+    appearance_callbacks: Mutex<Vec<ChangeCallback>>,
     positions: Mutex<PositionJournal>,
+}
+
+impl Shared {
+    fn lock_published(&self) -> std::sync::MutexGuard<'_, Published> {
+        self.published.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn publish<'a>(
+        &self,
+        addons: Vec<AddonInfo>,
+        error: Option<&str>,
+        appearances: impl Iterator<Item = (&'a String, &'a Appearance)> + Clone,
+    ) {
+        let mut current = self.lock_published();
+        let addons_changed =
+            current.snapshot.addons != addons || current.snapshot.error.as_deref() != error;
+        let mut previous = current.appearances.iter();
+        let appearances_changed = !appearances.clone().all(|(id, look)| {
+            previous
+                .next()
+                .is_some_and(|(old_id, old_look)| id == old_id && look == old_look)
+        }) || previous.next().is_some();
+        if addons_changed {
+            current.snapshot = Arc::new(AddonSnapshot {
+                revision: current.snapshot.revision.wrapping_add(1),
+                addons,
+                error: error.map(str::to_owned),
+            });
+        }
+        if appearances_changed {
+            current.appearances = Arc::new(
+                appearances
+                    .map(|(id, look)| (id.clone(), look.clone()))
+                    .collect(),
+            );
+        }
+        drop(current);
+
+        if addons_changed {
+            notify(&self.callbacks);
+        }
+        if appearances_changed {
+            notify(&self.appearance_callbacks);
+        }
+    }
+}
+
+fn notify(callbacks: &Mutex<Vec<ChangeCallback>>) {
+    let callbacks = callbacks.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for callback in callbacks {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback()));
+    }
 }
 
 /// A handle may be retained by capture and export workers after a UI window closes.
@@ -185,20 +248,31 @@ impl AddonHandle {
 
     /// Use on the UI thread; keep the previous snapshot when publication is in progress.
     pub(crate) fn try_snapshot(&self) -> Option<Arc<AddonSnapshot>> {
-        self.shared
-            .snapshot
-            .try_lock()
-            .ok()
-            .map(|value| value.clone())
+        let published = self.shared.published.try_lock().ok()?;
+        Some(published.snapshot.clone())
     }
 
-    /// For workers and tests. The lock only protects an Arc swap, never I/O.
+    /// For workers and tests. The lock only protects in-memory snapshots, never I/O.
     pub(crate) fn snapshot(&self) -> Arc<AddonSnapshot> {
+        self.shared.lock_published().snapshot.clone()
+    }
+
+    /// Read current appearance offers without waiting for publication. On `None`,
+    /// keep the previous snapshot. Its Arc is reused while the offers are unchanged.
+    #[allow(dead_code, reason = "used by the appearance UI in a separate package")]
+    pub(crate) fn try_appearances(&self) -> Option<Arc<AddonAppearances>> {
+        let published = self.shared.published.try_lock().ok()?;
+        Some(published.appearances.clone())
+    }
+
+    /// Subscribe UI repaints to appearance changes. Callbacks must return promptly.
+    #[allow(dead_code, reason = "used by the appearance UI in a separate package")]
+    pub(crate) fn subscribe_appearances(&self, callback: ChangeCallback) {
         self.shared
-            .snapshot
+            .appearance_callbacks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .push(callback);
     }
 
     /// Subscribe capture wakes and UI repaints. Callbacks must return promptly.
@@ -345,12 +419,14 @@ impl AddonManager {
     pub(crate) fn unavailable(reason: String) -> Self {
         let (commands, _receive) = mpsc::channel();
         let shared = Arc::new(Shared {
-            snapshot: Mutex::new(Arc::new(AddonSnapshot {
-                error: Some(format!("Add-ons are unavailable: {reason}")),
-                ..AddonSnapshot::default()
-            })),
-            callbacks: Mutex::new(Vec::new()),
-            positions: Mutex::new(PositionJournal::default()),
+            published: Mutex::new(Published {
+                snapshot: Arc::new(AddonSnapshot {
+                    error: Some(format!("Add-ons are unavailable: {reason}")),
+                    ..AddonSnapshot::default()
+                }),
+                ..Published::default()
+            }),
+            ..Shared::default()
         });
         Self {
             handle: AddonHandle { commands, shared },
@@ -366,11 +442,7 @@ impl AddonManager {
         fs::create_dir_all(&data_root).map_err(|e| e.to_string())?;
         let host = Host::bind(env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
         let (commands, receive) = mpsc::channel();
-        let shared = Arc::new(Shared {
-            snapshot: Mutex::new(Arc::new(AddonSnapshot::default())),
-            callbacks: Mutex::new(Vec::new()),
-            positions: Mutex::new(PositionJournal::default()),
-        });
+        let shared = Arc::new(Shared::default());
         let worker_state = Worker::new(data_root.clone(), host, shared.clone())?;
         let worker = thread::Builder::new()
             .name("add-on host".into())
@@ -478,6 +550,7 @@ struct Entry {
     runtime: Option<Runtime>,
     restarts: RestartPolicy,
     position_filter: PositionFilter,
+    appearance: Option<Appearance>,
 }
 
 impl Entry {
@@ -501,10 +574,12 @@ impl Entry {
             runtime: None,
             restarts: RestartPolicy::default(),
             position_filter: PositionFilter::default(),
+            appearance: None,
         }
     }
 
     fn clear_description(&mut self) {
+        self.appearance = None;
         self.position_filter.clear();
         self.info.sources.clear();
         self.info.settings.clear();
@@ -658,34 +733,12 @@ impl Worker {
             .values()
             .map(|entry| entry.info.clone())
             .collect();
-        let changed = {
-            let mut slot = self
-                .shared
-                .snapshot
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if slot.addons == addons && slot.error == self.error {
-                false
-            } else {
-                *slot = Arc::new(AddonSnapshot {
-                    revision: slot.revision.wrapping_add(1),
-                    addons,
-                    error: self.error.clone(),
-                });
-                true
-            }
-        };
-        if changed {
-            let callbacks = self
-                .shared
-                .callbacks
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            for callback in callbacks {
-                callback();
-            }
-        }
+        let appearances = self
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| entry.appearance.as_ref().map(|look| (id, look)));
+        self.shared
+            .publish(addons, self.error.as_deref(), appearances);
     }
 
     fn command(&mut self, command: Command) {
@@ -847,6 +900,7 @@ impl Worker {
             }
             return Ok(());
         }
+        entry.clear_description();
         let result = (|| {
             let manifest = entry
                 .info
@@ -901,7 +955,6 @@ impl Worker {
                 entry.info.pid = Some(runtime.process.id());
                 entry.info.state = AddonState::Starting;
                 entry.info.message = None;
-                entry.clear_description();
                 entry.runtime = Some(runtime);
                 Ok(())
             }
@@ -1122,6 +1175,7 @@ impl Worker {
                                 }
                             }
                             if connection.is_disconnected() && runtime.stop.is_none() {
+                                entry.appearance = None;
                                 // EOF can precede the process exit by a scheduling slice. Give a
                                 // conforming child time to exit so the restart policy sees it.
                                 let disconnected = runtime.disconnected_at.get_or_insert(now);
@@ -1269,6 +1323,17 @@ impl Worker {
                             time,
                             channels,
                         });
+                }
+            }
+            AddonMessage::Appearance(appearance) => {
+                if entry.info.state == AddonState::Running
+                    && has_capability(&entry.info, Capability::Appearance)
+                    && !entry
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|run| run.disconnected_at.is_some())
+                {
+                    entry.appearance = (!appearance.is_empty()).then_some(appearance);
                 }
             }
             AddonMessage::Unknown => {}
@@ -1897,12 +1962,197 @@ mod tests {
     }
 
     fn worker(root: &Path) -> Worker {
-        let shared = Arc::new(Shared {
-            snapshot: Mutex::new(Arc::new(AddonSnapshot::default())),
-            callbacks: Mutex::new(Vec::new()),
-            positions: Mutex::new(PositionJournal::default()),
-        });
+        let shared = Arc::new(Shared::default());
         Worker::new(root.to_owned(), Host::bind("test").unwrap(), shared).unwrap()
+    }
+
+    fn appearance_fixture(worker: &mut Worker, capability: Capability) -> (AddonHandle, String) {
+        let mut info = info(vec![capability]);
+        info.sources.clear();
+        info.settings.clear();
+        info.actions.clear();
+        let id = info.id.clone();
+        let mut entry = Entry::from_manifest(id.clone(), Ok(info.manifest.clone().unwrap()), true);
+        entry.info = info;
+        worker.entries.insert(id.clone(), entry);
+        worker.publish();
+        let (commands, _) = mpsc::channel();
+        let handle = AddonHandle {
+            commands,
+            shared: worker.shared.clone(),
+        };
+        (handle, id)
+    }
+
+    fn offer_appearance(worker: &mut Worker, id: &str, json: &str) {
+        let message = backtracking_addon::protocol::decode_addon(json.as_bytes()).unwrap();
+        worker.receive(id, message).unwrap();
+        worker.publish();
+    }
+
+    #[test]
+    fn appearance_requires_the_capability() {
+        let dir = TestDir::new();
+        let mut worker = worker(&dir.0);
+        let (handle, id) = appearance_fixture(&mut worker, Capability::Source);
+        let before = handle.snapshot();
+        let initial = handle.try_appearances().unwrap();
+        offer_appearance(
+            &mut worker,
+            &id,
+            r##"{"type":"appearance","colors":{"waveform":"#67e7b5"}}"##,
+        );
+        assert!(initial.is_empty());
+        assert!(Arc::ptr_eq(&initial, &handle.try_appearances().unwrap()));
+        assert!(Arc::ptr_eq(&before, &handle.snapshot()));
+    }
+
+    #[test]
+    fn appearance_publication_replaces_the_offer_without_waking_capture() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = TestDir::new();
+        let mut worker = worker(&dir.0);
+        let (handle, id) = appearance_fixture(&mut worker, Capability::Appearance);
+        let summary = handle.snapshot();
+        let before = handle.try_appearances().unwrap();
+        let capture_wakes = Arc::new(AtomicUsize::new(0));
+        let wakes = capture_wakes.clone();
+        handle.subscribe(Arc::new(move || {
+            wakes.fetch_add(1, Ordering::Relaxed);
+        }));
+        let repaints = Arc::new(AtomicUsize::new(0));
+        let count = repaints.clone();
+        handle.subscribe_appearances(Arc::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        }));
+        let theme = r##"{"type":"appearance","colors":{"waveform":"#67e7b5","border":"#ffffff80"},"rows":{"LFE":"#ff8800"}}"##;
+        offer_appearance(&mut worker, &id, theme);
+        let look = handle.try_appearances().unwrap();
+        assert!(!Arc::ptr_eq(&before, &look));
+        assert_eq!(look[&id].colors["waveform"], [103, 231, 181, 255]);
+        assert_eq!(look[&id].colors["border"], [255, 255, 255, 128]);
+        assert_eq!(look[&id].rows["LFE"], [255, 136, 0, 255]);
+        assert_eq!(repaints.load(Ordering::Relaxed), 1);
+
+        offer_appearance(&mut worker, &id, theme);
+        offer_appearance(&mut worker, &id, r#"{"type":"appearance","rows":null}"#);
+        assert!(Arc::ptr_eq(&look, &handle.try_appearances().unwrap()));
+        assert_eq!(repaints.load(Ordering::Relaxed), 1);
+
+        offer_appearance(
+            &mut worker,
+            &id,
+            r#"{"type":"appearance","numbers":{"border_width":9}}"#,
+        );
+        let replaced = handle.try_appearances().unwrap();
+        assert!(!Arc::ptr_eq(&replaced, &look));
+        assert!(replaced[&id].colors.is_empty());
+        assert!(replaced[&id].rows.is_empty());
+        assert_eq!(replaced[&id].numbers["border_width"], 8.0);
+
+        offer_appearance(&mut worker, &id, r#"{"type":"appearance"}"#);
+        assert!(handle.try_appearances().unwrap().is_empty());
+        assert!(Arc::ptr_eq(&summary, &handle.snapshot()));
+        assert_eq!(repaints.load(Ordering::Relaxed), 3);
+        assert_eq!(capture_wakes.load(Ordering::Relaxed), 0);
+        assert!(!dir.0.join(STATE_FILE).exists());
+    }
+
+    #[test]
+    fn stopped_disabled_and_failed_addons_clear_their_appearance() {
+        let dir = TestDir::new();
+        let mut worker = worker(&dir.0);
+        let (handle, id) = appearance_fixture(&mut worker, Capability::Appearance);
+        let theme = r##"{"type":"appearance","colors":{"waveform":"#67e7b5"}}"##;
+
+        for state in [AddonState::Stopped, AddonState::Failed("failed".into())] {
+            worker.entries.get_mut(&id).unwrap().info.state = AddonState::Running;
+            offer_appearance(&mut worker, &id, theme);
+            assert!(handle.try_appearances().unwrap().contains_key(&id));
+            worker.stop(&id, state.clone());
+            worker.publish();
+            assert_eq!(handle.snapshot().addons[0].state, state);
+            assert!(handle.try_appearances().unwrap().is_empty());
+            offer_appearance(&mut worker, &id, theme);
+            assert!(handle.try_appearances().unwrap().is_empty());
+        }
+
+        worker.entries.get_mut(&id).unwrap().info.state = AddonState::Running;
+        offer_appearance(&mut worker, &id, theme);
+        let (reply, result) = mpsc::channel();
+        worker.command(Command::Enabled(id.clone(), false, reply));
+        result
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.publish();
+        assert!(!handle.snapshot().addons[0].enabled);
+        assert!(handle.try_appearances().unwrap().is_empty());
+        let saved = fs::read_to_string(dir.0.join(STATE_FILE)).unwrap();
+        assert!(!saved.contains("appearance") && !saved.contains("waveform"));
+    }
+
+    #[test]
+    fn bridge_delivers_appearance_changes_and_clears_them_when_primary_disappears() {
+        let dir = TestDir::new();
+        let mut worker = worker(&dir.0);
+        let (handle, id) = appearance_fixture(&mut worker, Capability::Appearance);
+        offer_appearance(
+            &mut worker,
+            &id,
+            r##"{"type":"appearance","colors":{"border":"#ffffff80"}}"##,
+        );
+        let primary = bridge::Bridge::start(&dir.0, handle).unwrap();
+        let secondary = AddonManager::connect_existing(dir.0.clone()).unwrap();
+        let proxy = secondary.handle();
+        let summary = proxy.snapshot();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let initial = loop {
+            if let Some(offers) = proxy.try_appearances() {
+                break offers;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "proxy did not publish its initial appearance"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(initial[&id].colors["border"], [255, 255, 255, 128]);
+
+        offer_appearance(
+            &mut worker,
+            &id,
+            r##"{"type":"appearance","colors":{"border":"#a1b2c3d4"}}"##,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let changed = loop {
+            if let Some(offers) = proxy.try_appearances() {
+                if !Arc::ptr_eq(&offers, &initial) {
+                    break offers;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "appearance update did not arrive"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(changed[&id].colors["border"], [161, 178, 195, 212]);
+        assert!(Arc::ptr_eq(&summary, &proxy.snapshot()));
+
+        drop(primary);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if proxy.snapshot().error.is_some() {
+                if let Some(offers) = proxy.try_appearances() {
+                    assert!(offers.is_empty());
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "offline snapshot did not arrive");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn position_message(time: u64) -> AddonPositions {
@@ -1989,7 +2239,7 @@ mod tests {
             (2, -1.0, 1.0, 1.0, Some(1.0))
         );
         assert_eq!(worker.entries[&id].info.state, AddonState::Running);
-        assert_eq!(worker.shared.snapshot.lock().unwrap().revision, 0);
+        assert_eq!(worker.shared.lock_published().snapshot.revision, 0);
     }
 
     #[test]
@@ -2111,6 +2361,7 @@ mod tests {
                 runtime: None,
                 restarts: RestartPolicy::default(),
                 position_filter: PositionFilter::default(),
+                appearance: None,
             },
         );
         worker
@@ -2173,6 +2424,7 @@ mod tests {
                 runtime: None,
                 restarts: RestartPolicy::default(),
                 position_filter: PositionFilter::default(),
+                appearance: None,
             },
         );
         let results: Vec<_> = ["unknown", "main"]
@@ -2226,6 +2478,7 @@ mod tests {
                 }),
                 restarts: RestartPolicy::default(),
                 position_filter: PositionFilter::default(),
+                appearance: None,
             },
         );
         worker.shutting_down = true;
@@ -2248,11 +2501,7 @@ mod tests {
         let manager = AddonManager {
             handle: AddonHandle {
                 commands,
-                shared: Arc::new(Shared {
-                    snapshot: Mutex::new(Arc::new(AddonSnapshot::default())),
-                    callbacks: Mutex::new(Vec::new()),
-                    positions: Mutex::new(PositionJournal::default()),
-                }),
+                shared: Arc::new(Shared::default()),
             },
             worker: Some(worker),
             bridge: None,
@@ -2670,20 +2919,18 @@ mod tests {
 
     #[test]
     fn snapshot_reads_never_wait_on_publisher_and_sources_require_running() {
-        let shared = Arc::new(Shared {
-            snapshot: Mutex::new(Arc::new(AddonSnapshot::default())),
-            callbacks: Mutex::new(Vec::new()),
-            positions: Mutex::new(PositionJournal::default()),
-        });
+        let shared = Arc::new(Shared::default());
         let (commands, _receive) = mpsc::channel();
         let handle = AddonHandle {
             commands,
             shared: shared.clone(),
         };
-        let guard = shared.snapshot.lock().unwrap();
+        let guard = shared.lock_published();
         assert!(handle.try_snapshot().is_none());
+        assert!(handle.try_appearances().is_none());
         drop(guard);
         assert!(handle.try_snapshot().is_some());
+        assert!(handle.try_appearances().is_some());
         let mut snapshot = AddonSnapshot {
             addons: vec![info(vec![Capability::Source])],
             ..Default::default()

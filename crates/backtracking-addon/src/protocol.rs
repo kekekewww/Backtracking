@@ -3,9 +3,17 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, value::RawValue};
+use serde_json::{value::RawValue, Value};
 
 use crate::{Error, Result};
+
+mod appearance;
+pub use appearance::{
+    Appearance, APPEARANCE_COLOR_NAMES, APPEARANCE_NUMBER_RANGES,
+    MAX_APPEARANCE_MESSAGES_PER_SECOND, MAX_APPEARANCE_ROWS,
+};
+
+const MAX_CHANNEL_LABEL_CHARS: usize = 24;
 
 /// Maximum encoded line length, including its terminating newline.
 pub const MAX_LINE_BYTES: usize = 65_536;
@@ -46,6 +54,8 @@ pub enum AddonMessage {
         #[serde(default)]
         channels: Vec<ChannelPosition>,
     },
+    /// Replaces all appearance overrides from this add-on.
+    Appearance(Appearance),
     /// A later contract 1 message that this implementation ignores.
     #[serde(other)]
     Unknown,
@@ -324,7 +334,7 @@ impl AddonMessage {
                 source_id("positions.source", source)?;
                 count_limit("positions.channels", channels.len(), 64)?;
             }
-            Self::Unknown => {}
+            Self::Appearance(_) | Self::Unknown => {}
         }
         Ok(())
     }
@@ -400,7 +410,7 @@ impl Source {
                 }
                 channels = channels.saturating_add(group.channels.len());
                 for label in &group.channels {
-                    text_limit("channel label", label, 24)?;
+                    text_limit("channel label", label, MAX_CHANNEL_LABEL_CHARS)?;
                 }
             }
             count_limit("source channel count", channels, 64)?;
@@ -495,13 +505,20 @@ pub fn encode_addon(message: &AddonMessage) -> Result<Vec<u8>> {
 pub fn decode_addon(line: &[u8]) -> Result<AddonMessage> {
     // Read raw fields so even a number outside f64's range can be discarded on its own.
     if let Ok(fields) = decode::<RawFields>(line) {
-        if fields
+        match fields
             .get("type")
             .and_then(|kind| serde_json::from_str::<String>(kind.get()).ok())
             .as_deref()
-            == Some("positions")
         {
-            return Ok(decode_positions(&fields).unwrap_or(AddonMessage::Unknown));
+            Some("positions") => {
+                return Ok(decode_positions(&fields).unwrap_or(AddonMessage::Unknown));
+            }
+            Some("appearance") => {
+                return Ok(appearance::decode_appearance(&fields)
+                    .map(AddonMessage::Appearance)
+                    .unwrap_or(AddonMessage::Unknown));
+            }
+            _ => {}
         }
     }
     let message: AddonMessage = decode(line)?;
@@ -532,19 +549,22 @@ fn decode_positions(fields: &RawFields<'_>) -> Option<AddonMessage> {
 
 fn decode_position(entry: &RawValue) -> Option<ChannelPosition> {
     let fields: RawFields = serde_json::from_str(entry.get()).ok()?;
-    let finite = |raw: &&RawValue| raw.get().parse::<f64>().ok().filter(|n| n.is_finite());
     let optional = |name: &str| match fields.get(name) {
-        Some(raw) => finite(raw).map(Some),
+        Some(raw) => finite_number(raw).map(Some),
         None => Some(None),
     };
     Some(ChannelPosition {
         channel: u32::try_from(whole_number(fields.get("channel")?)?).ok()?,
-        x: finite(fields.get("x")?)?,
-        y: finite(fields.get("y")?)?,
-        z: finite(fields.get("z")?)?,
+        x: finite_number(fields.get("x")?)?,
+        y: finite_number(fields.get("y")?)?,
+        z: finite_number(fields.get("z")?)?,
         size: optional("size")?,
         gain: optional("gain")?,
     })
+}
+
+fn finite_number(raw: &RawValue) -> Option<f64> {
+    raw.get().parse::<f64>().ok().filter(|n| n.is_finite())
 }
 
 // Check the decimal digits directly. An f64 would round fractional frames and
@@ -702,6 +722,152 @@ fn absolute_path(field: &str, path: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn appearance_wire_after_validation(input: &str) -> Value {
+        let message = decode_addon(input.as_bytes()).unwrap();
+        let encoded = encode_addon(&message).unwrap();
+        assert_eq!(decode_addon(&encoded).unwrap(), message);
+        serde_json::from_slice(&encoded).unwrap()
+    }
+
+    #[test]
+    fn appearance_round_trips_every_known_color_and_number() {
+        let input = json!({
+            "type": "appearance",
+            "colors": {
+                "waveform": "#67e7b5",
+                "waveform_selected": "#ffffff80",
+                "plot_background": "#13151a",
+                "center_line": "#0a0b0c04",
+                "border": "#abcdef",
+                "lane_divider": "#112233",
+                "bar_line": "#556677",
+                "second_line": "#000000",
+                "row_label": "#eeeeee",
+                "flag": "#ffa500",
+                "playhead": "#335599",
+                "panel_background": "#224466",
+                "chip_background": "#224466",
+                "chip_text": "#e1e2e3",
+                "chip_current": "#224466",
+                "scroll_thumb": "#224466",
+                "preview_highlight": "#c8ffd7"
+            },
+            "numbers": {
+                "border_width": 2.0,
+                "corner_radius": 5.0,
+                "waveform_stroke_scale": 1.5,
+                "waveform_fill_opacity": 0.7
+            },
+            "rows": { "LFE": "#ff8800", "Ltf": "#88ccff45" }
+        });
+        assert_eq!(appearance_wire_after_validation(&input.to_string()), input);
+    }
+
+    #[test]
+    fn appearance_drops_single_bad_or_unknown_values_and_keeps_siblings() {
+        let input = r##"{
+            "type":"appearance",
+            "colors":{
+                "waveform":"#67e7b5","border":"#ABCDEF80","row_label":"#01234",
+                "flag":"abcdef","chip_text":"#u01122","chip_current":"#112233444",
+                "playhead":"#0ábcd","bar_line":false,"second_line":null,"scroll_thumb":1e400,
+                "layout":"#112233","Waveform":"#aa99cc"
+            },
+            "numbers":{
+                "border_width":2,"corner_radius":"2","waveform_fill_opacity":null,
+                "waveform_stroke_scale":1e400,"capture_rate":123,"unbounded":-1e400
+            },
+            "rows":{"LFE":"#FF8800","R":{},"C":"#123","Ltf":1e400},
+            "future":{"known_to_newer_hosts":1e400}
+        }"##;
+        assert_eq!(
+            appearance_wire_after_validation(&input.replace('\n', " ")),
+            json!({
+                "type":"appearance", "colors":{"border":"#abcdef80","waveform":"#67e7b5"},
+                "numbers":{"border_width":2.0}, "rows":{"LFE":"#ff8800"}
+            })
+        );
+        for value in ["true", "[]", "{}", "\"NaN\"", "\"Infinity\"", "-1e999"] {
+            let input = format!(
+                r#"{{"type":"appearance","numbers":{{"border_width":{value},"corner_radius":5}}}}"#
+            );
+            assert_eq!(
+                appearance_wire_after_validation(&input),
+                json!({"type":"appearance","numbers":{"corner_radius":5.0}}),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn appearance_clamps_every_number_at_both_ends() {
+        for (input, expected) in [
+            ([-1, -1, 0, -3], [0.0, 0.0, 0.5, 0.0]),
+            ([9, 17, 4, 2], [8.0, 16.0, 3.0, 1.0]),
+        ] {
+            let numbers = |values: [f64; 4]| {
+                json!({
+                    "border_width":values[0], "corner_radius":values[1],
+                    "waveform_stroke_scale":values[2], "waveform_fill_opacity":values[3]
+                })
+            };
+            let message = json!({"type":"appearance","numbers":numbers(input.map(f64::from))});
+            assert_eq!(
+                appearance_wire_after_validation(&message.to_string()),
+                json!({"type":"appearance","numbers":numbers(expected)})
+            );
+        }
+    }
+
+    #[test]
+    fn appearance_rows_keep_at_most_sixty_four_valid_unicode_labels() {
+        let longest = "あ".repeat(24);
+        let long = "あ".repeat(25);
+        let labels = std::iter::once("L".to_owned())
+            .chain(std::iter::once(longest.clone()))
+            .chain((0..=62).map(|index| format!("音{index:02}")));
+        let mut rows: serde_json::Map<String, Value> =
+            labels.map(|label| (label, json!("#aabbcc"))).collect();
+        rows.insert("".into(), json!("#010203"));
+        rows.insert(long.clone(), json!("#010203"));
+        let message = json!({"type":"appearance","rows":rows});
+        let decoded = appearance_wire_after_validation(&message.to_string());
+        let rows = decoded["rows"].as_object().unwrap();
+        assert_eq!(rows.len(), 64);
+        assert_eq!(rows["L"], "#aabbcc");
+        assert_eq!(rows[&longest], "#aabbcc");
+        assert!(!rows.contains_key(""));
+        assert!(!rows.contains_key(&long));
+    }
+
+    #[test]
+    fn appearance_empty_and_omitted_members_have_the_same_meaning() {
+        for input in [
+            r#"{"type":"appearance"}"#,
+            r#"{"type":"appearance","colors":{},"numbers":{},"rows":{}}"#,
+        ] {
+            assert_eq!(
+                appearance_wire_after_validation(input),
+                json!({"type":"appearance"})
+            );
+        }
+    }
+
+    #[test]
+    fn appearance_bad_envelopes_are_ignored() {
+        for field in ["colors", "numbers", "rows"] {
+            for value in ["null", "[]", "\"map\"", "0", "true", "1e400"] {
+                let input =
+                    format!(r#"{{"type":"appearance","{field}":{value},"future":"reserved"}}"#);
+                assert_eq!(
+                    decode_addon(input.as_bytes()).unwrap(),
+                    AddonMessage::Unknown,
+                    "accepted {input}",
+                );
+            }
+        }
+    }
 
     #[test]
     fn every_addon_message_round_trips() {
