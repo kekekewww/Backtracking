@@ -203,7 +203,8 @@ impl AddonLook {
     }
 
     /// Whether the chosen add-on offers a look now.
-    pub(super) fn offered(&self) -> bool {
+    #[cfg(test)]
+    fn offered(&self) -> bool {
         self.chosen
             .as_ref()
             .is_some_and(|id| self.offers.contains_key(id))
