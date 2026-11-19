@@ -23,7 +23,9 @@ use windows::Win32::{
 };
 use windows::core::PCWSTR;
 
-use crate::hotkeys::{GlobalBinding, GlobalKey, Hotkeys, MAX_BINDINGS};
+#[cfg(test)]
+use crate::hotkeys::Hotkeys;
+use crate::hotkeys::{GlobalBinding, GlobalKey, MAX_BINDINGS};
 
 const HOTKEY_ID: i32 = 1;
 const LAYOUT_POLL_MS: u32 = 250;
@@ -49,6 +51,7 @@ pub(crate) struct SnapshotHotkey {
 }
 
 impl SnapshotHotkey {
+    #[cfg(test)]
     pub(crate) fn start(context: Context) -> io::Result<Self> {
         Self::start_with(context, Hotkeys::defaults().global_bindings())
     }

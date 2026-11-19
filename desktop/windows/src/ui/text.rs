@@ -420,8 +420,8 @@ impl Language {
             BindingError::Reserved(shortcut) => self.reserved_shortcut(shortcut).to_owned(),
             BindingError::GlobalNeedsModifier => self
                 .pick(
-                    "A system-wide shortcut needs Ctrl, Alt or Win.",
-                    "全系統快速鍵需要搭配 Ctrl、Alt 或 Win。",
+                    "A system-wide shortcut needs Ctrl or Alt.",
+                    "全系統快速鍵需要搭配 Ctrl 或 Alt。",
                 )
                 .to_owned(),
             BindingError::GlobalRightCtrlTap => self
@@ -1579,11 +1579,11 @@ mod tests {
         }
         assert_eq!(
             English.hotkey_problem(BindingError::GlobalNeedsModifier),
-            "A system-wide shortcut needs Ctrl, Alt or Win."
+            "A system-wide shortcut needs Ctrl or Alt."
         );
         assert_eq!(
             TraditionalChinese.hotkey_problem(BindingError::GlobalNeedsModifier),
-            "全系統快速鍵需要搭配 Ctrl、Alt 或 Win。"
+            "全系統快速鍵需要搭配 Ctrl 或 Alt。"
         );
         assert_eq!(
             English.hotkey_problem(BindingError::Reserved(R::AltGr)),
