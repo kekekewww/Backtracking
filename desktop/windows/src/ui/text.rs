@@ -635,6 +635,12 @@ impl Language {
                     "得知你匯出的每個片段及其檔案路徑",
                 )
                 .to_owned(),
+            Capability::Appearance => self
+                .pick(
+                    "Offer colors and line styles for the window, which you can turn on in Options",
+                    "提供視窗的顏色與線條樣式，可在「選項」中啟用",
+                )
+                .to_owned(),
         }
     }
 

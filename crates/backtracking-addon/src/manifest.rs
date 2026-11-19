@@ -15,6 +15,7 @@ pub enum Capability {
     Settings,
     Actions,
     Clips,
+    Appearance,
 }
 
 /// File types accepted by an add-on with the `open-files` capability.
