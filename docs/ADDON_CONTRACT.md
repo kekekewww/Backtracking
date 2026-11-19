@@ -259,13 +259,7 @@ indices are 2 and 3.
 **`appearance`** offers a set of drawing values with the `appearance` capability.
 Backtracking draws the app. An appearance can change only the drawing values listed here.
 Backtracking controls capture, selection, export, files, shortcuts, layout, text content and
-status indicators. Backtracking may ignore a value that would make the waveform or selection hard
-to see. It ignores a color with less than 2:1 contrast (WCAG 2) against the plot background for the
-waveform, selection, row colors, flags or playhead, less than 3:1 for channel names and chip text,
-less than 40 % alpha (102 of 255) for those lines, a selection with no red, green or blue channel at
-least 80 away from the waveform's, and a background within 90 (the sum of the red, green and blue
-differences) of a capture status mark, and it ignores the alpha of `plot_background` and
-`panel_background`, so the user's transparency setting decides.
+status indicators.
 
 Appearance is off until the user chooses an add-on in Options > Appearance. The user can choose
 at most one add-on's appearance. Backtracking uses its own look when the user turns the appearance
@@ -303,7 +297,7 @@ upper- or lower-case.
 | `chip_text` | The text of a chip. |
 | `chip_current` | The current chip's highlight. |
 | `scroll_thumb` | The scrollbar thumb. |
-| `preview_highlight` | The highlight for previewed audio. |
+| `preview_highlight` | The highlight under the rows a drag-out would take. |
 
 Backtracking clamps `numbers` to these inclusive ranges and drops values that are not finite.
 
@@ -314,15 +308,56 @@ Backtracking clamps `numbers` to these inclusive ranges and drops values that ar
 | `waveform_stroke_scale` | 0.5 to 3 | Multiplier for the waveform stroke width. |
 | `waveform_fill_opacity` | 0 to 1 | Opacity of the waveform fill. |
 
+`panel_background` and `corner_radius` apply only in the full window. `border` and `border_width`
+apply only when the user shows a border. The user's own border color takes precedence over the
+look's. While the look is on, a `border_width` it supplies replaces the user's width when
+drawing the border. The window keeps its size. Backtracking uses the user's transparency
+setting for `plot_background` and `panel_background` and ignores the alpha in those two colors.
+
 `rows` gives waveform colors by channel label. Use the source's channel labels, each 1 to 24
 characters. Row colors have the same format as `colors`. Backtracking keeps up to 64 valid
 entries and drops the rest.
 
+Backtracking checks legibility using WCAG 2 contrast, measured after drawing a color over what
+is behind it. Where the rules below call for contrast, graphics need at least 2.0 and text needs
+at least 3.0. Where alpha is checked, the minimum is 102 of 255. Two drawn colors are apart if
+at least one red, green or blue channel differs by 80 or more. The distance from a status mark
+is the sum of the absolute red, green and blue differences and must be at least 90.
+
+Backtracking checks plot colors on both the plot background and the panel background. When the
+look leaves out `panel_background`, Backtracking uses the window's own dark panel. In the full
+window the plot sits on the panel when the user's transparency is above 0.
+
+- `plot_background` must stay at least 90 away from every capture status mark.
+- `panel_background` must stay at least 90 away from every status light and give the window's
+  text a contrast of at least 3.0.
+- `waveform`, `flag` and `playhead` need alpha of at least 102 and contrast of at least 2.0
+  on both backgrounds.
+- `waveform_selected` has the same alpha and contrast requirements and must be apart from
+  the waveform on both backgrounds.
+- Each row color has the same alpha and contrast requirements and must be apart from the
+  selection on both backgrounds.
+- `row_label` needs contrast of at least 3.0 on both backgrounds. `chip_text` needs contrast
+  of at least 3.0 on `chip_background` drawn over each of those backgrounds.
+- White text needs contrast of at least 3.0 on `chip_background` and on `chip_current`
+  drawn over `chip_background`, on both backgrounds. The current chip must also be apart
+  from `chip_background` on both backgrounds.
+- `preview_highlight` needs alpha of at least 102 and must be apart from the waveform on
+  both backgrounds.
+- `lane_divider` and `scroll_thumb` need alpha of at least 102 and contrast of at least 2.0
+  on both backgrounds. The thumb is checked in both its normal and active states.
+- Backtracking skips legibility checks on `center_line`, `bar_line`, `second_line` and `border`.
+
+When a pair fails, Backtracking ignores the value the look set for what is drawn on top. If the
+look set only what is behind it, Backtracking ignores that value. It falls back to its own value,
+checks again and keeps the rest of the look.
+
 Backtracking drops unknown color and number names and individual invalid entries. A message with
-a map supplied in the wrong form is ignored. Send at most 10 `appearance` messages in any
-one-second period per add-on. Backtracking silently drops excess messages and ignores messages
-from add-ons without the capability. Rust add-ons can use `Client::send_appearance(&appearance)`,
-which returns an error if called faster than the limit.
+a map supplied in the wrong form is ignored. Backtracking applies at most 10 appearance updates
+per add-on in any rolling second. If more arrive, it keeps the newest waiting update and applies
+it as soon as the rate limit allows. Backtracking ignores messages from add-ons without the
+capability. Rust add-ons can use `Client::send_appearance(&appearance)`, which returns an error
+if called faster than the limit.
 
 **`message`** shows one line next to the add-on on the Add-ons page, replacing the previous one.
 `level` is `info`, `warning` or `error`; `text` is up to 300 characters. An empty `text` clears it.

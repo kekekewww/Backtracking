@@ -259,14 +259,12 @@ impl AddonHandle {
 
     /// Read current appearance offers without waiting for publication. On `None`,
     /// keep the previous snapshot. Its Arc is reused while the offers are unchanged.
-    #[allow(dead_code, reason = "used by the appearance UI in a separate package")]
     pub(crate) fn try_appearances(&self) -> Option<Arc<AddonAppearances>> {
         let published = self.shared.published.try_lock().ok()?;
         Some(published.appearances.clone())
     }
 
     /// Subscribe UI repaints to appearance changes. Callbacks must return promptly.
-    #[allow(dead_code, reason = "used by the appearance UI in a separate package")]
     pub(crate) fn subscribe_appearances(&self, callback: ChangeCallback) {
         self.shared
             .appearance_callbacks

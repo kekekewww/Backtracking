@@ -249,10 +249,16 @@ fn serve_client(mut stream: TcpStream, handle: &AddonHandle, token: &str, stoppi
 fn dispatch(handle: &AddonHandle, command: WireCommand, stopping: &AtomicBool) -> Response {
     match command {
         WireCommand::Snapshot => {
-            let current = handle.shared.lock_published();
+            let (snapshot, appearances) = {
+                let current = handle.shared.lock_published();
+                (
+                    Arc::clone(&current.snapshot),
+                    Arc::clone(&current.appearances),
+                )
+            };
             Ok(ResponseData::Snapshot(WireSnapshot {
-                snapshot: current.snapshot.as_ref().clone(),
-                appearances: current.appearances.as_ref().clone(),
+                snapshot: snapshot.as_ref().clone(),
+                appearances: appearances.as_ref().clone(),
             }))
         }
         WireCommand::Positions { after } => {

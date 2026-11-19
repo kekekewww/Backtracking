@@ -1,6 +1,8 @@
 use backtracking_addon::client::Client;
 use backtracking_addon::host::{Connection, Host, HostEvent};
-use backtracking_addon::protocol::{AddonMessage, HostMessage, MessageLevel, TransportState};
+use backtracking_addon::protocol::{
+    encode_addon, AddonMessage, Appearance, HostMessage, MessageLevel, TransportState,
+};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -269,35 +271,112 @@ fn malformed_appearance_envelopes_leave_the_connection_open() {
     assert!(!connection.is_disconnected());
 }
 
+fn appearance_update(step: u8) -> AddonMessage {
+    AddonMessage::Appearance(Appearance {
+        colors: BTreeMap::from([("waveform".into(), [step, 231, 181, 255])]),
+        ..Appearance::default()
+    })
+}
+
+fn send_appearance_burst(peer: &mut TcpStream, steps: std::ops::RangeInclusive<u8>) {
+    let mut burst = Vec::new();
+    for step in steps {
+        burst.extend(encode_addon(&appearance_update(step)).unwrap());
+    }
+    peer.write_all(&burst).unwrap();
+}
+
+fn receive_appearance_burst(connection: &mut Connection, steps: std::ops::RangeInclusive<u8>) {
+    for (index, step) in steps.enumerate() {
+        let expected = if index < 10 {
+            appearance_update(step)
+        } else {
+            AddonMessage::Unknown
+        };
+        assert_eq!(receive_next(connection), expected);
+    }
+}
+
 #[test]
-fn host_thins_appearance_floods_per_addon_and_recovers_after_one_second() {
+fn host_coalesces_appearance_floods_to_the_latest_update_per_addon() {
     let mut host = Host::bind("test").unwrap();
     let (mut first, mut first_connection) = raw_peer(&mut host, "com.example.one");
     let (mut second, mut second_connection) = raw_peer(&mut host, "com.example.two");
-    let update = "{\"type\":\"appearance\"}\n";
-    let marker = "{\"type\":\"message\",\"level\":\"info\",\"text\":\"done\"}\n";
-    let burst = update.repeat(11) + marker;
-    first.write_all(burst.as_bytes()).unwrap();
-    second.write_all(burst.as_bytes()).unwrap();
-    for connection in [&mut first_connection, &mut second_connection] {
-        let mut updates = 0;
-        loop {
-            match receive_next(connection) {
-                AddonMessage::Unknown => {}
-                AddonMessage::Message { text, .. } => {
-                    assert_eq!(text, "done");
-                    break;
-                }
-                _ => updates += 1,
-            }
-        }
-        assert_eq!(updates, 10);
-        assert!(!connection.is_disconnected());
-    }
+    send_appearance_burst(&mut first, 1..=25);
+    send_appearance_burst(&mut second, 26..=50);
+    receive_appearance_burst(&mut first_connection, 1..=25);
+    receive_appearance_burst(&mut second_connection, 26..=50);
 
+    assert_eq!(receive_next(&mut first_connection), appearance_update(25));
+    assert_eq!(receive_next(&mut second_connection), appearance_update(50));
+    assert!(first_connection.try_recv().unwrap().is_none());
+    assert!(second_connection.try_recv().unwrap().is_none());
+}
+
+#[test]
+fn host_delivers_a_quiet_addons_late_appearance_update() {
+    let mut host = Host::bind("test").unwrap();
+    let (mut peer, mut connection) = raw_peer(&mut host, "com.example.theme");
+    send_appearance_burst(&mut peer, 1..=10);
+    receive_appearance_burst(&mut connection, 1..=10);
+    peer.write_all(&encode_addon(&appearance_update(11)).unwrap())
+        .unwrap();
+    assert_eq!(receive_next(&mut connection), AddonMessage::Unknown);
     std::thread::sleep(Duration::from_secs(1));
-    first.write_all(update.as_bytes()).unwrap();
-    assert_ne!(receive_next(&mut first_connection), AddonMessage::Unknown);
+
+    assert_eq!(connection.try_recv().unwrap(), Some(appearance_update(11)));
+}
+
+#[test]
+fn host_delivers_a_due_appearance_with_other_messages_waiting() {
+    let mut host = Host::bind("test").unwrap();
+    let (mut peer, mut connection) = raw_peer(&mut host, "com.example.theme");
+    send_appearance_burst(&mut peer, 1..=11);
+    receive_appearance_burst(&mut connection, 1..=11);
+    let message = AddonMessage::Message {
+        level: MessageLevel::Info,
+        text: "still connected".into(),
+    };
+    peer.write_all(&encode_addon(&message).unwrap()).unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+
+    assert_eq!(receive_next(&mut connection), appearance_update(11));
+    assert_eq!(receive_next(&mut connection), message);
+}
+
+#[test]
+fn host_never_delivers_an_older_pending_appearance_after_a_new_update() {
+    let mut host = Host::bind("test").unwrap();
+    let (mut peer, mut connection) = raw_peer(&mut host, "com.example.theme");
+    send_appearance_burst(&mut peer, 1..=11);
+    receive_appearance_burst(&mut connection, 1..=11);
+    peer.write_all(&encode_addon(&appearance_update(12)).unwrap())
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+
+    assert_eq!(receive_next(&mut connection), appearance_update(12));
+    assert!(connection.try_recv().unwrap().is_none());
+}
+
+#[test]
+fn host_discards_appearance_updates_on_disconnect() {
+    let mut host = Host::bind("test").unwrap();
+    let (mut local_peer, mut local) = raw_peer(&mut host, "com.example.local");
+    let (mut remote_peer, mut remote) = raw_peer(&mut host, "com.example.remote");
+    send_appearance_burst(&mut local_peer, 1..=12);
+    send_appearance_burst(&mut remote_peer, 1..=11);
+    receive_appearance_burst(&mut local, 1..=11);
+    receive_appearance_burst(&mut remote, 1..=11);
+
+    local.close();
+    remote_peer.shutdown(std::net::Shutdown::Write).unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+
+    for connection in [&mut local, &mut remote] {
+        assert!(connection.try_recv().unwrap().is_none());
+        assert!(connection.is_disconnected());
+        assert!(connection.try_recv().unwrap().is_none());
+    }
 }
 
 #[test]
@@ -308,6 +387,7 @@ fn client_refuses_the_eleventh_appearance_update_in_a_rolling_second() {
     host.expect_addon("com.example.theme", "secret", BTreeMap::new())
         .unwrap();
     let port = host.port();
+    let (burst_read, wait_for_burst) = mpsc::channel();
     let worker = std::thread::spawn(move || {
         let mut client = Client::connect(
             port,
@@ -327,6 +407,8 @@ fn client_refuses_the_eleventh_appearance_update_in_a_rolling_second() {
         assert!(error.contains("10 appearance"), "{error}");
         assert!(!client.is_disconnected());
 
+        // Let both rolling windows expire, starting after the host reads the burst.
+        wait_for_burst.recv_timeout(Duration::from_secs(3)).unwrap();
         std::thread::sleep(Duration::from_secs(1));
         client.send(&update).unwrap();
         client
@@ -337,9 +419,17 @@ fn client_refuses_the_eleventh_appearance_update_in_a_rolling_second() {
             .unwrap();
     });
     let mut connection = wait_connected(&mut host);
-    for _ in 0..11 {
-        assert_ne!(receive_next(&mut connection), AddonMessage::Unknown);
+    for _ in 0..10 {
+        assert!(matches!(
+            receive_next(&mut connection),
+            AddonMessage::Appearance(_)
+        ));
     }
+    burst_read.send(()).unwrap();
+    assert!(matches!(
+        receive_next(&mut connection),
+        AddonMessage::Appearance(_)
+    ));
     assert!(matches!(
         receive_next(&mut connection),
         AddonMessage::Message { text, .. } if text == "still connected"
