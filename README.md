@@ -119,7 +119,7 @@ Each release lists what changed and the SHA-256 of its files: [all releases](htt
 3. Drag the waveform out of the window onto a DAW track or a folder to export everything it holds. For a shorter clip, select first: `Ctrl`-drag on Windows or `Option`-drag on macOS for a free selection, `Shift`-drag for a snapped one. Then drag the highlighted range out.
 4. Press `Esc` to drop the selection and return to the live view.
 
-On the desktop, right-click the window for the menu, or click the gear for **Options**. With the window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` plays the selection and `Alt`-dragging (`Option` on a Mac) a selection flag fades it in or out. With two sources, a tap of the right `Ctrl` key (right `Command` on a Mac) lets you edit A and B separately. On Windows these keys and the global snapshot shortcut are defaults; change them in Options → **Hotkeys**.
+On the desktop, right-click the window for the menu, or click the gear for **Options**. With the window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` plays the selection and `Alt`-dragging (`Option` on a Mac) a selection flag fades it in or out. With two sources, a tap of the right `Ctrl` key (right `Command` on a Mac) lets you edit A and B separately. On Windows these keys and the global snapshot shortcut are defaults; change them in Options → **Hotkeys**. A few key combinations cannot be used because Windows or the window itself uses them.
 
 ## Watch
 
