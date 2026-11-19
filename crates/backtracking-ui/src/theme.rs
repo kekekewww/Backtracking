@@ -245,6 +245,240 @@ impl Theme {
     }
 }
 
+/// How far apart a capture status mark's colour and what lies behind it must be: the sum of
+/// their red, green and blue differences.
+pub const MARK_DISTANCE: u32 = 90;
+/// The least contrast ratio (WCAG 2, from relative luminance) a look's waveform, selection,
+/// row colours, flags and playhead keep against the plot's backing.
+pub const GRAPHIC_CONTRAST: f32 = 2.0;
+/// The least contrast ratio a look's channel names and group switch names keep against what
+/// is behind them, and the window's own text against a look's panel.
+pub const TEXT_CONTRAST: f32 = 3.0;
+/// The least alpha (of 255) of a look's waveform, selection, row, flag and playhead colours:
+/// 40 % opaque.
+pub const MIN_ALPHA: u8 = 102;
+
+/// Whether a status mark drawn in `mark` stands out from `behind`.
+pub fn distinguishable(mark: Color32, behind: Color32) -> bool {
+    let [r, g, b, _] = mark.to_array();
+    let [br, bg, bb, _] = behind.to_array();
+    [(r, br), (g, bg), (b, bb)]
+        .into_iter()
+        .map(|(a, b)| u32::from(a.abs_diff(b)))
+        .sum::<u32>()
+        >= MARK_DISTANCE
+}
+
+/// The relative luminance of an opaque colour, as WCAG 2 defines it.
+fn luminance(color: Color32) -> f32 {
+    let linear = |channel: u8| {
+        let value = f32::from(channel) / 255.0;
+        if value <= 0.040_45 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let [r, g, b, _] = color.to_array();
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+}
+
+/// The WCAG 2 contrast ratio of two opaque colours, from 1 (the same) to 21 (black and white).
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// `color` drawn over the opaque `behind`.
+fn over(color: Color32, behind: Color32) -> Color32 {
+    let keep = u16::from(255 - color.a());
+    let [r, g, b, _] = color.to_array();
+    let [br, bg, bb, _] = behind.to_array();
+    let mix = |top: u8, bottom: u8| top.saturating_add(((u16::from(bottom) * keep + 127) / 255) as u8);
+    Color32::from_rgb(mix(r, br), mix(g, bg), mix(b, bb))
+}
+
+/// `color` with its alpha dropped.
+fn opaque(color: Color32) -> Color32 {
+    let [r, g, b, _] = color.to_srgba_unmultiplied();
+    Color32::from_rgb(r, g, b)
+}
+
+/// Whether some channel of `a` differs from `b` by `contrast`, as [`selected_waveform_color`]
+/// asks of the accent's complement.
+fn apart(a: Color32, b: Color32, contrast: u8) -> bool {
+    let [r, g, bl, _] = a.to_array();
+    let [br, bg, bb, _] = b.to_array();
+    r.abs_diff(br) >= contrast || g.abs_diff(bg) >= contrast || bl.abs_diff(bb) >= contrast
+}
+
+/// What a look must keep readable that is not its own: values from the window that draws it.
+#[derive(Clone, Copy, Debug)]
+pub struct Legibility<'a> {
+    /// The user's accent, which the tokens a look leaves out are made from.
+    pub accent: Color32,
+    /// What [`selected_waveform_color`] asks of the selection.
+    pub selection_contrast: u8,
+    /// Every colour of the capture status mark drawn on the plot.
+    pub plot_marks: &'a [Color32],
+    /// Every colour of the capture status light drawn on the panel beside the plot.
+    pub panel_marks: &'a [Color32],
+    /// The colour of the window's own text on the panel.
+    pub panel_text: Color32,
+}
+
+/// A token [`Theme::legible`] can put back to the window's own value.
+#[derive(Clone, Debug, PartialEq)]
+enum Token {
+    PlotBackground,
+    PanelBackground,
+    Waveform,
+    WaveformSelected,
+    Row(String),
+    Flag,
+    Playhead,
+    RowLabel,
+    ChipText,
+    ChipBackground,
+}
+
+/// The first token that is set (`true`), which is the one a failed pair blames.
+fn blame<const N: usize>(candidates: [(bool, Token); N]) -> Option<Token> {
+    candidates
+        .into_iter()
+        .find_map(|(set, token)| set.then_some(token))
+}
+
+impl Theme {
+    /// This look with every token that would make the plot or the capture status hard to see
+    /// put back to the window's own, and the rest kept. A look's alpha on the plot's and the
+    /// panel's backing is dropped, so the user's transparency alone decides how see-through
+    /// they are.
+    ///
+    /// A pair fails when it is short of [`GRAPHIC_CONTRAST`], [`TEXT_CONTRAST`], [`MIN_ALPHA`]
+    /// or [`MARK_DISTANCE`], or when the selection is not apart from the waveform as
+    /// [`selected_waveform_color`] asks. A failed pair puts back the token the look set that
+    /// is drawn on top (the waveform before the plot's backing), and the pairs are checked
+    /// again until every one the look has a part in passes. Pairs made only of the window's
+    /// own values, such as the user's accent on the usual backing, are not checked.
+    pub fn legible(mut self, needs: &Legibility) -> Self {
+        self.plot_background = opaque(self.plot_background);
+        self.panel_background = self.panel_background.map(opaque);
+        while let Some(token) = self.illegible(needs) {
+            self.reset(token);
+        }
+        self
+    }
+
+    /// Whether every pair this look has a part in passes, as [`Self::legible`] leaves it.
+    pub fn is_legible(&self, needs: &Legibility) -> bool {
+        self.plot_background.a() == 255
+            && self.panel_background.is_none_or(|panel| panel.a() == 255)
+            && self.illegible(needs).is_none()
+    }
+
+    fn reset(&mut self, token: Token) {
+        let own = Self::default();
+        match token {
+            Token::PlotBackground => self.plot_background = own.plot_background,
+            Token::PanelBackground => self.panel_background = own.panel_background,
+            Token::Waveform => self.waveform = own.waveform,
+            Token::WaveformSelected => self.waveform_selected = own.waveform_selected,
+            Token::Row(label) => {
+                self.row_colors.remove(&label);
+            }
+            Token::Flag => self.flag = own.flag,
+            Token::Playhead => self.playhead = own.playhead,
+            Token::RowLabel => self.row_label = own.row_label,
+            Token::ChipText => self.chip_text = own.chip_text,
+            Token::ChipBackground => self.chip_background = own.chip_background,
+        }
+    }
+
+    /// The token to put back for the first pair that fails, if any does.
+    fn illegible(&self, needs: &Legibility) -> Option<Token> {
+        use Token::*;
+        let own = Self::default();
+        let backing = self.plot_background;
+        let backing_set = backing != own.plot_background;
+        let graphic = |color: Color32| {
+            color.a() >= MIN_ALPHA && contrast_ratio(over(color, backing), backing) >= GRAPHIC_CONTRAST
+        };
+        let text = |color: Color32, behind: Color32| {
+            contrast_ratio(over(color, behind), behind) >= TEXT_CONTRAST
+        };
+        let distinct = |a: Color32, b: Color32| {
+            apart(over(a, backing), over(b, backing), needs.selection_contrast)
+        };
+
+        let marks_lost = |behind: Color32, marks: &[Color32]| {
+            marks.iter().any(|&mark| !distinguishable(mark, behind))
+        };
+        if marks_lost(backing, needs.plot_marks)
+            && let Some(token) = blame([(backing_set, PlotBackground)])
+        {
+            return Some(token);
+        }
+        let waveform = self.waveform(needs.accent);
+        if !graphic(waveform)
+            && let Some(token) = blame([(self.waveform.is_some(), Waveform), (backing_set, PlotBackground)])
+        {
+            return Some(token);
+        }
+        let selected = self.waveform_selected(needs.accent, needs.selection_contrast);
+        if !(graphic(selected) && distinct(selected, waveform))
+            && let Some(token) = blame([
+                (self.waveform_selected.is_some(), WaveformSelected),
+                (self.waveform.is_some(), Waveform),
+                (backing_set, PlotBackground),
+            ])
+        {
+            return Some(token);
+        }
+        if let Some(label) = self
+            .row_colors
+            .iter()
+            .find(|&(_, &color)| !(graphic(color) && distinct(color, selected)))
+            .map(|(label, _)| label)
+        {
+            return Some(Row(label.clone()));
+        }
+        for (color, own_color, token) in [
+            (self.flag, own.flag, Flag),
+            (self.playhead, own.playhead, Playhead),
+        ] {
+            if !graphic(color)
+                && let Some(token) = blame([(color != own_color, token), (backing_set, PlotBackground)])
+            {
+                return Some(token);
+            }
+        }
+        if !text(self.row_label, backing)
+            && let Some(token) = blame([
+                (self.row_label != own.row_label, RowLabel),
+                (backing_set, PlotBackground),
+            ])
+        {
+            return Some(token);
+        }
+        if !text(self.chip_text, over(self.chip_background, backing))
+            && let Some(token) = blame([
+                (self.chip_text != own.chip_text, ChipText),
+                (self.chip_background != own.chip_background, ChipBackground),
+                (backing_set, PlotBackground),
+            ])
+        {
+            return Some(token);
+        }
+        if let Some(panel) = self.panel_background
+            && (marks_lost(panel, needs.panel_marks) || !text(needs.panel_text, panel))
+        {
+            return Some(PanelBackground);
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +719,320 @@ mod tests {
         theme.waveform = Some(Color32::from_rgb(1, 2, 3));
         assert_eq!(theme.row_waveform(Some("C"), accent), Color32::from_rgb(1, 2, 3));
         assert_eq!(theme.row_waveform(Some("LFE"), accent), lfe);
+    }
+
+    const ACCENT: Color32 = Color32::from_rgb(103, 231, 181);
+    /// Status colours like the desktop window's: bright marks on the plot, dark lights on the
+    /// panel.
+    const PLOT_MARKS: [Color32; 4] = [
+        Color32::from_rgb(246, 196, 118),
+        Color32::from_gray(214),
+        Color32::from_gray(132),
+        RECORDING_LIT,
+    ];
+    const PANEL_MARKS: [Color32; 2] = [Color32::from_rgb(54, 57, 60), Color32::from_rgb(76, 86, 88)];
+
+    fn needs(accent: Color32) -> Legibility<'static> {
+        Legibility {
+            accent,
+            selection_contrast: 80,
+            plot_marks: &PLOT_MARKS,
+            panel_marks: &PANEL_MARKS,
+            panel_text: Color32::from_gray(140),
+        }
+    }
+
+    /// A dark blue backing that keeps every plot mark apart, with the accent and its
+    /// complement readable on it.
+    const BACKING: Color32 = Color32::from_rgb(10, 20, 50);
+    const YELLOW: Color32 = Color32::from_rgb(240, 200, 40);
+
+    #[test]
+    fn contrast_is_measured_as_wcag_does() {
+        assert!((contrast_ratio(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.01);
+        assert!((contrast_ratio(Color32::WHITE, Color32::BLACK) - 21.0).abs() < 0.01);
+        assert_eq!(contrast_ratio(BACKING, BACKING), 1.0);
+        // Mid grey on black is about 5.3 : 1.
+        let grey = contrast_ratio(Color32::from_gray(128), Color32::BLACK);
+        assert!((5.2..5.4).contains(&grey), "{grey}");
+        assert!(distinguishable(Color32::from_gray(214), PLOT_BACKGROUND));
+        assert!(!distinguishable(Color32::from_rgb(54, 57, 60), Color32::from_rgb(30, 30, 30)));
+        assert!(distinguishable(Color32::from_rgb(54, 57, 60), Color32::from_gray(27)), "exactly 90 apart");
+    }
+
+    #[test]
+    fn the_windows_own_look_is_left_as_it_is() {
+        for accent in [ACCENT, accent_color([128, 128, 128]), PLOT_BACKGROUND, Color32::BLACK] {
+            assert_eq!(Theme::default().legible(&needs(accent)), Theme::default());
+            assert!(Theme::default().is_legible(&needs(accent)), "{accent:?}");
+        }
+    }
+
+    #[test]
+    fn a_waveform_lost_on_the_backing_is_dropped_and_the_backing_kept() {
+        let theme = Theme {
+            plot_background: BACKING,
+            waveform: Some(Color32::from_rgb(14, 28, 60)),
+            flag: Color32::from_rgb(255, 255, 0),
+            ..Theme::default()
+        };
+        assert!(!theme.is_legible(&needs(ACCENT)));
+        let kept = theme.legible(&needs(ACCENT));
+        assert_eq!(kept.waveform, None, "the accent draws it again");
+        assert_eq!(kept.plot_background, BACKING);
+        assert_eq!(kept.flag, Color32::from_rgb(255, 255, 0), "the rest stays");
+        assert!(kept.is_legible(&needs(ACCENT)));
+    }
+
+    #[test]
+    fn a_backing_the_accent_is_lost_on_is_dropped_when_the_look_leaves_the_waveform_alone() {
+        let theme = Theme {
+            plot_background: Color32::from_rgb(100, 225, 180),
+            ..Theme::default()
+        };
+        assert_eq!(theme.legible(&needs(ACCENT)), Theme::default());
+    }
+
+    #[test]
+    fn the_selection_must_read_on_the_backing_and_apart_from_the_waveform() {
+        let waveform = YELLOW;
+        // On the backing: drop the selection's colour, keep the waveform's, whose complement
+        // reads there.
+        let theme = Theme {
+            plot_background: BACKING,
+            waveform: Some(waveform),
+            waveform_selected: Some(BACKING),
+            ..Theme::default()
+        }
+        .legible(&needs(ACCENT));
+        assert_eq!((theme.waveform, theme.waveform_selected), (Some(waveform), None));
+        // Too close to the waveform: no channel is 80 apart.
+        let theme = Theme {
+            waveform: Some(waveform),
+            waveform_selected: Some(Color32::from_rgb(200, 160, 60)),
+            ..Theme::default()
+        }
+        .legible(&needs(ACCENT));
+        assert_eq!((theme.waveform, theme.waveform_selected), (Some(waveform), None));
+        assert!(theme.is_legible(&needs(ACCENT)));
+        // A selection worked out from a look's waveform that the backing then hides: the
+        // waveform goes, and the accent's own selection comes back.
+        let theme = Theme {
+            plot_background: Color32::from_gray(250),
+            waveform: Some(Color32::from_rgb(10, 10, 10)),
+            ..Theme::default()
+        }
+        .legible(&needs(Color32::from_rgb(10, 60, 30)));
+        assert!(theme.is_legible(&needs(Color32::from_rgb(10, 60, 30))));
+        assert_eq!(theme.waveform_selected, None);
+        let apart_enough = Theme {
+            waveform: Some(waveform),
+            waveform_selected: Some(Color32::from_rgb(240, 110, 40)),
+            ..Theme::default()
+        };
+        assert_eq!(apart_enough.clone().legible(&needs(ACCENT)), apart_enough, "90 apart in green");
+        // A white waveform's own selection would be black, lost on the usual backing.
+        let white = Theme {
+            waveform: Some(Color32::WHITE),
+            ..Theme::default()
+        };
+        assert_eq!(white.legible(&needs(ACCENT)), Theme::default());
+    }
+
+    #[test]
+    fn a_row_colour_lost_on_the_backing_or_on_the_selection_is_dropped_alone() {
+        let selected = Color32::from_rgb(255, 255, 0);
+        let mut theme = Theme {
+            waveform_selected: Some(selected),
+            ..Theme::default()
+        };
+        theme.row_colors.insert("LFE".into(), Color32::from_rgb(200, 40, 40));
+        theme.row_colors.insert("C".into(), PLOT_BACKGROUND);
+        theme.row_colors.insert("L".into(), Color32::from_rgb(250, 240, 20));
+        let theme = theme.legible(&needs(ACCENT));
+        assert_eq!(
+            theme.row_colors,
+            [("LFE".to_owned(), Color32::from_rgb(200, 40, 40))].into()
+        );
+        assert_eq!(theme.waveform_selected, Some(selected));
+    }
+
+    #[test]
+    fn flags_and_the_playhead_must_read_on_the_backing() {
+        let theme = Theme {
+            flag: Color32::from_rgb(30, 34, 38),
+            playhead: Color32::from_rgb(25, 25, 25),
+            ..Theme::default()
+        }
+        .legible(&needs(ACCENT));
+        assert_eq!((theme.flag, theme.playhead), (Theme::default().flag, Theme::default().playhead));
+        // The window's own flag on a look's backing it is lost on: the backing goes.
+        let theme = Theme {
+            plot_background: Color32::from_rgb(250, 200, 110),
+            waveform: Some(Color32::BLACK),
+            ..Theme::default()
+        }
+        .legible(&needs(ACCENT));
+        assert_eq!(theme.plot_background, PLOT_BACKGROUND);
+    }
+
+    #[test]
+    fn colours_too_transparent_to_see_are_dropped() {
+        let faint = |alpha| Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
+        let theme = Theme {
+            waveform: Some(faint(90)),
+            flag: faint(90),
+            playhead: faint(20),
+            ..Theme::default()
+        };
+        // White at 90 of 255 still contrasts with the dark backing; it is too faint all the same.
+        assert!(contrast_ratio(over(faint(90), PLOT_BACKGROUND), PLOT_BACKGROUND) >= GRAPHIC_CONTRAST);
+        let theme = theme.legible(&needs(ACCENT));
+        assert_eq!(theme, Theme::default());
+        let visible = Theme {
+            waveform: Some(faint(MIN_ALPHA)),
+            ..Theme::default()
+        };
+        assert_eq!(visible.clone().legible(&needs(ACCENT)), visible);
+    }
+
+    #[test]
+    fn channel_names_and_group_names_keep_text_contrast() {
+        let theme = Theme {
+            row_label: Color32::from_gray(60),
+            chip_text: Color32::from_gray(40),
+            ..Theme::default()
+        }
+        .legible(&needs(ACCENT));
+        assert_eq!(theme.row_label, Theme::default().row_label);
+        assert_eq!(theme.chip_text, Theme::default().chip_text);
+        // A group switch backing that hides the window's own names goes; one that keeps a
+        // look's names readable stays.
+        let theme = Theme {
+            chip_background: Color32::from_gray(180),
+            ..Theme::default()
+        }
+        .legible(&needs(ACCENT));
+        assert_eq!(theme.chip_background, Theme::default().chip_background);
+        let readable = Theme {
+            chip_background: Color32::from_gray(230),
+            chip_text: Color32::from_gray(20),
+            ..Theme::default()
+        };
+        assert_eq!(readable.clone().legible(&needs(ACCENT)), readable);
+    }
+
+    #[test]
+    fn a_backing_that_hides_a_status_mark_or_the_windows_text_is_dropped() {
+        // Close to the waiting mark's grey.
+        let theme = Theme {
+            plot_background: Color32::from_gray(120),
+            waveform: Some(YELLOW),
+            ..Theme::default()
+        }
+        .legible(&needs(ACCENT));
+        assert_eq!(theme.plot_background, PLOT_BACKGROUND);
+        assert_eq!(theme.waveform, Some(YELLOW));
+        // Close to the paused light, and to the window's grey text.
+        for panel in [Color32::from_rgb(50, 55, 60), Color32::from_gray(140)] {
+            let theme = Theme {
+                panel_background: Some(panel),
+                ..Theme::default()
+            };
+            assert_eq!(theme.legible(&needs(ACCENT)).panel_background, None, "{panel:?}");
+        }
+        let dark_blue = Theme {
+            panel_background: Some(Color32::from_rgb(10, 14, 40)),
+            ..Theme::default()
+        };
+        assert_eq!(dark_blue.clone().legible(&needs(ACCENT)), dark_blue);
+    }
+
+    #[test]
+    fn the_users_transparency_still_decides_how_see_through_the_backing_is() {
+        let theme = Theme {
+            plot_background: Color32::from_rgba_unmultiplied(20, 60, 120, 64),
+            panel_background: Some(Color32::from_rgba_unmultiplied(10, 14, 40, 0)),
+            ..Theme::default()
+        };
+        assert!(!theme.is_legible(&needs(ACCENT)));
+        let theme = theme.legible(&needs(ACCENT));
+        assert_eq!(theme.plot_background.a(), 255);
+        assert_eq!(theme.panel_background.map(|panel| panel.a()), Some(255));
+        assert_eq!(theme.translucent_plot_background(0).a(), 255);
+        assert_eq!(theme.translucent_plot_background(50).a(), 128);
+        assert_eq!(theme.translucent_plot_background(100).a(), 0);
+    }
+
+    /// Every colour token and row set to `color`.
+    fn all_one_colour(color: Color32) -> Theme {
+        Theme {
+            waveform: Some(color),
+            waveform_selected: Some(color),
+            plot_background: color,
+            center_line: color,
+            border: Some(color),
+            lane_divider: Some(color),
+            bar_line: color,
+            second_line: color,
+            row_label: color,
+            flag: color,
+            playhead: color,
+            panel_background: Some(color),
+            chip_background: color,
+            chip_text: color,
+            chip_current: Some(color),
+            scroll_thumb: Some(color),
+            preview_highlight: Some(color),
+            row_colors: [("LFE".to_owned(), color), ("C".to_owned(), color)].into(),
+            ..Theme::default()
+        }
+    }
+
+    #[test]
+    fn a_wild_look_all_in_the_backings_colour_ends_up_legible() {
+        for color in [
+            PLOT_BACKGROUND,
+            Color32::BLACK,
+            Color32::WHITE,
+            Color32::from_gray(128),
+            Color32::from_rgb(255, 0, 255),
+            ACCENT,
+            Color32::from_gray(214),
+            Color32::from_rgba_unmultiplied(40, 80, 160, 30),
+        ] {
+            for accent in [ACCENT, color, Color32::from_rgb(249, 78, 88)] {
+                let needs = needs(accent);
+                let theme = all_one_colour(color).legible(&needs);
+                assert!(theme.is_legible(&needs), "{color:?} with accent {accent:?}: {theme:?}");
+                // Spelled out: what the look still sets stands out from the backing, and so does
+                // all that is drawn on a backing of the look's.
+                let own = Theme::default();
+                let backing = theme.plot_background;
+                let backing_set = backing != own.plot_background;
+                let drawn = [
+                    (theme.waveform.is_some(), theme.waveform(accent)),
+                    (theme.waveform_selected.is_some(), theme.waveform_selected(accent, 80)),
+                    (theme.flag != own.flag, theme.flag),
+                    (theme.playhead != own.playhead, theme.playhead),
+                ]
+                .into_iter()
+                .chain(theme.row_colors.values().map(|&row| (true, row)));
+                for (set, drawn) in drawn {
+                    if set || backing_set {
+                        assert!(drawn.a() >= MIN_ALPHA);
+                        assert!(contrast_ratio(over(drawn, backing), backing) >= GRAPHIC_CONTRAST);
+                    }
+                }
+                if theme.row_label != own.row_label || backing_set {
+                    assert!(contrast_ratio(over(theme.row_label, backing), backing) >= TEXT_CONTRAST);
+                }
+                for mark in PLOT_MARKS {
+                    assert!(distinguishable(mark, backing) || backing == PLOT_BACKGROUND);
+                }
+                // Lines and highlights the guard does not judge keep the look's colour.
+                assert_eq!(theme.center_line, color);
+            }
+        }
     }
 }

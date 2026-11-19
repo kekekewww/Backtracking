@@ -32,8 +32,9 @@ pub use selection::{
 #[cfg(windows)]
 pub use system_fonts::add_system_font_fallbacks;
 pub use theme::{
-    CENTER_LINE, PLOT_BACKGROUND, RECORDING_DIM, RECORDING_LIT, Theme, accent_color,
-    muted_accent, selected_waveform_color,
+    CENTER_LINE, GRAPHIC_CONTRAST, Legibility, MARK_DISTANCE, MIN_ALPHA, PLOT_BACKGROUND,
+    RECORDING_DIM, RECORDING_LIT, TEXT_CONTRAST, Theme, accent_color, contrast_ratio,
+    distinguishable, muted_accent, selected_waveform_color,
 };
 pub use timeline::{
     FlagReach, fit_frame_range, flag_handle_at, frame_x, paint_guide_lines, selection_modifiers,
