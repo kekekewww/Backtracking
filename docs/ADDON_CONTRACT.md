@@ -260,7 +260,12 @@ indices are 2 and 3.
 Backtracking draws the app. An appearance can change only the drawing values listed here.
 Backtracking controls capture, selection, export, files, shortcuts, layout, text content and
 status indicators. Backtracking may ignore a value that would make the waveform or selection hard
-to see.
+to see. It ignores a color with less than 2:1 contrast (WCAG 2) against the plot background for the
+waveform, selection, row colors, flags or playhead, less than 3:1 for channel names and chip text,
+less than 40 % alpha (102 of 255) for those lines, a selection with no red, green or blue channel at
+least 80 away from the waveform's, and a background within 90 (the sum of the red, green and blue
+differences) of a capture status mark, and it ignores the alpha of `plot_background` and
+`panel_background`, so the user's transparency setting decides.
 
 Appearance is off until the user chooses an add-on in Options > Appearance. The user can choose
 at most one add-on's appearance. Backtracking uses its own look when the user turns the appearance

@@ -48,6 +48,8 @@
 //!   written, copies them into that folder and lists them in the log. The drag itself, which
 //!   Windows runs, is not done; the selection stays, so a `save=` after it writes the same
 //!   audio.
+//!   `look=<add-on id|none>` chooses that add-on's look, or the window's own, as the
+//!   "Look from add-on" row on the Appearance page does, and keeps the choice.
 //!
 //! The picture is `<file.png>`; `<file.png>.log` gets the frame times and any problem.
 
@@ -111,6 +113,8 @@ pub(super) enum Step {
     OpenExportMode,
     /// Writes what a drag-out would carry and copies it into this folder.
     DragPrepare(PathBuf),
+    /// The add-on whose look the window takes, or none.
+    Look(Option<String>),
 }
 
 impl Step {
@@ -341,6 +345,11 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                         .map_err(|error| format!("{json} is not a JSON value: {error}"))?;
                     Ok(Step::Set(id.trim().to_owned(), key.trim().to_owned(), json))
                 }
+                "look" => match value.trim() {
+                    "" => Err(format!("{step} needs an add-on id or none")),
+                    "none" => Ok(Step::Look(None)),
+                    id => Ok(Step::Look(Some(id.to_owned()))),
+                },
                 other => Err(format!("unknown step {other}")),
             }
         })
@@ -845,6 +854,10 @@ impl Recorder {
                     harness.notes.push(note);
                 }
             }
+            Step::Look(choice) => {
+                self.choose_look(choice.clone());
+                ctx.request_repaint();
+            }
         }
         Ok(())
     }
@@ -1338,6 +1351,22 @@ mod tests {
         // One filter byte, then the row: the Sub filter stores the second pixel as a difference.
         assert_eq!(rows.len(), 7);
         assert!(png.ends_with(&[0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82]));
+    }
+
+    #[test]
+    fn look_steps_choose_an_add_on_or_none() {
+        assert_eq!(
+            parse_steps("look=com.example.theme; look=none ;options=appearance").unwrap(),
+            [
+                Step::Look(Some("com.example.theme".into())),
+                Step::Look(None),
+                Step::Options(OptionsSection::Appearance, None),
+            ]
+        );
+        assert!(!Step::Look(None).waits());
+        for bad in ["look", "look=", "look= "] {
+            assert!(parse_steps(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

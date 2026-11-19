@@ -1308,8 +1308,7 @@ mod tests {
         writer.save(Key::AddonLook, "").unwrap();
         writer.flush().unwrap();
         assert_eq!(preferences.load().addon_look, None);
-        for bad in ["  ", "a
-b", &"x".repeat(129)] {
+        for bad in ["  ", "a\nb", &"x".repeat(129)] {
             preferences.save(Key::AddonLook, bad).unwrap();
             assert_eq!(preferences.load().addon_look, None, "{bad:?}");
         }
