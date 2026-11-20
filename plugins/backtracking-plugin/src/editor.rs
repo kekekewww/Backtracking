@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use backtracking_core::{
     AutoResumeDelay, ChannelRoute, DurationChoice, Fades, FrozenTrack, MeterReadings, Preview,
-    WavExportProfile, cleanup, export_routed_tracks_with_fades, waveform,
+    WavExportProfile, cleanup, waveform, waveform::PreviewLane,
 };
 use backtracking_ui::{
     CENTER_LINE, FadeEnd, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, PLOT_BACKGROUND,
@@ -358,6 +358,7 @@ impl Drop for ActiveDrag {
 }
 
 struct WavClip {
+    mask: u32,
     profile: WavExportProfile,
     force_mono: bool,
     output: PathBuf,
@@ -388,15 +389,15 @@ impl SavedWav {
 
 impl WavClip {
     fn write(self) -> io::Result<SavedWav> {
-        let paths = export_routed_tracks_with_fades(
+        let paths = crate::surround::export(
             &self.output,
             &self.snapshots,
             self.range,
             self.profile,
-            &[ChannelRoute::Merged; 2][..self.snapshots.len()],
             self.force_mono,
             self.tempo,
             self.fades,
+            self.mask,
         )?;
         Ok(SavedWav {
             paths: paths
@@ -637,6 +638,10 @@ impl NiceEguiApp for CaptureUi {
                     if capture_button(ui, paused, controls_enabled).clicked() {
                         self.toggle_capture(ui, paused);
                         paused = self.session.is_paused();
+                    }
+                    if self.timeline.channels > 2 {
+                        // The plug-in's window is in English, like its other labels.
+                        ui.label(format!("{} ch", self.timeline.channels));
                     }
                     self.recording_indicator(ui, paused, settings.status_mark);
                     if clear_button(ui, controls_enabled && self.seconds > 0.0).clicked() {
@@ -1022,7 +1027,11 @@ impl CaptureUi {
             self.clamp_edit_selection(&editing.timeline.frames);
             if self.preview_requested.as_ref() != Some(&key) {
                 if let Some(worker) = &self.preview_worker {
-                    worker.request(PreviewRequest { key: key.clone(), snapshots: editing.snapshots.clone() });
+                    worker.request(PreviewRequest {
+                        wide: editing.timeline.wide.clone(),
+                        key: key.clone(),
+                        snapshots: editing.snapshots.clone(),
+                    });
                     self.preview_requested = Some(key.clone());
                 } else {
                     self.message = "Waveform preview worker unavailable.".into();
@@ -1189,9 +1198,22 @@ impl CaptureUi {
             self.message = "Preparing selected audio…".into();
             return;
         };
-        let routes = [ChannelRoute::Merged; 2];
-        let routes = &routes[..editing.snapshots.len().min(routes.len())];
-        match Preview::new(&editing.snapshots, selection, routes, settings.force_mono, self.fades) {
+        let lanes: Vec<_> = editing
+            .snapshots
+            .iter()
+            .map(|track| PreviewLane {
+                track,
+                route: ChannelRoute::Merged,
+                selected: None,
+                group: editing
+                    .timeline
+                    .wide
+                    .as_ref()
+                    .filter(|_| track.channels() > 2)
+                    .map(|w| &w.group),
+            })
+            .collect();
+        match Preview::with_channels(&lanes, selection, None, settings.force_mono, self.fades) {
             Some(preview) => {
                 self.session.preview.play(preview);
                 self.preview_started = Some(Instant::now());
@@ -1714,15 +1736,18 @@ impl CaptureUi {
 
     fn begin_drag_preparation(&mut self) {
         let settings = self.session.settings();
-        let Some((epoch, snapshots)) = self.session.positioned_snapshots(false)
-            .filter(|(_, snapshots)| snapshots.first().is_some_and(|snapshot| snapshot.frame_count() > 0))
-        else {
+        let Some(material) = self.session.export_snapshots(false).filter(|s| {
+            s.tracks
+                .first()
+                .is_some_and(|snapshot| snapshot.frame_count() > 0)
+        }) else {
             self.message = "No captured audio to save yet.".into();
             return;
         };
-        self.sync_timeline(epoch);
+        self.sync_timeline(material.epoch);
         let Some(clip) = self.wav_clip(
-            snapshots.into(),
+            material.tracks,
+            material.mask,
             settings.output_dir,
             settings.wav_profile,
             settings.force_mono,
@@ -1810,16 +1835,19 @@ impl CaptureUi {
             self.message = "Preparing selected audio…".into();
             return;
         }
-        let snapshots = self.session.positioned_snapshots(false);
-        let Some((epoch, snapshots)) = snapshots.filter(|(_, snapshots)|
-            snapshots.first().is_some_and(|snapshot| snapshot.frame_count() > 0))
-        else {
+        let snapshots = self.session.export_snapshots(false);
+        let Some(material) = snapshots.filter(|s| {
+            s.tracks
+                .first()
+                .is_some_and(|snapshot| snapshot.frame_count() > 0)
+        }) else {
             self.message = "No captured audio to save yet.".into();
             return;
         };
-        self.sync_timeline(epoch);
+        self.sync_timeline(material.epoch);
         let Some(clip) = self.wav_clip(
-            snapshots.into(),
+            material.tracks,
+            material.mask,
             settings.saved_dir.clone(),
             settings.wav_profile,
             settings.force_mono,
@@ -1840,6 +1868,7 @@ impl CaptureUi {
     fn wav_clip(
         &mut self,
         snapshots: Arc<[FrozenTrack]>,
+        mask: u32,
         output: PathBuf,
         profile: WavExportProfile,
         force_mono: bool,
@@ -1848,6 +1877,7 @@ impl CaptureUi {
         let selected = self.selection.clone().unwrap_or_else(|| first.frame_range());
         let range = export_frame_range(first, &selected)?;
         Some(WavClip {
+            mask,
             profile,
             force_mono,
             output,
@@ -2782,6 +2812,7 @@ mod tests {
         let snapshots: Arc<[FrozenTrack]> = vec![main, sidechain].into();
         let prepare_file = || {
             WavClip {
+                mask: 0,
                 profile: WavExportProfile::default(),
                 force_mono: false,
                 output: output.clone(),
@@ -2826,6 +2857,7 @@ mod tests {
             writer
                 .requests
                 .send(WavClip {
+                    mask: 0,
                     profile: WavExportProfile::default(),
                     force_mono,
                     output: output.clone(),
@@ -2882,6 +2914,7 @@ mod tests {
         let snapshots: Arc<[FrozenTrack]> =
             vec![FrozenTrack::from_interleaved(48_000, 1, 0, &[0.5; 8]).unwrap()].into();
         let saved = WavClip {
+            mask: 0,
             profile: WavExportProfile::default(),
             force_mono: false,
             output: output.clone(),

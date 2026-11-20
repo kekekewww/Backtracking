@@ -136,8 +136,10 @@ version = "0.2.0"
 dependencies = [
  "backtracking-core",
  "backtracking-ui",
+ "clap-sys",
  "dunce",
  "egui",
+ "libloading",
  "nice-plug",
  "nice-plug-egui",
  "objc2 0.6.5",
@@ -147,6 +149,7 @@ dependencies = [
  "png",
  "raw-window-handle",
  "rfd",
+ "vst3",
  "windows",
  "windows-core",
 ]

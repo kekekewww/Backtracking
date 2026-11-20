@@ -81,6 +81,13 @@ objc2-foundation = { version = "0.3", default-features = false, optional = true,
     "NSURL",
 ] }
 
+[dev-dependencies]
+clap-sys = "0.5"
+vst3 = "0.3"
+
+[target.'cfg(windows)'.dev-dependencies]
+libloading = "0.8"
+
 # Standalone package: keeps cargo from walking up into an enclosing workspace
 # (for example when this checkout is nested inside another one).
 [workspace]

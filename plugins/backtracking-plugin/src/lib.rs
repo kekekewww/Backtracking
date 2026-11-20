@@ -3,6 +3,7 @@ mod editor;
 #[cfg_attr(not(feature = "editor"), allow(dead_code))]
 mod session;
 mod settings;
+mod surround;
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -64,6 +65,34 @@ impl Default for Backtracking {
     }
 }
 
+impl Backtracking {
+    fn configure_worker(
+        &mut self,
+        rate: u32,
+        channels: usize,
+        sidechain: usize,
+        max_buffer: u32,
+        labels: Vec<String>,
+    ) {
+        if !self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.matches(rate, channels, sidechain, max_buffer, &labels))
+        {
+            // Drop and join the old consumer before changing the format shared with the editor.
+            self.worker = None;
+            self.worker = Worker::with_labels(
+                self.session.clone(),
+                rate,
+                channels,
+                sidechain,
+                max_buffer,
+                labels,
+            );
+        }
+    }
+}
+
 impl Plugin for Backtracking {
     const NAME: &'static str = "Backtracking";
     const VENDOR: &'static str = "Backtracking";
@@ -78,6 +107,24 @@ impl Plugin for Backtracking {
         layout(1, &STEREO_AUX, SIDECHAIN_NAMES),
         layout(2, &[], PortNames::const_default()),
         layout(1, &[], PortNames::const_default()),
+        layout(6, &[], PortNames::const_default()),
+        layout(6, &MONO_AUX, SIDECHAIN_NAMES),
+        layout(6, &STEREO_AUX, SIDECHAIN_NAMES),
+        layout(8, &[], PortNames::const_default()),
+        layout(8, &MONO_AUX, SIDECHAIN_NAMES),
+        layout(8, &STEREO_AUX, SIDECHAIN_NAMES),
+        layout(10, &[], PortNames::const_default()),
+        layout(10, &MONO_AUX, SIDECHAIN_NAMES),
+        layout(10, &STEREO_AUX, SIDECHAIN_NAMES),
+        layout(12, &[], PortNames::const_default()),
+        layout(12, &MONO_AUX, SIDECHAIN_NAMES),
+        layout(12, &STEREO_AUX, SIDECHAIN_NAMES),
+        layout(14, &[], PortNames::const_default()),
+        layout(14, &MONO_AUX, SIDECHAIN_NAMES),
+        layout(14, &STEREO_AUX, SIDECHAIN_NAMES),
+        layout(16, &[], PortNames::const_default()),
+        layout(16, &MONO_AUX, SIDECHAIN_NAMES),
+        layout(16, &STEREO_AUX, SIDECHAIN_NAMES),
     ];
 
     #[cfg(feature = "editor")]
@@ -112,18 +159,13 @@ impl Plugin for Backtracking {
 
         let rate = config.sample_rate.round() as u32;
         let channels = layout.main_input_channels.map_or(0, |n| n.get() as usize);
-        let sidechain = layout.aux_input_ports.first().map_or(0, |n| n.get() as usize);
-        if !self
-            .worker
-            .as_ref()
-            .is_some_and(|worker| worker.matches(rate, channels, sidechain, config.max_buffer_size))
-        {
-            // Drop and join the old consumer before changing the format shared with the editor.
-            self.worker = None;
-            self.worker = Worker::with_sidechain(
-                self.session.clone(), rate, channels, sidechain, config.max_buffer_size,
-            );
-        }
+        let sidechain = layout
+            .aux_input_ports
+            .first()
+            .map_or(0, |n| n.get() as usize);
+        let labels =
+            surround::speaker_labels(&main_input_speaker_bits(context).unwrap_or_default());
+        self.configure_worker(rate, channels, sidechain, config.max_buffer_size, labels);
         true
     }
 
@@ -167,14 +209,21 @@ fn mix_preview(preview: &PreviewSlot, output: &mut [&mut [f32]], sample_rate: u3
         return 0;
     }
     let frames = output.first().map_or(0, |channel| channel.len());
-    preview.render_with(frames, sample_rate, |index, [left, right]| match &mut *output {
-        [only] => only[index] += (left + right) * 0.5,
-        [first, second, ..] => {
-            first[index] += left;
-            second[index] += right;
-        }
-        [] => {}
-    }).remaining
+    preview
+        .render_with(
+            frames,
+            sample_rate,
+            |index, [left, right]| match &mut *output {
+                [only] => only[index] += (left + right) * 0.5,
+                // Wide clips preview their stereo fold-down on the first two bus outputs.
+                [first, second, ..] => {
+                    first[index] += left;
+                    second[index] += right;
+                }
+                [] => {}
+            },
+        )
+        .remaining
 }
 
 /// A bar at or after the first sample, and the distance to subsequent bars.
@@ -323,6 +372,60 @@ mod tests {
         assert_eq!(auxiliary.inputs[0].as_slice_immutable()[0].iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
             expected_side.iter().copied().map(f32::to_bits).collect::<Vec<_>>());
         status
+    }
+
+    #[test]
+    fn changing_only_speakers_replaces_history_and_block_size_keeps_it() {
+        let mut plugin = Backtracking::default();
+        let first = surround::speaker_labels(&[0, 1, 2, 3, 4, 5, 12, 14, 15, 17]);
+        let second = surround::speaker_labels(&[0, 1, 2, 3, 4, 5, 9, 10, 24, 25]);
+        plugin.configure_worker(48000, 10, 0, 512, first.clone());
+        let epoch = plugin.session.timeline_epoch();
+        plugin.configure_worker(48000, 10, 0, 512, first);
+        assert_eq!(plugin.session.timeline_epoch(), epoch);
+        plugin.configure_worker(48000, 10, 0, 512, second.clone());
+        let next = plugin.session.timeline_epoch();
+        assert_ne!(next, epoch);
+        plugin.configure_worker(48000, 10, 0, 256, second.clone());
+        assert_eq!(plugin.session.timeline_epoch(), next);
+        plugin.configure_worker(48000, 10, 0, 8192, second);
+        assert_eq!(plugin.session.timeline_epoch(), next);
+    }
+
+    #[test]
+    fn surround_process_preserves_every_sample() {
+        let mut plugin = Backtracking::default();
+        let mut context = AudioContext::new(PluginApi::Clap);
+        assert!(plugin.activate(
+            &layout(12, &[], PortNames::const_default()),
+            &realtime_config(),
+            &mut context
+        ));
+        let mut audio: Vec<_> = (0..12)
+            .map(|c| vec![c as f32 / 16., -0., -0.3 + c as f32 / 20., 1e-20])
+            .collect();
+        let expected = audio.clone();
+        let mut buffer = Buffer::default();
+        unsafe {
+            buffer.set_slices(4, |s| {
+                *s = audio.iter_mut().map(Vec::as_mut_slice).collect()
+            });
+        }
+        plugin.process(
+            &mut buffer,
+            &mut AuxiliaryBuffers {
+                inputs: &mut [],
+                outputs: &mut [],
+            },
+            &mut context,
+        );
+        assert!(
+            audio
+                .iter()
+                .flatten()
+                .zip(expected.iter().flatten())
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
     }
 
     #[test]
@@ -607,3 +710,9 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, windows))]
+mod vst3_host;
+
+#[cfg(test)]
+mod clap_ports;
