@@ -12,7 +12,7 @@
 | --- | --- |
 | 瀏覽器、播放器或其他程式的聲音 | 開啟桌面版，在 Options 選擇系統播放或指定 App。 |
 | 麥克風，或系統聲加麥克風 | 開啟桌面版，在 Options 選擇麥克風，或啟用 A／B 分開擷取。 |
-| 某一軌、群組或主輸出的聲音 | 把 VST3 或 CLAP 插入對應的效果鏈。插件接收該位置的 mono 或 stereo 音訊，並將音訊原樣傳給下游。 |
+| 某一軌、群組或主輸出的聲音 | 把 VST3 或 CLAP 插入對應的效果鏈。插件接收該位置的 mono、stereo 或環繞聲音訊（見下方「多聲道來源」），並將音訊原樣傳給下游。 |
 | 軟體樂器加效果後的聲音 | 把插件放在樂器及要納入取樣的效果後面。若需要乾聲，就放在那些效果前面。 |
 | 在桌面版擷取 DAW 某一軌的聲音 | 在插件 Options 的 Sources 勾選 **Send to Backtracking desktop**，再到桌面版 Options 的 Sources，把音訊來源選為 **【Sender】**加上該軌名稱。Sender 列在系統音訊和預設麥克風之後。 |
 
@@ -185,7 +185,7 @@ Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift
 | 取樣率 | 44.1 kHz、48 kHz、96 kHz | 48 kHz |
 | 編碼 | 16-bit PCM、24-bit PCM、32-bit IEEE float | 32-bit float |
 
-快照保存及拖放匯出都使用目前選定的 WAV 規格，取樣率轉換在匯出時進行。桌面版的 **Left** 和 **Right** 匯出為單側有聲的立體聲，**Side** 以左側原相、右側反相匯出為立體聲，**Mid** 和 **Center** 匯出為單聲道。**Merged** 和插件沿用擷取結果的聲道數。
+快照保存及拖放匯出都使用目前選定的 WAV 規格，取樣率轉換在匯出時進行。桌面版的 **Left** 和 **Right** 匯出為單側有聲的立體聲，**Side** 以左側原相、右側反相匯出為立體聲，**Mid** 和 **Center** 匯出為單聲道。**Merged** 和插件沿用擷取結果的聲道數；插件擷取超過兩個聲道時，依「多聲道來源」的匯出設定寫出檔案。
 
 在 WAV 設定勾選 **全部轉成單聲道／Export every file as mono**，每個檔案都會單獨轉成單聲道。立體聲 Merged 與插件的左右聲道會取平均，Side 則輸出擷取到的 Side 訊號。A／B 仍各自匯出，選項預設關閉。回溯歷史儲存在記憶體，關閉桌面程式或移除插件前，請先存下需要的片段。
 
@@ -207,9 +207,17 @@ Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift
 
 想自己寫附加元件，請看 [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md)。
 
-### 多聲道來源（Windows 桌面版）
+### 多聲道來源（Windows 桌面版與插件）
 
 **擷取系統、應用程式或麥克風的所有聲道。** 系統播放、單一應用程式或麥克風的裝置超過兩個聲道時（例如 5.1 或 7.1 喇叭），Options → Sources 的 **Channel route** 會多一個 **All channels／所有聲道**，選了之後每個聲道各成一列，聲道名稱來自 Windows 的喇叭配置（`FL`、`FR`、`FC`、`LFE` 等）。裝置只有一或兩個聲道時不會列出這個選項；之前選過、但裝置現在只有立體聲時，Backtracking 改用合併聲道擷取，並在來源下方說明。只有一或兩個聲道的來源仍是一列或 L／R 兩列，不會變成多聲道軌道。
+
+**在 VST3／CLAP 插件中擷取環繞聲。** 把 VST3 插件插在 5.1 至 9.1.6 的環繞聲匯流排上，插件會擷取每個聲道，每個聲道各成一列，名稱來自 DAW 的喇叭配置；7.1.4 依序為 `FL`、`FR`、`FC`、`LFE`、`Lb`、`Rb`、`Ls`、`Rs`、`TFL`、`TFR`、`TBL`、`TBR`。名稱沿用 Windows 的寫法：喇叭配置同時有後方與側邊兩對時，後方一對標為 `Lb`、`Rb`，側邊一對標為 `Ls`、`Rs`。CLAP 也能擷取 6 到 16 個聲道，但 CLAP 不提供喇叭配置，聲道只以編號標示，檔名為 `-Ch01_Channel 1.wav` 這類形式；這些聲道沒有方向，混成 L 與 R 或雙耳音訊時左右一樣大聲。插件的多聲道波形、**L/R of multichannel sources** 與 **Multichannel sources** 和下文相同，兩個設定都隨 DAW 專案保存，舊專案使用預設值。與桌面版不同的地方：
+
+- 插件一律顯示並匯出所有聲道，沒有 **Hide silent channels／隱藏無聲的聲道**、聲道群組切換與分開編輯，所以保存與拖放一律匯出所有列，並寫出 L/R 檔案。
+- 出現多聲道軌道時，插件會向 DAW 要求較高的視窗；DAW 讓視窗維持較小時，用滾輪捲動各列。
+- 試聽目前把混好的聲音從匯流排的前兩個聲道（前左與前右）播放。
+- 同時擷取側鏈時（**Both**），側鏈仍在下方，以標為 **B** 的一列顯示，並照舊匯出為 `-B` 結尾的檔案；多聲道軌道的檔案則在長度後加上 `-A`。
+- 多聲道軌道的檔名不含 BPM。
 
 **多聲道波形。** 超過兩個聲道的來源，最上方是 **L** 與 **R** 兩列：所有聲道混成立體聲的結果，下方以細線分隔。再往下每個聲道各佔一列並標上聲道名稱；7.1.4 就是 L、R 加 12 列。列數放不下時可用滾輪捲動。來源若有多個聲道群組（例如聲道與物件），波形左下角可切換目前顯示的群組；L 與 R 一律由聲道群組混成。多聲道來源的音量表只有 Peak 與 VU，沒有 LUFS。聲道越多，記憶體能保留的歷史越短；實際保留的長度會顯示在 Options 的 **Capture** 頁。
 
@@ -265,7 +273,7 @@ Windows 和 macOS 桌面版在變更後會自動保存保留時間、自動續�
 | --- | --- |
 | A browser, media player, or another desktop app | Open the desktop recorder and choose system playback or the app in Options. |
 | A microphone, or system playback plus a microphone | Choose a microphone in desktop Options or enable A/B to capture them separately. |
-| One DAW track, a bus, or the master output | Insert the VST3 or CLAP plug-in on the relevant effects chain. It captures mono or stereo audio at that point and passes the input through unchanged. |
+| One DAW track, a bus, or the master output | Insert the VST3 or CLAP plug-in on the relevant effects chain. It captures mono, stereo or surround audio at that point (see Multichannel sources below) and passes the input through unchanged. |
 | A software instrument with effects | Insert Backtracking after the instrument and any effects you want in the sample. Move it ahead of those effects to capture the dry signal. |
 | One DAW track inside the desktop recorder | In the plug-in, open Options → Sources and tick **Send to Backtracking desktop**. Then open desktop Options → Sources and choose **【Sender】** followed by the track name as the audio source. Senders are listed right after system audio and the default microphone. |
 
@@ -438,7 +446,7 @@ Choose the sample rate and encoding independently on the Export page of Options.
 | Sample rate | 44.1 kHz, 48 kHz, 96 kHz | 48 kHz |
 | Encoding | 16-bit PCM, 24-bit PCM, 32-bit IEEE float | 32-bit float |
 
-Snapshot saves and drag-and-drop exports use the current WAV settings. Any sample rate conversion happens during export. On desktop, **Left** and **Right** export as stereo with audio on the corresponding side, **Side** exports as stereo with an inverted right channel, and **Mid** and **Center** export as mono. **Merged** and the plug-ins use the captured channel count.
+Snapshot saves and drag-and-drop exports use the current WAV settings. Any sample rate conversion happens during export. On desktop, **Left** and **Right** export as stereo with audio on the corresponding side, **Side** exports as stereo with an inverted right channel, and **Mid** and **Center** export as mono. **Merged** and the plug-ins use the captured channel count; a plug-in capture of more than two channels writes the files chosen under Multichannel sources.
 
 Enable **Export every file as mono** to export each WAV in mono. Stereo Merged and stereo plug-in captures average the left and right channels. Side exports the captured Side signal. A and B still export as individual files. The option defaults to Off. The rolling history lives in memory, so export any clips you need before closing the app or removing the plug-in.
 
@@ -460,9 +468,17 @@ An add-on is a separate program that Backtracking starts and captures audio from
 
 To write an add-on, see [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md).
 
-### Multichannel sources (Windows desktop)
+### Multichannel sources (Windows desktop and plug-ins)
 
 **Capture every channel of system, app or microphone audio.** When the device behind system playback, a single app or a microphone has more than two channels (5.1 or 7.1 speakers, say), **Channel route** in Options → Sources offers **All channels**. With it, every channel gets its own row, named after the Windows speaker layout (`FL`, `FR`, `FC`, `LFE`, and so on). A device with one or two channels does not offer it. If you chose it earlier and the device now has two channels, Backtracking captures it merged and says so under the source. A source with one or two channels stays one row, or L and R rows; it never becomes a multichannel lane.
+
+**Capture surround in the VST3 and CLAP plug-ins.** Insert the VST3 plug-in on a surround bus from 5.1 to 9.1.6 and it captures every channel, each in its own row, named from the DAW's speaker layout; 7.1.4 is `FL`, `FR`, `FC`, `LFE`, `Lb`, `Rb`, `Ls`, `Rs`, `TFL`, `TFR`, `TBL`, `TBR`, in that order. The names are the Windows ones: when a layout has both a back pair and a side pair, the back pair is `Lb` and `Rb` and the side pair `Ls` and `Rs`. CLAP captures 6 to 16 channels too, but CLAP gives no speaker layout, so its channels are only numbered, with files such as `-Ch01_Channel 1.wav`; they have no direction, so L and R and the binaural choices give them the same level on both sides. In the plug-in, the multichannel waveform, **L/R of multichannel sources** and **Multichannel sources** work as described below, both choices are saved with the DAW project, and older projects load with the defaults. Where the plug-in differs from the desktop app:
+
+- It always shows and exports every channel. It has no **Hide silent channels**, no channel group switch and no editing separately, so a save or drag-out always exports every row, L/R file included.
+- When a multichannel lane appears, the plug-in asks the DAW for a taller window. If the DAW keeps the window smaller, scroll the rows with the mouse wheel.
+- Preview plays the mixed sound in the bus's first two channels (front left and right) for now.
+- With the sidechain captured too (**Both**), the sidechain stays below as one row labelled **B** and exports as before, in a file ending in `-B`; the multichannel lane's files have `-A` after the length.
+- Multichannel lane files carry no tempo in their names.
 
 **Multichannel waveforms.** A source with more than two channels shows two rows on top, **L** and **R**: all its channels mixed to stereo, with a thin line below them. Under them each channel has its own row, labelled with the channel's name; 7.1.4 is L, R and twelve rows. Scroll with the mouse wheel when the rows do not fit. When a source has more than one channel group, for example channels and objects, a switch at the bottom left of the waveform chooses the group on show; L and R are always mixed from the channels group. Meters for multichannel sources offer Peak and VU, not LUFS. The more channels a source has, the less history fits in memory; the **Capture** page of Options shows how much is kept.
 
@@ -581,12 +597,19 @@ macOS 若要安裝到目前使用者的資料夾，也可使用 `~/Library/Audio
 
 For a per-user macOS install, use the corresponding `VST3` or `CLAP` subfolder under `~/Library/Audio/Plug-Ins/` and verify that your DAW scans it. [Steinberg VST3 locations](https://steinbergmedia.github.io/vst3_dev_portal/pages/Technical%2BDocumentation/Locations%2BFormat/Plugin%2BLocations.html)
 
+插件接收它所在位置的聲道：單聲道或立體聲軌道，或 5.1 至 9.1.6 的 VST3 環繞聲匯流排（CLAP 為 6 到 16 個聲道，沒有聲道名稱）。超過兩個聲道時，視窗會顯示每個聲道，見「多聲道來源」。
+
+The plug-in takes the channels where it sits: a mono or stereo track, or a VST3 surround bus from 5.1 to 9.1.6 (6 to 16 channels under CLAP, without channel names). With more than two channels its window shows every channel; see Multichannel sources.
+
 1. **REAPER**。開啟 Preferences，在 Plug-ins 的 **VST** 或 **LV2/CLAP** 頁面確認路徑並重新掃描。開啟目標音軌的 **FX**，搜尋 **Backtracking**。
 
    Open Preferences. Under Plug-ins, check the path on the **VST** or **LV2/CLAP** page and rescan. Open **FX** on the target track and search for **Backtracking**. [REAPER User Guide](https://dlx.reaper.fm/userguide/html/)
 2. **FL Studio**。開啟 **Options → File settings → Manage plugins**，執行 **Find installed plugins** 並確認已啟用 **Verify plugins**。在目標 Mixer insert 的效果欄加入 **Backtracking**。
 
    Open **Options → File settings → Manage plugins**. Run **Find installed plugins** with **Verify plugins** enabled. Add **Backtracking** to an effect slot on the target Mixer insert. [FL Studio manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/basics_externalplugins.htm)
+3. **Cubase／Nuendo 的 Dolby Atmos**。要擷取 Dolby Atmos 混音的 7.1.4 聲道，把 Backtracking 的 VST3 插在 **Main Mix** 輸出聲道上、**Renderer for Dolby Atmos** 之後的 insert。依 Steinberg 手冊描述的訊號流程，renderer 之後是床聲道加物件的完整 7.1.4 輸出；插在 renderer 之前只收得到床聲道，沒有物件。這個位置尚未在 Cubase 或 Nuendo 中實際確認。renderer 的 **Downmix** 設為 Binaural 時，插件收到的是 7.1.4 還是兩個雙耳聲道，也尚未確認。
+
+   To capture the 7.1.4 channels of a Dolby Atmos mix, insert the Backtracking VST3 on the **Main Mix** output channel, after the **Renderer for Dolby Atmos**. By the signal flow in Steinberg's manual, the full 7.1.4 render, bed and objects, leaves the renderer there; before the renderer, Main Mix carries only the bed, without the objects. This placement has not yet been checked in Cubase or Nuendo. Whether the plug-in still gets 7.1.4, or two binaural channels, when the renderer's **Downmix** is set to Binaural is not checked either.
 
 ### 裝好後做一次快速測試 / Check the installation
 

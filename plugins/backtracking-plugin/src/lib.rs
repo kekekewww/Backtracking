@@ -215,7 +215,9 @@ fn mix_preview(preview: &PreviewSlot, output: &mut [&mut [f32]], sample_rate: u3
             sample_rate,
             |index, [left, right]| match &mut *output {
                 [only] => only[index] += (left + right) * 0.5,
-                // Wide clips preview their stereo fold-down on the first two bus outputs.
+                // For now a wide clip plays its L/R, the stereo fold-down or the binaural mix
+                // chosen on the Capture page, on the first two outputs of the bus. S3-5 changes
+                // this so the clip plays in its own channels of a surround bus.
                 [first, second, ..] => {
                     first[index] += left;
                     second[index] += right;

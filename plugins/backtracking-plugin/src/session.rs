@@ -14,7 +14,7 @@ use backtracking_core::{
 };
 
 use crate::settings::{CaptureInput, MeterMode, SessionSettings, SettingsStore, WaveformLayout};
-use crate::surround::WideLayout;
+use crate::surround::{WideLayout, WideRow, WideSave};
 
 pub(crate) const WAVEFORM_BINS: usize = 512;
 
@@ -100,6 +100,8 @@ pub(crate) struct WaveformTimeline {
     pub(crate) wide: Option<WideLayout>,
     pub(crate) b_channels: Option<usize>,
     pub(crate) bar_markers: Vec<u64>,
+    /// The history memory holds at the capture's width, in seconds.
+    pub(crate) retention_seconds: f64,
 }
 
 #[derive(Clone)]
@@ -166,20 +168,115 @@ struct WaveformCache {
     layout: WaveformLayout,
     range: Range<u64>,
     peaks: [WaveformPeaks; 2],
+    /// The rows of a capture wider than stereo, read only for the rows on screen.
+    rows: RowCache,
+}
+
+#[derive(Default)]
+struct RowCache {
+    revision: Option<u64>,
+    rows: Vec<WideRow>,
+    range: Range<u64>,
+    bins: usize,
+    peaks: Vec<WaveformPeaks>,
 }
 
 pub(crate) struct ExportSnapshots {
     pub(crate) epoch: u64,
     pub(crate) tracks: Arc<[FrozenTrack]>,
     pub(crate) mask: u32,
+    /// The speaker layout of a main input wider than stereo in `tracks`.
+    pub(crate) wide: Option<WideLayout>,
 }
 
 impl Consumer {
     fn wav_mask(&self) -> u32 {
+        self.shown_wide().map_or(0, |wide| wide.mask)
+    }
+
+    /// The layout of the main input when it is wider than stereo and being captured.
+    fn shown_wide(&self) -> Option<&WideLayout> {
         self.wide
             .as_ref()
             .filter(|_| self.input != CaptureInput::Sidechain)
-            .map_or(0, |wide| wide.mask)
+    }
+
+    fn timeline(&self, epoch: u64) -> WaveformTimeline {
+        let frames = self.capture.frame_range();
+        WaveformTimeline {
+            epoch,
+            bar_markers: self.capture.bar_markers(frames.clone()),
+            frames,
+            sample_rate: self.sample_rate,
+            channels: self.capture.track_channels(0).unwrap_or(1),
+            wide: self.shown_wide().cloned(),
+            b_channels: self.capture.track_channels(1),
+            retention_seconds: self.capture.effective_retention_seconds(),
+        }
+    }
+
+    /// Peaks for `rows` of a capture wider than stereo over `range`.
+    fn rows(
+        &mut self,
+        rows: &[WideRow],
+        range: Range<u64>,
+        bins: usize,
+        peaks: &mut Vec<WaveformPeaks>,
+    ) {
+        let cache = &mut self.waveform.rows;
+        let revision = self.capture.revision();
+        if cache.revision != Some(revision)
+            || cache.rows != rows
+            || cache.range != range
+            || cache.bins != bins
+        {
+            cache.peaks.resize_with(rows.len(), WaveformPeaks::default);
+            for (row, trace) in rows.iter().zip(&mut cache.peaks) {
+                trace.minimum.resize(bins, 0.0);
+                trace.maximum.resize(bins, 0.0);
+                let (minimum, maximum) = (&mut trace.minimum, &mut trace.maximum);
+                match (*row, &self.wide) {
+                    (WideRow::Pair(side), Some(wide)) => {
+                        self.capture.track_pair_waveform_range(
+                            0,
+                            &wide.group,
+                            side,
+                            range.clone(),
+                            minimum,
+                            maximum,
+                        );
+                    }
+                    (WideRow::Channel(channel), _) => {
+                        self.capture.track_channel_waveform_range(
+                            0,
+                            channel,
+                            range.clone(),
+                            minimum,
+                            maximum,
+                        );
+                    }
+                    (WideRow::Sidechain, _) => {
+                        self.capture.track_waveform_range(
+                            1,
+                            WaveformView::Merged,
+                            range.clone(),
+                            minimum,
+                            maximum,
+                        );
+                    }
+                    (WideRow::Pair(_), None) => {
+                        minimum.fill(0.0);
+                        maximum.fill(0.0);
+                    }
+                }
+            }
+            cache.revision = Some(revision);
+            cache.rows.clear();
+            cache.rows.extend_from_slice(rows);
+            cache.range = range;
+            cache.bins = bins;
+        }
+        peaks.clone_from(&cache.peaks);
     }
 
     fn has_fresh_input(&self) -> bool {
@@ -807,6 +904,7 @@ impl Session {
                 epoch: editing.timeline.epoch,
                 tracks: editing.snapshots,
                 mask: editing.timeline.wide.as_ref().map_or(0, |w| w.mask),
+                wide: editing.timeline.wide.clone(),
             });
         }
         let mut state = self.lock();
@@ -820,6 +918,7 @@ impl Session {
             epoch,
             tracks: track_snapshots(&consumer.capture).into(),
             mask: consumer.wav_mask(),
+            wide: consumer.shown_wide().cloned(),
         })
     }
 
@@ -903,18 +1002,35 @@ impl Session {
             .filter(|range| !range.is_empty())
             .unwrap_or_else(|| frames.clone());
         consumer.waveform(layout, range, bins, peaks);
-        WaveformTimeline {
-            epoch,
-            bar_markers: consumer.capture.bar_markers(frames.clone()),
-            frames,
-            sample_rate: consumer.sample_rate,
-            channels: consumer.capture.track_channels(0).unwrap_or(1),
-            wide: consumer
-                .wide
-                .clone()
-                .filter(|_| consumer.input != CaptureInput::Sidechain),
-            b_channels: consumer.capture.track_channels(1),
-        }
+        consumer.timeline(epoch)
+    }
+
+    /// Like [`Self::try_waveform_in_range_with_bins`] for the `rows` of a capture wider than
+    /// stereo: `peaks` gets one entry per row, in the order asked.
+    pub(crate) fn try_wide_rows(
+        &self,
+        rows: &[WideRow],
+        visible: Option<Range<u64>>,
+        bins: usize,
+        peaks: &mut Vec<WaveformPeaks>,
+    ) -> Option<WaveformTimeline> {
+        let mut state = self.state.try_lock().ok()?;
+        let bins = bins.clamp(1, backtracking_core::waveform::MAX_WAVEFORM_BINS);
+        let epoch = state.timeline_epoch;
+        let Some(consumer) = &mut state.consumer else {
+            peaks.clear();
+            return Some(WaveformTimeline {
+                epoch,
+                ..WaveformTimeline::default()
+            });
+        };
+        let frames = consumer.capture.frame_range();
+        let range = visible
+            .map(|range| range.start.max(frames.start)..range.end.min(frames.end))
+            .filter(|range| !range.is_empty())
+            .unwrap_or(frames);
+        consumer.rows(rows, range, bins, peaks);
+        Some(consumer.timeline(epoch))
     }
 
 
@@ -992,6 +1108,7 @@ impl Session {
             track_snapshots(&consumer.capture).into()
         };
         let mask = state.consumer.as_ref()?.wav_mask();
+        let wide = state.consumer.as_ref()?.shown_wide().cloned();
         let available = snapshots.first()?.frame_range();
         let range = selected
             .clone()
@@ -1020,6 +1137,7 @@ impl Session {
             epoch,
             range,
             mask,
+            wide,
             relative: first..end,
             fades,
         })
@@ -1066,21 +1184,9 @@ impl Session {
         // Pin the already displayed material before queued audio advances the
         // rolling boundary. The audio callback continues accepting packets.
         if state.editing_pending && let Some(consumer) = &state.consumer {
-            let frames = consumer.capture.frame_range();
             let editing = EditingSnapshot {
                 token: state.edit_serial,
-                timeline: Arc::new(WaveformTimeline {
-                    epoch: state.timeline_epoch,
-                    bar_markers: consumer.capture.bar_markers(frames.clone()),
-                    frames,
-                    sample_rate: consumer.sample_rate,
-                    channels: consumer.capture.track_channels(0).unwrap_or(1),
-                    wide: consumer
-                        .wide
-                        .clone()
-                        .filter(|_| consumer.input != CaptureInput::Sidechain),
-                    b_channels: consumer.capture.track_channels(1),
-                }),
+                timeline: Arc::new(consumer.timeline(state.timeline_epoch)),
                 snapshots: track_snapshots(&consumer.capture).into(),
             };
             state.editing = Some(editing);
@@ -1107,6 +1213,8 @@ fn track_snapshots(capture: &Capture) -> Vec<FrozenTrack> {
 
 struct SnapshotJob {
     mask: u32,
+    /// The layout of a main input wider than stereo, written in the mode the settings choose.
+    wide: Option<WideLayout>,
     settings: SessionSettings,
     snapshots: Arc<[FrozenTrack]>,
     epoch: u64,
@@ -1124,7 +1232,12 @@ enum SnapshotAttempt {
 
 impl SnapshotJob {
     fn write(self) -> SnapshotResult {
-        let result = crate::surround::export(
+        let wide = self.wide.map(|layout| WideSave {
+            layout,
+            mode: self.settings.wide_export,
+            pair_binaural: self.settings.pair_render.binaural(),
+        });
+        let result = crate::surround::export_clip(
             &self.settings.saved_dir,
             &self.snapshots,
             self.relative,
@@ -1133,6 +1246,7 @@ impl SnapshotJob {
             self.tempo,
             self.fades,
             self.mask,
+            wide.as_ref(),
         )
         .map_err(|error| error.to_string());
         (self.epoch, self.range, result)

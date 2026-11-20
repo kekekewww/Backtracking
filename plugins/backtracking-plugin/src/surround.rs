@@ -1,11 +1,13 @@
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use backtracking_core::{
-    ChannelRoute, Fades, FrozenTrack, TrackAudio, WavExportProfile, WaveformView,
-    export_routed_tracks_with_fades,
+    ChannelRoute, Fades, FrozenTrack, Lane, TakeLabel, TrackAudio, WavExportProfile, WaveformView,
+    export_labelled_tracks, export_routed_tracks_with_fades,
     waveform::{PairGroup, PairSide},
+    wide_export::{WideExportGroup, WideExportMode, WideRowExport, export_wide_track},
 };
 
 use crate::session::WaveformPeaks;
@@ -53,6 +55,8 @@ pub(super) fn speaker_labels(bits: &[u32]) -> Vec<String> {
 pub(crate) struct WideLayout {
     pub(crate) group: PairGroup,
     pub(crate) mask: u32,
+    /// One speaker name per channel, in stream order.
+    pub(crate) labels: Arc<[String]>,
 }
 
 impl WideLayout {
@@ -84,7 +88,18 @@ impl WideLayout {
         Some(Self {
             group: PairGroup::new(0, names)?,
             mask,
+            labels: names.into(),
         })
+    }
+
+    /// The rows of a lane this wide: L and R, then one per channel.
+    pub(crate) fn rows(&self) -> impl Iterator<Item = WideRow> + use<> {
+        [
+            WideRow::Pair(PairSide::Left),
+            WideRow::Pair(PairSide::Right),
+        ]
+        .into_iter()
+        .chain((0..self.labels.len()).map(WideRow::Channel))
     }
 
     pub(super) fn peaks(
@@ -116,6 +131,109 @@ impl WideLayout {
             }
         }
     }
+}
+
+/// One row of the waveform of a capture wider than stereo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WideRow {
+    /// A side of the stereo fold-down of every channel.
+    Pair(PairSide),
+    /// One channel of the main input, counted from zero.
+    Channel(usize),
+    /// The sidechain captured too, merged to one row.
+    Sidechain,
+}
+
+/// How a capture wider than stereo is written: its channels in `mode`, with the L/R file
+/// rendered as set on the Capture page.
+#[derive(Clone)]
+pub(crate) struct WideSave {
+    pub(crate) layout: WideLayout,
+    pub(crate) mode: WideExportMode,
+    pub(crate) pair_binaural: bool,
+}
+
+/// Writes a clip as [`export`] does, except that a main input wider than stereo with a
+/// matching `wide` goes through the core's wide export, as on the desktop. A sidechain captured
+/// too is written as before. All files of a failed clip are removed.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn export_clip(
+    output: &Path,
+    tracks: &[FrozenTrack],
+    range: Range<usize>,
+    profile: WavExportProfile,
+    force_mono: bool,
+    tempo: Option<f64>,
+    fades: Fades,
+    mask: u32,
+    wide: Option<&WideSave>,
+) -> io::Result<Vec<PathBuf>> {
+    let (main, side) = match tracks {
+        [main] => (main, None),
+        [main, side] => (main, Some(side)),
+        _ => {
+            return export(
+                output, tracks, range, profile, force_mono, tempo, fades, mask,
+            );
+        }
+    };
+    let Some(wide) = wide.filter(|wide| main.channels() == wide.layout.labels.len()) else {
+        return export(
+            output, tracks, range, profile, force_mono, tempo, fades, mask,
+        );
+    };
+    // The files of a two-input clip are told apart by their lane, as before.
+    let label = TakeLabel::new("", side.map(|_| Lane::A));
+    let group = WideExportGroup {
+        channels: 0..main.channels(),
+        labels: &wide.layout.labels,
+        positioned: false,
+    };
+    let rows = WideRowExport {
+        pair: true,
+        pair_binaural: wide.pair_binaural,
+        ..WideRowExport::default()
+    };
+    // The core names wide files without the host tempo.
+    let mut paths = export_wide_track(
+        output,
+        main,
+        range.clone(),
+        fades,
+        profile,
+        &label,
+        Some(&group),
+        wide.mode,
+        &rows,
+    )?
+    .paths;
+    let finished = (|| {
+        if wide.mode == WideExportMode::Multichannel && wide.layout.mask != 0 {
+            // The one multichannel file comes first and is the only one as wide as the capture.
+            write_mask(&paths[0], main.channels(), wide.layout.mask)?;
+        }
+        if let Some(side) = side {
+            paths.extend(export_labelled_tracks(
+                output,
+                std::slice::from_ref(side),
+                range,
+                profile,
+                &[ChannelRoute::Merged],
+                force_mono,
+                tempo,
+                fades,
+                &[TakeLabel::new("", Some(Lane::B))],
+            )?);
+        }
+        Ok(())
+    })();
+    if let Err(err) = finished {
+        for path in &paths {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(err);
+    }
+    Ok(paths)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -313,6 +431,221 @@ mod tests {
                 .all(|b| f32::from_le_bytes(*b) == 0.375)
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The channel count and the float samples of a WAV written with the default profile.
+    fn read_wav(path: &Path) -> (usize, Vec<f32>) {
+        let bytes = std::fs::read(path).unwrap();
+        let channels = usize::from(u16::from_le_bytes([bytes[22], bytes[23]]));
+        let data = bytes.windows(4).position(|c| c == b"data").unwrap() + 8;
+        let samples = bytes[data..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        (channels, samples)
+    }
+
+    fn rms(samples: impl Iterator<Item = f32>) -> f64 {
+        let (sum, count) = samples.fold((0.0, 0), |(sum, count), s| {
+            (sum + f64::from(s).powi(2), count + 1)
+        });
+        (sum / f64::from(count)).sqrt()
+    }
+
+    /// Whether the rising zero crossings of `samples` are `period` samples apart.
+    fn crossings_every(samples: &[f32], period: f64) -> bool {
+        let crossings: Vec<_> = samples
+            .windows(2)
+            .enumerate()
+            .filter(|(_, p)| p[0] < 0. && p[1] >= 0.)
+            .map(|(i, _)| i)
+            .collect();
+        crossings.len() > 4
+            && crossings
+                .windows(2)
+                .all(|p| ((p[1] - p[0]) as f64 - period).abs() <= 1.)
+    }
+
+    #[test]
+    fn each_wide_export_mode_writes_the_expected_files_from_a_twelve_channel_capture() {
+        let labels = speaker_labels(&[0, 1, 2, 3, 4, 5, 9, 10, 12, 14, 15, 17]);
+        let layout = WideLayout::new(12, &labels).unwrap();
+        let frames = 9600;
+        let tone = |i: usize, ch: usize| {
+            (0.25
+                * ((i as f64 + 0.125) * (ch + 1) as f64 * 100. * std::f64::consts::TAU / 48000.)
+                    .sin()) as f32
+        };
+        let audio: Vec<_> = (0..frames)
+            .flat_map(|i| (0..12).map(move |ch| tone(i, ch)))
+            .collect();
+        let main = FrozenTrack::from_interleaved(48000, 12, 100, &audio).unwrap();
+        let side =
+            FrozenTrack::from_interleaved(48000, 2, 100, &[0.5, 0.25].repeat(frames)).unwrap();
+        let names: Vec<_> = labels.iter().map(String::as_str).collect();
+        let weights = backtracking_core::spatial::stereo_weights(&names);
+        let channel_suffixes = |end: &str| -> Vec<String> {
+            labels
+                .iter()
+                .enumerate()
+                .map(|(ch, label)| format!("-Ch{:02}_{label}{end}", ch + 1))
+                .collect()
+        };
+        for (mode, pair_binaural, mut expected) in [
+            (
+                WideExportMode::BinauralFiles,
+                false,
+                channel_suffixes("_binaural"),
+            ),
+            (WideExportMode::MonoFiles, true, channel_suffixes("")),
+            (WideExportMode::Multichannel, false, vec![String::new()]),
+            (WideExportMode::BinauralMix, false, vec!["-Binaural".into()]),
+            (WideExportMode::BinauralMix, true, Vec::new()),
+        ] {
+            expected.push(
+                if pair_binaural {
+                    "-Binaural"
+                } else {
+                    "-Stereo"
+                }
+                .into(),
+            );
+            let save = WideSave {
+                layout: layout.clone(),
+                mode,
+                pair_binaural,
+            };
+            for with_side in [false, true] {
+                let dir = std::env::temp_dir()
+                    .join(format!("s3-4b-wide-{}", backtracking_core::new_sender_id()));
+                let tracks = if with_side {
+                    vec![main.clone(), side.clone()]
+                } else {
+                    vec![main.clone()]
+                };
+                let paths = export_clip(
+                    &dir,
+                    &tracks,
+                    0..frames,
+                    WavExportProfile::default(),
+                    true,
+                    Some(120.0),
+                    Fades::NONE,
+                    layout.mask,
+                    Some(&save),
+                )
+                .unwrap();
+                // Everything after the length of the take: the lane, then the file's part.
+                let suffixes: Vec<_> = paths
+                    .iter()
+                    .map(|path| {
+                        let name = path.file_name().unwrap().to_str().unwrap();
+                        assert!(name.starts_with("Backtracking_"), "{name}");
+                        let (_, rest) = name.split_once("_0.2s").unwrap();
+                        rest.strip_suffix(".wav").unwrap().to_owned()
+                    })
+                    .collect();
+                let mut wanted: Vec<_> = expected
+                    .iter()
+                    .map(|suffix| {
+                        if with_side {
+                            format!("-A{suffix}")
+                        } else {
+                            suffix.clone()
+                        }
+                    })
+                    .collect();
+                if with_side {
+                    // The sidechain is written as before, with the tempo the host reported.
+                    wanted.push("_120bpm-B".into());
+                }
+                assert_eq!(suffixes, wanted, "{mode:?} {pair_binaural} {with_side}");
+                for (path, suffix) in paths.iter().zip(&expected) {
+                    let (channels, samples) = read_wav(path);
+                    // The far ear of a binaural render starts after the sound reaches it, a few samples in.
+                    let onset = if suffix.contains("inaural") {
+                        2 * 64
+                    } else {
+                        0
+                    };
+                    let zeros: Vec<_> = samples
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| **s == 0.)
+                        .map(|(i, _)| i)
+                        .collect();
+                    assert!(zeros.iter().all(|&i| i < onset), "{suffix} {zeros:?}");
+                    match suffix.as_str() {
+                        "" => {
+                            assert_eq!(channels, 12);
+                            let bytes = std::fs::read(path).unwrap();
+                            assert_eq!(&bytes[40..44], &0x2d63fu32.to_le_bytes());
+                            assert_eq!(samples, audio);
+                        }
+                        "-Stereo" => {
+                            assert_eq!(channels, 2);
+                            for (frame, pair) in samples.as_chunks::<2>().0.iter().enumerate() {
+                                for (ear, sample) in pair.iter().enumerate() {
+                                    let mixed: f32 =
+                                        (0..12).map(|ch| weights[ch][ear] * tone(frame, ch)).sum();
+                                    assert!((sample - mixed).abs() < 1e-5);
+                                }
+                            }
+                        }
+                        "-Binaural" => {
+                            assert_eq!(channels, 2);
+                            assert!(rms(samples.iter().copied()) > 0.01);
+                        }
+                        _ => {
+                            let ch = suffix[3..5].parse::<usize>().unwrap() - 1;
+                            let period = 480. / (ch + 1) as f64;
+                            if mode == WideExportMode::MonoFiles {
+                                assert_eq!(channels, 1);
+                                let own: Vec<_> = (0..frames).map(|i| tone(i, ch)).collect();
+                                assert_eq!(samples, own);
+                                let level = rms(samples.iter().copied());
+                                assert!((level - 0.25 / std::f64::consts::SQRT_2).abs() < 1e-6);
+                                assert!(crossings_every(&samples, period));
+                            } else {
+                                assert_eq!(channels, 2);
+                                // Past the filter's start, each ear carries the channel's tone.
+                                let steady = &samples[4800..];
+                                let ears = [0, 1].map(|ear| {
+                                    steady
+                                        .iter()
+                                        .skip(ear)
+                                        .step_by(2)
+                                        .copied()
+                                        .collect::<Vec<_>>()
+                                });
+                                for ear in &ears {
+                                    assert!(crossings_every(ear, period), "{suffix}");
+                                }
+                                let [left, right] = ears.map(|ear| rms(ear.into_iter()));
+                                let label = labels[ch].as_str();
+                                match label {
+                                    "FL" | "Lb" | "Ls" | "TFL" | "TBL" => {
+                                        assert!(left > right, "{label}: {left} {right}");
+                                    }
+                                    "FR" | "Rb" | "Rs" | "TFR" | "TBR" => {
+                                        assert!(right > left, "{label}: {left} {right}");
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                if with_side {
+                    let (channels, samples) = read_wav(paths.last().unwrap());
+                    assert_eq!(channels, 1);
+                    assert!(samples.iter().all(|&s| s == 0.375));
+                }
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
     }
 
     #[test]

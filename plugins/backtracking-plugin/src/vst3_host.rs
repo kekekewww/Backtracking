@@ -186,13 +186,7 @@ fn exercise(
 fn process_surround_dll() {
     let path = std::env::var_os("BACKTRACKING_TEST_VST3").unwrap();
     let profile = std::env::var("LOCALAPPDATA").unwrap();
-    assert!(
-        std::path::Path::new(&profile)
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("s3-3-")
-    );
+    assert!(test_profile(std::path::Path::new(&profile)));
     unsafe {
         let module = libloading::Library::new(path).unwrap();
         let factory = module
@@ -237,7 +231,7 @@ fn process_surround_dll() {
         );
         #[cfg(feature = "editor")]
         if let Some((editor, path)) = editor {
-            editor.capture(std::path::Path::new(&path));
+            let _ = editor.capture(std::path::Path::new(&path));
         }
         exercise(
             &component,
@@ -257,6 +251,306 @@ fn process_surround_dll() {
     }
 }
 
+/// Whether `profile` is a test profile folder, which the host may use as LOCALAPPDATA.
+fn test_profile(profile: &std::path::Path) -> bool {
+    let name = profile.file_name().unwrap_or_default().to_string_lossy();
+    name.starts_with("s3-3-") || name.starts_with("s3-4b-")
+}
+
+/// One step of a scripted editor run, from `S3_4B_STEPS`. Points are in the editor's pixels.
+#[cfg(feature = "editor")]
+#[derive(Debug)]
+enum Step {
+    /// Save the editor's last displayed frame as this PNG, in `S3_4B_OUT`.
+    Png(String),
+    Move(i32, i32),
+    /// A press and release of the left (`false`) or right (`true`) button where the pointer is.
+    Press(bool),
+    /// Turns of the wheel where the pointer is; negative turns scroll down.
+    Wheel(i32),
+    /// The pointer leaves the editor.
+    Leave,
+    Wait(u64),
+    /// The snapshot shortcut, as the desktop sends it to the Sender.
+    Snapshot,
+    /// Waits until the saved folder has WAV files and stops changing.
+    Saved,
+    /// The host gives the editor this size, as when the user resizes the plug-in window.
+    Size(i32, i32),
+    /// The host puts the editor's window back to this size itself, as a host that keeps plug-in
+    /// windows at the size they opened with. The editor cannot be resized by a host otherwise.
+    Clamp(i32, i32),
+}
+
+#[cfg(feature = "editor")]
+fn steps(script: &str) -> std::collections::VecDeque<Step> {
+    let point = |text: &str| {
+        let mut parts = text
+            .split(',')
+            .map(|part| part.trim().parse::<i32>().unwrap());
+        (parts.next().unwrap(), parts.next().unwrap(), parts.next())
+    };
+    let mut steps = std::collections::VecDeque::new();
+    for item in script
+        .split(';')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let (name, argument) = item.split_once(':').unwrap_or((item, ""));
+        match name {
+            "png" => steps.push_back(Step::Png(argument.to_owned())),
+            "move" | "click" | "rclick" | "wheel" => {
+                let (x, y, turns) = point(argument);
+                steps.extend([Step::Move(x, y), Step::Wait(150)]);
+                steps.push_back(match name {
+                    "click" => Step::Press(false),
+                    "rclick" => Step::Press(true),
+                    "wheel" => Step::Wheel(turns.unwrap()),
+                    _ => Step::Wait(0),
+                });
+                steps.push_back(Step::Wait(400));
+            }
+            "leave" => steps.extend([Step::Leave, Step::Wait(400)]),
+            "wait" => steps.push_back(Step::Wait(argument.parse().unwrap())),
+            "size" | "clamp" => {
+                let (width, height, _) = point(argument);
+                steps.push_back(if name == "size" {
+                    Step::Size(width, height)
+                } else {
+                    Step::Clamp(width, height)
+                });
+                steps.push_back(Step::Wait(600));
+            }
+            "snapshot" => steps.push_back(Step::Snapshot),
+            "saved" => steps.push_back(Step::Saved),
+            _ => panic!("unknown step {item}"),
+        }
+    }
+    steps
+}
+
+/// The WAV files under `folder` and their total size.
+#[cfg(feature = "editor")]
+fn saved_files(folder: &std::path::Path) -> (usize, u64) {
+    let mut found = (0, 0);
+    for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let (count, bytes) = saved_files(&path);
+            found = (found.0 + count, found.1 + bytes);
+        } else if path.extension().is_some_and(|extension| extension == "wav") {
+            found = (
+                found.0 + 1,
+                found.1 + entry.metadata().map_or(0, |data| data.len()),
+            );
+        }
+    }
+    found
+}
+
+/// Drives the shipped DLL's editor through one scenario for pictures and saves. The scenario
+/// comes from the environment: `S3_4B_LAYOUT` (`7.1.4`, the default, or `stereo`),
+/// `S3_4B_SIDECHAIN` (any value adds a stereo sidechain bus and captures both),
+/// `S3_4B_FIELDS` (`key=value;...` added to the saved settings), `S3_4B_FRAME` (`0` for a host
+/// that refuses to resize the editor), `S3_4B_HOLD_SECONDS` (audio before the first step),
+/// `S3_4B_STEPS` (see [`steps`]) and `S3_4B_OUT` (the folder for pictures). Saves go to the
+/// profile's `saved` folder. Every channel gets its own tone, quieter as the channel number
+/// rises, and every output block must equal its input.
+#[cfg(feature = "editor")]
+#[test]
+#[ignore = "set BACKTRACKING_TEST_VST3 to the release DLL, LOCALAPPDATA to a test profile and S3_4B_* to the scenario"]
+fn editor_pictures_dll() {
+    use nice_plug::params::persist::serialize_field;
+    use std::collections::BTreeMap;
+    let var = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let path = var("BACKTRACKING_TEST_VST3").unwrap();
+    let profile = std::path::PathBuf::from(var("LOCALAPPDATA").unwrap());
+    assert!(test_profile(&profile));
+    let out = var("S3_4B_OUT").map_or_else(|| profile.clone(), std::path::PathBuf::from);
+    let mut main = if var("S3_4B_LAYOUT").as_deref() == Some("stereo") {
+        kStereo
+    } else {
+        k71_4
+    };
+    let sidechain = var("S3_4B_SIDECHAIN").is_some();
+    let saved = profile.join("saved");
+    let mut fields = BTreeMap::from([
+        ("sender_enabled".to_owned(), "true".to_owned()),
+        ("sender_instance_id".to_owned(), ID.to_owned()),
+        ("sender_name".to_owned(), "S3-4b plug-in".to_owned()),
+        (
+            "saved_dir".to_owned(),
+            serialize_field(saved.as_os_str()).unwrap(),
+        ),
+        (
+            "output_dir".to_owned(),
+            serialize_field(profile.join("output").as_os_str()).unwrap(),
+        ),
+    ]);
+    if sidechain {
+        fields.insert("capture_input".to_owned(), "both".to_owned());
+    }
+    for field in var("S3_4B_FIELDS").unwrap_or_default().split(';') {
+        if let Some((key, value)) = field.split_once('=') {
+            fields.insert(key.trim().to_owned(), value.trim().to_owned());
+        }
+    }
+    let state = format!(
+        r#"{{"params":{{}},"fields":{{"capture_settings_v1":{}}}}}"#,
+        serialize_field(&serialize_field(&fields).unwrap()).unwrap()
+    );
+    let state: &'static [u8] = Box::leak(state.into_bytes().into_boxed_slice());
+    let mut script = steps(&var("S3_4B_STEPS").unwrap_or_default());
+    let hold =
+        Duration::from_secs_f64(var("S3_4B_HOLD_SECONDS").map_or(0.0, |s| s.parse().unwrap()));
+    let resizable = var("S3_4B_FRAME").as_deref() != Some("0");
+    unsafe {
+        let module = libloading::Library::new(path).unwrap();
+        let factory = module
+            .get::<extern "system" fn() -> *mut IPluginFactory>(b"GetPluginFactory\0")
+            .unwrap();
+        let factory = ComPtr::from_raw(factory()).unwrap();
+        let mut info: PClassInfo = std::mem::zeroed();
+        assert_eq!(factory.getClassInfo(0, &mut info), kResultOk);
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            factory.createInstance(info.cid.as_ptr(), IComponent::IID.as_ptr().cast(), &mut raw),
+            kResultOk
+        );
+        let component = ComPtr::<IComponent>::from_raw(raw.cast()).unwrap();
+        assert_eq!(component.initialize(ptr::null_mut()), kResultOk);
+        let processor = component.cast::<IAudioProcessor>().unwrap();
+        let state = ComWrapper::new(State(RefCell::new(Cursor::new(state))));
+        assert_eq!(
+            component.setState(state.as_com_ref::<IBStream>().unwrap().as_ptr()),
+            kResultOk
+        );
+        let mut setup = ProcessSetup {
+            processMode: 0,
+            symbolicSampleSize: 0,
+            maxSamplesPerBlock: FRAMES as i32,
+            sampleRate: 48000.,
+        };
+        assert_eq!(processor.setupProcessing(&mut setup), kResultOk);
+        let window = editor_window::Window::open_framed(&component, resizable);
+        let mut inputs = [main, kStereo];
+        let buses = 1 + i32::from(sidechain);
+        assert_eq!(
+            processor.setBusArrangements(inputs.as_mut_ptr(), buses, &mut main, 1),
+            kResultOk
+        );
+        assert_eq!(component.setActive(1), kResultOk);
+        assert_eq!(processor.setProcessing(1), kResultOk);
+        let width = main.count_ones() as usize;
+        let channels = width + if sidechain { 2 } else { 0 };
+        let mut tones: Vec<Vec<f32>> = (0..channels)
+            .map(|ch| {
+                let amplitude = 0.6 - 0.035 * ch as f64;
+                (0..FRAMES)
+                    .map(|i| {
+                        (amplitude
+                            * ((i as f64 + 0.125) * (ch + 1) as f64 * std::f64::consts::TAU
+                                / FRAMES as f64)
+                                .sin()) as f32
+                    })
+                    .collect()
+            })
+            .collect();
+        let expected: Vec<Vec<u32>> = tones[..width]
+            .iter()
+            .map(|tone| tone.iter().map(|s| s.to_bits()).collect())
+            .collect();
+        let mut output = vec![vec![0.; FRAMES]; width];
+        let (main_tones, aux_tones) = tones.split_at_mut(width);
+        let mut main_pointers: Vec<_> = main_tones.iter_mut().map(Vec::as_mut_ptr).collect();
+        let mut aux_pointers: Vec<_> = aux_tones.iter_mut().map(Vec::as_mut_ptr).collect();
+        let mut outputs: Vec<_> = output.iter_mut().map(Vec::as_mut_ptr).collect();
+        let mut input_buses = [bus(&mut main_pointers), bus(&mut aux_pointers)];
+        let mut output_bus = bus(&mut outputs);
+        let mut data = ProcessData {
+            numSamples: FRAMES as i32,
+            numInputs: buses,
+            numOutputs: 1,
+            inputs: input_buses.as_mut_ptr(),
+            outputs: &mut output_bus,
+            ..std::mem::zeroed()
+        };
+        let start = Instant::now();
+        let mut next = start;
+        let mut ready = start + hold;
+        let mut settled = (0, 0, start);
+        loop {
+            for channel in &mut output {
+                channel.fill(f32::NAN);
+            }
+            assert_eq!(processor.process(&mut data), kResultOk);
+            for (out, want) in output.iter().zip(&expected) {
+                assert!(out.iter().map(|s| s.to_bits()).eq(want.iter().copied()));
+            }
+            window.pump();
+            let now = Instant::now();
+            if now >= ready {
+                let Some(step) = script.pop_front() else {
+                    break;
+                };
+                ready = now;
+                match &step {
+                    Step::Png(name) => {
+                        let size = window.capture(&out.join(name));
+                        println!("{name}: {} x {}", size.0, size.1);
+                    }
+                    Step::Move(x, y) => window.send(0x0200, 0, *x, *y),
+                    Step::Press(right) => {
+                        let (down, up, held) = if *right {
+                            (0x0204, 0x0205, 2)
+                        } else {
+                            (0x0201, 0x0202, 1)
+                        };
+                        // Back to back, so the editor holds the pointer capture for no time.
+                        window.send(down, held, -1, -1);
+                        window.send(up, 0, -1, -1);
+                    }
+                    Step::Wheel(turns) => {
+                        window.send(0x020A, ((turns * 120) as i16 as u16 as usize) << 16, -1, -1)
+                    }
+                    Step::Leave => window.send(0x02A3, 0, -1, -1),
+                    Step::Size(width, height) => window.resize(*width, *height),
+                    Step::Clamp(width, height) => window.clamp(*width, *height),
+                    Step::Wait(ms) => ready = now + Duration::from_millis(*ms),
+                    Step::Snapshot => {
+                        if backtracking_core::request_sender_snapshot(ID).is_err() {
+                            ready = now + Duration::from_millis(100);
+                            script.push_front(step);
+                        }
+                    }
+                    Step::Saved => {
+                        let (count, bytes) = saved_files(&saved);
+                        if (count, bytes) != (settled.0, settled.1) {
+                            settled = (count, bytes, now);
+                        }
+                        if count == 0 || now < settled.2 + Duration::from_millis(1500) {
+                            assert!(
+                                now < start + hold + Duration::from_secs(120),
+                                "no saved files"
+                            );
+                            ready = now + Duration::from_millis(250);
+                            script.push_front(step);
+                        } else {
+                            println!("saved {count} files, {bytes} bytes");
+                        }
+                    }
+                }
+            }
+            next += Duration::from_secs_f64(FRAMES as f64 / 48000.);
+            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        }
+        assert_eq!(processor.setProcessing(0), kResultOk);
+        assert_eq!(component.setActive(0), kResultOk);
+        drop(window);
+        assert_eq!(component.terminate(), kResultOk);
+    }
+}
+
 #[cfg(feature = "editor")]
 mod editor_window {
     use super::*;
@@ -265,9 +559,29 @@ mod editor_window {
         core::w,
     };
 
-    pub(super) struct Window(HWND, ComPtr<IPlugView>);
+    /// A host frame that resizes the editor when it asks, on the next pump, as hosts do.
+    pub(super) struct Frame(std::sync::Mutex<Option<ViewRect>>);
+    impl Class for Frame {
+        type Interfaces = (IPlugFrame,);
+    }
+    impl IPlugFrameTrait for Frame {
+        unsafe fn resizeView(&self, _view: *mut IPlugView, size: *mut ViewRect) -> tresult {
+            if size.is_null() {
+                return kInvalidArgument;
+            }
+            *self.0.lock().unwrap() = Some(unsafe { *size });
+            kResultOk
+        }
+    }
+
+    pub(super) struct Window(HWND, ComPtr<IPlugView>, Option<ComWrapper<Frame>>);
     impl Window {
         pub(super) unsafe fn open(component: &ComPtr<IComponent>) -> Self {
+            unsafe { Self::open_framed(component, false) }
+        }
+
+        /// Opens the editor; with `resizable`, under a frame that grants its size requests.
+        pub(super) unsafe fn open_framed(component: &ComPtr<IComponent>, resizable: bool) -> Self {
             unsafe {
                 let controller = component.cast::<IEditController>().unwrap();
                 let view = ComPtr::from_raw(controller.createView(ViewType::kEditor)).unwrap();
@@ -288,8 +602,75 @@ mod editor_window {
                     None,
                 )
                 .unwrap();
+                let frame = resizable.then(|| ComWrapper::new(Frame(Default::default())));
+                if let Some(frame) = &frame {
+                    let frame = frame.as_com_ref::<IPlugFrame>().unwrap();
+                    assert_eq!(view.setFrame(frame.as_ptr()), kResultOk);
+                }
                 assert_eq!(view.attached(parent.0, kPlatformTypeHWND), kResultOk);
-                Self(parent, view)
+                Self(parent, view, frame)
+            }
+        }
+
+        /// Handles the editor's messages, and after each one a size it asked the frame for, as
+        /// a host that resizes at once. The real pointer is elsewhere, so Windows says at once
+        /// that a pointer moved here left; that message is dropped and the pointer stays until a
+        /// `Leave` step.
+        pub(super) fn pump(&self) {
+            let mut msg = MSG::default();
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    if msg.message != 0x02A3 {
+                        dispatch(&msg);
+                    }
+                    let requested = self
+                        .2
+                        .as_ref()
+                        .and_then(|frame| frame.0.lock().unwrap().take());
+                    if let Some(rect) = requested {
+                        self.resize(rect.right - rect.left, rect.bottom - rect.top);
+                    }
+                }
+            }
+        }
+
+        /// Gives the editor `width` x `height`, as a host does when its window is resized.
+        pub(super) fn resize(&self, width: i32, height: i32) {
+            let mut rect = ViewRect {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
+            unsafe {
+                let flags = SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE;
+                SetWindowPos(self.0, None, 0, 0, width, height, flags).unwrap();
+                assert_eq!(self.1.onSize(&mut rect), kResultOk);
+            }
+        }
+
+        /// Sets the parent and the editor's own window to `width` x `height`.
+        pub(super) fn clamp(&self, width: i32, height: i32) {
+            unsafe {
+                let flags = SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE;
+                SetWindowPos(self.0, None, 0, 0, width, height, flags).unwrap();
+                let child = GetWindow(self.0, GW_CHILD).unwrap();
+                SetWindowPos(child, None, 0, 0, width, height, flags).unwrap();
+            }
+        }
+
+        /// Sends a mouse message to the editor at `x`, `y`, or where the pointer is for -1.
+        pub(super) fn send(&self, message: u32, wparam: usize, x: i32, y: i32) {
+            unsafe {
+                let child = GetWindow(self.0, GW_CHILD).unwrap();
+                let lparam = ((y as u16 as u32) << 16 | x as u16 as u32) as isize;
+                let lparam = (x >= 0).then_some(windows::Win32::Foundation::LPARAM(lparam));
+                SendMessageW(
+                    child,
+                    message,
+                    Some(windows::Win32::Foundation::WPARAM(wparam)),
+                    lparam,
+                );
             }
         }
     }
@@ -297,8 +678,24 @@ mod editor_window {
         let mut msg = MSG::default();
         unsafe {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+                dispatch(&msg);
+            }
+        }
+    }
+
+    /// Dispatches one message. An editor that grew past a parent this host has not resized
+    /// keeps an update region outside the parent that the editor never validates, so Windows
+    /// would send WM_PAINT forever; this host validates it.
+    unsafe fn dispatch(msg: &MSG) {
+        unsafe {
+            let _ = TranslateMessage(msg);
+            DispatchMessageW(msg);
+            let mut rect = windows::Win32::Foundation::RECT::default();
+            if msg.message == 0x000F
+                && GetUpdateRect(msg.hwnd.0, &mut rect, 0) != 0
+                && (rect.right <= rect.left || rect.bottom <= rect.top)
+            {
+                ValidateRect(msg.hwnd.0, ptr::null());
             }
         }
     }
@@ -306,6 +703,12 @@ mod editor_window {
     unsafe extern "system" {
         fn GetDC(window: *mut c_void) -> *mut c_void;
         fn ReleaseDC(window: *mut c_void, dc: *mut c_void) -> i32;
+        fn GetUpdateRect(
+            window: *mut c_void,
+            rect: *mut windows::Win32::Foundation::RECT,
+            erase: i32,
+        ) -> i32;
+        fn ValidateRect(window: *mut c_void, rect: *const windows::Win32::Foundation::RECT) -> i32;
     }
     #[link(name = "opengl32")]
     unsafe extern "system" {
@@ -317,7 +720,7 @@ mod editor_window {
     }
 
     impl Window {
-        pub(super) fn capture(&self, path: &std::path::Path) {
+        pub(super) fn capture(&self, path: &std::path::Path) -> (i32, i32) {
             unsafe {
                 let child = GetWindow(self.0, GW_CHILD).unwrap();
                 let mut rect = windows::Win32::Foundation::RECT::default();
@@ -351,6 +754,7 @@ mod editor_window {
                 wglMakeCurrent(ptr::null_mut(), ptr::null_mut());
                 wglDeleteContext(ctx);
                 ReleaseDC(child.0, dc);
+                (w, h)
             }
         }
     }
