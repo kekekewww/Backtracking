@@ -1567,11 +1567,14 @@ impl CaptureUi {
         let wanted = self.timeline.wide.as_ref().and_then(|wide| {
             stack::comfortable_height(&wide_lanes(wide, self.timeline.b_channels.is_some()))
         });
+        // A cleared or restarted capture shows an empty timeline until the session answers. Its
+        // rows have not gone away yet, so the size waits for that answer.
         let busy = self.options_open
             || self.editor_sizing.options_size.is_some()
             || waveform_only
             || self.gesture.is_some()
-            || self.native_dragging.load(Ordering::Acquire);
+            || self.native_dragging.load(Ordering::Acquire)
+            || self.timeline.sample_rate == 0;
         if let Some(size) = self
             .editor_sizing
             .fit_rows(current, wanted, self.display_size.y, busy)
@@ -3951,6 +3954,56 @@ mod tests {
             sizing.fit_rows(Vec2::new(640.0, 600.0), Some(300.0), 528.0, false),
             None
         );
+    }
+
+    #[test]
+    fn clearing_a_wide_capture_keeps_the_grown_editor_until_the_session_answers() {
+        let session = Arc::new(Session::new(crate::settings::SettingsStore::default()));
+        let editor = EguiEditorState::from_size(LogicalSize::new(640.0, 324.0), 1.0);
+        let mut capture = CaptureUi::new(session, editor);
+        capture.timeline = WaveformTimeline {
+            frames: 0..48_000,
+            sample_rate: 48_000,
+            channels: 12,
+            wide: Some(seven_one_four()),
+            retention_seconds: 20.0,
+            ..WaveformTimeline::default()
+        };
+        capture.editor_sizing.grown = Some((212.0, 324.0));
+        let context = egui::Context::default();
+        let resizes = |capture: &mut CaptureUi| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 324.0))),
+                    ..Default::default()
+                },
+                |ui| capture.apply_waveform_size(ui, 280.0, false),
+            );
+            output.textures_delta.clear();
+            output
+                .viewport_output
+                .values()
+                .flat_map(|viewport| viewport.commands.iter())
+                .filter_map(|command| match command {
+                    egui::ViewportCommand::InnerSize(size) => Some(*size),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Clear swaps in an empty timeline of the next epoch. A frame that cannot read the
+        // session yet keeps the window and its memory of the height before it grew.
+        capture.sync_timeline(capture.timeline.epoch + 1);
+        assert_eq!(resizes(&mut capture), Vec::<Vec2>::new());
+        assert_eq!(capture.editor_sizing.grown, Some((212.0, 324.0)));
+        // A capture that answers as stereo has really lost its rows: back to the old height.
+        capture.timeline = WaveformTimeline {
+            epoch: capture.timeline.epoch,
+            frames: 0..48_000,
+            sample_rate: 48_000,
+            channels: 2,
+            ..WaveformTimeline::default()
+        };
+        assert_eq!(resizes(&mut capture), [Vec2::new(640.0, 212.0)]);
     }
 
     fn rendered_lane(

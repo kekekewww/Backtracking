@@ -1600,7 +1600,10 @@ impl SenderWorker {
         if self.published_route == Some(route) {
             endpoint.update(&name, enabled, self.rate, channels);
         } else {
-            let labels = if route == CaptureInput::Main {
+            // Only a surround main input is named. The desktop app ignores names for mono and
+            // stereo, and a stereo Sender that kept FL/FR would drop its listeners each time the
+            // capture input switched between Main and Sidechain.
+            let labels = if route == CaptureInput::Main && self.main > 2 {
                 self.labels.as_slice()
             } else {
                 &[]
@@ -1826,6 +1829,43 @@ mod tests {
         }
         let expected: Vec<_> = (0..12).map(|c| c as f32 / 16.).collect();
         assert_eq!(samples, expected.repeat(64));
+    }
+
+    #[test]
+    fn a_stereo_worker_publishes_its_audio_without_names() {
+        let store = SettingsStore::default();
+        store.lock().sender_enabled = true;
+        let session = Arc::new(Session::new(store));
+        // A stereo VST3 bus is named FL and FR, as every VST3 instance is.
+        let labels = crate::surround::speaker_labels(&[0, 1]);
+        assert_eq!(labels, ["FL", "FR"]);
+        let worker = Worker::with_labels(session.clone(), 48_000, 2, 0, 512, labels).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut receiver = loop {
+            if let Some(id) = session.settings().sender_id
+                && let Ok(receiver) = backtracking_core::SenderReceiver::connect(&id)
+            {
+                break receiver;
+            }
+            assert!(Instant::now() < deadline, "sender registration timed out");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(receiver.labels(), None);
+        let mut audio = [vec![0.25; 64], vec![-0.5; 64]];
+        let mut samples = Vec::new();
+        loop {
+            worker.push(&audio.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>());
+            if receiver
+                .packet(&mut samples, &mut Vec::new())
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "sender audio timed out");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(samples, [0.25, -0.5].repeat(64));
     }
 
     #[test]
