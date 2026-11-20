@@ -90,6 +90,13 @@ path = "tests/derive_params.rs"
 name = "derive_persist"
 path = "tests/derive_persist.rs"
 
+[[example]]
+name = "surround_probe"
+path = "examples/surround_probe.rs"
+crate-type = ["cdylib"]
+required-features = ["vst3"]
+test = true
+
 [dependencies.anyhow]
 version = "1.0.104"
 
@@ -212,9 +219,6 @@ optional = true
 [dependencies.zstd]
 version = "0.13.3"
 optional = true
-
-[dev-dependencies.approx]
-version = "0.5.1"
 
 [target.'cfg(all(target_family = "unix", not(target_os = "macos")))'.dependencies.libc]
 version = "0.2.124"

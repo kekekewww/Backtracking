@@ -6,6 +6,7 @@ use nice_plug_core::editor::Editor;
 use nice_plug_core::midi::{Channel, Key, MidiConfig, NoteEvent, VoiceID};
 use nice_plug_core::params::ParamFlags;
 use nice_plug_core::plugin::ProcessStatus;
+use parking_lot::Mutex;
 use std::ffi::c_void;
 use std::mem::{self, MaybeUninit};
 use std::num::NonZeroU32;
@@ -65,8 +66,45 @@ const K_BUS_TYPE_MAIN: i32 = vst3::Steinberg::Vst::BusTypes_::kMain as i32;
 #[allow(clippy::unnecessary_cast)]
 const K_BUS_TYPE_AUX: i32 = vst3::Steinberg::Vst::BusTypes_::kAux as i32;
 
+#[derive(Default)]
+struct BusArrangements {
+    inputs: Vec<SpeakerArrangement>,
+    outputs: Vec<SpeakerArrangement>,
+}
+
+fn default_arrangement(channels: NonZeroU32) -> Option<SpeakerArrangement> {
+    use vst3::Steinberg::Vst::SpeakerArr::*;
+
+    Some(match channels.get() {
+        1 => kMono,
+        2 => kStereo,
+        3 => k30Cine,
+        4 => k40Music,
+        5 => k50,
+        6 => k51,
+        7 => k70Music,
+        8 => k71Music,
+        9 => k70_2,
+        10 => k71_2,
+        11 => k70_4,
+        12 => k71_4,
+        13 => k70_6,
+        14 => k71_6,
+        15 => k90_6,
+        16 => k91_6,
+        22 => k220,
+        24 => k222,
+        25 => kAmbi4thOrderACN,
+        36 => kAmbi5thOrderACN,
+        49 => kAmbi6thOrderACN,
+        64 => kAmbi7thOrderACN,
+        _ => return None,
+    })
+}
+
 pub struct Wrapper<P: Vst3Plugin> {
     inner: Arc<WrapperInner<P>>,
+    arrangements: Mutex<BusArrangements>,
 }
 
 impl<P: Vst3Plugin> Class for Wrapper<P> {
@@ -86,6 +124,7 @@ impl<P: Vst3Plugin> Wrapper<P> {
     pub fn new() -> Self {
         Self {
             inner: WrapperInner::new(),
+            arrangements: Mutex::default(),
         }
     }
 }
@@ -414,7 +453,18 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
                 }
 
                 let mut activate_context = self.inner.make_activate_context();
-                let audio_io_layout = self.inner.current_audio_io_layout.load();
+                let (audio_io_layout, main_speakers) = {
+                    let arrangements = self.arrangements.lock();
+                    let layout = self.inner.current_audio_io_layout.load();
+                    let speakers = layout.main_input_channels.and_then(|count| {
+                        arrangements
+                            .inputs
+                            .first()
+                            .copied()
+                            .or_else(|| default_arrangement(count))
+                    });
+                    (layout, speakers)
+                };
 
                 // In the case a host misbehaves and tries to activate the plugin without waiting for the
                 // `process` method to finish, manually wait for that method to finish.
@@ -422,8 +472,9 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
                 let mut result = kResultFalse;
                 loop {
                     if let Some(mut plugin) = self.inner.plugin.try_lock() {
-                        if plugin.activate(&audio_io_layout, &buffer_config, &mut activate_context)
-                        {
+                        if crate::speakers::with_main_input(main_speakers, || {
+                            plugin.activate(&audio_io_layout, &buffer_config, &mut activate_context)
+                        }) {
                             // NOTE: We don't call `Plugin::reset()` here. The call is done in `set_process()`
                             //       instead. Otherwise we would call the function twice, and `set_process()` needs
                             //       to be called after this function before the plugin may process audio again.
@@ -833,76 +884,40 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
 
         // nice-plug no longer supports flexible IO layouts. Instead we'll try to find an audio IO
         // layout that matches the host's requested layout.
-        let matching_layout = P::AUDIO_IO_LAYOUTS
-            .iter()
-            .find(|layout| {
-                // If the number of ports/busses doesn't match then we can immediately discard the
-                // layout. VST3 doesn't allow for optional switchable ports like CLAP does. Only the
-                // channel counts can change.
-                let num_layout_ins = if layout.main_input_channels.is_some() {
-                    1
-                } else {
-                    0
-                } + layout.aux_input_ports.len();
-                let num_layout_outs = if layout.main_output_channels.is_some() {
-                    1
-                } else {
-                    0
-                } + layout.aux_output_ports.len();
-                if num_ins as usize != num_layout_ins || num_outs as usize != num_layout_outs {
-                    return false;
-                }
+        // A host may pass null for an empty bus array.
+        let inputs = if num_ins == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(inputs, num_ins as usize) }
+        };
+        let outputs = if num_outs == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(outputs, num_outs as usize) }
+        };
+        let matches =
+            |main: Option<NonZeroU32>, aux: &[NonZeroU32], masks: &[SpeakerArrangement]| {
+                main.iter()
+                    .chain(aux)
+                    .map(|n| n.get())
+                    .eq(masks.iter().map(|m| m.count_ones()))
+            };
+        let Some(layout) = P::AUDIO_IO_LAYOUTS.iter().find(|layout| {
+            matches(layout.main_input_channels, layout.aux_input_ports, inputs)
+                && matches(
+                    layout.main_output_channels,
+                    layout.aux_output_ports,
+                    outputs,
+                )
+        }) else {
+            return kResultFalse;
+        };
 
-                // NOTE: We completely ignore the speaker arrangements and only look at the channel
-                //       counts here. This may cause issues at some point, but it works for now.
-                let has_main_input = layout.main_input_channels.is_some();
-                let aux_input_start_idx = usize::from(has_main_input);
-                if has_main_input
-                    && unsafe {
-                        (*inputs).count_ones() != layout.main_input_channels.unwrap().get()
-                    }
-                {
-                    return false;
-                }
-                for (aux_input_idx, channel_count) in layout.aux_input_ports.iter().enumerate() {
-                    if unsafe {
-                        (*inputs.add(aux_input_idx + aux_input_start_idx)).count_ones()
-                            != channel_count.get()
-                    } {
-                        return false;
-                    }
-                }
-
-                let has_main_output = layout.main_output_channels.is_some();
-                let aux_output_start_idx = usize::from(has_main_output);
-                if layout.main_output_channels.is_some_and(|channels| unsafe {
-                    (*outputs).count_ones() != channels.get()
-                }) {
-                    return false;
-                }
-                for (aux_output_idx, channel_count) in layout.aux_output_ports.iter().enumerate() {
-                    if unsafe {
-                        (*outputs.add(aux_output_idx + aux_output_start_idx)).count_ones()
-                            != channel_count.get()
-                    } {
-                        return false;
-                    }
-                }
-
-                true
-            })
-            .copied();
-
-        match matching_layout {
-            Some(layout) => {
-                // This layout is used from hereon onwards, at least until this function is called
-                // again
-                self.inner.current_audio_io_layout.store(layout);
-
-                kResultOk
-            }
-            None => kResultFalse,
-        }
+        let mut arrangements = self.arrangements.lock();
+        arrangements.inputs = inputs.to_vec();
+        arrangements.outputs = outputs.to_vec();
+        self.inner.current_audio_io_layout.store(*layout);
+        kResultOk
     }
 
     unsafe fn getBusArrangement(
@@ -912,55 +927,35 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
         arr: *mut SpeakerArrangement,
     ) -> tresult {
         check_null_ptr!(arr);
-
-        let channel_count_to_map = |count| match count {
-            0 => vst3::Steinberg::Vst::SpeakerArr::kEmpty,
-            1 => vst3::Steinberg::Vst::SpeakerArr::kMono,
-            2 => vst3::Steinberg::Vst::SpeakerArr::kStereo,
-            5 => vst3::Steinberg::Vst::SpeakerArr::k50,
-            6 => vst3::Steinberg::Vst::SpeakerArr::k51,
-            7 => vst3::Steinberg::Vst::SpeakerArr::k70Cine,
-            8 => vst3::Steinberg::Vst::SpeakerArr::k71Cine,
-            n => {
-                crate::nice_debug_assert_failure!(
-                    "No defined layout for {} channels, making something up on the spot...",
-                    n
-                );
-                (1 << n) - 1
-            }
-        };
-
-        let current_audio_io_layout = self.inner.current_audio_io_layout.load();
-        let num_channels = if dir == K_BUS_DIRECTION_INPUT {
-            let has_main_input = current_audio_io_layout.main_input_channels.is_some();
-            let aux_input_start_idx = if has_main_input { 1 } else { 0 };
-            let aux_input_idx = (index - aux_input_start_idx).max(0) as usize;
-            if index == 0 && has_main_input {
-                current_audio_io_layout.main_input_channels.unwrap().get()
-            } else if aux_input_idx < current_audio_io_layout.aux_input_ports.len() {
-                current_audio_io_layout.aux_input_ports[aux_input_idx].get()
-            } else {
-                return kInvalidArgument;
-            }
-        } else if dir == K_BUS_DIRECTION_OUTPUT {
-            let has_main_output = current_audio_io_layout.main_output_channels.is_some();
-            let aux_output_start_idx = if has_main_output { 1 } else { 0 };
-            let aux_output_idx = (index - aux_output_start_idx).max(0) as usize;
-            if index == 0 && has_main_output {
-                current_audio_io_layout.main_output_channels.unwrap().get()
-            } else if aux_output_idx < current_audio_io_layout.aux_output_ports.len() {
-                current_audio_io_layout.aux_output_ports[aux_output_idx].get()
-            } else {
-                return kInvalidArgument;
-            }
-        } else {
+        let Ok(index) = usize::try_from(index) else {
             return kInvalidArgument;
         };
-        let channel_map = channel_count_to_map(num_channels);
-
-        crate::nice_debug_assert_eq!(num_channels, channel_map.count_ones());
-        unsafe { *arr = channel_map };
-
+        let arrangements = self.arrangements.lock();
+        let layout = self.inner.current_audio_io_layout.load();
+        let (masks, main, aux) = match dir {
+            K_BUS_DIRECTION_INPUT => (
+                &arrangements.inputs,
+                layout.main_input_channels,
+                layout.aux_input_ports,
+            ),
+            K_BUS_DIRECTION_OUTPUT => (
+                &arrangements.outputs,
+                layout.main_output_channels,
+                layout.aux_output_ports,
+            ),
+            _ => return kInvalidArgument,
+        };
+        let Some(count) = main.into_iter().chain(aux.iter().copied()).nth(index) else {
+            return kInvalidArgument;
+        };
+        let Some(mask) = masks
+            .get(index)
+            .copied()
+            .or_else(|| default_arrangement(count))
+        else {
+            return kResultFalse;
+        };
+        unsafe { *arr = mask };
         kResultOk
     }
 
