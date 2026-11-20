@@ -55,6 +55,8 @@ pub(super) fn speaker_labels(bits: &[u32]) -> Vec<String> {
 pub(crate) struct WideLayout {
     pub(crate) group: PairGroup,
     pub(crate) mask: u32,
+    /// Negotiated host speaker bits in buffer order, or zero for an unnamed bus.
+    pub(crate) speaker_mask: u64,
     /// One speaker name per channel, in stream order.
     pub(crate) labels: Arc<[String]>,
 }
@@ -88,6 +90,7 @@ impl WideLayout {
         Some(Self {
             group: PairGroup::new(0, names)?,
             mask,
+            speaker_mask: 0,
             labels: names.into(),
         })
     }

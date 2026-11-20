@@ -185,6 +185,7 @@ pub(crate) struct SessionSettings {
     pub(crate) force_mono: bool,
     /// How the L and R of a capture wider than stereo are played and written.
     pub(crate) pair_render: PairRender,
+    pub(crate) preview_as_lr: bool,
     /// The files a capture wider than stereo is saved and dragged out as.
     pub(crate) wide_export: WideExportMode,
     pub(crate) show_waveform_only: bool,
@@ -233,6 +234,7 @@ impl Default for SessionSettings {
             wav_profile: WavExportProfile::default(),
             force_mono: false,
             pair_render: PairRender::default(),
+            preview_as_lr: false,
             wide_export: WideExportMode::default(),
             show_waveform_only: false,
             waveform_layout: WaveformLayout::default(),
@@ -334,6 +336,9 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                 .get("wav_force_mono")
                 .is_some_and(|value| value == "true"),
             // Projects saved before these choices existed get the desktop's defaults.
+            preview_as_lr: fields
+                .get("wide_preview")
+                .is_some_and(|value| value == "lr"),
             pair_render: fields
                 .get("pair_render")
                 .and_then(|value| {
@@ -458,6 +463,15 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                     .to_string(),
             ),
             ("wav_force_mono".into(), settings.force_mono.to_string()),
+            (
+                "wide_preview".into(),
+                if settings.preview_as_lr {
+                    "lr"
+                } else {
+                    "own-channels"
+                }
+                .into(),
+            ),
             ("pair_render".into(), settings.pair_render.stored().into()),
             (
                 "wide_export".into(),
@@ -629,6 +643,32 @@ mod tests {
         let restored = SettingsStore::default();
         restored.set(source.map(Clone::clone));
         assert_eq!(*restored.lock(), *source.lock());
+    }
+
+    #[test]
+    fn wide_preview_round_trips_and_defaults_for_unknown_and_missing_values() {
+        let store = SettingsStore::default();
+        for value in [Some("lr"), Some("own-channels"), Some("future"), None] {
+            store.set(
+                value
+                    .map(|v| ("wide_preview".into(), v.to_owned()))
+                    .into_iter()
+                    .collect(),
+            );
+            assert_eq!(store.lock().preview_as_lr, value == Some("lr"));
+            let fields = store.map(Clone::clone);
+            assert_eq!(
+                fields["wide_preview"],
+                if value == Some("lr") {
+                    "lr"
+                } else {
+                    "own-channels"
+                }
+            );
+            let restored = SettingsStore::default();
+            restored.set(fields);
+            assert_eq!(restored.lock().preview_as_lr, store.lock().preview_as_lr);
+        }
     }
 
     #[test]

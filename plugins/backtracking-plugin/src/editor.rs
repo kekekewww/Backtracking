@@ -1430,9 +1430,7 @@ impl CaptureUi {
             self.message = "Preparing selected audio…".into();
             return;
         };
-        // A wide clip plays its L and R as chosen on the Capture page, through the core's wide
-        // preview. For now that is the first two outputs of the bus; S3-5 changes the routing so
-        // the clip plays in its own channels.
+        // Keep the Capture page's L/R render ready for a bus with a different layout.
         let binaural = editing.timeline.wide.is_some() && settings.pair_render.binaural();
         let model = if binaural {
             let Some(model) = self.head_model(editing.timeline.sample_rate) else {
@@ -1458,7 +1456,18 @@ impl CaptureUi {
                     .map(|w| &w.group),
             })
             .collect();
-        match Preview::with_channels(&lanes, selection, model, settings.force_mono, self.fades) {
+        let preview = match &editing.timeline.wide {
+            Some(wide) if !settings.preview_as_lr => Preview::for_bus(
+                &lanes,
+                selection,
+                wide.speaker_mask,
+                model,
+                settings.force_mono,
+                self.fades,
+            ),
+            _ => Preview::with_channels(&lanes, selection, model, settings.force_mono, self.fades),
+        };
+        match preview {
             Some(preview) => {
                 self.session.preview.play(preview);
                 self.preview_started = Some(Instant::now());
@@ -2847,8 +2856,20 @@ fn capture_page(ui: &mut egui::Ui, settings: &mut SessionSettings, history_note:
     );
     options_note(
         ui,
-        "How L and R sound in preview and on export. Binaural places each channel around your \
-         head, for headphones. The waveform is the same either way.",
+        "How L and R sound on export and when preview plays as L/R. Binaural places each channel around your head, for headphones.",
+    );
+    option_combo(
+        ui,
+        "Preview of multichannel sources",
+        &mut settings.preview_as_lr,
+        [
+            (false, "In their own channels".into()),
+            (true, "As L/R".into()),
+        ],
+    );
+    options_note(
+        ui,
+        "With a matching bus, each channel plays on the same channel for your DAW to monitor. As L/R plays the mix above on the first two channels.",
     );
 }
 

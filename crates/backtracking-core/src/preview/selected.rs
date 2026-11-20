@@ -194,12 +194,21 @@ impl WideLane {
         })
     }
 
-    pub(super) fn mix(&mut self, source: &Source, first: u64, mixed: &mut [[f32; 2]]) {
-        let width = source.channels();
-        let input = &mut self.input[..mixed.len() * width];
+    pub(super) fn read(&mut self, source: &Source, first: u64, frames: usize) {
+        let input = &mut self.input[..frames * source.channels()];
         if !source.read_frames(first, input) {
             input.fill(0.);
         }
+    }
+
+    pub(super) fn frame(&self, offset: usize, width: usize) -> &[f32] {
+        &self.input[offset * width..(offset + 1) * width]
+    }
+
+    pub(super) fn mix(&mut self, source: &Source, first: u64, mixed: &mut [[f32; 2]]) {
+        self.read(source, first, mixed.len());
+        let width = source.channels();
+        let input = &mut self.input[..mixed.len() * width];
         let group = self.range.len();
         if group != width {
             for frame in 0..mixed.len() {
@@ -252,6 +261,128 @@ impl WideRender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_main_and_sidechain_follow_the_stereo_gain_at_every_frame() {
+        let width = 12;
+        let count = 1400;
+        let samples: Vec<_> = (0..count * width).map(|i| i as f32 / 32768.0).collect();
+        let main = FrozenTrack::from_interleaved(48000, width, 100, &samples).unwrap();
+        let side =
+            FrozenTrack::from_interleaved(48000, 2, 100, &[0.25, -0.5].repeat(count)).unwrap();
+        let ones = FrozenTrack::from_interleaved(48000, 1, 100, &vec![1.0; count]).unwrap();
+        let group = PairGroup::new(0, &vec!["unknown".into(); width]).unwrap();
+        let lanes = [
+            PreviewLane {
+                track: &main,
+                group: Some(&group),
+                route: ChannelRoute::Merged,
+                selected: None,
+            },
+            PreviewLane {
+                track: &side,
+                group: None,
+                route: ChannelRoute::Merged,
+                selected: None,
+            },
+        ];
+        let selection = 137..1397;
+        let fades = Fades::new(129, 411);
+        for block in [1, 67, 256, 513] {
+            for stop_at in [800, 1260] {
+                let preview =
+                    Preview::for_bus(&lanes, selection.clone(), 0xfff, None, false, fades).unwrap();
+                let reference = Preview::new(
+                    std::slice::from_ref(&ones),
+                    selection.clone(),
+                    &[ChannelRoute::Merged],
+                    false,
+                    fades,
+                )
+                .unwrap();
+                let mut pos = 0;
+                while !reference.is_finished() {
+                    let n = if pos < stop_at {
+                        block.min(stop_at - pos)
+                    } else {
+                        block
+                    };
+                    let mut gains = vec![];
+                    reference.render_with(n, |_, [gain, _]| gains.push(gain));
+                    let mut calls = 0;
+                    let written = preview.render_channels_with(n, width, 0xfff, |i, c, sample| {
+                        let base = samples[(37 + pos + i) * width + c];
+                        let extra = match c {
+                            0 => 0.25,
+                            1 => -0.5,
+                            _ => 0.0,
+                        };
+                        assert_eq!(sample, (base + extra) * gains[i]);
+                        calls += 1;
+                    });
+                    assert_eq!(written, gains.len());
+                    assert_eq!(calls, written * width);
+                    pos += written;
+                    if pos == stop_at {
+                        preview.stop();
+                        reference.stop();
+                    }
+                }
+                assert!(preview.is_finished());
+                assert_eq!(pos, (stop_at + 384).min(1260));
+            }
+        }
+    }
+
+    #[test]
+    fn mono_bus_hears_both_ears_and_the_companion_lane() {
+        let group = PairGroup::new(0, &["FL".into(), "FR".into(), "FC".into()]).unwrap();
+        let main =
+            FrozenTrack::from_interleaved(48000, 3, 0, &[0.125, -0.25, 0.5].repeat(512)).unwrap();
+        let side = FrozenTrack::from_interleaved(48000, 2, 0, &[0.75, 0.25].repeat(512)).unwrap();
+        let lanes = [
+            PreviewLane {
+                track: &main,
+                route: ChannelRoute::Merged,
+                group: Some(&group),
+                selected: None,
+            },
+            PreviewLane {
+                track: &side,
+                route: ChannelRoute::Merged,
+                group: None,
+                selected: None,
+            },
+        ];
+        let model = Arc::new(HeadModel::new(48000).unwrap());
+        let preview =
+            Preview::for_bus(&lanes, 0..512, 7, Some(model.clone()), false, Fades::NONE).unwrap();
+        let reference =
+            Preview::with_channels(&lanes, 0..512, Some(model), false, Fades::NONE).unwrap();
+        let mut expected = Vec::new();
+        reference.render_with(512, |_, [l, r]| expected.push((l + r) * 0.5));
+        let gate = Box::leak(Box::new(PreviewGate::local()));
+        let slot = PreviewSlot::with_gate(gate);
+        slot.play(preview);
+        assert_eq!(
+            slot.render_channels_with(512, 44100, 1, 0, |_, _, _| panic!()),
+            SlotRender::default()
+        );
+        let mut mono = Vec::new();
+        let played = slot.render_channels_with(600, 48000, 1, 0, |i, c, x| {
+            assert_eq!((i, c), (mono.len(), 0));
+            mono.push(x);
+        });
+        assert_eq!(mono, expected);
+        assert_eq!(
+            played,
+            SlotRender {
+                frames: 512,
+                remaining: 0
+            }
+        );
+        assert_eq!(gate.covered(crate::capture_clock_ns(), 512, 48000), 0..512);
+    }
 
     #[test]
     fn renderer_keys_keep_both_neighbors_and_bound_gain_before_conversion() {

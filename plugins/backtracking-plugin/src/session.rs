@@ -1300,6 +1300,7 @@ impl Worker {
         Self::with_labels(session, rate, channels, sidechain, max_buffer, Vec::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn with_labels(
         session: Arc<Session>,
         rate: u32,
@@ -1307,6 +1308,18 @@ impl Worker {
         sidechain: usize,
         max_buffer: u32,
         labels: Vec<String>,
+    ) -> Option<Self> {
+        Self::with_layout(session, rate, channels, sidechain, max_buffer, labels, 0)
+    }
+
+    pub(crate) fn with_layout(
+        session: Arc<Session>,
+        rate: u32,
+        channels: usize,
+        sidechain: usize,
+        max_buffer: u32,
+        labels: Vec<String>,
+        speaker_mask: u64,
     ) -> Option<Self> {
         if rate == 0 || !(1..=16).contains(&channels) || sidechain > 2 {
             return None;
@@ -1349,7 +1362,10 @@ impl Worker {
                 routed: Vec::new(),
                 bars: Vec::new(),
                 sample_rate: rate,
-                wide: WideLayout::new(channels, &labels),
+                wide: WideLayout::new(channels, &labels).map(|mut wide| {
+                    wide.speaker_mask = speaker_mask;
+                    wide
+                }),
                 main_channels: channels,
                 sidechain_channels: sidechain,
                 input,

@@ -254,7 +254,19 @@ fn process_surround_dll() {
 /// Whether `profile` is a test profile folder, which the host may use as LOCALAPPDATA.
 fn test_profile(profile: &std::path::Path) -> bool {
     let name = profile.file_name().unwrap_or_default().to_string_lossy();
-    name.starts_with("s3-3-") || name.starts_with("s3-4b-")
+    name.starts_with("s3-3-")
+        || name.starts_with("s3-4b-")
+        || (name.starts_with("s3-5-")
+            && profile
+                .canonicalize()
+                .ok()
+                .zip(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("target")
+                        .canonicalize()
+                        .ok(),
+                )
+                .is_some_and(|(path, target)| path.starts_with(target)))
 }
 
 /// One step of a scripted editor run, from `S3_4B_STEPS`. Points are in the editor's pixels.
@@ -263,6 +275,14 @@ fn test_profile(profile: &std::path::Path) -> bool {
 enum Step {
     /// Save the editor's last displayed frame as this PNG, in `S3_4B_OUT`.
     Png(String),
+    Silence,
+    Space,
+    DragStart,
+    DragTo(i32, i32),
+    DragEnd,
+    CheckPreview {
+        native: bool,
+    },
     Move(i32, i32),
     /// A press and release of the left (`false`) or right (`true`) button where the pointer is.
     Press(bool),
@@ -298,6 +318,34 @@ fn steps(script: &str) -> std::collections::VecDeque<Step> {
     {
         let (name, argument) = item.split_once(':').unwrap_or((item, ""));
         match name {
+            "silence" => steps.push_back(Step::Silence),
+            "space" => steps.push_back(Step::Space),
+            "check" => steps.push_back(Step::CheckPreview {
+                native: match argument {
+                    "own" => true,
+                    "lr" => false,
+                    _ => panic!("expected check:own or check:lr"),
+                },
+            }),
+            "drag" => {
+                let xy: Vec<i32> = argument
+                    .split(',')
+                    .map(|v| v.trim().parse().unwrap())
+                    .collect();
+                let [x, y, end_x, end_y] = xy[..] else {
+                    panic!("expected drag:x,y,end_x,end_y")
+                };
+                steps.extend([
+                    Step::Move(x, y),
+                    Step::Wait(150),
+                    Step::DragStart,
+                    Step::Wait(200),
+                    Step::DragTo(end_x, end_y),
+                    Step::Wait(200),
+                    Step::DragEnd,
+                    Step::Wait(400),
+                ]);
+            }
             "png" => steps.push_back(Step::Png(argument.to_owned())),
             "move" | "click" | "rclick" | "wheel" => {
                 let (x, y, turns) = point(argument);
@@ -348,14 +396,56 @@ fn saved_files(folder: &std::path::Path) -> (usize, u64) {
     found
 }
 
+/// Each input tone completes an integer number of periods in one host block.
+#[cfg(feature = "editor")]
+fn check_preview(output: &[Vec<f32>], native: bool) {
+    assert!(output.len() > 2);
+    for (channel, samples) in output.iter().enumerate() {
+        assert!(samples.iter().all(|x| x.is_finite()));
+        if native {
+            for tone in 0..output.len() {
+                let mut re = 0.0;
+                let mut im = 0.0;
+                for (frame, &sample) in samples.iter().enumerate() {
+                    let phase = std::f64::consts::TAU * ((tone + 1) * frame) as f64 / FRAMES as f64;
+                    let (sin, cos) = phase.sin_cos();
+                    re += f64::from(sample) * cos;
+                    im += f64::from(sample) * sin;
+                }
+                let amplitude = 2.0 * re.hypot(im) / FRAMES as f64;
+                let expected = if tone == channel {
+                    0.6 - 0.035 * channel as f64
+                } else {
+                    0.0
+                };
+                assert!(
+                    (amplitude - expected).abs() < 0.0001,
+                    "output {channel}, tone {tone}: {amplitude}, expected {expected}"
+                );
+            }
+        } else if channel < 2 {
+            assert!(
+                samples.iter().any(|x| x.abs() > 0.01),
+                "silent pair channel {channel}"
+            );
+        } else {
+            assert!(
+                samples.iter().all(|&x| x == 0.0),
+                "unexpected output on {channel}"
+            );
+        }
+    }
+}
+
 /// Drives the shipped DLL's editor through one scenario for pictures and saves. The scenario
-/// comes from the environment: `S3_4B_LAYOUT` (`7.1.4`, the default, or `stereo`),
+/// comes from the environment: `S3_4B_LAYOUT` (`7.1.4` by default, `stereo`, or `7.1.2-to-5.1.4`),
 /// `S3_4B_SIDECHAIN` (any value adds a stereo sidechain bus and captures both),
 /// `S3_4B_FIELDS` (`key=value;...` added to the saved settings), `S3_4B_FRAME` (`0` for a host
 /// that refuses to resize the editor), `S3_4B_HOLD_SECONDS` (audio before the first step),
 /// `S3_4B_STEPS` (see [`steps`]) and `S3_4B_OUT` (the folder for pictures). Saves go to the
 /// profile's `saved` folder. Every channel gets its own tone, quieter as the channel number
-/// rises, and every output block must equal its input.
+/// rises. Before `silence`, each block must match the input. Use `drag:x,y,end_x,end_y`,
+/// `space` and then `check:own` or `check:lr` on a steady preview block.
 #[cfg(feature = "editor")]
 #[test]
 #[ignore = "set BACKTRACKING_TEST_VST3 to the release DLL, LOCALAPPDATA to a test profile and S3_4B_* to the scenario"]
@@ -367,10 +457,10 @@ fn editor_pictures_dll() {
     let profile = std::path::PathBuf::from(var("LOCALAPPDATA").unwrap());
     assert!(test_profile(&profile));
     let out = var("S3_4B_OUT").map_or_else(|| profile.clone(), std::path::PathBuf::from);
-    let mut main = if var("S3_4B_LAYOUT").as_deref() == Some("stereo") {
-        kStereo
-    } else {
-        k71_4
+    let (main, mut output_layout) = match var("S3_4B_LAYOUT").as_deref() {
+        Some("stereo") => (kStereo, kStereo),
+        Some("7.1.2-to-5.1.4") => (k71_2, k51_4),
+        _ => (k71_4, k71_4),
     };
     let sidechain = var("S3_4B_SIDECHAIN").is_some();
     let saved = profile.join("saved");
@@ -436,7 +526,7 @@ fn editor_pictures_dll() {
         let mut inputs = [main, kStereo];
         let buses = 1 + i32::from(sidechain);
         assert_eq!(
-            processor.setBusArrangements(inputs.as_mut_ptr(), buses, &mut main, 1),
+            processor.setBusArrangements(inputs.as_mut_ptr(), buses, &mut output_layout, 1),
             kResultOk
         );
         assert_eq!(component.setActive(1), kResultOk);
@@ -478,14 +568,17 @@ fn editor_pictures_dll() {
         let start = Instant::now();
         let mut next = start;
         let mut ready = start + hold;
+        let mut silent_input = false;
         let mut settled = (0, 0, start);
         loop {
             for channel in &mut output {
                 channel.fill(f32::NAN);
             }
             assert_eq!(processor.process(&mut data), kResultOk);
-            for (out, want) in output.iter().zip(&expected) {
-                assert!(out.iter().map(|s| s.to_bits()).eq(want.iter().copied()));
+            if !silent_input {
+                for (out, want) in output.iter().zip(&expected) {
+                    assert!(out.iter().map(|s| s.to_bits()).eq(want.iter().copied()));
+                }
             }
             window.pump();
             let now = Instant::now();
@@ -495,6 +588,24 @@ fn editor_pictures_dll() {
                 };
                 ready = now;
                 match &step {
+                    Step::Silence => {
+                        for tone in &mut tones {
+                            tone.fill(0.0);
+                        }
+                        silent_input = true;
+                    }
+                    Step::Space => {
+                        window.send(0x0100, 0x20, 1, 0x39);
+                        window.send(0x0101, 0x20, 1, 0xc039);
+                    }
+                    Step::DragStart => window.send(0x0201, 9, -1, -1),
+                    Step::DragTo(x, y) => window.send(0x0200, 9, *x, *y),
+                    Step::DragEnd => window.send(0x0202, 0, -1, -1),
+                    Step::CheckPreview { native } => {
+                        assert!(silent_input);
+                        check_preview(&output, *native);
+                        println!("preview verified on silent input: {step:?}");
+                    }
                     Step::Png(name) => {
                         let size = window.capture(&out.join(name));
                         println!("{name}: {} x {}", size.0, size.1);

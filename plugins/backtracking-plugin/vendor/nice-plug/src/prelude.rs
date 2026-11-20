@@ -11,7 +11,7 @@ pub use crate::nice_export_vst3;
 pub use crate::wrapper::standalone::{nice_export_standalone, nice_export_standalone_with_args};
 
 pub use crate::formatters;
-pub use crate::speakers::main_input_speaker_bits;
+pub use crate::speakers::{main_input_speaker_bits, main_output_speaker_bits};
 pub use crate::util;
 
 pub use crate::audio_setup::{

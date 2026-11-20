@@ -215,7 +215,7 @@ Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift
 
 - 插件一律顯示並匯出所有聲道，沒有 **Hide silent channels／隱藏無聲的聲道**、聲道群組切換與分開編輯，所以保存與拖放一律匯出所有列，並寫出 L/R 檔案。
 - 出現多聲道軌道時，插件會向 DAW 要求較高的視窗；DAW 讓視窗維持較小時，用滾輪捲動各列。
-- 試聽目前把混好的聲音從匯流排的前兩個聲道（前左與前右）播放。
+- Capture 頁的 **Preview of multichannel sources** 預設為 **In their own channels**。當主輸入與主輸出的聲道數和喇叭配置都與錄製時相同，每個聲道會從匯流排的對應聲道播放，由 DAW 監聽。配置不同或選擇 **As L/R** 時，會從前兩個輸出聲道播放 Stereo 或 Binaural 混音；單聲道輸出則合併左右兩聲道。
 - 同時擷取側鏈時（**Both**），側鏈仍在下方，以標為 **B** 的一列顯示，並照舊匯出為 `-B` 結尾的檔案；多聲道軌道的檔案則在長度後加上 `-A`。
 - 多聲道軌道的檔名不含 BPM。
 
@@ -476,7 +476,7 @@ To write an add-on, see [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md).
 
 - It always shows and exports every channel. It has no **Hide silent channels**, no channel group switch and no editing separately, so a save or drag-out always exports every row, L/R file included.
 - When a multichannel lane appears, the plug-in asks the DAW for a taller window. If the DAW keeps the window smaller, scroll the rows with the mouse wheel.
-- Preview plays the mixed sound in the bus's first two channels (front left and right) for now.
+- On the Capture page, **Preview of multichannel sources** defaults to **In their own channels**. When the main input and output both match the capture's width and speaker layout, each channel plays on the same bus channel through your DAW's monitoring. With a different bus or **As L/R** selected, the Stereo or Binaural mix plays on the first two outputs. A mono output combines both sides.
 - With the sidechain captured too (**Both**), the sidechain stays below as one row labelled **B** and exports as before, in a file ending in `-B`; the multichannel lane's files have `-A` after the length.
 - Multichannel lane files carry no tempo in their names.
 

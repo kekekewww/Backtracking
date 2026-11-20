@@ -3,7 +3,7 @@ use std::cell::Cell;
 use crate::prelude::{ActivateContext, Plugin, PluginApi};
 
 thread_local! {
-    static MAIN_INPUT: Cell<Option<u64>> = const { Cell::new(None) };
+    static MAIN_BUSES: Cell<(Option<u64>, Option<u64>)> = const { Cell::new((None, None)) };
 }
 
 /// Main input speaker bit positions in buffer channel order (ascending bit).
@@ -19,22 +19,39 @@ thread_local! {
 /// Other set bits also retain their channel positions. Ambisonic arrangements
 /// describe components in ACN order instead of physical speakers.
 pub fn main_input_speaker_bits<P: Plugin>(context: &impl ActivateContext<P>) -> Option<Vec<u32>> {
+    speaker_bits(context, MAIN_BUSES.get().0)
+}
+
+/// Main output speaker bit positions in buffer channel order during activation.
+/// VST3 supplies the negotiated main output arrangement or the standard default
+/// for its width. Returns `None` for other APIs, no main output or no known layout.
+/// See [`main_input_speaker_bits`] for speaker bit assignments.
+pub fn main_output_speaker_bits<P: Plugin>(context: &impl ActivateContext<P>) -> Option<Vec<u32>> {
+    speaker_bits(context, MAIN_BUSES.get().1)
+}
+
+fn speaker_bits<P: Plugin>(
+    context: &impl ActivateContext<P>,
+    mask: Option<u64>,
+) -> Option<Vec<u32>> {
     if context.plugin_api() != PluginApi::Vst3 {
         return None;
     }
-    MAIN_INPUT
-        .get()
-        .map(|mask| (0..64).filter(|bit| mask & (1u64 << bit) != 0).collect())
+    mask.map(|mask| (0..64).filter(|bit| mask & (1u64 << bit) != 0).collect())
 }
 
 #[cfg(feature = "vst3")]
-pub(crate) fn with_main_input<T>(mask: Option<u64>, activate: impl FnOnce() -> T) -> T {
-    struct Restore(Option<u64>);
+pub(crate) fn with_main_buses<T>(
+    input: Option<u64>,
+    output: Option<u64>,
+    activate: impl FnOnce() -> T,
+) -> T {
+    struct Restore((Option<u64>, Option<u64>));
     impl Drop for Restore {
         fn drop(&mut self) {
-            MAIN_INPUT.set(self.0);
+            MAIN_BUSES.set(self.0);
         }
     }
-    let _restore = Restore(MAIN_INPUT.replace(mask));
+    let _restore = Restore(MAIN_BUSES.replace((input, output)));
     activate()
 }

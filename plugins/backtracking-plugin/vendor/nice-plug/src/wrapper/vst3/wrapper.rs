@@ -453,17 +453,16 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
                 }
 
                 let mut activate_context = self.inner.make_activate_context();
-                let (audio_io_layout, main_speakers) = {
+                let (audio_io_layout, main_input, main_output) = {
                     let arrangements = self.arrangements.lock();
                     let layout = self.inner.current_audio_io_layout.load();
-                    let speakers = layout.main_input_channels.and_then(|count| {
-                        arrangements
-                            .inputs
-                            .first()
-                            .copied()
-                            .or_else(|| default_arrangement(count))
-                    });
-                    (layout, speakers)
+                    let main_mask = |count: Option<NonZeroU32>, masks: &[SpeakerArrangement]| {
+                        count
+                            .and_then(|n| masks.first().copied().or_else(|| default_arrangement(n)))
+                    };
+                    let input = main_mask(layout.main_input_channels, &arrangements.inputs);
+                    let output = main_mask(layout.main_output_channels, &arrangements.outputs);
+                    (layout, input, output)
                 };
 
                 // In the case a host misbehaves and tries to activate the plugin without waiting for the
@@ -472,7 +471,7 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
                 let mut result = kResultFalse;
                 loop {
                     if let Some(mut plugin) = self.inner.plugin.try_lock() {
-                        if crate::speakers::with_main_input(main_speakers, || {
+                        if crate::speakers::with_main_buses(main_input, main_output, || {
                             plugin.activate(&audio_io_layout, &buffer_config, &mut activate_context)
                         }) {
                             // NOTE: We don't call `Plugin::reset()` here. The call is done in `set_process()`

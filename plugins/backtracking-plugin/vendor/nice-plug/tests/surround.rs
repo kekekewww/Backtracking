@@ -37,6 +37,12 @@ impl Instance {
                 kResultOk
             );
             let component = ComPtr::<IComponent>::from_raw(raw_component.cast()).unwrap();
+            Self::from_component(component)
+        }
+    }
+
+    unsafe fn from_component(component: ComPtr<IComponent>) -> Self {
+        unsafe {
             assert_eq!(component.initialize(ptr::null_mut()), kResultOk);
             let processor = component.cast::<IAudioProcessor>().unwrap();
             let mut setup = ProcessSetup {
@@ -119,6 +125,73 @@ fn default_and_negotiated_buses_reach_activation_in_channel_order() {
             assert_eq!(OBSERVED.take().as_deref(), Some(expected));
         }
     }
+}
+
+#[test]
+fn activation_sees_independent_main_input_and_output_speakers() {
+    use nice_plug::prelude::*;
+    use std::sync::Arc;
+
+    thread_local! {
+        static OUTPUT_BITS: Cell<Option<Vec<u32>>> = const { Cell::new(None) };
+    }
+
+    #[derive(Default)]
+    struct BusProbe;
+    impl Plugin for BusProbe {
+        const NAME: &'static str = "Main bus probe";
+        const VENDOR: &'static str = super::Probe::VENDOR;
+        const URL: &'static str = "";
+        const EMAIL: &'static str = "";
+        const VERSION: &'static str = super::Probe::VERSION;
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = super::Probe::AUDIO_IO_LAYOUTS;
+        type Editor = ();
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        fn params(&self) -> Arc<dyn Params> {
+            super::Probe.params()
+        }
+
+        fn activate(
+            &mut self,
+            _: &AudioIOLayout,
+            _: &BufferConfig,
+            context: &mut impl ActivateContext<Self>,
+        ) -> bool {
+            OBSERVED.set(main_input_speaker_bits(context));
+            OUTPUT_BITS.set(main_output_speaker_bits(context));
+            true
+        }
+
+        fn process(
+            &mut self,
+            _: &mut Buffer,
+            _: &mut AuxiliaryBuffers,
+            _: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+    }
+    impl Vst3Plugin for BusProbe {
+        const VST3_CLASS_ID: [u8; 16] = *b"MainBusMaskProbe";
+        const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = super::Probe::VST3_SUBCATEGORIES;
+    }
+
+    let wrapper = ::vst3::ComWrapper::new(nice_plug::wrapper::vst3::Wrapper::<BusProbe>::new());
+    let component = wrapper.to_com_ptr::<IComponent>().unwrap();
+    let instance = unsafe { Instance::from_component(component) };
+    instance.activate();
+    let atmos = vec![0, 1, 2, 3, 4, 5, 9, 10, 12, 14, 15, 17];
+    assert_eq!(OBSERVED.take().as_ref(), Some(&atmos));
+    assert_eq!(OUTPUT_BITS.take(), Some(atmos));
+    assert_eq!(instance.set(&mut [k71_2], k51_4), kResultOk);
+    instance.activate();
+    assert_eq!(OBSERVED.take(), Some(vec![0, 1, 2, 3, 4, 5, 9, 10, 24, 25]));
+    assert_eq!(
+        OUTPUT_BITS.take(),
+        Some(vec![0, 1, 2, 3, 4, 5, 12, 14, 15, 17])
+    );
 }
 
 #[test]
