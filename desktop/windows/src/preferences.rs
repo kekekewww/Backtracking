@@ -28,6 +28,17 @@ pub(crate) enum WideExportMode {
     Multichannel,
 }
 
+impl From<WideExportMode> for backtracking_core::wide_export::WideExportMode {
+    fn from(mode: WideExportMode) -> Self {
+        match mode {
+            WideExportMode::BinauralFiles => Self::BinauralFiles,
+            WideExportMode::BinauralMix => Self::BinauralMix,
+            WideExportMode::MonoFiles => Self::MonoFiles,
+            WideExportMode::Multichannel => Self::Multichannel,
+        }
+    }
+}
+
 impl WideExportMode {
     pub(crate) const ALL: [Self; 4] = [
         Self::BinauralFiles,

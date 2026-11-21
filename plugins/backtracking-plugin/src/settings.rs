@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use backtracking_core::{AutoResumeDelay, DurationChoice, WavExportProfile, WavSampleFormat, cleanup};
+use backtracking_core::wide_export::WideExportMode;
 use nice_plug::params::persist::{PersistentField, deserialize_field, serialize_field};
 
 pub(crate) const TRANSPARENCY_LEVELS: [u8; 5] = [0, 25, 50, 75, 100];
@@ -111,6 +112,67 @@ impl CaptureInput {
     }
 }
 
+/// How the L and R rows of a capture wider than stereo sound in preview and on export. The
+/// waveform is the same either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PairRender {
+    #[default]
+    Stereo,
+    Binaural,
+}
+
+impl PairRender {
+    pub(crate) const ALL: [Self; 2] = [Self::Stereo, Self::Binaural];
+
+    #[cfg(feature = "editor")]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Stereo => "Stereo",
+            Self::Binaural => "Binaural",
+        }
+    }
+
+    /// The value kept in the project, the same as the desktop's.
+    fn stored(self) -> &'static str {
+        match self {
+            Self::Stereo => "stereo",
+            Self::Binaural => "binaural",
+        }
+    }
+
+    pub(crate) fn binaural(self) -> bool {
+        self == Self::Binaural
+    }
+}
+
+/// The choices of Multichannel sources on the Export page, in the desktop's order.
+pub(crate) const WIDE_EXPORT_MODES: [WideExportMode; 4] = [
+    WideExportMode::BinauralFiles,
+    WideExportMode::MonoFiles,
+    WideExportMode::Multichannel,
+    WideExportMode::BinauralMix,
+];
+
+#[cfg(feature = "editor")]
+pub(crate) fn wide_export_label(mode: WideExportMode) -> &'static str {
+    match mode {
+        WideExportMode::BinauralFiles => "Binaural, one file per channel",
+        WideExportMode::MonoFiles => "Mono, one file per channel",
+        WideExportMode::Multichannel => "One multichannel file",
+        WideExportMode::BinauralMix => "One binaural mix",
+    }
+}
+
+/// The value kept in the project, the same as the desktop's.
+fn wide_export_stored(mode: WideExportMode) -> &'static str {
+    match mode {
+        WideExportMode::BinauralFiles => "binaural-files",
+        WideExportMode::BinauralMix => "binaural-mix",
+        WideExportMode::MonoFiles => "mono-files",
+        WideExportMode::Multichannel => "multichannel",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionSettings {
     pub(crate) retention: DurationChoice,
@@ -121,6 +183,11 @@ pub(crate) struct SessionSettings {
     pub(crate) meter_mode: MeterMode,
     pub(crate) wav_profile: WavExportProfile,
     pub(crate) force_mono: bool,
+    /// How the L and R of a capture wider than stereo are played and written.
+    pub(crate) pair_render: PairRender,
+    pub(crate) preview_as_lr: bool,
+    /// The files a capture wider than stereo is saved and dragged out as.
+    pub(crate) wide_export: WideExportMode,
     pub(crate) show_waveform_only: bool,
     pub(crate) waveform_layout: WaveformLayout,
     pub(crate) show_bar_lines: bool,
@@ -166,6 +233,9 @@ impl Default for SessionSettings {
             meter_mode: MeterMode::Dbfs,
             wav_profile: WavExportProfile::default(),
             force_mono: false,
+            pair_render: PairRender::default(),
+            preview_as_lr: false,
+            wide_export: WideExportMode::default(),
             show_waveform_only: false,
             waveform_layout: WaveformLayout::default(),
             show_bar_lines: false,
@@ -265,6 +335,26 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
             force_mono: fields
                 .get("wav_force_mono")
                 .is_some_and(|value| value == "true"),
+            // Projects saved before these choices existed get the desktop's defaults.
+            preview_as_lr: fields
+                .get("wide_preview")
+                .is_some_and(|value| value == "lr"),
+            pair_render: fields
+                .get("pair_render")
+                .and_then(|value| {
+                    PairRender::ALL
+                        .into_iter()
+                        .find(|pair| pair.stored() == value)
+                })
+                .unwrap_or(defaults.pair_render),
+            wide_export: fields
+                .get("wide_export")
+                .and_then(|value| {
+                    WIDE_EXPORT_MODES
+                        .into_iter()
+                        .find(|mode| wide_export_stored(*mode) == value)
+                })
+                .unwrap_or(defaults.wide_export),
             show_waveform_only: fields
                 .get("show_waveform_only")
                 .is_some_and(|value| value == "true"),
@@ -373,6 +463,20 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                     .to_string(),
             ),
             ("wav_force_mono".into(), settings.force_mono.to_string()),
+            (
+                "wide_preview".into(),
+                if settings.preview_as_lr {
+                    "lr"
+                } else {
+                    "own-channels"
+                }
+                .into(),
+            ),
+            ("pair_render".into(), settings.pair_render.stored().into()),
+            (
+                "wide_export".into(),
+                wide_export_stored(settings.wide_export).into(),
+            ),
             ("show_bar_lines".into(), settings.show_bar_lines.to_string()),
             ("show_seconds_lines".into(), settings.show_seconds_lines.to_string()),
             ("seconds_interval".into(), settings.seconds_interval.to_string()),
@@ -539,5 +643,93 @@ mod tests {
         let restored = SettingsStore::default();
         restored.set(source.map(Clone::clone));
         assert_eq!(*restored.lock(), *source.lock());
+    }
+
+    #[test]
+    fn wide_preview_round_trips_and_defaults_for_unknown_and_missing_values() {
+        let store = SettingsStore::default();
+        for value in [Some("lr"), Some("own-channels"), Some("future"), None] {
+            store.set(
+                value
+                    .map(|v| ("wide_preview".into(), v.to_owned()))
+                    .into_iter()
+                    .collect(),
+            );
+            assert_eq!(store.lock().preview_as_lr, value == Some("lr"));
+            let fields = store.map(Clone::clone);
+            assert_eq!(
+                fields["wide_preview"],
+                if value == Some("lr") {
+                    "lr"
+                } else {
+                    "own-channels"
+                }
+            );
+            let restored = SettingsStore::default();
+            restored.set(fields);
+            assert_eq!(restored.lock().preview_as_lr, store.lock().preview_as_lr);
+        }
+    }
+
+    #[test]
+    fn multichannel_choices_are_stored_restored_and_default_for_old_projects() {
+        let settings = SettingsStore::default();
+        // A project saved before these choices existed: the desktop's defaults.
+        settings.set(BTreeMap::from([("history_seconds".into(), "30".into())]));
+        assert_eq!(settings.lock().pair_render, PairRender::Stereo);
+        assert_eq!(settings.lock().wide_export, WideExportMode::BinauralFiles);
+        let stored = settings.map(Clone::clone);
+        assert_eq!(stored["pair_render"], "stereo");
+        assert_eq!(stored["wide_export"], "binaural-files");
+
+        for (pair, mode, stored_pair, stored_mode) in [
+            (
+                PairRender::Binaural,
+                WideExportMode::MonoFiles,
+                "binaural",
+                "mono-files",
+            ),
+            (
+                PairRender::Stereo,
+                WideExportMode::Multichannel,
+                "stereo",
+                "multichannel",
+            ),
+            (
+                PairRender::Binaural,
+                WideExportMode::BinauralMix,
+                "binaural",
+                "binaural-mix",
+            ),
+            (
+                PairRender::Stereo,
+                WideExportMode::BinauralFiles,
+                "stereo",
+                "binaural-files",
+            ),
+        ] {
+            let source = SettingsStore::default();
+            {
+                let mut settings = source.lock();
+                settings.pair_render = pair;
+                settings.wide_export = mode;
+            }
+            let fields = source.map(Clone::clone);
+            assert_eq!(fields["pair_render"], stored_pair);
+            assert_eq!(fields["wide_export"], stored_mode);
+            let restored = SettingsStore::default();
+            restored.set(fields);
+            assert_eq!(restored.lock().pair_render, pair);
+            assert_eq!(restored.lock().wide_export, mode);
+            assert_eq!(*restored.lock(), *source.lock());
+        }
+
+        // Anything else, such as a value from a later version, keeps the default.
+        settings.set(BTreeMap::from([
+            ("pair_render".into(), "surround".into()),
+            ("wide_export".into(), "Binaural".into()),
+        ]));
+        assert_eq!(settings.lock().pair_render, PairRender::Stereo);
+        assert_eq!(settings.lock().wide_export, WideExportMode::BinauralFiles);
     }
 }

@@ -33,6 +33,7 @@ use backtracking_core::{
     waveform,
 };
 use backtracking_core::{FrozenPositionTrack, spatial::HeadModel};
+use backtracking_ui::stack::{self, LaneBox};
 use backtracking_ui::{
     FadeEnd, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, RECORDING_DIM, RECORDING_LIT, Theme,
     TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES, accent_color,
@@ -66,7 +67,6 @@ mod addon_sources;
 mod addons_page;
 mod harness;
 mod look;
-mod stack;
 #[cfg(test)]
 mod test_profile;
 mod text;
@@ -74,7 +74,6 @@ mod text;
 use addon_sources::AddonSources;
 use addons_page::{AddonsPage, PageRequest};
 use look::AddonLook;
-use stack::LaneBox;
 use text::Language;
 
 /// How often the window looks at work that only reports progress when asked.
@@ -8108,6 +8107,48 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn every_row_maps_a_point_to_the_same_time() {
+        // One selection crosses all rows: the time comes from x alone, whichever row is hit.
+        let audio = eframe::egui::Rect::from_min_size(
+            eframe::egui::Pos2::new(36.0, 40.0),
+            eframe::egui::Vec2::new(566.0, 150.0),
+        );
+        let specs = [
+            stack::LaneRows {
+                rows: 12,
+                stacked: true,
+            },
+            stack::LaneRows {
+                rows: 1,
+                stacked: false,
+            },
+        ];
+        let boxes = stack::lay_out(audio.height(), &specs, &[0, 0]);
+        let guides = backtracking_core::waveform::TimelineGuides::default();
+        let mut times = Vec::new();
+        for lane in &boxes {
+            for row in lane.visible() {
+                let y = audio.top() + lane.row_top(row).unwrap() + lane.row_height / 2.0;
+                assert!(stack::row_at(&boxes, y - audio.top()).is_some());
+                times.push(frame_from_pointer(
+                    audio,
+                    300.0,
+                    0..480_000,
+                    false,
+                    &[],
+                    &guides,
+                ));
+            }
+        }
+        assert_eq!(times.len(), 10);
+        assert!(times.iter().all(|&time| time == times[0]));
+        assert_eq!(
+            times[0],
+            ((300.0 - 36.0) / 566.0 * 480_000.0f64).round() as u64
+        );
+    }
 
     fn painted_waveform(
         minimum: &[f32],

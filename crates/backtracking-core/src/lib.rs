@@ -13,6 +13,7 @@ pub mod spatial;
 mod synchronized;
 mod track_ffi;
 pub mod waveform;
+pub mod wide_export;
 
 pub use capture::{
     Capture, CaptureError, CaptureState, DurationChoice, FrozenCapture, FrozenTrack, Snapshot,

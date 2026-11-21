@@ -9,6 +9,7 @@
 mod form;
 mod options;
 mod selection;
+pub mod stack;
 #[cfg(windows)]
 mod system_fonts;
 mod theme;

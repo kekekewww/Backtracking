@@ -9,8 +9,12 @@ use std::time::{Duration, Instant};
 
 use backtracking_core::{
     AutoResumeDelay, ChannelRoute, DurationChoice, Fades, FrozenTrack, MeterReadings, Preview,
-    WavExportProfile, cleanup, export_routed_tracks_with_fades, waveform,
+    WavExportProfile, cleanup,
+    spatial::HeadModel,
+    waveform,
+    waveform::{PairSide, PreviewLane},
 };
+use backtracking_ui::stack::{self, LaneBox};
 use backtracking_ui::{
     CENTER_LINE, FadeEnd, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, PLOT_BACKGROUND,
     RECORDING_DIM, RECORDING_LIT, TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS,
@@ -31,16 +35,20 @@ use nice_plug_egui::{
 
 use crate::session::{EditingSnapshot, Session, WaveformPeaks, WaveformTimeline, waveform_views};
 use crate::settings::{
-    BORDER_WIDTHS, CaptureInput, DEFAULT_ACCENT, MeterMode, SessionSettings, StatusMark,
-    TRANSPARENCY_LEVELS, WaveformLayout,
+    BORDER_WIDTHS, CaptureInput, DEFAULT_ACCENT, MeterMode, PairRender, SessionSettings,
+    StatusMark, TRANSPARENCY_LEVELS, WIDE_EXPORT_MODES, WaveformLayout, wide_export_label,
 };
+use crate::surround::{WideLayout, WideRow, WideSave};
 
 #[cfg(target_os = "windows")]
 mod win_drag;
 #[cfg(target_os = "windows")]
 mod win_ime;
 mod preview;
-use preview::{PreviewKey, PreviewRequest, PreviewResult, PreviewWorker};
+use preview::{
+    PreviewKey, PreviewRequest, PreviewResult, PreviewWorker, RowsKey, RowsRequest, RowsResult,
+    RowsWorker,
+};
 
 const REFRESH: Duration = Duration::from_millis(80);
 const RECORDING_BLINK: Duration = Duration::from_millis(500);
@@ -67,6 +75,14 @@ const PREVIEW_WAIT: Duration = Duration::from_millis(600);
 /// The selected waveform takes the accent's complement when it differs by at least this much.
 const SELECTION_CONTRAST: u8 = 64;
 const PRODUCT_ICON: &[u8] = include_bytes!("../../../assets/backtracking-icon.png");
+/// The L and R rows of a capture wider than stereo are set apart from its channel rows by a faint
+/// backing and a rule, both fainter than the line between two lanes, as on the desktop.
+const PAIR_BACKING: Color32 = Color32::from_rgba_premultiplied(7, 7, 7, 7);
+const PAIR_DIVIDER: Color32 = Color32::from_rgba_premultiplied(22, 22, 22, 22);
+/// The tallest the editor grows by itself for the rows of a capture wider than stereo.
+const MAX_GROWN_HEIGHT: f32 = 560.0;
+const NO_LOUDNESS: &str = "Loudness is measured for mono and stereo sources only.";
+const SCROLL_HINT: &str = "Scroll here or drag the bar on the right to see the other channels.";
 
 pub type CaptureEditor = EguiEditor<CaptureUi>;
 
@@ -114,6 +130,23 @@ pub struct CaptureUi {
     drag_results: Option<Receiver<Result<SavedWav, String>>>,
     output_cleanup: cleanup::Schedule,
     message: String,
+    /// The rows on screen of a capture wider than stereo, top to bottom, whose peaks are in
+    /// `row_peaks`. Empty for mono and stereo, which draw `peaks`.
+    rows: Vec<WideRow>,
+    row_peaks: Vec<WaveformPeaks>,
+    rows_worker: Option<RowsWorker>,
+    rows_requested: Option<RowsKey>,
+    /// The first row on screen of a wide capture's lane; the ones above are scrolled out.
+    first_row: usize,
+    /// Where the scroll thumb was grabbed, while it is dragged.
+    scroll_drag: Option<f32>,
+    /// This frame's scroll track in the right margin, then the label gutter beside it, while
+    /// a wide capture's rows scroll.
+    scroll_zones: Vec<Rect>,
+    /// Whether the waveform is drawn alone, without its labels and margins' furniture.
+    waveform_only: bool,
+    /// Made the first time a binaural preview needs it.
+    head_model: Option<Arc<HeadModel>>,
     /// Keeps a Chinese, Japanese or Korean input method from swallowing Space and the other keys.
     #[cfg(target_os = "windows")]
     input_method: win_ime::InputMethod,
@@ -249,6 +282,8 @@ struct EditorSizing {
     options_size: Option<Vec2>,
     full_height: Option<f32>,
     waveform_only: bool,
+    /// The heights before and after the editor grew for a wide capture's rows.
+    grown: Option<(f32, f32)>,
 }
 
 impl EditorSizing {
@@ -298,6 +333,37 @@ impl EditorSizing {
             self.full_height.take().unwrap_or(212.0)
         }.max(MIN_WAVEFORM_HEIGHT);
         ((height - current.y).abs() >= 1.0).then_some(Vec2::new(current.x, height))
+    }
+
+    /// What the editor `current` big does for rows that want `wanted` points of a plot that has
+    /// `plot`, as the desktop window does: it grows once when a wide capture's rows appear, at
+    /// most to `MAX_GROWN_HEIGHT`, and goes back when they go unless it was resized meanwhile.
+    /// While `busy` (Options, a gesture or another resize under way) it stays as it is.
+    fn fit_rows(
+        &mut self,
+        current: Vec2,
+        wanted: Option<f32>,
+        plot: f32,
+        busy: bool,
+    ) -> Option<Vec2> {
+        if busy {
+            return None;
+        }
+        match (wanted, self.grown) {
+            (Some(wanted), None) => {
+                let target = (current.y + wanted - plot)
+                    .min(MAX_GROWN_HEIGHT)
+                    .max(current.y);
+                self.grown = Some((current.y, target));
+                (target > current.y + 0.5).then_some(Vec2::new(current.x, target))
+            }
+            (None, Some((before, after))) => {
+                self.grown = None;
+                ((current.y - after).abs() < 1.0 && after > before + 0.5)
+                    .then_some(Vec2::new(current.x, before))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -358,6 +424,7 @@ impl Drop for ActiveDrag {
 }
 
 struct WavClip {
+    mask: u32,
     profile: WavExportProfile,
     force_mono: bool,
     output: PathBuf,
@@ -387,36 +454,70 @@ impl SavedWav {
 }
 
 impl WavClip {
+    /// Writes a clip that has no wide channels to lay out.
+    #[cfg(test)]
     fn write(self) -> io::Result<SavedWav> {
-        let paths = export_routed_tracks_with_fades(
-            &self.output,
-            &self.snapshots,
-            self.range,
-            self.profile,
-            &[ChannelRoute::Merged; 2][..self.snapshots.len()],
-            self.force_mono,
-            self.tempo,
-            self.fades,
+        ClipJob::from(self).write()
+    }
+}
+
+/// A clip and, for a capture wider than stereo, how its channels are written.
+struct ClipJob {
+    clip: WavClip,
+    wide: Option<WideSave>,
+}
+
+impl From<WavClip> for ClipJob {
+    fn from(clip: WavClip) -> Self {
+        Self { clip, wide: None }
+    }
+}
+
+impl ClipJob {
+    fn write(self) -> io::Result<SavedWav> {
+        let Self { clip, wide } = self;
+        let paths = crate::surround::export_clip(
+            &clip.output,
+            &clip.snapshots,
+            clip.range,
+            clip.profile,
+            clip.force_mono,
+            clip.tempo,
+            clip.fades,
+            clip.mask,
+            wide.as_ref(),
         )?;
         Ok(SavedWav {
             paths: paths
                 .into_iter()
                 .map(|path| path.canonicalize().unwrap_or(path))
                 .collect(),
-            marker: self.marker,
+            marker: clip.marker,
         })
     }
 }
 
+/// Takes plain clips as well as wide ones.
+struct ClipSender(Sender<ClipJob>);
+
+impl ClipSender {
+    /// Fails only once the writer has stopped.
+    fn send(&self, job: impl Into<ClipJob>) -> io::Result<()> {
+        self.0
+            .send(job.into())
+            .map_err(|_| io::Error::other("snapshot writer stopped unexpectedly"))
+    }
+}
+
 struct SnapshotWriter {
-    requests: Sender<WavClip>,
+    requests: ClipSender,
     results: Receiver<io::Result<SavedWav>>,
     worker: JoinHandle<()>,
 }
 
 impl SnapshotWriter {
     fn start() -> io::Result<Self> {
-        let (requests, incoming) = mpsc::channel::<WavClip>();
+        let (requests, incoming) = mpsc::channel::<ClipJob>();
         let (completed, results) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("backtracking-snapshot".into())
@@ -426,7 +527,7 @@ impl SnapshotWriter {
                 }
             })?;
         Ok(Self {
-            requests,
+            requests: ClipSender(requests),
             results,
             worker,
         })
@@ -541,7 +642,9 @@ impl NiceEguiApp for CaptureUi {
             let retention_changed = previous.retention != settings.retention;
             let output_changed = previous.output_dir != settings.output_dir;
             let format_changed = previous.wav_profile != settings.wav_profile
-                || previous.force_mono != settings.force_mono;
+                || previous.force_mono != settings.force_mono
+                || previous.pair_render != settings.pair_render
+                || previous.wide_export != settings.wide_export;
             let folders_changed = output_changed || previous.saved_dir != settings.saved_dir;
             if retention_changed {
                 self.next_refresh = Instant::now();
@@ -592,6 +695,7 @@ impl NiceEguiApp for CaptureUi {
             self.toggle_preview(&settings);
         }
         self.explain_waiting_preview();
+        self.waveform_only = settings.show_waveform_only;
         let mut paused = self.session.is_paused();
         self.refresh_waveform(paused, settings.waveform_layout);
         ui.visuals_mut().selection.bg_fill = muted_accent(accent_color(settings.accent));
@@ -638,6 +742,10 @@ impl NiceEguiApp for CaptureUi {
                         self.toggle_capture(ui, paused);
                         paused = self.session.is_paused();
                     }
+                    if self.timeline.channels > 2 {
+                        // The plug-in's window is in English, like its other labels.
+                        ui.label(format!("{} ch", self.timeline.channels));
+                    }
                     self.recording_indicator(ui, paused, settings.status_mark);
                     if clear_button(ui, controls_enabled && self.seconds > 0.0).clicked() {
                         self.clear_capture();
@@ -681,6 +789,7 @@ impl NiceEguiApp for CaptureUi {
         }
         self.apply_waveform_size(ui, rect.height(), settings.show_waveform_only);
         let configured_seconds = settings.retention.seconds() as f32;
+        let row_tip = self.interact_lanes(ui, rect, !settings_open);
         if !canceled_selection {
             self.interact_waveform(ui, frame, &response, &settings, !settings_open);
         }
@@ -688,6 +797,10 @@ impl NiceEguiApp for CaptureUi {
             response.surrender_focus();
         }
         self.draw_waveform(ui, rect, configured_seconds, !settings_open, &settings);
+        let response = match row_tip {
+            Some(text) => response.on_hover_text(text),
+            None => response,
+        };
         if !settings_open {
             let cursor = ui.input(|input| input.pointer.hover_pos())
                 .filter(|position| self.selection_handle(self.audio_rect(rect, configured_seconds), *position).is_some())
@@ -793,6 +906,15 @@ impl CaptureUi {
             // The project's choice arrives later, with the rest of the restored settings.
             output_cleanup: cleanup::Schedule::new(None, Instant::now()),
             message: String::new(),
+            rows: Vec::new(),
+            row_peaks: Vec::new(),
+            rows_worker: None,
+            rows_requested: None,
+            first_row: 0,
+            scroll_drag: None,
+            scroll_zones: Vec::new(),
+            waveform_only: false,
+            head_model: None,
             #[cfg(target_os = "windows")]
             input_method: win_ime::InputMethod::default(),
         }
@@ -801,10 +923,15 @@ impl CaptureUi {
     fn meter_readout(&self, ui: &mut egui::Ui, mode: MeterMode) {
         let value = mode.reading(self.session.meter_readings());
         let text = format!("{} {}", meter_number(Some(value), false), mode.label());
-        ui.add_sized(
+        let response = ui.add_sized(
             [90.0, TOOLBAR_CONTROL_HEIGHT],
             egui::Label::new(egui::RichText::new(text).monospace()).truncate(),
         );
+        // A capture wider than stereo has a peak and a VU reading but no loudness, as on the
+        // desktop, so LUFS reads "—".
+        if mode == MeterMode::Lufs && self.timeline.wide.is_some() {
+            response.on_hover_text(NO_LOUDNESS);
+        }
     }
 
     fn recording_indicator(&mut self, ui: &mut egui::Ui, paused: bool, mark: StatusMark) {
@@ -871,6 +998,8 @@ impl CaptureUi {
         let window_size = (bounds.size() - Vec2::splat(16.0))
             .min(OPTIONS_EDITOR_SIZE - Vec2::splat(16.0))
             .max(Vec2::new(220.0, 100.0));
+        let history_note = self.short_history_note(settings.retention);
+        let wide = self.timeline.wide.is_some();
         egui::Window::new("Options")
             .id(egui::Id::unique("backtracking-options"))
             .open(&mut open)
@@ -883,14 +1012,16 @@ impl CaptureUi {
                 options_layout(ui, &mut selected_tab, accent, |ui, tab| {
                     match tab {
                         OptionsTab::Actions => self.capture_actions(ui, settings),
-                        OptionsTab::Capture => capture_options(ui, &mut edited),
+                        OptionsTab::Capture => {
+                            capture_page(ui, &mut edited, history_note.as_deref());
+                        }
                         OptionsTab::Sources => source_options(
                             ui,
                             &mut edited,
                             self.session.sidechain_available(),
                             self.session.host_track_name().as_deref(),
                         ),
-                        OptionsTab::Appearance => appearance_options(ui, &mut edited),
+                        OptionsTab::Appearance => appearance_page(ui, &mut edited, wide),
                         OptionsTab::Export => folder_action = export_options(ui, &mut edited),
                     }
                     if !self.message.is_empty() {
@@ -937,7 +1068,11 @@ impl CaptureUi {
             return;
         }
         self.session.update_editor_settings(edited.clone());
-        if edited.wav_profile != settings.wav_profile || edited.force_mono != settings.force_mono {
+        if edited.wav_profile != settings.wav_profile
+            || edited.force_mono != settings.force_mono
+            || edited.pair_render != settings.pair_render
+            || edited.wide_export != settings.wide_export
+        {
             self.discard_drag_preparation();
             self.message.clear();
         }
@@ -999,9 +1134,17 @@ impl CaptureUi {
             self.gesture.is_some() || self.native_dragging.load(Ordering::Acquire),
         );
         let bins = policy.bins.max(1);
-        if self.peak_layout == layout && now < self.next_refresh
-            && self.peaks[0].minimum.len() == bins
-        {
+        let current = match &self.timeline.wide {
+            // A wide capture's rows are current while the same rows are on screen.
+            Some(wide) => {
+                self.row_peaks
+                    .first()
+                    .is_none_or(|peaks| peaks.minimum.len() == bins)
+                    && self.rows == self.rows_for(wide, self.timeline.b_channels.is_some())
+            }
+            None => self.peaks[0].minimum.len() == bins,
+        };
+        if self.peak_layout == layout && now < self.next_refresh && current {
             return;
         }
         if self.session.editing_pending() {
@@ -1011,6 +1154,11 @@ impl CaptureUi {
         }
         if let Some(editing) = self.session.editing_snapshot() {
             let range = clamped_view(self.view.clone(), &editing.timeline.frames);
+            if let Some(wide) = editing.timeline.wide.clone() {
+                self.refresh_edit_rows(&editing, wide, range, bins);
+                self.next_refresh = now + Duration::from_millis(16);
+                return;
+            }
             let key = PreviewKey {
                 epoch: editing.timeline.epoch,
                 editing_token: editing.token,
@@ -1022,7 +1170,11 @@ impl CaptureUi {
             self.clamp_edit_selection(&editing.timeline.frames);
             if self.preview_requested.as_ref() != Some(&key) {
                 if let Some(worker) = &self.preview_worker {
-                    worker.request(PreviewRequest { key: key.clone(), snapshots: editing.snapshots.clone() });
+                    worker.request(PreviewRequest {
+                        wide: editing.timeline.wide.clone(),
+                        key: key.clone(),
+                        snapshots: editing.snapshots.clone(),
+                    });
                     self.preview_requested = Some(key.clone());
                 } else {
                     self.message = "Waveform preview worker unavailable.".into();
@@ -1034,18 +1186,49 @@ impl CaptureUi {
             return;
         }
         self.preview_requested = None;
+        self.rows_requested = None;
         self.editing_seconds = None;
         if self.selection.is_some() && self.gesture.is_none() {
             self.reset_selection_preview();
         }
-        let mut peaks = self.peaks.clone();
         let requested = self.view.clone();
+        if let Some(wide) = self.timeline.wide.clone() {
+            let rows = self.rows_for(&wide, self.timeline.b_channels.is_some());
+            let mut peaks = self.row_peaks.clone();
+            let Some(timeline) =
+                self.session
+                    .try_wide_rows(&rows, requested.clone(), bins, &mut peaks)
+            else {
+                self.next_refresh = now + Duration::from_millis(16);
+                return;
+            };
+            // A capture that is no longer wide is drawn the usual way below.
+            if timeline.wide.is_some() {
+                self.adopt_live_timeline(timeline, requested);
+                self.rows = rows;
+                self.row_peaks = peaks;
+                self.peak_layout = layout;
+                self.next_refresh = now + REFRESH;
+                return;
+            }
+        }
+        self.rows.clear();
+        self.row_peaks.clear();
+        let mut peaks = self.peaks.clone();
         let Some(timeline) = self.session.try_waveform_in_range_with_bins(
             layout, requested.clone(), bins, &mut peaks,
         ) else {
             self.next_refresh = now + Duration::from_millis(16);
             return;
         };
+        self.adopt_live_timeline(timeline, requested);
+        self.peak_layout = layout;
+        self.peaks = peaks;
+        self.next_refresh = now + REFRESH;
+    }
+
+    /// Takes the live capture's `timeline` and the view `requested` of it.
+    fn adopt_live_timeline(&mut self, timeline: WaveformTimeline, requested: Option<Range<u64>>) {
         self.sync_timeline(timeline.epoch);
         self.seconds = timeline.duration();
         self.peak_frames = clamped_view(requested, &timeline.frames);
@@ -1065,9 +1248,62 @@ impl CaptureUi {
             }
         }
         self.timeline = timeline;
-        self.peak_layout = layout;
-        self.peaks = peaks;
-        self.next_refresh = now + REFRESH;
+    }
+
+    /// Asks for the rows on screen of a pinned wide capture and shows them once they are read.
+    fn refresh_edit_rows(
+        &mut self,
+        editing: &EditingSnapshot,
+        wide: WideLayout,
+        range: Range<u64>,
+        bins: usize,
+    ) {
+        let key = RowsKey {
+            epoch: editing.timeline.epoch,
+            editing_token: editing.token,
+            range,
+            rows: self.rows_for(&wide, editing.timeline.b_channels.is_some()),
+            bins,
+        };
+        self.sync_timeline(editing.timeline.epoch);
+        self.clamp_edit_selection(&editing.timeline.frames);
+        if self.rows_requested.as_ref() != Some(&key) {
+            if self.rows_worker.is_none() {
+                self.rows_worker = RowsWorker::start().ok();
+            }
+            if let Some(worker) = &self.rows_worker {
+                worker.request(RowsRequest {
+                    wide,
+                    key: key.clone(),
+                    snapshots: editing.snapshots.clone(),
+                });
+                self.rows_requested = Some(key.clone());
+            } else {
+                self.message = "Waveform preview worker unavailable.".into();
+            }
+        }
+        let result = self.rows_worker.as_ref().and_then(RowsWorker::try_take);
+        self.apply_edit_rows(editing, &key, result);
+    }
+
+    /// Shows the rows `key` asked for, when `result` is for them.
+    fn apply_edit_rows(
+        &mut self,
+        editing: &EditingSnapshot,
+        key: &RowsKey,
+        result: Option<RowsResult>,
+    ) -> bool {
+        let Some(result) = result.filter(|result| &result.key == key) else {
+            return false;
+        };
+        // Geometry and data change together, as for a pinned mono or stereo view.
+        self.timeline = editing.timeline.as_ref().clone();
+        self.seconds = self.timeline.duration();
+        self.peak_frames = result.key.range;
+        self.displayed_zoomed = self.peak_frames != self.timeline.frames;
+        self.rows = result.key.rows;
+        self.row_peaks = result.peaks;
+        true
     }
 
     fn clamp_edit_selection(&mut self, bounds: &Range<u64>) {
@@ -1130,6 +1366,10 @@ impl CaptureUi {
             ..WaveformTimeline::default()
         };
         self.peaks.fill(WaveformPeaks::default());
+        self.rows.clear();
+        self.row_peaks.clear();
+        self.first_row = 0;
+        self.scroll_drag = None;
         self.seconds = 0.0;
     }
 
@@ -1165,6 +1405,7 @@ impl CaptureUi {
         // The preview plays the selection, so it ends with it.
         self.stop_preview();
         self.preview_requested = None;
+        self.rows_requested = None;
         self.editing_seconds = None;
         self.session.set_snapshot_selection(None);
         self.next_refresh = Instant::now();
@@ -1189,9 +1430,44 @@ impl CaptureUi {
             self.message = "Preparing selected audio…".into();
             return;
         };
-        let routes = [ChannelRoute::Merged; 2];
-        let routes = &routes[..editing.snapshots.len().min(routes.len())];
-        match Preview::new(&editing.snapshots, selection, routes, settings.force_mono, self.fades) {
+        // Keep the Capture page's L/R render ready for a bus with a different layout.
+        let binaural = editing.timeline.wide.is_some() && settings.pair_render.binaural();
+        let model = if binaural {
+            let Some(model) = self.head_model(editing.timeline.sample_rate) else {
+                self.message = "The selected audio is no longer available.".into();
+                return;
+            };
+            Some(model)
+        } else {
+            None
+        };
+        let lanes: Vec<_> = editing
+            .snapshots
+            .iter()
+            .map(|track| PreviewLane {
+                track,
+                route: ChannelRoute::Merged,
+                selected: None,
+                group: editing
+                    .timeline
+                    .wide
+                    .as_ref()
+                    .filter(|_| track.channels() > 2)
+                    .map(|w| &w.group),
+            })
+            .collect();
+        let preview = match &editing.timeline.wide {
+            Some(wide) if !settings.preview_as_lr => Preview::for_bus(
+                &lanes,
+                selection,
+                wide.speaker_mask,
+                model,
+                settings.force_mono,
+                self.fades,
+            ),
+            _ => Preview::with_channels(&lanes, selection, model, settings.force_mono, self.fades),
+        };
+        match preview {
             Some(preview) => {
                 self.session.preview.play(preview);
                 self.preview_started = Some(Instant::now());
@@ -1285,12 +1561,76 @@ impl CaptureUi {
             toolbar_height,
         ) {
             ui.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            return;
+        }
+        // The rows of a wide capture ask for room, as on the desktop. Mono and stereo never do.
+        let wanted = self.timeline.wide.as_ref().and_then(|wide| {
+            stack::comfortable_height(&wide_lanes(wide, self.timeline.b_channels.is_some()))
+        });
+        // A cleared or restarted capture shows an empty timeline until the session answers. Its
+        // rows have not gone away yet, so the size waits for that answer.
+        let busy = self.options_open
+            || self.editor_sizing.options_size.is_some()
+            || waveform_only
+            || self.gesture.is_some()
+            || self.native_dragging.load(Ordering::Acquire)
+            || self.timeline.sample_rate == 0;
+        if let Some(size) = self
+            .editor_sizing
+            .fit_rows(current, wanted, self.display_size.y, busy)
+        {
+            ui.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
     }
 
-    fn audio_rect(&self, rect: Rect, seconds: f32) -> Rect {
+    /// Whether the capture shows one row per channel under L and R.
+    fn stacked(&self) -> bool {
+        self.timeline.wide.is_some()
+    }
+
+    /// Where the rows go in the waveform's `rect`: inside its margins, and right of the label
+    /// gutter while a wide capture's channels are named beside their rows.
+    fn timeline_rect(&self, rect: Rect) -> Rect {
         let inner = rect.shrink(8.0);
-        let seconds = self.editing_seconds.unwrap_or(seconds);
+        if self.stacked() && !self.waveform_only {
+            Rect::from_min_max(
+                Pos2::new(
+                    (rect.left() + stack::LABEL_GUTTER).min(inner.right()),
+                    inner.top(),
+                ),
+                inner.max,
+            )
+        } else {
+            inner
+        }
+    }
+
+    /// Where each lane's rows go in a plot `height` points high.
+    fn lane_boxes(&self, height: f32) -> Vec<LaneBox> {
+        self.timeline.wide.as_ref().map_or_else(Vec::new, |wide| {
+            let lanes = wide_lanes(wide, self.timeline.b_channels.is_some());
+            stack::lay_out(height, &lanes, &[self.first_row, 0])
+        })
+    }
+
+    /// The rows of `wide` on screen, with the sidechain's below when it is captured too.
+    fn rows_for(&self, wide: &WideLayout, sidechain: bool) -> Vec<WideRow> {
+        let boxes = stack::lay_out(
+            self.display_size.y,
+            &wide_lanes(wide, sidechain),
+            &[self.first_row, 0],
+        );
+        rows_on_screen(wide, &boxes)
+    }
+
+    fn audio_rect(&self, rect: Rect, seconds: f32) -> Rect {
+        let inner = self.timeline_rect(rect);
+        let mut seconds = self.editing_seconds.unwrap_or(seconds);
+        let kept = self.timeline.retention_seconds as f32;
+        if self.stacked() && kept.is_finite() && kept > 0.0 {
+            // More channels keep less history; the plot's width is what memory holds.
+            seconds = seconds.min(kept).max(1.0);
+        }
         let width = if self.displayed_zoomed && !self.peak_frames.is_empty() {
             inner.width()
         } else {
@@ -1372,51 +1712,41 @@ impl CaptureUi {
         if width > 0.0 && opacity > 0 {
             self.draw_reference_lines(&painter, audio_rect, settings, opacity);
         }
-        let rows = if self.timeline.b_channels.is_some() {
-            2
-        } else {
-            waveform_views(self.peak_layout, self.timeline.channels).len()
-        };
-        let row_height = inner.height() / rows as f32;
-        let extent = row_height * 0.47;
         let selection_clip = explicit_range.as_ref().and_then(|range|
             waveform_selection_clip(audio_rect, &self.peak_frames, range));
-        for (row, peaks) in self.peaks[..rows].iter().enumerate() {
-            let middle = inner.top() + (row as f32 + 0.5) * row_height;
-            if !waveform_only {
-                painter.hline(
-                    inner.x_range(),
-                    middle,
-                    Stroke::new(policy.seconds_stroke, CENTER_LINE),
-                );
-            }
-            if width <= 0.0 {
-                continue;
-            }
-            let tapered;
-            let peaks = match &explicit_range {
-                // The waveform tapers the way the exported clip does.
-                Some(range) if !fades.is_none() => {
-                    let mut faded = peaks.clone();
-                    fade_waveform_bins(&mut faded.minimum, &mut faded.maximum,
-                        self.peak_frames.clone(), range, fades);
-                    tapered = faded;
-                    &tapered
-                }
-                _ => peaks,
+        let trace = RowTrace {
+            audio_rect,
+            range: explicit_range.as_ref(),
+            fades,
+            stroke: policy.waveform_stroke,
+            color,
+            selected_color,
+            selection_clip,
+        };
+        if let Some(wide) = &self.timeline.wide {
+            let hover = ui.input(|input| input.pointer.hover_pos());
+            self.draw_rows(&painter, rect, wide, &trace, policy.seconds_stroke, hover);
+        } else {
+            let rows = if self.timeline.b_channels.is_some() {
+                2
+            } else {
+                waveform_views(self.peak_layout, self.timeline.channels).len()
             };
-            let geometry = waveform::waveform_geometry(
-                &peaks.minimum, &peaks.maximum, self.peak_frames.clone());
-            paint_waveform_geometry(&painter, &geometry, audio_rect, middle, extent,
-                policy.waveform_stroke, color);
-            if let Some(clip) = selection_clip {
-                paint_waveform_geometry(&painter.with_clip_rect(clip), &geometry, audio_rect,
-                    middle, extent, policy.waveform_stroke, selected_color);
-            }
-            if let Some(range) = &explicit_range {
-                // Full scale is drawn at the height paint_waveform_geometry uses.
-                paint_fades(&painter, audio_rect, middle, extent, &self.peak_frames, range,
-                    fades, FLAG_COLOR);
+            let row_height = inner.height() / rows as f32;
+            let extent = row_height * 0.47;
+            for (row, peaks) in self.peaks[..rows].iter().enumerate() {
+                let middle = inner.top() + (row as f32 + 0.5) * row_height;
+                if !waveform_only {
+                    painter.hline(
+                        inner.x_range(),
+                        middle,
+                        Stroke::new(policy.seconds_stroke, CENTER_LINE),
+                    );
+                }
+                if width <= 0.0 {
+                    continue;
+                }
+                self.paint_row(&painter, &trace, peaks, middle, extent);
             }
         }
         if width > 0.0 {
@@ -1452,6 +1782,316 @@ impl CaptureUi {
                 Color32::WHITE,
             );
         }
+    }
+
+    /// One row's waveform about `middle`, tapered the way the clip is written, with its
+    /// selection drawn over it.
+    fn paint_row(
+        &self,
+        painter: &egui::Painter,
+        trace: &RowTrace<'_>,
+        peaks: &WaveformPeaks,
+        middle: f32,
+        extent: f32,
+    ) {
+        let tapered;
+        let peaks = match trace.range {
+            // The waveform tapers the way the exported clip does.
+            Some(range) if !trace.fades.is_none() => {
+                let mut faded = peaks.clone();
+                fade_waveform_bins(
+                    &mut faded.minimum,
+                    &mut faded.maximum,
+                    self.peak_frames.clone(),
+                    range,
+                    trace.fades,
+                );
+                tapered = faded;
+                &tapered
+            }
+            _ => peaks,
+        };
+        let geometry =
+            waveform::waveform_geometry(&peaks.minimum, &peaks.maximum, self.peak_frames.clone());
+        paint_waveform_geometry(
+            painter,
+            &geometry,
+            trace.audio_rect,
+            middle,
+            extent,
+            trace.stroke,
+            trace.color,
+        );
+        if let Some(clip) = trace.selection_clip {
+            paint_waveform_geometry(
+                &painter.with_clip_rect(clip),
+                &geometry,
+                trace.audio_rect,
+                middle,
+                extent,
+                trace.stroke,
+                trace.selected_color,
+            );
+        }
+        if let Some(range) = trace.range {
+            // Full scale is drawn at the height paint_waveform_geometry uses.
+            paint_fades(
+                painter,
+                trace.audio_rect,
+                middle,
+                extent,
+                &self.peak_frames,
+                range,
+                trace.fades,
+                FLAG_COLOR,
+            );
+        }
+    }
+
+    /// The rows of a capture wider than stereo, as on the desktop: L and R on a faint backing
+    /// with a rule below, a row per channel named in the gutter, and the sidechain's row below
+    /// a lane line when it is captured too. A lane whose rows do not all fit has a scroll bar
+    /// in the right margin. `line` is the centre lines' width.
+    fn draw_rows(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        wide: &WideLayout,
+        trace: &RowTrace<'_>,
+        line: f32,
+        hover: Option<Pos2>,
+    ) {
+        let inner = self.timeline_rect(rect);
+        let audio = trace.audio_rect;
+        let boxes = self.lane_boxes(inner.height());
+        for (lane, lane_box) in boxes.iter().enumerate() {
+            for index in lane_box.visible() {
+                let Some(source) = wide_row(wide, lane, index) else {
+                    continue;
+                };
+                let top = inner.top() + lane_box.row_top(index).unwrap_or_default();
+                let row = Rect::from_min_size(
+                    Pos2::new(inner.left(), top),
+                    Vec2::new(inner.width(), lane_box.row_height),
+                );
+                let middle = row.center().y;
+                if !self.waveform_only {
+                    if matches!(source, WideRow::Pair(_)) {
+                        painter.rect_filled(
+                            Rect::from_x_y_ranges(rect.left()..=audio.right(), row.y_range()),
+                            0.0,
+                            PAIR_BACKING,
+                        );
+                    }
+                    painter.hline(inner.x_range(), middle, Stroke::new(line, CENTER_LINE));
+                    if source == WideRow::Pair(PairSide::Right)
+                        && index + 1 < lane_box.first + lane_box.shown
+                    {
+                        painter.hline(
+                            rect.left() + 1.0..=audio.right(),
+                            row.bottom(),
+                            Stroke::new(1.0, PAIR_DIVIDER),
+                        );
+                    }
+                    if lane_box.row_height >= stack::LABELLED_ROW_HEIGHT {
+                        painter.text(
+                            Pos2::new(rect.left() + 1.0, middle),
+                            egui::Align2::LEFT_CENTER,
+                            row_label(wide, source),
+                            egui::FontId::monospace(8.0),
+                            Color32::from_gray(180),
+                        );
+                    }
+                }
+                if audio.width() <= 0.0 {
+                    continue;
+                }
+                // Rows just scrolled into view wait for their peaks.
+                if let Some(peaks) = self
+                    .rows
+                    .iter()
+                    .position(|shown| *shown == source)
+                    .and_then(|position| self.row_peaks.get(position))
+                {
+                    self.paint_row(painter, trace, peaks, middle, lane_box.row_height * 0.47);
+                }
+            }
+        }
+        if self.waveform_only {
+            return;
+        }
+        for lane_box in boxes.iter().skip(1) {
+            painter.hline(
+                rect.left() + 1.0..=audio.right(),
+                inner.top() + lane_box.top,
+                Stroke::new(1.0, Color32::from_white_alpha(36)),
+            );
+        }
+        if let Some(lane_box) = boxes.first().filter(|lane_box| lane_box.scrolls()) {
+            let track = scroll_track(rect, inner, lane_box);
+            let x = track.center().x - 1.5..=track.center().x + 1.5;
+            painter.rect_filled(
+                Rect::from_x_y_ranges(x.clone(), track.y_range()),
+                1.5,
+                Color32::from_white_alpha(18),
+            );
+            let thumb = lane_box.thumb();
+            let active =
+                self.scroll_drag.is_some() || hover.is_some_and(|point| track.contains(point));
+            painter.rect_filled(
+                Rect::from_x_y_ranges(x, inner.top() + thumb.start..=inner.top() + thumb.end),
+                1.5,
+                Color32::from_gray(if active { 200 } else { 128 }),
+            );
+        }
+    }
+
+    /// The scroll bar and the wheel over the margins of a wide capture's lane, as on the desktop.
+    /// Returns the tooltip of the row beside the pointer, in the gutter or the right margin.
+    fn interact_lanes(&mut self, ui: &egui::Ui, rect: Rect, enabled: bool) -> Option<String> {
+        self.scroll_zones.clear();
+        let Some(wide) = self
+            .timeline
+            .wide
+            .clone()
+            .filter(|_| enabled && !self.waveform_only)
+        else {
+            self.scroll_drag = None;
+            return None;
+        };
+        let inner = self.timeline_rect(rect);
+        let boxes = self.lane_boxes(inner.height());
+        let lane = *boxes.first()?;
+        let track = scroll_track(rect, inner, &lane);
+        if lane.scrolls() {
+            self.scroll_zones.push(track);
+            self.scroll_zones.push(Rect::from_x_y_ranges(
+                rect.left()..=inner.left(),
+                track.y_range(),
+            ));
+        }
+        let (hover, position, press, down, steps) = ui.input(|input| {
+            let mut press = None;
+            let mut steps = 0.0f32;
+            for event in &input.events {
+                match event {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        ..
+                    } => press = Some(*pos),
+                    egui::Event::MouseWheel { unit, delta, .. } => {
+                        steps += match unit {
+                            egui::MouseWheelUnit::Point => delta.y / 48.0,
+                            egui::MouseWheelUnit::Line => delta.y,
+                            egui::MouseWheelUnit::Page => delta.y * 3.0,
+                        };
+                    }
+                    _ => {}
+                }
+            }
+            (
+                input.pointer.hover_pos(),
+                input.pointer.interact_pos(),
+                press,
+                input.pointer.button_down(PointerButton::Primary),
+                steps,
+            )
+        });
+        if lane.scrolls()
+            && self.gesture.is_none()
+            && let Some(point) = press.filter(|point| track.contains(*point))
+        {
+            let thumb = lane.thumb();
+            let (top, bottom) = (inner.top() + thumb.start, inner.top() + thumb.end);
+            self.scroll_drag = Some(if (top..=bottom).contains(&point.y) {
+                point.y - top
+            } else {
+                // A press beside the thumb brings it there.
+                (bottom - top) / 2.0
+            });
+        }
+        if let Some(grab) = self.scroll_drag {
+            if down && let Some(point) = position {
+                self.scroll_rows_to(lane.first_for_thumb(point.y - grab - inner.top()));
+            } else if !down {
+                self.scroll_drag = None;
+            }
+        }
+        if steps != 0.0
+            && let Some(point) = hover
+            && self.scroll_zones.iter().any(|zone| zone.contains(point))
+        {
+            // At least one row for each turn of the wheel; up shows earlier channels.
+            let rows = steps.abs().ceil().max(1.0) as usize;
+            self.scroll_rows_to(if steps > 0.0 {
+                lane.first.saturating_sub(rows)
+            } else {
+                lane.first + rows
+            });
+        }
+        let point = hover.filter(|point| {
+            rect.contains(*point) && !(inner.left()..inner.right()).contains(&point.x)
+        })?;
+        let (index, row) = stack::row_at(&boxes, point.y - inner.top())?;
+        let mut text = row_tooltip(&wide, wide_row(&wide, index, row)?)?;
+        if boxes[index].scrolls() {
+            text.push('\n');
+            text.push_str(SCROLL_HINT);
+        }
+        Some(text)
+    }
+
+    /// Shows the wide lane's rows from `first`, kept so that the last row ends the lane.
+    fn scroll_rows_to(&mut self, first: usize) {
+        let first = self
+            .lane_boxes(self.display_size.y)
+            .first()
+            .map_or(0, |lane| first.min(lane.rows - lane.shown));
+        if first != self.first_row {
+            self.first_row = first;
+            self.next_refresh = Instant::now();
+            self.session.mark_interaction();
+        }
+    }
+
+    /// Whether a press at `position` belongs to the scroll bar rather than the waveform.
+    fn on_scroll_track(&self, position: Pos2) -> bool {
+        self.scroll_drag.is_some()
+            || self
+                .scroll_zones
+                .first()
+                .is_some_and(|track| track.contains(position))
+    }
+
+    /// Under the history setting, when the capture's width leaves room for less than was asked
+    /// for, says how much memory keeps, as on the desktop.
+    fn short_history_note(&self, retention: DurationChoice) -> Option<String> {
+        let requested = f64::from(retention.seconds());
+        let kept = self.timeline.retention_seconds;
+        if !kept.is_finite() || kept <= 0.0 || kept >= requested - 0.5 {
+            return None;
+        }
+        let channels = self.timeline.channels + self.timeline.b_channels.unwrap_or(0);
+        Some(format!(
+            "With {channels} channels, memory holds the latest {}.",
+            kept_duration(kept)
+        ))
+    }
+
+    /// The head model for a binaural preview at `rate`, made the first time it is needed.
+    fn head_model(&mut self, rate: u32) -> Option<Arc<HeadModel>> {
+        if let Some(model) = self
+            .head_model
+            .as_ref()
+            .filter(|model| model.sample_rate() == rate)
+        {
+            return Some(Arc::clone(model));
+        }
+        let model = Arc::new(HeadModel::new(rate).ok()?);
+        self.head_model = Some(Arc::clone(&model));
+        Some(model)
     }
 
     fn draw_reference_lines(
@@ -1526,9 +2166,22 @@ impl CaptureUi {
         }
         let current = clamped_view(self.view.clone(), &full);
         let current_len = current.end - current.start;
-        let next = if let Some(pointer) = pointer.filter(|pointer| rect.contains(*pointer)) && wheel != 0.0 {
+        // Over a wide lane's margins the wheel scrolls its rows instead.
+        let over_rows =
+            |pointer: &Pos2| self.scroll_zones.iter().any(|zone| zone.contains(*pointer));
+        let next = if let Some(pointer) =
+            pointer.filter(|pointer| rect.contains(*pointer) && !over_rows(pointer))
+            && wheel != 0.0
+        {
             let audio_rect = self.audio_rect(rect, settings.retention.seconds() as f32);
-            Some(wheel_zoom_view(&full, &current, wheel, pointer.x, audio_rect, rect.shrink(8.0)))
+            Some(wheel_zoom_view(
+                &full,
+                &current,
+                wheel,
+                pointer.x,
+                audio_rect,
+                self.timeline_rect(rect),
+            ))
         } else if self.view.is_some() && pan != 0.0 {
             let delta = (-f64::from(pan) / f64::from(rect.width().max(1.0)) * current_len as f64).round() as i64;
             Some(fit_frame_range(&full, current.start.saturating_add_signed(delta), current_len))
@@ -1576,8 +2229,9 @@ impl CaptureUi {
         }
 
         if allow_new_gesture
-            && let Some((position, selecting, snap)) =
-                press.filter(|(position, _, _)| rect.contains(*position))
+            && let Some((position, selecting, snap)) = press.filter(|(position, _, _)| {
+                rect.contains(*position) && !self.on_scroll_track(*position)
+            })
         {
             self.discard_drag_preparation();
             self.next_refresh = Instant::now();
@@ -1714,15 +2368,19 @@ impl CaptureUi {
 
     fn begin_drag_preparation(&mut self) {
         let settings = self.session.settings();
-        let Some((epoch, snapshots)) = self.session.positioned_snapshots(false)
-            .filter(|(_, snapshots)| snapshots.first().is_some_and(|snapshot| snapshot.frame_count() > 0))
-        else {
+        let Some(material) = self.session.export_snapshots(false).filter(|s| {
+            s.tracks
+                .first()
+                .is_some_and(|snapshot| snapshot.frame_count() > 0)
+        }) else {
             self.message = "No captured audio to save yet.".into();
             return;
         };
-        self.sync_timeline(epoch);
+        self.sync_timeline(material.epoch);
+        let wide = wide_save(material.wide, &settings);
         let Some(clip) = self.wav_clip(
-            snapshots.into(),
+            material.tracks,
+            material.mask,
             settings.output_dir,
             settings.wav_profile,
             settings.force_mono,
@@ -1730,6 +2388,7 @@ impl CaptureUi {
             self.message = "The selected audio is no longer available.".into();
             return;
         };
+        let clip = ClipJob { clip, wide };
         let (cancel, canceled) = mpsc::channel();
         let result = Arc::new(Mutex::new(None));
         let pending = result.clone();
@@ -1810,16 +2469,20 @@ impl CaptureUi {
             self.message = "Preparing selected audio…".into();
             return;
         }
-        let snapshots = self.session.positioned_snapshots(false);
-        let Some((epoch, snapshots)) = snapshots.filter(|(_, snapshots)|
-            snapshots.first().is_some_and(|snapshot| snapshot.frame_count() > 0))
-        else {
+        let snapshots = self.session.export_snapshots(false);
+        let Some(material) = snapshots.filter(|s| {
+            s.tracks
+                .first()
+                .is_some_and(|snapshot| snapshot.frame_count() > 0)
+        }) else {
             self.message = "No captured audio to save yet.".into();
             return;
         };
-        self.sync_timeline(epoch);
+        self.sync_timeline(material.epoch);
+        let wide = wide_save(material.wide, settings);
         let Some(clip) = self.wav_clip(
-            snapshots.into(),
+            material.tracks,
+            material.mask,
             settings.saved_dir.clone(),
             settings.wav_profile,
             settings.force_mono,
@@ -1830,7 +2493,7 @@ impl CaptureUi {
         if selected {
             self.cancel_selection();
         }
-        let result = self.queue_saved_snapshot(clip);
+        let result = self.queue_saved_snapshot(ClipJob { clip, wide });
         self.message = match result {
             Ok(()) => "Saving snapshot…".into(),
             Err(error) => format!("Could not save snapshot: {error}"),
@@ -1840,6 +2503,7 @@ impl CaptureUi {
     fn wav_clip(
         &mut self,
         snapshots: Arc<[FrozenTrack]>,
+        mask: u32,
         output: PathBuf,
         profile: WavExportProfile,
         force_mono: bool,
@@ -1848,6 +2512,7 @@ impl CaptureUi {
         let selected = self.selection.clone().unwrap_or_else(|| first.frame_range());
         let range = export_frame_range(first, &selected)?;
         Some(WavClip {
+            mask,
             profile,
             force_mono,
             output,
@@ -1859,15 +2524,12 @@ impl CaptureUi {
         })
     }
 
-    fn queue_saved_snapshot(&mut self, clip: WavClip) -> io::Result<()> {
+    fn queue_saved_snapshot(&mut self, clip: ClipJob) -> io::Result<()> {
         let writer = match &self.snapshot_writer {
             Some(writer) => writer,
             None => self.snapshot_writer.insert(SnapshotWriter::start()?),
         };
-        writer
-            .requests
-            .send(clip)
-            .map_err(|_| io::Error::other("snapshot writer stopped unexpectedly"))
+        writer.requests.send(clip)
     }
 
     fn collect_saved_snapshots(&mut self) {
@@ -1952,6 +2614,123 @@ fn export_frame_range(snapshot: &FrozenTrack, selection: &Range<u64>) -> Option<
         return None;
     }
     Some((selection.start - bounds.start) as usize..(selection.end - bounds.start) as usize)
+}
+
+/// How a capture with the wide main input `layout` is saved and dragged out, by `settings`.
+fn wide_save(layout: Option<WideLayout>, settings: &SessionSettings) -> Option<WideSave> {
+    layout.map(|layout| WideSave {
+        layout,
+        mode: settings.wide_export,
+        pair_binaural: settings.pair_render.binaural(),
+    })
+}
+
+/// How the rows of one frame are drawn: where the audio goes, the selection and its fades.
+struct RowTrace<'a> {
+    audio_rect: Rect,
+    range: Option<&'a Range<u64>>,
+    fades: Fades,
+    stroke: f32,
+    color: Color32,
+    selected_color: Color32,
+    selection_clip: Option<Rect>,
+}
+
+/// The lanes of a capture wider than stereo: L, R and one row per channel, which scroll when
+/// they do not fit, then the sidechain's one row when it is captured too.
+fn wide_lanes(wide: &WideLayout, sidechain: bool) -> Vec<stack::LaneRows> {
+    let mut lanes = vec![stack::LaneRows {
+        rows: wide.labels.len() + 2,
+        stacked: true,
+    }];
+    if sidechain {
+        lanes.push(stack::LaneRows {
+            rows: 1,
+            stacked: false,
+        });
+    }
+    lanes
+}
+
+/// Row `row` of lane `lane` of [`wide_lanes`].
+fn wide_row(wide: &WideLayout, lane: usize, row: usize) -> Option<WideRow> {
+    match (lane, row) {
+        (0, row) => wide.rows().nth(row),
+        (1, 0) => Some(WideRow::Sidechain),
+        _ => None,
+    }
+}
+
+/// The rows on screen in `boxes`, laid out from [`wide_lanes`], top to bottom.
+fn rows_on_screen(wide: &WideLayout, boxes: &[LaneBox]) -> Vec<WideRow> {
+    boxes
+        .iter()
+        .enumerate()
+        .flat_map(|(lane, lane_box)| {
+            lane_box
+                .visible()
+                .filter_map(move |row| wide_row(wide, lane, row))
+        })
+        .collect()
+}
+
+/// What the gutter says beside a row: L and R, the channel's short speaker name or else its
+/// number, and B for the sidechain, as the desktop names its second lane.
+fn row_label(wide: &WideLayout, row: WideRow) -> String {
+    match row {
+        WideRow::Pair(PairSide::Left) => "L".into(),
+        WideRow::Pair(PairSide::Right) => "R".into(),
+        WideRow::Channel(channel) => Some(stack::short_label(
+            wide.labels.get(channel).map_or("", String::as_str),
+        ))
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| (channel + 1).to_string()),
+        WideRow::Sidechain => "B".into(),
+    }
+}
+
+/// The tooltip of a row's label, in the desktop's English words. The sidechain's has none.
+fn row_tooltip(wide: &WideLayout, row: WideRow) -> Option<String> {
+    match row {
+        WideRow::Pair(PairSide::Left) => {
+            Some("L: the left side of all channels mixed to stereo".into())
+        }
+        WideRow::Pair(PairSide::Right) => {
+            Some("R: the right side of all channels mixed to stereo".into())
+        }
+        WideRow::Channel(channel) => {
+            let label = wide
+                .labels
+                .get(channel)
+                .map_or_else(|| (channel + 1).to_string(), Clone::clone);
+            Some(format!(
+                "Channel {} of {}: {label}",
+                channel + 1,
+                wide.labels.len()
+            ))
+        }
+        WideRow::Sidechain => None,
+    }
+}
+
+/// The scroll bar's track in the right margin, as high as the lane.
+fn scroll_track(rect: Rect, inner: Rect, lane: &LaneBox) -> Rect {
+    Rect::from_x_y_ranges(
+        inner.right()..=rect.right(),
+        inner.top() + lane.top..=inner.top() + lane.top + lane.height,
+    )
+}
+
+/// A length of history as the desktop says it: "1 minute 56 seconds".
+fn kept_duration(seconds: f64) -> String {
+    let total = seconds.max(0.0).floor() as u64;
+    let part =
+        |value: u64, unit: &str| format!("{value} {unit}{}", if value == 1 { "" } else { "s" });
+    match (total / 60, total % 60) {
+        (0, seconds) => part(seconds, "second"),
+        (minutes, 0) => part(minutes, "minute"),
+        (minutes, seconds) => format!("{} {}", part(minutes, "minute"), part(seconds, "second")),
+    }
 }
 
 /// The Options form: the list of pages on the left and the selected page on the right.
@@ -2054,12 +2833,47 @@ fn option_combo<T: Copy + PartialEq>(
     });
 }
 
+#[cfg(test)]
 fn capture_options(ui: &mut egui::Ui, settings: &mut SessionSettings) {
+    capture_page(ui, settings, None);
+}
+
+/// The Capture page. `history_note` says how much history memory keeps when the capture's
+/// width leaves room for less than the setting asks for.
+fn capture_page(ui: &mut egui::Ui, settings: &mut SessionSettings, history_note: Option<&str>) {
     option_combo(ui, "Retain the latest audio", &mut settings.retention,
         DurationChoice::ALL.map(|duration| (duration, duration_label(duration.seconds()))));
+    if let Some(note) = history_note {
+        options_note(ui, note);
+    }
     ui.checkbox(&mut settings.retain_silence, "Keep quiet sections");
     option_combo(ui, "Auto-resume delay", &mut settings.idle_resume,
         AutoResumeDelay::ALL.map(|delay| (delay, auto_resume_label(delay))));
+    ui.separator();
+    options_group_heading(ui, "Multichannel sources");
+    option_combo(
+        ui,
+        "L/R of multichannel sources",
+        &mut settings.pair_render,
+        PairRender::ALL.map(|pair| (pair, pair.label().to_owned())),
+    );
+    options_note(
+        ui,
+        "How L and R sound on export and when preview plays as L/R. Binaural places each channel around your head, for headphones.",
+    );
+    option_combo(
+        ui,
+        "Preview of multichannel sources",
+        &mut settings.preview_as_lr,
+        [
+            (false, "In their own channels".into()),
+            (true, "As L/R".into()),
+        ],
+    );
+    options_note(
+        ui,
+        "With a matching bus, each channel plays on the same channel for your DAW to monitor. As L/R plays the mix above on the first two channels.",
+    );
 }
 
 /// "Off" leaves a paused capture paused. It is stored as 0 seconds, which never meant "at once".
@@ -2111,11 +2925,27 @@ fn source_options(
 fn export_options(ui: &mut egui::Ui, settings: &mut SessionSettings) -> Option<FolderAction> {
     wav_format_controls(ui, &mut settings.wav_profile);
     ui.checkbox(&mut settings.force_mono, "Export every file as mono");
+    option_combo(
+        ui,
+        "Multichannel sources",
+        &mut settings.wide_export,
+        WIDE_EXPORT_MODES.map(|mode| (mode, wide_export_label(mode).to_owned())),
+    );
+    options_note(
+        ui,
+        "Binaural files let you hear on headphones where each channel sits.",
+    );
     ui.separator();
     folder_options(ui, settings)
 }
 
+#[cfg(test)]
 fn appearance_options(ui: &mut egui::Ui, settings: &mut SessionSettings) {
+    appearance_page(ui, settings, false);
+}
+
+/// The Appearance page. `wide` says the capture is wider than stereo, which has no loudness.
+fn appearance_page(ui: &mut egui::Ui, settings: &mut SessionSettings, wide: bool) {
     options_group_heading(ui, "Window");
     ui.checkbox(&mut settings.show_waveform_only, "Show waveform only");
     option_combo(ui, "Background transparency", &mut settings.panel_transparency,
@@ -2167,6 +2997,9 @@ fn appearance_options(ui: &mut egui::Ui, settings: &mut SessionSettings) {
         WaveformLayout::ALL.map(|layout| (layout, layout.label().to_owned())));
     option_combo(ui, "Meter", &mut settings.meter_mode,
         MeterMode::ALL.map(|mode| (mode, mode.label().to_owned())));
+    if wide && settings.meter_mode == MeterMode::Lufs {
+        options_note(ui, NO_LOUDNESS);
+    }
 }
 
 fn folder_options(ui: &mut egui::Ui, settings: &mut SessionSettings) -> Option<FolderAction> {
@@ -2782,6 +3615,7 @@ mod tests {
         let snapshots: Arc<[FrozenTrack]> = vec![main, sidechain].into();
         let prepare_file = || {
             WavClip {
+                mask: 0,
                 profile: WavExportProfile::default(),
                 force_mono: false,
                 output: output.clone(),
@@ -2826,6 +3660,7 @@ mod tests {
             writer
                 .requests
                 .send(WavClip {
+                    mask: 0,
                     profile: WavExportProfile::default(),
                     force_mono,
                     output: output.clone(),
@@ -2882,6 +3717,7 @@ mod tests {
         let snapshots: Arc<[FrozenTrack]> =
             vec![FrozenTrack::from_interleaved(48_000, 1, 0, &[0.5; 8]).unwrap()].into();
         let saved = WavClip {
+            mask: 0,
             profile: WavExportProfile::default(),
             force_mono: false,
             output: output.clone(),
@@ -2977,6 +3813,290 @@ mod tests {
         let seconds = waveform::TimelineGuides { bars: vec![], seconds: vec![500] };
         assert_eq!(frame_at_pointer_with_guides(rect, 103.0, visible.clone(), &[], &seconds), 500);
         assert_eq!(frame_at_pointer_with_guides(rect, 103.0, visible, &[], &waveform::TimelineGuides::default()), 503);
+    }
+
+    fn seven_one_four() -> WideLayout {
+        let labels: Vec<String> = "FL FR FC LFE Lb Rb Ls Rs TFL TFR TBL TBR"
+            .split(' ')
+            .map(str::to_owned)
+            .collect();
+        WideLayout::new(12, &labels).unwrap()
+    }
+
+    fn row_names(wide: &WideLayout, rows: &[WideRow]) -> String {
+        rows.iter()
+            .map(|row| row_label(wide, *row))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn twelve_channel_lane_lays_out_l_r_and_every_speaker_with_and_without_a_sidechain() {
+        let wide = seven_one_four();
+        let speakers = "L R FL FR FC LFE Lb Rb Ls Rs TFL TFR TBL TBR";
+        for sidechain in [false, true] {
+            let lanes = wide_lanes(&wide, sidechain);
+            let rows = 14 + usize::from(sidechain);
+            assert_eq!(lanes[0].rows, 14);
+            assert!(lanes[0].stacked);
+            if sidechain {
+                assert_eq!((lanes[1].rows, lanes[1].stacked), (1, false));
+            }
+            // The editor asks for room to give every row the comfortable height.
+            let comfortable = stack::comfortable_height(&lanes).unwrap();
+            assert_eq!(comfortable, rows as f32 * stack::COMFORTABLE_ROW_HEIGHT);
+            let boxes = stack::lay_out(comfortable, &lanes, &[0, 0]);
+            assert!(!boxes[0].scrolls());
+            let all = rows_on_screen(&wide, &boxes);
+            let expected = if sidechain {
+                format!("{speakers} B")
+            } else {
+                speakers.to_owned()
+            };
+            assert_eq!(row_names(&wide, &all), expected);
+            assert_eq!(
+                all[..3],
+                [
+                    WideRow::Pair(PairSide::Left),
+                    WideRow::Pair(PairSide::Right),
+                    WideRow::Channel(0)
+                ]
+            );
+            assert_eq!(all.last() == Some(&WideRow::Sidechain), sidechain);
+            // A plot of 140 points shows ten rows of 14; the sidechain keeps one of them.
+            let boxes = stack::lay_out(140.0, &lanes, &[0, 0]);
+            assert!(boxes[0].scrolls());
+            assert_eq!(boxes[0].row_height, stack::MIN_ROW_HEIGHT);
+            assert_eq!(boxes[0].shown, if sidechain { 9 } else { 10 });
+            if sidechain {
+                assert_eq!((boxes[1].top, boxes[1].shown), (9.0 * 14.0, 1));
+            }
+            let shown = rows_on_screen(&wide, &boxes);
+            assert_eq!(shown.first(), Some(&WideRow::Pair(PairSide::Left)));
+            assert_eq!(shown.last() == Some(&WideRow::Sidechain), sidechain);
+            // Scrolling past the end stops at the last speaker; the sidechain stays.
+            let scrolled = stack::lay_out(140.0, &lanes, &[99, 0]);
+            assert_eq!(scrolled[0].first, 14 - scrolled[0].shown);
+            let names = row_names(&wide, &rows_on_screen(&wide, &scrolled));
+            assert!(
+                names.starts_with(if sidechain { "LFE " } else { "FC " }),
+                "{names}"
+            );
+            assert!(
+                names.ends_with(if sidechain { "TBR B" } else { "TBR" }),
+                "{names}"
+            );
+        }
+        // Unnamed channels, as under CLAP, are numbered.
+        let unnamed = WideLayout::new(12, &[]).unwrap();
+        assert_eq!(row_label(&unnamed, WideRow::Channel(11)), "12");
+        assert_eq!(
+            row_tooltip(&unnamed, WideRow::Channel(11)).unwrap(),
+            "Channel 12 of 12: Channel 12"
+        );
+        assert_eq!(
+            row_tooltip(&wide, WideRow::Channel(8)).unwrap(),
+            "Channel 9 of 12: TFL"
+        );
+        assert_eq!(
+            row_tooltip(&wide, WideRow::Pair(PairSide::Left)).unwrap(),
+            "L: the left side of all channels mixed to stereo"
+        );
+        assert_eq!(row_tooltip(&wide, WideRow::Sidechain), None);
+        // Mono and stereo ask for no room and have no rows.
+        assert_eq!(
+            stack::comfortable_height(&[stack::LaneRows {
+                rows: 2,
+                stacked: false
+            }]),
+            None
+        );
+        assert!(WideLayout::new(2, &["L".into(), "R".into()]).is_none());
+    }
+
+    #[test]
+    fn editor_grows_once_for_wide_rows_and_shrinks_back_unless_resized_meanwhile() {
+        let mut sizing = EditorSizing::default();
+        let current = Vec2::new(640.0, 212.0);
+        // Nothing to do for a stereo capture, or while busy.
+        assert_eq!(sizing.fit_rows(current, None, 140.0, false), None);
+        assert_eq!(sizing.fit_rows(current, Some(280.0), 140.0, true), None);
+        assert_eq!(
+            sizing.fit_rows(current, Some(280.0), 140.0, false),
+            Some(Vec2::new(640.0, 352.0))
+        );
+        // Once grown it does not grow again, even when the host gave less.
+        assert_eq!(
+            sizing.fit_rows(Vec2::new(640.0, 300.0), Some(280.0), 228.0, false),
+            None
+        );
+        assert_eq!(
+            sizing.fit_rows(Vec2::new(640.0, 352.0), None, 280.0, false),
+            Some(current)
+        );
+        // A window the user resized after it grew stays as it is.
+        assert_eq!(
+            sizing.fit_rows(current, Some(280.0), 140.0, false),
+            Some(Vec2::new(640.0, 352.0))
+        );
+        assert_eq!(
+            sizing.fit_rows(Vec2::new(640.0, 400.0), None, 328.0, false),
+            None
+        );
+        // The growth stops at MAX_GROWN_HEIGHT and never shrinks a tall editor.
+        let mut sizing = EditorSizing::default();
+        assert_eq!(
+            sizing.fit_rows(Vec2::new(640.0, 500.0), Some(300.0), 140.0, false),
+            Some(Vec2::new(640.0, MAX_GROWN_HEIGHT))
+        );
+        let mut sizing = EditorSizing::default();
+        assert_eq!(
+            sizing.fit_rows(Vec2::new(640.0, 600.0), Some(300.0), 528.0, false),
+            None
+        );
+    }
+
+    #[test]
+    fn clearing_a_wide_capture_keeps_the_grown_editor_until_the_session_answers() {
+        let session = Arc::new(Session::new(crate::settings::SettingsStore::default()));
+        let editor = EguiEditorState::from_size(LogicalSize::new(640.0, 324.0), 1.0);
+        let mut capture = CaptureUi::new(session, editor);
+        capture.timeline = WaveformTimeline {
+            frames: 0..48_000,
+            sample_rate: 48_000,
+            channels: 12,
+            wide: Some(seven_one_four()),
+            retention_seconds: 20.0,
+            ..WaveformTimeline::default()
+        };
+        capture.editor_sizing.grown = Some((212.0, 324.0));
+        let context = egui::Context::default();
+        let resizes = |capture: &mut CaptureUi| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 324.0))),
+                    ..Default::default()
+                },
+                |ui| capture.apply_waveform_size(ui, 280.0, false),
+            );
+            output.textures_delta.clear();
+            output
+                .viewport_output
+                .values()
+                .flat_map(|viewport| viewport.commands.iter())
+                .filter_map(|command| match command {
+                    egui::ViewportCommand::InnerSize(size) => Some(*size),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Clear swaps in an empty timeline of the next epoch. A frame that cannot read the
+        // session yet keeps the window and its memory of the height before it grew.
+        capture.sync_timeline(capture.timeline.epoch + 1);
+        assert_eq!(resizes(&mut capture), Vec::<Vec2>::new());
+        assert_eq!(capture.editor_sizing.grown, Some((212.0, 324.0)));
+        // A capture that answers as stereo has really lost its rows: back to the old height.
+        capture.timeline = WaveformTimeline {
+            epoch: capture.timeline.epoch,
+            frames: 0..48_000,
+            sample_rate: 48_000,
+            channels: 2,
+            ..WaveformTimeline::default()
+        };
+        assert_eq!(resizes(&mut capture), [Vec2::new(640.0, 212.0)]);
+    }
+
+    fn rendered_lane(
+        wide: &WideLayout,
+        sidechain: bool,
+        height: f32,
+        first_row: usize,
+    ) -> Vec<(Pos2, String)> {
+        let session = Arc::new(Session::new(crate::settings::SettingsStore::default()));
+        let editor = EguiEditorState::from_size(LogicalSize::new(640.0, 212.0), 1.0);
+        let mut capture = CaptureUi::new(session, editor);
+        capture.timeline = WaveformTimeline {
+            frames: 0..48_000,
+            sample_rate: 48_000,
+            channels: 12,
+            wide: Some(wide.clone()),
+            b_channels: sidechain.then_some(2),
+            retention_seconds: 20.0,
+            ..WaveformTimeline::default()
+        };
+        capture.peak_frames = 0..48_000;
+        capture.displayed_zoomed = true;
+        capture.first_row = first_row;
+        capture.rows = wide
+            .rows()
+            .chain(sidechain.then_some(WideRow::Sidechain))
+            .collect();
+        capture.row_peaks = capture
+            .rows
+            .iter()
+            .map(|_| WaveformPeaks {
+                minimum: vec![-0.5; 4],
+                maximum: vec![0.5; 4],
+            })
+            .collect();
+        let rect = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(400.0, height + 16.0));
+        let context = egui::Context::default();
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 400.0))),
+                ..Default::default()
+            },
+            |ui| capture.draw_waveform(ui, rect, 1.0, false, &SessionSettings::default()),
+        );
+        output.textures_delta.clear();
+        let mut labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.pos.x < rect.left() + stack::LABEL_GUTTER => {
+                    Some((text.pos, text.galley.text().to_owned()))
+                }
+                _ => None,
+            })
+            .collect();
+        labels.sort_by(|a, b| a.0.y.total_cmp(&b.0.y));
+        output.drop_without_applying_deltas();
+        labels
+    }
+
+    #[test]
+    fn rendered_twelve_channel_lane_names_each_row_in_the_gutter() {
+        let wide = seven_one_four();
+        let names = |labels: &[(Pos2, String)]| {
+            labels
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let speakers = "L R FL FR FC LFE Lb Rb Ls Rs TFL TFR TBL TBR";
+        let labels = rendered_lane(&wide, false, 280.0, 0);
+        assert_eq!(names(&labels), speakers);
+        // Rows are 20 points apart and the first sits in the middle of the first row.
+        assert!(
+            labels
+                .windows(2)
+                .all(|pair| (pair[1].0.y - pair[0].0.y - 20.0).abs() < 1.0)
+        );
+        assert!(labels.iter().all(|(position, _)| position.x == 11.0));
+        assert_eq!(
+            names(&rendered_lane(&wide, true, 300.0, 0)),
+            format!("{speakers} B")
+        );
+        // A short plot shows the top rows, and scrolled the last, with the sidechain below.
+        assert_eq!(
+            names(&rendered_lane(&wide, true, 140.0, 0)),
+            "L R FL FR FC LFE Lb Rb Ls B"
+        );
+        assert_eq!(
+            names(&rendered_lane(&wide, true, 140.0, 5)),
+            "LFE Lb Rb Ls Rs TFL TFR TBL TBR B"
+        );
     }
 }
 

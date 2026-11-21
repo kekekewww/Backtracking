@@ -3,6 +3,7 @@ mod editor;
 #[cfg_attr(not(feature = "editor"), allow(dead_code))]
 mod session;
 mod settings;
+mod surround;
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -42,6 +43,8 @@ struct Backtracking {
     session: Arc<Session>,
     worker: Option<Worker>,
     capture_enabled: bool,
+    input_speaker_mask: u64,
+    output_speaker_mask: u64,
 }
 
 #[derive(Params)]
@@ -60,6 +63,37 @@ impl Default for Backtracking {
             session: Arc::new(Session::new(settings)),
             worker: None,
             capture_enabled: false,
+            input_speaker_mask: 0,
+            output_speaker_mask: 0,
+        }
+    }
+}
+
+impl Backtracking {
+    fn configure_worker(
+        &mut self,
+        rate: u32,
+        channels: usize,
+        sidechain: usize,
+        max_buffer: u32,
+        labels: Vec<String>,
+    ) {
+        if !self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.matches(rate, channels, sidechain, max_buffer, &labels))
+        {
+            // Drop and join the old consumer before changing the format shared with the editor.
+            self.worker = None;
+            self.worker = Worker::with_layout(
+                self.session.clone(),
+                rate,
+                channels,
+                sidechain,
+                max_buffer,
+                labels,
+                self.input_speaker_mask,
+            );
         }
     }
 }
@@ -78,6 +112,24 @@ impl Plugin for Backtracking {
         layout(1, &STEREO_AUX, SIDECHAIN_NAMES),
         layout(2, &[], PortNames::const_default()),
         layout(1, &[], PortNames::const_default()),
+        layout(6, &[], PortNames::const_default()),
+        layout(6, &MONO_AUX, SIDECHAIN_NAMES),
+        layout(6, &STEREO_AUX, SIDECHAIN_NAMES),
+        layout(8, &[], PortNames::const_default()),
+        layout(8, &MONO_AUX, SIDECHAIN_NAMES),
+        layout(8, &STEREO_AUX, SIDECHAIN_NAMES),
+        layout(10, &[], PortNames::const_default()),
+        layout(10, &MONO_AUX, SIDECHAIN_NAMES),
+        layout(10, &STEREO_AUX, SIDECHAIN_NAMES),
+        layout(12, &[], PortNames::const_default()),
+        layout(12, &MONO_AUX, SIDECHAIN_NAMES),
+        layout(12, &STEREO_AUX, SIDECHAIN_NAMES),
+        layout(14, &[], PortNames::const_default()),
+        layout(14, &MONO_AUX, SIDECHAIN_NAMES),
+        layout(14, &STEREO_AUX, SIDECHAIN_NAMES),
+        layout(16, &[], PortNames::const_default()),
+        layout(16, &MONO_AUX, SIDECHAIN_NAMES),
+        layout(16, &STEREO_AUX, SIDECHAIN_NAMES),
     ];
 
     #[cfg(feature = "editor")]
@@ -112,18 +164,20 @@ impl Plugin for Backtracking {
 
         let rate = config.sample_rate.round() as u32;
         let channels = layout.main_input_channels.map_or(0, |n| n.get() as usize);
-        let sidechain = layout.aux_input_ports.first().map_or(0, |n| n.get() as usize);
-        if !self
-            .worker
-            .as_ref()
-            .is_some_and(|worker| worker.matches(rate, channels, sidechain, config.max_buffer_size))
-        {
-            // Drop and join the old consumer before changing the format shared with the editor.
+        let sidechain = layout
+            .aux_input_ports
+            .first()
+            .map_or(0, |n| n.get() as usize);
+        let bits = main_input_speaker_bits(context).unwrap_or_default();
+        let mask = |bits: &[u32]| bits.iter().fold(0u64, |mask, bit| mask | (1u64 << bit));
+        let speaker_mask = mask(&bits);
+        self.output_speaker_mask = mask(&main_output_speaker_bits(context).unwrap_or_default());
+        if self.input_speaker_mask != speaker_mask {
             self.worker = None;
-            self.worker = Worker::with_sidechain(
-                self.session.clone(), rate, channels, sidechain, config.max_buffer_size,
-            );
+            self.input_speaker_mask = speaker_mask;
         }
+        let labels = surround::speaker_labels(&bits);
+        self.configure_worker(rate, channels, sidechain, config.max_buffer_size, labels);
         true
     }
 
@@ -147,8 +201,16 @@ impl Plugin for Backtracking {
             );
             // The preview joins the output after the input was recorded, so it never lands in
             // this plug-in's own history.
-            let previewing = mix_preview(&self.session.preview, buffer.as_slice(), worker.sample_rate());
-            if context.plugin_api() == PluginApi::Clap && self.session.continuous_processing_requested() {
+            let previewing = mix_preview(
+                &self.session.preview,
+                buffer.as_slice(),
+                worker.sample_rate(),
+                self.input_speaker_mask,
+                self.output_speaker_mask,
+            );
+            if context.plugin_api() == PluginApi::Clap
+                && self.session.continuous_processing_requested()
+            {
                 return ProcessStatus::KeepAlive;
             }
             if previewing != 0 {
@@ -162,19 +224,35 @@ impl Plugin for Backtracking {
 
 /// Adds the editor's preview, when one is playing, to the audio leaving the plug-in. A mono
 /// output hears both sides. Returns how many frames of the preview are still to come.
-fn mix_preview(preview: &PreviewSlot, output: &mut [&mut [f32]], sample_rate: u32) -> u64 {
+fn mix_preview(
+    preview: &PreviewSlot,
+    output: &mut [&mut [f32]],
+    sample_rate: u32,
+    input_mask: u64,
+    output_mask: u64,
+) -> u64 {
     if !preview.is_occupied() {
         return 0;
     }
     let frames = output.first().map_or(0, |channel| channel.len());
-    preview.render_with(frames, sample_rate, |index, [left, right]| match &mut *output {
-        [only] => only[index] += (left + right) * 0.5,
-        [first, second, ..] => {
-            first[index] += left;
-            second[index] += right;
-        }
-        [] => {}
-    }).remaining
+    // Limit preview to the front pair when the insert maps its input and output to
+    // different speakers. The core also checks the clip's mask and channel count.
+    let channels = if input_mask == output_mask {
+        output.len()
+    } else {
+        output.len().min(2)
+    };
+    preview
+        .render_channels_with(
+            frames,
+            sample_rate,
+            channels,
+            input_mask,
+            |frame, channel, sample| {
+                output[channel][frame] += sample;
+            },
+        )
+        .remaining
 }
 
 /// A bar at or after the first sample, and the distance to subsequent bars.
@@ -326,6 +404,60 @@ mod tests {
     }
 
     #[test]
+    fn changing_only_speakers_replaces_history_and_block_size_keeps_it() {
+        let mut plugin = Backtracking::default();
+        let first = surround::speaker_labels(&[0, 1, 2, 3, 4, 5, 12, 14, 15, 17]);
+        let second = surround::speaker_labels(&[0, 1, 2, 3, 4, 5, 9, 10, 24, 25]);
+        plugin.configure_worker(48000, 10, 0, 512, first.clone());
+        let epoch = plugin.session.timeline_epoch();
+        plugin.configure_worker(48000, 10, 0, 512, first);
+        assert_eq!(plugin.session.timeline_epoch(), epoch);
+        plugin.configure_worker(48000, 10, 0, 512, second.clone());
+        let next = plugin.session.timeline_epoch();
+        assert_ne!(next, epoch);
+        plugin.configure_worker(48000, 10, 0, 256, second.clone());
+        assert_eq!(plugin.session.timeline_epoch(), next);
+        plugin.configure_worker(48000, 10, 0, 8192, second);
+        assert_eq!(plugin.session.timeline_epoch(), next);
+    }
+
+    #[test]
+    fn surround_process_preserves_every_sample() {
+        let mut plugin = Backtracking::default();
+        let mut context = AudioContext::new(PluginApi::Clap);
+        assert!(plugin.activate(
+            &layout(12, &[], PortNames::const_default()),
+            &realtime_config(),
+            &mut context
+        ));
+        let mut audio: Vec<_> = (0..12)
+            .map(|c| vec![c as f32 / 16., -0., -0.3 + c as f32 / 20., 1e-20])
+            .collect();
+        let expected = audio.clone();
+        let mut buffer = Buffer::default();
+        unsafe {
+            buffer.set_slices(4, |s| {
+                *s = audio.iter_mut().map(Vec::as_mut_slice).collect()
+            });
+        }
+        plugin.process(
+            &mut buffer,
+            &mut AuxiliaryBuffers {
+                inputs: &mut [],
+                outputs: &mut [],
+            },
+            &mut context,
+        );
+        assert!(
+            audio
+                .iter()
+                .flatten()
+                .zip(expected.iter().flatten())
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+    }
+
+    #[test]
     fn quiet_capture_process_keeps_host_alive_and_preserves_all_audio_buffers() {
         for api in [PluginApi::Clap, PluginApi::Vst3, PluginApi::Standalone] {
             let mut plugin = Backtracking::default();
@@ -458,6 +590,90 @@ mod tests {
             .map(|channel| std::array::from_fn(|frame| channel[frame]))
             .collect();
         (output, status)
+    }
+
+    #[test]
+    fn preview_mix_uses_native_channels_only_for_the_matching_bus() {
+        use backtracking_core::{
+            ChannelRoute, Fades, FrozenTrack, Preview, PreviewGate, waveform::PreviewLane,
+        };
+        let labels = surround::speaker_labels(&[0, 1, 2, 3, 4, 5, 9, 10, 12, 14, 15, 17]);
+        let layout = surround::WideLayout::new(12, &labels).unwrap();
+        let samples: Vec<_> = (1..=12).map(|c| c as f32 / 16.0).collect();
+        let track = FrozenTrack::from_interleaved(48_000, 12, 0, &samples).unwrap();
+        let lanes = [PreviewLane {
+            track: &track,
+            group: Some(&layout.group),
+            selected: None,
+            route: ChannelRoute::Merged,
+        }];
+        let pair = || Preview::with_channels(&lanes, 0..1, None, false, Fades::NONE).unwrap();
+        let mut lr = [0.0; 2];
+        pair().render_with(1, |_, frame| lr = frame);
+        let gate = Box::leak(Box::new(PreviewGate::local()));
+        let slot = PreviewSlot::with_gate(gate);
+        for (channels, mask, as_lr) in [
+            (12, 42, false),
+            (10, 42, false),
+            (12, 43, false),
+            (12, 42, true),
+            (1, 42, false),
+        ] {
+            slot.play(if as_lr {
+                pair()
+            } else {
+                Preview::for_bus(&lanes, 0..1, 42, None, false, Fades::NONE).unwrap()
+            });
+            let mut out = vec![[0.125]; channels];
+            let mut buffers: Vec<_> = out.iter_mut().map(|c| c.as_mut_slice()).collect();
+            mix_preview(&slot, &mut buffers, 44_100, mask, mask);
+            assert!(buffers.iter().all(|c| c[0] == 0.125));
+            mix_preview(&slot, &mut buffers, 48_000, mask, mask);
+            for (c, channel) in out.iter().enumerate() {
+                let sample = if channels == 12 && mask == 42 && !as_lr {
+                    samples[c]
+                } else if channels == 1 {
+                    (lr[0] + lr[1]) * 0.5
+                } else {
+                    lr.get(c).copied().unwrap_or(0.0)
+                };
+                assert_eq!(channel[0], 0.125 + sample);
+            }
+        }
+    }
+
+    #[test]
+    fn asymmetric_main_buses_play_the_pair_even_when_one_mask_matches_the_clip() {
+        use ::vst3::Steinberg::Vst::SpeakerArr::{k51_4, k71_2};
+        use backtracking_core::{
+            ChannelRoute, Fades, FrozenTrack, Preview, PreviewGate, waveform::PreviewLane,
+        };
+        let labels = surround::speaker_labels(&[0, 1, 2, 3, 4, 5, 9, 10, 24, 25]);
+        let layout = surround::WideLayout::new(10, &labels).unwrap();
+        let track = FrozenTrack::from_interleaved(
+            48_000,
+            10,
+            0,
+            &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+        )
+        .unwrap();
+        let lanes = [PreviewLane {
+            track: &track,
+            group: Some(&layout.group),
+            selected: None,
+            route: ChannelRoute::Merged,
+        }];
+        let pair = Preview::with_channels(&lanes, 0..1, None, false, Fades::NONE).unwrap();
+        let mut expected = [0.0; 10];
+        pair.render_with(1, |_, lr| expected[..2].copy_from_slice(&lr));
+        let slot = PreviewSlot::with_gate(Box::leak(Box::new(PreviewGate::local())));
+        for (input, output) in [(k71_2, k51_4), (k51_4, k71_2)] {
+            slot.play(Preview::for_bus(&lanes, 0..1, k71_2, None, false, Fades::NONE).unwrap());
+            let mut bus = [[0.0]; 10];
+            let mut buffers = bus.each_mut().map(|c| c.as_mut_slice());
+            mix_preview(&slot, &mut buffers, 48_000, input, output);
+            assert_eq!(bus.map(|channel| channel[0]), expected);
+        }
     }
 
     #[test]
@@ -607,3 +823,9 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, windows))]
+mod vst3_host;
+
+#[cfg(test)]
+mod clap_ports;
