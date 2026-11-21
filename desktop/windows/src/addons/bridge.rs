@@ -43,7 +43,7 @@ enum WireCommand {
 
 #[derive(Serialize, Deserialize)]
 enum ResponseData {
-    Snapshot(AddonSnapshot),
+    Snapshot(WireSnapshot),
     Positions {
         cursor: u64,
         messages: Vec<AddonPositions>,
@@ -54,6 +54,14 @@ enum ResponseData {
 }
 
 type Response = Result<ResponseData, String>;
+
+#[derive(Serialize, Deserialize)]
+struct WireSnapshot {
+    #[serde(flatten)]
+    snapshot: AddonSnapshot,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    appearances: AddonAppearances,
+}
 
 #[derive(Serialize, Deserialize)]
 struct WirePackage {
@@ -151,12 +159,17 @@ pub(super) fn connect(root: PathBuf) -> Result<AddonManager, String> {
     if !root.is_absolute() {
         return Err("The add-on data root must be absolute".into());
     }
-    let snapshot = remote_snapshot(&root, None)?;
+    let WireSnapshot {
+        snapshot,
+        appearances,
+    } = remote_snapshot(&root, None)?;
     let (commands, receiver) = mpsc::channel();
     let shared = Arc::new(Shared {
-        snapshot: Mutex::new(Arc::new(snapshot)),
-        callbacks: Mutex::new(Vec::new()),
-        positions: Mutex::new(PositionJournal::default()),
+        published: Mutex::new(Published {
+            snapshot: Arc::new(snapshot),
+            appearances: Arc::new(appearances),
+        }),
+        ..Shared::default()
     });
     let worker_shared = shared.clone();
     let worker = thread::Builder::new()
@@ -235,7 +248,19 @@ fn serve_client(mut stream: TcpStream, handle: &AddonHandle, token: &str, stoppi
 
 fn dispatch(handle: &AddonHandle, command: WireCommand, stopping: &AtomicBool) -> Response {
     match command {
-        WireCommand::Snapshot => Ok(ResponseData::Snapshot((*handle.snapshot()).clone())),
+        WireCommand::Snapshot => {
+            let (snapshot, appearances) = {
+                let current = handle.shared.lock_published();
+                (
+                    Arc::clone(&current.snapshot),
+                    Arc::clone(&current.appearances),
+                )
+            };
+            Ok(ResponseData::Snapshot(WireSnapshot {
+                snapshot: snapshot.as_ref().clone(),
+                appearances: appearances.as_ref().clone(),
+            }))
+        }
         WireCommand::Positions { after } => {
             let mut cursor = after;
             let messages = handle
@@ -366,8 +391,16 @@ fn proxy(root: PathBuf, receiver: mpsc::Receiver<Command>, shared: Arc<Shared>) 
         }
         if Instant::now() >= refresh {
             match remote_snapshot(&root, Some(&stopping)) {
-                Ok(snapshot) => {
-                    publish(&shared, snapshot);
+                Ok(WireSnapshot {
+                    snapshot,
+                    appearances,
+                }) => {
+                    // The remote revision can reset when the primary restarts.
+                    shared.publish(
+                        snapshot.addons,
+                        snapshot.error.as_deref(),
+                        appearances.iter(),
+                    );
                     if let Ok((cursor, messages)) = remote_positions(
                         &root,
                         position_cursor,
@@ -383,22 +416,16 @@ fn proxy(root: PathBuf, receiver: mpsc::Receiver<Command>, shared: Arc<Shared>) 
                     }
                 }
                 Err(error) => {
-                    let mut snapshot = shared
-                        .snapshot
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                        .clone();
+                    let mut addons = shared.lock_published().snapshot.addons.clone();
                     let reason = format!("Cannot reach the primary add-on host: {error}");
-                    snapshot.error = Some(reason);
-                    for addon in &mut snapshot.addons {
+                    for addon in &mut addons {
                         addon.state = AddonState::Stopped;
                         addon.pid = None;
                         addon.sources.clear();
                         addon.settings.clear();
                         addon.actions.clear();
                     }
-                    publish(&shared, snapshot);
+                    shared.publish(addons, Some(&reason), std::iter::empty());
                 }
             }
             refresh = Instant::now() + SNAPSHOT_INTERVAL;
@@ -510,7 +537,7 @@ fn request_done(root: &Path, command: WireCommand, stopping: &AtomicBool) -> Res
     }
 }
 
-fn remote_snapshot(root: &Path, stopping: Option<&AtomicBool>) -> Result<AddonSnapshot, String> {
+fn remote_snapshot(root: &Path, stopping: Option<&AtomicBool>) -> Result<WireSnapshot, String> {
     match exchange(&read_endpoint(root)?, WireCommand::Snapshot, stopping)? {
         ResponseData::Snapshot(snapshot) => Ok(snapshot),
         _ => Err("The primary add-on host returned an unexpected snapshot".into()),
@@ -558,26 +585,6 @@ fn exchange(endpoint: &Endpoint, command: WireCommand, stopping: Option<&AtomicB
         stopping,
     )?;
     read_json::<Response>(&mut stream, timeout, stopping)?
-}
-
-fn publish(shared: &Shared, mut snapshot: AddonSnapshot) {
-    let mut current = shared.snapshot.lock().unwrap_or_else(|e| e.into_inner());
-    if current.addons == snapshot.addons && current.error == snapshot.error {
-        return;
-    }
-    // Remote revisions can restart at zero, and offline states have no remote
-    // revision. Keep one local sequence for every observable proxy change.
-    snapshot.revision = current.revision.wrapping_add(1);
-    *current = Arc::new(snapshot);
-    drop(current);
-    let callbacks = shared
-        .callbacks
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    for callback in callbacks {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback()));
-    }
 }
 
 fn reap(workers: &mut Vec<JoinHandle<()>>) {
@@ -808,9 +815,11 @@ mod tests {
             }],
         };
         let shared = Arc::new(Shared {
-            snapshot: Mutex::new(Arc::new(snapshot)),
-            callbacks: Mutex::new(Vec::new()),
-            positions: Mutex::new(PositionJournal::default()),
+            published: Mutex::new(Published {
+                snapshot: Arc::new(snapshot),
+                ..Published::default()
+            }),
+            ..Shared::default()
         });
         (AddonHandle { commands, shared }, receiver)
     }
@@ -974,7 +983,7 @@ mod tests {
         assert!(commands.recv_timeout(Duration::from_millis(150)).is_err());
         let mut changed = primary_handle.snapshot().as_ref().clone();
         changed.addons[0].sources[0].name = "Updated source".into();
-        *primary_handle.shared.snapshot.lock().unwrap() = Arc::new(changed);
+        primary_handle.shared.lock_published().snapshot = Arc::new(changed);
         wait_for(&handle, |snapshot| {
             snapshot.addons[0].sources[0].name == "Updated source"
         });

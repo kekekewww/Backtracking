@@ -1,6 +1,9 @@
 //! Nonblocking host listener and authenticated add-on connections.
-use crate::protocol::{self, AddonMessage, ChannelPosition, HostMessage, Source};
-use crate::transport::Wire;
+use crate::protocol::{
+    self, AddonMessage, Appearance, ChannelPosition, HostMessage, Source,
+    MAX_APPEARANCE_MESSAGES_PER_SECOND,
+};
+use crate::transport::{below_rate_limit, Wire};
 use crate::{Error, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
@@ -39,6 +42,9 @@ pub enum HostEvent {
 pub struct Connection {
     id: String,
     wire: Wire,
+    appearance_updates: VecDeque<Instant>,
+    pending_appearance: Option<Appearance>,
+    deferred_message: Option<AddonMessage>,
 }
 
 /// Bounds and validates position updates independently for each declared source.
@@ -62,12 +68,7 @@ impl PositionFilter {
             return None;
         }
         let received = self.received.entry(source.id.clone()).or_default();
-        while received.front().is_some_and(|previous| {
-            received_at.saturating_duration_since(*previous) >= Duration::from_secs(1)
-        }) {
-            received.pop_front();
-        }
-        if received.len() >= 50 {
+        if !below_rate_limit(received, received_at, 50) {
             return None;
         }
         received.push_back(received_at);
@@ -240,10 +241,7 @@ impl Host {
                             continue;
                         }
                         self.expected.remove(&id);
-                        events.push(HostEvent::Connected(Connection {
-                            id,
-                            wire: pending.wire,
-                        }));
+                        events.push(HostEvent::Connected(Connection::new(id, pending.wire)));
                         continue;
                     }
                 }
@@ -304,28 +302,85 @@ fn accept_pending(
 }
 
 impl Connection {
+    fn new(id: String, wire: Wire) -> Self {
+        Self {
+            id,
+            wire,
+            appearance_updates: VecDeque::new(),
+            pending_appearance: None,
+            deferred_message: None,
+        }
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
 
     /// Queue one line and try to send it. A full queue returns an error without blocking.
     pub fn send(&mut self, message: &HostMessage) -> Result<()> {
-        self.wire.queue(protocol::encode_host(message)?)
+        let result = self.wire.queue(protocol::encode_host(message)?);
+        if self.is_disconnected() {
+            self.close();
+        }
+        result
     }
 
     /// Receive at most one message, or return immediately when none is ready.
+    /// Keep the newest appearance update that exceeds the rate limit and return it when due.
     pub fn try_recv(&mut self) -> Result<Option<AddonMessage>> {
-        let Some(line) = self.wire.receive()? else {
+        if self.is_disconnected() {
             return Ok(None);
-        };
-        let message = match protocol::decode_addon(&line) {
-            Ok(message) => message,
-            Err(e) => {
-                self.wire.close();
-                return Err(e);
+        }
+        if let Some(message) = self.deferred_message.take() {
+            return Ok(Some(message));
+        }
+
+        // Read first so EOF or a newer appearance takes precedence over a pending one.
+        let message = match self.wire.receive() {
+            Ok(Some(line)) => protocol::decode_addon(&line),
+            Ok(None) if self.is_disconnected() => {
+                self.close();
+                return Ok(None);
             }
+            Ok(None) => return Ok(self.take_due_appearance()),
+            Err(error) => Err(error),
         };
-        Ok(Some(message))
+        match message {
+            Ok(AddonMessage::Appearance(appearance)) => {
+                self.pending_appearance = Some(appearance);
+                // A line was consumed, so the caller should keep polling for other messages.
+                Ok(Some(
+                    self.take_due_appearance().unwrap_or(AddonMessage::Unknown),
+                ))
+            }
+            Ok(message) => {
+                if let Some(appearance) = self.take_due_appearance() {
+                    // Other traffic must not hold up a due appearance.
+                    self.deferred_message = Some(message);
+                    Ok(Some(appearance))
+                } else {
+                    Ok(Some(message))
+                }
+            }
+            Err(error) => {
+                self.close();
+                Err(error)
+            }
+        }
+    }
+
+    fn take_due_appearance(&mut self) -> Option<AddonMessage> {
+        self.pending_appearance.as_ref()?;
+        let now = Instant::now();
+        if !below_rate_limit(
+            &mut self.appearance_updates,
+            now,
+            MAX_APPEARANCE_MESSAGES_PER_SECOND,
+        ) {
+            return None;
+        }
+        self.appearance_updates.push_back(now);
+        self.pending_appearance.take().map(AddonMessage::Appearance)
     }
 
     /// Reflects closure observed by the most recent send or receive attempt.
@@ -333,7 +388,11 @@ impl Connection {
         self.wire.disconnected()
     }
     pub fn close(&mut self) {
-        self.wire.close();
+        self.pending_appearance = None;
+        self.deferred_message = None;
+        if !self.is_disconnected() {
+            self.wire.close();
+        }
     }
 }
 
@@ -520,10 +579,8 @@ mod tests {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let mut peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (stream, _) = listener.accept().unwrap();
-        let mut connection = Connection {
-            id: "com.example.test-tone".into(),
-            wire: Wire::new(stream).unwrap(),
-        };
+        let mut connection =
+            Connection::new("com.example.test-tone".into(), Wire::new(stream).unwrap());
         let lines = [
             r#"{"type":"positions","time":-1}"#,
             r#"{"type":"positions","source":"main","time":0,"channels":[{"channel":2,"x":null,"y":0,"z":0},{"channel":3,"x":-2,"y":2,"z":0,"size":null}]}"#,
