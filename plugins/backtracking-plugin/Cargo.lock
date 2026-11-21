@@ -132,7 +132,7 @@ version = "0.1.0"
 
 [[package]]
 name = "backtracking-plugin"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "backtracking-core",
  "backtracking-ui",
