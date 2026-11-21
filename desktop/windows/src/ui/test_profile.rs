@@ -30,6 +30,12 @@
 //!   `BACKTRACKING_TEST_ATMOS_PACKAGE` (the path of a built `backtracking-joc.btaddon`), switches its
 //!   `play_through_speakers` setting off as soon as it runs (and `capture_objects` on when `BACKTRACKING_TEST_ATMOS_OBJECTS=1`) and waits until the host holds
 //!   that value. Nothing may make sound, so no file is ever opened before that.
+//!   `theme` installs the example appearance add-on (`com.example.theme`) from
+//!   `BACKTRACKING_TEST_THEME_PACKAGE`, or else packs
+//!   `crates/backtracking-addon/examples/theme-package` with the `theme_example` example built
+//!   in that crate (`cargo build --locked --release --example theme_example`) into
+//!   `<LOCALAPPDATA>\packages\theme.btaddon`, and waits until it offers its look. Choose the look with `addon-look=com.example.theme` in
+//!   `BACKTRACKING_TEST_PREFERENCES`, or with the harness's `look=` step.
 //! - `BACKTRACKING_TEST_LANE_A`: `tone` (default when the test tone is installed), `atmos`
 //!   (default when only the Atmos add-on is) or `off`. Lane B takes `atmos` as well. To see a
 //!   missing source: `stopped` (the add-on from `quits`, which has stopped), `gone` (the test
@@ -55,6 +61,7 @@ const QUITS_ID: &str = "com.example.quits";
 const BROKEN_ID: &str = "com.example.broken";
 const ATMOS_ID: &str = "com.kamelkyp.backtracking.joc";
 const ATMOS_SETTING: &str = "play_through_speakers";
+const THEME_ID: &str = "com.example.theme";
 /// Sender ids are hexadecimal digits and dashes.
 const STEREO_SENDER_ID: &str = "c1c1-5e7d-0002";
 const STEREO_SENDER_NAME: &str = "Stereo test tone";
@@ -97,6 +104,7 @@ fn preference_key(name: &str) -> Option<Key> {
         "keep-quiet-sections" => Key::RetainSilence,
         "hide-silent-channels" => Key::HideSilentChannels,
         "multichannel-pair-render" => Key::PairRender,
+        "addon-look" => Key::AddonLook,
         _ => return None,
     })
 }
@@ -143,6 +151,42 @@ fn repack_manifest(
     fs::remove_dir_all(&copy).unwrap();
 }
 
+/// The example appearance add-on as a package: `BACKTRACKING_TEST_THEME_PACKAGE`, or one
+/// packed from its package folder and the built example program into `output`.
+fn theme_package(work: &Path, output: &Path) -> PathBuf {
+    if let Some(path) = std::env::var_os("BACKTRACKING_TEST_THEME_PACKAGE") {
+        return PathBuf::from(path);
+    }
+    let addon = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/backtracking-addon");
+    let program = ["release", "debug"]
+        .into_iter()
+        .map(|profile| addon.join("target").join(profile).join("examples/theme_example.exe"))
+        .find(|program| program.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "build the example first: cargo build --locked --release --manifest-path \
+                 crates/backtracking-addon/Cargo.toml --example theme_example"
+            )
+        });
+    let folder = work.join("theme-package");
+    if folder.exists() {
+        fs::remove_dir_all(&folder).unwrap();
+    }
+    fs::create_dir_all(folder.join("bin")).unwrap();
+    fs::copy(
+        addon.join("examples/theme-package/addon.json"),
+        folder.join("addon.json"),
+    )
+    .unwrap();
+    fs::copy(program, folder.join("bin/theme-example.exe")).unwrap();
+    if output.exists() {
+        fs::remove_file(output).unwrap();
+    }
+    package::pack(&folder, output).unwrap();
+    fs::remove_dir_all(&folder).unwrap();
+    output.to_path_buf()
+}
+
 #[test]
 #[ignore = "prepares a test copy's data folder; run by hand with LOCALAPPDATA set to it"]
 fn seed_test_profile() {
@@ -164,8 +208,9 @@ fn seed_test_profile() {
         .collect();
     for name in &wanted {
         assert!(
-            ["tone", "tone-opens", "quits", "broken", "atmos", "none"].contains(name),
-            "BACKTRACKING_TEST_ADDONS takes tone, tone-opens, quits, broken, atmos or none, not {name}"
+            ["tone", "tone-opens", "quits", "broken", "atmos", "theme", "none"].contains(name),
+            "BACKTRACKING_TEST_ADDONS takes tone, tone-opens, quits, broken, atmos, theme or none, \
+             not {name}"
         );
     }
     let tone_installed = wanted.contains(&"tone") || wanted.contains(&"tone-opens");
@@ -210,6 +255,9 @@ fn seed_test_profile() {
         },
         &packages.join("tone-opens.btaddon"),
     );
+    let theme = wanted
+        .contains(&"theme")
+        .then(|| theme_package(&work, &packages.join("theme.btaddon")));
     // A file the Atmos add-on cannot decode, to see an add-on's error message.
     fs::write(
         packages.join("not-audio.ec3"),
@@ -323,6 +371,19 @@ fn seed_test_profile() {
                 "the Atmos add-on holds the setting",
             );
         }
+    }
+    if let Some(path) = theme {
+        let inspected = reply(handle.inspect(path.clone()));
+        reply(handle.install(path, inspected.identity));
+        reply(handle.set_enabled(THEME_ID, true));
+        wait_for(
+            || {
+                handle
+                    .try_appearances()
+                    .is_some_and(|offers| offers.contains_key(THEME_ID))
+            },
+            "the example appearance add-on offers its look",
+        );
     }
     if wanted.contains(&"quits") {
         // Its program says hello as the test tone, is refused and exits with an error.

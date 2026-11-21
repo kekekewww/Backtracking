@@ -299,6 +299,43 @@ impl Language {
         )
     }
 
+    // The look an add-on offers, chosen on the Appearance page.
+
+    pub(crate) fn look_field(self) -> &'static str {
+        self.pick("Look from add-on", "附加元件的外觀")
+    }
+
+    pub(crate) fn look_none(self) -> &'static str {
+        self.pick("None", "無")
+    }
+
+    pub(crate) fn look_none_offered(self) -> &'static str {
+        self.pick(
+            "No running add-on offers a look.",
+            "目前沒有執行中的附加元件提供外觀。",
+        )
+    }
+
+    /// Under the Border width control while the chosen look sets its own width.
+    pub(crate) fn look_border_width(self) -> &'static str {
+        self.pick(
+            "The chosen look sets its own width, which is used while that look is on.",
+            "目前選用的外觀有自己的寬度，使用該外觀期間以它為準。",
+        )
+    }
+
+    /// The chosen add-on is not running or offers no look; the choice is kept.
+    pub(crate) fn look_not_offered(self, addon: &str) -> String {
+        match self {
+            Self::English => format!(
+                "{addon} is not offering a look right now. Backtracking shows its own look until it does."
+            ),
+            Self::TraditionalChinese => {
+                format!("{addon} 目前沒有提供外觀。在它提供之前，Backtracking 使用自己的外觀。")
+            }
+        }
+    }
+
     // The Add-ons page and the screen shown before an install.
 
     pub(crate) fn addons_section(self) -> &'static str {
@@ -633,6 +670,12 @@ impl Language {
                 .pick(
                     "Be told about every clip you export, with its file path",
                     "得知你匯出的每個片段及其檔案路徑",
+                )
+                .to_owned(),
+            Capability::Appearance => self
+                .pick(
+                    "Offer colors and line styles for the window, which you can turn on in Options",
+                    "提供視窗的顏色與線條樣式，可在「選項」中啟用",
                 )
                 .to_owned(),
         }
@@ -1235,6 +1278,35 @@ mod tests {
             TraditionalChinese.size_in_files(2048, 3),
             "3 個檔案，共 2.0 KB"
         );
+    }
+
+    #[test]
+    fn every_look_text_exists_in_both_languages_and_differs() {
+        let pairs = [
+            super::Language::look_field,
+            super::Language::look_none,
+            super::Language::look_none_offered,
+            super::Language::look_border_width,
+        ]
+        .into_iter()
+        .map(|text| {
+            (
+                text(English).to_owned(),
+                text(TraditionalChinese).to_owned(),
+            )
+        })
+        .chain([(
+            English.look_not_offered("Example appearance"),
+            TraditionalChinese.look_not_offered("Example appearance"),
+        )]);
+        for (english, chinese) in pairs {
+            assert!(!english.is_empty() && !chinese.is_empty());
+            assert_ne!(english, chinese);
+            assert!(chinese.chars().any(|c| c as u32 >= 0x3000), "{chinese}");
+        }
+        assert_eq!(English.look_field(), "Look from add-on");
+        assert!(English.look_not_offered("Example appearance").starts_with("Example appearance "));
+        assert!(TraditionalChinese.look_not_offered("Example appearance").starts_with("Example appearance "));
     }
 
     #[test]

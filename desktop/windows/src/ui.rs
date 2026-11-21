@@ -35,15 +35,14 @@ use backtracking_core::{
 use backtracking_core::{FrozenPositionTrack, spatial::HeadModel};
 use backtracking_ui::stack::{self, LaneBox};
 use backtracking_ui::{
-    CENTER_LINE, FadeEnd, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, PLOT_BACKGROUND,
-    RECORDING_DIM, RECORDING_LIT, TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES,
-    accent_color, add_system_font_fallbacks, configure_options_menu, configure_options_style,
-    dragged_fades, fade_end_at, fade_waveform_bins, fit_frame_range, flag_handle_at, icon_button,
-    meter_number, muted_accent, options_choice, options_control_width, options_field,
-    options_group_heading, options_heading_text, options_list, options_menu_height,
-    options_navigation_item, options_note, options_value, paint_fades, paint_guide_lines,
-    paint_playhead, paint_transport_glyph, paint_waveform_trace, remeasure_options_menu,
-    selected_waveform_color, status_led, waveform_press,
+    FadeEnd, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, RECORDING_DIM, RECORDING_LIT, Theme,
+    TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES, accent_color,
+    add_system_font_fallbacks, configure_options_menu, configure_options_style, dragged_fades,
+    fade_end_at, fade_waveform_bins, fit_frame_range, flag_handle_at, icon_button, meter_number,
+    muted_accent, options_choice, options_control_width, options_field, options_group_heading,
+    options_heading_text, options_list, options_menu_height, options_navigation_item, options_note,
+    options_value, paint_fades, paint_guide_lines, paint_playhead, paint_transport_glyph,
+    paint_waveform_trace, remeasure_options_menu, status_led, waveform_press,
 };
 use eframe::egui::{
     self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection, Stroke, Vec2,
@@ -67,12 +66,14 @@ use winit::{
 mod addon_sources;
 mod addons_page;
 mod harness;
+mod look;
 #[cfg(test)]
 mod test_profile;
 mod text;
 
 use addon_sources::AddonSources;
 use addons_page::{AddonsPage, PageRequest};
+use look::AddonLook;
 use text::Language;
 
 /// How often the window looks at work that only reports progress when asked.
@@ -210,14 +211,9 @@ const FLAG_REACH: FlagReach = FlagReach {
 /// Alt is taken: dragging with it moves the window, except on a flag of the selection, where
 /// it drags that end's fade.
 const ALT_SELECTS: bool = false;
-const FLAG_COLOR: Color32 = Color32::from_rgb(255, 201, 109);
-/// The line that follows a playing selection.
-const PLAYHEAD_COLOR: Color32 = Color32::from_gray(245);
 /// While a drag selecting rows is past the edge of a lane that scrolls, the lane shows its
 /// next row this often.
 const EDGE_SCROLL_STEP: Duration = Duration::from_millis(90);
-/// How strongly the accent draws the line between lanes A and B while they are separate.
-const LANE_DIVIDER_ALPHA: f32 = 0.7;
 /// The rule under a wide lane's L/R pair, fainter than the line between two lanes.
 const PAIR_DIVIDER: Color32 = Color32::from_rgba_premultiplied(22, 22, 22, 22);
 /// The backing behind a wide lane's L/R pair, a shade lighter than the plot.
@@ -313,6 +309,7 @@ pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
                 // A delayed request runs one pass. An immediate one runs two.
                 repaint.request_repaint_after_for(Duration::from_millis(1), egui::ViewportId::ROOT);
             }));
+            recorder.wake_on_new_looks(&context.egui_ctx);
             recorder.options_in_taskbar = show_options_on_start;
             if show_options_on_start {
                 recorder.open_options(&context.egui_ctx);
@@ -508,6 +505,10 @@ struct Recorder {
     transparency: u8,
     accent: Color32,
     saved_accent: Color32,
+    /// How the plot looks, beyond what the user's own choices above decide.
+    theme: Theme,
+    /// The add-on whose look `theme` is, when the user chose one.
+    look: AddonLook,
     meter_modes: [MeterMode; 2],
     split_waveform: bool,
     wav_profile: WavExportProfile,
@@ -2474,6 +2475,8 @@ impl Recorder {
             transparency: settings.transparency,
             accent: accent_color(settings.accent),
             saved_accent: accent_color(settings.accent),
+            theme: Theme::default(),
+            look: AddonLook::new(settings.addon_look),
             meter_modes: [settings.meter_mode, settings.meter_b_mode],
             split_waveform: settings.split_waveform,
             wav_profile: settings.wav_profile,
@@ -3246,14 +3249,34 @@ impl Recorder {
         self.rows_rect(audio, rows).unwrap_or(audio)
     }
 
-    fn background_color(&self, color: Color32) -> Color32 {
-        let alpha = ((100 - u16::from(self.transparency)) * 255 + 50) / 100;
-        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha as u8)
+    /// Draws the plot with `theme` from the next frame on. The user's own choices of accent,
+    /// border and transparency keep applying where the theme leaves them.
+    fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
+    /// Keeps the waveform-only window's plot the same height when the user's own border
+    /// width has changed from `old_window_inset` ([`Self::window_border_inset`]).
+    fn fit_border_change(&self, ctx: &egui::Context, old_window_inset: f32) {
+        fit_window_border(
+            ctx,
+            self.waveform_only,
+            old_window_inset,
+            self.window_border_inset(),
+        );
+    }
+
+    /// The border the waveform-only window's size makes room for: the user's own width. A
+    /// look's width is drawn as it is and the plot takes up the difference, so a look never
+    /// resizes the window.
+    fn window_border_inset(&self) -> f32 {
+        window_border_inset(self.waveform_border, self.waveform_border_width)
+    }
+
+    /// The border drawn around the plot: a chosen look's width, else the user's own.
     fn border_inset(&self) -> f32 {
         if self.waveform_border {
-            f32::from(self.waveform_border_width)
+            self.theme.border_width(self.waveform_border_width)
         } else {
             0.0
         }
@@ -4299,7 +4322,7 @@ impl Recorder {
             self.full_window_size = size;
             Vec2::new(
                 size.x,
-                self.full_waveform_height + self.border_inset() * 2.0,
+                self.full_waveform_height + self.window_border_inset() * 2.0,
             )
             .max(minimum)
         } else {
@@ -4325,7 +4348,7 @@ impl Recorder {
         }
         let pinned = self.pinned;
         let waveform_only = self.waveform_only;
-        let old_border_inset = self.border_inset();
+        let old_window_inset = self.window_border_inset();
         let mut title = if self.primary {
             tray::OPTIONS_TITLE.to_owned()
         } else {
@@ -4408,12 +4431,8 @@ impl Recorder {
         });
         if self.waveform_only != waveform_only {
             self.apply_waveform_mode(ctx, frame);
-        } else if self.waveform_only && self.border_inset() != old_border_inset {
-            let size = ctx.viewport_rect().size();
-            let height = size.y + (self.border_inset() - old_border_inset) * 2.0;
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(
-                Vec2::new(size.x, height).max(min_window_size(true)),
-            ));
+        } else {
+            self.fit_border_change(ctx, old_window_inset);
         }
         if self.pinned != pinned {
             self.apply_pinned(ctx);
@@ -4746,6 +4765,7 @@ impl Recorder {
             }
         });
         self.accent_settings(ui);
+        self.addon_look_settings(ui);
         ui.separator();
         options_group_heading(ui, "Show");
         if ui
@@ -4827,6 +4847,7 @@ impl Recorder {
                         self.waveform_border_width.to_string(),
                     );
                 }
+                self.look_border_width_note(ui);
             });
             let mut theme = self.waveform_border_color.is_none();
             let theme_changed = ui.checkbox(&mut theme, "Use theme color").changed();
@@ -6769,16 +6790,21 @@ impl Recorder {
     }
 
     fn draw_waveform(&self, ui: &egui::Ui, rect: Rect, preview_hover: bool) {
+        let theme = &self.theme;
         if self.waveform_border {
-            let color = self.waveform_border_color.unwrap_or(self.accent);
-            let color = if self.waveform_border_follows_background {
-                self.background_color(color)
-            } else {
-                color
-            };
+            let color = theme.border(
+                self.accent,
+                self.waveform_border_color,
+                self.waveform_border_follows_background,
+                self.transparency,
+            );
             ui.painter_at(rect).rect_stroke(
                 rect,
-                if self.waveform_only { 0.0 } else { 6.0 },
+                if self.waveform_only {
+                    0.0
+                } else {
+                    theme.corner_radius
+                },
                 Stroke::new(self.border_inset(), color),
                 egui::StrokeKind::Inside,
             );
@@ -6786,11 +6812,15 @@ impl Recorder {
         let rect = rect.shrink(self.border_inset());
         let painter = ui.painter_at(rect);
         if self.waveform_only {
-            painter.rect_filled(rect, 0.0, self.background_color(PLOT_BACKGROUND));
+            painter.rect_filled(
+                rect,
+                0.0,
+                theme.translucent_plot_background(self.transparency),
+            );
         } else {
             // The panel already supplies the chosen alpha when translucent.
             if self.transparency == 0 {
-                painter.rect_filled(rect, 6.0, PLOT_BACKGROUND);
+                painter.rect_filled(rect, theme.corner_radius, theme.plot_background);
             }
         }
         let audio = self.audio_rect(rect);
@@ -6855,7 +6885,7 @@ impl Recorder {
                 None => Some(audio),
             };
             if let Some(area) = area {
-                painter.rect_filled(area, 2.0, muted_accent(self.accent));
+                painter.rect_filled(area, 2.0, theme.preview_highlight(self.accent));
             }
         }
 
@@ -6887,7 +6917,11 @@ impl Recorder {
                             PAIR_BACKING,
                         );
                     }
-                    painter.hline(row.x_range(), row.center().y, Stroke::new(1.0, CENTER_LINE));
+                    painter.hline(
+                        row.x_range(),
+                        row.center().y,
+                        Stroke::new(1.0, theme.center_line),
+                    );
                     if source == RowSource::Pair(plan.lane, PairSide::Right)
                         && index + 1 < lane_box.first + lane_box.shown
                     {
@@ -6926,7 +6960,7 @@ impl Recorder {
                             egui::Align2::LEFT_CENTER,
                             label,
                             egui::FontId::monospace(8.0),
-                            Color32::from_gray(180),
+                            theme.row_label,
                         );
                     }
                 }
@@ -6956,11 +6990,17 @@ impl Recorder {
                         }
                         _ => peaks,
                     };
+                    // A look can colour a channel's row by the channel's label.
+                    let channel = plan
+                        .group_channel(index)
+                        .and_then(|(group, channel)| group.labels.get(channel))
+                        .map(String::as_str);
                     self.paint_waveform(
                         &painter,
                         row,
                         peaks,
                         highlight.as_ref().filter(|_| selected),
+                        channel,
                     );
                 }
                 if let Some(range) = row_selection {
@@ -6973,7 +7013,7 @@ impl Recorder {
                         &visible,
                         range,
                         fades,
-                        FLAG_COLOR,
+                        theme.flag,
                     );
                 }
             }
@@ -6987,13 +7027,13 @@ impl Recorder {
             painter.hline(
                 audio.x_range(),
                 audio.top() + lane_b.top,
-                Stroke::new(1.0, self.accent.gamma_multiply(LANE_DIVIDER_ALPHA)),
+                Stroke::new(1.0, theme.lane_divider(self.accent)),
             );
         }
         self.paint_transport(ui, &painter, rect, &boxes);
         self.paint_flags(&painter, audio);
         if let Some(player) = &self.preview {
-            paint_playhead(&painter, audio, &visible, player.playhead(), PLAYHEAD_COLOR);
+            paint_playhead(&painter, audio, &visible, player.playhead(), theme.playhead);
         }
 
         let rate = f64::from(self.sample_rate.max(1));
@@ -7094,7 +7134,7 @@ impl Recorder {
             painter.rect_filled(
                 Rect::from_x_y_ranges(x, audio.top() + thumb.start..=audio.top() + thumb.end),
                 1.5,
-                Color32::from_gray(if active { 200 } else { 128 }),
+                self.theme.scroll_thumb(active),
             );
         }
         // The same dark backing as the waveform-only status mark keeps the switch readable.
@@ -7104,15 +7144,15 @@ impl Recorder {
             let (Some(start), Some(end)) = (lane_chips.first(), lane_chips.last()) else {
                 continue;
             };
-            painter.rect_filled(
-                start.rect.union(end.rect),
-                3.0,
-                Color32::from_black_alpha(168),
-            );
+            painter.rect_filled(start.rect.union(end.rect), 3.0, self.theme.chip_background);
             for chip in lane_chips {
                 let hovered = hover.is_some_and(|point| chip.rect.contains(point));
                 if chip.current {
-                    painter.rect_filled(chip.rect.shrink(1.0), 2.5, muted_accent(self.accent));
+                    painter.rect_filled(
+                        chip.rect.shrink(1.0),
+                        2.5,
+                        self.theme.chip_current(self.accent),
+                    );
                 }
                 painter.text(
                     chip.rect.center(),
@@ -7122,7 +7162,7 @@ impl Recorder {
                     if chip.current || hovered {
                         Color32::WHITE
                     } else {
-                        Color32::from_gray(180)
+                        self.theme.chip_text
                     },
                 );
             }
@@ -7149,18 +7189,25 @@ impl Recorder {
     fn paint_time_lines(&self, painter: &egui::Painter, audio: Rect) {
         let guides = self.visible_guides(audio);
         let policy = self.display_policy(audio, self.visible_frames.clone());
-        let draw = |frames: &[u64], alpha: u16, stroke| {
-            let alpha = alpha * u16::from(100 - self.transparency) / 100;
+        let draw = |frames: &[u64], color, stroke| {
             paint_guide_lines(
                 painter,
                 audio,
                 &self.visible_frames,
                 frames,
-                Stroke::new(stroke, Color32::from_white_alpha(alpha as u8)),
+                Stroke::new(stroke, color),
             );
         };
-        draw(&guides.seconds, 52, policy.seconds_stroke);
-        draw(&guides.bars, 104, policy.bar_stroke);
+        draw(
+            &guides.seconds,
+            self.theme.second_line(self.transparency),
+            policy.seconds_stroke,
+        );
+        draw(
+            &guides.bars,
+            self.theme.bar_line(self.transparency),
+            policy.bar_stroke,
+        );
     }
 
     fn paint_flags(&self, painter: &egui::Painter, audio: Rect) {
@@ -7168,7 +7215,7 @@ impl Recorder {
         for (x, y, height, direction) in self.flag_marks(audio) {
             painter.line_segment(
                 [Pos2::new(x, y), Pos2::new(x, y + height)],
-                Stroke::new(1.0, FLAG_COLOR),
+                Stroke::new(1.0, self.theme.flag),
             );
             painter.add(egui::Shape::convex_polygon(
                 vec![
@@ -7176,7 +7223,7 @@ impl Recorder {
                     Pos2::new(x + direction * 6.0, y + height * 0.28),
                     Pos2::new(x, y + height * 0.56),
                 ],
-                FLAG_COLOR,
+                self.theme.flag,
                 Stroke::NONE,
             ));
         }
@@ -7230,36 +7277,64 @@ impl Recorder {
         audio: Rect,
         peaks: &WaveformPeaks,
         selection: Option<&Range<f32>>,
+        channel: Option<&str>,
     ) {
         let policy = self.display_policy(audio, self.visible_frames.clone());
         let geometry =
             waveform::waveform_geometry(&peaks.low, &peaks.high, self.visible_frames.clone());
-        let selected = selected_waveform_color(self.accent, SELECTION_CONTRAST);
-        let painter = painter.with_clip_rect(audio);
-        let paint_range = |range: Range<f32>, color| {
-            if range.is_empty() {
-                return;
-            }
-            let clip = Rect::from_x_y_ranges(
-                audio.left() + range.start * audio.width()
-                    ..=audio.left() + range.end * audio.width(),
-                audio.y_range(),
-            );
-            paint_waveform_geometry(
-                &painter.with_clip_rect(clip),
-                audio,
-                &geometry,
-                policy.waveform_stroke,
-                color,
-            );
-        };
-        if let Some(range) = selection.filter(|range| range.start < range.end) {
-            paint_range(0.0..range.start, self.accent);
-            paint_range(range.clone(), selected);
-            paint_range(range.end..1.0, self.accent);
-        } else {
-            paint_range(0.0..1.0, self.accent);
+        paint_row_waveform(
+            painter,
+            audio,
+            &geometry,
+            policy.waveform_stroke,
+            selection,
+            &self.theme,
+            self.accent,
+            channel,
+        );
+    }
+}
+
+/// Paints one row's waveform `geometry` across `audio` as `theme` draws it for this accent:
+/// in the colour of the row's `channel` (its label) or the waveform's, and in the selected
+/// colour across `selection`, given as fractions of the row's width.
+#[allow(clippy::too_many_arguments)]
+fn paint_row_waveform(
+    painter: &egui::Painter,
+    audio: Rect,
+    geometry: &waveform::WaveformGeometry,
+    stroke: f32,
+    selection: Option<&Range<f32>>,
+    theme: &Theme,
+    accent: Color32,
+    channel: Option<&str>,
+) {
+    let color = theme.row_waveform(channel, accent);
+    let selected = theme.waveform_selected(accent, SELECTION_CONTRAST);
+    let painter = painter.with_clip_rect(audio);
+    let paint_range = |range: Range<f32>, color| {
+        if range.is_empty() {
+            return;
         }
+        let clip = Rect::from_x_y_ranges(
+            audio.left() + range.start * audio.width()..=audio.left() + range.end * audio.width(),
+            audio.y_range(),
+        );
+        paint_waveform_geometry(
+            &painter.with_clip_rect(clip),
+            audio,
+            geometry,
+            stroke,
+            color,
+            theme,
+        );
+    };
+    if let Some(range) = selection.filter(|range| range.start < range.end) {
+        paint_range(0.0..range.start, color);
+        paint_range(range.clone(), selected);
+        paint_range(range.end..1.0, color);
+    } else {
+        paint_range(0.0..1.0, color);
     }
 }
 
@@ -7317,6 +7392,23 @@ fn status_mark_shown(mark: StatusMark, indicator: CaptureIndicator, problem: boo
 /// Paints the waveform-only status mark in the top-left corner of the plot: a dot coloured by
 /// state, or pause bars, with the source problem written beside it when there is one.
 /// Returns the area whose tooltip explains the mark.
+/// See [`Recorder::window_border_inset`].
+fn window_border_inset(waveform_border: bool, width: u8) -> f32 {
+    if waveform_border { f32::from(width) } else { 0.0 }
+}
+
+/// Grows or shrinks the waveform-only window by the change from `old_inset` to `new_inset` on
+/// each side, so its plot keeps its height.
+fn fit_window_border(ctx: &egui::Context, waveform_only: bool, old_inset: f32, new_inset: f32) {
+    if waveform_only && new_inset != old_inset {
+        let size = ctx.viewport_rect().size();
+        let height = size.y + (new_inset - old_inset) * 2.0;
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(
+            Vec2::new(size.x, height).max(min_window_size(true)),
+        ));
+    }
+}
+
 fn paint_compact_status(
     painter: &egui::Painter,
     rect: Rect,
@@ -7373,6 +7465,7 @@ fn paint_waveform_geometry(
     geometry: &waveform::WaveformGeometry,
     stroke: f32,
     color: Color32,
+    theme: &Theme,
 ) {
     let position = |x, value| {
         Pos2::new(
@@ -7380,13 +7473,14 @@ fn paint_waveform_geometry(
             audio.center().y - value * audio.height() * 0.47,
         )
     };
+    let stroke = theme.waveform_stroke(stroke);
     paint_waveform_trace(
         painter,
         geometry,
         position,
         &TraceStyle {
             stroke: Stroke::new(stroke, color),
-            fill: color.linear_multiply(0.4),
+            fill: theme.waveform_fill(color),
             lone_sample: LoneSample::Dot(stroke * 0.55),
         },
     );
@@ -7483,6 +7577,7 @@ impl eframe::App for Recorder {
         self.collect_source_list();
         self.addons_page
             .poll(self.controller.addons(), Language::current());
+        self.refresh_look();
         let in_use = |id: &str| {
             self.controller.sources().iter().flatten().any(|settings| {
                 matches!(&settings.source, CaptureSource::Addon { addon_id, .. } if addon_id == id)
@@ -7548,7 +7643,10 @@ impl eframe::App for Recorder {
         let frame_style = if self.waveform_only {
             panel.fill(Color32::TRANSPARENT).inner_margin(0)
         } else {
-            panel.fill(self.background_color(ui.visuals().panel_fill))
+            panel.fill(
+                self.theme
+                    .panel_background(ui.visuals().panel_fill, self.transparency),
+            )
         };
         // Menu and keyboard commands wait until the frame is laid out, like the Options window's
         // changes: some of them resize the window or switch its mode.
@@ -8072,12 +8170,110 @@ mod tests {
                     &geometry,
                     1.5,
                     Color32::GREEN,
+                    &Theme::default(),
                 );
             },
         );
         let shapes = std::mem::take(&mut output.shapes);
         output.drop_without_applying_deltas();
         shapes
+    }
+
+    /// The colours and widths of what one row's waveform paints: (outline colour, width) of
+    /// each path and the colours of each fill.
+    fn painted_row(theme: &Theme, channel: Option<&str>) -> (Vec<(Color32, f32)>, Vec<Color32>) {
+        let audio = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(120.0, 100.0));
+        let geometry = waveform::waveform_geometry(&[-0.6; 3], &[0.8; 3], 100..400);
+        let context = egui::Context::default();
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0))),
+                ..Default::default()
+            },
+            |ui| {
+                paint_row_waveform(
+                    ui.painter(),
+                    audio,
+                    &geometry,
+                    1.5,
+                    Some(&(0.25..0.75)),
+                    theme,
+                    ACCENT,
+                    channel,
+                );
+            },
+        );
+        let shapes = std::mem::take(&mut output.shapes);
+        output.drop_without_applying_deltas();
+        let mut lines = Vec::new();
+        let mut fills = Vec::new();
+        for shape in shapes {
+            match shape.shape {
+                egui::Shape::Path(path) => match path.stroke.color {
+                    egui::epaint::ColorMode::Solid(color) => lines.push((color, path.stroke.width)),
+                    other => panic!("unexpected stroke {other:?}"),
+                },
+                egui::Shape::Mesh(mesh) => {
+                    fills.extend(mesh.vertices.iter().map(|vertex| vertex.color));
+                }
+                other => panic!("unexpected shape {other:?}"),
+            }
+        }
+        fills.dedup();
+        (lines, fills)
+    }
+
+    const ACCENT: Color32 = Color32::from_rgb(103, 231, 181);
+
+    #[test]
+    fn the_default_look_paints_the_waveform_as_it_always_has() {
+        let selected = backtracking_ui::selected_waveform_color(ACCENT, 80);
+        let (lines, fills) = painted_row(&Theme::default(), Some("LFE"));
+        // Before, inside and after the selection: two outlines each.
+        assert_eq!(
+            lines,
+            [ACCENT, ACCENT, selected, selected, ACCENT, ACCENT].map(|color| (color, 1.5))
+        );
+        assert_eq!(
+            fills,
+            [ACCENT, selected, ACCENT].map(|color| color.linear_multiply(0.4))
+        );
+    }
+
+    #[test]
+    fn a_look_colours_the_waveform_its_selection_and_a_channels_row() {
+        let waveform = Color32::from_rgb(10, 20, 200);
+        let selected = Color32::from_rgb(240, 230, 10);
+        let lfe = Color32::from_rgb(200, 40, 40);
+        let mut theme = Theme {
+            waveform: Some(waveform),
+            waveform_selected: Some(selected),
+            waveform_stroke_scale: 2.0,
+            waveform_fill_opacity: 0.9,
+            ..Theme::default()
+        };
+        let (lines, fills) = painted_row(&theme, None);
+        assert_eq!(
+            lines,
+            [waveform, waveform, selected, selected, waveform, waveform].map(|color| (color, 3.0))
+        );
+        assert_eq!(
+            fills,
+            [waveform, selected, waveform].map(|color| color.linear_multiply(0.9))
+        );
+
+        // A row whose channel the look colours takes that colour outside the selection.
+        theme.row_colors.insert("LFE".into(), lfe);
+        let (lines, _) = painted_row(&theme, Some("LFE"));
+        assert_eq!(
+            lines.iter().map(|line| line.0).collect::<Vec<_>>(),
+            [lfe, lfe, selected, selected, lfe, lfe]
+        );
+        let (lines, _) = painted_row(&theme, Some("C"));
+        assert_eq!(
+            lines[0].0, waveform,
+            "other channels keep the waveform's colour"
+        );
     }
 
     #[test]
@@ -8522,27 +8718,20 @@ mod tests {
         );
 
         // In waveform-only mode colour alone has to tell the four states apart, in both halves
-        // of the recording blink, against the dark plot.
+        // of the recording blink, against the dark plot. A look's plot backing is held to the
+        // same test (`Theme::legible`).
         let plot = Color32::from_rgb(22, 26, 29);
-        let distance = |a: Color32, b: Color32| {
-            a.to_array()
-                .into_iter()
-                .zip(b.to_array())
-                .take(3)
-                .map(|(a, b)| u32::from(a.abs_diff(b)))
-                .sum::<u32>()
-        };
         for lit in [false, true] {
             let colors =
                 [Unavailable, Paused, Recording, Waiting].map(|state| state.compact_color(lit));
             for (index, color) in colors.iter().enumerate() {
                 assert!(
-                    distance(*color, plot) >= 90,
+                    backtracking_ui::distinguishable(*color, plot),
                     "{color:?} is lost on the plot"
                 );
                 for other in &colors[index + 1..] {
                     assert!(
-                        distance(*color, *other) >= 90,
+                        backtracking_ui::distinguishable(*color, *other),
                         "{color:?} is too close to {other:?}"
                     );
                 }

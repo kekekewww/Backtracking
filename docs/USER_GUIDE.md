@@ -205,6 +205,8 @@ Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift
 - 能開啟檔案的附加元件會多一個 **Open file…** 按鈕，也可以直接把檔案拖到視窗上。
 - 能播放的來源會有 **Play**／**Pause**、**Stop** 和位置滑桿，主視窗的波形左下角也有一個播放／暫停按鈕。
 
+**使用附加元件的外觀。** 具有 `appearance` 功能的附加元件可以為視窗提供一套外觀：波形、選區、背景、外框、旗標等的顏色，以及外框寬度、圓角和波形線條的粗細。外觀預設不會套用：到 Options 的 **Appearance** 頁，在 **附加元件的外觀／Look from add-on** 選擇一個正在提供外觀的執行中附加元件。一次只會套用一個外觀，選 **無／None** 即恢復 Backtracking 自己的外觀。這個選擇會被保存；若該附加元件沒有執行或目前沒有提供外觀，視窗會使用自己的外觀，這一列也會註明它目前沒有提供外觀，等它再次提供時就會自動套用。外觀只會改變視窗的樣子：擷取、選取、匯出、檔案、快捷鍵、版面（外框寬度除外）、文字，以及錄音、等待、暫停與錯誤的標記都維持原樣。外觀啟用期間，它的外框寬度會取代你設定的寬度（視窗大小不變，波形區域隨之調整），但你自己選的外框顏色仍優先於外觀的外框顏色，背景透明度也仍依你的設定。若某個值會讓波形、選區、旗標、播放線、聲道名稱或擷取狀態標記難以看清，Backtracking 會忽略那個值，改用自己的。
+
 想自己寫附加元件，請看 [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md)。
 
 ### 多聲道來源（Windows 桌面版與插件）
@@ -465,6 +467,8 @@ An add-on is a separate program that Backtracking starts and captures audio from
 - **Format** takes the place of **Channel route** and lists the formats the add-on offers, for example Stereo, 5.1, or 7.1.4. Formats with one or two channels keep the channel route as well.
 - An add-on that opens files shows an **Open file…** button. You can also drop the file on a window.
 - A source that plays shows **Play** / **Pause**, **Stop**, and a position slider. The main window has a small play/pause button at the bottom left of the waveform.
+
+**Use an add-on's look.** An add-on with the `appearance` capability can offer a look for the window: colors for the waveform, the selection, the backgrounds, the border, the flags and more, and the border width, corner rounding and the thickness of the waveform's line. A look is off until you choose it: on the **Appearance** page of Options, pick a running add-on that offers one under **Look from add-on**. Only one look is on at a time, and **None** brings back Backtracking's own look. The choice is saved. When that add-on is not running or offers no look, the window shows its own look and the row says the add-on is not offering one right now; its look comes back when it does. A look changes only how the window looks: capture, selection, export, files, shortcuts, layout (other than the border width), text, and the recording, waiting, paused and error marks stay as they are. While a look is on, its border width replaces yours (the window keeps its size and the waveform area adjusts), but a border color you chose yourself still wins over the look's, and your background transparency still applies. Backtracking ignores any value that would make the waveform, the selection, the flags, the playhead, channel names or the capture status hard to see, and uses its own there instead.
 
 To write an add-on, see [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md).
 

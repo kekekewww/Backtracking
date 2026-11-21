@@ -2,10 +2,22 @@ use crate::{Error, Result};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::time::{Duration, Instant};
 
 // Bound both memory and the amount of socket work done during one UI poll.
 const IO_BUDGET: usize = 65536;
 const MAX_QUEUED_BYTES: usize = 1024 * 1024;
+
+/// Discard timestamps outside the rolling second before checking the remaining budget.
+pub(crate) fn below_rate_limit(times: &mut VecDeque<Instant>, now: Instant, limit: usize) -> bool {
+    while times
+        .front()
+        .is_some_and(|time| now.saturating_duration_since(*time) >= Duration::from_secs(1))
+    {
+        times.pop_front();
+    }
+    times.len() < limit
+}
 
 pub(crate) struct Wire {
     stream: TcpStream,

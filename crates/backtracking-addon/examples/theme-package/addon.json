@@ -1,0 +1,13 @@
+{
+  "contract": 1,
+  "id": "com.example.theme",
+  "name": "Example appearance",
+  "version": "0.1.0",
+  "author": "Backtracking contributors",
+  "description": "Offers waveform colors and a slowly changing border color.",
+  "license": "Apache-2.0",
+  "capabilities": ["appearance"],
+  "run": {
+    "windows-x86_64": { "program": "bin/theme-example.exe", "args": [] }
+  }
+}
