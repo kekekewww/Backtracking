@@ -88,6 +88,10 @@ vst3 = "0.3"
 [target.'cfg(windows)'.dev-dependencies]
 libloading = "0.8"
 
+# baseview 0.4.2 with one Windows paint fix; see vendor/baseview/BACKTRACKING-CHANGES.md.
+[patch.crates-io]
+baseview = { path = "vendor/baseview" }
+
 # Standalone package: keeps cargo from walking up into an enclosing workspace
 # (for example when this checkout is nested inside another one).
 [workspace]

@@ -729,8 +729,10 @@ mod editor_window {
         /// `Leave` step.
         pub(super) fn pump(&self) {
             let mut msg = MSG::default();
+            let mut paints = 0;
             unsafe {
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    count_paint(&msg, &mut paints);
                     if msg.message != 0x02A3 {
                         dispatch(&msg);
                     }
@@ -787,39 +789,39 @@ mod editor_window {
     }
     pub(super) fn pump() {
         let mut msg = MSG::default();
+        let mut paints = 0;
         unsafe {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                count_paint(&msg, &mut paints);
                 dispatch(&msg);
             }
         }
     }
 
-    /// Dispatches one message. An editor that grew past a parent this host has not resized
-    /// keeps an update region outside the parent that the editor never validates, so Windows
-    /// would send WM_PAINT forever; this host validates it.
+    /// Fails when WM_PAINT keeps coming within one pump. Windows sends it for as long as part of
+    /// a window's update region stays invalid, and it comes before WM_TIMER, so an editor that
+    /// leaves part unvalidated (as one grown past a parent the host has not resized did) never
+    /// redraws again while the host goes on. In Nuendo that froze the editor.
+    fn count_paint(msg: &MSG, paints: &mut u32) {
+        if msg.message == WM_PAINT {
+            *paints += 1;
+            assert!(
+                *paints < 1000,
+                "WM_PAINT keeps coming: the editor leaves part of its update region invalid"
+            );
+        }
+    }
+
     unsafe fn dispatch(msg: &MSG) {
         unsafe {
             let _ = TranslateMessage(msg);
             DispatchMessageW(msg);
-            let mut rect = windows::Win32::Foundation::RECT::default();
-            if msg.message == 0x000F
-                && GetUpdateRect(msg.hwnd.0, &mut rect, 0) != 0
-                && (rect.right <= rect.left || rect.bottom <= rect.top)
-            {
-                ValidateRect(msg.hwnd.0, ptr::null());
-            }
         }
     }
     #[link(name = "user32")]
     unsafe extern "system" {
         fn GetDC(window: *mut c_void) -> *mut c_void;
         fn ReleaseDC(window: *mut c_void, dc: *mut c_void) -> i32;
-        fn GetUpdateRect(
-            window: *mut c_void,
-            rect: *mut windows::Win32::Foundation::RECT,
-            erase: i32,
-        ) -> i32;
-        fn ValidateRect(window: *mut c_void, rect: *const windows::Win32::Foundation::RECT) -> i32;
     }
     #[link(name = "opengl32")]
     unsafe extern "system" {
