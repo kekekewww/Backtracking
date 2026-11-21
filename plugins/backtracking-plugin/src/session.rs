@@ -6,15 +6,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use backtracking_core::{
-    AutoResumeDelay, Capture, CaptureState, ChannelRoute, DurationChoice, Fades, FrozenTrack,
-    MeterReadings, PreviewSlot, SenderEndpoint, TimedAudioQueue, WavExportProfile, WaveformView,
-    capture_clock_ns, export_routed_tracks_with_fades,
-};
 #[cfg(test)]
 use backtracking_core::Snapshot;
+use backtracking_core::{
+    AutoResumeDelay, Capture, CaptureState, DurationChoice, Fades, FrozenTrack, MeterReadings,
+    PreviewSlot, SenderEndpoint, TimedAudioQueue, WavExportProfile, WaveformView, capture_clock_ns,
+};
 
 use crate::settings::{CaptureInput, MeterMode, SessionSettings, SettingsStore, WaveformLayout};
+use crate::surround::{WideLayout, WideRow, WideSave};
 
 pub(crate) const WAVEFORM_BINS: usize = 512;
 
@@ -84,7 +84,7 @@ impl Default for WaveformPeaks {
 }
 
 pub(crate) fn waveform_views(layout: WaveformLayout, channels: usize) -> &'static [WaveformView] {
-    if layout == WaveformLayout::Stereo && channels == 2 {
+    if channels > 2 || (layout == WaveformLayout::Stereo && channels == 2) {
         &[WaveformView::Left, WaveformView::Right]
     } else {
         &[WaveformView::Merged]
@@ -97,8 +97,11 @@ pub(crate) struct WaveformTimeline {
     pub(crate) frames: Range<u64>,
     pub(crate) sample_rate: u32,
     pub(crate) channels: usize,
+    pub(crate) wide: Option<WideLayout>,
     pub(crate) b_channels: Option<usize>,
     pub(crate) bar_markers: Vec<u64>,
+    /// The history memory holds at the capture's width, in seconds.
+    pub(crate) retention_seconds: f64,
 }
 
 #[derive(Clone)]
@@ -150,6 +153,7 @@ struct Consumer {
     routed: Vec<f32>,
     bars: Vec<usize>,
     sample_rate: u32,
+    wide: Option<WideLayout>,
     main_channels: usize,
     sidechain_channels: usize,
     input: CaptureInput,
@@ -164,9 +168,117 @@ struct WaveformCache {
     layout: WaveformLayout,
     range: Range<u64>,
     peaks: [WaveformPeaks; 2],
+    /// The rows of a capture wider than stereo, read only for the rows on screen.
+    rows: RowCache,
+}
+
+#[derive(Default)]
+struct RowCache {
+    revision: Option<u64>,
+    rows: Vec<WideRow>,
+    range: Range<u64>,
+    bins: usize,
+    peaks: Vec<WaveformPeaks>,
+}
+
+pub(crate) struct ExportSnapshots {
+    pub(crate) epoch: u64,
+    pub(crate) tracks: Arc<[FrozenTrack]>,
+    pub(crate) mask: u32,
+    /// The speaker layout of a main input wider than stereo in `tracks`.
+    pub(crate) wide: Option<WideLayout>,
 }
 
 impl Consumer {
+    fn wav_mask(&self) -> u32 {
+        self.shown_wide().map_or(0, |wide| wide.mask)
+    }
+
+    /// The layout of the main input when it is wider than stereo and being captured.
+    fn shown_wide(&self) -> Option<&WideLayout> {
+        self.wide
+            .as_ref()
+            .filter(|_| self.input != CaptureInput::Sidechain)
+    }
+
+    fn timeline(&self, epoch: u64) -> WaveformTimeline {
+        let frames = self.capture.frame_range();
+        WaveformTimeline {
+            epoch,
+            bar_markers: self.capture.bar_markers(frames.clone()),
+            frames,
+            sample_rate: self.sample_rate,
+            channels: self.capture.track_channels(0).unwrap_or(1),
+            wide: self.shown_wide().cloned(),
+            b_channels: self.capture.track_channels(1),
+            retention_seconds: self.capture.effective_retention_seconds(),
+        }
+    }
+
+    /// Peaks for `rows` of a capture wider than stereo over `range`.
+    fn rows(
+        &mut self,
+        rows: &[WideRow],
+        range: Range<u64>,
+        bins: usize,
+        peaks: &mut Vec<WaveformPeaks>,
+    ) {
+        let cache = &mut self.waveform.rows;
+        let revision = self.capture.revision();
+        if cache.revision != Some(revision)
+            || cache.rows != rows
+            || cache.range != range
+            || cache.bins != bins
+        {
+            cache.peaks.resize_with(rows.len(), WaveformPeaks::default);
+            for (row, trace) in rows.iter().zip(&mut cache.peaks) {
+                trace.minimum.resize(bins, 0.0);
+                trace.maximum.resize(bins, 0.0);
+                let (minimum, maximum) = (&mut trace.minimum, &mut trace.maximum);
+                match (*row, &self.wide) {
+                    (WideRow::Pair(side), Some(wide)) => {
+                        self.capture.track_pair_waveform_range(
+                            0,
+                            &wide.group,
+                            side,
+                            range.clone(),
+                            minimum,
+                            maximum,
+                        );
+                    }
+                    (WideRow::Channel(channel), _) => {
+                        self.capture.track_channel_waveform_range(
+                            0,
+                            channel,
+                            range.clone(),
+                            minimum,
+                            maximum,
+                        );
+                    }
+                    (WideRow::Sidechain, _) => {
+                        self.capture.track_waveform_range(
+                            1,
+                            WaveformView::Merged,
+                            range.clone(),
+                            minimum,
+                            maximum,
+                        );
+                    }
+                    (WideRow::Pair(_), None) => {
+                        minimum.fill(0.0);
+                        maximum.fill(0.0);
+                    }
+                }
+            }
+            cache.revision = Some(revision);
+            cache.rows.clear();
+            cache.rows.extend_from_slice(rows);
+            cache.range = range;
+            cache.bins = bins;
+        }
+        peaks.clone_from(&cache.peaks);
+    }
+
     fn has_fresh_input(&self) -> bool {
         self.last_input
             .is_some_and(|last| last.elapsed() < self.input_timeout)
@@ -235,9 +347,29 @@ impl Consumer {
                     views.get(index).map(|&view| (0, view))
                 };
                 if let Some((lane, view)) = route {
-                    self.capture.track_waveform_range(
-                        lane, view, range.clone(), &mut trace.minimum, &mut trace.maximum,
-                    );
+                    if lane == 0 && a > 2 {
+                        self.wide
+                            .as_ref()
+                            .unwrap()
+                            .peaks(view, trace, |group, side, lo, hi| {
+                                self.capture.track_pair_waveform_range(
+                                    0,
+                                    group,
+                                    side,
+                                    range.clone(),
+                                    lo,
+                                    hi,
+                                );
+                            });
+                    } else {
+                        self.capture.track_waveform_range(
+                            lane,
+                            view,
+                            range.clone(),
+                            &mut trace.minimum,
+                            &mut trace.maximum,
+                        );
+                    }
                 } else {
                     trace.minimum.fill(0.0);
                     trace.maximum.fill(0.0);
@@ -760,10 +892,20 @@ impl Session {
         self.published().epoch
     }
 
-    pub(crate) fn positioned_snapshots(&self, live: bool) -> Option<(u64, Arc<[FrozenTrack]>)> {
+    #[cfg(test)]
+    fn positioned_snapshots(&self, live: bool) -> Option<(u64, Arc<[FrozenTrack]>)> {
+        self.export_snapshots(live).map(|s| (s.epoch, s.tracks))
+    }
+
+    pub(crate) fn export_snapshots(&self, live: bool) -> Option<ExportSnapshots> {
         if !live && self.edit_requested.load(Ordering::Acquire) {
             let editing = self.editing_snapshot()?;
-            return Some((editing.timeline.epoch, editing.snapshots));
+            return Some(ExportSnapshots {
+                epoch: editing.timeline.epoch,
+                tracks: editing.snapshots,
+                mask: editing.timeline.wide.as_ref().map_or(0, |w| w.mask),
+                wide: editing.timeline.wide.clone(),
+            });
         }
         let mut state = self.lock();
         let recording = live && !state.paused && self.accepting.load(Ordering::SeqCst);
@@ -772,7 +914,12 @@ impl Session {
         if recording {
             consumer.drain(usize::MAX);
         }
-        Some((epoch, track_snapshots(&consumer.capture).into()))
+        Some(ExportSnapshots {
+            epoch,
+            tracks: track_snapshots(&consumer.capture).into(),
+            mask: consumer.wav_mask(),
+            wide: consumer.shown_wide().cloned(),
+        })
     }
 
     #[cfg(test)]
@@ -855,14 +1002,35 @@ impl Session {
             .filter(|range| !range.is_empty())
             .unwrap_or_else(|| frames.clone());
         consumer.waveform(layout, range, bins, peaks);
-        WaveformTimeline {
-            epoch,
-            bar_markers: consumer.capture.bar_markers(frames.clone()),
-            frames,
-            sample_rate: consumer.sample_rate,
-            channels: consumer.capture.track_channels(0).unwrap_or(1),
-            b_channels: consumer.capture.track_channels(1),
-        }
+        consumer.timeline(epoch)
+    }
+
+    /// Like [`Self::try_waveform_in_range_with_bins`] for the `rows` of a capture wider than
+    /// stereo: `peaks` gets one entry per row, in the order asked.
+    pub(crate) fn try_wide_rows(
+        &self,
+        rows: &[WideRow],
+        visible: Option<Range<u64>>,
+        bins: usize,
+        peaks: &mut Vec<WaveformPeaks>,
+    ) -> Option<WaveformTimeline> {
+        let mut state = self.state.try_lock().ok()?;
+        let bins = bins.clamp(1, backtracking_core::waveform::MAX_WAVEFORM_BINS);
+        let epoch = state.timeline_epoch;
+        let Some(consumer) = &mut state.consumer else {
+            peaks.clear();
+            return Some(WaveformTimeline {
+                epoch,
+                ..WaveformTimeline::default()
+            });
+        };
+        let frames = consumer.capture.frame_range();
+        let range = visible
+            .map(|range| range.start.max(frames.start)..range.end.min(frames.end))
+            .filter(|range| !range.is_empty())
+            .unwrap_or(frames);
+        consumer.rows(rows, range, bins, peaks);
+        Some(consumer.timeline(epoch))
     }
 
 
@@ -939,6 +1107,8 @@ impl Session {
             if recording { consumer.drain(usize::MAX); }
             track_snapshots(&consumer.capture).into()
         };
+        let mask = state.consumer.as_ref()?.wav_mask();
+        let wide = state.consumer.as_ref()?.shown_wide().cloned();
         let available = snapshots.first()?.frame_range();
         let range = selected
             .clone()
@@ -966,6 +1136,8 @@ impl Session {
             snapshots,
             epoch,
             range,
+            mask,
+            wide,
             relative: first..end,
             fades,
         })
@@ -1012,17 +1184,9 @@ impl Session {
         // Pin the already displayed material before queued audio advances the
         // rolling boundary. The audio callback continues accepting packets.
         if state.editing_pending && let Some(consumer) = &state.consumer {
-            let frames = consumer.capture.frame_range();
             let editing = EditingSnapshot {
                 token: state.edit_serial,
-                timeline: Arc::new(WaveformTimeline {
-                    epoch: state.timeline_epoch,
-                    bar_markers: consumer.capture.bar_markers(frames.clone()),
-                    frames,
-                    sample_rate: consumer.sample_rate,
-                    channels: consumer.capture.track_channels(0).unwrap_or(1),
-                    b_channels: consumer.capture.track_channels(1),
-                }),
+                timeline: Arc::new(consumer.timeline(state.timeline_epoch)),
                 snapshots: track_snapshots(&consumer.capture).into(),
             };
             state.editing = Some(editing);
@@ -1048,6 +1212,9 @@ fn track_snapshots(capture: &Capture) -> Vec<FrozenTrack> {
 }
 
 struct SnapshotJob {
+    mask: u32,
+    /// The layout of a main input wider than stereo, written in the mode the settings choose.
+    wide: Option<WideLayout>,
     settings: SessionSettings,
     snapshots: Arc<[FrozenTrack]>,
     epoch: u64,
@@ -1065,16 +1232,23 @@ enum SnapshotAttempt {
 
 impl SnapshotJob {
     fn write(self) -> SnapshotResult {
-        let result = export_routed_tracks_with_fades(
+        let wide = self.wide.map(|layout| WideSave {
+            layout,
+            mode: self.settings.wide_export,
+            pair_binaural: self.settings.pair_render.binaural(),
+        });
+        let result = crate::surround::export_clip(
             &self.settings.saved_dir,
             &self.snapshots,
             self.relative,
             self.settings.wav_profile,
-            &[ChannelRoute::Merged; 2][..self.snapshots.len()],
             self.settings.force_mono,
             self.tempo,
             self.fades,
-        ).map_err(|error| error.to_string());
+            self.mask,
+            wide.as_ref(),
+        )
+        .map_err(|error| error.to_string());
         (self.epoch, self.range, result)
     }
 }
@@ -1091,6 +1265,7 @@ pub(crate) struct Worker {
     channels: usize,
     sidechain: usize,
     capacity_frames: usize,
+    labels: Vec<String>,
 }
 
 impl Worker {
@@ -1114,6 +1289,7 @@ impl Worker {
         Self::with_sidechain(session, rate, channels, 0, max_buffer)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_sidechain(
         session: Arc<Session>,
         rate: u32,
@@ -1121,7 +1297,31 @@ impl Worker {
         sidechain: usize,
         max_buffer: u32,
     ) -> Option<Self> {
-        if rate == 0 || !(1..=2).contains(&channels) || sidechain > 2 {
+        Self::with_labels(session, rate, channels, sidechain, max_buffer, Vec::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_labels(
+        session: Arc<Session>,
+        rate: u32,
+        channels: usize,
+        sidechain: usize,
+        max_buffer: u32,
+        labels: Vec<String>,
+    ) -> Option<Self> {
+        Self::with_layout(session, rate, channels, sidechain, max_buffer, labels, 0)
+    }
+
+    pub(crate) fn with_layout(
+        session: Arc<Session>,
+        rate: u32,
+        channels: usize,
+        sidechain: usize,
+        max_buffer: u32,
+        labels: Vec<String>,
+        speaker_mask: u64,
+    ) -> Option<Self> {
+        if rate == 0 || !(1..=16).contains(&channels) || sidechain > 2 {
             return None;
         }
         let (queue, capacity_frames, metadata_slots) = {
@@ -1162,6 +1362,10 @@ impl Worker {
                 routed: Vec::new(),
                 bars: Vec::new(),
                 sample_rate: rate,
+                wide: WideLayout::new(channels, &labels).map(|mut wide| {
+                    wide.speaker_mask = speaker_mask;
+                    wide
+                }),
                 main_channels: channels,
                 sidechain_channels: sidechain,
                 input,
@@ -1184,6 +1388,7 @@ impl Worker {
         let worker_sender_queue = sender_queue.clone();
         let sender_active = Arc::new(AtomicBool::new(false));
         let worker_sender_active = sender_active.clone();
+        let sender_labels = labels.clone();
         let worker_queue = queue.clone();
         let thread = match thread::Builder::new()
             .name("backtracking-capture".to_owned())
@@ -1195,6 +1400,7 @@ impl Worker {
                     channels,
                     sidechain,
                 );
+                sender.labels = sender_labels;
                 let mut pace = Pace::starting_at(Instant::now());
                 while !worker_stop.load(Ordering::Relaxed) {
                     // Blocks the host delivered since the last pass show that it is
@@ -1229,6 +1435,7 @@ impl Worker {
             channels,
             sidechain,
             capacity_frames,
+            labels,
         })
     }
 
@@ -1237,11 +1444,21 @@ impl Worker {
         self.rate
     }
 
-    pub(crate) fn matches(&self, rate: u32, channels: usize, sidechain: usize, max_buffer: u32) -> bool {
+    pub(crate) fn matches(
+        &self,
+        rate: u32,
+        channels: usize,
+        sidechain: usize,
+        max_buffer: u32,
+        labels: &[String],
+    ) -> bool {
         self.rate == rate
             && self.channels == channels
             && self.sidechain == sidechain
+            // A host may change its block size often (Nuendo's ASIO-Guard, for one). Keep the
+            // history while the queue still holds a block.
             && self.capacity_frames >= max_buffer.min(rate) as usize
+            && self.labels == labels
     }
 
     #[cfg(test)]
@@ -1300,6 +1517,7 @@ impl Worker {
 
 struct SenderWorker {
     endpoint: Option<SenderEndpoint>,
+    published_route: Option<CaptureInput>,
     retry_at: Instant,
     queue: Arc<TimedAudioQueue>,
     active: Arc<AtomicBool>,
@@ -1309,6 +1527,7 @@ struct SenderWorker {
     rate: u32,
     main: usize,
     sidechain: usize,
+    labels: Vec<String>,
     scratch: Vec<f32>,
     routed: Vec<f32>,
     bars: Vec<u32>,
@@ -1324,6 +1543,7 @@ impl SenderWorker {
     ) -> Self {
         Self {
             endpoint: None,
+            published_route: None,
             retry_at: Instant::now(),
             queue,
             active,
@@ -1332,6 +1552,7 @@ impl SenderWorker {
             pending_snapshot_epoch: None,
             rate,
             main,
+            labels: Vec::new(),
             sidechain,
             scratch: Vec::new(),
             routed: Vec::new(),
@@ -1362,6 +1583,7 @@ impl SenderWorker {
                 if settings.sender_id == preferred_id {
                     settings.sender_id = Some(endpoint.id().to_owned());
                     self.endpoint = Some(endpoint);
+                    self.published_route = None;
                     self.retry_at = Instant::now();
                 }
             }
@@ -1375,7 +1597,27 @@ impl SenderWorker {
         } else {
             (CaptureInput::Main, self.main)
         };
-        endpoint.update(&name, enabled, self.rate, channels);
+        if self.published_route == Some(route) {
+            endpoint.update(&name, enabled, self.rate, channels);
+        } else {
+            // Only a surround main input is named. The desktop app ignores names for mono and
+            // stereo, and a stereo Sender that kept FL/FR would drop its listeners each time the
+            // capture input switched between Main and Sidechain.
+            let labels = if route == CaptureInput::Main && self.main > 2 {
+                self.labels.as_slice()
+            } else {
+                &[]
+            };
+            let names: Vec<_> = labels.iter().map(String::as_str).collect();
+            if endpoint
+                .update_with_labels(&name, enabled, self.rate, channels, &names)
+                .is_err()
+            {
+                self.active.store(false, Ordering::Relaxed);
+                return;
+            }
+            self.published_route = Some(route);
+        }
         self.active.store(enabled, Ordering::Relaxed);
         if enabled {
             for _ in 0..self.queue.pending_packets().min(64) {
@@ -1492,6 +1734,167 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn wide_routes_keep_native_samples_and_share_the_history_budget() {
+        for side in 0..=2 {
+            for input in [
+                CaptureInput::Main,
+                CaptureInput::Sidechain,
+                CaptureInput::Both,
+            ] {
+                let settings = SettingsStore::default();
+                settings.lock().capture_input = input;
+                settings.lock().retention = DurationChoice::Minutes10;
+                let session = Arc::new(Session::new(settings));
+                let mut worker =
+                    Worker::with_sidechain(session.clone(), 48_000, 12, side, 512).unwrap();
+                worker.stop_background_for_test();
+                let mut main = (0..12)
+                    .map(|c| vec![(c + 1) as f32 / 16.; 128])
+                    .collect::<Vec<_>>();
+                let mut aux = vec![vec![-0.5; 128]; side];
+                worker.push_block(
+                    &main.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(),
+                    &aux.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(),
+                    None,
+                );
+                let (_, tracks) = session.positioned_snapshots(true).unwrap();
+                let main_selected = side == 0 || input != CaptureInput::Sidechain;
+                let both = side != 0 && input == CaptureInput::Both;
+                let a = if main_selected { 12 } else { side };
+                assert_eq!(tracks.len(), 1 + usize::from(both));
+                assert_eq!(tracks[0].channels(), a);
+                for (ch, sample) in tracks[0].snapshot().samples[..a].iter().enumerate() {
+                    assert_eq!(*sample, if main_selected { main[ch][0] } else { -0.5 });
+                }
+                if both {
+                    assert_eq!(tracks[1].channels(), side);
+                    assert_eq!(tracks[1].snapshot().samples, vec![-0.5; 128 * side]);
+                }
+                let state = session.lock();
+                let capture = &state.consumer.as_ref().unwrap().capture;
+                let width = a + if both { side } else { 0 };
+                assert_eq!(
+                    capture.effective_retention_frames(),
+                    (64 * 1024 * 1024 / width).min(600 * 48_000)
+                );
+            }
+        }
+        for (rate, main, side) in [(0, 12, 0), (48000, 0, 0), (48000, 17, 0), (48000, 12, 3)] {
+            assert!(
+                Worker::with_sidechain(
+                    Arc::new(Session::new(SettingsStore::default())),
+                    rate,
+                    main,
+                    side,
+                    512
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn worker_publishes_named_audio_to_a_receiver() {
+        let store = SettingsStore::default();
+        store.lock().sender_enabled = true;
+        let session = Arc::new(Session::new(store));
+        let labels = crate::surround::speaker_labels(&[0, 1, 2, 3, 4, 5, 9, 10, 12, 14, 15, 17]);
+        let worker =
+            Worker::with_labels(session.clone(), 48_000, 12, 0, 512, labels.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut receiver = loop {
+            if let Some(id) = session.settings().sender_id
+                && let Ok(receiver) = backtracking_core::SenderReceiver::connect(&id)
+            {
+                break receiver;
+            }
+            assert!(Instant::now() < deadline, "sender registration timed out");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(receiver.labels(), Some(labels.as_slice()));
+        let mut audio: Vec<_> = (0..12).map(|c| vec![c as f32 / 16.; 64]).collect();
+        let mut samples = Vec::new();
+        loop {
+            worker.push(&audio.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>());
+            if receiver
+                .packet(&mut samples, &mut Vec::new())
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "sender audio timed out");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let expected: Vec<_> = (0..12).map(|c| c as f32 / 16.).collect();
+        assert_eq!(samples, expected.repeat(64));
+    }
+
+    #[test]
+    fn a_stereo_worker_publishes_its_audio_without_names() {
+        let store = SettingsStore::default();
+        store.lock().sender_enabled = true;
+        let session = Arc::new(Session::new(store));
+        // A stereo VST3 bus is named FL and FR, as every VST3 instance is.
+        let labels = crate::surround::speaker_labels(&[0, 1]);
+        assert_eq!(labels, ["FL", "FR"]);
+        let worker = Worker::with_labels(session.clone(), 48_000, 2, 0, 512, labels).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut receiver = loop {
+            if let Some(id) = session.settings().sender_id
+                && let Ok(receiver) = backtracking_core::SenderReceiver::connect(&id)
+            {
+                break receiver;
+            }
+            assert!(Instant::now() < deadline, "sender registration timed out");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(receiver.labels(), None);
+        let mut audio = [vec![0.25; 64], vec![-0.5; 64]];
+        let mut samples = Vec::new();
+        loop {
+            worker.push(&audio.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>());
+            if receiver
+                .packet(&mut samples, &mut Vec::new())
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "sender audio timed out");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(samples, [0.25, -0.5].repeat(64));
+    }
+
+    #[test]
+    #[ignore = "release push_block timing"]
+    fn time_capture_callback() {
+        for width in [2, 12, 12, 2, 2, 12, 12, 2] {
+            let session = Arc::new(Session::new(SettingsStore::default()));
+            let mut worker = Worker::new(session.clone(), 48_000, width, 512).unwrap();
+            worker.stop_background_for_test();
+            let mut audio = vec![vec![0.25; 512]; width];
+            let channels: Vec<_> = audio.iter_mut().map(Vec::as_mut_slice).collect();
+            let mut elapsed = Duration::ZERO;
+            for batch in 0..41 {
+                let start = Instant::now();
+                for _ in 0..128 {
+                    worker.push(&channels);
+                }
+                if batch != 0 {
+                    elapsed += start.elapsed();
+                }
+                session.lock().consumer.as_mut().unwrap().discard();
+            }
+            assert_eq!(session.dropped_frames(), 0);
+            println!(
+                "{width} channels {:.3} us/block",
+                elapsed.as_secs_f64() * 1e6 / (40. * 128.)
+            );
+        }
+    }
     #[test]
     fn split_and_merged_waveforms_preserve_the_same_stereo_capture() {
         let session = Arc::new(Session::new(SettingsStore::default()));

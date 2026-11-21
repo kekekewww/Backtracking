@@ -156,6 +156,7 @@ impl SnapshotRef {
 pub struct Preview {
     lanes: Vec<(Source, Placement)>,
     wide: Option<WideRender>,
+    native_layout: Option<u64>,
     /// The selection on the retained-audio timeline.
     frames: Range<u64>,
     sample_rate: u32,
@@ -249,6 +250,7 @@ impl Preview {
         Some(Self {
             lanes,
             wide,
+            native_layout: None,
             frames,
             sample_rate,
             next: AtomicU64::new(0),
@@ -327,17 +329,84 @@ impl Preview {
     /// Renders up to `frames` stereo frames and hands each to `emit` with its index. Returns how
     /// many it rendered: fewer than asked once the selection or the stop ramp runs out.
     /// One thread renders a preview; others only read its position or change its settings.
-    pub fn render_with(&self, frames: usize, emit: impl FnMut(usize, [f32; 2])) -> usize {
+    pub fn render_with(&self, frames: usize, mut emit: impl FnMut(usize, [f32; 2])) -> usize {
+        self.render_frames(frames, false, |index, pair, _, gain| {
+            emit(index, [pair[0] * gain, pair[1] * gain]);
+        })
+    }
+
+    /// Builds a preview of a complete wide main track and an optional narrow companion.
+    /// On a matching bus the main plays in channel order. Other outputs get the pair
+    /// prepared with `model`, just as in [`Preview::with_channels`]. The caller supplies
+    /// the same layout identifier for equivalent speaker orders (zero for an unnamed bus).
+    pub fn for_bus(
+        lanes: &[PreviewLane<'_>],
+        frames: Range<u64>,
+        layout: u64,
+        model: Option<std::sync::Arc<crate::spatial::HeadModel>>,
+        force_mono: bool,
+        fades: Fades,
+    ) -> Option<Self> {
+        let main = lanes.first()?;
+        let width = main.track.channels();
+        if width <= 2
+            || main.selected.is_some()
+            || main.group?.channels() != (0..width)
+            || lanes.get(1).is_some_and(|side| side.track.channels() > 2)
+        {
+            return None;
+        }
+        let mut preview = Self::with_channels(lanes, frames, model, force_mono, fades)?;
+        preview.native_layout = Some(layout);
+        Some(preview)
+    }
+
+    /// Adds preview samples via `emit(frame, channel, sample)`. The caller mixes these
+    /// into its output. Mono hears the average of the pair. An empty bus consumes no frames.
+    pub fn render_channels_with(
+        &self,
+        frames: usize,
+        channels: usize,
+        layout: u64,
+        mut emit: impl FnMut(usize, usize, f32),
+    ) -> usize {
+        if channels == 0 {
+            return 0;
+        }
+        let native = self.native_layout == Some(layout) && channels == self.lanes[0].0.channels();
+        self.render_frames(frames, native, |index, [left, right], main, gain| {
+            if !main.is_empty() {
+                emit(index, 0, (main[0] + left) * gain);
+                emit(index, 1, (main[1] + right) * gain);
+                for (channel, sample) in main.iter().enumerate().skip(2) {
+                    emit(index, channel, sample * gain);
+                }
+            } else if channels == 1 {
+                emit(index, 0, (left * gain + right * gain) * 0.5);
+            } else {
+                emit(index, 0, left * gain);
+                emit(index, 1, right * gain);
+            }
+        })
+    }
+
+    fn render_frames(
+        &self,
+        frames: usize,
+        native: bool,
+        emit: impl FnMut(usize, [f32; 2], &[f32], f32),
+    ) -> usize {
         match &self.wide {
-            Some(wide) => wide.render(|lanes| self.render_blocks(frames, emit, lanes)),
-            None => self.render_blocks(frames, emit, &mut []),
+            Some(wide) => wide.render(|lanes| self.render_blocks(frames, native, emit, lanes)),
+            None => self.render_blocks(frames, false, emit, &mut []),
         }
     }
 
     fn render_blocks(
         &self,
         frames: usize,
-        mut emit: impl FnMut(usize, [f32; 2]),
+        native: bool,
+        mut emit: impl FnMut(usize, [f32; 2], &[f32], f32),
         wide: &mut [selected::WideLane],
     ) -> usize {
         let length = self.len();
@@ -362,7 +431,11 @@ impl Preview {
             let mut mixed = [[0.0f32; 2]; BLOCK];
             for (source, placement) in &self.lanes {
                 if let Placement::Wide(index) = placement {
-                    wide[*index].mix(source, self.frames.start + position, &mut mixed[..count]);
+                    if native {
+                        wide[*index].read(source, self.frames.start + position, count);
+                    } else {
+                        wide[*index].mix(source, self.frames.start + position, &mut mixed[..count]);
+                    }
                     continue;
                 }
                 let mut read = [0.0f32; BLOCK * 2];
@@ -384,7 +457,12 @@ impl Preview {
                 if index >= stopped_at {
                     gain *= (stopped_at + ramp - 1 - index) as f32 / ramp as f32;
                 }
-                emit(written + offset, [left * gain, right * gain]);
+                let main = if native {
+                    wide[0].frame(offset, self.lanes[0].0.channels())
+                } else {
+                    &[]
+                };
+                emit(written + offset, [left, right], main, gain);
             }
             position += count as u64;
             written += count;

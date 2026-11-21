@@ -1,7 +1,7 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,6 +10,8 @@ const EXPIRES: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_CLIENTS: usize = 16;
 const MAX_CHANNELS: usize = 64;
+const MAX_LABEL_BYTES: usize = 128;
+const MAX_LABEL_FILE_BYTES: usize = 32 + MAX_CHANNELS * (MAX_LABEL_BYTES + 1);
 const MAX_FRAMES: usize = 8192;
 const MAX_SAMPLES: usize = 65_536;
 const MAX_MARKERS: usize = MAX_FRAMES;
@@ -37,6 +39,7 @@ pub struct SenderEndpoint {
     id: String,
     listener: TcpListener,
     registration: Option<(String, bool, u32, usize)>,
+    labels: Vec<String>,
     heartbeat_at: Instant,
     pending: Vec<PendingClient>,
     clients: Vec<Client>,
@@ -112,8 +115,7 @@ impl SenderEndpoint {
     pub fn with_id(preferred: &str) -> io::Result<Self> {
         let directory = sender_directory()?;
         create_sender_directory(&directory)?;
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        listener.set_nonblocking(true)?;
+        let listener = bind_listener()?;
         let id = if valid_id(preferred) && reserve_id(preferred).is_ok() {
             preferred.to_owned()
         } else {
@@ -121,10 +123,12 @@ impl SenderEndpoint {
             reserve_id(&id)?;
             id
         };
+        let _ = fs::remove_file(registration_path(&id)?.with_extension("labels"));
         Ok(Self {
             id,
             listener,
             registration: None,
+            labels: Vec::new(),
             heartbeat_at: Instant::now(),
             pending: Vec::new(),
             clients: Vec::new(),
@@ -138,6 +142,87 @@ impl SenderEndpoint {
     }
 
     pub fn update(&mut self, name: &str, sender_enabled: bool, sample_rate: u32, channels: usize) {
+        let _ = self.maintain_registration(name, sender_enabled, sample_rate, channels);
+    }
+
+    /// Publishes one speaker label per channel in audio stream order. Use names recognized by
+    /// `speaker_directions`, such as `FL`, `FR`, `FC`, `LFE`, `Ls`, `Rs`, `Lb`, `Rb`, `TFL`,
+    /// `TFR`, `TBL` and `TBR`. Unknown names are allowed and have no direction.
+    ///
+    /// Labels must contain a non-whitespace character, have at most 128 UTF-8 bytes, and contain
+    /// no control characters. An empty list, wrong count, or invalid label clears all labels.
+    /// `update` and `publish` keep these labels until the rate or channel count changes. Changing
+    /// the labels disconnects audio clients so they can reconnect with the new layout.
+    pub fn update_with_labels(
+        &mut self,
+        name: &str,
+        sender_enabled: bool,
+        sample_rate: u32,
+        channels: usize,
+        labels: &[&str],
+    ) -> io::Result<()> {
+        let labels = if labels.len() == channels
+            && channels <= MAX_CHANNELS
+            && labels.iter().all(|label| valid_label(label))
+        {
+            labels
+        } else {
+            &[]
+        };
+        if !self
+            .labels
+            .iter()
+            .map(String::as_str)
+            .eq(labels.iter().copied())
+            || (!labels.is_empty() && self.format_changed(sample_rate, channels))
+        {
+            // The port identifies the label layout. A connection racing the update cannot
+            // receive new audio using the old registration or an old queued handshake.
+            self.listener = bind_listener()?;
+            self.pending.clear();
+            self.clients.clear();
+            self.labels = labels.iter().map(|label| (*label).to_owned()).collect();
+            self.registration = None;
+            if labels.is_empty() {
+                let _ = fs::remove_file(registration_path(&self.id)?.with_extension("labels"));
+            }
+        }
+        self.refresh_registration(name, sender_enabled, sample_rate, channels)
+    }
+
+    fn format_changed(&self, rate: u32, channels: usize) -> bool {
+        self.registration
+            .as_ref()
+            .is_some_and(|(_, _, old_rate, old_channels)| {
+                *old_rate != rate || *old_channels != channels
+            })
+    }
+
+    fn maintain_registration(
+        &mut self,
+        name: &str,
+        enabled: bool,
+        rate: u32,
+        channels: usize,
+    ) -> io::Result<()> {
+        if !self.labels.is_empty() && self.format_changed(rate, channels) {
+            return self.update_with_labels(name, enabled, rate, channels, &[]);
+        }
+        let result = self.refresh_registration(name, enabled, rate, channels);
+        if self.labels.is_empty() {
+            Ok(())
+        } else {
+            result
+        }
+    }
+
+    fn refresh_registration(
+        &mut self,
+        name: &str,
+        sender_enabled: bool,
+        sample_rate: u32,
+        channels: usize,
+    ) -> io::Result<()> {
         let name = name.trim();
         let name = if name.is_empty() {
             "Backtracking"
@@ -164,23 +249,32 @@ impl SenderEndpoint {
             {
                 self.clients.clear();
             }
-            let _ = self.register(name, sender_enabled, sample_rate, channels);
+            let result = self.register(name, sender_enabled, sample_rate, channels);
             self.registration = Some((name.to_owned(), sender_enabled, sample_rate, channels));
-            self.heartbeat_at = now + HEARTBEAT;
+            self.heartbeat_at = if result.is_ok() { now + HEARTBEAT } else { now };
+            self.service(sender_enabled);
+            return result;
         }
         self.service(sender_enabled);
+        Ok(())
     }
 
     fn register(&self, name: &str, enabled: bool, rate: u32, channels: usize) -> io::Result<()> {
         let path = registration_path(&self.id)?;
-        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         let name: String = name.chars().filter(|c| !c.is_control()).take(120).collect();
         let port = self.listener.local_addr()?.port();
-        fs::write(
-            &temporary,
-            format!("{port}\t{}\t{rate}\t{channels}\t{name}", u8::from(enabled)),
-        )?;
-        fs::rename(temporary, path)
+        if !self.labels.is_empty() {
+            let mut contents = format!("BTL1\t{port}\t{rate}\t{channels}\n");
+            for label in &self.labels {
+                contents.push_str(label);
+                contents.push('\n');
+            }
+            write_atomic(&path.with_extension("labels"), &contents)?;
+        }
+        write_atomic(
+            &path,
+            &format!("{port}\t{}\t{rate}\t{channels}\t{name}", u8::from(enabled)),
+        )
     }
 
     fn service(&mut self, audio_enabled: bool) {
@@ -271,7 +365,7 @@ impl SenderEndpoint {
         {
             return Err(invalid("invalid Sender audio format"));
         }
-        self.update(name, true, sample_rate, channels);
+        self.maintain_registration(name, true, sample_rate, channels)?;
         if self.clients.is_empty() {
             return Ok(());
         }
@@ -309,6 +403,7 @@ impl SenderEndpoint {
 impl Drop for SenderEndpoint {
     fn drop(&mut self) {
         if let Ok(path) = registration_path(&self.id) {
+            let _ = fs::remove_file(path.with_extension("labels"));
             let _ = fs::remove_file(path);
         }
     }
@@ -323,6 +418,7 @@ pub struct SenderPacket {
 
 pub struct SenderReceiver {
     pub info: SenderInfo,
+    labels: Option<Vec<String>>,
     stream: TcpStream,
     pending: Vec<u8>,
     offset: usize,
@@ -334,15 +430,22 @@ impl SenderReceiver {
         let registration = read_registration(id)
             .filter(|entry| entry.audio_enabled)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Sender is unavailable"))?;
+        let labels = read_labels(&registration);
         let stream = connect(&registration, b'A')?;
         stream.set_nonblocking(true)?;
         Ok(Self {
             info: registration.info,
+            labels,
             stream,
             pending: Vec::new(),
             offset: 0,
             eof: false,
         })
+    }
+
+    /// Speaker labels in stream order, if the Sender published a matching label file.
+    pub fn labels(&self) -> Option<&[String]> {
+        self.labels.as_deref()
     }
 
     pub fn packet(
@@ -513,6 +616,58 @@ fn read_registration(id: &str) -> Option<Registration> {
         port,
         audio_enabled,
     })
+}
+
+fn read_labels(registration: &Registration) -> Option<Vec<String>> {
+    let path = registration_path(&registration.info.id)
+        .ok()?
+        .with_extension("labels");
+    let file = File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if metadata.modified().ok()?.elapsed().unwrap_or_default() >= EXPIRES {
+        return None;
+    }
+    let mut contents = String::new();
+    file.take(MAX_LABEL_FILE_BYTES as u64 + 1)
+        .read_to_string(&mut contents)
+        .ok()?;
+    if contents.len() > MAX_LABEL_FILE_BYTES {
+        return None;
+    }
+    let mut lines = contents.strip_suffix('\n')?.split('\n');
+    let mut header = lines.next()?.split('\t');
+    if header.next()? != "BTL1"
+        || header.next()?.parse::<u16>().ok()? != registration.port
+        || header.next()?.parse::<u32>().ok()? != registration.info.sample_rate
+        || header.next()?.parse::<usize>().ok()? != registration.info.channels
+        || header.next().is_some()
+    {
+        return None;
+    }
+    let labels: Vec<_> = lines.collect();
+    (labels.len() == registration.info.channels && labels.iter().all(|label| valid_label(label)))
+        .then(|| labels.into_iter().map(str::to_owned).collect())
+}
+
+fn valid_label(label: &str) -> bool {
+    label.len() <= MAX_LABEL_BYTES
+        && !label.trim().is_empty()
+        && !label.chars().any(char::is_control)
+}
+
+fn bind_listener() -> io::Result<TcpListener> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let result = fs::write(&temporary, contents).and_then(|()| fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 fn valid_format(rate: u32, channels: usize) -> bool {
@@ -704,6 +859,160 @@ mod tests {
         (endpoint, receiver)
     }
 
+    // The released registration parser reads the whole last field as the Sender name.
+    fn read_old_registration(id: &str) -> Option<Registration> {
+        let path = registration_path(id).ok()?;
+        let metadata = path.metadata().ok()?;
+        if metadata.len() > 1024
+            || metadata.modified().ok()?.elapsed().unwrap_or_default() >= EXPIRES
+        {
+            return None;
+        }
+        let text = fs::read_to_string(path).ok()?;
+        let mut parts = text.splitn(5, '\t');
+        let port = parts.next()?.parse().ok()?;
+        let audio_enabled = match parts.next()? {
+            "1" => true,
+            "0" => false,
+            _ => return None,
+        };
+        let sample_rate = parts.next()?.parse().ok()?;
+        let channels = parts.next()?.parse().ok()?;
+        let name = parts.next()?.to_owned();
+        if !valid_format(sample_rate, channels) || port == 0 {
+            return None;
+        }
+        Some(Registration {
+            info: SenderInfo {
+                id: id.to_owned(),
+                name,
+                sample_rate,
+                channels,
+            },
+            port,
+            audio_enabled,
+        })
+    }
+
+    #[test]
+    fn labels_round_trip_and_leave_the_released_registration_intact() {
+        let _directory = TestDirectory::new();
+        let mut endpoint = SenderEndpoint::new().unwrap();
+        let label = "é".repeat(64);
+        let labels = [label.as_str(); 64];
+        let id = endpoint.id().to_owned();
+        endpoint
+            .update_with_labels("Surround Tone 🎵", true, 48_000, labels.len(), &labels)
+            .unwrap();
+        let receiver = SenderReceiver::connect(&id).unwrap();
+        assert_eq!(receiver.labels().unwrap(), labels);
+        let old = read_old_registration(&id).unwrap();
+        assert_eq!(old.info.name, "Surround Tone 🎵");
+        assert_eq!(old.info.sample_rate, 48_000);
+        assert_eq!(old.info.channels, 64);
+        assert_eq!(old.info, receiver.info);
+        let path = registration_path(&id).unwrap().with_extension("labels");
+        assert!(path.metadata().unwrap().len() > 1024);
+        drop(endpoint);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn absent_invalid_and_stale_label_files_are_ignored() {
+        let _directory = TestDirectory::new();
+        let mut endpoint = SenderEndpoint::new().unwrap();
+        endpoint.update("Stereo", true, 48_000, 2);
+        let id = endpoint.id();
+        let registration = read_registration(id).unwrap();
+        let port = registration.port;
+        let path = registration_path(id).unwrap().with_extension("labels");
+        assert!(!path.exists());
+        assert!(SenderReceiver::connect(id).unwrap().labels().is_none());
+        for bad_file in [
+            format!("BTL1\t{port}\t48000\t2\nFL\n"),
+            format!("BTL1\t{port}\t48000\t2\nFL\nF\tR\n"),
+            "BTL1\t0\t48000\t2\nFL\nFR\n".to_owned(),
+        ] {
+            fs::write(&path, bad_file).unwrap();
+            assert!(SenderReceiver::connect(id).unwrap().labels().is_none());
+        }
+        fs::write(&path, format!("BTL1\t{port}\t48000\t2\nFL\nFR\n")).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - EXPIRES)
+            .unwrap();
+        assert!(SenderReceiver::connect(id).unwrap().labels().is_none());
+    }
+
+    #[test]
+    fn replacing_labels_at_the_same_width_disconnects_existing_and_queued_clients() {
+        let _directory = TestDirectory::new();
+        let mut endpoint = SenderEndpoint::new().unwrap();
+        let old = [
+            "FL", "FR", "FC", "LFE", "Ls", "Rs", "TFL", "TFR", "TBL", "TBR",
+        ];
+        let new = [
+            "FL", "FR", "FC", "LFE", "Lb", "Rb", "Ls", "Rs", "TFL", "TFR",
+        ];
+        endpoint
+            .update_with_labels("Bus", true, 48_000, 10, &old)
+            .unwrap();
+        let mut receiver = SenderReceiver::connect(endpoint.id()).unwrap();
+        assert_eq!(receiver.labels().unwrap(), old);
+        endpoint.publish("Bus", 48_000, 10, 0, &[], &[]).unwrap();
+        assert_eq!(endpoint.clients.len(), 1);
+        let queued = SenderReceiver::connect(endpoint.id()).unwrap();
+        endpoint
+            .update_with_labels("Bus", true, 48_000, 10, &new)
+            .unwrap();
+        assert!(endpoint.clients.is_empty());
+        let mut next = SenderReceiver::connect(endpoint.id()).unwrap();
+        assert_eq!(next.labels().unwrap(), new);
+        endpoint
+            .publish("Bus", 48_000, 10, 0, &[0.5; 10], &[])
+            .unwrap();
+        assert_eq!(endpoint.clients.len(), 1);
+        assert_eq!(queued.labels().unwrap(), old);
+        let mut samples = Vec::new();
+        let mut markers = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match receiver.packet(&mut samples, &mut markers) {
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Ok(None) if Instant::now() < deadline => std::thread::yield_now(),
+                other => panic!("expected the old connection to close: {other:?}"),
+            }
+        }
+        while next.packet(&mut samples, &mut markers).unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "expected audio on the new connection"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(samples, [0.5; 10]);
+        assert_eq!(
+            SenderReceiver::connect(endpoint.id())
+                .unwrap()
+                .labels()
+                .unwrap(),
+            new
+        );
+        endpoint
+            .update_with_labels("Bus", true, 48_000, 10, &["Invalid count"])
+            .unwrap();
+        assert!(SenderReceiver::connect(endpoint.id())
+            .unwrap()
+            .labels()
+            .is_none());
+        assert!(!registration_path(endpoint.id())
+            .unwrap()
+            .with_extension("labels")
+            .exists());
+    }
+
     fn round_trip_channels(channels: usize) {
         let _directory = TestDirectory::new();
         let (mut endpoint, mut receiver) = connected_sender(channels);
@@ -802,6 +1111,7 @@ mod tests {
                 sample_rate: 48_000,
                 channels: 1,
             },
+            labels: None,
             stream,
             pending: Vec::new(),
             offset: 0,
