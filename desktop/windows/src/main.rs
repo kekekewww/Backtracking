@@ -18,6 +18,8 @@ mod data_paths;
 #[cfg(target_os = "windows")]
 mod file_drag;
 #[cfg(target_os = "windows")]
+mod hotkeys;
+#[cfg(target_os = "windows")]
 mod lane_key;
 #[cfg(target_os = "windows")]
 mod loopback;

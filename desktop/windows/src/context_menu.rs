@@ -14,6 +14,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
+use crate::hotkeys::Action;
+
 /// An everyday action that the menu, the keyboard and the toolbar all run the same way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WindowCommand {
@@ -28,20 +30,34 @@ pub(crate) enum WindowCommand {
 }
 
 impl WindowCommand {
-    /// The key that runs this command while the recorder window has keyboard focus.
-    pub(crate) fn shortcut(self) -> Option<&'static str> {
+    /// The shortcut action that runs this command while the recorder window has keyboard focus.
+    pub(crate) fn action(self) -> Action {
         match self {
-            Self::ToggleCapture => Some("Space"),
-            Self::Clear => Some("Delete"),
-            // A tap, on its own; see `lane_key`. It turns "Edit separately" on and off.
-            Self::SeparateLanes => Some("Right Ctrl"),
-            // Saving has the global shortcut only; the Options window names its key.
-            Self::SaveSnapshot
-            | Self::WaveformOnly
-            | Self::KeepOnTop
-            | Self::Options
-            | Self::Quit => None,
+            Self::ToggleCapture => Action::ToggleCapture,
+            Self::Clear => Action::Clear,
+            Self::SaveSnapshot => Action::SaveSnapshot,
+            Self::SeparateLanes => Action::SeparateLanes,
+            Self::WaveformOnly => Action::WaveformOnly,
+            Self::KeepOnTop => Action::KeepOnTop,
+            Self::Options => Action::OpenOptions,
+            Self::Quit => Action::Quit,
         }
+    }
+
+    /// The command a shortcut of the recorder window runs. Cancelling a selection is no command:
+    /// it works only while there is one. The system-wide save is not the window's.
+    pub(crate) fn for_action(action: Action) -> Option<Self> {
+        Some(match action {
+            Action::ToggleCapture => Self::ToggleCapture,
+            Action::Clear => Self::Clear,
+            Action::SaveSnapshot => Self::SaveSnapshot,
+            Action::SeparateLanes => Self::SeparateLanes,
+            Action::WaveformOnly => Self::WaveformOnly,
+            Action::KeepOnTop => Self::KeepOnTop,
+            Action::OpenOptions => Self::Options,
+            Action::Quit => Self::Quit,
+            Action::SaveSnapshotGlobal | Action::CancelSelection => return None,
+        })
     }
 }
 
@@ -77,12 +93,14 @@ pub(crate) struct State {
     pub(crate) separate_label: &'static str,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Entry {
     Separator,
     Item {
         command: WindowCommand,
         label: &'static str,
+        /// The key that runs the command, as the Hotkeys page names it; none when unbound.
+        shortcut: Option<String>,
         checked: bool,
         enabled: bool,
     },
@@ -91,20 +109,28 @@ pub(crate) enum Entry {
 impl Entry {
     /// The native menu text. A tab right-aligns the shortcut, as in any Windows menu.
     fn text(&self) -> Option<String> {
-        let Self::Item { command, label, .. } = self else {
+        let Self::Item {
+            label, shortcut, ..
+        } = self
+        else {
             return None;
         };
-        Some(match command.shortcut() {
+        Some(match shortcut {
             Some(shortcut) => format!("{label}\t{shortcut}"),
             None => (*label).to_owned(),
         })
     }
 }
 
-pub(crate) fn entries(state: State) -> Vec<Entry> {
+/// `shortcut` names the current key of a command, if it has one.
+pub(crate) fn entries(
+    state: State,
+    shortcut: impl Fn(WindowCommand) -> Option<String>,
+) -> Vec<Entry> {
     let item = |command, label, checked, enabled| Entry::Item {
         command,
         label,
+        shortcut: shortcut(command),
         checked,
         enabled,
     };
@@ -222,7 +248,8 @@ pub(crate) fn show(window: &Window, entries: &[Entry]) -> Option<WindowCommand> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Entry, State, Transport, WindowCommand};
+    use crate::hotkeys::{Action, Hotkeys};
 
     fn state() -> State {
         State {
@@ -236,6 +263,28 @@ mod tests {
         }
     }
 
+    /// Names each command's first binding. The recorder window names them through the Hotkeys
+    /// page (`ui::menu_entries`), which its own tests check.
+    fn shortcuts(hotkeys: &Hotkeys) -> impl Fn(WindowCommand) -> Option<String> + '_ {
+        |command| {
+            hotkeys
+                .bindings(command.action())
+                .first()
+                .map(ToString::to_string)
+        }
+    }
+
+    fn entries(state: State) -> Vec<Entry> {
+        super::entries(state, shortcuts(&Hotkeys::defaults()))
+    }
+
+    fn texts(entries: &[Entry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| entry.text().unwrap_or_else(|| "-".into()))
+            .collect()
+    }
+
     fn item(entries: &[Entry], wanted: WindowCommand) -> (&'static str, bool, bool) {
         entries
             .iter()
@@ -245,6 +294,7 @@ mod tests {
                     label,
                     checked,
                     enabled,
+                    ..
                 } if *command == wanted => Some((*label, *checked, *enabled)),
                 _ => None,
             })
@@ -253,12 +303,8 @@ mod tests {
 
     #[test]
     fn menu_lists_everyday_commands_in_order_with_their_shortcuts() {
-        let texts: Vec<_> = entries(state())
-            .iter()
-            .map(|entry| entry.text().unwrap_or_else(|| "-".into()))
-            .collect();
         assert_eq!(
-            texts,
+            texts(&entries(state())),
             [
                 "Pause\tSpace",
                 "Clear\tDelete",
@@ -272,6 +318,24 @@ mod tests {
                 "Quit",
             ]
         );
+    }
+
+    #[test]
+    fn every_command_has_its_action_and_back() {
+        for command in [
+            WindowCommand::ToggleCapture,
+            WindowCommand::Clear,
+            WindowCommand::SaveSnapshot,
+            WindowCommand::SeparateLanes,
+            WindowCommand::WaveformOnly,
+            WindowCommand::KeepOnTop,
+            WindowCommand::Options,
+            WindowCommand::Quit,
+        ] {
+            assert_eq!(WindowCommand::for_action(command.action()), Some(command));
+        }
+        assert_eq!(WindowCommand::for_action(Action::CancelSelection), None);
+        assert_eq!(WindowCommand::for_action(Action::SaveSnapshotGlobal), None);
     }
 
     #[test]

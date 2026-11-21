@@ -987,7 +987,9 @@ mod tests {
         wait_for(&handle, |snapshot| {
             snapshot.addons[0].sources[0].name == "Updated source"
         });
-        assert!(callbacks.load(Ordering::Relaxed) > 0);
+        // Callbacks run after the new snapshot is stored and its lock let go, so the
+        // snapshot can be seen a moment before any callback has run.
+        wait_for(&handle, |_| callbacks.load(Ordering::Relaxed) > 0);
         first_reply.send(Ok(())).unwrap();
         first.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
         let Command::Enabled(_, true, second_reply) =

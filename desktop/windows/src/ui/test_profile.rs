@@ -104,6 +104,7 @@ fn preference_key(name: &str) -> Option<Key> {
         "keep-quiet-sections" => Key::RetainSilence,
         "hide-silent-channels" => Key::HideSilentChannels,
         "multichannel-pair-render" => Key::PairRender,
+        "hotkeys-v1" => Key::Hotkeys,
         "addon-look" => Key::AddonLook,
         _ => return None,
     })

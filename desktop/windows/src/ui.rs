@@ -14,6 +14,7 @@ use crate::controller::{
     SourceSettings,
 };
 use crate::file_drag;
+use crate::hotkeys::{Action, Binding, Hotkeys, Modifiers, Scope};
 use crate::lane_key;
 use crate::playback::PreviewPlayer;
 use crate::preferences::{
@@ -66,6 +67,7 @@ use winit::{
 mod addon_sources;
 mod addons_page;
 mod harness;
+mod hotkeys_page;
 mod look;
 #[cfg(test)]
 mod test_profile;
@@ -73,6 +75,7 @@ mod text;
 
 use addon_sources::AddonSources;
 use addons_page::{AddonsPage, PageRequest};
+use hotkeys_page::HotkeysPage;
 use look::AddonLook;
 use text::Language;
 
@@ -317,7 +320,10 @@ pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
             // A test copy leaves the shortcut, the tray, the startup entry and updates to the
             // installed app.
             if primary && !test_copy {
-                match SnapshotHotkey::start(context.egui_ctx.clone()) {
+                // Only the saved chords are registered, so a default the user moved or cleared
+                // is never taken from other apps, not even for a moment.
+                let initial = recorder.hotkeys.global_bindings();
+                match SnapshotHotkey::start_with(context.egui_ctx.clone(), initial) {
                     Ok(hotkey) => recorder.hotkey = Some(hotkey),
                     Err(error) => recorder.hotkey_error = Some(error.to_string()),
                 }
@@ -595,6 +601,10 @@ struct Recorder {
     pending_snapshot_saves: VecDeque<WavClip>,
     hotkey: Option<SnapshotHotkey>,
     hotkey_error: Option<String>,
+    /// The keyboard shortcuts this window runs and the system-wide one, as the Hotkeys page
+    /// sets them.
+    hotkeys: Hotkeys,
+    hotkeys_page: HotkeysPage,
     snapshot_target: Option<String>,
     snapshot_targets: Vec<backtracking_core::SenderInfo>,
     snapshot_target_scan: Instant,
@@ -637,6 +647,7 @@ enum Gesture {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum OptionsSection {
     Actions,
+    Hotkeys,
     Capture,
     Sources,
     Appearance,
@@ -646,9 +657,10 @@ enum OptionsSection {
 }
 
 impl OptionsSection {
-    const ALL: [(Self, &'static str); 7] = [
+    const ALL: [(Self, &'static str); 8] = [
         // One short word each, so the list never wraps and a page is easy to name.
         (Self::Actions, "Actions"),
+        (Self::Hotkeys, "Hotkeys"),
         (Self::Capture, "Capture"),
         (Self::Sources, "Sources"),
         (Self::Appearance, "Appearance"),
@@ -658,9 +670,12 @@ impl OptionsSection {
     ];
 
     fn title(self) -> &'static str {
-        // The Add-ons page is the first one written in both languages (see `text`).
+        // The Add-ons and Hotkeys pages are written in both languages (see `text`).
         if self == Self::Addons {
             return Language::current().addons_section();
+        }
+        if self == Self::Hotkeys {
+            return Language::current().hotkeys_section();
         }
         Self::ALL
             .iter()
@@ -776,24 +791,78 @@ fn compact_status_text(state: &str, problem: Option<&str>, message: &str) -> Str
     parts.join(" · ")
 }
 
-/// The recorder window's own keys. Held keys do not repeat a command.
-fn window_shortcut(events: &[egui::Event]) -> Option<WindowCommand> {
+/// The recorder window's own keys, as the Hotkeys page binds them: the full chord has to match.
+/// Held keys do not repeat a command. Cancelling a selection is not here; see `is_cancel_key`.
+fn window_shortcut(events: &[egui::Event], hotkeys: &Hotkeys) -> Option<WindowCommand> {
     events.iter().find_map(|event| {
-        let egui::Event::Key {
-            key,
-            pressed: true,
-            repeat: false,
-            modifiers,
-            ..
-        } = event
-        else {
-            return None;
-        };
-        match key {
-            egui::Key::Space if modifiers.is_none() => Some(WindowCommand::ToggleCapture),
-            egui::Key::Delete if modifiers.is_none() => Some(WindowCommand::Clear),
-            _ => None,
-        }
+        let (modifiers, key) = hotkeys_page::pressed_chord(event)?;
+        WindowCommand::for_action(hotkeys.find(Scope::Window, modifiers, key)?)
+    })
+}
+
+/// A key that cancels the selection or gesture under way. A binding without modifiers takes the
+/// key with any held, as Escape and Backspace always have: Shift is often still down from a
+/// snapped selection. Repeats count; there is nothing left to cancel after the first.
+fn is_cancel_key(event: &egui::Event, hotkeys: &Hotkeys) -> bool {
+    let egui::Event::Key {
+        key,
+        physical_key,
+        pressed: true,
+        modifiers,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    let Some(key) = hotkeys_page::shortcut_key(*key, *physical_key) else {
+        return false;
+    };
+    let held = hotkeys_page::shortcut_modifiers(*modifiers);
+    hotkeys
+        .bindings(Action::CancelSelection)
+        .iter()
+        .any(|binding| match *binding {
+            Binding::Chord {
+                key: bound,
+                modifiers,
+            } => bound == key && (modifiers == Modifiers::NONE || modifiers == held),
+            Binding::RightCtrlTap => false,
+        })
+}
+
+/// What a window command from a key or the Right Ctrl tap does, given whether a selection is on
+/// screen. The menu and the toolbar run their commands as they are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyEffect {
+    Run(WindowCommand),
+    /// The pause key with a selection plays it or stops it.
+    TogglePreview,
+    /// The clear key with a selection drops the selection; wiping the capture takes a second
+    /// press.
+    CancelSelection,
+}
+
+fn key_effect(command: WindowCommand, has_selection: bool) -> KeyEffect {
+    match command {
+        WindowCommand::Clear if has_selection => KeyEffect::CancelSelection,
+        WindowCommand::ToggleCapture if has_selection => KeyEffect::TogglePreview,
+        command => KeyEffect::Run(command),
+    }
+}
+
+/// The command a tap of Right Ctrl runs, if the Hotkeys page gave it one.
+fn tap_command(hotkeys: &Hotkeys) -> Option<WindowCommand> {
+    WindowCommand::for_action(hotkeys.find_binding(Scope::Window, Binding::RightCtrlTap)?)
+}
+
+/// The right-click menu, each item naming its command's first key as the Hotkeys page does.
+fn menu_entries(
+    state: context_menu::State,
+    language: Language,
+    hotkeys: &Hotkeys,
+) -> Vec<context_menu::Entry> {
+    context_menu::entries(state, |command| {
+        hotkeys_page::shortcut_label(language, hotkeys, command.action())
     })
 }
 
@@ -2535,6 +2604,8 @@ impl Recorder {
             pending_snapshot_saves: VecDeque::new(),
             hotkey: None,
             hotkey_error: None,
+            hotkeys: settings.hotkeys,
+            hotkeys_page: HotkeysPage::default(),
             snapshot_target: settings.snapshot_target,
             snapshot_targets: Vec::new(),
             snapshot_target_scan: Instant::now(),
@@ -2547,6 +2618,11 @@ impl Recorder {
             auto_grow: true,
             harness: None,
         }
+    }
+
+    /// Keeps what the Hotkeys page changed. It is in use already.
+    fn save_hotkeys(&mut self) {
+        self.save_preference(Key::Hotkeys, self.hotkeys.to_json());
     }
 
     fn save_preference(&mut self, key: Key, value: impl AsRef<str>) {
@@ -4140,7 +4216,8 @@ impl Recorder {
             self.open_options(ctx);
             return;
         };
-        let command = context_menu::show(window, &context_menu::entries(self.menu_state()));
+        let entries = menu_entries(self.menu_state(), Language::current(), &self.hotkeys);
+        let command = context_menu::show(window, &entries);
         // The menu ran its own message loop. Time spent reading it is not idle time.
         self.last_interaction = Instant::now();
         if let Some(command) = command {
@@ -4385,6 +4462,21 @@ impl Recorder {
             if ui.input(|input| input.viewport().close_requested()) {
                 return Some(OptionsAction::Close);
             }
+            // A row of the Hotkeys page that records takes every key, Escape included, before
+            // a button or the window can act on it.
+            if self.hotkeys_page.is_recording()
+                && let Some(recorded) = ui
+                    .ctx()
+                    .input_mut(|input| hotkeys_page::take_recorded(&mut input.events))
+            {
+                let global = hotkeys_page::global(self.hotkey.as_ref());
+                if self
+                    .hotkeys_page
+                    .recorded(recorded, &mut self.hotkeys, global)
+                {
+                    self.save_hotkeys();
+                }
+            }
             // Escape closes an open add-on question first, and leaves a text field alone.
             // Otherwise it closes the window unless it is closing a drop-down or a colour picker.
             if !egui::Popup::is_any_open(ui.ctx())
@@ -4516,6 +4608,10 @@ impl Recorder {
                                 ui.separator();
                                 self.app_options(ui, frame)
                             }
+                            OptionsSection::Hotkeys => {
+                                self.hotkey_options(ui);
+                                None
+                            }
                             OptionsSection::Capture => {
                                 self.capture_options(ui);
                                 None
@@ -4564,10 +4660,18 @@ impl Recorder {
         if !self.primary {
             return;
         }
+        // The Hotkeys page changes it; this line only names it.
+        let language = Language::current();
         options_field(ui, "Global shortcut", |ui| {
-            options_value(ui, "Alt + the key left of 1");
+            options_value(
+                ui,
+                &hotkeys_page::bindings_text(
+                    language,
+                    self.hotkeys.bindings(Action::SaveSnapshotGlobal),
+                ),
+            );
             if let Some(error) = &self.hotkey_error {
-                options_note(ui, format!("Could not register the shortcut: {error}"));
+                options_note(ui, language.could_not_register(error));
             }
         });
         if Instant::now() >= self.snapshot_target_scan {
@@ -4647,6 +4751,22 @@ impl Recorder {
         }
         if clear {
             self.clear_capture();
+        }
+    }
+
+    /// The Hotkeys page. A change is kept and in use at once: this window reads `hotkeys` for
+    /// every key, and the page hands the system-wide shortcut its new chord itself.
+    fn hotkey_options(&mut self, ui: &mut egui::Ui) {
+        let global = hotkeys_page::global(self.hotkey.as_ref());
+        if self.hotkeys_page.show(
+            ui,
+            Language::current(),
+            &mut self.hotkeys,
+            global,
+            self.hotkey_error.as_deref(),
+            self.primary,
+        ) {
+            self.save_hotkeys();
         }
     }
 
@@ -7509,16 +7629,7 @@ impl eframe::App for Recorder {
         let selection_active =
             self.selection.is_some() || matches!(self.gesture, Some(Gesture::Select { .. }));
         if !menu_open && (selection_active || self.gesture.is_some()) {
-            let cancel_key = |event: &egui::Event| {
-                matches!(
-                    event,
-                    egui::Event::Key {
-                        key: egui::Key::Escape | egui::Key::Backspace,
-                        pressed: true,
-                        ..
-                    }
-                )
-            };
+            let cancel_key = |event: &egui::Event| is_cancel_key(event, &self.hotkeys);
             if input.events.iter().any(cancel_key) {
                 input.events.retain(|event| !cancel_key(event));
                 self.cancel_selection();
@@ -7658,19 +7769,28 @@ impl eframe::App for Recorder {
         let shortcut = (commands_allowed
             && !egui::Popup::is_any_open(ui.ctx())
             && ui.memory(|memory| memory.focused().is_none()))
-        .then(|| ui.input(|input| window_shortcut(&input.events)))
+        .then(|| ui.input(|input| window_shortcut(&input.events, &self.hotkeys)))
         .flatten();
         if self.lane_key.is_none() {
             self.lane_key = frame
                 .winit_window()
                 .and_then(|window| lane_key::LaneKey::attach(window));
         }
-        // A tap during a gesture is dropped rather than kept for later.
-        let lane_tap = self
+        // A tap during a gesture is dropped rather than kept for later. It runs only what the
+        // Hotkeys page gave it, which by default is "Edit separately".
+        let tapped = self
             .lane_key
             .as_ref()
-            .is_some_and(lane_key::LaneKey::take_tap)
-            && commands_allowed;
+            .is_some_and(lane_key::LaneKey::take_tap);
+        let tapped = self
+            .harness
+            .as_mut()
+            .is_some_and(harness::Harness::take_tap)
+            || tapped;
+        let lane_tap = tapped
+            .then(|| tap_command(&self.hotkeys))
+            .flatten()
+            .filter(|_| commands_allowed);
         egui::CentralPanel::default()
             .frame(frame_style)
             .show(ui, |ui| {
@@ -7768,18 +7888,13 @@ impl eframe::App for Recorder {
             // A press in this same frame started a waveform gesture, and that comes first.
         } else if open_menu {
             self.show_context_menu(ui.ctx(), frame);
-        } else if lane_tap {
-            self.run_command(WindowCommand::SeparateLanes, ui.ctx(), frame);
-        } else if let Some(command) = shortcut {
-            // Delete with a selection on screen drops the selection, as Backspace and Escape do.
-            // Wiping the whole capture takes a second press.
-            if command == WindowCommand::Clear && self.selection.is_some() {
-                self.cancel_selection();
-            } else if command == WindowCommand::ToggleCapture && self.selection.is_some() {
-                // Space with a selection plays it or stops it. Without one it pauses capture.
-                self.toggle_preview(ui.ctx());
-            } else {
-                self.run_command(command, ui.ctx(), frame);
+        } else if let Some(command) = lane_tap.or(shortcut) {
+            // The clear key with a selection on screen drops the selection, as the cancel keys
+            // do, and the pause key plays it or stops it.
+            match key_effect(command, self.selection.is_some()) {
+                KeyEffect::Run(command) => self.run_command(command, ui.ctx(), frame),
+                KeyEffect::TogglePreview => self.toggle_preview(ui.ctx()),
+                KeyEffect::CancelSelection => self.cancel_selection(),
             }
         }
         // A package dropped on this window opens its confirmation in Options. Other files are
@@ -7798,6 +7913,10 @@ impl eframe::App for Recorder {
         }
         addons_page::paint_drop_hint(ui.ctx(), self.accent, Language::current());
         self.draw_options_window(ui.ctx(), frame);
+        // A row of the Hotkeys page records only while this pass drew the page: not on another
+        // page, nor with the Options window closed or hidden.
+        self.hotkeys_page
+            .end_pass(hotkeys_page::global(self.hotkey.as_ref()));
         // Drawing can start a gesture, an export or the recording blink.
         self.watch_pin(frame, Instant::now());
         self.schedule_wake(ui.ctx(), frame);
@@ -8107,6 +8226,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::hotkeys::{BindingError, ReservedShortcut};
 
     #[test]
     fn every_row_maps_a_point_to_the_same_time() {
@@ -8882,7 +9002,9 @@ mod tests {
             modifiers,
         };
         let none = egui::Modifiers::NONE;
-        let press = |code, modifiers| window_shortcut(&[key(code, modifiers, true, false)]);
+        let defaults = Hotkeys::defaults();
+        let press =
+            |code, modifiers| window_shortcut(&[key(code, modifiers, true, false)], &defaults);
         assert_eq!(
             press(egui::Key::Space, none),
             Some(WindowCommand::ToggleCapture)
@@ -8903,21 +9025,314 @@ mod tests {
 
         // A held key repeats, and releasing it is not a press: neither toggles capture again.
         assert_eq!(
-            window_shortcut(&[key(egui::Key::Space, none, true, true)]),
+            window_shortcut(&[key(egui::Key::Space, none, true, true)], &defaults),
             None
         );
         assert_eq!(
-            window_shortcut(&[key(egui::Key::Space, none, false, false)]),
+            window_shortcut(&[key(egui::Key::Space, none, false, false)], &defaults),
             None
         );
         assert_eq!(
-            window_shortcut(&[
-                egui::Event::PointerMoved(Pos2::ZERO),
-                key(egui::Key::Space, none, true, true),
-                key(egui::Key::Delete, none, true, false),
-            ]),
+            window_shortcut(
+                &[
+                    egui::Event::PointerMoved(Pos2::ZERO),
+                    key(egui::Key::Space, none, true, true),
+                    key(egui::Key::Delete, none, true, false),
+                ],
+                &defaults
+            ),
             Some(WindowCommand::Clear)
         );
+    }
+
+    fn chord(modifiers: Modifiers, key: crate::hotkeys::Key) -> Binding {
+        Binding::Chord { modifiers, key }
+    }
+
+    /// A key press as egui-winit reports it on a US layout.
+    fn pressed(modifiers: Modifiers, key: crate::hotkeys::Key) -> egui::Event {
+        hotkeys_page::key_event(modifiers, key, true)
+    }
+
+    #[test]
+    fn rebound_window_keys_run_their_new_command_and_free_the_old_key() {
+        use crate::hotkeys::Key as K;
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::NONE
+        };
+        let none = Modifiers::NONE;
+        let press = |hotkeys: &Hotkeys, modifiers, key| {
+            window_shortcut(&[pressed(modifiers, key)], hotkeys)
+        };
+        let mut hotkeys = Hotkeys::defaults();
+        hotkeys
+            .set(Action::ToggleCapture, &[chord(none, K::F6)])
+            .unwrap();
+        assert_eq!(
+            press(&hotkeys, none, K::F6),
+            Some(WindowCommand::ToggleCapture)
+        );
+        assert_eq!(press(&hotkeys, none, K::Space), None);
+        // The whole chord has to match.
+        assert_eq!(press(&hotkeys, ctrl, K::F6), None);
+        hotkeys.clear(Action::ToggleCapture);
+        assert_eq!(press(&hotkeys, none, K::F6), None);
+        // An action without a default works once it has a key.
+        assert_eq!(press(&hotkeys, ctrl, K::O), None);
+        hotkeys
+            .set(Action::OpenOptions, &[chord(ctrl, K::O)])
+            .unwrap();
+        assert_eq!(press(&hotkeys, ctrl, K::O), Some(WindowCommand::Options));
+        for (action, command) in [
+            (Action::SaveSnapshot, WindowCommand::SaveSnapshot),
+            (Action::WaveformOnly, WindowCommand::WaveformOnly),
+            (Action::KeepOnTop, WindowCommand::KeepOnTop),
+            (Action::Quit, WindowCommand::Quit),
+        ] {
+            hotkeys.set(action, &[chord(ctrl, K::F7)]).unwrap();
+            assert_eq!(press(&hotkeys, ctrl, K::F7), Some(command), "{action:?}");
+            hotkeys.clear(action);
+        }
+        // The system-wide chord is not the window's, and a cancel key is no command.
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::NONE
+        };
+        assert_eq!(press(&hotkeys, alt, K::KeyLeftOf1), None);
+        assert_eq!(press(&hotkeys, none, K::Escape), None);
+        // A held key still runs nothing more.
+        let held = egui::Event::Key {
+            key: egui::Key::O,
+            physical_key: Some(egui::Key::O),
+            pressed: true,
+            repeat: true,
+            modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+        };
+        assert_eq!(window_shortcut(&[held], &hotkeys), None);
+    }
+
+    #[test]
+    fn edit_separately_follows_its_binding_and_the_tap_follows_its_action() {
+        use crate::hotkeys::Key as K;
+        let mut hotkeys = Hotkeys::defaults();
+        assert_eq!(tap_command(&hotkeys), Some(WindowCommand::SeparateLanes));
+        hotkeys
+            .set(Action::SeparateLanes, &[chord(Modifiers::NONE, K::E)])
+            .unwrap();
+        assert_eq!(
+            window_shortcut(&[pressed(Modifiers::NONE, K::E)], &hotkeys),
+            Some(WindowCommand::SeparateLanes)
+        );
+        // Replaced, the tap does nothing.
+        assert_eq!(tap_command(&hotkeys), None);
+        // Only Edit separately can have the tap; another action is refused and keeps its keys.
+        for action in [Action::KeepOnTop, Action::CancelSelection] {
+            let before = hotkeys.clone();
+            assert_eq!(
+                hotkeys.set(action, &[Binding::RightCtrlTap]),
+                Err(BindingError::Reserved(ReservedShortcut::RightCtrlTap)),
+                "{action:?}"
+            );
+            assert_eq!(hotkeys, before);
+            assert_eq!(tap_command(&hotkeys), None);
+        }
+        // Back on Edit separately, as its second binding, the tap runs it again.
+        hotkeys
+            .set(
+                Action::SeparateLanes,
+                &[chord(Modifiers::NONE, K::E), Binding::RightCtrlTap],
+            )
+            .unwrap();
+        assert_eq!(tap_command(&hotkeys), Some(WindowCommand::SeparateLanes));
+    }
+
+    /// The menu's texts as `context_menu::show` writes them.
+    fn menu_texts(language: Language, hotkeys: &Hotkeys) -> Vec<String> {
+        let state = context_menu::State {
+            transport: context_menu::Transport::Pause,
+            capture_controls: true,
+            waveform_only: false,
+            keep_on_top: false,
+            several_rows: true,
+            separate_rows: false,
+            separate_label: "Edit separately",
+        };
+        menu_entries(state, language, hotkeys)
+            .iter()
+            .map(|entry| match entry {
+                context_menu::Entry::Separator => "-".to_owned(),
+                context_menu::Entry::Item {
+                    label,
+                    shortcut: Some(shortcut),
+                    ..
+                } => format!("{label}	{shortcut}"),
+                context_menu::Entry::Item { label, .. } => (*label).to_owned(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn menu_shortcuts_follow_changed_and_cleared_bindings() {
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::NONE
+        };
+        let defaults = [
+            "Pause	Space",
+            "Clear	Delete",
+            "Save snapshot",
+            "-",
+            "Edit separately	Right Ctrl",
+            "Show waveform only",
+            "Keep on top",
+            "-",
+            "Options…",
+            "Quit",
+        ];
+        for language in [Language::English, Language::TraditionalChinese] {
+            assert_eq!(menu_texts(language, &Hotkeys::defaults()), defaults);
+        }
+        let mut hotkeys = Hotkeys::defaults();
+        hotkeys.clear(Action::ToggleCapture);
+        hotkeys
+            .set(
+                Action::Clear,
+                &[
+                    chord(ctrl, crate::hotkeys::Key::K),
+                    chord(Modifiers::NONE, crate::hotkeys::Key::Delete),
+                ],
+            )
+            .unwrap();
+        hotkeys
+            .set(
+                Action::SeparateLanes,
+                &[chord(Modifiers::NONE, crate::hotkeys::Key::E)],
+            )
+            .unwrap();
+        hotkeys
+            .set(
+                Action::OpenOptions,
+                &[chord(ctrl, crate::hotkeys::Key::Comma)],
+            )
+            .unwrap();
+        assert_eq!(
+            menu_texts(Language::English, &hotkeys),
+            [
+                "Pause",
+                // The menu names the first of two.
+                "Clear	Ctrl + K",
+                "Save snapshot",
+                "-",
+                "Edit separately	E",
+                "Show waveform only",
+                "Keep on top",
+                "-",
+                "Options…	Ctrl + ,",
+                "Quit",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_selection_turns_the_pause_and_clear_keys_into_preview_and_cancel() {
+        use crate::hotkeys::Key as K;
+        for command in [
+            WindowCommand::ToggleCapture,
+            WindowCommand::Clear,
+            WindowCommand::SaveSnapshot,
+            WindowCommand::SeparateLanes,
+            WindowCommand::Options,
+        ] {
+            assert_eq!(key_effect(command, false), KeyEffect::Run(command));
+        }
+        assert_eq!(
+            key_effect(WindowCommand::ToggleCapture, true),
+            KeyEffect::TogglePreview
+        );
+        assert_eq!(
+            key_effect(WindowCommand::Clear, true),
+            KeyEffect::CancelSelection
+        );
+        assert_eq!(
+            key_effect(WindowCommand::SaveSnapshot, true),
+            KeyEffect::Run(WindowCommand::SaveSnapshot)
+        );
+        // The rules go with the action, whatever key it has.
+        let mut hotkeys = Hotkeys::defaults();
+        hotkeys
+            .set(Action::ToggleCapture, &[chord(Modifiers::NONE, K::P)])
+            .unwrap();
+        hotkeys
+            .set(Action::Clear, &[chord(Modifiers::NONE, K::X)])
+            .unwrap();
+        let effect = |key| {
+            window_shortcut(&[pressed(Modifiers::NONE, key)], &hotkeys)
+                .map(|command| key_effect(command, true))
+        };
+        assert_eq!(effect(K::P), Some(KeyEffect::TogglePreview));
+        assert_eq!(effect(K::X), Some(KeyEffect::CancelSelection));
+        assert_eq!(effect(K::Space), None);
+        assert_eq!(effect(K::Delete), None);
+    }
+
+    #[test]
+    fn cancel_keys_take_any_modifiers_when_bound_bare_and_follow_rebinding() {
+        use crate::hotkeys::Key as K;
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::NONE
+        };
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::NONE
+        };
+        let defaults = Hotkeys::defaults();
+        let raw = |key, modifiers, pressed, repeat| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat,
+            modifiers,
+        };
+        let none = egui::Modifiers::NONE;
+        // As before the Hotkeys page: Escape and Backspace, with modifiers held and repeats too.
+        for event in [
+            raw(egui::Key::Escape, none, true, false),
+            raw(egui::Key::Backspace, none, true, false),
+            raw(egui::Key::Escape, egui::Modifiers::SHIFT, true, false),
+            raw(egui::Key::Backspace, egui::Modifiers::CTRL, true, true),
+        ] {
+            assert!(is_cancel_key(&event, &defaults), "{event:?}");
+        }
+        for event in [
+            raw(egui::Key::Escape, none, false, false),
+            raw(egui::Key::Delete, none, true, false),
+            raw(egui::Key::Space, none, true, false),
+        ] {
+            assert!(!is_cancel_key(&event, &defaults), "{event:?}");
+        }
+        let mut hotkeys = Hotkeys::defaults();
+        hotkeys
+            .set(
+                Action::CancelSelection,
+                &[chord(Modifiers::NONE, K::Q), chord(ctrl, K::Z)],
+            )
+            .unwrap();
+        assert!(is_cancel_key(&pressed(shift, K::Q), &hotkeys));
+        assert!(is_cancel_key(&pressed(ctrl, K::Z), &hotkeys));
+        // A binding with modifiers needs exactly those.
+        assert!(!is_cancel_key(&pressed(Modifiers::NONE, K::Z), &hotkeys));
+        assert!(!is_cancel_key(&pressed(shift, K::Z), &hotkeys));
+        assert!(!is_cancel_key(
+            &pressed(Modifiers::NONE, K::Escape),
+            &hotkeys
+        ));
+        hotkeys.clear(Action::CancelSelection);
+        assert!(!is_cancel_key(
+            &pressed(Modifiers::NONE, K::Escape),
+            &hotkeys
+        ));
     }
 
     #[test]

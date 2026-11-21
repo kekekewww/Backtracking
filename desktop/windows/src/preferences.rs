@@ -13,6 +13,7 @@ use backtracking_core::{
 
 use crate::controller::{CaptureSource, SourceSettings};
 use crate::data_paths::DataPaths;
+use crate::hotkeys::Hotkeys;
 
 const MAX_VALUE_BYTES: u64 = 128 * 1024;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -170,6 +171,7 @@ pub(crate) enum Key {
     WideExport,
     PairRender,
     ShownGroups,
+    Hotkeys,
     Output,
     OutputCleanup,
     SavedSnapshots,
@@ -211,6 +213,7 @@ impl Key {
             Self::WideExport => "wide-lane-export-v1",
             Self::PairRender => "multichannel-pair-render",
             Self::ShownGroups => "shown-channel-groups-v1",
+            Self::Hotkeys => "hotkeys-v1",
             Self::Output => "output-folder",
             // Absent or 0 keeps every file.
             Self::OutputCleanup => "output-folder-cleanup-days",
@@ -253,6 +256,7 @@ pub(crate) struct Settings {
     pub(crate) wide_export: WideExportMode,
     pub(crate) pair_render: PairRender,
     pub(crate) shown_groups: SourceGroupChoices,
+    pub(crate) hotkeys: Hotkeys,
     pub(crate) output: PathBuf,
     /// Days after which old exports in `output` are deleted; `None` keeps them.
     pub(crate) output_cleanup: Option<u16>,
@@ -304,6 +308,7 @@ impl Default for Settings {
             wide_export: WideExportMode::default(),
             pair_render: PairRender::default(),
             shown_groups: SourceGroupChoices::new(),
+            hotkeys: Hotkeys::default(),
             output: directory.join("output"),
             output_cleanup: None,
             saved_output: directory.join("saved"),
@@ -405,6 +410,13 @@ impl Preferences {
             .and_then(|value| PairRender::from_preference(value.trim()))
             .unwrap_or_default();
         settings.shown_groups = self.load_shown_groups();
+        if let Some(hotkeys) = self
+            .read(Key::Hotkeys)
+            .as_deref()
+            .and_then(Hotkeys::from_json)
+        {
+            settings.hotkeys = hotkeys;
+        }
         if let Some(path) = self.read_absolute_path(Key::Output) {
             settings.output = path;
         }
@@ -1663,6 +1675,89 @@ mod tests {
         assert_eq!(
             preferences.read(Key::ShownGroups).as_deref(),
             Some("{invalid json")
+        );
+    }
+
+    #[test]
+    fn loading_hotkeys_leaves_missing_corrupt_and_future_files_untouched() {
+        let preferences = workspace_preferences("hotkeys-safe-load");
+        let file = preferences.directory.as_ref().unwrap().join("hotkeys-v1");
+        assert_eq!(Settings::default().hotkeys, Hotkeys::defaults());
+        assert_eq!(preferences.load().hotkeys, Hotkeys::defaults());
+        assert!(!file.exists());
+
+        for text in [
+            "{damaged json",
+            r#"{"version":2,"bindings":{"clear":[]}}"#,
+            r#"{"version":1,"bindings":[]}"#,
+        ] {
+            preferences.save(Key::Hotkeys, text).unwrap();
+            assert_eq!(preferences.load().hotkeys, Hotkeys::defaults());
+            assert_eq!(fs::read_to_string(&file).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn hotkey_settings_keep_valid_overrides_and_skip_unknown_keys_and_actions() {
+        use crate::hotkeys::{Action, Binding, Key as HotkeyKey, Modifiers};
+
+        let preferences = workspace_preferences("hotkeys-partial");
+        let text = r#"{
+            "version": 1,
+            "bindings": {
+                "future-action": {"a-future-shape": true},
+                "toggle-capture": [{"type":"chord","key":"future-key"}],
+                "clear": [],
+                "cancel-selection": [
+                    {"type":"chord","key":"f6"},
+                    {"type":"chord","key":"another-future-key"}
+                ],
+                "separate-lanes": [{"type":"chord","key":"tab"}],
+                "keep-on-top": [{"type":"chord","key":"x","modifiers":{"ctrl":"yes"}}],
+                "save-snapshot-global": [{"type":"right-ctrl-tap"}]
+            }
+        }"#;
+        preferences.save(Key::Hotkeys, text).unwrap();
+        let defaults = Hotkeys::defaults();
+        let hotkeys = preferences.load().hotkeys;
+        for action in [
+            Action::ToggleCapture,
+            Action::SeparateLanes,
+            Action::KeepOnTop,
+            Action::SaveSnapshotGlobal,
+            Action::OpenOptions,
+        ] {
+            assert_eq!(hotkeys.bindings(action), defaults.bindings(action), "{action:?}");
+        }
+        assert_eq!(
+            hotkeys.bindings(Action::CancelSelection),
+            &[Binding::Chord {
+                modifiers: Modifiers::NONE,
+                key: HotkeyKey::F6,
+            }]
+        );
+        assert!(hotkeys.bindings(Action::Clear).is_empty());
+        assert_eq!(preferences.read(Key::Hotkeys).as_deref(), Some(text));
+    }
+
+    #[test]
+    fn preference_writer_saves_edited_hotkeys_as_one_document() {
+        use crate::hotkeys::Action;
+
+        let preferences = workspace_preferences("hotkeys-save");
+        let mut hotkeys = preferences.load().hotkeys;
+        hotkeys.clear(Action::SaveSnapshotGlobal);
+        let writer = PreferenceWriter::new(preferences.clone()).unwrap();
+        writer.save(Key::Hotkeys, &hotkeys.to_json()).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(preferences.load().hotkeys, hotkeys);
+        assert!(
+            preferences
+                .directory
+                .as_ref()
+                .unwrap()
+                .join("hotkeys-v1")
+                .is_file()
         );
     }
 

@@ -20,7 +20,7 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 ### 開啟設定
 
-點擊工具列的齒輪可開啟 **Options**。在插件視窗內按滑鼠右鍵也會開啟 Options；Windows／macOS 桌面版的右鍵則開啟選單，依序為 **Pause／Resume／Retry capture**、**Clear**、**Save snapshot**、**Edit separately／分開編輯**（macOS 為 **Edit A and B separately**）、**Show waveform only**、**Keep on top**、**Options…** 與 **Quit**。桌面版視窗有焦點時，按 `Space` 可暫停或恢復擷取，按 `Delete`（Mac 鍵盤為 `Fn` + `Delete`）清除目前錄音；有選區時，`Space` 改為試聽選區，`Delete` 則先取消選區。波形有一列以上時（macOS 為擷取兩個來源時），單獨輕按右側 `Ctrl`（Mac 為右側 `Command`）可切換[分開編輯](#分開編輯)。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
+點擊工具列的齒輪可開啟 **Options**。在插件視窗內按滑鼠右鍵也會開啟 Options；Windows／macOS 桌面版的右鍵則開啟選單，依序為 **Pause／Resume／Retry capture**、**Clear**、**Save snapshot**、**Edit separately／分開編輯**（macOS 為 **Edit A and B separately**）、**Show waveform only**、**Keep on top**、**Options…** 與 **Quit**。桌面版視窗有焦點時，按 `Space` 可暫停或恢復擷取，按 `Delete`（Mac 鍵盤為 `Fn` + `Delete`）清除目前錄音；有選區時，`Space` 改為試聽選區，`Delete` 則先取消選區。波形有一列以上時（macOS 為擷取兩個來源時），單獨輕按右側 `Ctrl`（Mac 為右側 `Command`）可切換[分開編輯](#分開編輯)。這些是預設按鍵，Windows 桌面版可在 Options 的 **Hotkeys／快速鍵** 頁變更，見[快速鍵](#快速鍵windows-桌面版)。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
 
 Options 左側是分類，右側以一列一項的直向清單顯示設定。頁標題使用較大粗體，分組與欄位有明確層級，主要文字至少 15。保留時間、自動續錄、透明度和 WAV 格式使用下拉選單；少於 10 項時依實際項目數決定高度，最多顯示 10 列，超過則在選單內捲動。右側內容較長時向下捲動。桌面設定視窗可調整大小，底部關閉按鈕維持可見。插件會向 DAW 要求放大設定視窗，關閉後恢復原尺寸。
 
@@ -86,7 +86,7 @@ macOS 桌面版可從選單列顯示或隱藏視窗、暫停或恢復擷取、�
 | 移動視窗 | 在內容區按住 `Alt`，用滑鼠左鍵拖曳。 | 在波形外的內容區按住 `Option`，用左鍵拖曳。在內容區任意位置可按住 `Command` + `Option` 再用左鍵拖曳。 |
 | 調整視窗大小 | 將游標移到視窗內容區的內緣或內角，按住左鍵拖曳。 | 將游標移到視窗內容區的內緣或內角，按住左鍵拖曳。 |
 | 框選音訊 | `Ctrl` 加左鍵自由框選，或 `Shift` 加左鍵吸附框選；兩者可合用。 | `Option`／`Control` 加左鍵自由框選，或 `Shift` 加左鍵吸附框選；可再加 Shift 吸附。 |
-| 分開編輯 | 單獨輕按右側 `Ctrl`。 | 單獨輕按右側 `Command`。 |
+| 分開編輯 | 單獨輕按右側 `Ctrl`（預設，可在 Options → **Hotkeys** 變更）。 | 單獨輕按右側 `Command`。 |
 
 ### 讀懂波形與錄音狀態
 
@@ -123,7 +123,7 @@ macOS 桌面版可從選單列顯示或隱藏視窗、暫停或恢復擷取、�
 
 單擊、框選和視窗內的拖曳只會操作波形。要匯出框選片段，請拖出後放到可接受 WAV 的位置，或從 Options 選擇 **Save snapshot**。取消拖曳、拖回原視窗放開或目標拒絕時，不會留下匯出檔。若 WAV 還在準備，請保持按住滑鼠再放開。DAW 拒絕拖放時，可從 Options 選擇 **Save snapshot**，再從保存資料夾手動匯入。
 
-Backtracking 視窗有焦點時，按 `Esc` 或 `Backspace` 可取消編輯並回到即時視野，不寫檔；背景錄音保持原狀，不會解除手動 Pause。
+Backtracking 視窗有焦點時，按 `Esc` 或 `Backspace` 可取消編輯並回到即時視野，不寫檔；背景錄音保持原狀，不會解除手動 Pause。Windows 桌面版的這兩個鍵是預設值，可在[快速鍵](#快速鍵windows-桌面版)變更。
 
 ### 試聽選區與淡入淡出
 
@@ -154,7 +154,22 @@ Windows 版開啟這個模式後，選區涵蓋從開始拖曳的那一列到游
 
 從 Options 選擇 **Save snapshot**，即可保存目前錄音器的快照。有框選時使用固定素材中的原始選段，A／B 依相同取樣邊界切割；開啟分開編輯時只保存選取的列。未框選時保存觸發當下保留的整段音訊。準備和保存不隱含暫停背景錄音，也不強制解除手動 Pause。保存選段完成後可回到即時視野；全段保存於背景完成時，不會取消之後才建立的新選區。
 
-Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift），macOS 使用 Fn／Globe 加同一位置的鍵，可在背景觸發快照，不必讓 Backtracking 或插件視窗取得焦點。Linux 請使用[快照快捷鍵常駐程式](../desktop/linux/README.md)。在 Options 可指定單一插件實例作為全域快照快捷鍵的目標。Backtracking 沒有綁定 `Ctrl+S`；在 DAW 中仍可用它儲存專案。
+Windows 按 Alt 加數字 1 左側的實體鍵（~／grave 鍵，不必按 Shift），macOS 使用 Fn／Globe 加同一位置的鍵，可在背景觸發快照，不必讓 Backtracking 或插件視窗取得焦點。Linux 請使用[快照快捷鍵常駐程式](../desktop/linux/README.md)。在 Options 可指定單一插件實例作為全域快照快捷鍵的目標。Windows 的這個快捷鍵是預設值，可在[快速鍵](#快速鍵windows-桌面版)變更。Backtracking 預設沒有綁定 `Ctrl+S`；在 DAW 中仍可用它儲存專案。
+
+### 快速鍵（Windows 桌面版）
+
+Options 的 **Hotkeys／快速鍵** 頁列出所有鍵盤快速鍵，都可以變更。點一下動作旁的快速鍵按鈕，按鈕會顯示「Press keys…／請按下按鍵…」，接著按下想用的按鍵組合即可；按 `Esc` 會停止且不變更。每個動作最多兩組快速鍵，**Add another／再新增一組** 可加入第二組。**Clear／清除** 移除該動作的快速鍵，**Reset／重設** 恢復預設，頁面底部的 **Reset all／全部重設** 恢復全部預設。變更立即生效並保存，不必重新啟動。
+
+| 動作 | 預設 |
+| --- | --- |
+| 從任何地方儲存快照（全系統） | `Alt` 加數字 1 左側的鍵 |
+| 暫停或繼續擷取 | `Space` |
+| 清除擷取內容 | `Delete` |
+| 取消選取 | `Esc`、`Backspace` |
+| 分開編輯 | 單獨輕按右側 `Ctrl` |
+| 儲存快照、只顯示波形、保持在最上層、開啟 Options、結束 | 未設定 |
+
+全系統快速鍵需要搭配 `Ctrl` 或 `Alt`，在其他程式位於前景時也有效；錄製新按鍵期間會暫時停用，以免觸發。其他快速鍵只在 Backtracking 視窗位於前景時有效。有選區時，暫停擷取的按鍵改為試聽選區，清除的按鍵改為先取消選區。與其他動作重複的按鍵會被拒絕，原本的設定不變，該列下方會說明原因。少數按鍵組合無法使用，因為 Windows 或視窗本身要用，例如 `Alt` + `F4`、縮放用的 `Ctrl` + `=`、`Ctrl` + `-`、`Ctrl` + `0`，以及 `Shift` + `Tab`。輕按右 `Ctrl` 無法錄製，分開編輯另有 **Use a tap of Right Ctrl／改用輕按右 Ctrl** 按鈕。`Esc` 用於停止錄製，要把 `Esc` 設回取消選取請按 **Reset／重設**。Win 鍵與複製、剪下、貼上的按鍵無法錄製。另開的擷取視窗也有這一頁，但變更只套用到該視窗，不會保存。滑鼠手勢（`Ctrl`／`Shift`／`Alt` 拖曳、滾輪縮放或在列數放不下的軌道左右邊緣捲動列、中鍵拖曳平移、右鍵選單）固定不變，列在頁面底部供參考。
 
 ### 啟用、暫停與自動續錄
 
@@ -283,7 +298,7 @@ On Windows, route the source to the default playback device. If a DAW uses ASIO,
 
 ### Open settings
 
-Click the gear in the toolbar to open **Options**. Right-clicking inside the plug-in also opens Options. In the Windows and macOS desktop apps, right-clicking opens a menu instead: **Pause / Resume / Retry capture**, **Clear**, **Save snapshot**, **Edit separately** (**Edit A and B separately** in the macOS app), **Show waveform only**, **Keep on top**, **Options…**, and **Quit**. With the desktop window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` previews the selection instead and `Delete` cancels the selection first. With more than one waveform row (two sources in the macOS app), tapping the right `Ctrl` key on its own (the right `Command` key on a Mac) switches [Edit separately](#edit-separately) on or off. The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
+Click the gear in the toolbar to open **Options**. Right-clicking inside the plug-in also opens Options. In the Windows and macOS desktop apps, right-clicking opens a menu instead: **Pause / Resume / Retry capture**, **Clear**, **Save snapshot**, **Edit separately** (**Edit A and B separately** in the macOS app), **Show waveform only**, **Keep on top**, **Options…**, and **Quit**. With the desktop window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` previews the selection instead and `Delete` cancels the selection first. With more than one waveform row (two sources in the macOS app), tapping the right `Ctrl` key on its own (the right `Command` key on a Mac) switches [Edit separately](#edit-separately) on or off. These are the default keys; in the Windows desktop app you can change them on the **Hotkeys** page of Options (see [Hotkeys](#hotkeys-windows-desktop)). The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
 
 Choose a category on the left, then use the vertical settings list on the right. Larger bold titles, group headings, and body/control text of at least 15 distinguish hierarchy. History, auto-resume, transparency, and WAV format use dropdowns sized to their item count, up to ten rows before scrolling. Scroll the details pane for longer content. Desktop Options can be resized and keeps Close visible. The plug-in requests a larger editor and restores its prior size when closed.
 
@@ -349,7 +364,7 @@ On macOS, use the menu bar item to show or hide the window, pause or resume capt
 | Move the window | Hold `Alt` and left-drag inside the content area. | Hold `Option` and left-drag outside the waveform. Hold `Command` + `Option` and left-drag from anywhere in the content area. |
 | Resize the window | Move the pointer to an inside edge or corner, then left-drag. | Move the pointer to an inside edge or corner, then left-drag. |
 | Select audio | Ctrl-left-drag for free selection or Shift-left-drag for snapping; combine both if desired. | Option/Control-left-drag for free selection or Shift-left-drag for snapping; adding Shift also snaps. |
-| Edit separately | Tap the right `Ctrl` key on its own. | Tap the right `Command` key on its own. |
+| Edit separately | Tap the right `Ctrl` key on its own (the default; change it in Options → **Hotkeys**). | Tap the right `Command` key on its own. |
 
 ### Read the waveform and capture status
 
@@ -386,7 +401,7 @@ In the full interface, hover over an unselected waveform to preview all retained
 
 Clicking, selecting, and dragging within the window only affect the waveform. To export a selected clip, drag it out and drop it on a target that accepts WAV files, or choose **Save snapshot** in Options. Canceled or rejected drops, including drops back in the source window, leave no export file. Keep the mouse button held while an export finishes preparing. If the DAW rejects the drop, choose **Save snapshot** in Options and import the WAV from the saved snapshots folder.
 
-With Backtracking focused, press `Esc` or `Backspace` to cancel editing and return to live view without writing a file. Background capture keeps its prior state; a manual Pause is not cleared.
+With Backtracking focused, press `Esc` or `Backspace` to cancel editing and return to live view without writing a file. Background capture keeps its prior state; a manual Pause is not cleared. In the Windows desktop app these are the default keys and can be changed under [Hotkeys](#hotkeys-windows-desktop).
 
 ### Preview a selection and fade its ends
 
@@ -417,7 +432,22 @@ There is one selection at a time, and its rows share the flags, which stand on t
 
 Choose **Save snapshot** in Options to save from the current recorder. A selection uses its original fixed samples with the same A/B sample boundaries; with Edit separately on, it saves the selected rows only. With no selection, it saves all audio retained when triggered. Saving neither implicitly pauses capture nor forces manual Pause to resume. Selected-range completion can return to live view; completion of a background full-history save does not cancel a selection created afterward.
 
-On Windows, press Alt plus the physical key to the left of 1 (the ~ / grave key, without Shift). On macOS, press Fn/Globe plus that same physical key. The global shortcut works from the background, without focusing Backtracking or the plug-in editor. On Linux, use the [snapshot shortcut helper](../desktop/linux/README.md). Options can select one plug-in instance as the global shortcut target. Backtracking does not bind `Ctrl+S`; it remains available to save the DAW project.
+On Windows, press Alt plus the physical key to the left of 1 (the ~ / grave key, without Shift). On macOS, press Fn/Globe plus that same physical key. The global shortcut works from the background, without focusing Backtracking or the plug-in editor. On Linux, use the [snapshot shortcut helper](../desktop/linux/README.md). Options can select one plug-in instance as the global shortcut target. On Windows this shortcut is the default and can be changed under [Hotkeys](#hotkeys-windows-desktop). By default Backtracking does not bind `Ctrl+S`; it remains available to save the DAW project.
+
+### Hotkeys (Windows desktop)
+
+The **Hotkeys** page of Options lists every keyboard shortcut, and each one can be changed. Click the shortcut button beside an action; it shows **Press keys…**. Then press the keys you want. `Esc` stops without a change. An action can have two shortcuts: **Add another** records the second. **Clear** removes an action's shortcuts, **Reset** restores its default, and **Reset all** at the bottom restores every default. Changes apply at once and are saved; there is no need to restart.
+
+| Action | Default |
+| --- | --- |
+| Save snapshot from anywhere (system-wide) | `Alt` plus the key left of 1 |
+| Pause or resume capture | `Space` |
+| Clear capture | `Delete` |
+| Cancel selection | `Esc`, `Backspace` |
+| Edit separately | A tap of the right `Ctrl` key on its own |
+| Save snapshot, Show waveform only, Keep on top, Open Options, Quit | Not set |
+
+The system-wide shortcut needs `Ctrl` or `Alt` and works while another app is in front; it is paused while you record a new one, so it does not fire. The other shortcuts work while the Backtracking window is in front. With a selection, the key that pauses capture plays the selection instead, and the key that clears cancels the selection first. A key another action already uses is refused: the old shortcut stays and the row says why. A few key combinations cannot be used because Windows or the window itself uses them, such as `Alt` + `F4`, the zoom keys `Ctrl` + `=`, `Ctrl` + `-` and `Ctrl` + `0`, and `Shift` + `Tab`. A tap of Right Ctrl cannot be recorded, so Edit separately has a **Use a tap of Right Ctrl** button. `Esc` stops recording, so to give `Esc` back to Cancel selection, use **Reset**. The Windows key and the copy, cut and paste keys cannot be recorded. An extra capture window has this page too, but its changes apply to that window only and are not kept. The mouse gestures (`Ctrl`, `Shift` and `Alt` drags, the wheel, which zooms or, over the side margins of a track whose rows do not fit, scrolls its rows, middle-drag pan, right-click menu) are fixed; the bottom of the page lists them.
 
 ### Arm, pause, and auto-resume capture
 
