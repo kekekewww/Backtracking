@@ -7,12 +7,15 @@
 //!   capture sources and a few settings.
 //! - `serve_stereo_sender` publishes a two-channel tone as a Sender for a while, so lane B can
 //!   capture something too.
+//! - `serve_wide_sender` publishes 12 steady tones, with or without 7.1.4 speaker labels.
 //!
 //! Settings, all optional:
 //! - `BACKTRACKING_TEST_SYSTEM_FORMAT`: select System with All channels in lane A. A test
 //!   instance accepts `5.1`, `7.1` or `7.1.4` followed by `:all` or `:stereo`.
 //! - `BACKTRACKING_TEST_FORMAT`: `stereo`, `5.1` or `7.1.4` (default) for the test tone.
-//! - `BACKTRACKING_TEST_LANE_B`: `off` (default), `sender` (the stereo Sender) or `tone`.
+//! - `BACKTRACKING_TEST_LANE_B`: `off` (default), `sender` (the stereo Sender), `sender-7.1.4`
+//!   (labelled), `sender-7.1.4-unlabelled`, `tone` or `atmos`. For either 7.1.4 value, run
+//!   `serve_wide_sender` in the test profile alongside the test copy.
 //! - `BACKTRACKING_TEST_LANE_B_ROUTE`: `all` stores All channels as lane B's route, as a choice
 //!   kept from a wider device would be.
 //! - `BACKTRACKING_TEST_PREFERENCES`: `name=value` pairs separated by `;`, named like the files
@@ -55,6 +58,11 @@ const ATMOS_SETTING: &str = "play_through_speakers";
 /// Sender ids are hexadecimal digits and dashes.
 const STEREO_SENDER_ID: &str = "c1c1-5e7d-0002";
 const STEREO_SENDER_NAME: &str = "Stereo test tone";
+const WIDE_SENDER_ID: &str = "c3c1-5e7d-0012";
+const WIDE_SENDER_NAME: &str = "7.1.4 test tone";
+const WIDE_SENDER_LABELS: [&str; 12] = [
+    "FL", "FR", "FC", "LFE", "Lb", "Rb", "Ls", "Rs", "TFL", "TFR", "TBL", "TBR",
+];
 
 /// The folder in `LOCALAPPDATA`, after checking that it is not the user's own.
 fn test_folder() -> PathBuf {
@@ -379,10 +387,19 @@ fn seed_test_profile() {
             },
             route: ChannelRoute::Merged,
         }),
+        Ok("sender-7.1.4" | "sender-7.1.4-unlabelled") => Some(SourceSettings {
+            source: CaptureSource::Sender {
+                id: WIDE_SENDER_ID.into(),
+                name: WIDE_SENDER_NAME.into(),
+            },
+            route: ChannelRoute::Merged,
+        }),
         Ok("tone") => Some(tone.clone()),
         Ok("atmos") => Some(atmos.clone()),
         Ok("off") | Err(_) => None,
-        Ok(other) => panic!("BACKTRACKING_TEST_LANE_B is off, sender, tone or atmos, not {other}"),
+        Ok(other) => panic!(
+            "BACKTRACKING_TEST_LANE_B is off, sender, sender-7.1.4, sender-7.1.4-unlabelled, tone or atmos, not {other}"
+        ),
     };
     // A stored All channels choice on a source of two channels, which falls back to Merged.
     let lane_b = lane_b.map(
@@ -429,36 +446,83 @@ fn seed_test_profile() {
 #[test]
 #[ignore = "feeds a test copy a stereo Sender; run by hand with LOCALAPPDATA set to its folder"]
 fn serve_stereo_sender() {
+    serve_sender(
+        STEREO_SENDER_ID,
+        STEREO_SENDER_NAME,
+        2,
+        &[],
+        |time, pair| {
+            // A slow swell tells this lane apart from the steady test tone.
+            let swell = 0.35 + 0.3 * (std::f64::consts::TAU * 0.5 * time).sin();
+            pair[0] = (swell * (std::f64::consts::TAU * 300.0 * time).sin()) as f32;
+            pair[1] = (swell * 0.6 * (std::f64::consts::TAU * 500.0 * time).sin()) as f32;
+        },
+    );
+}
+
+#[test]
+#[ignore = "feeds a test copy a wide Sender; run by hand with LOCALAPPDATA set to its folder"]
+fn serve_wide_sender() {
+    let labels = match std::env::var("BACKTRACKING_TEST_LANE_B").as_deref() {
+        Ok("sender-7.1.4") => WIDE_SENDER_LABELS.as_slice(),
+        Ok("sender-7.1.4-unlabelled") => &[],
+        _ => panic!("choose sender-7.1.4 or sender-7.1.4-unlabelled for lane B"),
+    };
+    serve_sender(
+        WIDE_SENDER_ID,
+        WIDE_SENDER_NAME,
+        12,
+        labels,
+        |time, frame| {
+            for (channel, sample) in frame.iter_mut().enumerate() {
+                let frequency = 181.0 + 37.0 * channel as f64;
+                // Start between zero crossings, including at the 48 kHz sample positions.
+                *sample =
+                    (0.25 * (std::f64::consts::TAU * (frequency * time + 0.12345)).sin()) as f32;
+            }
+        },
+    );
+}
+
+fn serve_sender(
+    id: &str,
+    name: &str,
+    channels: usize,
+    labels: &[&str],
+    fill_frame: impl Fn(f64, &mut [f32]),
+) {
     test_folder();
     let seconds = std::env::var("BACKTRACKING_TEST_SENDER_SECONDS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(40.0f64);
-    let mut sender = SenderEndpoint::with_id(STEREO_SENDER_ID).unwrap();
+    let mut sender = SenderEndpoint::with_id(id).unwrap();
     assert_eq!(
         sender.id(),
-        STEREO_SENDER_ID,
+        id,
         "an earlier Sender with this id is still registered"
     );
     const RATE: u32 = 48_000;
     const FRAMES: usize = 480;
+    if !labels.is_empty() {
+        sender
+            .update_with_labels(name, true, RATE, channels, labels)
+            .unwrap();
+    }
     let started = Instant::now();
     let clock = capture_clock_ns();
     let mut frame = 0u64;
-    let mut block = vec![0.0f32; FRAMES * 2];
+    let mut block = vec![0.0f32; FRAMES * channels];
     while started.elapsed().as_secs_f64() < seconds {
         // Windows sleeps in coarse steps, so catch up with every block that is due.
         while frame * 1_000_000 / u64::from(RATE) <= started.elapsed().as_micros() as u64 {
-            for (index, pair) in block.chunks_exact_mut(2).enumerate() {
+            for (index, samples) in block.chunks_exact_mut(channels).enumerate() {
                 let time = (frame + index as u64) as f64 / f64::from(RATE);
-                // A slow swell tells this lane apart from the steady test tone.
-                let swell = 0.35 + 0.3 * (std::f64::consts::TAU * 0.5 * time).sin();
-                pair[0] = (swell * (std::f64::consts::TAU * 300.0 * time).sin()) as f32;
-                pair[1] = (swell * 0.6 * (std::f64::consts::TAU * 500.0 * time).sin()) as f32;
+                fill_frame(time, samples);
             }
             let timestamp = clock + frame * 1_000_000_000 / u64::from(RATE);
             sender
-                .publish(STEREO_SENDER_NAME, RATE, 2, timestamp, &block, &[])
+                .publish(name, RATE, channels, timestamp, &block, &[])
                 .unwrap();
             frame += FRAMES as u64;
         }

@@ -1,0 +1,12 @@
+# VST3 surround buses in nice-plug 0.4.2
+
+Carry these changes forward when updating the vendored framework.
+
+- In `src/wrapper/vst3/wrapper.rs`, each VST3 instance stores the host's exact input and output speaker masks alongside the selected layout. Match the declared buses by channel count, then replace all masks together. A rejected request leaves the previous layout available for activation and readback.
+- Before negotiation, choose standard VST3 arrangements. Music surround uses side and back pairs for 7.1, then adds heights for larger Atmos buses. The defaults for 6, 8, 10, 12, 14 and 16 channels are `k51`, `k71Music`, `k71_2`, `k71_4`, `k71_6` and `k91_6`. The function `default_arrangement` lists all supported counts. A bus with no standard default returns `kResultFalse` until the host supplies a matching mask.
+- In `src/speakers.rs`, `main_input_speaker_bits` exposes the main input mask as ordered bit positions during activation. The VST3 wrapper snapshots the layout and mask under the same lock, then releases it before calling the plug-in. A thread-local value scoped to that callback keeps concurrent instances independent and restores the outer value on return or unwind. The prelude exports the query for S3-3. This keeps the registry version of `nice-plug-core` and its activation trait compatible.
+- `examples/surround_probe.rs` and `tests/surround.rs` exercise the COM factory, negotiation, readback and activation. The example also builds as a test DLL. The manifest drops the unused `approx` dev-dependency so Cargo can run these tests from the plug-in's locked workspace with `-p nice-plug`.
+
+## S3-5 · Main output speakers during activation
+
+The prelude now also exports `main_output_speaker_bits`. The VST3 wrapper snapshots both main arrangements under the layout lock and exposes them for the duration of activation, including when input and output have equal widths and different speakers. Each direction uses its negotiated arrangement or its own width's standard default. CLAP, standalone and absent main buses return `None` for the respective query.

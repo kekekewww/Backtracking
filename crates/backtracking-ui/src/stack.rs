@@ -9,53 +9,62 @@
 use std::ops::Range;
 
 /// The lowest row on which a waveform is still readable, in points.
-pub(super) const MIN_ROW_HEIGHT: f32 = 14.0;
+pub const MIN_ROW_HEIGHT: f32 = 14.0;
 /// The row height a window grows for when a wide lane appears.
-pub(super) const COMFORTABLE_ROW_HEIGHT: f32 = 20.0;
+pub const COMFORTABLE_ROW_HEIGHT: f32 = 20.0;
 /// The plot's left margin while any lane is stacked: room for labels like "LFE" or "Ltf".
-pub(super) const LABEL_GUTTER: f32 = 28.0;
+pub const LABEL_GUTTER: f32 = 28.0;
 /// Rows lower than this are drawn without their labels, which would overlap.
-pub(super) const LABELLED_ROW_HEIGHT: f32 = 9.0;
+pub const LABELLED_ROW_HEIGHT: f32 = 9.0;
 /// The shortest scroll thumb, so it stays easy to grab.
 const MIN_THUMB: f32 = 10.0;
 
+/// The rows a lane asks the layout to show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct LaneRows {
-    pub(super) rows: usize,
+pub struct LaneRows {
+    /// The number of rows before layout and scrolling.
+    pub rows: usize,
     /// One row per channel. Only such a lane scrolls.
-    pub(super) stacked: bool,
+    pub stacked: bool,
 }
 
 /// Where one lane's rows go, relative to the top of the plot's audio area.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct LaneBox {
-    pub(super) top: f32,
-    pub(super) height: f32,
-    pub(super) rows: usize,
+pub struct LaneBox {
+    /// The lane's top in points, relative to the plot's audio area.
+    pub top: f32,
+    /// The lane's visible height in points.
+    pub height: f32,
+    /// The total number of rows in the lane.
+    pub rows: usize,
     /// The first row on screen; the ones above are scrolled out.
-    pub(super) first: usize,
-    pub(super) shown: usize,
-    pub(super) row_height: f32,
+    pub first: usize,
+    /// The number of rows visible in the lane.
+    pub shown: usize,
+    /// The height of each visible row in points.
+    pub row_height: f32,
 }
 
 impl LaneBox {
-    pub(super) fn scrolls(&self) -> bool {
+    /// Whether some rows can only be reached by scrolling.
+    pub fn scrolls(&self) -> bool {
         self.shown < self.rows
     }
 
-    pub(super) fn visible(&self) -> Range<usize> {
+    /// The range of lane-relative row indices on screen.
+    pub fn visible(&self) -> Range<usize> {
         self.first..self.first + self.shown
     }
 
     /// The top of a row on screen, or `None` while it is scrolled out.
-    pub(super) fn row_top(&self, row: usize) -> Option<f32> {
+    pub fn row_top(&self, row: usize) -> Option<f32> {
         self.visible()
             .contains(&row)
             .then(|| self.top + (row - self.first) as f32 * self.row_height)
     }
 
     /// The scroll thumb's top and bottom, for a track as high as the lane.
-    pub(super) fn thumb(&self) -> Range<f32> {
+    pub fn thumb(&self) -> Range<f32> {
         if !self.scrolls() {
             return self.top..self.top + self.height;
         }
@@ -68,7 +77,7 @@ impl LaneBox {
     }
 
     /// The first row that puts the thumb's top nearest `thumb_top`.
-    pub(super) fn first_for_thumb(&self, thumb_top: f32) -> usize {
+    pub fn first_for_thumb(&self, thumb_top: f32) -> usize {
         let thumb = self.thumb();
         let travel = self.height - (thumb.end - thumb.start);
         if !self.scrolls() || travel <= 0.0 {
@@ -81,7 +90,7 @@ impl LaneBox {
 
 /// Places the lanes one above the other in `height`. `first` holds each lane's requested
 /// first row; it is limited so the last row is never followed by empty space.
-pub(super) fn lay_out(height: f32, lanes: &[LaneRows], first: &[usize]) -> Vec<LaneBox> {
+pub fn lay_out(height: f32, lanes: &[LaneRows], first: &[usize]) -> Vec<LaneBox> {
     let height = height.max(0.0);
     let total: usize = lanes.iter().map(|lane| lane.rows).sum();
     let mut shown: Vec<usize> = lanes.iter().map(|lane| lane.rows).collect();
@@ -154,7 +163,7 @@ pub(super) fn lay_out(height: f32, lanes: &[LaneRows], first: &[usize]) -> Vec<L
 }
 
 /// The lane (index into `boxes`) and row under a height measured like the boxes' tops.
-pub(super) fn row_at(boxes: &[LaneBox], y: f32) -> Option<(usize, usize)> {
+pub fn row_at(boxes: &[LaneBox], y: f32) -> Option<(usize, usize)> {
     boxes.iter().enumerate().find_map(|(index, lane)| {
         let offset = y - lane.top;
         if lane.shown == 0 || offset < 0.0 || offset >= lane.height {
@@ -167,7 +176,7 @@ pub(super) fn row_at(boxes: &[LaneBox], y: f32) -> Option<(usize, usize)> {
 
 /// The audio height a window grows to so that every row is comfortable, when a lane is
 /// stacked. Mono and stereo layouts never ask for more room.
-pub(super) fn comfortable_height(lanes: &[LaneRows]) -> Option<f32> {
+pub fn comfortable_height(lanes: &[LaneRows]) -> Option<f32> {
     lanes
         .iter()
         .any(|lane| lane.stacked)
@@ -176,7 +185,7 @@ pub(super) fn comfortable_height(lanes: &[LaneRows]) -> Option<f32> {
 
 /// A channel name short enough for the label column. Long names keep a trailing number
 /// ("Object 12" shows "12") or their first four characters; the tooltip has the full name.
-pub(super) fn short_label(label: &str) -> String {
+pub fn short_label(label: &str) -> String {
     let label = label.trim();
     if label.chars().count() <= 4 {
         return label.to_owned();
@@ -337,38 +346,6 @@ mod tests {
         assert_eq!(row_at(&boxes, 149.99), Some((1, 0)));
         assert_eq!(row_at(&boxes, -1.0), None);
         assert_eq!(row_at(&boxes, 150.0), None);
-    }
-
-    #[test]
-    fn every_row_maps_a_point_to_the_same_time() {
-        // One selection crosses all rows: the time comes from x alone, whichever row is hit.
-        let audio = eframe::egui::Rect::from_min_size(
-            eframe::egui::Pos2::new(36.0, 40.0),
-            eframe::egui::Vec2::new(566.0, 150.0),
-        );
-        let boxes = lay_out(audio.height(), &[wide(12), narrow(1)], &[0, 0]);
-        let guides = backtracking_core::waveform::TimelineGuides::default();
-        let mut times = Vec::new();
-        for lane in &boxes {
-            for row in lane.visible() {
-                let y = audio.top() + lane.row_top(row).unwrap() + lane.row_height / 2.0;
-                assert!(row_at(&boxes, y - audio.top()).is_some());
-                times.push(super::super::frame_from_pointer(
-                    audio,
-                    300.0,
-                    0..480_000,
-                    false,
-                    &[],
-                    &guides,
-                ));
-            }
-        }
-        assert_eq!(times.len(), 10);
-        assert!(times.iter().all(|&time| time == times[0]));
-        assert_eq!(
-            times[0],
-            ((300.0 - 36.0) / 566.0 * 480_000.0f64).round() as u64
-        );
     }
 
     #[test]

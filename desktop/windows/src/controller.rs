@@ -216,10 +216,10 @@ impl Stream {
         match source {
             CaptureSource::Sender { id, .. } => {
                 let receiver = SenderReceiver::connect(&id).map_err(|error| error.to_string())?;
-                let format = Arc::new(Format::sender(
-                    receiver.info.sample_rate,
-                    receiver.info.channels,
-                ));
+                let format = Arc::new(
+                    Format::sender(receiver.info.sample_rate, receiver.info.channels)
+                        .with_sender_labels(receiver.labels()),
+                );
                 Ok(Self::Sender {
                     receiver: Some(receiver),
                     format,
@@ -298,6 +298,7 @@ impl Stream {
                 let next = SenderReceiver::connect(id).map_err(|error| error.to_string())?;
                 if next.info.sample_rate != format.sample_rate
                     || next.info.channels != format.channels
+                    || (format.channels > 2 && next.labels() != format.sender_labels())
                 {
                     return Err("Sender format changed".into());
                 }
@@ -1732,7 +1733,7 @@ impl CaptureSession {
         let mut native_groups = lane_groups(self.addon_source(&settings.source), format.channels)?;
         if channels == format.channels {
             if channels > 2
-                && !is_sender(&settings.source)
+                && !matches!(settings.source, CaptureSource::Addon { .. })
                 && let Some(labels) = format.speaker_labels()
             {
                 native_groups[0].labels = labels;
@@ -1815,15 +1816,19 @@ impl CaptureSession {
                         settings
                             .as_ref()
                             .is_some_and(|settings| settings.source.same_source(&source))
-                            && self.formats[lane]
-                                .as_ref()
-                                .is_some_and(|old| old.shape() != stream.format().shape())
+                            && self.formats[lane].as_ref().is_some_and(|old| {
+                                let next = stream.format();
+                                old.shape() != next.shape()
+                                    || (matches!(source, CaptureSource::Sender { .. })
+                                        && old.sender_labels() != next.sender_labels())
+                            })
                     });
                     if layout_changed
                         && (is_sender(&source) || requests_all_channels(&self.sources, &source))
                     {
-                        // Independent lanes use a common output rate. A native rate change still
-                        // starts a new history even when that common output shape is unchanged.
+                        // A native rate change starts a new history even at the same output rate.
+                        // A Sender label change also starts a new history so old audio is never
+                        // rendered with the new speaker positions.
                         self.reset_capture();
                     }
                     for (lane, settings) in self.sources.iter().enumerate() {
@@ -2431,6 +2436,113 @@ fn missing_capture_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sender_groups_use_labels_only_on_wide_lanes() {
+        let labels = [
+            "FL", "FR", "FC", "LFE", "Lb", "Rb", "Ls", "Rs", "TFL", "TFR", "TBL", "TBR",
+        ];
+        let mut sender = backtracking_core::SenderEndpoint::new().unwrap();
+        let source = CaptureSource::Sender {
+            id: sender.id().into(),
+            name: "Sender groups".into(),
+        };
+        let mut session = CaptureSession::new();
+        session.sources[1] = Some(SourceSettings {
+            source: source.clone(),
+            route: ChannelRoute::Merged,
+        });
+        for (channels, names, expected) in [
+            (12, labels.as_slice(), labels.map(str::to_owned).to_vec()),
+            (12, &[], (1..=12).map(|i| format!("Channel {i}")).collect()),
+            (
+                2,
+                &labels[..2],
+                vec!["Channel 1".into(), "Channel 2".into()],
+            ),
+        ] {
+            sender
+                .update_with_labels("Sender groups", true, 48_000, channels, names)
+                .unwrap();
+            let stream = Stream::open(source.clone(), Arc::new(|| {}), false).unwrap();
+            session.formats[1] = Some(Arc::clone(stream.format()));
+            let groups = session.groups_for_lane(1).unwrap();
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].channels, 0..channels);
+            assert_eq!(groups[0].labels, expected);
+            assert!(!groups[0].positioned);
+        }
+    }
+
+    #[test]
+    fn connected_sender_reopens_for_new_labels_and_frozen_audio_keeps_its_layout() {
+        let old = [
+            "FL", "FR", "FC", "LFE", "Ls", "Rs", "TFL", "TFR", "TBL", "TBR",
+        ];
+        let new = [
+            "FL", "FR", "FC", "LFE", "Lb", "Rb", "Ls", "Rs", "TFL", "TFR",
+        ];
+        let mut sender = backtracking_core::SenderEndpoint::new().unwrap();
+        sender
+            .update_with_labels("Ten channels", true, 48_000, 10, &old)
+            .unwrap();
+        let mut session = CaptureSession::new();
+        session.history_budget_samples = 48_000;
+        session.paused = false;
+        session.set_sources([
+            Some(SourceSettings {
+                source: CaptureSource::Sender {
+                    id: sender.id().into(),
+                    name: "Ten channels".into(),
+                },
+                route: ChannelRoute::Merged,
+            }),
+            None,
+        ]);
+        let pump_until_recording =
+            |sender: &mut backtracking_core::SenderEndpoint, session: &mut CaptureSession| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    sender
+                        .publish("Ten channels", 48_000, 10, now_ns(), &[0.25; 4800], &[])
+                        .unwrap();
+                    session.poll();
+                    session.drain(true);
+                    if !session.inputs.is_empty()
+                        && let Some(snapshot) = session.edit_snapshot()
+                    {
+                        return snapshot;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "Sender failed to record: {:?}",
+                        session.error
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+        let frozen = pump_until_recording(&mut sender, &mut session);
+        assert_eq!(frozen.groups[0][0].labels, old);
+        sender
+            .update_with_labels("Ten channels", true, 48_000, 10, &new)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.groups[0][0].labels != new {
+            session.poll();
+            assert!(
+                Instant::now() < deadline,
+                "Sender did not reconnect: {:?}",
+                session.error
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(session.generation > frozen.generation);
+        assert!(session.edit_snapshot().is_none());
+        let resumed = pump_until_recording(&mut sender, &mut session);
+        assert_eq!(resumed.groups[0][0].labels, new);
+        assert_eq!(frozen.groups[0][0].labels, old);
+        assert!(!frozen.snapshots[0].frame_range().is_empty());
+    }
 
     fn addon_fixture(state: AddonState) -> AddonSnapshot {
         use backtracking_addon::protocol::{ChannelGroup, Format as AddonFormat, Source};

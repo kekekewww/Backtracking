@@ -1322,6 +1322,7 @@ pub(crate) struct Format {
     pub(crate) sample_rate: u32,
     pub(crate) channels: usize,
     channel_mask: u32,
+    sender_labels: Option<Vec<String>>,
     process_wide_available: bool,
     frame_bytes: usize,
     sample_bytes: usize,
@@ -1368,11 +1369,22 @@ impl Format {
     pub(crate) fn shape(&self) -> (u32, usize, u32) {
         (self.sample_rate, self.channels, self.channel_mask)
     }
+
+    pub(crate) fn with_sender_labels(mut self, labels: Option<&[String]>) -> Self {
+        self.sender_labels = labels.filter(|_| self.channels > 2).map(<[_]>::to_vec);
+        self
+    }
+
+    pub(crate) fn sender_labels(&self) -> Option<&[String]> {
+        self.sender_labels.as_deref()
+    }
+
     pub(crate) fn sender(sample_rate: u32, channels: usize) -> Self {
         Self {
             sample_rate,
             channels,
             channel_mask: 0,
+            sender_labels: None,
             process_wide_available: false,
             frame_bytes: channels * size_of::<f32>(),
             sample_bytes: size_of::<f32>(),
@@ -1449,6 +1461,7 @@ impl Format {
             sample_rate,
             channels,
             channel_mask: mask,
+            sender_labels: None,
             process_wide_available: false,
             frame_bytes,
             sample_bytes,
@@ -1461,6 +1474,9 @@ impl Format {
     }
 
     pub(crate) fn speaker_labels(&self) -> Option<Vec<String>> {
+        if let Some(labels) = &self.sender_labels {
+            return Some(labels.clone());
+        }
         const NAMES: [&str; 18] = [
             "FL", "FR", "FC", "LFE", "Lb", "Rb", "FLc", "FRc", "BC", "Ls", "Rs", "TpC", "TFL",
             "TpFC", "TFR", "TBL", "TpBC", "TBR",

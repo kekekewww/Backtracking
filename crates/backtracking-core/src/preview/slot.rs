@@ -140,6 +140,24 @@ impl PreviewSlot {
         sample_rate: u32,
         emit: impl FnMut(usize, [f32; 2]),
     ) -> SlotRender {
+        self.render(sample_rate, |preview| preview.render_with(frames, emit))
+    }
+
+    /// As [`Self::render_with`], routing through [`Preview::render_channels_with`].
+    pub fn render_channels_with(
+        &self,
+        frames: usize,
+        sample_rate: u32,
+        channels: usize,
+        layout: u64,
+        emit: impl FnMut(usize, usize, f32),
+    ) -> SlotRender {
+        self.render(sample_rate, |preview| {
+            preview.render_channels_with(frames, channels, layout, emit)
+        })
+    }
+
+    fn render(&self, sample_rate: u32, run: impl FnOnce(&Preview) -> usize) -> SlotRender {
         let _render = Render::begin(&self.renders);
         let current = self.current.load(Ordering::SeqCst);
         // SAFETY: a preview taken out of the slot is freed only after every render that may
@@ -150,7 +168,7 @@ impl PreviewSlot {
         if preview.sample_rate() != sample_rate {
             return SlotRender::default();
         }
-        let rendered = preview.render_with(frames, emit);
+        let rendered = run(preview);
         if rendered != 0 {
             let now = capture_clock_ns();
             self.last_render_ns.store(now, Ordering::Release);
