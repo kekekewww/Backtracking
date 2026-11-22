@@ -1,0 +1,126 @@
+# One-off build of the v0.2.1 macOS release files on a GitHub macOS runner, made because
+# the usual Mac build host was offline. It builds what desktop-verification.yml builds, adds
+# the DMG and the updater's ZIP, and uploads them as a workflow artifact. Nothing here signs
+# or publishes: the maintainer signs the ZIP with the release key and uploads it by hand.
+name: macOS release build
+
+on:
+  push:
+    branches:
+      - claude/auto-update-v0-2-1-eb7417
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust and the plug-in bundler
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          cargo +1.99.1 install cargo-nice-plug --locked --version 0.1.1
+      - name: Build the app with the release update key
+        run: |
+          read -r BACKTRACKING_UPDATE_PUBLIC_KEY < desktop/update-public-key.hex
+          export BACKTRACKING_UPDATE_PUBLIC_KEY
+          RUSTUP_TOOLCHAIN=1.99.1 bash desktop/macos/build.sh
+          plist=target/bundled/Backtracking.app/Contents/Info.plist
+          test "$(/usr/libexec/PlistBuddy -c 'Print :BacktrackingUpdatePublicKey' "$plist")" = "$BACKTRACKING_UPDATE_PUBLIC_KEY"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = 0.2.1
+          codesign --verify --strict --deep target/bundled/Backtracking.app
+      - name: Test signed update and rollback
+        run: |
+          xcrun swiftc -swift-version 5 -parse-as-library -D BACKTRACKING_UPDATER_TESTS \
+            desktop/macos/StartupUpdater.swift desktop/macos/tests/StartupUpdaterTests.swift \
+            -framework AppKit -o "$RUNNER_TEMP/backtracking-updater-tests"
+          "$RUNNER_TEMP/backtracking-updater-tests"
+      - name: Bundle the plug-ins
+        run: RUSTUP_TOOLCHAIN=1.99.1 bash plugins/backtracking-plugin/bundle-macos.sh
+      - name: Make the DMG and the update ZIP
+        run: |
+          set -euo pipefail
+          version=0.2.1
+          stage="$RUNNER_TEMP/dmg"
+          mkdir -p "$stage/Plug-ins" out
+          ditto target/bundled/Backtracking.app "$stage/Backtracking.app"
+          ditto target/bundled/Backtracking.vst3 "$stage/Plug-ins/Backtracking.vst3"
+          ditto target/bundled/Backtracking.clap "$stage/Plug-ins/Backtracking.clap"
+          ln -s /Applications "$stage/Applications"
+          cp LICENSE "$stage/LICENSE.txt"
+          cat > "$stage/Read Me.txt" <<'README'
+          Backtracking 0.2.1 for macOS (Apple silicon)
+          ============================================
+
+          Requires macOS 14.2 or later on an Apple silicon Mac.
+
+          Install the desktop app
+          -----------------------
+          1. Quit any Backtracking that is already running (menu bar item > Quit Backtracking).
+          2. Drag Backtracking.app onto the Applications shortcut in this window.
+          3. Open Backtracking from Applications.
+
+          This build is not notarized by Apple, so macOS blocks it the first time.
+          Open System Settings > Privacy & Security, scroll to the message about
+          Backtracking and choose Open Anyway. You only need to do this once.
+
+          When macOS asks, allow Backtracking to record system audio. Capturing a
+          microphone asks for the microphone permission. The global snapshot shortcut
+          (Fn/Globe + the key left of 1) needs Input Monitoring; Options > Actions has
+          a button that opens that setting.
+
+          Later versions can install themselves: Options > Updates chooses whether
+          Backtracking asks first, updates at startup, or only checks when you ask.
+
+          Install the plug-ins (optional)
+          -------------------------------
+          The desktop updates do not change the plug-ins. Quit your DAW first, then
+          copy from the Plug-ins folder in this window, replacing older copies:
+
+            Backtracking.vst3  ->  ~/Library/Audio/Plug-Ins/VST3/
+            Backtracking.clap  ->  ~/Library/Audio/Plug-Ins/CLAP/
+
+          If your DAW refuses to load them, remove the download quarantine in Terminal
+          and rescan:
+
+            xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/VST3/Backtracking.vst3
+            xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/CLAP/Backtracking.clap
+
+          User guide: https://github.com/kekekewww/Backtracking/blob/v0.2.1/docs/USER_GUIDE.md
+          License: Apache 2.0
+          README
+          hdiutil create -volname "Backtracking $version" -srcfolder "$stage" -fs HFS+ -format UDZO \
+            -ov "out/Backtracking-$version-macOS-arm64.dmg"
+          hdiutil verify "out/Backtracking-$version-macOS-arm64.dmg"
+          # The updater's payload: the app alone, as the top-level entry of a ZIP.
+          ditto -c -k --keepParent target/bundled/Backtracking.app out/Backtracking-update-macos-arm64.zip
+
+          # Open both the way a user's Mac will, and check what each one holds.
+          check="$RUNNER_TEMP/check"
+          mkdir -p "$check"
+          ditto -x -k out/Backtracking-update-macos-arm64.zip "$check"
+          ls -la "$check"
+          test -d "$check/Backtracking.app"
+          app_plist="$check/Backtracking.app/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_plist")" = com.backtracking.audio.capture
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_plist")" = "$version"
+          codesign --verify --strict --deep "$check/Backtracking.app"
+          mount="$(mktemp -d)"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "out/Backtracking-$version-macOS-arm64.dmg"
+          for bundle in "$mount/Backtracking.app" "$mount/Plug-ins/Backtracking.vst3" "$mount/Plug-ins/Backtracking.clap"; do
+            codesign --verify --strict --deep "$bundle"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$bundle/Contents/Info.plist")" = "$version"
+            echo "ok: $(basename "$bundle") $version"
+          done
+          ls -la "$mount" "$mount/Plug-ins"
+          hdiutil detach "$mount"
+          ls -l out
+          shasum -a 256 out/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backtracking-0.2.1-macos-arm64
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
