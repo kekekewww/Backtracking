@@ -11,7 +11,7 @@ use backtracking_addon::manifest::{Capability, OpenFiles};
 use backtracking_addon::protocol::MessageLevel;
 
 use crate::hotkeys::{Action, BindingError, ReservedShortcut};
-use crate::preferences::WideExportMode;
+use crate::preferences::{WaveformColoring, WideExportMode};
 
 /// Lines the capture code (`controller.rs`) writes in both languages at once, word for word.
 /// A test checks that the capture code still writes them so.
@@ -573,6 +573,68 @@ impl Language {
                 format!("{addon} 目前沒有提供外觀。在它提供之前，Backtracking 使用自己的外觀。")
             }
         }
+    }
+
+    // Waveform colour on the Appearance page.
+
+    pub(crate) fn waveform_color_field(self) -> &'static str {
+        self.pick("Waveform color", "波形顏色")
+    }
+
+    pub(crate) fn waveform_coloring(self, coloring: WaveformColoring) -> &'static str {
+        match coloring {
+            WaveformColoring::Single => self.pick("Single color", "單一顏色"),
+            WaveformColoring::Frequency => self.pick("By frequency", "依頻率"),
+        }
+    }
+
+    pub(crate) fn gradient_field(self) -> &'static str {
+        self.pick("Frequency colors", "頻率顏色")
+    }
+
+    /// Under the gradient's left end, and beside its lowest stop.
+    pub(crate) fn gradient_low(self) -> &'static str {
+        self.pick("Low", "低頻")
+    }
+
+    /// Under the gradient's right end, and beside its highest stop.
+    pub(crate) fn gradient_high(self) -> &'static str {
+        self.pick("High", "高頻")
+    }
+
+    /// The tooltip of a middle stop's position.
+    pub(crate) fn gradient_position(self) -> &'static str {
+        self.pick(
+            "Where this color sits between the lowest and the highest frequencies",
+            "這個顏色在最低頻與最高頻之間的位置",
+        )
+    }
+
+    pub(crate) fn gradient_remove(self) -> &'static str {
+        self.pick("Remove", "移除")
+    }
+
+    pub(crate) fn gradient_add(self) -> &'static str {
+        self.pick("Add color", "新增顏色")
+    }
+
+    pub(crate) fn gradient_reset(self) -> &'static str {
+        self.pick("Reset", "重設")
+    }
+
+    pub(crate) fn gradient_note(self) -> &'static str {
+        self.pick(
+            "Each moment of the waveform mixes these colors by how much of its sound is low or high.",
+            "波形的每個時刻，依其聲音中低頻與高頻的多寡混合這些顏色。",
+        )
+    }
+
+    /// Some stop is too dark or faint to see on the plot.
+    pub(crate) fn gradient_illegible(self) -> &'static str {
+        self.pick(
+            "A color too hard to see on the waveform's background is drawn in the default color instead.",
+            "在波形背景上不易看清的顏色，會改用預設顏色繪製。",
+        )
     }
 
     // The Add-ons page and the screen shown before an install.
@@ -1716,6 +1778,40 @@ mod tests {
         assert_eq!(English.look_field(), "Look from add-on");
         assert!(English.look_not_offered("Example appearance").starts_with("Example appearance "));
         assert!(TraditionalChinese.look_not_offered("Example appearance").starts_with("Example appearance "));
+    }
+
+    #[test]
+    fn every_waveform_color_text_exists_in_both_languages_and_differs() {
+        use crate::preferences::WaveformColoring;
+        let pairs = [
+            super::Language::waveform_color_field,
+            super::Language::gradient_field,
+            super::Language::gradient_low,
+            super::Language::gradient_high,
+            super::Language::gradient_position,
+            super::Language::gradient_remove,
+            super::Language::gradient_add,
+            super::Language::gradient_reset,
+            super::Language::gradient_note,
+            super::Language::gradient_illegible,
+        ]
+        .into_iter()
+        .map(|text| (text(English), text(TraditionalChinese)))
+        .chain(WaveformColoring::ALL.map(|coloring| {
+            (
+                English.waveform_coloring(coloring),
+                TraditionalChinese.waveform_coloring(coloring),
+            )
+        }));
+        for (english, chinese) in pairs {
+            assert!(!english.is_empty() && !chinese.is_empty());
+            assert_ne!(english, chinese);
+            assert!(chinese.chars().any(|c| c as u32 >= 0x3000), "{chinese}");
+        }
+        assert_eq!(
+            WaveformColoring::ALL.map(|coloring| English.waveform_coloring(coloring)),
+            ["Single color", "By frequency"]
+        );
     }
 
     #[test]

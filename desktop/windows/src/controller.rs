@@ -958,6 +958,52 @@ impl Controller {
         rendered
     }
 
+    /// Pins the retained part of `frames` for reading off the capture and window threads, as
+    /// the channel rows' worker does: by logical lane, with the frames pinned and the capture's
+    /// generation. Sealed pages are shared, so this holds the session lock for a pointer per
+    /// second of audio and a copy of the one page still being written. `None` while the capture
+    /// worker holds the session, or when nothing is captured.
+    pub(crate) fn try_freeze_frames(
+        &self,
+        frames: Range<u64>,
+    ) -> Option<([Option<FrozenTrack>; 2], Range<u64>, u64)> {
+        let state = try_lock(&self.state)?;
+        let capture = state.capture.as_ref().map(SynchronizedCapture::capture)?;
+        let retained = capture.frame_range();
+        let start = frames.start.clamp(retained.start, retained.end);
+        let frames = start..frames.end.clamp(start, retained.end);
+        let frozen = capture.freeze_range(frames.clone())?;
+        let tracks = state
+            .capture_lanes
+            .map(|lane| lane.and_then(|lane| frozen.track(lane)));
+        Some((tracks, frames, state.generation))
+    }
+
+    /// Puts `interleaved` audio of `channels` channels in lane A, as captured audio.
+    #[cfg(test)]
+    pub(crate) fn load_test_capture(&self, rate: u32, interleaved: &[f32], channels: usize) {
+        let mut state = lock(&self.state);
+        let mut capture =
+            SynchronizedCapture::new(rate, channels, None, DurationChoice::Seconds20).unwrap();
+        capture.set_retain_silence(true);
+        capture
+            .push_native_interleaved(0, interleaved, false)
+            .unwrap();
+        state.capture = Some(capture);
+        state.shape = Some((rate, channels, None));
+        state.capture_lanes = [Some(0), None];
+    }
+
+    /// How many retained pages hold band energies a spectrum read has started; see
+    /// [`backtracking_core::Capture::spectrum_cache_pages`].
+    #[cfg(test)]
+    pub(crate) fn spectrum_cache_pages(&self) -> usize {
+        lock(&self.state)
+            .capture
+            .as_ref()
+            .map_or(0, |capture| capture.capture().spectrum_cache_pages())
+    }
+
     pub(crate) fn track_channels(&self, lane: usize) -> Option<usize> {
         self.source_status.channels.get(lane).copied().flatten()
     }

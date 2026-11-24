@@ -330,6 +330,7 @@ fn the_cache_is_built_only_by_reads_only_for_asked_channels_and_reused() {
     assert!(pages(&capture)
         .iter()
         .all(|cache| cache.channels.get().is_none()));
+    assert_eq!(capture.spectrum_cache_pages(), 0);
     let before = analysed();
     let left = spectrum(
         &capture,
@@ -342,6 +343,7 @@ fn the_cache_is_built_only_by_reads_only_for_asked_channels_and_reused() {
     assert!(pages(&capture)
         .iter()
         .all(|cache| built(cache, 0) && !built(cache, 1)));
+    assert_eq!(capture.spectrum_cache_pages(), pages(&capture).len());
     // Sealed pages drop their filter state and keep exactly one value per block.
     for cache in &pages(&capture)[..3] {
         let slot = cache.channels.get().unwrap()[0].lock().unwrap();

@@ -19,7 +19,7 @@ use crate::lane_key;
 use crate::playback::PreviewPlayer;
 use crate::preferences::{
     BORDER_WIDTHS, DEFAULT_ACCENT, Key, MeterMode, PairRender, PreferenceWriter, Preferences,
-    Settings, SourceNames, StatusMark, WideExportMode, serialize_sources,
+    Settings, SourceNames, StatusMark, WaveformColoring, WideExportMode, serialize_sources,
     wav_sample_format_preference,
 };
 use crate::snapshot_hotkey::{self, SnapshotHotkey};
@@ -42,8 +42,9 @@ use backtracking_ui::{
     fade_end_at, fade_waveform_bins, fit_frame_range, flag_handle_at, icon_button, meter_number,
     muted_accent, options_choice, options_control_width, options_field, options_group_heading,
     options_heading_text, options_list, options_menu_height, options_navigation_item, options_note,
-    options_value, paint_fades, paint_guide_lines, paint_playhead, paint_transport_glyph,
-    paint_waveform_trace, remeasure_options_menu, status_led, waveform_press,
+    options_value, paint_colored_waveform_trace, paint_fades, paint_guide_lines, paint_playhead,
+    paint_transport_glyph, paint_waveform_trace, remeasure_options_menu, status_led, trace_bin,
+    waveform_press,
 };
 use eframe::egui::{
     self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection, Stroke, Vec2,
@@ -69,6 +70,7 @@ mod addons_page;
 mod harness;
 mod hotkeys_page;
 mod look;
+mod spectrum;
 #[cfg(test)]
 mod test_profile;
 mod text;
@@ -77,6 +79,7 @@ use addon_sources::AddonSources;
 use addons_page::{AddonsPage, PageRequest};
 use hotkeys_page::HotkeysPage;
 use look::AddonLook;
+use spectrum::WaveformColors;
 use text::Language;
 
 /// How often the window looks at work that only reports progress when asked.
@@ -515,6 +518,13 @@ struct Recorder {
     theme: Theme,
     /// The add-on whose look `theme` is, when the user chose one.
     look: AddonLook,
+    /// The waveform's colour: one colour, or by frequency (see `spectrum`).
+    waveform_coloring: WaveformColoring,
+    /// The user's own gradient for colouring by frequency, and the one last written.
+    waveform_gradient: Option<backtracking_ui::Spectrum>,
+    saved_waveform_gradient: Option<backtracking_ui::Spectrum>,
+    /// The colours read for the rows on screen, while the waveform is coloured by frequency.
+    waveform_colors: WaveformColors,
     meter_modes: [MeterMode; 2],
     split_waveform: bool,
     wav_profile: WavExportProfile,
@@ -2546,6 +2556,10 @@ impl Recorder {
             saved_accent: accent_color(settings.accent),
             theme: Theme::default(),
             look: AddonLook::new(settings.addon_look),
+            waveform_coloring: settings.waveform_coloring,
+            saved_waveform_gradient: settings.waveform_gradient.clone(),
+            waveform_gradient: settings.waveform_gradient,
+            waveform_colors: WaveformColors::default(),
             meter_modes: [settings.meter_mode, settings.meter_b_mode],
             split_waveform: settings.split_waveform,
             wav_profile: settings.wav_profile,
@@ -4886,6 +4900,7 @@ impl Recorder {
         });
         self.accent_settings(ui);
         self.addon_look_settings(ui);
+        self.waveform_color_settings(ui);
         ui.separator();
         options_group_heading(ui, "Show");
         if ui
@@ -7019,6 +7034,8 @@ impl Recorder {
         let stacked = self.stacked();
         let rows: usize = boxes.iter().map(|lane| lane.shown).sum();
         let dual = self.dual_source();
+        // Colouring by frequency: the band colours, once for every row.
+        let palette = self.waveform_palette();
         for (plan, lane_box) in self.lanes.iter().zip(&boxes) {
             for index in lane_box.visible() {
                 let top = audio.top() + lane_box.row_top(index).unwrap_or_default();
@@ -7115,12 +7132,19 @@ impl Recorder {
                         .group_channel(index)
                         .and_then(|(group, channel)| group.labels.get(channel))
                         .map(String::as_str);
+                    let colors = palette
+                        .as_ref()
+                        .map(|palette| self.row_column_colors(source, peaks.low.len(), palette));
                     self.paint_waveform(
                         &painter,
                         row,
                         peaks,
                         highlight.as_ref().filter(|_| selected),
                         channel,
+                        colors.as_deref().map(|colors| ColumnColors {
+                            colors,
+                            selection_shown: highlight.is_some(),
+                        }),
                     );
                 }
                 if let Some(range) = row_selection {
@@ -7398,11 +7422,12 @@ impl Recorder {
         peaks: &WaveformPeaks,
         selection: Option<&Range<f32>>,
         channel: Option<&str>,
+        colors: Option<ColumnColors<'_>>,
     ) {
         let policy = self.display_policy(audio, self.visible_frames.clone());
         let geometry =
             waveform::waveform_geometry(&peaks.low, &peaks.high, self.visible_frames.clone());
-        paint_row_waveform(
+        paint_colored_row_waveform(
             painter,
             audio,
             &geometry,
@@ -7411,14 +7436,26 @@ impl Recorder {
             &self.theme,
             self.accent,
             channel,
+            colors,
         );
     }
+}
+
+/// A row's colours while the waveform is coloured by frequency.
+#[derive(Clone, Copy)]
+struct ColumnColors<'a> {
+    /// One for each bin the row's geometry was made from; `None` draws that column in the
+    /// single colour.
+    colors: &'a [Option<Color32>],
+    /// A selection is on screen, on this row or another: what lies outside it is dimmed.
+    selection_shown: bool,
 }
 
 /// Paints one row's waveform `geometry` across `audio` as `theme` draws it for this accent:
 /// in the colour of the row's `channel` (its label) or the waveform's, and in the selected
 /// colour across `selection`, given as fractions of the row's width.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn paint_row_waveform(
     painter: &egui::Painter,
     audio: Rect,
@@ -7429,10 +7466,37 @@ fn paint_row_waveform(
     accent: Color32,
     channel: Option<&str>,
 ) {
+    paint_colored_row_waveform(
+        painter, audio, geometry, stroke, selection, theme, accent, channel, None,
+    );
+}
+
+/// [`paint_row_waveform`], with each column in its frequency colour when `colors` has one for
+/// it. That colour wins over the look's waveform and row colours; inside `selection` it is
+/// drawn in full and, while a selection is shown, dimmed everywhere else
+/// (`spectrum::unselected_color`). Columns without one take the row's single colour, treated
+/// the same way.
+#[allow(clippy::too_many_arguments)]
+fn paint_colored_row_waveform(
+    painter: &egui::Painter,
+    audio: Rect,
+    geometry: &waveform::WaveformGeometry,
+    stroke: f32,
+    selection: Option<&Range<f32>>,
+    theme: &Theme,
+    accent: Color32,
+    channel: Option<&str>,
+    colors: Option<ColumnColors<'_>>,
+) {
     let color = theme.row_waveform(channel, accent);
+    let single = color;
     let selected = theme.waveform_selected(accent, SELECTION_CONTRAST);
     let painter = painter.with_clip_rect(audio);
-    let paint_range = |range: Range<f32>, color| {
+    let outside: fn(Color32) -> Color32 = match colors {
+        Some(colors) if colors.selection_shown => spectrum::unselected_color,
+        _ => std::convert::identity,
+    };
+    let paint_range = |range: Range<f32>, color, tint: fn(Color32) -> Color32| {
         if range.is_empty() {
             return;
         }
@@ -7440,21 +7504,32 @@ fn paint_row_waveform(
             audio.left() + range.start * audio.width()..=audio.left() + range.end * audio.width(),
             audio.y_range(),
         );
-        paint_waveform_geometry(
-            &painter.with_clip_rect(clip),
-            audio,
-            geometry,
-            stroke,
-            color,
-            theme,
-        );
+        let painter = painter.with_clip_rect(clip);
+        match colors {
+            // A column without its colour yet takes the waveform's single colour, dimmed or
+            // not like its neighbours, so the selection reads the same across it.
+            Some(colors) => paint_colored_waveform_geometry(
+                &painter,
+                audio,
+                geometry,
+                stroke,
+                color,
+                theme,
+                |x| {
+                    let column = trace_bin(x, colors.colors.len());
+                    let own = colors.colors.get(column).copied().flatten();
+                    Some(tint(own.unwrap_or(single)))
+                },
+            ),
+            None => paint_waveform_geometry(&painter, audio, geometry, stroke, color, theme),
+        }
     };
     if let Some(range) = selection.filter(|range| range.start < range.end) {
-        paint_range(0.0..range.start, color);
-        paint_range(range.clone(), selected);
-        paint_range(range.end..1.0, color);
+        paint_range(0.0..range.start, color, outside);
+        paint_range(range.clone(), selected, spectrum::selected_color);
+        paint_range(range.end..1.0, color, outside);
     } else {
-        paint_range(0.0..1.0, color);
+        paint_range(0.0..1.0, color, outside);
     }
 }
 
@@ -7606,6 +7681,38 @@ fn paint_waveform_geometry(
     );
 }
 
+/// [`paint_waveform_geometry`] with the colour `color_at` gives each column and sample, and
+/// `color` where it gives none.
+fn paint_colored_waveform_geometry(
+    painter: &egui::Painter,
+    audio: Rect,
+    geometry: &waveform::WaveformGeometry,
+    stroke: f32,
+    color: Color32,
+    theme: &Theme,
+    color_at: impl Fn(f32) -> Option<Color32>,
+) {
+    let position = |x, value| {
+        Pos2::new(
+            audio.left() + x * audio.width(),
+            audio.center().y - value * audio.height() * 0.47,
+        )
+    };
+    let stroke = theme.waveform_stroke(stroke);
+    paint_colored_waveform_trace(
+        painter,
+        geometry,
+        position,
+        &TraceStyle {
+            stroke: Stroke::new(stroke, color),
+            fill: theme.waveform_fill(color),
+            lone_sample: LoneSample::Dot(stroke * 0.55),
+        },
+        color_at,
+        |color| theme.waveform_fill(color),
+    );
+}
+
 impl eframe::App for Recorder {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0; 4]
@@ -7721,6 +7828,7 @@ impl eframe::App for Recorder {
         }
         if !ctx.input(|input| input.pointer.any_down()) {
             self.save_accent();
+            self.save_waveform_gradient();
         }
         self.controller_busy = !self.controller.poll();
         self.sync_generation();
@@ -7843,6 +7951,7 @@ impl eframe::App for Recorder {
                 self.update_lanes();
                 self.fit_window_to_rows(ui.ctx(), frame);
                 self.refresh_waveform();
+                self.refresh_waveform_colors(ui.ctx());
                 if !self.waveform_only {
                     self.full_waveform_height = rect.height() - 2.0 * WAVEFORM_INSET;
                     self.full_window_size = ui.ctx().viewport_rect().size();
@@ -7927,6 +8036,7 @@ impl eframe::App for Recorder {
 impl Drop for Recorder {
     fn drop(&mut self) {
         self.save_accent();
+        self.save_waveform_gradient();
         self.save_window_position();
         if let Some(request) = self.edit_request.take()
             && !request.saves.is_empty()

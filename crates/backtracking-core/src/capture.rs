@@ -852,6 +852,13 @@ impl Capture {
             .spectrum(self.sample_rate, &members, range, bins)
     }
 
+    /// How many retained pages hold band energies that a spectrum read, of this capture or of
+    /// a frozen copy, has started. Zero until something reads a spectrum, which is how an app
+    /// that never colours its waveform by frequency can check it never paid for one.
+    pub fn spectrum_cache_pages(&self) -> usize {
+        self.history.spectrum_pages()
+    }
+
     fn waveform_for(
         &self,
         trace: usize,

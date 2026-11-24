@@ -929,6 +929,16 @@ impl History {
         channel_extrema(self.pages(range), self.layout, channel)
     }
 
+    /// How many held pages, sealed or open, a spectrum read has started band energies for.
+    pub(super) fn spectrum_pages(&self) -> usize {
+        self.sealed
+            .iter()
+            .map(|page| &**page)
+            .chain(self.open.iter())
+            .filter(|page| page.bands.is_started())
+            .count()
+    }
+
     /// See [`spectrum::bins`]. `range` must lie inside the retained frames.
     pub(super) fn spectrum(
         &self,

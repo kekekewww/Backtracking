@@ -292,6 +292,16 @@ impl AddonLook {
         Some(theme)
     }
 
+    /// The gradient the chosen look offers for "Waveform color: By frequency", which the
+    /// window draws with while the user has not made their own (`spectrum::chosen_spectrum`).
+    ///
+    /// The hook for a later step: an appearance offer has no gradient yet, so no look offers
+    /// one and this is always `None`. The offer, once it has one, is checked as every stop
+    /// is, by `Theme::legible_spectrum`.
+    pub(super) fn offered_spectrum(&self) -> Option<backtracking_ui::Spectrum> {
+        None
+    }
+
     /// The add-ons that offer a look now, by id and name, in id order.
     fn offering(&self) -> Vec<(String, String)> {
         self.offers

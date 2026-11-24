@@ -132,6 +132,66 @@ impl StatusMark {
     }
 }
 
+/// How the waveform is coloured: in one colour, as it always was, or by what each moment of it
+/// holds from low to high frequencies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WaveformColoring {
+    #[default]
+    Single,
+    Frequency,
+}
+
+impl WaveformColoring {
+    pub(crate) const ALL: [Self; 2] = [Self::Single, Self::Frequency];
+
+    /// The value written to preferences.
+    pub(crate) fn preference(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Frequency => "frequency",
+        }
+    }
+
+    pub(crate) fn from_preference(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|coloring| coloring.preference() == text)
+    }
+}
+
+/// The user's own gradient for "By frequency" as it is stored: each stop as `#rrggbb@position`,
+/// lowest first, separated by commas, for example `#e8302c@0,#2c68ec@1`. Positions run from
+/// 0 (the lowest band) to 1 (the highest).
+pub(crate) fn serialize_gradient(spectrum: &backtracking_ui::Spectrum) -> String {
+    spectrum
+        .stops()
+        .iter()
+        .map(|stop| {
+            let [r, g, b, _] = stop.color.to_array();
+            format!("#{r:02x}{g:02x}{b:02x}@{}", stop.position)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Reads [`serialize_gradient`]'s text. `None` for anything else: too few or too many stops,
+/// a colour that is not `#rrggbb`, or a position outside 0 to 1.
+pub(crate) fn parse_gradient(text: &str) -> Option<backtracking_ui::Spectrum> {
+    let stops = text
+        .split(',')
+        .map(|stop| {
+            let (color, position) = stop.trim().split_once('@')?;
+            let [r, g, b] = parse_accent(color)?;
+            let position: f32 = position.trim().parse().ok()?;
+            Some(backtracking_ui::SpectrumStop {
+                position,
+                color: eframe::egui::Color32::from_rgb(r, g, b),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    backtracking_ui::Spectrum::new(stops).ok()
+}
+
 /// The widths the waveform border can have, in points.
 pub(crate) const BORDER_WIDTHS: [u8; 4] = [1, 2, 3, 4];
 
@@ -190,6 +250,8 @@ pub(crate) enum Key {
     SnapshotTarget,
     WindowPosition,
     AddonLook,
+    WaveformColor,
+    WaveformGradient,
 }
 
 impl Key {
@@ -235,6 +297,10 @@ impl Key {
             Self::WindowPosition => "window-position",
             // The id of the add-on whose look is on; absent or empty is the app's own look.
             Self::AddonLook => "addon-look",
+            // `single` or `frequency`; anything else is a single colour.
+            Self::WaveformColor => "waveform-color",
+            // The user's own gradient (`serialize_gradient`); absent or empty is the default.
+            Self::WaveformGradient => "waveform-gradient-v1",
         }
     }
 }
@@ -277,6 +343,9 @@ pub(crate) struct Settings {
     pub(crate) window_position: Option<[i32; 2]>,
     /// The add-on whose look the window takes while it offers one.
     pub(crate) addon_look: Option<String>,
+    pub(crate) waveform_coloring: WaveformColoring,
+    /// The gradient the user made for "By frequency", or `None` when they made none.
+    pub(crate) waveform_gradient: Option<backtracking_ui::Spectrum>,
 }
 
 impl Default for Settings {
@@ -327,6 +396,8 @@ impl Default for Settings {
             snapshot_target: None,
             window_position: None,
             addon_look: None,
+            waveform_coloring: WaveformColoring::Single,
+            waveform_gradient: None,
         }
     }
 }
@@ -471,6 +542,14 @@ impl Preferences {
             .read(Key::AddonLook)
             .map(|id| id.trim().to_owned())
             .filter(|id| !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control));
+        settings.waveform_coloring = self
+            .read(Key::WaveformColor)
+            .and_then(|text| WaveformColoring::from_preference(text.trim()))
+            .unwrap_or_default();
+        settings.waveform_gradient = self
+            .read(Key::WaveformGradient)
+            .as_deref()
+            .and_then(parse_gradient);
         settings
     }
 
@@ -1335,6 +1414,103 @@ mod tests {
             preferences.save(Key::AddonLook, bad).unwrap();
             assert_eq!(preferences.load().addon_look, None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_waveform_colouring_and_gradient_round_trip_and_garbage_reads_as_the_default() {
+        use backtracking_ui::{Spectrum, SpectrumStop};
+        use eframe::egui::Color32;
+
+        let preferences = workspace_preferences("waveform-color");
+        let settings = preferences.load();
+        assert_eq!(settings.waveform_coloring, WaveformColoring::Single);
+        assert_eq!(settings.waveform_gradient, None);
+
+        let gradient = Spectrum::new([
+            SpectrumStop {
+                position: 0.0,
+                color: Color32::from_rgb(232, 48, 44),
+            },
+            SpectrumStop {
+                position: 1.0 / 3.0,
+                color: Color32::from_rgb(250, 200, 40),
+            },
+            SpectrumStop {
+                position: 0.62,
+                color: Color32::from_rgb(40, 200, 90),
+            },
+            SpectrumStop {
+                position: 1.0,
+                color: Color32::from_rgb(44, 104, 236),
+            },
+        ])
+        .unwrap();
+        let writer = PreferenceWriter::new(preferences.clone()).unwrap();
+        writer.save(Key::WaveformColor, "frequency").unwrap();
+        writer
+            .save(Key::WaveformGradient, &serialize_gradient(&gradient))
+            .unwrap();
+        writer.flush().unwrap();
+        let settings = preferences.load();
+        assert_eq!(settings.waveform_coloring, WaveformColoring::Frequency);
+        assert_eq!(settings.waveform_gradient.as_ref(), Some(&gradient));
+        for (key, file) in [
+            (Key::WaveformColor, "waveform-color"),
+            (Key::WaveformGradient, "waveform-gradient-v1"),
+        ] {
+            assert_eq!(key.filename(), file);
+            assert!(preferences.directory.as_ref().unwrap().join(file).is_file());
+        }
+        assert_eq!(
+            preferences.read(Key::WaveformGradient).as_deref(),
+            Some("#e8302c@0,#fac828@0.33333334,#28c85a@0.62,#2c68ec@1")
+        );
+        // Reset writes an empty file, which is the default gradient again.
+        writer.save(Key::WaveformGradient, "").unwrap();
+        writer.save(Key::WaveformColor, "single").unwrap();
+        writer.flush().unwrap();
+        let settings = preferences.load();
+        assert_eq!(settings.waveform_coloring, WaveformColoring::Single);
+        assert_eq!(settings.waveform_gradient, None);
+
+        for bad in ["Frequency", "spectral", "", "1"] {
+            preferences.save(Key::WaveformColor, bad).unwrap();
+            assert_eq!(
+                preferences.load().waveform_coloring,
+                WaveformColoring::Single,
+                "{bad:?}"
+            );
+        }
+        preferences
+            .save(Key::WaveformColor, " frequency\n")
+            .unwrap();
+        assert_eq!(
+            preferences.load().waveform_coloring,
+            WaveformColoring::Frequency
+        );
+        for bad in [
+            "#e8302c@0",
+            "#e8302c@0,#2c68ec@1.5",
+            "#e8302c@0,#2c68ec@-0.1",
+            "#e8302c@0,#2c68ec@NaN",
+            "#e8302c@0,#2c68ec",
+            "#e8302c@0,2c68ec@1",
+            "#e8302c@0,#2c68zz@1",
+            "#e8302c@0,,#2c68ec@1",
+            &["#e8302c@0.5"; 9].join(","),
+            "not a gradient",
+        ] {
+            preferences.save(Key::WaveformGradient, bad).unwrap();
+            assert_eq!(preferences.load().waveform_gradient, None, "{bad:?}");
+        }
+        // Stops may be written in any order and with spaces; they read back sorted.
+        preferences
+            .save(Key::WaveformGradient, " #2C68EC@1 , #E8302C@0 ")
+            .unwrap();
+        assert_eq!(
+            preferences.load().waveform_gradient,
+            Some(Spectrum::default())
+        );
     }
 
     #[test]

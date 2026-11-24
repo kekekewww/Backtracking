@@ -423,6 +423,13 @@ pub(super) struct BandCache {
     channels: OnceLock<Box<[Mutex<ChannelBands>]>>,
 }
 
+impl BandCache {
+    /// Whether a read has started this page's band energies.
+    pub(super) fn is_started(&self) -> bool {
+        self.channels.get().is_some()
+    }
+}
+
 impl Page {
     /// The samples are about to change. A cache shared with a frozen copy stays with it.
     pub(super) fn invalidate_bands(&mut self) {

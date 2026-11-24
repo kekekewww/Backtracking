@@ -59,6 +59,11 @@
 //!   audio.
 //!   `look=<add-on id|none>` chooses that add-on's look, or the window's own, as the
 //!   "Look from add-on" row on the Appearance page does, and keeps the choice.
+//!   `waveform-color=<single|frequency>` colours the waveform in one colour or by frequency, and
+//!   `gradient=<#rrggbb@position,...|default>` makes those stops (2 to 8, positions from 0 for
+//!   the lowest frequencies to 1 for the highest, as in the `waveform-gradient-v1` settings
+//!   file) the user's own gradient, or puts the default back, as the Appearance page's
+//!   "Waveform color" rows do; both keep the choice. The picture waits for the colours.
 //!
 //! The picture is `<file.png>`; `<file.png>.log` gets the frame times and any problem.
 
@@ -73,7 +78,7 @@ use eframe::egui;
 
 use super::{OptionsSection, Recorder, RowSource, hotkeys_page, rows_between};
 use crate::hotkeys::{Action, Binding};
-use crate::preferences::{PairRender, WideExportMode};
+use crate::preferences::{PairRender, WaveformColoring, WideExportMode, parse_gradient};
 
 pub(super) const SCREENSHOT: &str = "BACKTRACKING_TEST_SCREENSHOT";
 const SCREENSHOT_DELAY: &str = "BACKTRACKING_TEST_SCREENSHOT_DELAY_MS";
@@ -129,6 +134,10 @@ pub(super) enum Step {
     Key(Binding),
     /// The add-on whose look the window takes, or none.
     Look(Option<String>),
+    /// How the waveform is coloured.
+    WaveformColor(WaveformColoring),
+    /// The user's own gradient for colouring by frequency, or none for the default.
+    Gradient(Option<backtracking_ui::Spectrum>),
 }
 
 impl Step {
@@ -381,6 +390,17 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                     "" => Err(format!("{step} needs an add-on id or none")),
                     "none" => Ok(Step::Look(None)),
                     id => Ok(Step::Look(Some(id.to_owned()))),
+                },
+                "waveform-color" => WaveformColoring::from_preference(value.trim())
+                    .map(Step::WaveformColor)
+                    .ok_or_else(|| format!("{value} is not single or frequency")),
+                "gradient" => match value.trim() {
+                    "default" => Ok(Step::Gradient(None)),
+                    stops => parse_gradient(stops)
+                        .map(|gradient| Step::Gradient(Some(gradient)))
+                        .ok_or_else(|| {
+                            format!("{stops} is not 2 to 8 stops like #e8302c@0,#2c68ec@1")
+                        }),
                 },
                 other => Err(format!("unknown step {other}")),
             }
@@ -657,6 +677,8 @@ impl Recorder {
         let settled = now.duration_since(applied) >= SETTLE + harness.hold
             && self.edit_request.is_none()
             && self.edit_preview.is_none()
+            // Colours by frequency are read off the window's thread.
+            && !self.waveform_colors.busy()
             // Dropped files are read in the next pass, and the manager answers after that.
             && harness.main_drops.is_empty()
             && harness.main_keys.is_empty()
@@ -927,6 +949,15 @@ impl Recorder {
             }
             Step::Look(choice) => {
                 self.choose_look(choice.clone());
+                ctx.request_repaint();
+            }
+            &Step::WaveformColor(coloring) => {
+                self.set_waveform_coloring(coloring);
+                ctx.request_repaint();
+            }
+            Step::Gradient(gradient) => {
+                self.set_waveform_gradient(gradient.clone());
+                self.save_waveform_gradient();
                 ctx.request_repaint();
             }
         }
@@ -1436,6 +1467,44 @@ mod tests {
         );
         assert!(!Step::Look(None).waits());
         for bad in ["look", "look=", "look= "] {
+            assert!(parse_steps(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn waveform_color_steps_choose_the_colouring_and_the_gradient() {
+        use backtracking_ui::{Spectrum, SpectrumStop};
+        let stop = |position, [r, g, b]: [u8; 3]| SpectrumStop {
+            position,
+            color: egui::Color32::from_rgb(r, g, b),
+        };
+        assert_eq!(
+            parse_steps(
+                "waveform-color=frequency; gradient=#e8302c@0,#28c85a@0.5,#2c68ec@1; \
+                 gradient=default;waveform-color=single"
+            )
+            .unwrap(),
+            [
+                Step::WaveformColor(WaveformColoring::Frequency),
+                Step::Gradient(Some(
+                    Spectrum::new([
+                        stop(0.0, [232, 48, 44]),
+                        stop(0.5, [40, 200, 90]),
+                        stop(1.0, [44, 104, 236]),
+                    ])
+                    .unwrap()
+                )),
+                Step::Gradient(None),
+                Step::WaveformColor(WaveformColoring::Single),
+            ]
+        );
+        assert!(!Step::Gradient(None).waits());
+        for bad in [
+            "waveform-color=rainbow",
+            "gradient=",
+            "gradient=#e8302c@0",
+            "gradient=red@0,blue@1",
+        ] {
             assert!(parse_steps(bad).is_err(), "{bad}");
         }
     }
