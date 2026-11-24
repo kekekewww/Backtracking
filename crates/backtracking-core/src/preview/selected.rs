@@ -23,7 +23,7 @@ impl Preview {
         force_mono: bool,
         fades: Fades,
     ) -> Option<Self> {
-        Self::with_positions(lanes, frames, model, force_mono, fades, &[None, None])
+        Self::with_lane_positions(lanes, frames, model, force_mono, fades, &[])
     }
 
     /// Each group is the group being auditioned. Frozen tracks use lane-native indices.
@@ -35,7 +35,24 @@ impl Preview {
         fades: Fades,
         positions: &[Option<&crate::FrozenPositionTrack>; 2],
     ) -> Option<Self> {
-        if lanes.is_empty() || lanes.len() > 2 {
+        if lanes.len() > 2 {
+            return None;
+        }
+        Self::with_lane_positions(lanes, frames, model, force_mono, fades, positions)
+    }
+
+    /// Like [`Preview::with_positions`] for 1 to [`crate::MAX_LANES`] lanes, mixed into one
+    /// stereo preview. `positions[i]`, where given, moves the objects of lane `i`; a lane past
+    /// the end of `positions` has none. Every lane must hold the selection at one sample rate.
+    pub fn with_lane_positions(
+        lanes: &[PreviewLane<'_>],
+        frames: Range<u64>,
+        model: Option<Arc<HeadModel>>,
+        force_mono: bool,
+        fades: Fades,
+        positions: &[Option<&crate::FrozenPositionTrack>],
+    ) -> Option<Self> {
+        if lanes.is_empty() || lanes.len() > crate::MAX_LANES {
             return None;
         }
         let mut sources = Vec::new();
@@ -48,7 +65,7 @@ impl Preview {
                     lane,
                     model.as_ref(),
                     frames.clone(),
-                    positions[lane_index],
+                    positions.get(lane_index).copied().flatten(),
                 )?);
                 Placement::Wide(index)
             } else {
@@ -332,6 +349,45 @@ mod tests {
                 assert_eq!(pos, (stop_at + 384).min(1260));
             }
         }
+    }
+
+    #[test]
+    fn a_wide_lane_mixes_with_several_narrow_lanes() {
+        let group = PairGroup::new(0, &["FL".into(), "FR".into(), "FC".into()]).unwrap();
+        let main =
+            FrozenTrack::from_interleaved(48000, 3, 0, &[0.125, -0.25, 0.5].repeat(512)).unwrap();
+        let side = FrozenTrack::from_interleaved(48000, 2, 0, &[0.75, 0.25].repeat(512)).unwrap();
+        let mono = FrozenTrack::from_interleaved(48000, 1, 0, &[0.5; 512]).unwrap();
+        let lanes = [(&main, Some(&group)), (&side, None), (&mono, None)].map(|(track, group)| {
+            PreviewLane {
+                track,
+                route: ChannelRoute::Merged,
+                group,
+                selected: None,
+            }
+        });
+        let render = |preview: Preview| {
+            let mut frames = Vec::new();
+            preview.render_with(512, |_, frame| frames.push(frame));
+            frames
+        };
+        let mixed = render(
+            Preview::with_lane_positions(&lanes, 0..512, None, false, Fades::NONE, &[]).unwrap(),
+        );
+        let wide = render(Preview::with_channels(&lanes[..1], 0..512, None, false, Fades::NONE).unwrap());
+        let narrow = render(
+            Preview::new(&[side.clone(), mono.clone()], 0..512, &[ChannelRoute::Merged; 2], false,
+                Fades::NONE).unwrap(),
+        );
+        assert_eq!(mixed.len(), 512);
+        for ((mixed, wide), narrow) in mixed.iter().zip(&wide).zip(&narrow) {
+            for side in 0..2 {
+                assert!((mixed[side] - (wide[side] + narrow[side])).abs() < 1e-6, "{mixed:?}");
+            }
+        }
+        // The two-lane entry point keeps refusing a third lane.
+        assert!(Preview::with_positions(&lanes, 0..512, None, false, Fades::NONE, &[None, None])
+            .is_none());
     }
 
     #[test]

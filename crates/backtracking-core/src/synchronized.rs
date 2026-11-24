@@ -443,15 +443,15 @@ impl FrameClock {
 // Batch the gate's decisions into runs. No clock record is written per sample.
 fn push_timed(
     capture: &mut Capture,
-    clocks: &mut [Option<Box<FrameClock>>; 2],
-    sources: [Option<ClockSpan>; 2],
+    clocks: &mut [Option<Box<FrameClock>>],
+    sources: &[Option<ClockSpan>],
     grid: u64,
     samples: &[f32],
     bars: &[usize],
 ) -> Result<(), CaptureError> {
     let limit = capture.effective_retention_frames() as u64;
     let mut record = |first: usize, end: usize, retained: Option<(u64, usize)>| {
-        for (clock, source) in clocks.iter_mut().zip(sources) {
+        for (clock, &source) in clocks.iter_mut().zip(sources) {
             if let Some(clock) = clock {
                 clock.record(
                     source,
@@ -633,16 +633,23 @@ impl Lane {
 
 /// Aligns timestamped input lanes on one sample grid, then feeds one silence gate.
 /// Each packet timestamp is the monotonic host time of its first input frame.
+///
+/// There are 1 to [`crate::MAX_LANES`] lanes. Every lane is aligned against the same
+/// clock with the same jitter window, dropout fades and gap rules, and the gate keeps
+/// a frame when any lane is loud.
 pub struct SynchronizedCapture {
     sample_rate: u32,
-    lanes: [Option<Lane>; 2],
+    lanes: Vec<Lane>,
     capture: Capture,
     cursor: Option<u64>,
     native_end_ns: Option<u64>,
     scratch: Vec<f32>,
     bar_scratch: Vec<usize>,
     capture_error: Option<CaptureError>,
-    clocks: [Option<Box<FrameClock>>; 2],
+    // One entry per lane; `None` until that lane's frame clock is enabled.
+    clocks: Vec<Option<Box<FrameClock>>>,
+    // The clock span each lane contributes to the block being pushed, reused per block.
+    sources: Vec<Option<ClockSpan>>,
 }
 
 impl SynchronizedCapture {
@@ -671,6 +678,8 @@ impl SynchronizedCapture {
         retention: DurationChoice,
         max_buffer_samples: usize,
     ) -> Result<Self, CaptureError> {
+        // Validate the pair exactly as `Capture::new_tracks_with_budget` does, so a
+        // zero-width lane B still reports the same error as before.
         let capture = Capture::new_tracks_with_budget(
             rate,
             a_channels,
@@ -678,23 +687,70 @@ impl SynchronizedCapture {
             retention,
             max_buffer_samples,
         )?;
-        Ok(Self {
+        let widths = [a_channels, b_channels.unwrap_or(0)];
+        Ok(Self::with_capture(
+            rate,
+            &widths[..1 + usize::from(b_channels.is_some())],
+            capture,
+        ))
+    }
+
+    /// Creates one lane per entry of `lane_channels`, in order, with the default
+    /// sample budget. See [`Self::new_lanes_with_budget`] for the limits.
+    pub fn new_lanes(
+        rate: u32,
+        lane_channels: &[usize],
+        retention: DurationChoice,
+    ) -> Result<Self, CaptureError> {
+        Self::new_lanes_with_budget(
+            rate,
+            lane_channels,
+            retention,
+            crate::capture::DEFAULT_MAX_BUFFER_SAMPLES,
+        )
+    }
+
+    /// Creates one lane per entry of `lane_channels`, in order. There must be 1 to
+    /// [`crate::MAX_LANES`] lanes, each with 1 to 64 channels and at most 64 channels in
+    /// total; otherwise this returns [`CaptureError::InvalidChannelCount`]. Lane `i` is
+    /// pushed with `push(i, ..)` and occupies the matching channels of every history
+    /// frame. One or two lanes behave exactly as [`Self::new_with_budget`].
+    pub fn new_lanes_with_budget(
+        rate: u32,
+        lane_channels: &[usize],
+        retention: DurationChoice,
+        max_buffer_samples: usize,
+    ) -> Result<Self, CaptureError> {
+        let capture =
+            Capture::new_lanes_with_budget(rate, lane_channels, retention, max_buffer_samples)?;
+        Ok(Self::with_capture(rate, lane_channels, capture))
+    }
+
+    fn with_capture(rate: u32, lane_channels: &[usize], capture: Capture) -> Self {
+        let channels: usize = lane_channels.iter().sum();
+        Self {
             sample_rate: rate,
-            lanes: [Some(Lane::new(a_channels)), b_channels.map(Lane::new)],
+            lanes: lane_channels.iter().map(|&width| Lane::new(width)).collect(),
             capture,
             cursor: None,
             native_end_ns: None,
-            scratch: Vec::with_capacity(DRAIN_FRAMES * (a_channels + b_channels.unwrap_or(0))),
+            scratch: Vec::with_capacity(DRAIN_FRAMES * channels),
             bar_scratch: Vec::new(),
             capture_error: None,
-            clocks: [None, None],
-        })
+            clocks: lane_channels.iter().map(|_| None).collect(),
+            sources: vec![None; lane_channels.len()],
+        }
+    }
+
+    /// The number of lanes, from 1 to [`crate::MAX_LANES`].
+    pub fn lane_count(&self) -> usize {
+        self.lanes.len()
     }
 
     /// Enable the bounded timestamp index on a positioned lane or trim its expired entries.
     /// The record pool is reserved once before accepting packets.
     pub fn enable_frame_clock(&mut self, lane: usize) -> Result<(), CaptureError> {
-        if self.lanes.get(lane).and_then(Option::as_ref).is_none() {
+        if lane >= self.lanes.len() {
             return Err(CaptureError::InvalidChannelCount);
         }
         if let Some(clock) = &mut self.clocks[lane] {
@@ -767,7 +823,7 @@ impl SynchronizedCapture {
         for clock in self.clocks.iter_mut().flatten() {
             clock.discard_quiet();
         }
-        for lane in self.lanes.iter_mut().flatten() {
+        for lane in &mut self.lanes {
             lane.reset();
         }
         self.cursor = None;
@@ -793,7 +849,7 @@ impl SynchronizedCapture {
         discontinuity: bool,
         source_block_offset_of_bars: &[usize],
     ) -> Result<(), CaptureError> {
-        let channels: usize = self.lanes.iter().flatten().map(|lane| lane.channels).sum();
+        let channels: usize = self.lanes.iter().map(|lane| lane.channels).sum();
         let frames = interleaved.len() / channels;
         if interleaved.len() % channels != 0 {
             return Err(CaptureError::IncompleteFrame);
@@ -847,10 +903,11 @@ impl SynchronizedCapture {
                         let count = remaining.min(DRAIN_FRAMES as u64) as usize;
                         let samples = &self.scratch[..count * channels];
                         if self.clocks.iter().any(Option::is_some) {
+                            self.sources.fill(None);
                             push_timed(
                                 &mut self.capture,
                                 &mut self.clocks,
-                                [None; 2],
+                                &self.sources,
                                 0,
                                 samples,
                                 &[],
@@ -874,10 +931,11 @@ impl SynchronizedCapture {
                 samples: u32::try_from(frames).map_err(|_| CaptureError::BufferTooLarge)?,
                 rate: self.sample_rate,
             };
+            self.sources.fill(Some(source));
             push_timed(
                 &mut self.capture,
                 &mut self.clocks,
-                [Some(source); 2],
+                &self.sources,
                 0,
                 interleaved,
                 source_block_offset_of_bars,
@@ -934,7 +992,6 @@ impl SynchronizedCapture {
         let lane = self
             .lanes
             .get_mut(lane)
-            .and_then(Option::as_mut)
             .ok_or(CaptureError::InvalidChannelCount)?;
         if source_rate == 0 {
             return Err(CaptureError::InvalidSampleRate);
@@ -1081,7 +1138,6 @@ impl SynchronizedCapture {
         let Some(latest) = self
             .lanes
             .iter()
-            .flatten()
             .filter_map(|lane| lane.last_end)
             .max()
         else {
@@ -1094,7 +1150,6 @@ impl SynchronizedCapture {
             let settled = self
                 .lanes
                 .iter()
-                .flatten()
                 .map(|lane| lane.ready_end(fade_frames))
                 .min()
                 .unwrap_or(latest);
@@ -1104,15 +1159,14 @@ impl SynchronizedCapture {
             // Once the jitter window has passed its end, that lane no longer delays the grid.
             self.lanes
                 .iter()
-                .flatten()
                 .filter(|lane| lane.last_end.is_some_and(|end| end >= candidate))
                 .map(|lane| lane.ready_end(fade_frames))
                 .fold(candidate, u64::min)
         };
         // A source still missing after the jitter window is an actual dropout on this grid.
-        // Fade its last available packet independently so the other lane stays intact.
+        // Fade its last available packet independently so the other lanes stay intact.
         if !flush {
-            for lane in self.lanes.iter_mut().flatten() {
+            for lane in &mut self.lanes {
                 if lane.last_end.is_some_and(|end| end < target) {
                     lane.waiting_after_gap = true;
                     if let Some(last) = lane.packets.back_mut() {
@@ -1124,7 +1178,6 @@ impl SynchronizedCapture {
         let Some(mut cursor) = self.cursor.or_else(|| {
             self.lanes
                 .iter()
-                .flatten()
                 .filter_map(|lane| lane.packets.front().map(|packet| packet.start))
                 .min()
         }) else {
@@ -1137,13 +1190,12 @@ impl SynchronizedCapture {
         }
         let gap_tail = frames_for_ms(self.sample_rate, GAP_TAIL_MS);
         while cursor < target {
-            for lane in self.lanes.iter_mut().flatten() {
+            for lane in &mut self.lanes {
                 lane.discard_before(cursor);
             }
             let next_packet = self
                 .lanes
                 .iter()
-                .flatten()
                 .filter_map(|lane| lane.packets.front().map(|packet| packet.start))
                 .min()
                 .unwrap_or(target);
@@ -1173,62 +1225,54 @@ impl SynchronizedCapture {
 
     fn push_block(&mut self, start: u64, end: u64, fade_frames: u64) {
         if self.clocks.iter().all(Option::is_none) {
-            self.render_block(start, end, fade_frames, None);
+            self.render_block(start, end, fade_frames, false);
             return;
         }
         let mut cursor = start;
         while cursor < end {
             let mut boundary = end;
-            let mut sources = [None; 2];
+            self.sources.fill(None);
             for (i, lane) in self.lanes.iter_mut().enumerate() {
-                if self.clocks[i].is_none() {
+                let Some(clock) = &mut self.clocks[i] else {
                     continue;
-                }
-                if let Some(lane) = lane {
-                    lane.discard_before(cursor);
-                    if let Some(packet) = lane.packets.front() {
-                        if cursor < packet.start {
-                            boundary = boundary.min(packet.start);
-                        } else {
-                            if cursor == packet.start && packet.fade_in {
-                                if let Some(clock) = &mut self.clocks[i] {
-                                    clock.break_next = true;
-                                }
-                            }
-                            boundary = boundary.min(packet.end);
-                            sources[i] = Some(packet.clock_span());
+                };
+                lane.discard_before(cursor);
+                if let Some(packet) = lane.packets.front() {
+                    if cursor < packet.start {
+                        boundary = boundary.min(packet.start);
+                    } else {
+                        if cursor == packet.start && packet.fade_in {
+                            clock.break_next = true;
                         }
+                        boundary = boundary.min(packet.end);
+                        self.sources[i] = Some(packet.clock_span());
                     }
                 }
             }
-            self.render_block(cursor, boundary, fade_frames, Some(sources));
+            self.render_block(cursor, boundary, fade_frames, true);
             cursor = boundary;
         }
     }
 
-    fn render_block(
-        &mut self,
-        start: u64,
-        end: u64,
-        fade_frames: u64,
-        sources: Option<[Option<ClockSpan>; 2]>,
-    ) {
+    /// Renders every lane's frames `start..end` into one block and pushes it. When
+    /// `timed`, `self.sources` holds each lane's clock span for the block.
+    fn render_block(&mut self, start: u64, end: u64, fade_frames: u64, timed: bool) {
         self.scratch.clear();
         self.bar_scratch.clear();
         for frame in start..end {
             let mut bar = false;
-            for lane in self.lanes.iter_mut().flatten() {
+            for lane in &mut self.lanes {
                 bar |= lane.append_frame(frame, fade_frames, &mut self.scratch);
             }
             if bar {
                 self.bar_scratch.push((frame - start) as usize);
             }
         }
-        let result = if let Some(sources) = sources {
+        let result = if timed {
             push_timed(
                 &mut self.capture,
                 &mut self.clocks,
-                sources,
+                &self.sources,
                 start,
                 &self.scratch,
                 &self.bar_scratch,
@@ -1291,6 +1335,40 @@ mod tests {
                 "clock={timed}, median {:.3} us per native stereo 480-frame packet",
                 batches[3]
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "release packet ingest timings"]
+    fn aligned_lanes_drain_cost() {
+        for widths in [&[2][..], &[2, 2], &[2, 2, 2], &[1; 64]] {
+            let mut capture = match *widths {
+                [a] => SynchronizedCapture::new(48_000, a, None, DurationChoice::Seconds10),
+                [a, b] => SynchronizedCapture::new(48_000, a, Some(b), DurationChoice::Seconds10),
+                _ => SynchronizedCapture::new_lanes(48_000, widths, DurationChoice::Seconds10),
+            }
+            .unwrap();
+            let packets: Vec<Vec<f32>> = widths
+                .iter()
+                .map(|&width| (0..480 * width).map(|i| (i as f32 * 0.01).sin() * 0.3).collect())
+                .collect();
+            let mut ns = 0;
+            let mut batches = Vec::new();
+            for batch in 0..8 {
+                let start = std::time::Instant::now();
+                for _ in 0..2_000 {
+                    for (lane, packet) in packets.iter().enumerate() {
+                        capture.push(lane, ns, 48_000, std::hint::black_box(packet)).unwrap();
+                    }
+                    capture.drain(false);
+                    ns += 10_000_000;
+                }
+                if batch != 0 {
+                    batches.push(start.elapsed().as_secs_f64() * 1e6 / 2000.);
+                }
+            }
+            batches.sort_by(f64::total_cmp);
+            eprintln!("lanes {widths:?}: median {:.3} us per 480-frame packet on each lane", batches[3]);
         }
     }
 
@@ -2134,6 +2212,97 @@ mod tests {
         assert!(a.samples[..59_980].iter().all(|&sample| sample == 0.25));
         assert_eq!(a.samples[59_980..], [0.; 20]);
         assert!(b.samples.iter().all(|&sample| sample == 0.75));
+    }
+
+    #[test]
+    fn lane_lists_follow_the_capture_limits_and_refuse_lanes_past_the_last() {
+        for widths in [&[][..], &[0], &[2, 0], &[1; crate::MAX_LANES + 1], &[32, 32, 1]] {
+            assert!(matches!(
+                SynchronizedCapture::new_lanes(1000, widths, DurationChoice::Seconds10),
+                Err(CaptureError::InvalidChannelCount)
+            ));
+        }
+        let mut capture =
+            SynchronizedCapture::new_lanes(1000, &[1; crate::MAX_LANES], DurationChoice::Seconds10)
+                .unwrap();
+        assert_eq!(capture.lane_count(), crate::MAX_LANES);
+        assert_eq!(capture.capture().lane_count(), crate::MAX_LANES);
+        let past = crate::MAX_LANES;
+        assert!(matches!(
+            capture.push(past, 0, 1000, &[0.5; 10]),
+            Err(CaptureError::InvalidChannelCount)
+        ));
+        assert!(matches!(
+            capture.enable_frame_clock(past),
+            Err(CaptureError::InvalidChannelCount)
+        ));
+        assert_eq!(capture.take_frame_clock_eviction(past), None);
+        assert_eq!(capture.retained_frame_at(past, 0), std::task::Poll::Ready(None));
+        // Every lane is pushed on its own and lands in its own channel of one frame grid.
+        for lane in 0..crate::MAX_LANES {
+            capture.push(lane, 0, 1000, &[lane as f32 / 64.0; 20]).unwrap();
+        }
+        capture.drain(true);
+        for lane in 0..crate::MAX_LANES {
+            let snapshot = capture.capture().track_snapshot(lane).unwrap();
+            assert_eq!(snapshot.frame_range(), 0..20);
+            assert_eq!(snapshot.samples, [lane as f32 / 64.0; 20]);
+        }
+        // The native path splits one physical source's frames across every lane.
+        let mut native =
+            SynchronizedCapture::new_lanes(1000, &[2, 12, 1], DurationChoice::Seconds10).unwrap();
+        native.set_retain_silence(true);
+        let frame: Vec<f32> = (0..15).map(|channel| channel as f32 / 16.0).collect();
+        native.push_native_interleaved(0, &frame.repeat(30), false).unwrap();
+        assert!(matches!(
+            native.push_native_interleaved(30_000_000, &frame[..14], false),
+            Err(CaptureError::IncompleteFrame)
+        ));
+        for (lane, channels) in [0..2, 2..14, 14..15].into_iter().enumerate() {
+            let snapshot = native.capture().track_snapshot(lane).unwrap();
+            assert_eq!(snapshot.samples, frame[channels].repeat(30));
+        }
+    }
+
+    #[test]
+    fn three_sources_align_when_one_starts_late_and_another_drops_out_and_returns() {
+        let mut capture =
+            SynchronizedCapture::new_lanes(1000, &[1, 2, 1], DurationChoice::Seconds10).unwrap();
+        capture.enable_frame_clock(2).unwrap();
+        // Lane A plays throughout. Lane B starts past the jitter window, so the grid has
+        // already moved on without it. Lane C drops five packets, then comes back.
+        for packet in 0..30u64 {
+            let time = packet * 10_000_000;
+            capture.push(0, time, 1000, &[0.25; 10]).unwrap();
+            if packet >= 12 {
+                capture.push(1, time, 1000, &[0.5; 20]).unwrap();
+            }
+            if !(16..21).contains(&packet) {
+                capture.push(2, time, 1000, &[0.75; 10]).unwrap();
+            }
+            capture.drain(false);
+        }
+        capture.drain(true);
+        let lanes: Vec<_> = (0..3)
+            .map(|lane| capture.capture().track_snapshot(lane).unwrap())
+            .collect();
+        for lane in &lanes {
+            assert_eq!(lane.frame_range(), 0..300);
+        }
+        assert_eq!(lanes[0].samples, [0.25; 300]);
+        assert_eq!(&lanes[1].samples[..240], &[0.0; 240]);
+        assert_eq!(&lanes[1].samples[240..], &[0.5; 360]);
+        // The dropout fades the packet before it and the one after, a frame each, and the
+        // gap between stays silent, without touching the other lanes.
+        let c = &lanes[2].samples;
+        assert_eq!(&c[..159], &[0.75; 159]);
+        assert_eq!(&c[159..211], &[0.0; 52]);
+        assert_eq!(&c[211..], &[0.75; 89]);
+        // Lane C's own clock maps its timestamps to the same grid, and its gap to nothing.
+        use std::task::Poll;
+        assert_eq!(capture.retained_frame_at(2, 50_000_000), Poll::Ready(Some(50)));
+        assert_eq!(capture.retained_frame_at(2, 250_000_000), Poll::Ready(Some(250)));
+        assert_eq!(capture.retained_frame_at(2, 180_000_000), Poll::Ready(None));
     }
 
     #[test]

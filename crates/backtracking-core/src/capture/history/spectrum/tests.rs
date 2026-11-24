@@ -399,12 +399,8 @@ fn the_open_page_extends_as_audio_arrives_and_ends_where_one_late_read_does() {
 
 #[test]
 fn frozen_prefixes_extend_the_shared_cache_and_edits_detach_it() {
-    let layout = Layout {
-        page_frames: 9_600,
-        channels: 1,
-        a_channels: 1,
-    };
-    let mut history = History::new(layout.page_frames, 1, 1, 48_000).unwrap();
+    let layout = Layout::new(9_600, &[1]);
+    let mut history = History::new(layout.page_frames, &[1], 48_000).unwrap();
     let audio = mixture(48_000, 8_000, 1);
     let append = |history: &mut History, samples: &[f32]| {
         for sample in samples {
@@ -532,6 +528,69 @@ fn rows_of_several_channels_sum_their_members_energies() {
         read(0, SpectrumRow::Channel(1))
     );
     assert_eq!(read(1, SpectrumRow::View(WaveformView::Right)), single[1]);
+}
+
+#[test]
+fn every_lane_of_many_reads_the_spectrum_its_audio_has_alone() {
+    let rate = 48_000;
+    let frames = rate as usize * 3 / 2;
+    let widths = [2, 12, 1, 3];
+    let lanes: Vec<Vec<f32>> = widths
+        .iter()
+        .enumerate()
+        .map(|(lane, &width)| {
+            let columns: Vec<Vec<f32>> = (0..width)
+                .map(|channel| {
+                    let seed = (lane * 16 + channel) as u64 + 1;
+                    match (lane + channel) % 3 {
+                        0 => sine(rate, 70.0 * (channel + 1) as f64, frames),
+                        1 => white(frames, seed),
+                        _ => pink(frames, seed),
+                    }
+                })
+                .collect();
+            (0..frames)
+                .flat_map(|frame| columns.iter().map(move |column| column[frame]))
+                .collect()
+        })
+        .collect();
+    let interleaved: Vec<f32> = (0..frames)
+        .flat_map(|frame| {
+            lanes.iter().zip(widths).flat_map(move |(lane, width)| {
+                lane[frame * width..(frame + 1) * width].iter().copied()
+            })
+        })
+        .collect();
+    let mut capture = Capture::new_lanes(rate, &widths, DurationChoice::Seconds10).unwrap();
+    capture.set_retain_silence(true);
+    capture.push_interleaved(&interleaved).unwrap();
+    let frozen = capture.freeze();
+    let range = 0..frames as u64;
+    for (lane, (&width, audio)) in widths.iter().zip(&lanes).enumerate() {
+        let alone = capture_of(rate, width, audio);
+        let track = frozen.track(lane).unwrap();
+        let views = [WaveformView::Merged, WaveformView::Left, WaveformView::Right];
+        let rows = views
+            .map(SpectrumRow::View)
+            .into_iter()
+            .chain((0..width).map(SpectrumRow::Channel));
+        for row in rows {
+            let expected = bits(&spectrum(&alone, row, range.clone(), 40));
+            let mut live = vec![None; 40];
+            assert_eq!(capture.track_spectrum_range(lane, row, range.clone(), &mut live), frames);
+            assert_eq!(bits(&live), expected, "lane {lane}");
+            let mut held = vec![None; 40];
+            assert_eq!(track.spectrum(row, range.clone(), &mut held), frames);
+            assert_eq!(bits(&held), expected, "frozen lane {lane}");
+        }
+    }
+    // Past the last lane, or the last channel of a lane, there is nothing to read.
+    let mut out = vec![Some([1.0; BANDS]); 4];
+    assert_eq!(capture.track_spectrum_range(4, MERGED, range.clone(), &mut out), 0);
+    assert_eq!(out, [None; 4]);
+    let mut out = vec![Some([1.0; BANDS]); 4];
+    assert_eq!(capture.track_spectrum_range(2, SpectrumRow::Channel(1), range, &mut out), 0);
+    assert_eq!(out, [None; 4]);
 }
 
 /// Run with `cargo test --release --workspace spectrum_analysis_cost -- --ignored --nocapture`.

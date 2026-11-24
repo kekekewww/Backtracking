@@ -17,7 +17,7 @@ pub mod wide_export;
 
 pub use capture::{
     Capture, CaptureError, CaptureState, DurationChoice, FrozenCapture, FrozenTrack, Snapshot,
-    DEFAULT_MAX_BUFFER_SAMPLES,
+    DEFAULT_MAX_BUFFER_SAMPLES, MAX_LANES,
 };
 pub use export::{
     export_channel_range_with_profile, export_labelled_tracks, export_routed_tracks_with_fades,

@@ -34,6 +34,12 @@ fn scan(page: &Page, layout: Layout, channel: usize, frames: Range<usize>) -> (f
     }
 }
 
+/// The layout of lane A's `a_channels` channels and, if any are left, lane B's.
+fn pair_layout(page_frames: usize, channels: usize, a_channels: usize) -> Layout {
+    let widths = [a_channels, channels - a_channels];
+    Layout::new(page_frames, &widths[..1 + usize::from(a_channels < channels)])
+}
+
 fn audio(frames: usize, channels: usize) -> Vec<f32> {
     (0..frames)
         .flat_map(|frame| {
@@ -45,24 +51,22 @@ fn audio(frames: usize, channels: usize) -> Vec<f32> {
 
 #[test]
 fn narrow_pages_keep_the_original_size_and_peak_allocation() {
-    assert_eq!(size_of::<PagePeaks>(), size_of::<Vec<[Bounds; TRACES]>>());
+    assert_eq!(size_of::<PagePeaks>(), size_of::<Vec<Bounds>>());
     // The one addition is the pointer to the lazily built band cache.
     assert_eq!(
         size_of::<Page>(),
-        size_of::<(u64, Vec<f32>, Vec<[Bounds; TRACES]>, Arc<()>)>()
+        size_of::<(u64, Vec<f32>, Vec<Bounds>, Arc<()>)>()
     );
     for (a_channels, channels) in [(1, 1), (2, 2), (1, 2), (1, 3), (2, 4)] {
-        let layout = Layout {
-            page_frames: 1_024,
-            channels,
-            a_channels,
-        };
+        let layout = pair_layout(1_024, channels, a_channels);
         let page = Page::from_samples(0, &audio(1_024, channels), layout).unwrap();
         let original_allocation = page.peaks.as_ptr();
         let PagePeaks::Traces(traces) = &page.peaks else {
             panic!("mono/stereo lanes must not allocate a wide cache");
         };
-        assert_eq!(traces.capacity(), 1_024 / PEAK_FRAMES);
+        // One bound per trace per block: 4 for one lane, 7 for two.
+        assert_eq!(traces.capacity(), 1_024 / PEAK_FRAMES * layout.traces());
+        assert_eq!(layout.traces(), if a_channels < channels { 7 } else { 4 });
         for channel in 0..channels {
             assert_eq!(
                 read(&page, layout, channel, 0..1_024),
@@ -76,11 +80,7 @@ fn narrow_pages_keep_the_original_size_and_peak_allocation() {
 
 #[test]
 fn extra_peaks_allocate_only_for_requested_channels_and_complete_blocks() {
-    let layout = Layout {
-        page_frames: 1_024,
-        channels: 14,
-        a_channels: 2,
-    };
+    let layout = pair_layout(1_024, 14, 2);
     let page = Page::from_samples(0, &audio(641, layout.channels), layout).unwrap();
     let cache = wide_cache(&page);
     assert!(cache.native.get().is_none());
@@ -126,11 +126,7 @@ fn extra_peaks_allocate_only_for_requested_channels_and_complete_blocks() {
 
 #[test]
 fn a_short_standalone_page_reserves_only_its_actual_audio_length() {
-    let layout = Layout {
-        page_frames: u32::MAX as usize,
-        channels: 12,
-        a_channels: 12,
-    };
+    let layout = pair_layout(u32::MAX as usize, 12, 12);
     let page = Page::from_samples(0, &audio(32, 12), layout).unwrap();
     assert_eq!(
         read(&page, layout, 11, 0..32),
@@ -143,14 +139,10 @@ fn a_short_standalone_page_reserves_only_its_actual_audio_length() {
 
 #[test]
 fn open_page_prefixes_share_cold_caches_and_warmed_peak_storage() {
-    let layout = Layout {
-        page_frames: 1_024,
-        channels: 12,
-        a_channels: 12,
-    };
+    let layout = pair_layout(1_024, 12, 12);
     let page = Page::from_samples(0, &audio(337, 12), layout).unwrap();
-    let short = page.prefix(200, 12);
-    let long = page.prefix(337, 12);
+    let short = page.prefix(200, layout);
+    let long = page.prefix(337, layout);
     assert!(Arc::ptr_eq(wide_cache(&page), wide_cache(&short)));
     assert!(Arc::ptr_eq(wide_cache(&short), wide_cache(&long)));
     assert!(wide_cache(&page).native.get().is_none());
@@ -187,14 +179,14 @@ fn open_page_prefixes_share_cold_caches_and_warmed_peak_storage() {
 
 #[test]
 fn shared_prefix_queries_can_run_while_the_live_page_appends() {
-    let mut history = History::new(1_024, 12, 12, 2_048).unwrap();
+    let mut history = History::new(1_024, &[12], 2_048).unwrap();
     for frame in audio(257, 12).chunks_exact(12) {
         history.ensure_append_capacity().unwrap();
         history.push(frame, 1.0);
     }
     let layout = history.layout;
-    let short = history.open.as_ref().unwrap().prefix(129, 12);
-    let long = history.open.as_ref().unwrap().prefix(257, 12);
+    let short = history.open.as_ref().unwrap().prefix(129, layout);
+    let long = history.open.as_ref().unwrap().prefix(257, layout);
     let expected_short = scan(&short, layout, 11, 0..129);
     let expected_long = scan(&long, layout, 11, 0..257);
     let barrier = Barrier::new(3);
@@ -233,11 +225,7 @@ fn shared_prefix_queries_can_run_while_the_live_page_appends() {
 
 #[test]
 fn reset_reuses_unique_cache_capacity_but_detaches_shared_prefixes() {
-    let layout = Layout {
-        page_frames: 1_024,
-        channels: 12,
-        a_channels: 12,
-    };
+    let layout = pair_layout(1_024, 12, 12);
     let mut page = Page::from_samples(0, &audio(512, 12), layout).unwrap();
     read(&page, layout, 11, 0..512);
     let owner = Arc::as_ptr(wide_cache(&page));
@@ -259,11 +247,10 @@ fn reset_reuses_unique_cache_capacity_but_detaches_shared_prefixes() {
     }
     page.samples.extend_from_slice(&audio(256, 12));
     for block in 0..2 {
-        let bounds = page.summarize(block, 12, 12);
-        page.peaks.push(bounds);
+        page.push_summary(block, layout);
     }
     read(&page, layout, 11, 0..256);
-    let prefix = page.prefix(256, 12);
+    let prefix = page.prefix(256, layout);
     let expected = scan(&prefix, layout, 11, 0..256);
     page.reset(4_096);
     assert!(!Arc::ptr_eq(wide_cache(&page), wide_cache(&prefix)));
@@ -275,7 +262,7 @@ fn reset_reuses_unique_cache_capacity_but_detaches_shared_prefixes() {
 
 #[test]
 fn fading_an_open_page_detaches_its_frozen_prefix_cache() {
-    let mut history = History::new(1_024, 12, 12, 2_048).unwrap();
+    let mut history = History::new(1_024, &[12], 2_048).unwrap();
     for _ in 0..385 {
         history.ensure_append_capacity().unwrap();
         history.push(&[1.0; 12], 1.0);

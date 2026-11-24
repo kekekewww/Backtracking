@@ -1,5 +1,5 @@
-//! Plays a selection back: the frozen audio of one or two lanes, placed the way their WAVs
-//! are exported and faded the way the selection is, rendered a block at a time.
+//! Plays a selection back: the frozen audio of 1 to [`crate::MAX_LANES`] lanes, placed the way
+//! their WAVs are exported, mixed, and faded the way the selection is, a block at a time.
 //!
 //! The editor builds a [`Preview`] and shares it with whatever plays it: a device thread on
 //! the desktop or the plug-in's audio thread. Rendering never allocates, locks or frees, so
@@ -234,7 +234,7 @@ impl Preview {
         let first = &lanes.first()?.0;
         let sample_rate = first.sample_rate();
         let held = first.frame_range();
-        if lanes.len() > 2
+        if lanes.len() > crate::MAX_LANES
             || frames.is_empty()
             || sample_rate == 0
             || frames.start < held.start
@@ -335,7 +335,7 @@ impl Preview {
         })
     }
 
-    /// Builds a preview of a complete wide main track and an optional narrow companion.
+    /// Builds a preview of a complete wide main track and optional narrow companions.
     /// On a matching bus the main plays in channel order. Other outputs get the pair
     /// prepared with `model`, just as in [`Preview::with_channels`]. The caller supplies
     /// the same layout identifier for equivalent speaker orders (zero for an unnamed bus).
@@ -352,7 +352,7 @@ impl Preview {
         if width <= 2
             || main.selected.is_some()
             || main.group?.channels() != (0..width)
-            || lanes.get(1).is_some_and(|side| side.track.channels() > 2)
+            || lanes[1..].iter().any(|side| side.track.channels() > 2)
         {
             return None;
         }
@@ -553,6 +553,33 @@ mod tests {
         let preview = Preview::new(&[stereo], 2..3, &[ChannelRoute::Merged], true, Fades::NONE)
             .unwrap();
         assert_eq!(rendered(&preview, 8)[0], [2.25, 2.25]);
+    }
+
+    #[test]
+    fn three_or_more_lanes_are_placed_as_their_wavs_and_summed() {
+        let a = ramp_track(0, 10, 2);
+        let b = ramp_track(0, 10, 1);
+        let c = ramp_track(0, 10, 1);
+        let routes = [ChannelRoute::Merged, ChannelRoute::Left, ChannelRoute::Right];
+        let preview = Preview::new(&[a.clone(), b.clone(), c], 4..6, &routes, false,
+            Fades::NONE).unwrap();
+        // A stereo lane, a lane on the left and one on the right, each at its frame number.
+        assert_eq!(rendered(&preview, 8), [[8.0, 8.5], [10.0, 10.5]]);
+        // As many lanes as a capture holds mix the same way, and one more is refused.
+        let quarter = FrozenTrack::from_interleaved(48_000, 1, 0, &[0.25; 10]).unwrap();
+        let all = vec![quarter.clone(); crate::MAX_LANES];
+        let merged = [ChannelRoute::Merged; crate::MAX_LANES + 1];
+        let preview = Preview::new(&all, 0..10, &merged[..crate::MAX_LANES], false, Fades::NONE)
+            .unwrap();
+        assert_eq!(rendered(&preview, 4), [[16.0, 16.0]; 10]);
+        let too_many = vec![quarter; crate::MAX_LANES + 1];
+        assert!(Preview::new(&too_many, 0..10, &merged, false, Fades::NONE).is_none());
+        // A third lane must hold the selection at the same rate, as a second must.
+        let short = ramp_track(0, 5, 1);
+        assert!(Preview::new(&[a.clone(), b.clone(), short], 4..6, &routes, false,
+            Fades::NONE).is_none());
+        let other_rate = FrozenTrack::from_interleaved(44_100, 1, 0, &[0.0; 10]).unwrap();
+        assert!(Preview::new(&[a, b, other_rate], 4..6, &routes, false, Fades::NONE).is_none());
     }
 
     #[test]
