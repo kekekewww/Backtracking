@@ -1033,6 +1033,33 @@ impl Session {
         Some(consumer.timeline(epoch))
     }
 
+    /// Pins the retained part of `frames` of every lane, for the editor's waveform colors to
+    /// read on a thread of their own, with the timeline's epoch. Like the waveform calls it
+    /// only tries the session lock, and holds it for a pointer per second of audio and a copy
+    /// of the one page still being written. `None` while the capture thread has the session,
+    /// or when nothing is captured.
+    pub(crate) fn try_freeze_frames(&self, frames: Range<u64>) -> Option<(u64, Arc<[FrozenTrack]>)> {
+        let (epoch, frozen) = {
+            let state = self.state.try_lock().ok()?;
+            let capture = &state.consumer.as_ref()?.capture;
+            let retained = capture.frame_range();
+            let start = frames.start.clamp(retained.start, retained.end);
+            let frozen = capture.freeze_range(start..frames.end.clamp(start, retained.end))?;
+            (state.timeline_epoch, frozen)
+        };
+        Some((epoch, frozen.tracks().into()))
+    }
+
+    /// How many pages of the live capture hold band energies; see
+    /// [`backtracking_core::Capture::spectrum_cache_pages`].
+    #[cfg(test)]
+    pub(crate) fn spectrum_cache_pages(&self) -> usize {
+        self.lock()
+            .consumer
+            .as_ref()
+            .map_or(0, |consumer| consumer.capture.spectrum_cache_pages())
+    }
+
 
     pub(crate) fn is_paused(&self) -> bool {
         self.published().paused
