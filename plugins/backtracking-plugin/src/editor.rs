@@ -1892,6 +1892,7 @@ impl CaptureUi {
                 &self.peak_frames,
                 peaks.minimum.len(),
                 palette,
+                self.timeline.sample_rate,
             );
             paint_colored_row(painter, trace, &geometry, middle, extent, &colors);
         } else {

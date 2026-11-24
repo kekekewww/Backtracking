@@ -21,7 +21,9 @@
 //! of 48 kHz stereo. That read takes only the cache's own per-page channel locks, which the
 //! capture thread never takes, and builds it two seconds of audio at a time, so a read that
 //! is no longer wanted stops within a few milliseconds. Until a column's colors are in it is
-//! drawn in the theme color. One read is in flight at a time, and the next waits at least
+//! drawn in the theme color, except the newest edge of the live view, captured since the last
+//! read was asked for, which carries on the newest color read for up to [`NEWEST_CARRY`].
+//! One read is in flight at a time, and the next waits at least
 //! [`MIN_INTERVAL`] and twice as long as the last one took, so a long, wide view cannot keep
 //! the thread busy.
 //!
@@ -55,6 +57,14 @@ const MIN_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_EXIT: Duration = Duration::from_secs(2);
 /// How much audio a read analyses before it looks again at whether it is still wanted.
 const WARM_SECONDS: u64 = 2;
+/// How much of the live view's newest edge, captured after the last read was pinned, takes
+/// the color of the newest column read until the next read covers it. While recording that
+/// edge is as old as one read cycle: a repaint (80 ms), the wait before the next read
+/// ([`MIN_INTERVAL`], or twice a read's time, a few milliseconds once the cache is warm) and
+/// the read itself, about 100 to 250 ms. Half a second leaves room for a pass skipped while
+/// the capture thread has the session, and keeps any longer stretch nobody has read yet (the
+/// first second after a cold read of a long history) in the theme color until it is read.
+const NEWEST_CARRY: Duration = Duration::from_millis(500);
 
 /// One row the editor draws, by logical lane: 0 is the main input (or the sidechain when only
 /// it is captured), 1 the sidechain captured with it.
@@ -96,16 +106,14 @@ impl RowSpectrum {
         if self.frames == *visible && self.bins.len() == columns {
             return self.bins.iter().map(color).collect();
         }
-        let shown = u128::from(visible.end.saturating_sub(visible.start));
         let read = u128::from(self.frames.end.saturating_sub(self.frames.start));
         let count = self.bins.len() as u128;
-        (0..columns as u128)
+        (0..columns)
             .map(|column| {
                 if read == 0 || count == 0 {
                     return None;
                 }
-                let middle =
-                    visible.start + ((2 * column + 1) * shown / (2 * columns as u128)) as u64;
+                let middle = column_middle(visible, columns, column);
                 if !self.frames.contains(&middle) {
                     return None;
                 }
@@ -114,6 +122,29 @@ impl RowSpectrum {
             })
             .collect()
     }
+
+    /// The columns of `columns` over `visible` that lie past the newest frame this read
+    /// covers, by their middles, but no further than `carry` frames past it: the newest edge
+    /// of the live view, captured since the read was asked for. Empty when the read reaches
+    /// the end of `visible`.
+    fn newest_unread(&self, visible: &Range<u64>, columns: usize, carry: u64) -> Range<usize> {
+        let limit = self.frames.end.saturating_add(carry);
+        let first = (0..columns)
+            .find(|&column| column_middle(visible, columns, column) >= self.frames.end)
+            .unwrap_or(columns);
+        let end = (first..columns)
+            .find(|&column| column_middle(visible, columns, column) >= limit)
+            .unwrap_or(columns);
+        first..end
+    }
+}
+
+/// The frame under the middle of `column` of `columns` spread evenly over `visible`, as the
+/// waveform's bins are.
+fn column_middle(visible: &Range<u64>, columns: usize, column: usize) -> u64 {
+    let shown = u128::from(visible.end.saturating_sub(visible.start));
+    let columns = columns.max(1) as u128;
+    visible.start + ((2 * column as u128 + 1) * shown / (2 * columns)) as u64
 }
 
 /// What one read covers. A read of a pinned view names the edit it was asked for; one of the
@@ -288,19 +319,24 @@ impl WaveformColors {
     }
 
     /// Each of `columns` columns' color for `row` across `visible`, quiet gaps between two
-    /// colors filled; `None` for a column to draw in the theme color.
+    /// colors filled and the newest edge not read yet carried on from the newest color (up to
+    /// [`NEWEST_CARRY`] of audio at `sample_rate`); `None` for a column to draw in the theme
+    /// color.
     pub(super) fn row_colors(
         &self,
         row: ColorRow,
         visible: &Range<u64>,
         columns: usize,
         palette: &SpectrumPalette,
+        sample_rate: u32,
     ) -> Vec<Option<Color32>> {
         self.row(row).map_or_else(
             || vec![None; columns],
             |spectrum| {
                 let mut colors = spectrum.column_colors(visible, columns, palette);
                 fill_quiet_columns(&mut colors);
+                let carry = u64::from(sample_rate) * NEWEST_CARRY.as_millis() as u64 / 1_000;
+                carry_to_newest_edge(&mut colors, spectrum.newest_unread(visible, columns, carry));
                 colors
             },
         )
@@ -487,7 +523,7 @@ fn gradient_of(spectrum: &Spectrum) -> Option<WaveformGradient> {
 /// Gives each run of columns without a color that lies between two colored ones (a quiet
 /// moment, a fade, a gap between sounds) the color of its nearer neighbour, so the waveform
 /// does not flash its theme color there. Runs at either end stay without one: those may be
-/// audio not read yet, as at the newest edge of the live view.
+/// audio not read yet, which only [`carry_to_newest_edge`] fills, and only at the newest edge.
 fn fill_quiet_columns(colors: &mut [Option<Color32>]) {
     let mut previous: Option<usize> = None;
     for index in 0..colors.len() {
@@ -504,6 +540,21 @@ fn fill_quiet_columns(colors: &mut [Option<Color32>]) {
             }
         }
         previous = Some(index);
+    }
+}
+
+/// Gives the `unread` columns, the newest edge of the live view that no read has covered
+/// yet, the color of the column just before them, the newest one read, so the waveform does
+/// not end in a tip of its theme color while recording; the next read puts in their own.
+/// When that column has none (the read ended in silence) they keep none too.
+fn carry_to_newest_edge(colors: &mut [Option<Color32>], unread: Range<usize>) {
+    let end = unread.end.min(colors.len());
+    let Some(newest) = unread.start.checked_sub(1).and_then(|before| colors.get(before).copied())
+    else {
+        return;
+    };
+    if unread.start < end {
+        colors[unread.start..end].fill(newest);
     }
 }
 
@@ -771,6 +822,56 @@ mod tests {
             colors,
             [None, Some(low), Some(low), Some(low), Some(high), Some(high), Some(high), None]
         );
+    }
+
+    #[test]
+    fn the_newest_edge_not_read_yet_carries_the_newest_color_for_half_a_second() {
+        let palette = Spectrum::default().palette(SPECTRUM_BANDS);
+        let (low, high) = (Spectrum::DEFAULT_LOW, Spectrum::DEFAULT_HIGH);
+        let row = ColorRow::View(0, WaveformView::Merged);
+        let showing: Showing = Arc::new(|| true);
+        // 1000 frames a second: half a second is 500 frames. Each bin and column is 100.
+        let colors_of = |bins: Vec<SpectrumBin>, frames: Range<u64>, visible: Range<u64>, rate| {
+            let mut colors = WaveformColors::new(Arc::clone(&showing));
+            colors.rows.push((row, RowSpectrum { frames, bins }));
+            let columns = ((visible.end - visible.start) / 100) as usize;
+            colors.row_colors(row, &visible, columns, &palette, rate)
+        };
+        let mut read = vec![Some(LOW); 9];
+        read.push(Some(HIGH));
+
+        // Two columns captured since the read was asked for take its newest color.
+        let mut expected = vec![Some(low); 9];
+        expected.extend([Some(high); 3]);
+        assert_eq!(colors_of(read.clone(), 0..1_000, 0..1_200, 1_000), expected);
+
+        // No further than half a second past the read: the rest has not been read for longer
+        // and keeps the theme color.
+        let colors = colors_of(read.clone(), 0..1_000, 0..2_000, 1_000);
+        assert_eq!(colors[9..15], [Some(high); 6]);
+        assert_eq!(colors[15..], [None; 5]);
+
+        // A read ending in silence leaves the edge after it plain too.
+        let mut quiet = read.clone();
+        quiet[9] = Some([0.0; 6]);
+        let colors = colors_of(quiet, 0..1_000, 0..1_200, 1_000);
+        assert_eq!(colors[8], Some(low));
+        assert_eq!(colors[9..], [None; 3]);
+
+        // The oldest edge, not read yet, is not filled from the newer side.
+        let colors = colors_of(read[5..].to_vec(), 500..1_000, 0..1_000, 1_000);
+        assert_eq!(colors[..5], [None; 5]);
+        assert_eq!(colors[5..], [Some(low), Some(low), Some(low), Some(low), Some(high)]);
+
+        // A read that covers the view, or no rate to measure half a second by, carries nothing.
+        assert_eq!(colors_of(read.clone(), 0..1_000, 0..1_000, 1_000)[9], Some(high));
+        assert_eq!(colors_of(read, 0..1_000, 0..1_200, 0)[10..], [None; 2]);
+
+        let mut colors = [Some(low), None, None];
+        carry_to_newest_edge(&mut colors, 0..3);
+        assert_eq!(colors, [Some(low), None, None]);
+        carry_to_newest_edge(&mut colors, 1..9);
+        assert_eq!(colors, [Some(low); 3]);
     }
 
     #[test]

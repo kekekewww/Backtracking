@@ -237,7 +237,9 @@ fn the_rows_of_a_surround_capture_take_their_own_channels_colors() {
     let palette = Spectrum::default().palette(backtracking_core::waveform::SPECTRUM_BANDS);
     let bins = capture.row_peaks[0].minimum.len();
     let colors = |capture: &CaptureUi, row: WideRow| {
-        capture.waveform_colors.row_colors(wide_color_row(row), &capture.peak_frames, bins, &palette)
+        let row = wide_color_row(row);
+        let rate = capture.timeline.sample_rate;
+        capture.waveform_colors.row_colors(row, &capture.peak_frames, bins, &palette, rate)
     };
     let middle = bins / 2;
     for (row, expected) in [
@@ -438,7 +440,9 @@ fn color_summary(capture: &CaptureUi, settings: &SessionSettings) -> String {
     let (rows, bins) = capture.color_rows();
     rows.iter()
         .map(|&row| {
-            let colors = capture.waveform_colors.row_colors(row, &capture.peak_frames, bins, &palette);
+            let rate = capture.timeline.sample_rate;
+            let colors =
+                capture.waveform_colors.row_colors(row, &capture.peak_frames, bins, &palette, rate);
             let line: Vec<_> = colors
                 .iter()
                 .step_by(24)
