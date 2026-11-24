@@ -63,7 +63,9 @@
 //!   `gradient=<#rrggbb@position,...|default>` makes those stops (2 to 8, positions from 0 for
 //!   the lowest frequencies to 1 for the highest, as in the `waveform-gradient-v1` settings
 //!   file) the user's own gradient, or puts the default back, as the Appearance page's
-//!   "Waveform color" rows do; both keep the choice. The picture waits for the colours.
+//!   "Waveform color" rows do; both keep the choice. The picture waits for the colours, unless
+//!   `color-wait=off` came first: then it is taken while a read may be in flight, as a person
+//!   watching the live view sees it (`color-wait=on` waits again).
 //!
 //! The picture is `<file.png>`; `<file.png>.log` gets the frame times and any problem.
 
@@ -138,6 +140,8 @@ pub(super) enum Step {
     WaveformColor(WaveformColoring),
     /// The user's own gradient for colouring by frequency, or none for the default.
     Gradient(Option<backtracking_ui::Spectrum>),
+    /// Whether steps and the picture wait for the colours by frequency in flight.
+    ColorWait(bool),
 }
 
 impl Step {
@@ -402,6 +406,11 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                             format!("{stops} is not 2 to 8 stops like #e8302c@0,#2c68ec@1")
                         }),
                 },
+                "color-wait" => match value.trim() {
+                    "on" => Ok(Step::ColorWait(true)),
+                    "off" => Ok(Step::ColorWait(false)),
+                    other => Err(format!("{other} is not on or off")),
+                },
                 other => Err(format!("unknown step {other}")),
             }
         })
@@ -435,6 +444,8 @@ pub(super) struct Harness {
     hold: Duration,
     /// A `drag-prepare=` waits for the drag's files and copies them here.
     drag_copy: Option<PathBuf>,
+    /// Steps and the picture wait for the colours by frequency in flight (`color-wait=`).
+    color_wait: bool,
 }
 
 impl Harness {
@@ -536,6 +547,7 @@ impl Harness {
             options_shot: None,
             hold: Duration::ZERO,
             drag_copy: None,
+            color_wait: true,
         })
     }
 
@@ -678,7 +690,7 @@ impl Recorder {
             && self.edit_request.is_none()
             && self.edit_preview.is_none()
             // Colours by frequency are read off the window's thread.
-            && !self.waveform_colors.busy()
+            && (!harness.color_wait || !self.waveform_colors.busy())
             // Dropped files are read in the next pass, and the manager answers after that.
             && harness.main_drops.is_empty()
             && harness.main_keys.is_empty()
@@ -959,6 +971,11 @@ impl Recorder {
                 self.set_waveform_gradient(gradient.clone());
                 self.save_waveform_gradient();
                 ctx.request_repaint();
+            }
+            &Step::ColorWait(wait) => {
+                if let Some(harness) = self.harness.as_mut() {
+                    harness.color_wait = wait;
+                }
             }
         }
         Ok(())
@@ -1481,7 +1498,7 @@ mod tests {
         assert_eq!(
             parse_steps(
                 "waveform-color=frequency; gradient=#e8302c@0,#28c85a@0.5,#2c68ec@1; \
-                 gradient=default;waveform-color=single"
+                 gradient=default;waveform-color=single;color-wait=off;color-wait=on"
             )
             .unwrap(),
             [
@@ -1496,6 +1513,8 @@ mod tests {
                 )),
                 Step::Gradient(None),
                 Step::WaveformColor(WaveformColoring::Single),
+                Step::ColorWait(false),
+                Step::ColorWait(true),
             ]
         );
         assert!(!Step::Gradient(None).waits());
@@ -1504,6 +1523,7 @@ mod tests {
             "gradient=",
             "gradient=#e8302c@0",
             "gradient=red@0,blue@1",
+            "color-wait=maybe",
         ] {
             assert!(parse_steps(bad).is_err(), "{bad}");
         }

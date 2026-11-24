@@ -84,6 +84,73 @@ impl RowSpectrum {
             })
             .collect()
     }
+
+    /// [`Self::column_colors`] as the window draws them: a quiet run between two colours takes
+    /// the nearer one ([`fill_quiet_columns`]), and the columns past the newest frame this read
+    /// covers take the colour just before them ([`fill_newest_unread`]) while that stretch is
+    /// at most `live_edge` frames long. Pass 0 where no newer audio is on its way.
+    pub(super) fn drawn_colors(
+        &self,
+        visible: &Range<u64>,
+        columns: usize,
+        palette: &SpectrumPalette,
+        live_edge: u64,
+    ) -> Vec<Option<Color32>> {
+        let mut colors = self.column_colors(visible, columns, palette);
+        fill_quiet_columns(&mut colors);
+        fill_newest_unread(&mut colors, visible, self.frames.end, live_edge);
+        colors
+    }
+}
+
+/// How far past the newest frame a live read covers its colours are carried forward: the audio
+/// that arrived since the read pinned its frames. That is one or two window passes plus the
+/// read itself (milliseconds once the band cache is warm), so a quarter second covers it with
+/// room to spare; a wrong guess there lasts only until the next read, at most that long. A
+/// longer stretch without colours (the first read after turning the colours on, a view moved
+/// past what was read) is left in the single colour until it is read.
+pub(super) const LIVE_EDGE_SECONDS: f64 = 0.25;
+
+/// Gives the columns over frames at or past `read_end`, the newest frame a read covers, the
+/// colour of the nearest coloured column before them, when the visible frames run at most
+/// `reach` frames past `read_end` and that column lies within `reach` frames of it too.
+/// Columns the read covered and found quiet are left as they are; nothing changes when the
+/// read reaches the end of `visible`, or with `reach` 0.
+fn fill_newest_unread(
+    colors: &mut [Option<Color32>],
+    visible: &Range<u64>,
+    read_end: u64,
+    reach: u64,
+) {
+    let columns = colors.len();
+    if columns == 0
+        || reach == 0
+        || visible.end <= read_end
+        || visible.end - read_end > reach
+        || read_end <= visible.start
+    {
+        return;
+    }
+    let shown = u128::from(visible.end - visible.start);
+    let middle = |column: usize| {
+        visible.start + ((2 * column as u128 + 1) * shown / (2 * columns as u128)) as u64
+    };
+    let first_unread = (0..columns)
+        .rev()
+        .take_while(|&column| middle(column) >= read_end)
+        .last();
+    let Some(first_unread) = first_unread else {
+        return;
+    };
+    let source = (0..first_unread)
+        .rev()
+        .take_while(|&column| middle(column) + reach >= read_end)
+        .find_map(|column| colors[column]);
+    if let Some(color) = source {
+        for column in &mut colors[first_unread..] {
+            column.get_or_insert(color);
+        }
+    }
 }
 
 /// What one read covers. A read for the live view names the revision it was asked at; one
@@ -330,7 +397,7 @@ fn drawn_spectrum(user: Option<&Spectrum>, look: &AddonLook, theme: &Theme) -> S
 /// Gives each run of columns without a colour that lies between two coloured ones (a quiet
 /// moment, a fade, a gap between sounds) the colour of its nearer neighbour, so the waveform
 /// does not flash its single colour there. Runs at either end stay without one: those may be
-/// audio not read yet, as at the newest edge of the live view.
+/// audio not read yet; [`fill_newest_unread`] handles the newest edge of the live view.
 fn fill_quiet_columns(colors: &mut [Option<Color32>]) {
     let mut previous: Option<usize> = None;
     for index in 0..colors.len() {
@@ -570,13 +637,16 @@ impl Recorder {
         columns: usize,
         palette: &SpectrumPalette,
     ) -> Vec<Option<Color32>> {
+        // Only the live view has newer audio than its last read; the editing copy's reads
+        // cover all of it.
+        let live_edge = if self.editing.is_none() {
+            (LIVE_EDGE_SECONDS * f64::from(self.sample_rate)) as u64
+        } else {
+            0
+        };
         self.waveform_colors.row(row).map_or_else(
             || vec![None; columns],
-            |spectrum| {
-                let mut colors = spectrum.column_colors(&self.visible_frames, columns, palette);
-                fill_quiet_columns(&mut colors);
-                colors
-            },
+            |spectrum| spectrum.drawn_colors(&self.visible_frames, columns, palette, live_edge),
         )
     }
 
@@ -770,6 +840,61 @@ mod tests {
         let mut nothing = [None; 4];
         fill_quiet_columns(&mut nothing);
         assert_eq!(nothing, [None; 4]);
+    }
+
+    #[test]
+    fn only_a_short_unread_stretch_at_the_newest_edge_takes_the_colour_before_it() {
+        let palette = Spectrum::default().palette(SPECTRUM_BANDS);
+        let low = Some(Spectrum::DEFAULT_LOW);
+        let high = Some(Spectrum::DEFAULT_HIGH);
+        let visible = 0..1_000;
+        // Ten columns of 100 frames; the read stops at 900, so the last column is not read.
+        let behind = row(
+            0..900,
+            vec![Some(LOW); 8].into_iter().chain([Some(HIGH)]).collect(),
+        );
+        let mut expected = vec![low; 8];
+        expected.extend([high, None]);
+        assert_eq!(behind.drawn_colors(&visible, 10, &palette, 0), expected);
+        // Within reach it takes the newest colour read.
+        expected[9] = high;
+        assert_eq!(behind.drawn_colors(&visible, 10, &palette, 250), expected);
+        // A longer unread stretch than the reach stays in the single colour.
+        expected[9] = None;
+        assert_eq!(behind.drawn_colors(&visible, 10, &palette, 50), expected);
+        let cold = row(0..300, vec![Some(LOW); 3]);
+        assert_eq!(
+            cold.drawn_colors(&visible, 10, &palette, 250),
+            [low, low, low, None, None, None, None, None, None, None]
+        );
+        // The oldest edge is never filled.
+        let older = row(200..1_000, vec![Some(LOW); 8]);
+        let mut expected = vec![None, None];
+        expected.extend([low; 8]);
+        assert_eq!(older.drawn_colors(&visible, 10, &palette, 250), expected);
+        // Silence the read found stays without a colour; the unread column looks past it only
+        // as far as the reach goes.
+        let quiet_end = row(
+            0..900,
+            vec![Some(LOW); 6].into_iter().chain([None; 3]).collect(),
+        );
+        let mut expected = vec![low; 6];
+        expected.extend([None; 4]);
+        assert_eq!(
+            quiet_end.drawn_colors(&visible, 10, &palette, 250),
+            expected
+        );
+        expected[9] = low;
+        assert_eq!(
+            quiet_end.drawn_colors(&visible, 10, &palette, 400),
+            expected
+        );
+        // A read that covers the view is drawn as read.
+        let whole = row(0..1_000, vec![Some(HIGH); 10]);
+        assert_eq!(
+            whole.drawn_colors(&visible, 10, &palette, 250),
+            vec![high; 10]
+        );
     }
 
     fn job(tracks: [Option<FrozenTrack>; 2], rows: Vec<RowSource>, frames: Range<u64>) -> Job {
