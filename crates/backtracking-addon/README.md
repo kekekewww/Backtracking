@@ -41,12 +41,15 @@ lists it for each platform. Only the Windows path has been run against the app.
 Declare `"appearance"` in `addon.json` and send a complete `protocol::Appearance`
 with `Client::send_appearance`. Its color maps use RGBA bytes. Use
 `APPEARANCE_COLOR_NAMES` and `APPEARANCE_NUMBER_RANGES` from `protocol` for the
-supported names and values. Each message replaces the previous offer. Send
+supported names and values. `Appearance::spectrum` is an optional gradient for
+coloring the waveform by frequency: 2 to 8 `SpectrumStop`s, positions from 0 (low)
+to 1 (high) in order. `Client::send_appearance` returns an error for a spectrum
+the host would drop. Each message replaces the previous offer. Send
 `Appearance::default()` to clear it. The client allows up to ten updates per second.
 The user chooses whether to apply the offer in Options > Appearance.
 
 Build with `cargo build --locked --release --example theme_example`. Copy the
 resulting `theme_example.exe` to `examples/theme-package/bin/theme-example.exe`
 and run `btaddon-pack` on `examples/theme-package`. The example offers waveform
-colors and updates its border color four times per second until the host tells
-it to quit. [Example source](examples/theme_example.rs) · [Package manifest](examples/theme-package/addon.json)
+colors and a three-stop spectrum, and updates its border color four times per
+second until the host tells it to quit. [Example source](examples/theme_example.rs) · [Package manifest](examples/theme-package/addon.json)

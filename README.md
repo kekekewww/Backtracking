@@ -84,6 +84,7 @@ You can try this in a browser, with nothing to install: [open the live demo](htt
 - **More than one recorder.** **New capture window** opens extra desktop recorders, each with its own source.
 - **WAV the way you need it.** 44.1, 48 or 96 kHz, in 16-bit PCM, 24-bit PCM or 32-bit float. The default is 48 kHz, 32-bit float.
 - **Readable levels.** The live meter shows dBFS, VU or momentary LUFS, and the waveform can be merged or split into L/R.
+- **Color by frequency.** In the Windows desktop app, **Waveform color: By frequency** colors the waveform from its low to its high frequencies, red to blue by default, in colors you can change.
 - **Your look.** Accent color, border width, background transparency, and whether the app name, meters and capture status mark are shown.
 - **A tidy disk.** A snapshot is saved to one folder only. **Delete old drag-and-drop files**, Off by default, removes drag-and-drop WAVs after 10, 20, 30, 60 or 90 days.
 - **Signed updates.** The desktop apps can install later releases from **Options → Updates**.

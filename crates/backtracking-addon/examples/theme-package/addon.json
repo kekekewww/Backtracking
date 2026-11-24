@@ -4,7 +4,7 @@
   "name": "Example appearance",
   "version": "0.1.0",
   "author": "Backtracking contributors",
-  "description": "Offers waveform colors and a slowly changing border color.",
+  "description": "Offers waveform colors, frequency colors and a slowly changing border color.",
   "license": "Apache-2.0",
   "capabilities": ["appearance"],
   "run": {

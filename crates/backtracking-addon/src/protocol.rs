@@ -9,8 +9,9 @@ use crate::{Error, Result};
 
 mod appearance;
 pub use appearance::{
-    Appearance, APPEARANCE_COLOR_NAMES, APPEARANCE_NUMBER_RANGES,
-    MAX_APPEARANCE_MESSAGES_PER_SECOND, MAX_APPEARANCE_ROWS,
+    Appearance, SpectrumStop, APPEARANCE_COLOR_NAMES, APPEARANCE_NUMBER_RANGES,
+    MAX_APPEARANCE_MESSAGES_PER_SECOND, MAX_APPEARANCE_ROWS, MAX_SPECTRUM_STOPS,
+    MIN_SPECTRUM_STOPS,
 };
 
 const MAX_CHANNEL_LABEL_CHARS: usize = 24;
@@ -334,7 +335,8 @@ impl AddonMessage {
                 source_id("positions.source", source)?;
                 count_limit("positions.channels", channels.len(), 64)?;
             }
-            Self::Appearance(_) | Self::Unknown => {}
+            Self::Appearance(appearance) => appearance.validate()?,
+            Self::Unknown => {}
         }
         Ok(())
     }
@@ -867,6 +869,142 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn appearance_spectrum_round_trips_in_order_with_its_alpha() {
+        let input = json!({
+            "type": "appearance",
+            "colors": {"waveform": "#67e7b5"},
+            "spectrum": [
+                {"color": "#e8302c", "position": 0.0},
+                {"color": "#28c85a80", "position": 0.5},
+                // A second stop at one position is a hard edge, and keeps its place.
+                {"color": "#fac828", "position": 0.5},
+                {"color": "#2c68ec", "position": 1.0}
+            ]
+        });
+        assert_eq!(appearance_wire_after_validation(&input.to_string()), input);
+        let Ok(AddonMessage::Appearance(appearance)) = decode_addon(input.to_string().as_bytes())
+        else {
+            panic!("not an appearance");
+        };
+        assert_eq!(
+            appearance.spectrum[1],
+            SpectrumStop {
+                color: [40, 200, 90, 128],
+                position: 0.5
+            }
+        );
+        assert!(!Appearance {
+            spectrum: appearance.spectrum,
+            ..Appearance::default()
+        }
+        .is_empty());
+        // Upper-case digits, whole-number positions and fields this version does not know.
+        let loose = r##"{"type":"appearance","spectrum":[{"color":"#E8302C","position":0,"name":"low"},{"position":1,"color":"#2C68EC"}]}"##;
+        assert_eq!(
+            appearance_wire_after_validation(loose),
+            json!({"type":"appearance","spectrum":[
+                {"color":"#e8302c","position":0.0},{"color":"#2c68ec","position":1.0}
+            ]})
+        );
+    }
+
+    #[test]
+    fn appearance_spectrum_keeps_two_to_eight_stops_and_drops_any_other_list_whole() {
+        let stops = |count: usize| -> Vec<Value> {
+            (0..count)
+                .map(|index| {
+                    let position = index as f64 / (count.max(2) - 1) as f64;
+                    json!({"color": "#aabbcc", "position": position})
+                })
+                .collect()
+        };
+        for count in [2, 8] {
+            let input = json!({"type":"appearance","spectrum":stops(count)});
+            assert_eq!(appearance_wire_after_validation(&input.to_string()), input);
+        }
+        // An empty list is the same as none.
+        assert_eq!(
+            appearance_wire_after_validation(r#"{"type":"appearance","spectrum":[]}"#),
+            json!({"type":"appearance"})
+        );
+        let good = r##"{"color":"#2c68ec","position":1}"##;
+        let mut lists: Vec<String> = [1, 9]
+            .map(|count| Value::from(stops(count)).to_string())
+            .into();
+        for bad in [
+            r##"{"color":"#e8302c","position":-0.1}"##,
+            r##"{"color":"#e8302c","position":1.5}"##,
+            r##"{"color":"#e8302c","position":"0"}"##,
+            r##"{"color":"#e8302c","position":null}"##,
+            r##"{"color":"#e8302c","position":1e400}"##,
+            r##"{"color":"#e8302c"}"##,
+            r##"{"position":0}"##,
+            r##"{"color":"#e83","position":0}"##,
+            r##"{"color":"e8302c","position":0}"##,
+            r##"{"color":"#e8302g","position":0}"##,
+            r##"{"color":null,"position":0}"##,
+            r##""#e8302c@0""##,
+            "[0, 1]",
+            "null",
+        ] {
+            lists.push(format!("[{bad},{good}]"));
+        }
+        // Out of order: a gradient read another way than its author wrote it.
+        lists.push(format!(r##"[{good},{{"color":"#e8302c","position":0}}]"##));
+        for list in lists {
+            let input = format!(
+                r##"{{"type":"appearance","colors":{{"waveform":"#67e7b5"}},"spectrum":{list}}}"##
+            );
+            assert_eq!(
+                appearance_wire_after_validation(&input),
+                json!({"type":"appearance","colors":{"waveform":"#67e7b5"}}),
+                "kept {list}"
+            );
+        }
+    }
+
+    #[test]
+    fn appearance_spectrum_that_is_not_a_list_ignores_the_message() {
+        for value in ["null", "{}", "\"#e8302c@0,#2c68ec@1\"", "0", "true", "1e400"] {
+            let input = format!(
+                r##"{{"type":"appearance","colors":{{"waveform":"#67e7b5"}},"spectrum":{value}}}"##
+            );
+            assert_eq!(
+                decode_addon(input.as_bytes()).unwrap(),
+                AddonMessage::Unknown,
+                "accepted {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_appearance_with_a_spectrum_the_host_would_drop_is_not_sent() {
+        let stop = |position| SpectrumStop {
+            color: [232, 48, 44, 255],
+            position,
+        };
+        for spectrum in [
+            vec![stop(0.0)],
+            vec![stop(0.0); 9],
+            vec![stop(1.0), stop(0.0)],
+            vec![stop(0.0), stop(1.5)],
+            vec![stop(f64::NAN), stop(1.0)],
+        ] {
+            let message = AddonMessage::Appearance(Appearance {
+                spectrum,
+                ..Appearance::default()
+            });
+            let error = encode_addon(&message).unwrap_err().to_string();
+            assert!(error.contains("appearance.spectrum"), "{error}");
+        }
+        let message = AddonMessage::Appearance(Appearance {
+            spectrum: vec![stop(0.0), stop(0.0), stop(1.0)],
+            ..Appearance::default()
+        });
+        assert!(encode_addon(&message).is_ok());
     }
 
     #[test]

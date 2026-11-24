@@ -84,6 +84,7 @@
 - **多個錄音器** 桌面版可用 **New capture window** 開啟額外的擷取視窗，各自選擇來源。
 - **WAV 規格** 44.1、48 或 96 kHz，16-bit PCM、24-bit PCM 或 32-bit float。預設為 48 kHz、32-bit float。
 - **音量一目了然** 即時音量表可顯示 dBFS、VU 或瞬時 LUFS，波形可合併顯示或分成 L/R。
+- **依頻率上色** Windows 桌面版的 **Waveform color: By frequency** 依低頻到高頻為波形上色，預設由紅到藍，顏色可以自訂。
 - **外觀可調** 主題色、外框寬度、背景透明度，以及是否顯示程式名稱、音量表與擷取狀態標記。
 - **不佔多餘空間** 快照只存到一個資料夾。**Delete old drag-and-drop files** 預設關閉，開啟後會刪除超過 10、20、30、60 或 90 天的拖放 WAV。
 - **簽章更新** 桌面版可在 **Options → Updates** 安裝之後的版本。

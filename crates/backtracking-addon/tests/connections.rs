@@ -380,6 +380,65 @@ fn host_discards_appearance_updates_on_disconnect() {
 }
 
 #[test]
+fn a_spectrum_reaches_the_host_from_the_client_and_a_bad_one_is_refused_before_sending() {
+    use backtracking_addon::protocol::SpectrumStop;
+
+    let mut host = Host::bind("test").unwrap();
+    host.expect_addon("com.example.theme", "secret", BTreeMap::new())
+        .unwrap();
+    let port = host.port();
+    let stop = |color, position| SpectrumStop { color, position };
+    let offer = Appearance {
+        colors: BTreeMap::from([("waveform".into(), [103, 231, 181, 255])]),
+        spectrum: vec![
+            stop([250, 120, 60, 255], 0.0),
+            stop([240, 220, 90, 255], 0.45),
+            stop([120, 200, 255, 200], 1.0),
+        ],
+        ..Appearance::default()
+    };
+    let sent = offer.clone();
+    let worker = std::thread::spawn(move || {
+        let mut client = Client::connect(
+            port,
+            "secret",
+            std::env::temp_dir(),
+            "com.example.theme",
+            "1",
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        let backwards = Appearance {
+            spectrum: vec![stop([0, 0, 0, 255], 1.0), stop([0, 0, 0, 255], 0.0)],
+            ..Appearance::default()
+        };
+        let error = client.send_appearance(&backwards).unwrap_err().to_string();
+        assert!(error.contains("spectrum"), "{error}");
+        client.send_appearance(&sent).unwrap();
+        // Leaving the spectrum out of the next offer clears it.
+        client
+            .send_appearance(&Appearance {
+                spectrum: Vec::new(),
+                ..sent
+            })
+            .unwrap();
+        assert!(matches!(
+            client.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Some(HostMessage::Quit)
+        ));
+    });
+    let mut connection = wait_connected(&mut host);
+    assert_eq!(receive_next(&mut connection), AddonMessage::Appearance(offer.clone()));
+    let AddonMessage::Appearance(cleared) = receive_next(&mut connection) else {
+        panic!("not an appearance");
+    };
+    assert!(cleared.spectrum.is_empty());
+    assert_eq!(cleared.colors, offer.colors);
+    connection.send(&HostMessage::Quit).unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
 fn client_refuses_the_eleventh_appearance_update_in_a_rolling_second() {
     use backtracking_addon::protocol::decode_addon;
 

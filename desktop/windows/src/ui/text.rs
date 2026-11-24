@@ -629,6 +629,30 @@ impl Language {
         )
     }
 
+    /// The user has no gradient of their own and the chosen look of `addon` offers one.
+    pub(crate) fn gradient_from_look(self, addon: &str) -> String {
+        match self {
+            Self::English => format!(
+                "These colors come from the look of {addon}. Changing one makes them your own."
+            ),
+            Self::TraditionalChinese => {
+                format!("這些顏色來自 {addon} 的外觀。修改其中任何一個，它們就成為你自己的顏色。")
+            }
+        }
+    }
+
+    /// The user's own gradient is drawn instead of the one the chosen look of `addon` offers.
+    pub(crate) fn gradient_own_over_look(self, addon: &str) -> String {
+        match self {
+            Self::English => format!(
+                "Your own colors are used instead of the ones from the look of {addon}. Reset uses the look's colors again."
+            ),
+            Self::TraditionalChinese => {
+                format!("目前使用你自己的顏色，而不是 {addon} 外觀的顏色。按「重設」會改回該外觀的顏色。")
+            }
+        }
+    }
+
     /// Some stop is too dark or faint to see on the plot.
     pub(crate) fn gradient_illegible(self) -> &'static str {
         self.pick(
@@ -1811,6 +1835,24 @@ mod tests {
         assert_eq!(
             WaveformColoring::ALL.map(|coloring| English.waveform_coloring(coloring)),
             ["Single color", "By frequency"]
+        );
+        // Where the colours come from, naming the add-on whose look offers them.
+        for text in [
+            super::Language::gradient_from_look,
+            super::Language::gradient_own_over_look,
+        ] {
+            let (english, chinese) = (
+                text(English, "Example appearance"),
+                text(TraditionalChinese, "Example appearance"),
+            );
+            assert_ne!(english, chinese);
+            assert!(english.contains("Example appearance"), "{english}");
+            assert!(chinese.contains("Example appearance"), "{chinese}");
+            assert!(chinese.chars().any(|c| c as u32 >= 0x3000), "{chinese}");
+        }
+        assert_ne!(
+            English.gradient_from_look("A"),
+            English.gradient_own_over_look("A")
         );
     }
 

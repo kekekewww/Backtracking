@@ -3,10 +3,10 @@
 //!
 //! Each column of a row takes its colour from the band energies of the audio it draws
 //! (`backtracking_core::waveform::SpectrumBin`) through a gradient: the user's own when they
-//! made one, else the one a chosen look offers ([`AddonLook::offered_spectrum`], which offers
-//! none yet), else the default. Every stop first passes `Theme::legible_spectrum`, which
-//! puts a stop that would be hard to see back to the default colour at its position, as
-//! `Theme::legible` puts back a look's colour.
+//! made one, else the one a chosen look offers (`AddonLook::offered_spectrum`, the
+//! `spectrum` of its appearance), else the default. Every stop first passes
+//! `Theme::legible_spectrum`, which puts a stop that would be hard to see back to the default
+//! colour at its position, as `Theme::legible` puts back a look's colour.
 //!
 //! Threads and locks. Band energies are read only on this module's thread,
 //! `backtracking-waveform-colours`, and only from frozen audio, never from the live capture:
@@ -35,12 +35,12 @@ use std::time::{Duration, Instant};
 use backtracking_core::FrozenTrack;
 use backtracking_core::waveform::{PairGroup, SPECTRUM_BANDS, SpectrumBin, SpectrumRow};
 use backtracking_ui::{
-    OPTIONS_CONTROL_OUTLINE, Spectrum, SpectrumPalette, SpectrumStop, options_choice,
+    OPTIONS_CONTROL_OUTLINE, Spectrum, SpectrumPalette, SpectrumStop, Theme, options_choice,
     options_control_width, options_field, options_note,
 };
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 
-use super::{Recorder, RowSource, text::Language};
+use super::{AddonLook, Recorder, RowSource, text::Language};
 use crate::preferences::{Key, WaveformColoring, serialize_gradient};
 
 /// The band energies of one row, read for `frames` in `bins.len()` equal parts, as the
@@ -315,6 +315,18 @@ pub(super) fn chosen_spectrum(
         .unwrap_or_default()
 }
 
+/// The gradient drawn for the `user`'s own gradient, if any, and `look`: the chosen one of
+/// those ([`chosen_spectrum`]), its stops checked for legibility on `theme`'s plot, the look
+/// the window draws with now.
+fn drawn_spectrum(user: Option<&Spectrum>, look: &AddonLook, theme: &Theme) -> Spectrum {
+    let chosen = chosen_spectrum(
+        user,
+        look.chosen().is_some(),
+        look.offered_spectrum().as_ref(),
+    );
+    theme.legible_spectrum(&chosen, egui::Visuals::dark().panel_fill)
+}
+
 /// Gives each run of columns without a colour that lies between two coloured ones (a quiet
 /// moment, a fade, a gap between sounds) the colour of its nearer neighbour, so the waveform
 /// does not flash its single colour there. Runs at either end stay without one: those may be
@@ -414,17 +426,135 @@ fn added_stop(spectrum: &Spectrum) -> SpectrumStop {
     }
 }
 
+/// What the user did on the "Frequency colors" rows in one pass.
+#[derive(Debug, Default, PartialEq)]
+struct GradientEdit {
+    /// The gradient as the user left it, which becomes their own.
+    edited: Option<Spectrum>,
+    /// Reset was pressed: the user's own gradient goes.
+    reset: bool,
+}
+
+/// The "Frequency colors" rows: `drawn` painted as a bar, and a row to edit each stop of
+/// `chosen`, the gradient in use before it is checked. Editing any stop of it makes the
+/// result the user's own, so editing a look's colours starts from them. `own` is whether the
+/// user has their own gradient, which Reset removes. `look` names the add-on whose look offers
+/// a gradient, which a note says is where the colours come from, or what Reset goes back to.
+fn gradient_rows(
+    ui: &mut egui::Ui,
+    language: Language,
+    chosen: &Spectrum,
+    drawn: &Spectrum,
+    own: bool,
+    look: Option<&str>,
+) -> GradientEdit {
+    let mut edit = GradientEdit::default();
+    options_field(ui, language.gradient_field(), |ui| {
+        let width = options_control_width(ui);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 16.0), egui::Sense::hover());
+        paint_gradient(ui.painter(), rect, drawn);
+        ui.horizontal(|ui| {
+            ui.set_width(width);
+            ui.small(language.gradient_low());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.small(language.gradient_high());
+            });
+        });
+        let mut stops = chosen.stops().to_vec();
+        let count = stops.len();
+        let mut changed = false;
+        let mut removed = None;
+        for index in 0..count {
+            ui.push_id(("gradient-stop", index), |ui| {
+                ui.horizontal(|ui| {
+                    let [r, g, b, _] = stops[index].color.to_array();
+                    let mut rgb = [r, g, b];
+                    if ui.color_edit_button_srgb(&mut rgb).changed() {
+                        let [r, g, b] = rgb;
+                        stops[index].color = Color32::from_rgb(r, g, b);
+                        changed = true;
+                    }
+                    if index == 0 || index + 1 == count {
+                        ui.label(if index == 0 {
+                            language.gradient_low()
+                        } else {
+                            language.gradient_high()
+                        });
+                        return;
+                    }
+                    // A middle stop moves between its neighbours, so the list keeps its
+                    // order under the pointer. A position between whole percents (a look's
+                    // 1/3, say) is left as it is until the user moves it: clamping it would
+                    // round it, which counts as an edit and would make the look's colours
+                    // the user's own.
+                    let range =
+                        stops[index - 1].position * 100.0..=stops[index + 1].position * 100.0;
+                    let mut percent = stops[index].position * 100.0;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut percent, range)
+                                .clamping(egui::SliderClamping::Edits)
+                                .suffix(" %")
+                                .fixed_decimals(0),
+                        )
+                        .on_hover_text(language.gradient_position())
+                        .changed()
+                    {
+                        stops[index].position = (percent / 100.0).clamp(0.0, 1.0);
+                        changed = true;
+                    }
+                    if ui.small_button(language.gradient_remove()).clicked() {
+                        removed = Some(index);
+                    }
+                });
+            });
+        }
+        if let Some(index) = removed {
+            stops.remove(index);
+            changed = true;
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    count < Spectrum::MAX_STOPS,
+                    egui::Button::new(language.gradient_add()),
+                )
+                .clicked()
+                && let Ok(spectrum) = Spectrum::new(stops.iter().copied())
+            {
+                stops.push(added_stop(&spectrum));
+                changed = true;
+            }
+            edit.reset = ui
+                .add_enabled(own, egui::Button::new(language.gradient_reset()))
+                .clicked();
+        });
+        if changed && let Ok(spectrum) = Spectrum::new(stops) {
+            edit.edited = Some(spectrum);
+        }
+        options_note(ui, language.gradient_note());
+        if let Some(name) = look {
+            options_note(
+                ui,
+                if own {
+                    language.gradient_own_over_look(name)
+                } else {
+                    language.gradient_from_look(name)
+                },
+            );
+        }
+        if drawn != chosen {
+            options_note(ui, language.gradient_illegible());
+        }
+    });
+    edit
+}
+
 impl Recorder {
     /// The gradient "By frequency" draws with now, its stops checked for legibility on this
     /// window's plot.
     pub(super) fn drawn_spectrum(&self) -> Spectrum {
-        let chosen = chosen_spectrum(
-            self.waveform_gradient.as_ref(),
-            self.look.chosen().is_some(),
-            self.look.offered_spectrum().as_ref(),
-        );
-        self.theme
-            .legible_spectrum(&chosen, egui::Visuals::dark().panel_fill)
+        drawn_spectrum(self.waveform_gradient.as_ref(), &self.look, &self.theme)
     }
 
     /// The band colours to draw with, while the waveform is coloured by frequency.
@@ -545,95 +675,15 @@ impl Recorder {
             self.look.offered_spectrum().as_ref(),
         );
         let drawn = self.drawn_spectrum();
-        let mut edited = None;
-        let mut reset = false;
-        options_field(ui, language.gradient_field(), |ui| {
-            let width = options_control_width(ui);
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 16.0), egui::Sense::hover());
-            paint_gradient(ui.painter(), rect, &drawn);
-            ui.horizontal(|ui| {
-                ui.set_width(width);
-                ui.small(language.gradient_low());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.small(language.gradient_high());
-                });
-            });
-            let mut stops = chosen.stops().to_vec();
-            let count = stops.len();
-            let mut changed = false;
-            let mut removed = None;
-            for index in 0..count {
-                ui.push_id(("gradient-stop", index), |ui| {
-                    ui.horizontal(|ui| {
-                        let [r, g, b, _] = stops[index].color.to_array();
-                        let mut rgb = [r, g, b];
-                        if ui.color_edit_button_srgb(&mut rgb).changed() {
-                            let [r, g, b] = rgb;
-                            stops[index].color = Color32::from_rgb(r, g, b);
-                            changed = true;
-                        }
-                        if index == 0 || index + 1 == count {
-                            ui.label(if index == 0 {
-                                language.gradient_low()
-                            } else {
-                                language.gradient_high()
-                            });
-                            return;
-                        }
-                        // A middle stop moves between its neighbours, so the list keeps its
-                        // order under the pointer.
-                        let range =
-                            stops[index - 1].position * 100.0..=stops[index + 1].position * 100.0;
-                        let mut percent = stops[index].position * 100.0;
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut percent, range)
-                                    .suffix(" %")
-                                    .fixed_decimals(0),
-                            )
-                            .on_hover_text(language.gradient_position())
-                            .changed()
-                        {
-                            stops[index].position = (percent / 100.0).clamp(0.0, 1.0);
-                            changed = true;
-                        }
-                        if ui.small_button(language.gradient_remove()).clicked() {
-                            removed = Some(index);
-                        }
-                    });
-                });
-            }
-            if let Some(index) = removed {
-                stops.remove(index);
-                changed = true;
-            }
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        count < Spectrum::MAX_STOPS,
-                        egui::Button::new(language.gradient_add()),
-                    )
-                    .clicked()
-                    && let Ok(spectrum) = Spectrum::new(stops.iter().copied())
-                {
-                    stops.push(added_stop(&spectrum));
-                    changed = true;
-                }
-                reset = ui
-                    .add_enabled(
-                        self.waveform_gradient.is_some(),
-                        egui::Button::new(language.gradient_reset()),
-                    )
-                    .clicked();
-            });
-            if changed && let Ok(spectrum) = Spectrum::new(stops) {
-                edited = Some(spectrum);
-            }
-            options_note(ui, language.gradient_note());
-            if drawn != chosen {
-                options_note(ui, language.gradient_illegible());
-            }
-        });
+        let look = self.look.spectrum_offered_by();
+        let GradientEdit { edited, reset } = gradient_rows(
+            ui,
+            language,
+            &chosen,
+            &drawn,
+            self.waveform_gradient.is_some(),
+            look.as_deref(),
+        );
         let repaint = reset || edited.is_some();
         if reset {
             self.set_waveform_gradient(None);
@@ -810,6 +860,232 @@ mod tests {
         );
         assert_eq!(chosen_spectrum(None, true, None), Spectrum::default());
         assert_eq!(chosen_spectrum(None, false, None), Spectrum::default());
+    }
+
+    const ACCENT: Color32 = Color32::from_rgb(103, 231, 181);
+    const THEME_ID: &str = "com.example.theme";
+
+    /// The offers after the example look sends `line`, as the host decodes it.
+    fn offers_from(line: &str) -> Arc<crate::addons::AddonAppearances> {
+        use backtracking_addon::protocol::{AddonMessage, decode_addon};
+        let AddonMessage::Appearance(appearance) = decode_addon(line.as_bytes()).unwrap() else {
+            panic!("not an appearance: {line}");
+        };
+        Arc::new([(THEME_ID.to_owned(), appearance)].into())
+    }
+
+    fn stop(position: f32, [r, g, b]: [u8; 3]) -> SpectrumStop {
+        SpectrumStop {
+            position,
+            color: Color32::from_rgb(r, g, b),
+        }
+    }
+
+    /// The example add-on's look, with its gradient.
+    const WARM: &str = r##"{"type":"appearance","colors":{"waveform":"#67e7b5","plot_background":"#141d2a"},"spectrum":[{"color":"#ff8c3c","position":0},{"color":"#f0dc5a80","position":0.45},{"color":"#6ec8ff","position":1}]}"##;
+
+    #[test]
+    fn the_users_gradient_beats_the_looks_which_beats_the_default_end_to_end() {
+        let mut look = AddonLook::new(Some(THEME_ID.into()));
+        let mut theme = Theme::default();
+        let mut take = |look: &mut AddonLook, offers| {
+            if let Some(newest) = look.update(offers, ACCENT) {
+                theme = newest;
+            }
+            theme.clone()
+        };
+        let warm = Spectrum::new([
+            stop(0.0, [255, 140, 60]),
+            // The alpha an add-on sends is not drawn.
+            stop(0.45, [240, 220, 90]),
+            stop(1.0, [110, 200, 255]),
+        ])
+        .unwrap();
+        let user = Spectrum::two(
+            Color32::from_rgb(250, 200, 40),
+            Color32::from_rgb(40, 200, 90),
+        );
+
+        // The look offers a gradient and the user has none: the look's, on its own plot.
+        let theme = take(&mut look, Some(offers_from(WARM)));
+        assert_eq!(theme.plot_background, Color32::from_rgb(20, 29, 42));
+        assert_eq!(drawn_spectrum(None, &look, &theme), warm);
+        // The user's own wins.
+        assert_eq!(drawn_spectrum(Some(&user), &look, &theme), user);
+
+        // A new offer that changes only the gradient changes nothing else, and is drawn.
+        let moved = WARM.replace("#6ec8ff", "#a0e0ff");
+        assert_eq!(look.update(Some(offers_from(&moved)), ACCENT), None);
+        assert_eq!(
+            drawn_spectrum(None, &look, &theme).stops()[2].color,
+            Color32::from_rgb(160, 224, 255)
+        );
+
+        // An offer without one, or a gradient the contract drops: the default.
+        let without = r##"{"type":"appearance","colors":{"waveform":"#67e7b5"}}"##;
+        let theme = take(&mut look, Some(offers_from(without)));
+        assert_eq!(drawn_spectrum(None, &look, &theme), Spectrum::default());
+        let backwards = WARM.replace(r#""position":0}"#, r#""position":0.9}"#);
+        let theme = take(&mut look, Some(offers_from(&backwards)));
+        assert_eq!(drawn_spectrum(None, &look, &theme), Spectrum::default());
+
+        // The look turned off: the default, while the add-on still offers its gradient.
+        let theme = take(&mut look, Some(offers_from(WARM)));
+        assert_eq!(drawn_spectrum(None, &look, &theme), warm);
+        look.choose(None);
+        let theme = take(&mut look, None);
+        assert_eq!(theme, Theme::default());
+        assert_eq!(drawn_spectrum(None, &look, &theme), Spectrum::default());
+        assert_eq!(drawn_spectrum(Some(&user), &look, &theme), user);
+
+        // A stop lost on the look's plot is drawn in the default colour there, as the user's.
+        look.choose(Some(THEME_ID.into()));
+        let dark = WARM.replace("#f0dc5a80", "#18202a");
+        let theme = take(&mut look, Some(offers_from(&dark)));
+        let drawn = drawn_spectrum(None, &look, &theme);
+        assert_eq!(
+            drawn.stops().iter().map(|stop| stop.color).collect::<Vec<_>>(),
+            [
+                Color32::from_rgb(255, 140, 60),
+                Spectrum::default().at(0.45),
+                Color32::from_rgb(110, 200, 255)
+            ]
+        );
+        let users_dark =
+            Spectrum::new([stop(0.0, [250, 200, 40]), stop(1.0, [24, 32, 42])]).unwrap();
+        assert_eq!(
+            drawn_spectrum(Some(&users_dark), &look, &theme).stops()[1].color,
+            Spectrum::default().at(1.0)
+        );
+    }
+
+    /// Draws the "Frequency colors" rows for three passes on one context, clicking the
+    /// button labelled `click` (when given) in the last two, and returns what the rows wrote
+    /// and what the user did.
+    fn gradient_rows_pass(
+        language: Language,
+        chosen: &Spectrum,
+        own: bool,
+        look: Option<&str>,
+        click: Option<&str>,
+    ) -> (Vec<String>, GradientEdit) {
+        let context = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(720.0, 600.0));
+        let mut texts = Vec::new();
+        let mut edit = GradientEdit::default();
+        let mut target = None;
+        for pass in 0..3 {
+            let mut events = Vec::new();
+            if let Some(pos) = target {
+                events.push(egui::Event::PointerMoved(pos));
+                events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: pass == 1,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ui| edit = gradient_rows(ui, language, chosen, chosen, own, look),
+            );
+            let shapes = std::mem::take(&mut output.shapes);
+            output.drop_without_applying_deltas();
+            texts.clear();
+            for shape in shapes {
+                if let egui::Shape::Text(text) = shape.shape {
+                    let label = text.galley.text().to_owned();
+                    if click == Some(label.as_str()) {
+                        target = Some(text.pos + text.galley.rect.center().to_vec2());
+                    }
+                    texts.push(label);
+                }
+            }
+        }
+        (texts, edit)
+    }
+
+    #[test]
+    fn the_frequency_colors_say_where_they_come_from_and_editing_starts_from_the_looks() {
+        let warm = Spectrum::new([
+            stop(0.0, [255, 140, 60]),
+            stop(0.45, [240, 220, 90]),
+            stop(1.0, [110, 200, 255]),
+        ])
+        .unwrap();
+        let name = "Example appearance";
+        for language in [Language::English, Language::TraditionalChinese] {
+            let from_look = language.gradient_from_look(name);
+            let over_look = language.gradient_own_over_look(name);
+            // The look's colours, and none of the user's own.
+            let (texts, edit) = gradient_rows_pass(language, &warm, false, Some(name), None);
+            assert!(texts.contains(&from_look), "{texts:?}");
+            assert!(!texts.contains(&over_look), "{texts:?}");
+            assert_eq!(edit, GradientEdit::default());
+            // Showing stops between whole percents edits nothing either.
+            let thirds = Spectrum::new([
+                stop(0.0, [255, 140, 60]),
+                stop(1.0 / 3.0, [240, 220, 90]),
+                stop(0.725, [120, 230, 160]),
+                stop(1.0, [110, 200, 255]),
+            ])
+            .unwrap();
+            let (_, edit) = gradient_rows_pass(language, &thirds, false, Some(name), None);
+            assert_eq!(edit, GradientEdit::default());
+            // Reset has nothing to remove yet.
+            let (_, edit) = gradient_rows_pass(
+                language,
+                &warm,
+                false,
+                Some(name),
+                Some(language.gradient_reset()),
+            );
+            assert!(!edit.reset);
+            // Adding a colour makes the look's stops, and the new one, the user's own.
+            let (_, edit) = gradient_rows_pass(
+                language,
+                &warm,
+                false,
+                Some(name),
+                Some(language.gradient_add()),
+            );
+            let own = edit.edited.expect("the user's own gradient");
+            assert_eq!(own.stops().len(), 4);
+            for stop in warm.stops() {
+                assert!(own.stops().contains(stop), "{stop:?} in {own:?}");
+            }
+
+            // The user's own over the look's: Reset goes back to the look's.
+            let (texts, _) = gradient_rows_pass(language, &own, true, Some(name), None);
+            assert!(texts.contains(&over_look), "{texts:?}");
+            assert!(!texts.contains(&from_look), "{texts:?}");
+            let (_, edit) = gradient_rows_pass(
+                language,
+                &own,
+                true,
+                Some(name),
+                Some(language.gradient_reset()),
+            );
+            assert_eq!(
+                edit,
+                GradientEdit {
+                    edited: None,
+                    reset: true
+                }
+            );
+
+            // No look with a gradient: no note about one.
+            for own in [false, true] {
+                let (texts, _) =
+                    gradient_rows_pass(language, &Spectrum::default(), own, None, None);
+                assert!(texts.contains(&language.gradient_note().to_owned()), "{texts:?}");
+                assert!(!texts.iter().any(|text| text.contains(name)), "{texts:?}");
+            }
+        }
     }
 
     #[test]

@@ -99,6 +99,18 @@ macOS 桌面版可從選單列顯示或隱藏視窗、暫停或恢復擷取、�
 
 **保留／History／Buffer** 可選 10、20、30、60 秒或 3、5、10 分鐘，預設為 20 秒。這是即時歷史的音訊長度。預設壓縮靜音時，兩段各 5 秒、相隔一分鐘的聲音會接在一起，中間只保留偵測需要的短緩衝；開啟保留安靜片段後，已知安靜時間也占用 History。非常小聲的內容在預設模式可能低於門檻。縮短會裁掉即時歷史最舊的部分，事後加長只增加接下來可保留的長度；固定編輯素材不因此重切。
 
+### 依頻率為波形上色（Windows 桌面版）
+
+在 Options 的 **Appearance** 頁，把 **波形顏色／Waveform color** 設為 **依頻率／By frequency**，波形的每個時刻會依它含有的聲音上色：低頻偏向第一個顏色，高頻偏向最後一個。預設由低頻的紅色到高頻的藍色，所以低沉的嗡聲偏紅、鈸聲偏藍，完整的混音落在兩者之間。預設的 **單一顏色／Single color** 照舊以一種顏色繪製。
+
+**頻率顏色／Frequency colors** 顯示漸層，並為每個顏色列一行，由低到高。按顏色可以更改它；拖曳中間顏色的滑桿，可在相鄰兩色之間移動它；**移除／Remove** 拿掉一個中間顏色；**新增顏色／Add color** 在最寬的間隔加入一個。漸層有 2 到 8 個顏色，**重設／Reset** 恢復預設。在波形背景上不易看清的顏色，會在它的位置改用預設顏色繪製，下方也會註明。
+
+有選區時，選區保留它的顏色，其餘波形變暗並偏灰，讓選區更明顯。
+
+附加元件的外觀（見「附加元件」）也可以提供這組顏色。只有在開啟依頻率、而且你沒有自己的顏色時才會使用，顏色下方會註明來自哪個附加元件。更改其中任何一個顏色，它們就以外觀的顏色為起點成為你自己的；之後按 **重設／Reset** 會改回外觀的顏色。附加元件無法替你開啟依頻率上色。
+
+目前只有 Windows 桌面版提供，macOS 桌面版尚未支援。
+
 ### 即時音量表
 
 齒輪旁的音量表顯示目前輸入的音訊，預設模式是 dBFS。從齒輪選單的音量表設定切換單位。macOS 桌面版也可直接點擊讀值切換。暫停錄音或目前無可用讀值時，顯示 `—`。
@@ -376,6 +388,18 @@ In the full interface, the toolbar's **Play/Pause** icon shows the available act
 - **Capture unavailable**. If the desktop recorder loses its connection, press **Play** to retry.
 
 **History / Buffer** offers 10/20/30/60 seconds or 3/5/10 minutes and defaults to 20 seconds. With default silence compression, two five-second sounds a minute apart join with only a short gap; Keep quiet sections also counts known silence against History. Very quiet input may fall below the default gate. Shortening trims the oldest live audio; lengthening gives future audio more room. Fixed editing material is not recut.
+
+### Color the waveform by frequency (Windows desktop)
+
+On the **Appearance** page of Options, set **Waveform color** to **By frequency** to color each moment of the waveform by the sound it holds: low frequencies toward the first color, high frequencies toward the last. The default runs from red for low to blue for high, so a low hum reads red, a hi-hat blue, and a full mix lands in between. **Single color**, the default, draws the waveform in one color as before.
+
+**Frequency colors** shows the gradient and one row for each color, lowest first. Click a color to change it, drag a middle color's slider to move it between its neighbors, **Remove** takes a middle color out, and **Add color** puts a new one in the widest gap. A gradient has 2 to 8 colors. **Reset** brings back the default. A color too hard to see on the waveform's background is drawn in the default color at its place, and a note under the colors says so.
+
+While there is a selection, the selected part keeps its colors and the rest of the waveform dims toward gray, so the selection stands out.
+
+A look from an add-on (see Add-ons) can supply these colors. They are used only while By frequency is on and you have no colors of your own, and a note under the colors names the add-on. Changing any of them makes them your own, starting from the look's; **Reset** then goes back to the look's colors. An add-on cannot turn By frequency on for you.
+
+Only the Windows desktop app has this for now; the macOS app does not yet.
 
 ### Live audio meter
 

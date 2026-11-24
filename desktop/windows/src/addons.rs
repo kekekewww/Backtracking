@@ -1995,11 +1995,12 @@ mod tests {
         let (handle, id) = appearance_fixture(&mut worker, Capability::Source);
         let before = handle.snapshot();
         let initial = handle.try_appearances().unwrap();
-        offer_appearance(
-            &mut worker,
-            &id,
+        for offer in [
             r##"{"type":"appearance","colors":{"waveform":"#67e7b5"}}"##,
-        );
+            r##"{"type":"appearance","spectrum":[{"color":"#ff8c3c","position":0},{"color":"#6ec8ff","position":1}]}"##,
+        ] {
+            offer_appearance(&mut worker, &id, offer);
+        }
         assert!(initial.is_empty());
         assert!(Arc::ptr_eq(&initial, &handle.try_appearances().unwrap()));
         assert!(Arc::ptr_eq(&before, &handle.snapshot()));
@@ -2049,10 +2050,24 @@ mod tests {
         assert!(replaced[&id].rows.is_empty());
         assert_eq!(replaced[&id].numbers["border_width"], 8.0);
 
+        // A gradient alone is an offer; the next offer without one clears it.
+        let gradient = r##"{"type":"appearance","spectrum":[{"color":"#ff8c3c","position":0},{"color":"#6ec8ff80","position":1}]}"##;
+        offer_appearance(&mut worker, &id, gradient);
+        let spectrum = &handle.try_appearances().unwrap()[&id].spectrum;
+        assert_eq!(spectrum.len(), 2);
+        assert_eq!(spectrum[1].color, [110, 200, 255, 128]);
+        assert_eq!(spectrum[1].position, 1.0);
+        offer_appearance(
+            &mut worker,
+            &id,
+            r#"{"type":"appearance","numbers":{"border_width":9}}"#,
+        );
+        assert!(handle.try_appearances().unwrap()[&id].spectrum.is_empty());
+
         offer_appearance(&mut worker, &id, r#"{"type":"appearance"}"#);
         assert!(handle.try_appearances().unwrap().is_empty());
         assert!(Arc::ptr_eq(&summary, &handle.snapshot()));
-        assert_eq!(repaints.load(Ordering::Relaxed), 3);
+        assert_eq!(repaints.load(Ordering::Relaxed), 5);
         assert_eq!(capture_wakes.load(Ordering::Relaxed), 0);
         assert!(!dir.0.join(STATE_FILE).exists());
     }
@@ -2118,10 +2133,11 @@ mod tests {
         };
         assert_eq!(initial[&id].colors["border"], [255, 255, 255, 128]);
 
+        // Secondary windows take the gradient as well.
         offer_appearance(
             &mut worker,
             &id,
-            r##"{"type":"appearance","colors":{"border":"#a1b2c3d4"}}"##,
+            r##"{"type":"appearance","colors":{"border":"#a1b2c3d4"},"spectrum":[{"color":"#ff8c3c","position":0},{"color":"#f0dc5a","position":0.45},{"color":"#6ec8ff","position":1}]}"##,
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         let changed = loop {
@@ -2137,6 +2153,19 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(changed[&id].colors["border"], [161, 178, 195, 212]);
+        let stops: Vec<_> = changed[&id]
+            .spectrum
+            .iter()
+            .map(|stop| (stop.color, stop.position))
+            .collect();
+        assert_eq!(
+            stops,
+            [
+                ([255, 140, 60, 255], 0.0),
+                ([240, 220, 90, 255], 0.45),
+                ([110, 200, 255, 255], 1.0)
+            ]
+        );
         assert!(Arc::ptr_eq(&summary, &proxy.snapshot()));
 
         drop(primary);

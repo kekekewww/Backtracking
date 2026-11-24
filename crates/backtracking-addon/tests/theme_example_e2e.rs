@@ -40,7 +40,7 @@ fn receive_appearance(connection: &mut Connection) -> Value {
 }
 
 #[test]
-fn theme_example_offers_an_appearance_animates_its_border_and_quits() {
+fn theme_example_offers_an_appearance_and_a_spectrum_animates_its_border_and_quits() {
     let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/theme-package");
     let manifest: Manifest =
         serde_json::from_str(&fs::read_to_string(package.join("addon.json")).unwrap()).unwrap();
@@ -99,6 +99,17 @@ fn theme_example_offers_an_appearance_animates_its_border_and_quits() {
 
     let mut original = receive_appearance(&mut connection);
     assert!(original["colors"]["waveform"].is_string());
+    // A gradient for coloring by frequency, lowest first, which stays as the border moves.
+    let spectrum = original["spectrum"].as_array().expect("a spectrum");
+    assert!((2..=8).contains(&spectrum.len()), "{spectrum:?}");
+    let positions: Vec<f64> = spectrum
+        .iter()
+        .map(|stop| stop["position"].as_f64().unwrap())
+        .collect();
+    assert_eq!(positions.first(), Some(&0.0));
+    assert_eq!(positions.last(), Some(&1.0));
+    assert!(positions.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(spectrum.iter().all(|stop| stop["color"].is_string()));
     let mut border = original["colors"]
         .as_object_mut()
         .unwrap()

@@ -269,12 +269,15 @@ off or the chosen add-on has no offer.
 {"type":"appearance",
  "colors":{"waveform":"#67e7b5","border":"#ffffff80"},
  "numbers":{"border_width":2},
- "rows":{"LFE":"#ff8800","Ltf":"#88ccff"}}
+ "rows":{"LFE":"#ff8800","Ltf":"#88ccff"},
+ "spectrum":[{"color":"#ff8c3c","position":0},{"color":"#f0dc5a","position":0.45},
+             {"color":"#6ec8ff","position":1}]}
 ```
 
-Each message replaces the add-on's entire offer. Every map is optional and missing entries use the
-app's own look. Send `{"type":"appearance"}` or empty maps to clear the offer. Backtracking
-keeps the offer in memory while the add-on is running and clears it when the add-on stops.
+Each message replaces the add-on's entire offer. Every member is optional and missing entries use
+the app's own look. Send `{"type":"appearance"}`, or empty maps and an empty `spectrum`, to clear
+the offer. Backtracking keeps the offer in memory while the add-on is running and clears it when
+the add-on stops.
 
 `colors` values are `#rrggbb` (opaque) or `#rrggbbaa` (with alpha). Hex digits may be
 upper- or lower-case.
@@ -318,6 +321,26 @@ setting for `plot_background` and `panel_background` and ignores the alpha in th
 characters. Row colors have the same format as `colors`. Backtracking keeps up to 64 valid
 entries and drops the rest.
 
+`spectrum` gives the colors for Waveform color: By frequency. It is a list of 2 to 8 stops,
+lowest frequencies first. Each stop has a `color`, in the same format as `colors`, and a
+`position` from 0 (the lowest frequencies) to 1 (the highest). Positions must not decrease. Two
+stops at one position make a hard edge, where the later stop's color starts. Each moment of the
+waveform mixes the colors by how much of its sound is low or high. Backtracking draws the stops
+opaque and ignores their alpha. Fields of a stop that Backtracking does not know are ignored.
+
+Backtracking keeps or drops `spectrum` as a whole, because a gradient missing a stop is not
+the one its author meant. It drops the list, and keeps the rest of the message, when it has
+fewer than 2 or more than 8 stops, when a stop has no valid `color`, or when a `position` is
+missing, not a number, outside 0 to 1 or lower than the one before it. An empty list is the
+same as leaving `spectrum` out. A `spectrum` that is not a list makes Backtracking ignore the
+message, like a map in the wrong form.
+
+The offer never turns coloring by frequency on or off; only the user does. While it is on,
+Backtracking draws with the user's own gradient if they have made one, else the chosen look's
+`spectrum`, else its own red-to-blue gradient. Options shows the user where the colors come
+from. Editing a stop there starts the user's own gradient from the look's stops, and Reset goes
+back to the look's.
+
 Backtracking checks legibility using WCAG 2 contrast, measured after drawing a color over what
 is behind it. Where the rules below call for contrast, graphics need at least 2.0 and text needs
 at least 3.0. Where alpha is checked, the minimum is 102 of 255. Two drawn colors are apart if
@@ -337,6 +360,9 @@ window the plot sits on the panel when the user's transparency is above 0.
   the waveform on both backgrounds.
 - Each row color has the same alpha and contrast requirements and must be apart from the
   selection on both backgrounds.
+- Each `spectrum` stop needs contrast of at least 2.0 on both backgrounds. A stop that fails
+  is drawn in Backtracking's own gradient's color at its position, and the other stops are
+  kept. The user's own stops are checked the same way.
 - `row_label` needs contrast of at least 3.0 on both backgrounds. `chip_text` needs contrast
   of at least 3.0 on `chip_background` drawn over each of those backgrounds.
 - White text needs contrast of at least 3.0 on `chip_background` and on `chip_current`
@@ -352,12 +378,13 @@ When a pair fails, Backtracking ignores the value the look set for what is drawn
 look set only what is behind it, Backtracking ignores that value. It falls back to its own value,
 checks again and keeps the rest of the look.
 
-Backtracking drops unknown color and number names and individual invalid entries. A message with
-a map supplied in the wrong form is ignored. Backtracking applies at most 10 appearance updates
-per add-on in any rolling second. If more arrive, it keeps the newest waiting update and applies
-it as soon as the rate limit allows. Backtracking ignores messages from add-ons without the
-capability. Rust add-ons can use `Client::send_appearance(&appearance)`, which returns an error
-if called faster than the limit.
+Backtracking drops unknown color and number names and individual invalid entries of the maps.
+A message with a map supplied in the wrong form is ignored. Backtracking applies at most 10
+appearance updates per add-on in any rolling second. If more arrive, it keeps the newest waiting
+update and applies it as soon as the rate limit allows. Backtracking ignores messages from
+add-ons without the capability. Rust add-ons can use `Client::send_appearance(&appearance)`,
+which returns an error if called faster than the limit or with a `spectrum` that Backtracking
+would drop.
 
 **`message`** shows one line next to the add-on on the Add-ons page, replacing the previous one.
 `level` is `info`, `warning` or `error`; `text` is up to 300 characters. An empty `text` clears it.
