@@ -80,6 +80,7 @@
 - **編輯時照常錄音** 框選、調整旗標、縮放與平移使用固定的素材，背景繼續擷取。
 - **單獨編輯一軌** 擷取兩個來源時，輕按右側 `Ctrl`（Mac 為右側 `Command`），即可單獨框選、試聽、淡化與拖出 A 或 B。
 - **檔名標示來源** 桌面版的 WAV 以來源命名，例如 `Backtracking_Spotify_A_…`。可在 **Options → Sources** 為每個裝置取名，名稱跟著裝置換到 A 或 B。
+- **最多 64 個來源** Windows 桌面版可在 **Options → Sources** 用 **Add source** 同時擷取更多來源，最多 64 條波形列、合計 64 個聲道。所有來源共用同一份歷史記憶體，聲道越多可保留的時間越短，每個檔案都標上該來源的字母。macOS 桌面版與插件維持不變。
 - **插件送到桌面版** 在插件勾選 **Send to Backtracking desktop**，桌面版的來源清單就會列出該音軌。
 - **多個錄音器** 桌面版可用 **New capture window** 開啟額外的擷取視窗，各自選擇來源。
 - **WAV 規格** 44.1、48 或 96 kHz，16-bit PCM、24-bit PCM 或 32-bit float。預設為 48 kHz、32-bit float。

@@ -11,7 +11,7 @@ use crate::clip_export::{self, ExportOptions};
 use crate::context_menu::{self, WindowCommand};
 use crate::controller::{
     CaptureSource, ChannelWaveform, Controller, EditSnapshot, LaneGroup, LaneMeterReadings,
-    SourceSettings, compact_sources,
+    SourceSettings, Sources, compact_sources,
 };
 use crate::file_drag;
 use crate::hotkeys::{Action, Binding, Hotkeys, Modifiers, Scope};
@@ -40,7 +40,8 @@ use backtracking_ui::{
     TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES, accent_color,
     add_system_font_fallbacks, configure_options_menu, configure_options_style, dragged_fades,
     fade_end_at, fade_waveform_bins, fit_frame_range, flag_handle_at, icon_button, meter_number,
-    muted_accent, options_choice, options_control_width, options_field, options_group_heading,
+    muted_accent, options_choice, options_control_right, options_control_width, options_field,
+    options_group_heading,
     options_heading_text, options_list, options_menu_height, options_navigation_item, options_note,
     options_value, paint_colored_waveform_trace, paint_fades, paint_guide_lines, paint_playhead,
     paint_transport_glyph, paint_waveform_trace, remeasure_options_menu, status_led, trace_bin,
@@ -554,12 +555,20 @@ struct Recorder {
     /// The first row on screen of each logical lane that scrolls; one for every lane there
     /// can be.
     lane_first_row: Vec<usize>,
-    /// A scroll thumb being dragged: its lane and where on the thumb it was grabbed.
-    scroll_drag: Option<(usize, f32)>,
+    /// With more than two lanes, the first row on screen of the plot's one column of rows.
+    plot_first_row: usize,
+    /// A scroll thumb being dragged: what it scrolls and where on the thumb it was grabbed.
+    scroll_drag: Option<(ScrollTarget, f32)>,
     /// Presses here belong to a lane's group switch or scroll bar, not to the timeline.
     lane_controls: Vec<Rect>,
-    /// The wheel scrolls a lane's rows here instead of zooming.
-    lane_scroll_zones: Vec<(usize, Rect)>,
+    /// The wheel scrolls a lane's rows, or the plot's, here instead of zooming.
+    lane_scroll_zones: Vec<(ScrollTarget, Rect)>,
+    /// The list of every lane's meter is open, from the "+N" button beside the meters.
+    meter_list_open: bool,
+    /// Where that list is on screen while it is open: presses and the wheel there are its own.
+    meter_list_rect: Option<Rect>,
+    /// Where the Options page scrolls to on its next pass, for the test harness.
+    options_scroll: Option<f32>,
     growth: Option<WindowGrowth>,
     plot_rect: Rect,
     editing: Option<FrozenEdit>,
@@ -777,6 +786,32 @@ fn capture_problem<'a>(
     })
 }
 
+/// What the full window's status line says of the lanes' problems, by lane: the first one,
+/// named by its lane's letter when there is more than one lane (`dual`), and how many other
+/// lanes have one.
+fn lanes_problem<'a>(
+    lanes: impl IntoIterator<Item = Option<&'a str>>,
+    dual: bool,
+    language: Language,
+) -> Option<String> {
+    let problems: Vec<(usize, &str)> = lanes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(lane, status)| Some((lane, status?)))
+        .collect();
+    let (&(lane, first), rest) = problems.split_first()?;
+    let mut text = if dual {
+        language.lane_problem(lane_name(lane), first)
+    } else {
+        first.to_owned()
+    };
+    if !rest.is_empty() {
+        text.push_str(" · ");
+        text.push_str(&language.more_lane_problems(rest.len()));
+    }
+    Some(text)
+}
+
 /// `remaining` is the time until capture resumes by itself, when it is going to.
 fn paused_status(remaining: Option<Duration>) -> String {
     match remaining {
@@ -935,6 +970,70 @@ impl RowSource {
             Self::Pair(lane, PairSide::Right),
         ]
     }
+}
+
+/// What a scroll bar, or the wheel over the plot's margins, scrolls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollTarget {
+    /// The rows of one stacked logical lane, with one or two lanes.
+    Lane(usize),
+    /// Every row of the plot as one column, with more than two lanes.
+    Plot,
+}
+
+/// With more than two lanes, the plot's left margin holds each lane's letter in a column of
+/// this width, wide enough for "BL", and a stacked lane's channel names after it.
+const LETTER_COLUMN: f32 = 12.0;
+/// The margin for letters alone, with more than two lanes and none stacked.
+const LETTER_GUTTER: f32 = 16.0;
+/// The margin for letters and channel names, with more than two lanes and one stacked.
+const LETTERED_GUTTER: f32 = LETTER_COLUMN + stack::LABEL_GUTTER - 4.0;
+
+/// The plot's left margin for `lanes` lanes, any of them `stacked`, when it needs more than
+/// the usual inset (see `Recorder::label_gutter`).
+fn label_gutter(lanes: usize, stacked: bool) -> Option<f32> {
+    match (lanes > 2, stacked) {
+        (false, false) => None,
+        (false, true) => Some(stack::LABEL_GUTTER),
+        (true, false) => Some(LETTER_GUTTER),
+        (true, true) => Some(LETTERED_GUTTER),
+    }
+}
+
+/// The rows a plot of `lanes` asks the window to grow for: a stacked lane's rows, as always,
+/// and with more than two lanes every row, so many lanes get room before they scroll.
+fn wanted_height(specs: &[stack::LaneRows]) -> Option<f32> {
+    stack::comfortable_height(specs).or_else(|| {
+        (specs.len() > 2).then(|| {
+            specs.iter().map(|lane| lane.rows).sum::<usize>() as f32
+                * stack::COMFORTABLE_ROW_HEIGHT
+        })
+    })
+}
+
+/// Whether a drag past the edge of the plot's column of rows, `offset` below its top, should
+/// scroll it: `Some(true)` down, `Some(false)` up, when it has more rows that way.
+fn column_edge(column: &LaneBox, offset: f32) -> Option<bool> {
+    if !column.scrolls() {
+        return None;
+    }
+    if offset < column.top && column.first > 0 {
+        Some(false)
+    } else if offset >= column.top + column.height && column.first + column.shown < column.rows {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// The row of the plot's column, counted from its top, that row `row` of lane `lane` is.
+fn column_row(lanes: &[LanePlan], lane: usize, row: usize) -> usize {
+    lanes
+        .iter()
+        .take_while(|plan| plan.lane != lane)
+        .map(LanePlan::rows)
+        .sum::<usize>()
+        + row
 }
 
 /// How one lane is drawn: as before, or one row per channel of the group on show.
@@ -1618,9 +1717,10 @@ enum WindowFit {
 
 /// What a window `window` points tall does for lanes laid out as `specs`, which have `current`
 /// points of it, and what it then remembers in `growth`. It grows once when a lane starts
-/// stacking rows, and again for rows that appear later while the user has not resized it
-/// since it last grew; rows that go never shrink it. It goes back when no lane stacks any
-/// more, unless the user resized it meanwhile. `cap` is the tallest it may grow to, asked only
+/// stacking rows, or a third lane is added (`wanted_height`), and again for rows that appear
+/// later while the user has not resized it since it last grew; rows that go never shrink it.
+/// It goes back when no lane stacks any more and two lanes or fewer are left, unless the user
+/// resized it meanwhile. `cap` is the tallest it may grow to, asked only
 /// when it grows. While the user drags the window (`window_drag`), or a pointer gesture on the
 /// waveform is in progress (`gesture`), it stays as it is.
 #[allow(clippy::too_many_arguments)]
@@ -1637,7 +1737,7 @@ fn fit_window(
     if window_drag || gesture {
         return WindowFit::Stay;
     }
-    let wanted = stack::comfortable_height(specs);
+    let wanted = wanted_height(specs);
     let regrow = match (wanted, *growth) {
         (Some(wanted), Some(grown)) => {
             wanted > current + 0.5
@@ -2201,6 +2301,9 @@ struct WavClip {
     groups: Vec<Vec<LaneGroup>>,
     /// By snapshot: the rows chosen, as lane-native channels and the pair.
     rows: Vec<RowChoice>,
+    /// The logical lanes the chosen rows lie in, when rows were chosen in more than one: only
+    /// these are written. `None` writes every lane (or the one in `format.lane`).
+    only: Option<Vec<usize>>,
     /// By snapshot: the position tracks frozen with the audio, when the clip was made from a
     /// frozen view.
     positions: Vec<Option<FrozenPositionTrack>>,
@@ -2251,6 +2354,7 @@ impl WavClip {
             export_options: ExportOptions::default(),
             groups: vec![Vec::new(); count],
             rows: vec![RowChoice::default(); count],
+            only: None,
             positions: vec![None; count],
         })
     }
@@ -2283,6 +2387,16 @@ impl WavClip {
                 return None;
             }
             self.format.lane = Some(lane);
+        } else {
+            // Rows in some lanes of many: the lanes without a chosen row are left out, as a
+            // lane is when the rows lie in one other lane.
+            let mut only: Vec<usize> = rows.iter().map(|row| row.lane()).collect();
+            only.sort_unstable();
+            only.dedup();
+            if only.iter().any(|lane| !self.lanes.contains(lane)) {
+                return None;
+            }
+            self.only = Some(only);
         }
         for (index, &lane) in self.lanes.iter().enumerate() {
             let choice = chosen.lane_choice(lane);
@@ -2337,12 +2451,23 @@ impl WavClip {
     }
 
     /// The snapshots written: every one, or the one of the lane saved on its own.
-    fn saved(&self) -> Range<usize> {
+    /// The snapshots written, in order: the one lane chosen, the lanes the chosen rows lie in,
+    /// or every lane.
+    fn saved(&self) -> Vec<usize> {
         let one = self
             .format
             .lane
             .and_then(|lane| self.lanes.iter().position(|&held| held == lane));
-        one.map_or(0..self.snapshots.len(), |index| index..index + 1)
+        if let Some(index) = one {
+            return vec![index];
+        }
+        (0..self.snapshots.len())
+            .filter(|&index| {
+                self.only
+                    .as_ref()
+                    .is_none_or(|only| only.contains(&self.lanes[index]))
+            })
+            .collect()
     }
 
     fn write(self, keep: bool) -> io::Result<ExportedWav> {
@@ -2350,9 +2475,10 @@ impl WavClip {
         let saved = self.saved();
         // Every file of a recording of several lanes carries its lane's letter. A lane saved
         // on its own keeps it, so its file still says which lane it was.
-        let labels: Vec<_> = self.lanes[saved.clone()]
+        let labels: Vec<_> = saved
             .iter()
-            .map(|&lane| {
+            .map(|&index| self.lanes[index])
+            .map(|lane| {
                 let letter = (self.snapshots.len() >= 2)
                     .then(|| Lane::from_index(lane))
                     .flatten();
@@ -2362,12 +2488,12 @@ impl WavClip {
         let routes = physical_routes(&format.routes, &self.lanes);
         // Everything is held by snapshot, so it moves along with the snapshots written: a
         // B-only save hands B's rows, groups and positions over in the first place.
-        let writes: Vec<LaneWrite> = saved.clone().map(|index| self.lane_write(index)).collect();
+        let writes: Vec<LaneWrite> = saved.iter().map(|&index| self.lane_write(index)).collect();
         let mut options = self.export_options.clone();
         options.groups = writes.iter().map(|write| write.shown.clone()).collect();
         let rows: Vec<clip_export::RowExport<'_>> = writes
             .iter()
-            .zip(saved.clone())
+            .zip(saved.iter().copied())
             .map(|(write, index)| clip_export::RowExport {
                 channels: write.channels.clone(),
                 pair: write.pair,
@@ -2376,13 +2502,19 @@ impl WavClip {
                 positions: self.positions.get(index).and_then(Option::as_ref),
             })
             .collect();
+        // Frozen tracks share the capture's pages, so the copies are cheap.
+        let snapshots: Vec<FrozenTrack> = saved
+            .iter()
+            .map(|&index| self.snapshots[index].clone())
+            .collect();
+        let routes: Vec<ChannelRoute> = saved.iter().map(|&index| routes[index]).collect();
         let written = clip_export::export_rows(
             &self.output,
-            &self.snapshots[saved.clone()],
+            &snapshots,
             self.frames.clone(),
             self.fades,
             format.profile,
-            &routes[saved],
+            &routes,
             format.force_mono,
             &labels,
             &options,
@@ -2607,9 +2739,13 @@ impl Recorder {
             peak_rows: Vec::new(),
             lanes: Vec::new(),
             lane_first_row: vec![0; MAX_LANES],
+            plot_first_row: 0,
             scroll_drag: None,
             lane_controls: Vec::new(),
             lane_scroll_zones: Vec::new(),
+            meter_list_open: false,
+            meter_list_rect: None,
+            options_scroll: None,
             growth: None,
             plot_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(610.0, DEFAULT_WAVEFORM_HEIGHT)),
             editing: None,
@@ -3955,7 +4091,12 @@ impl Recorder {
             self.next_refresh = Instant::now();
         }
         // A taller window shows more rows; never leave empty space below the last one.
-        let boxes = self.lane_boxes(self.timeline_rect(self.plot_rect).height());
+        let height = self.timeline_rect(self.plot_rect).height();
+        if let Some(column) = self.column(height) {
+            self.plot_first_row = column.first;
+            return;
+        }
+        let boxes = self.lane_boxes(height);
         for (plan, lane_box) in self.lanes.iter().zip(&boxes) {
             if let Some(first_row) = self.lane_first_row.get_mut(plan.lane) {
                 *first_row = lane_box.first;
@@ -3975,9 +4116,32 @@ impl Recorder {
             .and_then(LanePlan::pair_group)
     }
 
+    /// Whether the plot's rows scroll as one column rather than lane by lane: with more than
+    /// two lanes, which could otherwise each scroll on their own or be squeezed to nothing.
+    fn scrolls_as_column(&self) -> bool {
+        self.lanes.len() > 2
+    }
+
+    /// The plot's rows as one column in a plot area this high, while they scroll as one.
+    fn column(&self, height: f32) -> Option<LaneBox> {
+        if !self.scrolls_as_column() {
+            return None;
+        }
+        let specs: Vec<_> = self.lanes.iter().map(LanePlan::spec).collect();
+        Some(stack::lay_out_column(height, &specs, self.plot_first_row).1)
+    }
+
+    /// The plot's column of rows when it has more than fit and scrolls.
+    fn scrolling_column(&self, height: f32) -> Option<LaneBox> {
+        self.column(height).filter(LaneBox::scrolls)
+    }
+
     /// Where each lane's rows go in a plot area this high.
     fn lane_boxes(&self, height: f32) -> Vec<LaneBox> {
         let specs: Vec<_> = self.lanes.iter().map(LanePlan::spec).collect();
+        if self.scrolls_as_column() {
+            return stack::lay_out_column(height, &specs, self.plot_first_row).0;
+        }
         let first: Vec<_> = self
             .lanes
             .iter()
@@ -3996,13 +4160,32 @@ impl Recorder {
             .collect()
     }
 
+    /// Scrolls a stacked lane so `row` is its first on screen; with more than two lanes, the
+    /// whole plot, so that row of the lane is at its top.
     fn scroll_lane_to(&mut self, lane: usize, row: usize) {
+        if self.scrolls_as_column() {
+            self.scroll_plot_to(column_row(&self.lanes, lane, row));
+            return;
+        }
         let Some(slot) = self.lane_first_row.get_mut(lane) else {
             return;
         };
         if *slot != row {
             *slot = row;
             // Clamped to the lane's last page, then rendered on the next pass.
+            self.update_lanes();
+            self.live_revision = None;
+            self.next_refresh = Instant::now();
+            self.last_interaction = Instant::now();
+        }
+    }
+
+    /// Scrolls the plot's column of rows so row `first` of it is at the top, or as near as the
+    /// last row allows.
+    fn scroll_plot_to(&mut self, first: usize) {
+        if self.plot_first_row != first {
+            self.plot_first_row = first;
+            // Clamped to the last page, then rendered on the next pass.
             self.update_lanes();
             self.live_revision = None;
             self.next_refresh = Instant::now();
@@ -4093,17 +4276,30 @@ impl Recorder {
                 self.options_button(ui, !interaction_blocked && self.gesture.is_none());
                 if self.show_meters {
                     // Right to left: the last lane's readout first. One or two lanes always
-                    // show every readout; past that, those of the first lanes that fit.
+                    // show every readout; past that, those of the first lanes that fit, and a
+                    // "+N" button for the list of every lane's meter.
                     let count = self.lane_count();
                     let shown = if count <= 2 {
                         count
                     } else {
-                        let each = METER_WIDTH_SHARED + ui.spacing().item_spacing.x;
-                        ((ui.available_width() / each) as usize).clamp(2, count)
+                        let spacing = ui.spacing().item_spacing.x;
+                        meters_shown(
+                            count,
+                            ui.available_width(),
+                            METER_WIDTH_SHARED + spacing,
+                            MORE_METERS_WIDTH + spacing,
+                        )
                     };
+                    if shown < count {
+                        self.more_meters_button(ui, count - shown, interaction_blocked);
+                    } else {
+                        self.close_meter_list();
+                    }
                     for lane in (0..shown).rev() {
                         self.meter_readout(ui, lane);
                     }
+                } else {
+                    self.close_meter_list();
                 }
             });
         });
@@ -4223,9 +4419,25 @@ impl Recorder {
                 selection
             }
         } else {
+            // A lane's problem stays in view, before the last message, until it is solved.
+            let language = Language::current();
+            let problem = lanes_problem(
+                (0..self.lane_count()).map(|lane| {
+                    self.controller
+                        .source_status(lane)
+                        .map(|status| language.source_message(status))
+                }),
+                self.dual_source(),
+                language,
+            );
+            let message = match problem {
+                Some(problem) if self.message.is_empty() => problem,
+                Some(problem) => format!("{problem} · {}", self.message),
+                None => self.message.clone(),
+            };
             idle_status(
                 paused.then(|| paused_status(self.auto_resume_remaining())),
-                &self.message,
+                &message,
             )
         }
     }
@@ -4388,6 +4600,112 @@ impl Recorder {
             egui::FontId::monospace(if self.dual_source() { 10.0 } else { 12.0 }),
             ui.visuals().text_color(),
         );
+    }
+
+    /// The "+N" button beside the meters that do not fit, `hidden` of them, and the list of
+    /// every lane's meter it opens and closes.
+    fn more_meters_button(&mut self, ui: &mut egui::Ui, hidden: usize, menu_open: bool) {
+        let language = Language::current();
+        let text = format!("+{hidden}");
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(MORE_METERS_WIDTH, 24.0),
+            if menu_open {
+                egui::Sense::hover()
+            } else {
+                egui::Sense::click()
+            },
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::Role::Button,
+                !menu_open,
+                self.meter_list_open,
+                language.more_meters(hidden),
+            )
+        });
+        if response.clicked() {
+            self.toggle_meter_list();
+        }
+        let hovered = response.hovered();
+        response.on_hover_text(language.more_meters(hidden));
+        let visuals = ui.visuals();
+        let fill = if self.meter_list_open || hovered {
+            visuals.widgets.hovered.bg_fill
+        } else {
+            visuals.widgets.inactive.bg_fill
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, 5.0, fill);
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::monospace(10.0),
+            ui.visuals().text_color(),
+        );
+        if self.meter_list_open {
+            self.meter_list(ui.ctx(), rect);
+        } else {
+            self.meter_list_rect = None;
+        }
+    }
+
+    /// Opens or closes the list of every lane's meter, as the "+N" button does.
+    fn toggle_meter_list(&mut self) {
+        self.meter_list_open = !self.meter_list_open;
+        self.last_interaction = Instant::now();
+    }
+
+    fn close_meter_list(&mut self) {
+        self.meter_list_open = false;
+        self.meter_list_rect = None;
+    }
+
+    /// Every lane's meter, in rows under the "+N" button at `anchor`, inside the window. A
+    /// press outside the list and its button, or Escape, closes it.
+    fn meter_list(&mut self, ctx: &egui::Context, anchor: Rect) {
+        let window = ctx.content_rect();
+        let count = self.lane_count();
+        let each = METER_WIDTH_SHARED + 4.0;
+        let columns = (((window.width() - 24.0) / each).floor() as usize).clamp(1, 6);
+        let width = columns as f32 * each - 4.0;
+        let top = anchor.bottom() + 4.0;
+        let max_height = (window.bottom() - top - 16.0).max(30.0);
+        let shown = egui::Area::new(egui::Id::unique("meter-list"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .fixed_pos(Pos2::new(anchor.right(), top))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(max_height)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = Vec2::splat(4.0);
+                            for row in (0..count).collect::<Vec<_>>().chunks(columns) {
+                                ui.horizontal(|ui| {
+                                    ui.set_width(width);
+                                    for &lane in row {
+                                        self.meter_readout(ui, lane);
+                                    }
+                                });
+                            }
+                        });
+                });
+            });
+        let area = shown.response.rect;
+        self.meter_list_rect = Some(area);
+        let (pressed, escape) = ctx.input(|input| {
+            let pressed = input.pointer.any_pressed()
+                && input
+                    .pointer
+                    .interact_pos()
+                    .is_some_and(|point| !area.contains(point) && !anchor.contains(point));
+            (pressed, input.key_pressed(egui::Key::Escape))
+        });
+        if pressed || escape {
+            self.meter_list_open = false;
+            self.meter_list_rect = None;
+        }
     }
 
     fn pin_button(&mut self, ui: &mut egui::Ui, menu_open: bool) {
@@ -4695,9 +5013,7 @@ impl Recorder {
                 ui.add_space(2.0);
                 ui.separator();
                 ui.add_space(6.0);
-                egui::ScrollArea::vertical()
-                    .id_salt(self.options_section)
-                    .auto_shrink([false, false])
+                options_page_area(self.options_section, self.options_scroll.take())
                     .show(ui, |ui| {
                         options_list(ui, |ui| match self.options_section {
                             OptionsSection::Actions => {
@@ -5176,17 +5492,24 @@ impl Recorder {
         let scanning = self.source_list_worker.is_some();
         let mut source_menu_opened = false;
         let mut open_menu = None;
-        // The page offers lanes A and B, B with Off; any later lanes stay as they are.
+        // One section per lane, in order, then the control that adds one. A lane after A also
+        // offers Off, as lane B always did; Off and Remove take the lane out.
         let mut sources = self.controller.sources().clone();
-        if sources.len() < 2 {
-            sources.resize(2, None);
-        }
-        let dual = sources[1].is_some();
+        let count = sources.len();
+        let dual = count > 1;
         let mut names_changed = false;
+        let mut added = None;
+        let channels_in_use: usize = (0..count)
+            .filter_map(|lane| self.controller.track_channels(lane))
+            .sum();
         ui.add_enabled_ui(self.gesture.is_none(), |ui| {
-            for (lane, settings) in sources.iter_mut().enumerate().take(2) {
+            for (lane, settings) in sources.iter_mut().enumerate() {
                 ui.push_id(lane, |ui| {
-                    options_group_heading(ui, &format!("Source {}", lane_name(lane)));
+                    let title = format!("Source {}", lane_name(lane));
+                    if source_heading(ui, &title, dual, language, lane) {
+                        *settings = None;
+                        return;
+                    }
                     let configured = settings.clone();
                     let mut source = configured.as_ref().map(|settings| settings.source.clone());
                     options_field(ui, "Audio source", |ui| {
@@ -5216,38 +5539,23 @@ impl Recorder {
                             .width(width)
                             .height(options_menu_height(
                                 ui,
-                                choices.len() + usize::from(lane == 1),
+                                choices.len() + usize::from(lane > 0),
                             ))
                             .truncate()
                             .show_ui(ui, |ui| {
                                 configure_options_menu(ui, width);
                                 open_menu = Some(ui.layer_id());
-                                if lane == 1 {
+                                if lane > 0 {
                                     ui.selectable_value(&mut source, None, "Off");
                                 }
                                 source_menu_opened |= !was_open;
-                                if !was_open || scanning {
-                                    ui.spinner();
-                                    return;
-                                }
-                                for choice in choices {
-                                    let selected = source
-                                        .as_ref()
-                                        .is_some_and(|source| choice.same_source(source));
-                                    let label = source_picker_label(choice, choices);
-                                    let row = ui.selectable_label(selected, label.as_ref());
-                                    if row.clicked() && !selected {
-                                        source = Some(choice.clone());
-                                    }
-                                    match choice {
-                                        CaptureSource::Application { path, .. } => {
-                                            row.on_hover_text(path);
-                                        }
-                                        CaptureSource::Sender { id, .. } => {
-                                            row.on_hover_text(format!("Sender instance {id}"));
-                                        }
-                                        _ => {}
-                                    }
+                                if let Some(choice) = source_menu_rows(
+                                    ui,
+                                    choices,
+                                    !was_open || scanning,
+                                    source.as_ref(),
+                                ) {
+                                    source = Some(choice);
                                 }
                             })
                             .response
@@ -5357,11 +5665,54 @@ impl Recorder {
                     if !covered && let Some(status) = self.controller.source_status(lane) {
                         options_note(ui, language.source_message(status));
                     }
-                    if lane == 0 {
-                        ui.separator();
-                    }
+                    ui.separator();
                 });
             }
+            // Adding a lane: the same list of sources, from which a choice becomes the next
+            // lane. Past the last lane there can be, it says why there is no more.
+            let full = count >= MAX_LANES;
+            options_field(ui, language.add_source_field(), |ui| {
+                let menu = "add-source";
+                let width = options_control_width(ui);
+                let text = if full {
+                    language.no_more_sources()
+                } else {
+                    language.choose_source()
+                };
+                ui.add_enabled_ui(!full, |ui| {
+                    // Asked of the same `ui` the list is made in: its id is part of the
+                    // list's own.
+                    let was_open = egui::ComboBox::is_open(
+                        ui.ctx(),
+                        ui.make_persistent_id(egui::IdSalt::new(menu)),
+                    );
+                    egui::ComboBox::from_id_salt(menu)
+                        .selected_text(text)
+                        .width(width)
+                        .height(options_menu_height(ui, choices.len()))
+                        .truncate()
+                        .show_ui(ui, |ui| {
+                            configure_options_menu(ui, width);
+                            open_menu = Some(ui.layer_id());
+                            source_menu_opened |= !was_open;
+                            added = source_menu_rows(ui, choices, !was_open || scanning, None);
+                        })
+                        .response
+                        .on_hover_text(language.add_source_tip())
+                        .on_disabled_hover_text(language.sources_full());
+                });
+            });
+            if full {
+                options_note(ui, language.sources_full());
+            }
+            options_note(ui, language.channels_in_use(channels_in_use));
+            if channels_in_use >= CHANNEL_LIMIT && !full {
+                options_note(ui, language.channels_full());
+            }
+            if let Some(note) = history_note.as_deref() {
+                options_note(ui, note);
+            }
+            options_note(ui, language.sources_restart_history(dual));
         });
         self.source_menu = open_menu;
         if names_changed {
@@ -5370,21 +5721,68 @@ impl Recorder {
         if source_menu_opened {
             self.refresh_source_list();
         }
-        // A lane turned off is taken out, and the lanes after it move up.
-        let sources = compact_sources(sources);
-        if sources != *self.controller.sources() {
-            if sources.len() < 2 {
-                // The next pair of sources starts with every row edited together.
-                self.separate_rows = false;
-            }
-            self.save_sources(&sources);
-            self.controller.set_sources(sources);
-            self.sync_generation();
+        if let Some(source) = added {
+            sources.push(Some(SourceSettings {
+                source,
+                route: ChannelRoute::Merged,
+            }));
         }
+        // A lane turned off is taken out, and the lanes after it move up.
+        self.apply_sources(sources);
         if go_to_addons {
             self.options_section = OptionsSection::Addons;
         }
         action
+    }
+
+    /// Records `sources` from now on, as the Sources page leaves them. A lane that is `None`
+    /// is taken out and the lanes after it move up a letter, their meter units with them. Any
+    /// change starts a new, empty history (`Controller::set_sources`) and is kept.
+    fn apply_sources(&mut self, sources: Sources) {
+        let moving = lanes_moving_up(&sources);
+        let sources = compact_sources(sources);
+        if sources == *self.controller.sources() {
+            return;
+        }
+        if !moving.is_empty() {
+            shift_meter_modes(&mut self.meter_modes, &moving);
+            // Lane A, lane B, and every lane after B.
+            for lane in 0..3 {
+                self.save_meter_mode(lane);
+            }
+        }
+        if sources.len() < 2 {
+            // The next pair of sources starts with every row edited together.
+            self.separate_rows = false;
+        }
+        self.save_sources(&sources);
+        self.controller.set_sources(sources);
+        self.sync_generation();
+    }
+
+    /// The Sources page's "Add source": `source` becomes the next lane.
+    fn add_source(&mut self, source: CaptureSource) -> Result<(), String> {
+        let mut sources = self.controller.sources().clone();
+        if sources.len() >= MAX_LANES {
+            return Err(Language::current().sources_full().into());
+        }
+        sources.push(Some(SourceSettings {
+            source,
+            route: ChannelRoute::Merged,
+        }));
+        self.apply_sources(sources);
+        Ok(())
+    }
+
+    /// A lane's Remove button on the Sources page: the lanes after it move up a letter.
+    fn remove_source(&mut self, lane: usize) -> Result<(), String> {
+        let mut sources = self.controller.sources().clone();
+        if sources.len() < 2 || lane >= sources.len() {
+            return Err("only a lane among two or more can be removed".into());
+        }
+        sources[lane] = None;
+        self.apply_sources(sources);
+        Ok(())
     }
 
     /// Sends a file to an add-on and says so in the status line when that fails.
@@ -6201,19 +6599,22 @@ impl Recorder {
     fn timeline_rect(&self, rect: Rect) -> Rect {
         if self.waveform_only {
             rect.shrink2(Vec2::new(WAVEFORM_INSET, 0.0))
-        } else if self.stacked() {
-            // Channel names need a wider column than "L" and "R".
+        } else if let Some(gutter) = self.label_gutter() {
+            // Channel names need a wider column than "L" and "R", and many lanes their letters.
             let inner = rect.shrink(WAVEFORM_INSET);
             Rect::from_min_max(
-                Pos2::new(
-                    (rect.left() + stack::LABEL_GUTTER).min(inner.right()),
-                    inner.top(),
-                ),
+                Pos2::new((rect.left() + gutter).min(inner.right()), inner.top()),
                 inner.max,
             )
         } else {
             rect.shrink(WAVEFORM_INSET)
         }
+    }
+
+    /// The plot's left margin when its labels need more than the usual inset: a stacked lane's
+    /// channel names, and with more than two lanes every lane's letter.
+    fn label_gutter(&self) -> Option<f32> {
+        label_gutter(self.lanes.len(), self.stacked())
     }
 
     fn audio_rect(&self, rect: Rect) -> Rect {
@@ -6272,6 +6673,7 @@ impl Recorder {
                     && !self
                         .lane_controls
                         .iter()
+                        .chain(&self.meter_list_rect)
                         .any(|control| control.contains(*point))
             })
         {
@@ -6489,6 +6891,28 @@ impl Recorder {
     fn drag_across_rows(&mut self, audio: Rect, y: f32, at: RowSource) -> RowSource {
         let boxes = self.lane_boxes(audio.height());
         let offset = y - audio.top();
+        // With more than two lanes the whole plot scrolls, a row at a time, the same way.
+        if self.rows_separate()
+            && let Some(column) = self.scrolling_column(audio.height())
+        {
+            let Some(down) = column_edge(&column, offset) else {
+                self.edge_scroll = None;
+                return row_at_height(&self.lanes, &boxes, offset).unwrap_or(at);
+            };
+            let now = Instant::now();
+            if self.edge_scroll.is_some_and(|next| now < next) {
+                return at;
+            }
+            self.edge_scroll = Some(now + EDGE_SCROLL_STEP);
+            self.scroll_plot_to(if down {
+                column.first + 1
+            } else {
+                column.first.saturating_sub(1)
+            });
+            // The row that came into view at that edge.
+            let boxes = self.lane_boxes(audio.height());
+            return row_at_height(&self.lanes, &boxes, offset).unwrap_or(at);
+        }
         let step = if self.rows_separate() {
             row_drag(&self.lanes, &boxes, at, offset)
         } else {
@@ -6716,12 +7140,39 @@ impl Recorder {
         )
     }
 
-    /// Group switches, scroll bars and the wheel over a stacked lane's margins. Returns the
-    /// tooltip for what is under the pointer.
+    /// What scrolls in a plot area this high, with the box its scroll bar follows: with more
+    /// than two lanes the plot's column of rows when it has more than fit, else each stacked
+    /// lane that has.
+    fn scroll_boxes(&self, height: f32) -> Vec<(ScrollTarget, LaneBox)> {
+        if self.scrolls_as_column() {
+            return self
+                .scrolling_column(height)
+                .map(|column| (ScrollTarget::Plot, column))
+                .into_iter()
+                .collect();
+        }
+        self.lanes
+            .iter()
+            .zip(self.lane_boxes(height))
+            .filter(|(_, lane_box)| lane_box.scrolls())
+            .map(|(plan, lane_box)| (ScrollTarget::Lane(plan.lane), lane_box))
+            .collect()
+    }
+
+    fn scroll_to(&mut self, target: ScrollTarget, first: usize) {
+        match target {
+            ScrollTarget::Lane(lane) => self.scroll_lane_to(lane, first),
+            ScrollTarget::Plot => self.scroll_plot_to(first),
+        }
+    }
+
+    /// Group switches, scroll bars and the wheel over a stacked lane's margins, or with more
+    /// than two lanes over the plot's. Returns the tooltip for what is under the pointer.
     fn interact_lanes(&mut self, ui: &egui::Ui, rect: Rect) -> Option<String> {
         self.lane_controls.clear();
         self.lane_scroll_zones.clear();
-        if !self.stacked() || self.history_frames.is_empty() {
+        let many = self.scrolls_as_column();
+        if !(self.stacked() || many) || self.history_frames.is_empty() {
             self.scroll_drag = None;
             return None;
         }
@@ -6731,16 +7182,15 @@ impl Recorder {
         let chips = self.group_chips(ui, rect, &boxes);
         self.lane_controls
             .extend(chips.iter().map(|chip| chip.rect));
-        for (plan, lane_box) in self.lanes.iter().zip(&boxes) {
-            if lane_box.scrolls() {
-                let track = self.scroll_track(rect, lane_box);
-                self.lane_controls.push(track);
-                self.lane_scroll_zones.push((plan.lane, track));
-                self.lane_scroll_zones.push((
-                    plan.lane,
-                    Rect::from_x_y_ranges(rect.left()..=inner.left(), track.y_range()),
-                ));
-            }
+        let scrolling = self.scroll_boxes(inner.height());
+        for (target, lane_box) in &scrolling {
+            let track = self.scroll_track(rect, lane_box);
+            self.lane_controls.push(track);
+            self.lane_scroll_zones.push((*target, track));
+            self.lane_scroll_zones.push((
+                *target,
+                Rect::from_x_y_ranges(rect.left()..=inner.left(), track.y_range()),
+            ));
         }
         let (hover, position, press, down, steps) = ui.input(|input| {
             let mut press = None;
@@ -6771,21 +7221,27 @@ impl Recorder {
                 steps,
             )
         });
+        // A lane's box, or the plot's column while it scrolls.
         let by_lane: Vec<(usize, LaneBox)> = self
             .lanes
             .iter()
             .map(|plan| plan.lane)
             .zip(boxes.iter().copied())
             .collect();
-        let lane_box = |lane: usize| {
-            by_lane
+        let target_box = |target: ScrollTarget| match target {
+            ScrollTarget::Plot => scrolling.first().map(|(_, column)| *column),
+            ScrollTarget::Lane(lane) => by_lane
                 .iter()
                 .find(|(logical, _)| *logical == lane)
-                .map(|(_, lane_box)| *lane_box)
+                .map(|(_, lane_box)| *lane_box),
         };
 
         if self.gesture.is_none()
-            && let Some(point) = press
+            && let Some(point) = press.filter(|point| {
+                !self
+                    .meter_list_rect
+                    .is_some_and(|list| list.contains(*point))
+            })
         {
             if let Some(chip) = chips.iter().find(|chip| chip.rect.contains(point)) {
                 if !chip.current {
@@ -6794,11 +7250,11 @@ impl Recorder {
                         self.message = error;
                     }
                 }
-            } else if let Some(&(lane, _)) = self
+            } else if let Some(&(target, _)) = self
                 .lane_scroll_zones
                 .iter()
                 .find(|(_, zone)| zone.contains(point) && zone.left() >= inner.right())
-                && let Some(lane_box) = lane_box(lane)
+                && let Some(lane_box) = target_box(target)
             {
                 let thumb = lane_box.thumb();
                 let (top, bottom) = (inner.top() + thumb.start, inner.top() + thumb.end);
@@ -6808,36 +7264,40 @@ impl Recorder {
                     // A press beside the thumb brings it there.
                     (bottom - top) / 2.0
                 };
-                self.scroll_drag = Some((lane, grab));
+                self.scroll_drag = Some((target, grab));
             }
         }
-        if let Some((lane, grab)) = self.scroll_drag {
+        if let Some((target, grab)) = self.scroll_drag {
             if down
                 && let Some(point) = position
-                && let Some(lane_box) = lane_box(lane)
+                && let Some(lane_box) = target_box(target)
             {
                 let first = lane_box.first_for_thumb(point.y - grab - inner.top());
-                self.scroll_lane_to(lane, first);
+                self.scroll_to(target, first);
             } else if !down {
                 self.scroll_drag = None;
             }
         }
         if steps != 0.0
-            && let Some(point) = hover
-            && let Some(&(lane, _)) = self
+            && let Some(point) = hover.filter(|point| {
+                !self
+                    .meter_list_rect
+                    .is_some_and(|list| list.contains(*point))
+            })
+            && let Some(&(target, _)) = self
                 .lane_scroll_zones
                 .iter()
                 .find(|(_, zone)| zone.contains(point))
-            && let Some(lane_box) = lane_box(lane)
+            && let Some(lane_box) = target_box(target)
         {
-            // At least one row for each turn of the wheel; up shows earlier channels.
+            // At least one row for each turn of the wheel; up shows earlier rows.
             let rows = steps.abs().ceil().max(1.0) as usize;
             let first = if steps > 0.0 {
                 lane_box.first.saturating_sub(rows)
             } else {
                 lane_box.first + rows
             };
-            self.scroll_lane_to(lane, first);
+            self.scroll_to(target, first);
         }
 
         let point = hover?;
@@ -6861,21 +7321,53 @@ impl Recorder {
         }
         let (index, row) = stack::row_at(&boxes, point.y - inner.top())?;
         let plan = self.lanes.get(index)?;
-        let mut text = if let RowSource::Pair(_, side) = plan.row(row) {
-            language.pair_row(side == PairSide::Left).to_owned()
-        } else {
-            let (group, row) = plan.group_channel(row)?;
+        // With more than two lanes a row's label names its lane's source, and its problem.
+        let mut lines = Vec::new();
+        if many {
+            lines.push(self.lane_tip(plan.lane));
+        }
+        if let RowSource::Pair(_, side) = plan.row(row) {
+            lines.push(language.pair_row(side == PairSide::Left).to_owned());
+        } else if let Some((group, row)) = plan.group_channel(row) {
             let label = group
                 .labels
                 .get(row)
                 .map_or_else(|| (row + 1).to_string(), Clone::clone);
-            language.channel(row + 1, group.channels.len(), &label)
-        };
-        if boxes[index].scrolls() {
-            text.push('\n');
-            text.push_str(language.scroll_hint());
+            lines.push(language.channel(row + 1, group.channels.len(), &label));
         }
-        Some(text)
+        if lines.is_empty() {
+            return None;
+        }
+        if !scrolling.is_empty() && many {
+            lines.push(language.plot_scroll_hint().to_owned());
+        } else if boxes[index].scrolls() {
+            lines.push(language.scroll_hint().to_owned());
+        }
+        Some(lines.join("\n"))
+    }
+
+    /// The tooltip line that names logical lane `lane`: its letter, the source picked for it
+    /// and its route when that is not Merged, and the source's problem when it has one.
+    fn lane_tip(&self, lane: usize) -> String {
+        let language = Language::current();
+        let name = self
+            .controller
+            .sources()
+            .get(lane)
+            .and_then(Option::as_ref)
+            .map_or_else(String::new, |settings| {
+                let label = source_picker_label(&settings.source, &self.available_sources);
+                match settings.route {
+                    ChannelRoute::Merged => label.into_owned(),
+                    route => format!("{label} · {}", route_label(route, language)),
+                }
+            });
+        let mut tip = language.lane_source(lane_name(lane), &name);
+        if let Some(status) = self.controller.source_status(lane) {
+            tip.push('\n');
+            tip.push_str(language.source_message(status));
+        }
+        tip
     }
 
     fn interact_timeline(&mut self, ui: &egui::Ui, rect: Rect) -> bool {
@@ -6935,6 +7427,9 @@ impl Recorder {
                         .lane_scroll_zones
                         .iter()
                         .any(|(_, zone)| zone.contains(*point))
+                    && !self
+                        .meter_list_rect
+                        .is_some_and(|list| list.contains(*point))
             })
         {
             let requested = self.zoom_frames.as_ref().unwrap_or(&self.history_frames);
@@ -7137,6 +7632,7 @@ impl Recorder {
             Some(start as f32..end as f32)
         });
         let stacked = self.stacked();
+        let many = self.scrolls_as_column();
         let rows: usize = boxes.iter().map(|lane| lane.shown).sum();
         let dual = self.dual_source();
         // Colouring by frequency: the band colours, once for every row.
@@ -7198,15 +7694,37 @@ impl Recorder {
                         }
                         _ => None,
                     };
-                    if let Some(label) = label.filter(|label| {
-                        !label.is_empty() && lane_box.row_height >= stack::LABELLED_ROW_HEIGHT
-                    }) {
+                    let labelled = lane_box.row_height >= stack::LABELLED_ROW_HEIGHT;
+                    // A lane's letter is amber while its source has a problem.
+                    let letter_color = if self.controller.source_status(plan.lane).is_some() {
+                        ERROR_LED
+                    } else {
+                        theme.row_label
+                    };
+                    // Past two lanes a stacked lane's channel names move right of a column of
+                    // letters, and its letter stands on its first row on screen.
+                    let stacked_many = many && plan.stacked();
+                    if let Some(label) = label.filter(|label| !label.is_empty() && labelled) {
+                        let (x, color) = match source {
+                            _ if stacked_many => (rect.left() + 1.0 + LETTER_COLUMN, theme.row_label),
+                            RowSource::View(..) if dual => (rect.left() + 1.0, letter_color),
+                            _ => (rect.left() + 1.0, theme.row_label),
+                        };
                         painter.text(
-                            Pos2::new(rect.left() + 1.0, row.center().y),
+                            Pos2::new(x, row.center().y),
                             egui::Align2::LEFT_CENTER,
                             label,
                             egui::FontId::monospace(8.0),
-                            theme.row_label,
+                            color,
+                        );
+                    }
+                    if stacked_many && labelled && index == lane_box.first {
+                        painter.text(
+                            Pos2::new(rect.left() + 1.0, row.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            lane_name(plan.lane),
+                            egui::FontId::monospace(8.0),
+                            letter_color,
                         );
                     }
                 }
@@ -7271,7 +7789,7 @@ impl Recorder {
                 }
             }
         }
-        if stacked {
+        if stacked || self.scrolls_as_column() {
             self.paint_lane_furniture(ui, &painter, rect, audio, &boxes);
         }
         if separate && let [_, lane_b] = boxes.as_slice() {
@@ -7353,7 +7871,8 @@ impl Recorder {
         }
     }
 
-    /// The line between two lanes, the scroll bars and the group switches of stacked lanes.
+    /// The line between two lanes, the scroll bars and the group switches of stacked lanes,
+    /// and with more than two lanes the plot's scroll bar.
     fn paint_lane_furniture(
         &self,
         ui: &egui::Ui,
@@ -7363,18 +7882,22 @@ impl Recorder {
         boxes: &[LaneBox],
     ) {
         let hover = ui.input(|input| input.pointer.hover_pos());
-        for lane_box in boxes.iter().skip(1) {
-            painter.hline(
-                rect.left() + 1.0..=audio.right(),
-                audio.top() + lane_box.top,
-                Stroke::new(1.0, Color32::from_white_alpha(36)),
-            );
-        }
-        for (plan, lane_box) in self.lanes.iter().zip(boxes) {
-            if !lane_box.scrolls() {
-                continue;
+        let many = self.scrolls_as_column();
+        if self.stacked() {
+            for lane_box in boxes.iter().skip(1) {
+                // With many lanes, only a lane whose first row is on screen has its line.
+                if many && (lane_box.shown == 0 || lane_box.first > 0) {
+                    continue;
+                }
+                painter.hline(
+                    rect.left() + 1.0..=audio.right(),
+                    audio.top() + lane_box.top,
+                    Stroke::new(1.0, Color32::from_white_alpha(36)),
+                );
             }
-            let track = self.scroll_track(rect, lane_box);
+        }
+        for (target, lane_box) in self.scroll_boxes(audio.height()) {
+            let track = self.scroll_track(rect, &lane_box);
             let x = track.center().x - 1.5..=track.center().x + 1.5;
             painter.rect_filled(
                 Rect::from_x_y_ranges(x.clone(), track.y_range()),
@@ -7382,7 +7905,7 @@ impl Recorder {
                 Color32::from_white_alpha(18),
             );
             let thumb = lane_box.thumb();
-            let active = self.scroll_drag.is_some_and(|(lane, _)| lane == plan.lane)
+            let active = self.scroll_drag.is_some_and(|(held, _)| held == target)
                 || hover.is_some_and(|point| track.contains(point));
             painter.rect_filled(
                 Rect::from_x_y_ranges(x, audio.top() + thumb.start..=audio.top() + thumb.end),
@@ -8015,6 +8538,8 @@ impl eframe::App for Recorder {
                 let interaction_blocked = window_drag.is_some();
                 if !self.waveform_only {
                     self.controls(ui, interaction_blocked);
+                } else {
+                    self.close_meter_list();
                 }
                 // Alt over a flag of the selection offers its fade, not a window move.
                 let fade_hover = !interaction_blocked
@@ -8334,6 +8859,20 @@ fn source_file_name<'a>(names: &'a SourceNames, source: &'a CaptureSource) -> &'
 
 /// How wide each meter readout is while there is more than one lane.
 const METER_WIDTH_SHARED: f32 = 91.0;
+/// How wide the "+N" button for the meters that do not fit is.
+const MORE_METERS_WIDTH: f32 = 34.0;
+
+/// How many of `count` lanes' readouts (more than two) the toolbar shows in `available` points,
+/// each taking `each`: every one when they all fit, else as many as fit beside the "+N" button,
+/// which takes `more`, and at least one.
+fn meters_shown(count: usize, available: f32, each: f32, more: f32) -> usize {
+    let fit = |width: f32| (width.max(0.0) / each) as usize;
+    if fit(available) >= count {
+        count
+    } else {
+        fit(available - more).clamp(1, count.saturating_sub(1).max(1))
+    }
+}
 
 fn lane_name(lane: usize) -> &'static str {
     Lane::from_index(lane).map_or("?", Lane::letter)
@@ -8355,6 +8894,108 @@ fn dropped_paths(ctx: &egui::Context) -> Vec<PathBuf> {
             .map(|file| egui::DroppedFile::path(file.as_ref()).to_path_buf())
             .collect()
     })
+}
+
+/// The scrolling area of an Options page, scrolled to `offset` when the test harness asks for
+/// it (egui keeps it in range).
+fn options_page_area(section: OptionsSection, offset: Option<f32>) -> egui::ScrollArea {
+    let area = egui::ScrollArea::vertical()
+        .id_salt(section)
+        .auto_shrink([false, false]);
+    match offset {
+        Some(offset) => area.vertical_scroll_offset(offset),
+        None => area,
+    }
+}
+
+/// The most channels all lanes together hold (`controller::layout::lane_fits`).
+const CHANNEL_LIMIT: usize = 64;
+
+/// A lane's heading on the Sources page, with a Remove button at its right while there is more
+/// than one lane (`removable`). The heading takes the room it always did; the button sits on
+/// its line, its right edge under the controls'. True when the button was pressed.
+fn source_heading(
+    ui: &mut egui::Ui,
+    title: &str,
+    removable: bool,
+    language: Language,
+    lane: usize,
+) -> bool {
+    let right = options_control_right(ui);
+    let top = ui.cursor().top();
+    options_group_heading(ui, title);
+    if !removable {
+        return false;
+    }
+    // The heading's own line, from below the space above it to its bottom. A child that is not
+    // allocated in the page leaves the rows below where they were.
+    let line = Rect::from_x_y_ranges(
+        ui.max_rect().left()..=right,
+        top + 2.0..=ui.min_rect().bottom(),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(line)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    child
+        .small_button(language.remove_source())
+        .on_hover_text(language.remove_source_tip(lane_name(lane)))
+        .clicked()
+}
+
+/// The rows of an audio source list: a spinner while the list is being made (`loading`), else
+/// every choice, with an application's path or a Sender's id on hover. Returns the choice
+/// clicked, unless it is `selected` already.
+fn source_menu_rows(
+    ui: &mut egui::Ui,
+    choices: &[CaptureSource],
+    loading: bool,
+    selected: Option<&CaptureSource>,
+) -> Option<CaptureSource> {
+    if loading {
+        ui.spinner();
+        return None;
+    }
+    let mut picked = None;
+    for choice in choices {
+        let is_selected = selected.is_some_and(|source| choice.same_source(source));
+        let label = source_picker_label(choice, choices);
+        let row = ui.selectable_label(is_selected, label.as_ref());
+        if row.clicked() && !is_selected {
+            picked = Some(choice.clone());
+        }
+        match choice {
+            CaptureSource::Application { path, .. } => {
+                row.on_hover_text(path);
+            }
+            CaptureSource::Sender { id, .. } => {
+                row.on_hover_text(format!("Sender instance {id}"));
+            }
+            _ => {}
+        }
+    }
+    picked
+}
+
+/// The lanes of `sources` that are switched off (`None`) and have a lane after them that is
+/// on, which moves up into their place: these are the lanes whose meter unit goes with them.
+fn lanes_moving_up(sources: &[Option<SourceSettings>]) -> Vec<usize> {
+    let Some(last) = sources.iter().rposition(Option::is_some) else {
+        return Vec::new();
+    };
+    (0..last).filter(|&lane| sources[lane].is_none()).collect()
+}
+
+/// `modes` (by lane) after the lanes in `removed` are taken out and the lanes after each move
+/// up, with decibels for the lanes freed at the end.
+fn shift_meter_modes(modes: &mut Vec<MeterMode>, removed: &[usize]) {
+    for &lane in removed.iter().rev() {
+        if lane < modes.len() {
+            modes.remove(lane);
+            modes.push(MeterMode::Dbfs);
+        }
+    }
 }
 
 fn source_picker_label<'a>(
@@ -10551,6 +11192,58 @@ mod tests {
     }
 
     #[test]
+    fn rows_chosen_in_some_of_many_lanes_write_only_those_lanes() {
+        let snapshots: Arc<[FrozenTrack]> = (0..4).map(|_| numbered(2)).collect();
+        let lanes = [0, 1, 2, 3];
+        let write = |rows: &[RowSource]| {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let folder = std::env::temp_dir().join(format!(
+                "Backtracking-many-lanes-{}-{nonce}",
+                std::process::id()
+            ));
+            let format = ClipFormat {
+                names: ["Tone", "Music", "Voice", "Room"].map(String::from).to_vec(),
+                ..ClipFormat::unnamed([ChannelRoute::Merged; 4], false)
+            };
+            let clip = WavClip::new(
+                Arc::clone(&snapshots),
+                &lanes,
+                Some(&(101..105)),
+                Fades::NONE,
+                folder.clone(),
+                format,
+                None,
+            )
+            .unwrap();
+            let files = clip.with_rows(rows, &[]).unwrap().write(false).unwrap();
+            let mut names: Vec<String> = files
+                .paths
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            drop(files);
+            let _ = std::fs::remove_dir_all(folder);
+            names
+        };
+        let merged = |lane| RowSource::View(lane, WaveformView::Merged);
+        // Rows of B and D: A and C are left out, and each file keeps its lane's letter.
+        let names = write(&[merged(1), merged(3)]);
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names[0].starts_with("Backtracking_Music_B_"), "{names:?}");
+        assert!(names[1].starts_with("Backtracking_Room_D_"), "{names:?}");
+        // Rows of one lane write that lane, as before.
+        let names = write(&[merged(2)]);
+        assert_eq!(names.len(), 1);
+        assert!(names[0].starts_with("Backtracking_Voice_C_"), "{names:?}");
+        // No rows chosen: every lane.
+        assert_eq!(write(&[]).len(), 4);
+    }
+
+    #[test]
     fn a_row_drag_covers_its_start_row_to_the_row_under_the_pointer_and_back() {
         let lanes = [
             wide_plan(0, bed_group()),
@@ -12243,6 +12936,167 @@ mod tests {
             || MAX_GROWN_WINDOW_HEIGHT,
         );
         assert_eq!(fit, WindowFit::Grow(window + wanted - current));
+    }
+
+    #[test]
+    fn the_meters_that_fit_show_and_the_rest_go_behind_one_button() {
+        let (each, more) = (95.0, 38.0);
+        // One or two lanes, or every meter fitting, show them all.
+        assert_eq!(meters_shown(3, 3.0 * each, each, more), 3);
+        assert_eq!(meters_shown(6, 600.0, each, more), 6);
+        // Six lanes in 400 points: three meters and the "+3" button.
+        assert_eq!(meters_shown(6, 400.0, each, more), 3);
+        // 64 lanes in a wide toolbar still leave room for the button.
+        let shown = meters_shown(64, 1000.0, each, more);
+        assert_eq!(shown, 10);
+        assert!(shown as f32 * each + more <= 1000.0);
+        // Never fewer than one, nor all of them behind the button.
+        assert_eq!(meters_shown(6, 10.0, each, more), 1);
+        assert_eq!(meters_shown(3, 0.0, each, more), 1);
+    }
+
+    #[test]
+    fn removing_a_lane_takes_its_meter_unit_with_it_and_moves_the_later_ones_up() {
+        let tone = || {
+            Some(SourceSettings {
+                source: CaptureSource::System,
+                route: ChannelRoute::Merged,
+            })
+        };
+        // Lane B of four removed: C and D move up into B and C.
+        let sources = vec![tone(), None, tone(), tone()];
+        assert_eq!(lanes_moving_up(&sources), vec![1]);
+        let mut modes = vec![
+            MeterMode::Dbfs,
+            MeterMode::Lufs,
+            MeterMode::Vu,
+            MeterMode::Lufs,
+        ];
+        shift_meter_modes(&mut modes, &lanes_moving_up(&sources));
+        assert_eq!(
+            modes,
+            [MeterMode::Dbfs, MeterMode::Vu, MeterMode::Lufs, MeterMode::Dbfs]
+        );
+        // The last lane removed moves nothing, so every unit stays where it was.
+        assert!(lanes_moving_up(&[tone(), tone(), None]).is_empty());
+        // Two removed at once: B and D of five, so C and E become B and C.
+        let sources = vec![tone(), None, tone(), None, tone()];
+        assert_eq!(lanes_moving_up(&sources), vec![1, 3]);
+        let mut modes = vec![
+            MeterMode::Dbfs,
+            MeterMode::Lufs,
+            MeterMode::Vu,
+            MeterMode::Lufs,
+            MeterMode::Vu,
+        ];
+        shift_meter_modes(&mut modes, &[1, 3]);
+        assert_eq!(
+            modes,
+            [
+                MeterMode::Dbfs,
+                MeterMode::Vu,
+                MeterMode::Vu,
+                MeterMode::Dbfs,
+                MeterMode::Dbfs
+            ]
+        );
+        assert_eq!(
+            compact_sources(sources).len(),
+            3,
+            "the lanes left are the ones whose units were kept"
+        );
+    }
+
+    #[test]
+    fn many_lanes_ask_for_room_and_scroll_as_one_column() {
+        let mono = stack::LaneRows {
+            rows: 1,
+            stacked: false,
+        };
+        // One or two lanes that do not stack ask for nothing, as before.
+        assert_eq!(wanted_height(&[mono, mono]), None);
+        // Three lanes or more ask for a comfortable row each.
+        assert_eq!(
+            wanted_height(&[mono; 3]),
+            Some(3.0 * stack::COMFORTABLE_ROW_HEIGHT)
+        );
+        assert_eq!(
+            wanted_height(&[mono; 64]),
+            Some(64.0 * stack::COMFORTABLE_ROW_HEIGHT)
+        );
+        // A stacked lane asks as it always did.
+        let wide = stack::LaneRows {
+            rows: 14,
+            stacked: true,
+        };
+        assert_eq!(
+            wanted_height(&[wide, mono]),
+            stack::comfortable_height(&[wide, mono])
+        );
+
+        // The plot's margin: none, channel names, letters, letters and names.
+        assert_eq!(label_gutter(1, false), None);
+        assert_eq!(label_gutter(2, false), None);
+        assert_eq!(label_gutter(2, true), Some(stack::LABEL_GUTTER));
+        assert_eq!(label_gutter(3, false), Some(LETTER_GUTTER));
+        assert_eq!(label_gutter(6, true), Some(LETTERED_GUTTER));
+        assert!(LETTERED_GUTTER > stack::LABEL_GUTTER);
+
+        // 64 lanes in 500 points: 35 rows show, and the column scrolls by whole rows.
+        let (boxes, column) = stack::lay_out_column(500.0, &[mono; 64], 40);
+        assert_eq!((column.first, column.shown, column.rows), (29, 35, 64));
+        assert_eq!(column_edge(&column, -1.0), Some(false));
+        assert_eq!(column_edge(&column, 250.0), None);
+        assert_eq!(column_edge(&column, 500.0), None, "the last row is on show");
+        let (_, top) = stack::lay_out_column(500.0, &[mono; 64], 0);
+        assert_eq!(column_edge(&top, -1.0), None);
+        assert_eq!(column_edge(&top, 500.0), Some(true));
+        // Only the lanes on show have rows on screen.
+        let on_show: Vec<usize> = boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, lane)| lane.shown > 0)
+            .map(|(lane, _)| lane)
+            .collect();
+        assert_eq!(on_show, (29..64).collect::<Vec<_>>());
+
+        // A lane's row in the column counts every row of the lanes above it.
+        let lanes = [
+            views_plan(0, &[WaveformView::Merged]),
+            wide_plan(1, bed_group()),
+            views_plan(2, &[WaveformView::Merged]),
+        ];
+        assert_eq!(column_row(&lanes, 0, 0), 0);
+        assert_eq!(column_row(&lanes, 1, 3), 4);
+        assert_eq!(column_row(&lanes, 2, 0), 1 + lanes[1].rows());
+    }
+
+    #[test]
+    fn the_status_line_names_a_lane_problem_by_its_letter_with_more_than_one_lane() {
+        let english = Language::English;
+        assert_eq!(lanes_problem([None, None], true, english), None);
+        assert_eq!(
+            lanes_problem([Some("The device is gone.")], false, english).as_deref(),
+            Some("The device is gone.")
+        );
+        assert_eq!(
+            lanes_problem([None, None, Some("The device is gone.")], true, english).as_deref(),
+            Some("Source C: The device is gone.")
+        );
+        let refused = "Lane G cannot start: it needs 12 channels and 4 are left.";
+        let mut lanes = vec![None; 6];
+        lanes.push(Some(refused));
+        lanes.push(Some("The device is gone."));
+        lanes.push(Some("The device is gone."));
+        assert_eq!(
+            lanes_problem(lanes, true, english).as_deref(),
+            Some("Lane G cannot start: it needs 12 channels and 4 are left. · 2 more sources have a problem")
+        );
+        assert_eq!(
+            lanes_problem([None, Some("裝置已移除。")], true, Language::TraditionalChinese)
+                .as_deref(),
+            Some("來源 B：裝置已移除。")
+        );
     }
 
     #[test]

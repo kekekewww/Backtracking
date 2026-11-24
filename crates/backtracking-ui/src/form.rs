@@ -115,6 +115,18 @@ pub fn options_control_width(ui: &egui::Ui) -> f32 {
     ui.available_width().min(OPTIONS_CONTROL_WIDTH)
 }
 
+/// Where the right edge of the control in an `options_field` row placed in `ui` now falls, so
+/// something above the rows can line up with them.
+pub fn options_control_right(ui: &egui::Ui) -> f32 {
+    let (left, width) = (ui.cursor().left(), ui.available_width());
+    if width < OPTIONS_TWO_COLUMN_WIDTH {
+        return left + width.min(OPTIONS_CONTROL_WIDTH);
+    }
+    let label = OPTIONS_LABEL_WIDTH.min(width * OPTIONS_LABEL_SHARE);
+    let spacing = ui.spacing().item_spacing.x;
+    left + label + spacing + (width - label - spacing).min(OPTIONS_CONTROL_WIDTH)
+}
+
 /// A value that is shown, not edited, on the same line height as a control.
 pub fn options_value(ui: &mut egui::Ui, text: &str) {
     let size = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);

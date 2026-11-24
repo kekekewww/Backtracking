@@ -111,6 +111,21 @@ macOS 桌面版可從選單列顯示或隱藏視窗、暫停或恢復擷取、�
 
 目前只有 Windows 桌面版提供，macOS 桌面版尚未支援。
 
+### 多個來源（Windows 桌面版）
+
+Windows 桌面版可以同時擷取 A、B 以外的更多來源，最多 64 個，各占一條波形列，依序以 A、B、C……Z、AA……BL 命名。
+
+- 在 Options 的 **Sources** 頁，每個來源各有一段，標題為 **Source A**、**Source B** 等，下方是與以往相同的音訊來源、聲道路由與檔名欄位。清單最下方的 **新增來源／Add source** 選單列出可用來源，選擇後會加在清單最後。已有 64 個來源時，這個選單無法使用，並說明原因。
+- 來源超過一個時，每段標題右側有 **移除／Remove**。移除後，後面的來源會往前遞補一個字母，例如移除 B 後，原本的 C 變成 B，它的音量表單位也跟著移動。只剩一個來源時不能移除。來源 B 之後的每個來源也可在音訊來源選單選 **Off**，效果與移除相同。目前不能調整來源順序。
+- 新增、移除或更換來源會重新開始記錄歷史，頁面底部也會註明。
+- 所有來源合計最多 64 個聲道。頁面底部顯示目前使用了幾個（**N of 64 channels in use／已使用 N 個聲道，上限 64 個**）。超過上限的來源無法開始，原因會寫在該來源那一段，正常視窗的狀態列也會顯示，並以該來源的字母開頭；波形左側的字母改為警示色。
+- 保留歷史的記憶體由所有聲道共用（電腦記憶體的八分之一，介於 256 MiB 與 2 GiB 之間）。聲道越多，能保留的時間越短；放不下所選的保留時間時，**Capture** 頁和 **Sources** 頁會寫出實際能保留多久，例如 **With 64 channels, memory holds the latest 2 minutes 54 seconds.**。
+- 超過兩個來源時，波形左側顯示每個來源的字母；多聲道來源在字母旁再列出各聲道名稱。將游標移到字母上，會顯示該來源是什麼與它的狀態。
+- 列數多到在視窗內每列放不下 14 像素時，整個波形區會一起上下捲動：在波形左右邊緣或右側捲軸上捲動滑鼠滾輪，或拖曳捲軸。在波形中間捲動仍是縮放。框選、旗標、拖出與[分開編輯](#分開編輯)在捲動後的列上照常使用；分開編輯時拖到波形上下緣會自動捲動。視窗會先長高，最多到 560 像素，放不下時才捲動。
+- 工具列只顯示放得下的音量表，其餘收在 **+N** 按鈕；按下它會列出每個來源的音量表，按其他地方或 `Esc` 關閉。
+- 匯出、拖出與快照為每個來源各寫一個 WAV 檔，檔名含該來源的字母，例如 `Backtracking_Spotify_C_….wav`。
+- 一或兩個來源時，畫面與以往相同。macOS 桌面版與 VST3／CLAP 插件仍維持原本的來源數量。
+
 ### 即時音量表
 
 齒輪旁的音量表顯示目前輸入的音訊，預設模式是 dBFS。從齒輪選單的音量表設定切換單位。macOS 桌面版也可直接點擊讀值切換。暫停錄音或目前無可用讀值時，顯示 `—`。
@@ -400,6 +415,21 @@ While there is a selection, the selected part keeps its colors and the rest of t
 A look from an add-on (see Add-ons) can supply these colors. They are used only while By frequency is on and you have no colors of your own, and a note under the colors names the add-on. Changing any of them makes them your own, starting from the look's; **Reset** then goes back to the look's colors. An add-on cannot turn By frequency on for you.
 
 Only the Windows desktop app has this for now; the macOS app does not yet.
+
+### More than two sources (Windows desktop)
+
+The Windows desktop app can capture more sources than A and B at once, up to 64. Each gets its own lane, lettered in order A, B, C … Z, AA … BL.
+
+- On the **Sources** page of Options, each source has a section headed **Source A**, **Source B** and so on, with the same Audio source, Channel route and File name fields as before. Below the list, the **Add source** menu lists the sources you can pick; the one you choose is added at the end. With 64 sources the menu is unavailable and says why.
+- While there is more than one source, each heading has **Remove** at its right. The sources after it move up a letter: remove B and C becomes B, taking its meter unit with it. The only source left cannot be removed. Choosing **Off** for any source after A does the same as Remove. Sources cannot be reordered yet.
+- Adding, removing or changing a source starts a new history; the foot of the page says so.
+- All sources together hold at most 64 channels. The foot of the page shows how many are in use (**N of 64 channels in use**). A source past the limit cannot start: the reason shows in its own section, and on the status line of the full window, led by its letter. Its letter beside the waveform turns amber.
+- The memory for history is shared by every channel (one eighth of the computer's memory, from 256 MiB to 2 GiB). The more channels, the shorter the history; when the chosen length does not fit, the **Capture** and **Sources** pages say how much does, for example **With 64 channels, memory holds the latest 2 minutes 54 seconds.**
+- With more than two sources, each lane's letter shows at the left of the waveform; a multichannel source lists its channel names beside its letter. Hover over a letter to see which source it is and how it is doing.
+- When there are more rows than fit at 14 pixels each, the whole waveform scrolls up and down as one: turn the wheel over its left margin or the scroll bar on the right, or drag the bar. The wheel over the waveform itself still zooms. Selecting, flags, dragging out and [Edit separately](#edit-separately) work on scrolled rows; while editing separately, a drag past the top or bottom edge scrolls. The window first grows taller, up to 560 pixels, and scrolls only past that.
+- The toolbar shows the meters that fit and gathers the rest behind a **+N** button. Click it to see every source's meter; click elsewhere or press `Esc` to close the list.
+- Exports, drags and snapshots write a WAV file for each source, named with its letter, for example `Backtracking_Spotify_C_….wav`.
+- With one or two sources the window looks as before. The macOS app and the VST3 and CLAP plug-ins keep the sources they had.
 
 ### Live audio meter
 

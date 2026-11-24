@@ -22,8 +22,8 @@ pub use form::{
     OPTIONS_CONTROL_OUTLINE, OPTIONS_CONTROL_WIDTH, OPTIONS_LABEL_TEXT, OPTIONS_LABEL_WIDTH,
     OPTIONS_MENU_ROW_GAP, OPTIONS_NAVIGATION_ROW, OPTIONS_NAVIGATION_WIDTH, OPTIONS_NOTE_TEXT,
     OPTIONS_TITLE_TEXT, OPTIONS_TWO_COLUMN_WIDTH, OPTIONS_VALUE_TEXT, configure_options_menu,
-    configure_options_style, options_bold_family, options_choice, options_control_width,
-    options_field, options_group_heading, options_heading_text, options_list,
+    configure_options_style, options_bold_family, options_choice, options_control_right,
+    options_control_width, options_field, options_group_heading, options_heading_text, options_list,
     options_menu_height, options_navigation_item, options_note, options_value,
     remeasure_options_menu,
 };

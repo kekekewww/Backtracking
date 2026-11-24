@@ -189,6 +189,126 @@ impl Language {
         }
     }
 
+    /// The first line of the tooltip over a lane's rows, when there are more than two lanes.
+    pub(crate) fn lane_source(self, letter: &str, name: &str) -> String {
+        match self {
+            Self::English => format!("Source {letter}: {name}"),
+            Self::TraditionalChinese => format!("來源 {letter}：{name}"),
+        }
+    }
+
+    /// The tooltip line of a plot whose rows of every lane scroll as one.
+    pub(crate) fn plot_scroll_hint(self) -> &'static str {
+        self.pick(
+            "Scroll here or drag the bar on the right to see the other sources.",
+            "在這裡捲動，或拖曳右側的捲軸，查看其他來源。",
+        )
+    }
+
+    /// A lane's problem on the status line, named by its letter. A message that already names
+    /// the lane is left as it is.
+    pub(crate) fn lane_problem(self, letter: &str, text: &str) -> String {
+        if text.starts_with(&format!("Lane {letter} ")) || text.starts_with(&format!("來源 {letter} "))
+        {
+            return text.to_owned();
+        }
+        match self {
+            Self::English => format!("Source {letter}: {text}"),
+            Self::TraditionalChinese => format!("來源 {letter}：{text}"),
+        }
+    }
+
+    /// After the first lane's problem on the status line: how many other lanes have one.
+    pub(crate) fn more_lane_problems(self, count: usize) -> String {
+        match (self, count) {
+            (Self::English, 1) => "1 more source has a problem".to_owned(),
+            (Self::English, count) => format!("{count} more sources have a problem"),
+            (Self::TraditionalChinese, count) => format!("另有 {count} 個來源有問題"),
+        }
+    }
+
+    /// The Sources page's control under the list that adds a lane.
+    pub(crate) fn add_source_field(self) -> &'static str {
+        self.pick("Add source", "新增來源")
+    }
+
+    pub(crate) fn choose_source(self) -> &'static str {
+        self.pick("Choose a source", "選擇來源")
+    }
+
+    pub(crate) fn no_more_sources(self) -> &'static str {
+        self.pick("No more sources", "無法再新增")
+    }
+
+    pub(crate) fn add_source_tip(self) -> &'static str {
+        self.pick(
+            "The source you choose is added at the end of the list and recorded with the others.",
+            "選擇的來源會加在清單最後，與其他來源一起擷取。",
+        )
+    }
+
+    pub(crate) fn sources_full(self) -> &'static str {
+        self.pick(
+            "64 sources is the most the app can hold.",
+            "最多只能有 64 個來源。",
+        )
+    }
+
+    /// How many of the 64 channels the lanes use together.
+    pub(crate) fn channels_in_use(self, channels: usize) -> String {
+        match self {
+            Self::English => format!("{channels} of 64 channels in use"),
+            Self::TraditionalChinese => format!("已使用 {channels} 個聲道，上限 64 個"),
+        }
+    }
+
+    pub(crate) fn channels_full(self) -> &'static str {
+        self.pick(
+            "All 64 channels are in use. A source added now cannot start.",
+            "64 個聲道已全部使用，現在新增的來源無法開始。",
+        )
+    }
+
+    /// At the foot of the Sources page. With more than one lane (`dual`) it also says that
+    /// removing a lane moves the later ones up.
+    pub(crate) fn sources_restart_history(self, dual: bool) -> &'static str {
+        match (self, dual) {
+            (Self::English, false) => "Adding, removing or changing a source starts a new history.",
+            (Self::English, true) => {
+                "Adding, removing or changing a source starts a new history. Removing a source \
+                 moves the ones after it up a letter."
+            }
+            (Self::TraditionalChinese, false) => "新增、移除或更換來源會重新開始記錄歷史。",
+            (Self::TraditionalChinese, true) => {
+                "新增、移除或更換來源會重新開始記錄歷史。移除來源後，後面的來源會往前遞補一個字母。"
+            }
+        }
+    }
+
+    pub(crate) fn remove_source(self) -> &'static str {
+        self.pick("Remove", "移除")
+    }
+
+    pub(crate) fn remove_source_tip(self, letter: &str) -> String {
+        match self {
+            Self::English => format!("Remove source {letter}. The sources after it move up."),
+            Self::TraditionalChinese => format!("移除來源 {letter}，後面的來源會往前遞補。"),
+        }
+    }
+
+    /// The "+N" button beside the meters that fit, `hidden` meters not shown.
+    pub(crate) fn more_meters(self, hidden: usize) -> String {
+        match (self, hidden) {
+            (Self::English, 1) => "1 more meter. Click to see every source's meter.".to_owned(),
+            (Self::English, hidden) => {
+                format!("{hidden} more meters. Click to see every source's meter.")
+            }
+            (Self::TraditionalChinese, hidden) => {
+                format!("還有 {hidden} 個電平表。按一下可查看所有來源的電平表。")
+            }
+        }
+    }
+
     pub(crate) fn duration(self, seconds: f64) -> String {
         let total = seconds.max(0.0).floor() as u64;
         let (minutes, seconds) = (total / 60, total % 60);
@@ -1417,6 +1537,58 @@ mod tests {
         assert_eq!(English.channel(3, 12, "C"), "Channel 3 of 12: C");
         assert_eq!(TraditionalChinese.show_group("Objects"), "顯示Objects");
         assert_ne!(English.scroll_hint(), TraditionalChinese.scroll_hint());
+    }
+
+    #[test]
+    fn the_source_list_and_meter_texts_exist_in_both_languages() {
+        for text in [
+            super::Language::plot_scroll_hint,
+            super::Language::add_source_field,
+            super::Language::choose_source,
+            super::Language::no_more_sources,
+            super::Language::add_source_tip,
+            super::Language::sources_full,
+            super::Language::channels_full,
+            super::Language::remove_source,
+        ] {
+            assert_ne!(text(English), text(TraditionalChinese));
+            assert!(text(TraditionalChinese).chars().any(|c| c as u32 >= 0x3000));
+            assert!(!text(English).ends_with('。') && !text(English).is_empty());
+        }
+        for dual in [false, true] {
+            assert_ne!(
+                English.sources_restart_history(dual),
+                TraditionalChinese.sources_restart_history(dual)
+            );
+        }
+        assert!(English.sources_restart_history(true).contains("move"));
+        assert!(!English.sources_restart_history(false).contains("move"));
+        assert_eq!(English.channels_in_use(12), "12 of 64 channels in use");
+        assert_eq!(English.lane_source("C", "Speakers"), "Source C: Speakers");
+        assert_eq!(TraditionalChinese.lane_source("C", "喇叭"), "來源 C：喇叭");
+        assert_eq!(English.more_meters(1), "1 more meter. Click to see every source's meter.");
+        assert!(English.more_meters(5).starts_with("5 more meters"));
+        assert!(TraditionalChinese.more_meters(5).contains('5'));
+        assert_eq!(English.more_lane_problems(1), "1 more source has a problem");
+        assert_eq!(English.more_lane_problems(3), "3 more sources have a problem");
+        assert_ne!(English.remove_source_tip("B"), TraditionalChinese.remove_source_tip("B"));
+    }
+
+    #[test]
+    fn a_lane_problem_names_its_lane_once() {
+        assert_eq!(
+            English.lane_problem("C", "The device was unplugged."),
+            "Source C: The device was unplugged."
+        );
+        assert_eq!(
+            TraditionalChinese.lane_problem("C", "裝置已拔除。"),
+            "來源 C：裝置已拔除。"
+        );
+        // The capture code's refusal already names the lane.
+        let refused = "Lane G cannot start: all 64 channels are in use.";
+        assert_eq!(English.lane_problem("G", refused), refused);
+        let refused = "來源 G 無法開始：64 個聲道已用完。";
+        assert_eq!(TraditionalChinese.lane_problem("G", refused), refused);
     }
 
     #[test]

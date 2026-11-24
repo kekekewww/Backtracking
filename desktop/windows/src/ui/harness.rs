@@ -8,8 +8,16 @@
 //!   Steps are separated by `;`. Times are seconds back from the newest audio, and a lane is
 //!   named by its letter, `A` to `BL` in either case, or by its index from 0:
 //!   `zoom=<seconds>` shows only that much; `select=<from>-<to>` selects that stretch, as a
-//!   drag would; `scroll=<lane>:<row>` scrolls a stacked lane (A is 0) to that row;
+//!   drag would; `scroll=<lane>:<row>` scrolls a stacked lane (A is 0) to that row, or, with
+//!   more than two lanes, whose rows all scroll as one, the whole plot so that row is on top;
 //!   `group=<lane>:<group id>` shows another channel group.
+//!   `add-source=<name>` adds the source of that name (or the first whose name contains it,
+//!   ignoring case, `Test tone` say) as the next lane, and `remove-source=<lane>` removes a
+//!   lane, as the Sources page's Add source and Remove do; both wait until the steps before
+//!   them have settled. `meters=open` opens the list of every lane's meter, as the "+N" button
+//!   beside the meters does. `options-scroll=<points>` scrolls the Options page that far
+//!   down, once the steps before it have settled; much past the end shows an empty page, so
+//!   stay near the page's real length.
 //!   `separate=<on|off>` edits rows on their own or together, as Right Ctrl does.
 //!   `rows=<lane>:<first>-<last>` makes the next `select=` cover those rows of the lane, as a
 //!   drag from the first row to the last does; rows count from 1, top down, as in the row
@@ -81,6 +89,7 @@ use backtracking_core::Lane;
 use eframe::egui;
 
 use super::{OptionsSection, Recorder, RowSource, hotkeys_page, rows_between};
+use crate::controller::{CaptureSource, Controller};
 use crate::hotkeys::{Action, Binding};
 use crate::preferences::{PairRender, WaveformColoring, WideExportMode, parse_gradient};
 
@@ -144,6 +153,14 @@ pub(super) enum Step {
     Gradient(Option<backtracking_ui::Spectrum>),
     /// Whether steps and the picture wait for the colours by frequency in flight.
     ColorWait(bool),
+    /// Adds the source of this name as the next lane, as the Sources page's Add source does.
+    AddSource(String),
+    /// Removes this lane, as its Remove button on the Sources page does.
+    RemoveSource(usize),
+    /// Opens the list of every lane's meter, as the "+N" button beside the meters does.
+    OpenMeters,
+    /// Scrolls the Options page this many points down, as the wheel would.
+    OptionsScroll(f32),
 }
 
 impl Step {
@@ -168,6 +185,11 @@ impl Step {
                 | Self::SelectLane(_)
                 // Each press gets frames of its own, after what it acts on.
                 | Self::Key(_)
+                // The lanes change, so the steps after them count the new ones.
+                | Self::AddSource(_)
+                | Self::RemoveSource(_)
+                // The page has to be on show before it can scroll.
+                | Self::OptionsScroll(_)
         )
     }
 }
@@ -225,6 +247,18 @@ fn write_picture(output: &Path, image: &egui::ColorImage) -> PictureResult {
         .map(|()| size)
 }
 
+/// The source of `choices` whose name is `name`, or else the first whose name contains it,
+/// ignoring case.
+fn source_named(choices: &[CaptureSource], name: &str) -> Option<CaptureSource> {
+    let wanted = name.trim().to_lowercase();
+    let label = |source: &&CaptureSource| source.label().to_lowercase();
+    choices
+        .iter()
+        .find(|source| label(source) == wanted)
+        .or_else(|| choices.iter().find(|source| label(source).contains(&wanted)))
+        .cloned()
+}
+
 /// A lane named by its letter, A to BL in either case, or by its index from 0.
 fn parse_lane(text: &str) -> Result<usize, String> {
     let text = text.trim();
@@ -249,6 +283,9 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
             }
             if step == "open-export-mode" {
                 return Ok(Step::OpenExportMode);
+            }
+            if step == "meters=open" {
+                return Ok(Step::OpenMeters);
             }
             let (name, value) = step
                 .split_once('=')
@@ -420,6 +457,18 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                     "off" => Ok(Step::ColorWait(false)),
                     other => Err(format!("{other} is not on or off")),
                 },
+                "add-source" => match value.trim() {
+                    "" => Err(format!("{step} needs the name of a source")),
+                    name => Ok(Step::AddSource(name.to_owned())),
+                },
+                "remove-source" => Ok(Step::RemoveSource(lane(value)?)),
+                "options-scroll" => value
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|points| points.is_finite() && *points >= 0.0)
+                    .map(Step::OptionsScroll)
+                    .ok_or_else(|| format!("{value} is not a number of points")),
                 other => Err(format!("unknown step {other}")),
             }
         })
@@ -985,6 +1034,46 @@ impl Recorder {
                 if let Some(harness) = self.harness.as_mut() {
                     harness.color_wait = wait;
                 }
+            }
+            Step::AddSource(name) => {
+                // The Sources page lists what it last scanned; a name it has not seen yet is
+                // looked for in a fresh scan, as opening the list does.
+                let source = match source_named(&self.available_sources, name) {
+                    Some(source) => source,
+                    None => {
+                        let listed = match self.controller.addons() {
+                            Some(addons) => {
+                                Controller::available_sources_with_addons(&addons.snapshot())
+                            }
+                            None => Controller::available_sources(),
+                        };
+                        let found = source_named(&listed, name);
+                        self.available_sources = listed;
+                        found.ok_or_else(|| format!("no source is called {name}"))?
+                    }
+                };
+                self.add_source(source)?;
+                ctx.request_repaint();
+            }
+            &Step::RemoveSource(lane) => {
+                self.remove_source(lane)?;
+                ctx.request_repaint();
+            }
+            &Step::OptionsScroll(points) => {
+                if !self.options_open {
+                    return Err("the Options window is not open".into());
+                }
+                self.options_scroll = Some(points);
+                ctx.request_repaint();
+            }
+            Step::OpenMeters => {
+                if self.lane_count() <= 2 {
+                    return Err("the meters all show with one or two sources".into());
+                }
+                if !self.meter_list_open {
+                    self.toggle_meter_list();
+                }
+                ctx.request_repaint();
             }
         }
         Ok(())
@@ -1570,6 +1659,38 @@ mod tests {
                 Step::Scroll(27, 3),
             ]
         );
+    }
+
+    #[test]
+    fn source_list_steps_add_and_remove_lanes_and_open_the_meters() {
+        let steps = parse_steps(
+            "add-source= Test tone ;remove-source=B;meters=open;options=sources;options-scroll=400",
+        )
+        .unwrap();
+        assert_eq!(
+            steps,
+            [
+                Step::AddSource("Test tone".into()),
+                Step::RemoveSource(1),
+                Step::OpenMeters,
+                Step::Options(OptionsSection::Sources, None),
+                Step::OptionsScroll(400.0),
+            ]
+        );
+        assert!(steps[0].waits() && steps[1].waits() && steps[4].waits());
+        assert!(!steps[2].waits());
+        for bad in ["add-source=", "remove-source=BM", "options-scroll=-3", "meters=shut"] {
+            assert!(parse_steps(bad).is_err(), "{bad}");
+        }
+        let tone = CaptureSource::Addon {
+            addon_id: "com.example.test-tone".into(),
+            source_id: "main".into(),
+            name: "Test tone".into(),
+        };
+        let choices = [CaptureSource::System, tone.clone()];
+        assert_eq!(source_named(&choices, "test TONE"), Some(tone.clone()));
+        assert_eq!(source_named(&choices, "tone"), Some(tone));
+        assert_eq!(source_named(&choices, "microphone"), None);
     }
 
     #[test]
