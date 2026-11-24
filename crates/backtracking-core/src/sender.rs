@@ -961,7 +961,16 @@ mod tests {
             .unwrap();
         let mut receiver = SenderReceiver::connect(endpoint.id()).unwrap();
         assert_eq!(receiver.labels().unwrap(), old);
-        endpoint.publish("Bus", 48_000, 10, 0, &[], &[]).unwrap();
+        // The endpoint takes a connection in once its token has arrived, which can be a moment
+        // after `connect` returns.
+        let accept = |endpoint: &mut SenderEndpoint| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while endpoint.clients.is_empty() && Instant::now() < deadline {
+                endpoint.publish("Bus", 48_000, 10, 0, &[], &[]).unwrap();
+                std::thread::yield_now();
+            }
+        };
+        accept(&mut endpoint);
         assert_eq!(endpoint.clients.len(), 1);
         let queued = SenderReceiver::connect(endpoint.id()).unwrap();
         endpoint
@@ -970,6 +979,7 @@ mod tests {
         assert!(endpoint.clients.is_empty());
         let mut next = SenderReceiver::connect(endpoint.id()).unwrap();
         assert_eq!(next.labels().unwrap(), new);
+        accept(&mut endpoint);
         endpoint
             .publish("Bus", 48_000, 10, 0, &[0.5; 10], &[])
             .unwrap();
