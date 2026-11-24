@@ -2,11 +2,15 @@ use std::ops::Range;
 
 mod geometry;
 mod pair;
+mod spectrum;
 pub use crate::preview::PreviewLane;
 pub use geometry::{
     minimum_zoom_frames, waveform_geometry, EnvelopeColumn, SamplePoint, WaveformGeometry,
 };
 pub use pair::{PairGroup, PairSide};
+pub use spectrum::{
+    BandEnergies, SpectrumBin, SpectrumRow, SPECTRUM_BANDS, SPECTRUM_BAND_EDGES_HZ,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u32)]

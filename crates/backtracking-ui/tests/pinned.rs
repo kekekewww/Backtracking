@@ -9,8 +9,9 @@ use std::ops::Range;
 
 use backtracking_core::waveform;
 use backtracking_ui::{
-    LoneSample, TraceStyle, TransportGlyph, icon_button, paint_transport_glyph,
-    paint_waveform_trace, status_led,
+    LoneSample, Spectrum, SpectrumStop, TraceStyle, TransportGlyph, icon_button,
+    paint_colored_waveform_trace, paint_transport_glyph, paint_waveform_trace, status_led,
+    trace_bin,
 };
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 
@@ -29,7 +30,14 @@ fn summary(shapes: &[egui::epaint::ClippedShape]) -> String {
             egui::Shape::Path(path) => {
                 let color = match &path.stroke.color {
                     egui::epaint::ColorMode::Solid(color) => format!("{:?}", color.to_array()),
-                    _ => "callback".to_owned(),
+                    // What the callback gives at each point and halfway to the next.
+                    egui::epaint::ColorMode::UV(callback) => {
+                        let rect = Rect::from_points(&path.points);
+                        let mut at: Vec<_> = path.points.windows(2)
+                            .flat_map(|pair| [pair[0], pair[0].lerp(pair[1], 0.5)]).collect();
+                        at.extend(path.points.last());
+                        format!("callback{:?}", at.iter().map(|&p| callback(rect, p).to_array()).collect::<Vec<_>>())
+                    }
                 };
                 format!("path closed={} fill={:?} stroke={:?}/{color} at {}", path.closed,
                     path.fill.to_array(), path.stroke.width, points(&path.points))
@@ -142,6 +150,207 @@ fn hand_built_runs_too_short_to_draw_paint_nothing() {
             });
     });
     assert_eq!(shapes, "");
+}
+
+/// The desktop window's trace style and the fill it derives from a colour.
+fn desktop_style(color: Color32) -> TraceStyle {
+    TraceStyle {
+        stroke: Stroke::new(STROKE, color),
+        fill: color.linear_multiply(0.4),
+        lone_sample: LoneSample::Dot(STROKE * 0.55),
+    }
+}
+
+/// The plug-in editor's trace style and the fill it derives from a colour.
+fn plugin_style(color: Color32) -> TraceStyle {
+    TraceStyle {
+        stroke: Stroke::new(STROKE, color),
+        fill: Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 96),
+        lone_sample: LoneSample::Dash(STROKE.max(1.0)),
+    }
+}
+
+fn plot_position(x: f32, value: f32) -> Pos2 {
+    Pos2::new(
+        PLOT.left() + x * PLOT.width(),
+        PLOT.center().y - value * PLOT.height() * 0.47,
+    )
+}
+
+/// Band energies for each bin of the cases: one band, two bands, none, all six.
+fn case_energies(bin: usize) -> Option<[f32; 6]> {
+    match bin % 4 {
+        0 => Some([0.0, 0.0, 0.0, 0.0, 0.0, 2.0]),
+        1 => Some([1.0, 0.0, 0.0, 0.0, 3.0, 0.0]),
+        2 => None,
+        _ => Some([1.0; 6]),
+    }
+}
+
+#[test]
+fn the_colored_waveform_is_painted_as_pinned() {
+    let spectrum = Spectrum::new([
+        SpectrumStop {
+            position: 0.0,
+            color: Spectrum::DEFAULT_LOW,
+        },
+        SpectrumStop {
+            position: 0.5,
+            color: Color32::from_rgb(40, 200, 90),
+        },
+        SpectrumStop {
+            position: 1.0,
+            color: Spectrum::DEFAULT_HIGH,
+        },
+    ])
+    .unwrap();
+    let palette = spectrum.palette(6);
+    let mut actual = String::new();
+    for (app, style) in [
+        ("desktop", desktop_style as fn(Color32) -> TraceStyle),
+        ("plugin", plugin_style),
+    ] {
+        for (name, minimum, maximum, visible) in waveform_cases() {
+            let bins = minimum.len();
+            let geometry = waveform::waveform_geometry(&minimum, &maximum, visible);
+            let color_at =
+                |x| case_energies(trace_bin(x, bins)).and_then(|energies| palette.color(&energies));
+            let fill_of = |color: Color32| style(color).fill;
+            let shapes = painted(Vec2::splat(400.0), |ui| {
+                let painter = ui.painter().with_clip_rect(PLOT);
+                paint_colored_waveform_trace(
+                    &painter,
+                    &geometry,
+                    plot_position,
+                    &style(ACCENT),
+                    color_at,
+                    fill_of,
+                );
+            });
+            actual += &format!("== {app} {name}\n{shapes}");
+        }
+    }
+    // A selection painted the way the window paints its flat trace: the geometry again under
+    // clip rectangles, the selected part with selected colours.
+    let (minimum, maximum) = (vec![-0.8, -0.2, -0.5, -0.3], vec![0.4, 0.9, 0.6, 0.2]);
+    let geometry = waveform::waveform_geometry(&minimum, &maximum, 0..4_000);
+    let color_at = |x| case_energies(trace_bin(x, 4)).and_then(|energies| palette.color(&energies));
+    let selected =
+        |color: Color32| Color32::from_rgb(255 - color.r(), 255 - color.g(), 255 - color.b());
+    let shapes = painted(Vec2::splat(400.0), |ui| {
+        let painter = ui.painter().with_clip_rect(PLOT);
+        for (range, chosen) in [(0.0..0.3, false), (0.3..0.6, true), (0.6..1.0, false)] {
+            let clip = Rect::from_x_y_ranges(
+                PLOT.left() + range.start * PLOT.width()..=PLOT.left() + range.end * PLOT.width(),
+                PLOT.y_range(),
+            );
+            let painter = painter.with_clip_rect(clip);
+            if chosen {
+                paint_colored_waveform_trace(
+                    &painter,
+                    &geometry,
+                    plot_position,
+                    &desktop_style(selected(ACCENT)),
+                    |x| color_at(x).map(selected),
+                    |color| desktop_style(color).fill,
+                );
+            } else {
+                paint_colored_waveform_trace(
+                    &painter,
+                    &geometry,
+                    plot_position,
+                    &desktop_style(ACCENT),
+                    color_at,
+                    |color| desktop_style(color).fill,
+                );
+            }
+        }
+    });
+    actual += &format!("== desktop selection\n{shapes}");
+    assert_matches_golden(&actual, include_str!("golden/colored_waveform.txt"));
+}
+
+#[test]
+fn a_colored_trace_without_colours_paints_exactly_the_flat_trace() {
+    for style in [desktop_style(ACCENT), plugin_style(ACCENT)] {
+        let flat = painted_waveforms(|painter, geometry| {
+            paint_waveform_trace(painter, geometry, plot_position, &style);
+        });
+        let colored = painted_waveforms(|painter, geometry| {
+            paint_colored_waveform_trace(
+                painter,
+                geometry,
+                plot_position,
+                &style,
+                |_| None,
+                |_| Color32::RED,
+            );
+        });
+        assert_eq!(colored, flat);
+    }
+    // One colour everywhere is a plain stroke in that colour, not a callback.
+    let geometry = waveform::waveform_geometry(&[-0.5, -0.25], &[0.5, 0.25], 0..100);
+    let shapes = painted(Vec2::splat(400.0), |ui| {
+        paint_colored_waveform_trace(
+            ui.painter(),
+            &geometry,
+            plot_position,
+            &desktop_style(ACCENT),
+            |_| Some(Color32::RED),
+            |color| color.linear_multiply(0.4),
+        );
+    });
+    assert!(!shapes.contains("callback"), "{shapes}");
+    assert!(
+        shapes.contains(&format!("stroke=1.5/{:?}", Color32::RED.to_array())),
+        "{shapes}"
+    );
+    // Hand-built runs too short to draw paint nothing.
+    let column = waveform::EnvelopeColumn {
+        x: 0.5,
+        minimum: -0.5,
+        maximum: 0.5,
+    };
+    let geometry = waveform::WaveformGeometry::Envelope(vec![vec![column], vec![]]);
+    let shapes = painted(Vec2::splat(400.0), |ui| {
+        paint_colored_waveform_trace(
+            ui.painter(),
+            &geometry,
+            plot_position,
+            &desktop_style(ACCENT),
+            |_| Some(Color32::RED),
+            |color| color,
+        );
+    });
+    assert_eq!(shapes, "");
+}
+
+#[test]
+fn trace_bins_follow_envelope_centres_and_sample_positions() {
+    for bins in [1, 3, 7, 1_000, 4_096] {
+        let values: Vec<f32> = (0..bins).map(|bin| (bin % 5) as f32 / 10.0).collect();
+        let lows: Vec<f32> = values.iter().map(|value| value - 0.5).collect();
+        let waveform::WaveformGeometry::Envelope(runs) =
+            waveform::waveform_geometry(&lows, &values, 0..bins as u64 * 3)
+        else {
+            panic!()
+        };
+        let centres = &runs[0][1..runs[0].len() - 1];
+        assert_eq!(centres.len(), bins);
+        for (bin, column) in centres.iter().enumerate() {
+            assert_eq!(trace_bin(column.x, bins), bin);
+        }
+        let waveform::WaveformGeometry::Samples(runs) =
+            waveform::waveform_geometry(&values, &values, 0..bins as u64)
+        else {
+            panic!()
+        };
+        for (bin, point) in runs[0].iter().enumerate() {
+            assert_eq!(trace_bin(point.x, bins), bin);
+        }
+        assert_eq!(trace_bin(1.0, bins), bins - 1);
+        assert_eq!(trace_bin(-0.5, bins), 0);
+    }
 }
 
 const DESKTOP_GLYPH: TransportGlyph = TransportGlyph {

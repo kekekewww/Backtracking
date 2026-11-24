@@ -10,6 +10,7 @@ use crate::waveform::WaveformView;
 #[cfg(test)]
 mod cache_tests;
 pub(super) mod pair;
+pub(super) mod spectrum;
 
 const BASE_SECONDS: usize = 60;
 pub(super) const PEAK_FRAMES: usize = 128;
@@ -198,6 +199,8 @@ pub(super) struct Page {
     first_frame: u64,
     samples: Vec<f32>,
     peaks: PagePeaks,
+    /// Frequency bands, built by the first read that asks for them.
+    bands: Arc<spectrum::BandCache>,
 }
 
 impl Page {
@@ -214,6 +217,7 @@ impl Page {
             first_frame: 0,
             samples,
             peaks: PagePeaks::new(peaks, layout, page_frames),
+            bands: Arc::default(),
         })
     }
 
@@ -235,6 +239,7 @@ impl Page {
 
     fn reset(&mut self, first_frame: u64) {
         self.peaks.invalidate_channels();
+        self.invalidate_bands();
         self.first_frame = first_frame;
         self.samples.clear();
         self.peaks.clear();
@@ -254,6 +259,7 @@ impl Page {
             first_frame: self.first_frame,
             samples: self.samples[..frames * channels].to_vec(),
             peaks: self.peaks.prefix(frames / PEAK_FRAMES),
+            bands: Arc::clone(&self.bands),
         }
     }
 
@@ -890,6 +896,7 @@ impl History {
             .map(|page| Arc::get_mut(page).expect("the faded pages are not shared"));
         for page in sealed.chain(self.open.as_mut().filter(|_| open)) {
             page.peaks.invalidate_channels();
+            page.invalidate_bands();
             let start = start.saturating_sub(page.first_frame) as usize;
             for (offset, frame) in page
                 .samples
@@ -920,5 +927,23 @@ impl History {
 
     pub(super) fn channel_extrema(&self, channel: usize, range: Range<u64>) -> (f32, f32) {
         channel_extrema(self.pages(range), self.layout, channel)
+    }
+
+    /// See [`spectrum::bins`]. `range` must lie inside the retained frames.
+    pub(super) fn spectrum(
+        &self,
+        sample_rate: u32,
+        members: &[(usize, f32)],
+        range: Range<u64>,
+        bins: &mut [crate::waveform::SpectrumBin],
+    ) -> usize {
+        spectrum::bins(
+            self.pages(range.clone()),
+            self.layout,
+            sample_rate,
+            members,
+            range,
+            bins,
+        )
     }
 }

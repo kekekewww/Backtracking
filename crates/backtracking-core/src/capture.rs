@@ -11,7 +11,7 @@ use std::time::Instant;
 use std::{error::Error, fmt, ops::Range};
 
 use crate::meter::{Meter, MeterReadings};
-use crate::waveform::WaveformView;
+use crate::waveform::{SpectrumBin, SpectrumRow, WaveformView};
 pub use frozen::{FrozenCapture, FrozenTrack};
 use history::{History, Layout};
 
@@ -821,6 +821,35 @@ impl Capture {
         waveform_bins(range, minimum, maximum, |frames| {
             self.history.channel_extrema(track.start + channel, frames)
         })
+    }
+
+    /// Writes the band energies of one waveform row of `lane` for each chronological bin of
+    /// the retained part of `range`, and returns its frame count. The bins are the waveform
+    /// calls' bins over the same range, so bin `i` colours waveform column `i`. A bin is
+    /// `None` where it has no audio (silence included). An invalid lane or row clears `bins`
+    /// and returns 0.
+    ///
+    /// Band energies are built per page and channel by the first read that needs them, then
+    /// cached for later reads and frozen copies, so a first read of a long history is slow
+    /// (about half a second for 10 minutes of 48 kHz stereo in a release build; a cached read
+    /// of the same takes about 2 ms): prefer a frozen copy off the audio thread's lock for
+    /// that. See [`SpectrumRow`] for the
+    /// rows and [`crate::waveform::SPECTRUM_BAND_EDGES_HZ`] for the bands.
+    pub fn track_spectrum_range(
+        &self,
+        lane: usize,
+        row: SpectrumRow<'_>,
+        range: Range<u64>,
+        bins: &mut [SpectrumBin],
+    ) -> usize {
+        let Some(members) = self.track_range(lane).and_then(|track| row.members(track)) else {
+            bins.fill(None);
+            return 0;
+        };
+        let retained = self.frame_range();
+        let range = range.start.max(retained.start)..range.end.min(retained.end);
+        self.history
+            .spectrum(self.sample_rate, &members, range, bins)
     }
 
     fn waveform_for(

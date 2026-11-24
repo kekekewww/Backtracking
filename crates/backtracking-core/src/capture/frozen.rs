@@ -450,6 +450,30 @@ impl FrozenTrack {
         })
     }
 
+    /// Writes the band energies of one row of this track for each chronological bin of the
+    /// part of `frames` it holds, and returns that frame count. It shares the band cache of
+    /// the live capture's pages. See [`Capture::track_spectrum_range`](super::Capture::track_spectrum_range).
+    pub fn spectrum(
+        &self,
+        row: crate::waveform::SpectrumRow<'_>,
+        frames: Range<u64>,
+        bins: &mut [crate::waveform::SpectrumBin],
+    ) -> usize {
+        let Some(members) = row.members(self.channels.clone()) else {
+            bins.fill(None);
+            return 0;
+        };
+        let frames = self.capture.clamp(frames);
+        history::spectrum::bins(
+            self.capture.pages(frames.clone()),
+            self.capture.layout,
+            self.capture.sample_rate,
+            &members,
+            frames,
+            bins,
+        )
+    }
+
     /// Copies the whole lane into one owned buffer.
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot_range(self.frame_range())

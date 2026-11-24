@@ -9,6 +9,7 @@
 mod form;
 mod options;
 mod selection;
+mod spectrum;
 pub mod stack;
 #[cfg(windows)]
 mod system_fonts;
@@ -30,6 +31,7 @@ pub use options::{WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES, combo_popup_height, comb
 pub use selection::{
     FadeEnd, dragged_fades, fade_end_at, fade_waveform_bins, paint_fades, paint_playhead,
 };
+pub use spectrum::{Spectrum, SpectrumError, SpectrumPalette, SpectrumStop};
 #[cfg(windows)]
 pub use system_fonts::add_system_font_fallbacks;
 pub use theme::{
@@ -42,4 +44,6 @@ pub use timeline::{
     waveform_press,
 };
 pub use toolbar::{TransportGlyph, icon_button, meter_number, paint_transport_glyph, status_led};
-pub use trace::{LoneSample, TraceStyle, paint_waveform_trace};
+pub use trace::{
+    LoneSample, TraceStyle, paint_colored_waveform_trace, paint_waveform_trace, trace_bin,
+};

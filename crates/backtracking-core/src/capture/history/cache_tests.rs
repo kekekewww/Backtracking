@@ -46,9 +46,10 @@ fn audio(frames: usize, channels: usize) -> Vec<f32> {
 #[test]
 fn narrow_pages_keep_the_original_size_and_peak_allocation() {
     assert_eq!(size_of::<PagePeaks>(), size_of::<Vec<[Bounds; TRACES]>>());
+    // The one addition is the pointer to the lazily built band cache.
     assert_eq!(
         size_of::<Page>(),
-        size_of::<(u64, Vec<f32>, Vec<[Bounds; TRACES]>)>()
+        size_of::<(u64, Vec<f32>, Vec<[Bounds; TRACES]>, Arc<()>)>()
     );
     for (a_channels, channels) in [(1, 1), (2, 2), (1, 2), (1, 3), (2, 4)] {
         let layout = Layout {
