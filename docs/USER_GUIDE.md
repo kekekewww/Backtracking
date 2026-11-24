@@ -264,6 +264,19 @@ Options 的 **Hotkeys／快速鍵** 頁列出所有鍵盤快速鍵，都可以�
 - 它不能切換自己或其他附加元件的這個勾選框，不能安裝、移除、啟用或停用附加元件，不能更改其他設定、開啟檔案、結束 Backtracking 或更新。
 - 隨時取消勾選即可收回；還在等待的要求會被拒絕。這個選擇依附加元件分別保存，重新開啟 Backtracking 後仍有效；移除附加元件後就會忘記，重新安裝時又是不允許。
 
+### 讓 AI 助理使用 Backtracking（Windows 桌面版）
+
+**Backtracking Agent** 附加元件讓 Claude Code、Claude Desktop 或其他 MCP 用戶端透過上述的控制使用 Backtracking：讀取 Backtracking 保留的內容、暫停與開始錄音、框選一段、存成 WAV 檔、試聽，以及新增或移除來源。安裝檔請從 [`addons/backtracking-agent`](../addons/backtracking-agent/README.md) 建置。
+
+1. 像其他附加元件一樣安裝 `backtracking-agent.btaddon`。
+2. 在 **Add-ons** 頁勾選 Backtracking Agent 的 **允許此附加元件控制 Backtracking／Let this add-on control Backtracking**。勾選之前，用戶端可以連上，但每個要求都會被拒絕，附加元件的區塊也會這樣註明。
+3. 按 **Copy Claude Code command**，在終端機執行複製的指令；或按 **Copy Claude Desktop entry**，把它加進 Claude Desktop 的設定。兩者都會以 `--stdio` 啟動附加元件的程式，它會自己找到執行中的附加元件。
+
+- 用戶端操作時，Backtracking 必須開著，而且這個附加元件要啟用。否則用戶端會立刻收到說明。
+- 附加元件只在這台電腦上（`127.0.0.1`）服務，而且要有它的權杖（token）。以 `--stdio` 啟動的用戶端會自己讀取權杖；需要 `http://` 位址的用戶端，可按 **Show connection details** 顯示權杖 2 分鐘，按 **New token** 可換一個新的。
+- 透過用戶端新增或移除來源，和上述一樣會重新開始記錄歷史。用戶端做的每件事，狀態列都會註明 **· 由 Backtracking Agent 操作／· by Backtracking Agent**。
+- 附加元件區塊的文字只有英文。
+
 ### 多聲道來源（Windows 桌面版與插件）
 
 **擷取系統、應用程式或麥克風的所有聲道。** 系統播放、單一應用程式或麥克風的裝置超過兩個聲道時（例如 5.1 或 7.1 喇叭），Options → Sources 的 **Channel route** 會多一個 **All channels／所有聲道**，選了之後每個聲道各成一列，聲道名稱來自 Windows 的喇叭配置（`FL`、`FR`、`FC`、`LFE` 等）。裝置只有一或兩個聲道時不會列出這個選項；之前選過、但裝置現在只有立體聲時，Backtracking 改用合併聲道擷取，並在來源下方說明。只有一或兩個聲道的來源仍是一列或 L／R 兩列，不會變成多聲道軌道。
@@ -581,6 +594,19 @@ An add-on with the `control` capability can work Backtracking the way a person a
 - While you are dragging, dragging out or saving, its requests are told Backtracking is busy rather than interrupting you.
 - It cannot change its own check box or another add-on's, install, remove, enable or disable add-ons, change other options, open files, quit Backtracking, or update it.
 - Clear the box at any time to take control back; requests still waiting are refused. The choice is kept for each add-on when Backtracking restarts, and forgotten when the add-on is removed: installed again, it starts off.
+
+### Let an AI agent use Backtracking (Windows desktop)
+
+The **Backtracking Agent** add-on lets Claude Code, Claude Desktop or another MCP client use Backtracking through the control described above. The client can read what Backtracking holds, pause and start recording, select a stretch, save it as WAV files, play it, and add or remove sources. Build the package from [`addons/backtracking-agent`](../addons/backtracking-agent/README.md).
+
+1. Install `backtracking-agent.btaddon` as any add-on.
+2. On the **Add-ons** page, switch on **Let this add-on control Backtracking** under Backtracking Agent. Until you do, the client can connect, but every request is refused, and the card says so.
+3. Press **Copy Claude Code command** and run it in a terminal, or press **Copy Claude Desktop entry** and add it to Claude Desktop's configuration. Both start the add-on's program with `--stdio`, which finds the running add-on by itself.
+
+- Backtracking must be running with the add-on on whenever the client works. If it is not, the client is told so at once.
+- The add-on serves the client only on this computer (`127.0.0.1`), and only with its token. Clients started with `--stdio` read the token themselves; **Show connection details** shows it for 2 minutes for clients that need the `http://` address, and **New token** replaces it.
+- Adding or removing a source through the client starts a new history, as above. The status line says **· by Backtracking Agent** for everything the client does.
+- The add-on's card is in English only.
 
 ### Multichannel sources (Windows desktop and plug-ins)
 

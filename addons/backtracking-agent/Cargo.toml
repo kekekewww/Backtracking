@@ -1,0 +1,55 @@
+[package]
+name = "backtracking-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "A Backtracking add-on that lets MCP clients (AI agents) control Backtracking"
+publish = false
+
+[dependencies]
+backtracking-addon = { path = "../../crates/backtracking-addon" }
+rmcp = { version = "3.11.0", default-features = false, features = [
+    "base64",
+    "macros",
+    "server",
+    "client",
+    "transport-io",
+    "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
+] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-std", "sync", "time"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+getrandom = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+backtracking-addon = { path = "../../crates/backtracking-addon", features = ["install"] }
+reqwest = { version = "0.13", default-features = false }
+tokio = { version = "1", features = ["process"] }
+
+[[bin]]
+name = "backtracking-agent"
+path = "src/main.rs"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+
+# Keep this crate standalone, like the SDK it depends on.
+[workspace]

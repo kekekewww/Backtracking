@@ -83,6 +83,7 @@
 - **最多 64 個來源** Windows 桌面版可在 **Options → Sources** 用 **Add source** 同時擷取更多來源，最多 64 條波形列、合計 64 個聲道。所有來源共用同一份歷史記憶體，聲道越多可保留的時間越短，每個檔案都標上該來源的字母。macOS 桌面版與插件維持不變。
 - **插件送到桌面版** 在插件勾選 **Send to Backtracking desktop**，桌面版的來源清單就會列出該音軌。
 - **多個錄音器** 桌面版可用 **New capture window** 開啟額外的擷取視窗，各自選擇來源。
+- **AI 助理** Windows 桌面版的 [Backtracking Agent](addons/backtracking-agent/README.md) 附加元件，在 **Add-ons** 頁允許後，可讓 Claude Code、Claude Desktop 或其他 MCP 用戶端暫停與開始錄音、框選、存檔與變更來源。
 - **WAV 規格** 44.1、48 或 96 kHz，16-bit PCM、24-bit PCM 或 32-bit float。預設為 48 kHz、32-bit float。
 - **音量一目了然** 即時音量表可顯示 dBFS、VU 或瞬時 LUFS，波形可合併顯示或分成 L/R。
 - **依頻率上色** Windows 桌面版的 **Waveform color: By frequency** 依低頻到高頻為波形上色，預設由紅到藍，顏色可以自訂。

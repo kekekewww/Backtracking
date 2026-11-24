@@ -1,0 +1,14 @@
+{
+  "contract": 1,
+  "id": "com.kamelkyp.backtracking.agent",
+  "name": "Backtracking Agent",
+  "version": "0.1.0",
+  "author": "Backtracking contributors",
+  "description": "Lets AI agents and other MCP clients, such as Claude Code and Claude Desktop, use Backtracking once you allow it: read what it holds, pause and start recording, select, save the selection as files, and change sources.",
+  "homepage": "https://github.com/kekekewww/Backtracking",
+  "license": "Apache-2.0",
+  "capabilities": ["control", "settings", "actions"],
+  "run": {
+    "windows-x86_64": { "program": "bin/backtracking-agent.exe", "args": [] }
+  }
+}
