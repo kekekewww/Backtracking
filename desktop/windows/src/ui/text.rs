@@ -165,6 +165,15 @@ impl Language {
         match message {
             BILINGUAL_FALLBACK_TO_MERGED => self.all_channels_fallback(),
             BILINGUAL_POSITIONS_TRIMMED => self.positions_trimmed(),
+            // A lane past the channel limit, named in both languages by the capture code
+            // (`controller::lane_fits`): "Lane C cannot start: … / 來源 C 無法開始：…".
+            _ if message.starts_with("Lane ") && message.contains(" cannot start: ") => {
+                match (self, message.split_once(" / ")) {
+                    (Self::English, Some((english, _))) => english,
+                    (Self::TraditionalChinese, Some((_, chinese))) => chinese,
+                    (_, None) => message,
+                }
+            }
             _ => message,
         }
     }
@@ -1485,6 +1494,38 @@ mod tests {
         assert_eq!(
             TraditionalChinese.source_message(super::BILINGUAL_FALLBACK_TO_MERGED),
             "目前無法擷取所有聲道，已改用合併聲道。"
+        );
+        // A lane past the channel limit is named in this language. Lane B's English line is
+        // the one older versions wrote.
+        let lane_b = crate::controller::lane_fits(1, 64, 1).unwrap_err();
+        assert_eq!(
+            English.source_message(&lane_b),
+            "Lane B cannot start: lanes A and B would contain 65 channels; the limit is 64"
+        );
+        assert_eq!(
+            TraditionalChinese.source_message(&lane_b),
+            "來源 B 無法開始：來源 A 與 B 合計會有 65 個聲道，上限為 64。"
+        );
+        let lane_c = crate::controller::lane_fits(2, 60, 8).unwrap_err();
+        assert_eq!(
+            English.source_message(&lane_c),
+            "Lane C cannot start: lanes A to C would contain 68 channels; the limit is 64"
+        );
+        assert_eq!(
+            TraditionalChinese.source_message(&lane_c),
+            "來源 C 無法開始：來源 A 到 C 合計會有 68 個聲道，上限為 64。"
+        );
+        let lane_bl = crate::controller::lane_fits(63, 64, 1).unwrap_err();
+        assert!(
+            English
+                .source_message(&lane_bl)
+                .starts_with("Lane BL cannot start: lanes A to BL would contain 65 channels"),
+            "{lane_bl}"
+        );
+        assert!(
+            TraditionalChinese
+                .source_message(&lane_bl)
+                .starts_with("來源 BL 無法開始")
         );
         // Anything else is left as it came.
         assert_eq!(

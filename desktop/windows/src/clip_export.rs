@@ -17,7 +17,8 @@ use crate::preferences::WideExportMode;
 #[derive(Clone, Default)]
 pub(crate) struct ExportOptions {
     /// Groups are captured with the frozen audio, so later format changes cannot relabel it.
-    pub(crate) groups: [Option<LaneGroup>; 2],
+    /// One per track, in physical snapshot order; a track past the end has none.
+    pub(crate) groups: Vec<Option<LaneGroup>>,
     pub(crate) wide_mode: WideExportMode,
     pub(crate) addons: Option<AddonHandle>,
 }
@@ -39,8 +40,8 @@ pub(crate) struct ExportResult {
     pub(crate) objects_in_mono: bool,
 }
 
-/// Writes a frozen clip on a worker thread: of each track, the rows in `rows`, in physical
-/// snapshot order. Wide lanes use their group in `options`; mono and stereo keep the existing
+/// Writes a frozen clip on a worker thread: of each of the 1 to `MAX_LANES` tracks, the rows in
+/// `rows`, in physical snapshot order. Wide lanes use their group in `options`; mono and stereo keep the existing
 /// routing and file naming. `file_labels` names each track's files and `fades` ramp every file,
 /// wide lanes included.
 #[allow(clippy::too_many_arguments)]
@@ -54,10 +55,11 @@ pub(crate) fn export_rows(
     force_mono: bool,
     file_labels: &[TakeLabel],
     options: &ExportOptions,
-    rows: &[RowExport<'_>; 2],
+    rows: &[RowExport<'_>],
 ) -> io::Result<ExportResult> {
     if tracks.is_empty()
-        || tracks.len() > 2
+        || tracks.len() > crate::controller::MAX_LANES
+        || rows.len() < tracks.len()
         || routes.len() != tracks.len()
         || file_labels.len() != tracks.len()
     {
@@ -67,7 +69,7 @@ pub(crate) fn export_rows(
         ));
     }
     // The channels of a lane only some of whose rows were selected.
-    let mut narrowed = [None, None];
+    let mut narrowed = vec![None; tracks.len()];
     for (lane, track) in tracks.iter().enumerate() {
         let Some(indices) = &rows[lane].channels else {
             continue;
@@ -111,7 +113,7 @@ pub(crate) fn export_rows(
                         fades,
                         profile,
                         &file_labels[lane],
-                        options.groups[lane].as_ref(),
+                        options.groups.get(lane).and_then(Option::as_ref),
                         options.wide_mode,
                         &rows[lane],
                     )?;
@@ -598,7 +600,7 @@ mod tests {
                 ] {
                     let options = ExportOptions {
                         wide_mode: mode,
-                        groups: [Some(shown.clone()), None],
+                        groups: vec![Some(shown.clone()), None],
                         addons: None,
                     };
                     let selected = indices.as_ref().map_or(shown.channels.len(), Vec::len);
@@ -689,7 +691,7 @@ mod tests {
     fn options() -> ExportOptions {
         ExportOptions {
             wide_mode: WideExportMode::MonoFiles,
-            groups: [
+            groups: vec![
                 Some(LaneGroup {
                     id: "objects".into(),
                     positioned: true,

@@ -5,7 +5,8 @@
 //! - `BACKTRACKING_TEST_SCREENSHOT=<file.png>` turns it on.
 //! - `BACKTRACKING_TEST_SCREENSHOT_DELAY_MS=<ms>` is how long the app runs first (default 4000).
 //! - `BACKTRACKING_TEST_VIEW=<steps>` is done when the delay has passed, before the picture.
-//!   Steps are separated by `;`. Times are seconds back from the newest audio:
+//!   Steps are separated by `;`. Times are seconds back from the newest audio, and a lane is
+//!   named by its letter, `A` to `BL` in either case, or by its index from 0:
 //!   `zoom=<seconds>` shows only that much; `select=<from>-<to>` selects that stretch, as a
 //!   drag would; `scroll=<lane>:<row>` scrolls a stacked lane (A is 0) to that row;
 //!   `group=<lane>:<group id>` shows another channel group.
@@ -76,6 +77,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use backtracking_addon::protocol::TransportCommand;
+use backtracking_core::Lane;
 use eframe::egui;
 
 use super::{OptionsSection, Recorder, RowSource, hotkeys_page, rows_between};
@@ -223,6 +225,17 @@ fn write_picture(output: &Path, image: &egui::ColorImage) -> PictureResult {
         .map(|()| size)
 }
 
+/// A lane named by its letter, A to BL in either case, or by its index from 0.
+fn parse_lane(text: &str) -> Result<usize, String> {
+    let text = text.trim();
+    text.parse::<usize>()
+        .ok()
+        .and_then(Lane::from_index)
+        .or_else(|| Lane::from_letter(&text.to_ascii_uppercase()))
+        .map(Lane::index)
+        .ok_or_else(|| format!("{text} is not a lane"))
+}
+
 pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
     text.split(';')
         .map(str::trim)
@@ -251,11 +264,7 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                 text.split_once(':')
                     .ok_or_else(|| format!("{step} needs <lane>:<value>"))
             }
-            let lane = |text: &str| match text.trim() {
-                "0" | "A" | "a" => Ok(0),
-                "1" | "B" | "b" => Ok(1),
-                other => Err(format!("{other} is not a lane")),
-            };
+            let lane = parse_lane;
             match name.trim() {
                 "zoom" => Ok(Step::Zoom(number(value)?)),
                 "select" => {
@@ -785,7 +794,7 @@ impl Recorder {
                 let flags = self.flag_update(
                     start..end,
                     self.selection_rows.clone(),
-                    self.selection_whole,
+                    self.selection_whole.clone(),
                 );
                 self.apply_flags(flags);
                 self.selection = Some(start..end);
@@ -1069,8 +1078,11 @@ impl Recorder {
         }
         self.choose_rows(rows);
         if let Some(selection) = self.selection.clone() {
-            let flags =
-                self.flag_update(selection, self.selection_rows.clone(), self.selection_whole);
+            let flags = self.flag_update(
+                selection,
+                self.selection_rows.clone(),
+                self.selection_whole.clone(),
+            );
             self.apply_flags(flags);
             self.stop_preview();
             self.invalidate_export();
@@ -1530,6 +1542,37 @@ mod tests {
     }
 
     #[test]
+    fn lanes_are_named_by_letter_up_to_bl_or_by_index() {
+        for (text, lane) in [
+            ("A", 0),
+            ("b", 1),
+            ("C", 2),
+            ("z", 25),
+            ("AA", 26),
+            ("ab", 27),
+            ("BL", 63),
+            (" bl ", 63),
+            ("0", 0),
+            ("2", 2),
+            ("63", 63),
+        ] {
+            assert_eq!(parse_lane(text), Ok(lane), "{text}");
+        }
+        for bad in ["", "BM", "64", "-1", "A1", "Lane A", "ZZ"] {
+            assert!(parse_lane(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            parse_steps("separate=on;select-lane=E;rows=C:2-BL:1;scroll=AB:3").unwrap(),
+            [
+                Step::Separate(true),
+                Step::SelectLane(4),
+                Step::Rows(2, 1, 63, 0),
+                Step::Scroll(27, 3),
+            ]
+        );
+    }
+
+    #[test]
     fn view_steps_are_read_in_order_and_bad_ones_are_named() {
         assert_eq!(
             parse_steps("zoom=2.5; select=1.5-0.25;scroll=A:4;group=b:objects").unwrap(),
@@ -1564,7 +1607,7 @@ mod tests {
             "rows=A:0-2",
             "rows=A:3",
             "rows=3-5",
-            "rows=A:1-C:2",
+            "rows=A:1-BM:2",
             "rows=A:x-2",
         ] {
             assert!(parse_steps(bad).is_err(), "{bad}");
@@ -1670,7 +1713,7 @@ mod tests {
             "transport=A",
             "wait=soon",
             "open=nocolon",
-            "format=C:x",
+            "format=BM:x",
         ] {
             assert!(parse_steps(bad).is_err(), "{bad}");
         }
@@ -1681,7 +1724,7 @@ mod tests {
             "zoom",
             "zoom=-1",
             "select=2",
-            "scroll=C:1",
+            "scroll=BM:1",
             "spin=1",
             "options=plugins",
             "options=addons:820",

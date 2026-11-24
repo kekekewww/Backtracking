@@ -18,7 +18,7 @@ type OwnedTrace = (Vec<f32>, Vec<f32>);
 #[derive(Clone, PartialEq)]
 struct View {
     generation: u64,
-    lanes: [Option<usize>; 2],
+    lanes: Vec<Option<usize>>,
     channels: Vec<(usize, ChannelWaveform)>,
     views: Vec<(usize, WaveformView)>,
     zoom: Option<Range<u64>>,
@@ -108,10 +108,10 @@ impl ChannelWaveforms {
         traces: &mut [WaveformBuffers<'_>],
         view_traces: &mut [WaveformBuffers<'_>],
     ) -> Option<RenderedRange> {
-        let rate = state.shape.map_or(COMMON_RATE, |shape| shape.0);
+        let rate = state.shape.as_ref().map_or(COMMON_RATE, |shape| shape.0);
         let view = View {
             generation: state.generation,
-            lanes: state.capture_lanes,
+            lanes: state.capture_lanes.clone(),
             channels: channels.to_vec(),
             views: views.to_vec(),
             zoom: zoom.clone(),

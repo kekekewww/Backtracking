@@ -385,7 +385,7 @@ fn test_tone_child() {
     assert_eq!(group.channels, 0..6);
     assert_eq!(group.labels, ["L", "R", "C", "LFE", "Ls", "Rs"]);
     let options = ExportOptions {
-        groups: [Some(group.clone()), None],
+        groups: vec![Some(group.clone()), None],
         wide_mode: WideExportMode::MonoFiles,
         addons: Some(handle.clone()),
     };

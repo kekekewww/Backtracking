@@ -14,8 +14,8 @@ fn cold_channel_waveforms_leave_buffers_untouched_until_ready() {
             .push_native_interleaved(0, &vec![0.25; 8_000 * 12], false)
             .unwrap();
         state.capture = Some(capture);
-        state.shape = Some((8_000, 12, None));
-        state.capture_lanes = [Some(0), None];
+        state.shape = Some((8_000, vec![12]));
+        state.capture_lanes = vec![Some(0), None];
     }
     let mut low = [7.0; 32];
     let mut high = [8.0; 32];
@@ -45,8 +45,8 @@ fn mixed_waveform_controller() -> Controller {
         .collect();
     capture.push_native_interleaved(0, &audio, false).unwrap();
     state.capture = Some(capture);
-    state.shape = Some((8_000, 4, Some(1)));
-    state.capture_lanes = [Some(0), Some(1)];
+    state.shape = Some((8_000, vec![4, 1]));
+    state.capture_lanes = vec![Some(0), Some(1)];
     state.revision = 42;
     drop(state);
     controller
@@ -224,7 +224,7 @@ fn wide_waveform_capture_latency() {
         };
         {
             let mut state = lock(&controller.state);
-            state.sources = [
+            state.sources = vec![
                 Some(SourceSettings {
                     source: source.clone(),
                     route: ChannelRoute::Merged,
@@ -240,9 +240,9 @@ fn wide_waveform_capture_latency() {
                     error: None,
                 },
             }];
-            state.formats = [Some(format), None];
-            state.shape = Some((RATE as u32, channels, None));
-            state.capture_lanes = [Some(0), None];
+            state.formats = vec![Some(format), None];
+            state.shape = Some((RATE as u32, vec![channels]));
+            state.capture_lanes = vec![Some(0), None];
             state.capture = Some(capture);
             state.paused = false;
             state.retain_silence = true;

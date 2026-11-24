@@ -24,8 +24,8 @@ mod layout;
 mod waveform;
 #[cfg(test)]
 mod waveform_tests;
-pub(crate) use layout::{LaneGroup, LaneMeterReadings};
-use layout::{combined_channels, lane_groups, lane_meter_readings, machine_history_budget_samples};
+pub(crate) use layout::{LaneGroup, LaneMeterReadings, lane_fits};
+use layout::{lane_groups, lane_meter_readings, machine_history_budget_samples};
 pub(crate) use waveform::ChannelWaveform;
 use waveform::ChannelWaveforms;
 
@@ -63,8 +63,8 @@ struct DisplayStamp {
     /// Everything except the waveform and the meters.
     status: u64,
     revision: u64,
-    /// Tenths of a decibel, which is as fine as the readout shows.
-    meters: [Option<[i32; 3]>; 2],
+    /// Tenths of a decibel, which is as fine as the readout shows, by lane.
+    meters: Vec<Option<[i32; 3]>>,
 }
 
 impl DisplayStamp {
@@ -81,20 +81,26 @@ impl DisplayStamp {
         for (lane, format) in state.formats.iter().enumerate() {
             format.as_ref().map(Arc::as_ptr).hash(&mut status);
             capture
-                .and_then(|capture| capture.track_channels(state.capture_lanes[lane]?))
+                .and_then(|capture| {
+                    capture.track_channels(state.capture_lanes.get(lane).copied()??)
+                })
                 .hash(&mut status);
         }
         Self {
             status: status.finish(),
             revision: state.revision,
-            meters: std::array::from_fn(|lane| {
-                capture
-                    .and_then(|capture| capture.track_meter_readings(state.capture_lanes[lane]?))
-                    .map(|meter| {
-                        [meter.peak_dbfs, meter.vu, meter.momentary_lufs]
-                            .map(|value| (value * 10.0).round() as i32)
-                    })
-            }),
+            meters: state
+                .capture_lanes
+                .iter()
+                .map(|&physical| {
+                    capture
+                        .and_then(|capture| capture.track_meter_readings(physical?))
+                        .map(|meter| {
+                            [meter.peak_dbfs, meter.vu, meter.momentary_lufs]
+                                .map(|value| (value * 10.0).round() as i32)
+                        })
+                })
+                .collect(),
         }
     }
 
@@ -333,7 +339,27 @@ impl Stream {
     }
 }
 
-type Sources = [Option<SourceSettings>; 2];
+/// The sources of lanes A, B, C, … in order: 1 to [`MAX_LANES`] of them, every one `Some` once
+/// [`Controller::set_sources`] has taken the list. A `None` handed to it is a lane switched off,
+/// which [`compact_sources`] removes.
+pub(crate) type Sources = Vec<Option<SourceSettings>>;
+
+pub(crate) use backtracking_core::MAX_LANES;
+
+/// The lanes of `sources` that are on, in order, so a lane after one switched off moves up into
+/// its place, as lane B moves into lane A. At most [`MAX_LANES`] are kept, and with none on, lane
+/// A records system audio.
+pub(crate) fn compact_sources(sources: Sources) -> Sources {
+    let mut lanes: Sources = sources
+        .into_iter()
+        .filter(Option::is_some)
+        .take(MAX_LANES)
+        .collect();
+    if lanes.is_empty() {
+        lanes.push(Some(SourceSettings::default()));
+    }
+    lanes
+}
 
 fn requests_all_channels(sources: &Sources, source: &CaptureSource) -> bool {
     sources
@@ -435,13 +461,13 @@ pub(crate) struct EditSnapshot {
     pub(crate) snapshots: Arc<[FrozenTrack]>,
     /// Position history by logical lane, shared with this view until live writes diverge.
     #[allow(dead_code)] // Export and moving-source rendering consume this in the next wave.
-    pub(crate) positions: [FrozenPositionTrack; 2],
+    pub(crate) positions: Vec<FrozenPositionTrack>,
     pub(crate) bar_markers: Vec<u64>,
     pub(crate) generation: u64,
-    /// Group metadata is frozen with the audio, before a later format change.
-    pub(crate) groups: [Vec<LaneGroup>; 2],
-    pub(crate) shown_groups: [Option<String>; 2],
-    /// Physical snapshot index to logical lane (A = 0, B = 1).
+    /// Group metadata is frozen with the audio, before a later format change. By logical lane.
+    pub(crate) groups: Vec<Vec<LaneGroup>>,
+    pub(crate) shown_groups: Vec<Option<String>>,
+    /// Physical snapshot index to logical lane (A = 0, B = 1, C = 2, …).
     pub(crate) lanes: Vec<usize>,
 }
 
@@ -470,19 +496,20 @@ struct Request {
     complete: Option<mpsc::SyncSender<SourceStatus>>,
 }
 
+/// What the UI reads of the session, by logical lane where a field has one value per lane.
 #[derive(Default)]
 struct SourceStatus {
-    formats: [Option<Arc<Format>>; 2],
-    statuses: [Option<String>; 2],
+    formats: Vec<Option<Arc<Format>>>,
+    statuses: Vec<Option<String>>,
     error: Option<String>,
     paused: bool,
     recording: bool,
     generation: u64,
     revision: u64,
-    channels: [Option<usize>; 2],
-    meters: [Option<MeterReadings>; 2],
-    groups: [Vec<LaneGroup>; 2],
-    shown_groups: [Option<String>; 2],
+    channels: Vec<Option<usize>>,
+    meters: Vec<Option<MeterReadings>>,
+    groups: Vec<Vec<LaneGroup>>,
+    shown_groups: Vec<Option<String>>,
     effective_retention_seconds: Option<f64>,
     history_budget_samples: usize,
     lanes: Vec<usize>,
@@ -491,26 +518,31 @@ struct SourceStatus {
 impl SourceStatus {
     fn from_session(state: &CaptureSession) -> Self {
         let capture = state.capture.as_ref().map(SynchronizedCapture::capture);
+        let physical = |lane: usize| state.capture_lanes.get(lane).copied().flatten();
         Self {
             formats: state.formats.clone(),
-            statuses: std::array::from_fn(|lane| {
-                state.statuses[lane].clone().or_else(|| {
-                state.position_overflowed[lane].then(|| {
-                    "Position history was trimmed to its memory limit. / 位置歷史已依記憶體上限刪減。".into()
+            statuses: (0..state.lane_count())
+                .map(|lane| {
+                    state.statuses[lane].clone().or_else(|| {
+                        state.position_overflowed[lane].then(|| {
+                            "Position history was trimmed to its memory limit. / 位置歷史已依記憶體上限刪減。".into()
+                        })
+                    })
                 })
-            })
-            }),
+                .collect(),
             error: state.error.clone().or_else(|| state.mode_error.clone()),
             paused: state.is_paused(),
             recording: state.is_recording(),
             generation: state.generation,
             revision: state.revision,
-            channels: std::array::from_fn(|lane| {
-                capture.and_then(|capture| capture.track_channels(state.capture_lanes[lane]?))
-            }),
-            meters: std::array::from_fn(|lane| {
-                capture.and_then(|capture| capture.track_meter_readings(state.capture_lanes[lane]?))
-            }),
+            channels: (0..state.lane_count())
+                .map(|lane| capture.and_then(|capture| capture.track_channels(physical(lane)?)))
+                .collect(),
+            meters: (0..state.lane_count())
+                .map(|lane| {
+                    capture.and_then(|capture| capture.track_meter_readings(physical(lane)?))
+                })
+                .collect(),
             groups: state.groups.clone(),
             shown_groups: state.current_shown_groups(),
             effective_retention_seconds: capture
@@ -549,7 +581,8 @@ pub(crate) struct Controller {
     shown_groups: SourceGroupChoices,
     group_preferences: Option<PreferenceWriter>,
     channel_waveforms: Mutex<ChannelWaveforms>,
-    activity: Mutex<[ActivityRead; 2]>,
+    /// By logical lane; a lane gets its entry when it is first read.
+    activity: Mutex<Vec<ActivityRead>>,
     #[cfg(test)]
     channel_waveform_lock_ns: std::sync::atomic::AtomicU64,
 }
@@ -599,7 +632,7 @@ impl Controller {
                 CaptureSession::run(&worker_state, requests, &wake_pending, &worker_ui)
             })?;
         Ok(Self {
-            sources: [Some(SourceSettings::default()), None],
+            sources: vec![Some(SourceSettings::default())],
             retention: DurationChoice::Seconds20,
             retain_silence: false,
             source_status: SourceStatus {
@@ -636,16 +669,24 @@ impl Controller {
         self.ui.watching.store(watching, Ordering::Relaxed);
     }
 
+    /// The lanes' sources, A first: 1 to [`MAX_LANES`] of them, all `Some`.
     pub(crate) fn sources(&self) -> &Sources {
         &self.sources
     }
 
-    pub(crate) fn set_sources(&mut self, mut sources: Sources) {
-        if sources[0].is_none() {
-            sources[0] = sources[1]
-                .take()
-                .or_else(|| Some(SourceSettings::default()));
-        }
+    /// How many lanes there are, from 1 to [`MAX_LANES`].
+    pub(crate) fn lane_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// Records these lanes from now on: this is how a lane is added, removed, moved or given
+    /// another source. The lanes that are off (`None`) are taken out first ([`compact_sources`]).
+    /// When the list differs from the one held, the capture worker opens what is new, closes
+    /// inputs no lane uses any more, and starts a new, empty history: every lane's retained
+    /// audio, positions and channel groups are dropped, as when lane B changed before. Lanes
+    /// that share a source share one input.
+    pub(crate) fn set_sources(&mut self, sources: impl Into<Sources>) {
+        let sources = compact_sources(sources.into());
         if self.sources != sources {
             self.sources = sources.clone();
             self.request(CaptureCommand::SetSources(sources));
@@ -737,6 +778,9 @@ impl Controller {
         }
         let generation = self.source_status.generation;
         let mut reads = self.activity.try_lock().ok()?;
+        if reads.len() <= lane {
+            reads.resize_with(lane + 1, ActivityRead::default);
+        }
         let read = reads.get_mut(lane)?;
         if read.generation != generation {
             *read = ActivityRead {
@@ -776,7 +820,7 @@ impl Controller {
                         return None;
                     }
                     let revision = state.revision;
-                    let physical = state.capture_lanes[lane]?;
+                    let physical = state.capture_lanes.get(lane).copied().flatten()?;
                     let track = state.capture.as_ref()?.capture().freeze().track(physical)?;
                     drop(state);
                     #[cfg(test)]
@@ -966,7 +1010,7 @@ impl Controller {
     pub(crate) fn try_freeze_frames(
         &self,
         frames: Range<u64>,
-    ) -> Option<([Option<FrozenTrack>; 2], Range<u64>, u64)> {
+    ) -> Option<(Vec<Option<FrozenTrack>>, Range<u64>, u64)> {
         let state = try_lock(&self.state)?;
         let capture = state.capture.as_ref().map(SynchronizedCapture::capture)?;
         let retained = capture.frame_range();
@@ -975,7 +1019,9 @@ impl Controller {
         let frozen = capture.freeze_range(frames.clone())?;
         let tracks = state
             .capture_lanes
-            .map(|lane| lane.and_then(|lane| frozen.track(lane)));
+            .iter()
+            .map(|lane| lane.and_then(|lane| frozen.track(lane)))
+            .collect();
         Some((tracks, frames, state.generation))
     }
 
@@ -990,8 +1036,8 @@ impl Controller {
             .push_native_interleaved(0, interleaved, false)
             .unwrap();
         state.capture = Some(capture);
-        state.shape = Some((rate, channels, None));
-        state.capture_lanes = [Some(0), None];
+        state.shape = Some((rate, vec![channels]));
+        state.capture_lanes = vec![Some(0), None];
     }
 
     /// How many retained pages hold band energies a spectrum read has started; see
@@ -1041,7 +1087,7 @@ impl Controller {
         zoom: Option<Range<u64>>,
         traces: &mut [WaveformBuffers<'_>],
     ) -> (Range<u64>, Range<u64>, u32, Vec<u64>) {
-        let rate = state.shape.map_or(COMMON_RATE, |shape| shape.0);
+        let rate = state.shape.as_ref().map_or(COMMON_RATE, |shape| shape.0);
         let Some(capture) = state.capture.as_ref().map(SynchronizedCapture::capture) else {
             for (minimum, maximum) in traces {
                 minimum.fill(0.0);
@@ -1153,12 +1199,16 @@ fn try_lock(state: &Mutex<CaptureSession>) -> Option<MutexGuard<'_, CaptureSessi
     }
 }
 
+/// The capture worker's state. `sources` and every other field with one value per lane
+/// (`formats`, `statuses`, `positions`, `position_overflowed`, `groups`, `layout_blocked`,
+/// `capture_lanes`) are lists of the same length, by logical lane.
 struct CaptureSession {
-    sources: [Option<SourceSettings>; 2],
+    sources: Sources,
+    /// One per distinct source, shared by every lane that records it.
     inputs: Vec<Input>,
     pending: Vec<PendingInput>,
-    formats: [Option<Arc<Format>>; 2],
-    statuses: [Option<String>; 2],
+    formats: Vec<Option<Arc<Format>>>,
+    statuses: Vec<Option<String>>,
     capture: Option<SynchronizedCapture>,
     scratch: Vec<f32>,
     native: Vec<f32>,
@@ -1167,7 +1217,8 @@ struct CaptureSession {
     retention: DurationChoice,
     retain_silence: bool,
     requested_retain_silence: bool,
-    shape: Option<(u32, usize, Option<usize>)>,
+    /// The capture's rate and the width of each of its physical lanes.
+    shape: Option<(u32, Vec<usize>)>,
     generation: u64,
     revision: u64,
     paused: bool,
@@ -1180,15 +1231,18 @@ struct CaptureSession {
     sender_packet_at: Option<Instant>,
     addons: Option<AddonHandle>,
     addon_snapshot: Option<Arc<AddonSnapshot>>,
-    positions: [PositionTimeline; 2],
+    positions: Vec<PositionTimeline>,
     position_cursor: u64,
-    position_overflowed: [bool; 2],
-    groups: [Vec<LaneGroup>; 2],
+    position_overflowed: Vec<bool>,
+    groups: Vec<Vec<LaneGroup>>,
     shown_groups: SourceGroupChoices,
     history_budget_samples: usize,
     next_layout_check: Instant,
-    layout_blocked: [bool; 2],
-    capture_lanes: [Option<usize>; 2],
+    layout_blocked: Vec<bool>,
+    /// Logical lane to the capture's physical lane, which only lanes that record have.
+    capture_lanes: Vec<Option<usize>>,
+    /// Kept between drains, so routing a shared source allocates nothing.
+    shared_routes: Vec<ChannelRoute>,
 }
 
 impl CaptureSession {
@@ -1198,13 +1252,14 @@ impl CaptureSession {
     }
 
     fn with_wake(wake: DataWake) -> Self {
-        // The recorder loads the saved source preferences before starting capture.
+        // The recorder loads the saved source preferences before starting capture. Until then
+        // there are two lanes, the second off.
         Self {
-            sources: [Some(SourceSettings::default()), None],
+            sources: vec![Some(SourceSettings::default()), None],
             inputs: Vec::new(),
             pending: Vec::new(),
-            formats: [None, None],
-            statuses: [None, None],
+            formats: vec![None, None],
+            statuses: vec![None, None],
             capture: None,
             scratch: Vec::new(),
             native: Vec::new(),
@@ -1225,16 +1280,34 @@ impl CaptureSession {
             sender_packet_at: None,
             addons: None,
             addon_snapshot: None,
-            positions: std::array::from_fn(|_| PositionTimeline::default()),
+            positions: vec![PositionTimeline::default(), PositionTimeline::default()],
             position_cursor: 0,
-            position_overflowed: [false; 2],
-            groups: std::array::from_fn(|_| Vec::new()),
+            position_overflowed: vec![false; 2],
+            groups: vec![Vec::new(), Vec::new()],
             shown_groups: SourceGroupChoices::new(),
             history_budget_samples: machine_history_budget_samples(),
             next_layout_check: Instant::now(),
-            layout_blocked: [false; 2],
-            capture_lanes: [Some(0), Some(1)],
+            layout_blocked: vec![false; 2],
+            capture_lanes: vec![Some(0), Some(1)],
+            shared_routes: Vec::new(),
         }
+    }
+
+    fn lane_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// Gives every per-lane field one entry per lane: a lane added gets empty state, and the
+    /// state of a lane removed is dropped.
+    fn fit_lanes(&mut self) {
+        let lanes = self.lane_count();
+        self.formats.resize(lanes, None);
+        self.statuses.resize(lanes, None);
+        self.positions.resize_with(lanes, PositionTimeline::default);
+        self.position_overflowed.resize(lanes, false);
+        self.groups.resize(lanes, Vec::new());
+        self.layout_blocked.resize(lanes, false);
+        self.capture_lanes.resize(lanes, None);
     }
 
     fn run(
@@ -1360,18 +1433,21 @@ impl CaptureSession {
     }
 
     fn set_sources(&mut self, sources: Sources) {
-        let settings_changed =
-            self.sources
-                .iter()
-                .zip(&sources)
-                .any(|(previous, next)| match (previous, next) {
-                    (Some(previous), Some(next)) => {
-                        previous.route != next.route || !previous.source.same_source(&next.source)
-                    }
-                    (None, None) => false,
-                    _ => true,
-                });
+        // A lane past the end of a list is off, like a `None` in it.
+        fn lane(list: &Sources, lane: usize) -> Option<&SourceSettings> {
+            list.get(lane).and_then(Option::as_ref)
+        }
+        let settings_changed = (0..self.sources.len().max(sources.len())).any(|index| {
+            match (lane(&self.sources, index), lane(&sources, index)) {
+                (Some(previous), Some(next)) => {
+                    previous.route != next.route || !previous.source.same_source(&next.source)
+                }
+                (None, None) => false,
+                _ => true,
+            }
+        });
         let previous_sources = std::mem::replace(&mut self.sources, sources);
+        self.fit_lanes();
         if !settings_changed {
             return;
         }
@@ -1393,21 +1469,25 @@ impl CaptureSession {
                 .stream
                 .discard_pending(&mut self.native, &mut self.bars);
         }
-        self.formats = std::array::from_fn(|lane| {
-            let source = &self.sources[lane].as_ref()?.source;
-            self.inputs
-                .iter()
-                .find(|input| input.source.same_source(source))
-                .map(|input| Arc::clone(input.stream.format()))
-        });
-        self.statuses = std::array::from_fn(|lane| {
-            let settings = self.sources[lane].as_ref()?;
-            let format = self.formats[lane].as_ref()?;
-            missing_capture_channel(&settings.source, format, settings.route)
-        });
+        self.formats = (0..self.lane_count())
+            .map(|lane| {
+                let source = &self.sources[lane].as_ref()?.source;
+                self.inputs
+                    .iter()
+                    .find(|input| input.source.same_source(source))
+                    .map(|input| Arc::clone(input.stream.format()))
+            })
+            .collect();
+        self.statuses = (0..self.lane_count())
+            .map(|lane| {
+                let settings = self.sources[lane].as_ref()?;
+                let format = self.formats[lane].as_ref()?;
+                missing_capture_channel(&settings.source, format, settings.route)
+            })
+            .collect();
         self.error = None;
-        self.layout_blocked = [false; 2];
-        self.groups = std::array::from_fn(|_| Vec::new());
+        self.layout_blocked = vec![false; self.lane_count()];
+        self.groups = vec![Vec::new(); self.lane_count()];
         self.reset_capture();
         self.configure_capture();
         if !self.paused {
@@ -1531,7 +1611,7 @@ impl CaptureSession {
         if message.time < self.discard_before_ns {
             return;
         }
-        for lane in 0..2 {
+        for lane in 0..self.lane_count() {
             let Some(settings) = &self.sources[lane] else {
                 continue;
             };
@@ -1627,7 +1707,7 @@ impl CaptureSession {
                 reconnect = true;
             }
             if groups_changed {
-                for lane in 0..2 {
+                for lane in 0..self.lane_count() {
                     if self.sources[lane]
                         .as_ref()
                         .is_some_and(|settings| settings.source.same_source(&source))
@@ -1749,16 +1829,18 @@ impl CaptureSession {
         lanes.into_iter().map(|(_, logical)| logical).collect()
     }
 
-    fn current_shown_groups(&self) -> [Option<String>; 2] {
-        std::array::from_fn(|lane| {
-            let source = &self.sources[lane].as_ref()?.source;
-            let saved = self.shown_groups.get(&source_preference_key(source));
-            self.groups[lane]
-                .iter()
-                .find(|group| Some(&group.id) == saved)
-                .or_else(|| self.groups[lane].first())
-                .map(|group| group.id.clone())
-        })
+    fn current_shown_groups(&self) -> Vec<Option<String>> {
+        (0..self.lane_count())
+            .map(|lane| {
+                let source = &self.sources[lane].as_ref()?.source;
+                let saved = self.shown_groups.get(&source_preference_key(source));
+                self.groups[lane]
+                    .iter()
+                    .find(|group| Some(&group.id) == saved)
+                    .or_else(|| self.groups[lane].first())
+                    .map(|group| group.id.clone())
+            })
+            .collect()
     }
 
     fn groups_for_lane(&self, lane: usize) -> Result<Vec<LaneGroup>, String> {
@@ -1938,18 +2020,20 @@ impl CaptureSession {
         };
     }
 
-    fn positioned_lanes(&self) -> [Option<usize>; 2] {
-        std::array::from_fn(|lane| {
-            let settings = self.sources[lane].as_ref()?;
-            let source = self.addon_source(&settings.source)?;
-            source
-                .groups
-                .as_ref()?
-                .iter()
-                .any(|group| group.positioned)
-                .then_some(self.capture_lanes[lane])
-                .flatten()
-        })
+    fn positioned_lanes(&self) -> Vec<Option<usize>> {
+        (0..self.lane_count())
+            .map(|lane| {
+                let settings = self.sources[lane].as_ref()?;
+                let source = self.addon_source(&settings.source)?;
+                source
+                    .groups
+                    .as_ref()?
+                    .iter()
+                    .any(|group| group.positioned)
+                    .then_some(self.capture_lanes[lane])
+                    .flatten()
+            })
+            .collect()
     }
 
     fn configure_capture(&mut self) {
@@ -1957,7 +2041,7 @@ impl CaptureSession {
             let source = self.sources[lane].as_ref()?;
             capture_channels(&source.source, self.formats[lane].as_ref()?, source.route)
         };
-        let mut widths = [channels(0), channels(1)];
+        let mut widths: Vec<_> = (0..self.lane_count()).map(channels).collect();
         for (lane, source) in self.sources.iter().enumerate() {
             if let Some(source) = source
                 && let Some(format) = &self.formats[lane]
@@ -1974,8 +2058,8 @@ impl CaptureSession {
                 }
             }
         }
-        self.layout_blocked = [false; 2];
-        for lane in 0..2 {
+        self.layout_blocked = vec![false; self.lane_count()];
+        for lane in 0..self.lane_count() {
             if widths[lane].is_none() {
                 continue;
             }
@@ -1988,32 +2072,44 @@ impl CaptureSession {
                 }
             }
         }
-        if let Some(a) = widths[0]
-            && let Err(reason) = combined_channels(a, widths[1])
-        {
-            self.statuses[1] = Some(reason);
-            self.layout_blocked[1] = true;
-            widths[1] = None;
+        // Lanes start in order while their channels fit in 64; a lane that would pass the
+        // limit does not start and says so, and the lanes after it may still fit.
+        let mut total = 0;
+        for lane in 0..self.lane_count() {
+            let Some(width) = widths[lane] else {
+                continue;
+            };
+            match lane_fits(lane, total, width) {
+                Ok(()) => total += width,
+                Err(reason) => {
+                    self.statuses[lane] = Some(reason);
+                    self.layout_blocked[lane] = true;
+                    widths[lane] = None;
+                }
+            }
         }
-        let previous_lanes = self.capture_lanes;
+        let previous_lanes = std::mem::take(&mut self.capture_lanes);
         let mut physical = 0;
-        self.capture_lanes = widths.map(|width| {
-            width.map(|_| {
-                let lane = physical;
-                physical += 1;
-                lane
+        self.capture_lanes = widths
+            .iter()
+            .map(|width| {
+                width.map(|_| {
+                    let lane = physical;
+                    physical += 1;
+                    lane
+                })
             })
-        });
+            .collect();
         let active: Vec<_> = widths
             .iter()
             .enumerate()
             .filter_map(|(lane, width)| width.map(|width| (lane, width)))
             .collect();
-        let Some(&(first_lane, first_width)) = active.first() else {
+        let Some(&(first_lane, _)) = active.first() else {
             self.reset_capture();
             return;
         };
-        let sample_rate = if self.shared_source_routes().is_some() {
+        let sample_rate = if self.shared_source_routes(&mut Vec::new()) {
             self.formats[first_lane]
                 .as_ref()
                 .map_or(COMMON_RATE, |format| format.sample_rate)
@@ -2022,16 +2118,14 @@ impl CaptureSession {
         };
         let mut shape = (
             sample_rate,
-            first_width,
-            active.get(1).map(|&(_, width)| width),
+            active.iter().map(|&(_, width)| width).collect::<Vec<_>>(),
         );
-        if self.shape == Some(shape) && previous_lanes == self.capture_lanes {
+        if self.shape.as_ref() == Some(&shape) && previous_lanes == self.capture_lanes {
             return;
         }
-        let mut capture = SynchronizedCapture::new_with_budget(
+        let mut capture = SynchronizedCapture::new_lanes_with_budget(
             shape.0,
-            shape.1,
-            shape.2,
+            &shape.1,
             self.retention,
             self.history_budget_samples,
         );
@@ -2042,13 +2136,12 @@ impl CaptureSession {
         {
             // Very high native rates can exceed the maximum history allocation.
             shape.0 = COMMON_RATE;
-            if self.shape == Some(shape) && previous_lanes == self.capture_lanes {
+            if self.shape.as_ref() == Some(&shape) && previous_lanes == self.capture_lanes {
                 return;
             }
-            capture = SynchronizedCapture::new_with_budget(
+            capture = SynchronizedCapture::new_lanes_with_budget(
                 shape.0,
-                shape.1,
-                shape.2,
+                &shape.1,
                 self.retention,
                 self.history_budget_samples,
             );
@@ -2091,27 +2184,39 @@ impl CaptureSession {
         for positions in &mut self.positions {
             positions.clear();
         }
-        self.position_overflowed = [false; 2];
+        self.position_overflowed = vec![false; self.lane_count()];
     }
 
-    fn shared_source_routes(&self) -> Option<([ChannelRoute; 2], usize)> {
-        let mut active = self
-            .sources
-            .iter()
-            .enumerate()
-            .filter_map(|(lane, source)| self.capture_lanes[lane].and(source.as_ref()));
-        let a = active.next()?;
-        match active.next() {
-            None => Some(([a.route, a.route], 1)),
-            Some(b) if a.source.same_source(&b.source) => Some(([a.route, b.route], 2)),
-            Some(_) => None,
+    /// Whether every recording lane records the same source, with `routes` set to their routes
+    /// in order. Then each packet of that source is routed into all lanes at once on its own
+    /// clock, and the capture runs at the source's rate. Lanes recording two or more sources
+    /// are aligned at 48 kHz instead, and `routes` is left empty.
+    fn shared_source_routes(&self, routes: &mut Vec<ChannelRoute>) -> bool {
+        routes.clear();
+        let mut first: Option<&CaptureSource> = None;
+        for (lane, settings) in self.sources.iter().enumerate() {
+            let Some(settings) = self.capture_lanes[lane].and(settings.as_ref()) else {
+                continue;
+            };
+            match first {
+                None => first = Some(&settings.source),
+                Some(first) if !first.same_source(&settings.source) => {
+                    routes.clear();
+                    return false;
+                }
+                Some(_) => {}
+            }
+            routes.push(settings.route);
         }
+        first.is_some()
     }
 
     fn drain(&mut self, flush: bool) {
-        let shared_routes = self.shared_source_routes();
-        let capture_rate = self.shape.map_or(COMMON_RATE, |shape| shape.0);
+        let mut shared_routes = std::mem::take(&mut self.shared_routes);
+        let shared = self.shared_source_routes(&mut shared_routes);
+        let capture_rate = self.shape.as_ref().map_or(COMMON_RATE, |shape| shape.0);
         let Some(capture) = &mut self.capture else {
+            self.shared_routes = shared_routes;
             return;
         };
         let before = capture.capture().revision();
@@ -2150,21 +2255,22 @@ impl CaptureSession {
                 let timestamp_ns = packet.timestamp_ns.saturating_add(
                     (skip as u128 * 1_000_000_000 / u128::from(packet.sample_rate)) as u64,
                 );
-                if let Some((routes, count)) = shared_routes
-                    && packet.sample_rate == capture_rate
-                {
-                    // Both routes came from the same hardware frame and can stay on
+                if shared && packet.sample_rate == capture_rate {
+                    // Every route came from the same hardware frame and can stay on
                     // its native clock. WAV export converts the complete selection once.
                     if is_sender(&input.source) && format.channels > 2 {
                         self.scratch.clear();
                         for frame in samples.chunks_exact(format.channels) {
-                            for _ in 0..count {
+                            for _ in 0..shared_routes.len() {
                                 self.scratch.extend_from_slice(frame);
                             }
                         }
                     } else {
-                        let routes = routes.map(|route| effective_route(format, route));
-                        format.route_tracks(&routes[..count], samples, &mut self.scratch);
+                        // Only the shared input gets here, and the change is idempotent.
+                        for route in &mut shared_routes {
+                            *route = effective_route(format, *route);
+                        }
+                        format.route_tracks(&shared_routes, samples, &mut self.scratch);
                     }
                     if let Err(error) = capture.push_native_interleaved_with_markers(
                         timestamp_ns,
@@ -2240,6 +2346,7 @@ impl CaptureSession {
             positions.retain_frames(frames.clone());
             self.position_overflowed[lane] |= positions.take_overflowed();
         }
+        self.shared_routes = shared_routes;
     }
 
     fn pause(&mut self) {
@@ -2321,13 +2428,8 @@ impl CaptureSession {
         if frames.is_empty() {
             return None;
         }
-        let count = if capture.track_channels(1).is_some() {
-            2
-        } else {
-            1
-        };
         let frozen = capture.freeze_range(frames)?;
-        let tracks = (0..count)
+        let tracks = (0..capture.lane_count())
             .map(|lane| frozen.track(lane))
             .collect::<Option<Vec<_>>>()?;
         Some(tracks.into())
@@ -2338,7 +2440,11 @@ impl CaptureSession {
         let frames = capture.frame_range();
         Some(EditSnapshot {
             snapshots: self.snapshots(Some(frames.clone()))?,
-            positions: self.positions.each_ref().map(PositionTimeline::freeze),
+            positions: self
+                .positions
+                .iter()
+                .map(PositionTimeline::freeze)
+                .collect(),
             bar_markers: capture.bar_markers(frames),
             generation: self.generation,
             groups: self.groups.clone(),
@@ -2535,7 +2641,7 @@ mod tests {
         let mut session = CaptureSession::new();
         session.history_budget_samples = 48_000;
         session.paused = false;
-        session.set_sources([
+        session.set_sources(vec![
             Some(SourceSettings {
                 source: CaptureSource::Sender {
                     id: sender.id().into(),
@@ -2664,8 +2770,8 @@ mod tests {
         }
         let mut state = lock(&controller.state);
         state.capture = Some(capture);
-        state.shape = Some((rate, width, None));
-        state.capture_lanes = [Some(0), None];
+        state.shape = Some((rate, vec![width]));
+        state.capture_lanes = vec![Some(0), None];
         state.revision = 1;
         controller.source_status = SourceStatus::from_session(&state);
         drop(state);
@@ -2754,7 +2860,7 @@ mod tests {
         let mut session = CaptureSession::new();
         session.paused = false;
         session.history_budget_samples = 48000;
-        session.sources = [
+        session.sources = vec![
             Some(SourceSettings {
                 source: CaptureSource::System,
                 route: ChannelRoute::AllChannels,
@@ -2900,7 +3006,7 @@ mod tests {
 
     fn retained_addon_session() -> CaptureSession {
         let mut session = CaptureSession::new();
-        session.sources = [
+        session.sources = vec![
             Some(SourceSettings {
                 source: addon_selection(),
                 route: ChannelRoute::Merged,
@@ -2911,7 +3017,7 @@ mod tests {
             }),
         ];
         session.addon_snapshot = Some(Arc::new(addon_fixture(AddonState::Running)));
-        session.formats = [
+        session.formats = vec![
             Some(Arc::new(Format::sender(48_000, 6))),
             Some(Arc::new(Format::sender(48_000, 2))),
         ];
@@ -3174,7 +3280,7 @@ mod tests {
     #[test]
     fn stopped_addon_has_status_without_repeated_connection_attempts() {
         let mut session = CaptureSession::new();
-        session.sources = [
+        session.sources = vec![
             Some(SourceSettings {
                 source: addon_selection(),
                 route: ChannelRoute::Merged,
@@ -3195,7 +3301,7 @@ mod tests {
     fn wide_sender_ignores_saved_stereo_route_and_preserves_native_channels() {
         let mut session = CaptureSession::new();
         let source = addon_selection();
-        session.sources = [
+        session.sources = vec![
             Some(SourceSettings {
                 source: source.clone(),
                 route: ChannelRoute::Left,
@@ -3206,7 +3312,7 @@ mod tests {
         session.formats[0] = Some(Arc::new(Format::sender(10, 6)));
         session.history_budget_samples = 120;
         session.configure_capture();
-        assert_eq!(session.shape, Some((10, 6, None)));
+        assert_eq!(session.shape, Some((10, vec![6])));
         assert_eq!(session.groups[0][0].channels, 0..6);
         assert_eq!(
             session.groups[0][0].labels,
@@ -3236,22 +3342,24 @@ mod tests {
     #[test]
     fn second_lane_over_64_is_refused_without_allocating_its_channels() {
         let mut session = CaptureSession::new();
-        session.sources = ["abc-1", "abc-2"].map(|id| {
-            Some(SourceSettings {
-                source: CaptureSource::Sender {
-                    id: id.into(),
-                    name: id.into(),
-                },
-                route: ChannelRoute::Merged,
+        session.sources = ["abc-1", "abc-2"]
+            .map(|id| {
+                Some(SourceSettings {
+                    source: CaptureSource::Sender {
+                        id: id.into(),
+                        name: id.into(),
+                    },
+                    route: ChannelRoute::Merged,
+                })
             })
-        });
-        session.formats = [
+            .into();
+        session.formats = vec![
             Some(Arc::new(Format::sender(48_000, 40))),
             Some(Arc::new(Format::sender(48_000, 25))),
         ];
         session.history_budget_samples = 640;
         session.configure_capture();
-        assert_eq!(session.shape, Some((48_000, 40, None)));
+        assert_eq!(session.shape, Some((48_000, vec![40])));
         assert!(
             session.statuses[1]
                 .as_ref()
@@ -3269,14 +3377,206 @@ mod tests {
         );
         session.formats[1] = Some(Arc::new(Format::sender(48_000, 24)));
         session.configure_capture();
-        assert_eq!(session.shape, Some((48_000, 40, Some(24))));
+        assert_eq!(session.shape, Some((48_000, vec![40, 24])));
         assert!(session.statuses[1].is_none());
+    }
+
+    fn sender_lanes(lanes: &[(&str, ChannelRoute)]) -> Sources {
+        lanes
+            .iter()
+            .map(|&(id, route)| {
+                Some(SourceSettings {
+                    source: CaptureSource::Sender {
+                        id: id.into(),
+                        name: id.into(),
+                    },
+                    route,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lanes_that_are_off_are_taken_out_and_later_lanes_move_up() {
+        let [a, b, c] = ["abc-1", "abc-2", "abc-3"]
+            .map(|id| sender_lanes(&[(id, ChannelRoute::Merged)]).pop().unwrap());
+        // Lane B off: C becomes B.
+        assert_eq!(
+            compact_sources(vec![a.clone(), None, c.clone()]),
+            [a.clone(), c.clone()]
+        );
+        // Two lanes, B off, as version 0.2.1 stored them: one lane.
+        assert_eq!(compact_sources(vec![a.clone(), None]), [a.clone()]);
+        assert_eq!(
+            compact_sources(vec![None, b.clone(), c.clone()]),
+            [b.clone(), c]
+        );
+        // Every lane off leaves lane A on system audio, as a new installation starts.
+        assert_eq!(
+            compact_sources(vec![None, None]),
+            [Some(SourceSettings::default())]
+        );
+        assert_eq!(
+            compact_sources(Vec::new()),
+            [Some(SourceSettings::default())]
+        );
+        // No more than 64 lanes.
+        let many = compact_sources(vec![a.clone(); 70]);
+        assert_eq!(many.len(), MAX_LANES);
+        // The controller holds the compact list.
+        let mut controller = Controller::new().unwrap();
+        controller.set_sources(vec![a.clone(), None, b.clone()]);
+        assert_eq!(controller.sources(), &[a, b]);
+        assert_eq!(controller.lane_count(), 2);
+    }
+
+    #[test]
+    fn a_lane_past_64_channels_in_all_is_refused_by_name_and_later_lanes_still_start() {
+        let mut session = CaptureSession::new();
+        session.sources = sender_lanes(&[
+            ("abc-1", ChannelRoute::Merged),
+            ("abc-2", ChannelRoute::Merged),
+            ("abc-3", ChannelRoute::Merged),
+            ("abc-4", ChannelRoute::Merged),
+            ("abc-5", ChannelRoute::Merged),
+        ]);
+        session.fit_lanes();
+        session.formats = [40, 20, 8, 4, 2]
+            .map(|channels| Some(Arc::new(Format::sender(48_000, channels))))
+            .into();
+        session.history_budget_samples = 6_400;
+        session.configure_capture();
+        // A, B and D fit in 64 channels; C would make 68 and E 66.
+        assert_eq!(session.shape, Some((48_000, vec![40, 20, 4])));
+        assert_eq!(
+            session.capture_lanes,
+            [Some(0), Some(1), None, Some(2), None]
+        );
+        assert_eq!(
+            session.statuses[2].as_deref().unwrap().split(" / ").next(),
+            Some("Lane C cannot start: lanes A to C would contain 68 channels; the limit is 64")
+        );
+        assert!(
+            session.statuses[4]
+                .as_deref()
+                .unwrap()
+                .starts_with("Lane E cannot start: lanes A to E would contain 66 channels"),
+            "{:?}",
+            session.statuses[4]
+        );
+        assert!(session.statuses[..2].iter().all(Option::is_none));
+        assert!(session.statuses[3].is_none());
+        let capture = session.capture.as_ref().unwrap().capture();
+        assert_eq!(capture.lane_count(), 3);
+        assert_eq!(capture.track_channels(2), Some(4));
+        assert_eq!(
+            SourceStatus::from_session(&session).channels,
+            [Some(40), Some(20), None, Some(4), None]
+        );
+        // Lane C gets room once A narrows.
+        session.formats[0] = Some(Arc::new(Format::sender(48_000, 32)));
+        session.configure_capture();
+        assert_eq!(session.shape, Some((48_000, vec![32, 20, 8, 4])));
+        assert!(session.statuses[2].is_none());
+        assert!(
+            session.statuses[4]
+                .as_deref()
+                .unwrap()
+                .contains("66 channels")
+        );
+    }
+
+    #[test]
+    fn sixty_four_mono_lanes_of_one_source_record_at_its_own_rate() {
+        let mut session = CaptureSession::new();
+        let routes = [ChannelRoute::Left, ChannelRoute::Right];
+        let lanes: Vec<_> = (0..MAX_LANES)
+            .map(|lane| ("abc-1", routes[lane % 2]))
+            .collect();
+        session.sources = sender_lanes(&lanes);
+        session.fit_lanes();
+        session.formats = vec![Some(Arc::new(Format::sender(44_100, 2))); MAX_LANES];
+        session.history_budget_samples = 64 * 441;
+        session.configure_capture();
+        assert_eq!(session.shape, Some((44_100, vec![1; MAX_LANES])));
+        assert!(session.statuses.iter().all(Option::is_none));
+        assert_eq!(session.capture_lanes[63], Some(63));
+        // One packet of the shared source lands in every lane: left in A, right in B, ...
+        let mut routes = Vec::new();
+        assert!(session.shared_source_routes(&mut routes));
+        assert_eq!(routes.len(), MAX_LANES);
+        let format = session.formats[0].clone().unwrap();
+        let mut routed = Vec::new();
+        format.route_tracks(&routes, &[0.25, -0.5, 0.75, -1.0], &mut routed);
+        assert_eq!(&routed[..4], &[0.25, -0.5, 0.25, -0.5]);
+        assert_eq!(routed.len(), 2 * MAX_LANES);
+        assert_eq!(&routed[MAX_LANES..MAX_LANES + 2], &[0.75, -1.0]);
+    }
+
+    #[test]
+    fn lanes_record_at_the_source_rate_only_while_every_lane_shares_one_source() {
+        let mut session = CaptureSession::new();
+        session.sources = sender_lanes(&[
+            ("abc-1", ChannelRoute::Merged),
+            ("abc-1", ChannelRoute::Left),
+            ("abc-1", ChannelRoute::Side),
+        ]);
+        session.fit_lanes();
+        session.formats = vec![Some(Arc::new(Format::sender(44_100, 2))); 3];
+        session.history_budget_samples = 4_410;
+        session.configure_capture();
+        assert_eq!(session.shape, Some((44_100, vec![2, 1, 1])));
+        // A third lane from another source: every lane is aligned at 48 kHz.
+        session.sources = sender_lanes(&[
+            ("abc-1", ChannelRoute::Merged),
+            ("abc-1", ChannelRoute::Left),
+            ("abc-2", ChannelRoute::Merged),
+        ]);
+        session.configure_capture();
+        assert_eq!(session.shape, Some((COMMON_RATE, vec![2, 1, 2])));
+        let mut routes = Vec::new();
+        assert!(!session.shared_source_routes(&mut routes));
+        assert!(routes.is_empty());
+        // Once that lane cannot record, the two lanes left share one source again.
+        session.formats[2] = None;
+        session.configure_capture();
+        assert_eq!(session.shape, Some((44_100, vec![2, 1])));
+        assert_eq!(session.capture_lanes, [Some(0), Some(1), None]);
+    }
+
+    #[test]
+    fn lanes_that_share_a_source_share_one_input() {
+        let mut session = CaptureSession::new();
+        session.sources = sender_lanes(&[
+            ("abc-1", ChannelRoute::Merged),
+            ("abc-2", ChannelRoute::Merged),
+            ("abc-1", ChannelRoute::Left),
+        ]);
+        session.fit_lanes();
+        session.paused = false;
+        let sources: Vec<_> = session
+            .sources
+            .iter()
+            .flatten()
+            .map(|lane| lane.source.clone())
+            .collect();
+        for source in &sources[..2] {
+            let (_, result) = mpsc::sync_channel(1);
+            session.pending.push(PendingInput {
+                source: source.clone(),
+                result,
+            });
+        }
+        // Lane C's source is already being opened for lane A, so nothing more is asked for.
+        assert!(!session.source_missing());
+        session.request_missing();
+        assert_eq!(session.pending.len(), 2);
     }
 
     #[test]
     fn mismatched_addon_groups_do_not_start_capture() {
         let mut session = CaptureSession::new();
-        session.sources = [
+        session.sources = vec![
             Some(SourceSettings {
                 source: addon_selection(),
                 route: ChannelRoute::Merged,
@@ -3298,7 +3598,7 @@ mod tests {
     #[test]
     fn lane_b_records_while_lane_a_is_unavailable_without_phantom_channels() {
         let mut session = CaptureSession::new();
-        session.sources = [
+        session.sources = vec![
             Some(SourceSettings {
                 source: addon_selection(),
                 route: ChannelRoute::Merged,
@@ -3316,7 +3616,7 @@ mod tests {
         session.history_budget_samples = 120;
         session.paused = false;
         session.configure_capture();
-        assert_eq!(session.shape, Some((10, 6, None)));
+        assert_eq!(session.shape, Some((10, vec![6])));
         assert_eq!(session.capture_lanes, [None, Some(0)]);
         assert_eq!(
             SourceStatus::from_session(&session).channels,
@@ -3360,23 +3660,25 @@ mod tests {
     #[test]
     fn sender_rate_change_resets_independent_lanes_even_with_same_output_rate() {
         let mut session = CaptureSession::new();
-        session.sources = ["abc-1", "abc-2"].map(|id| {
-            Some(SourceSettings {
-                source: CaptureSource::Sender {
-                    id: id.into(),
-                    name: id.into(),
-                },
-                route: ChannelRoute::Merged,
+        session.sources = ["abc-1", "abc-2"]
+            .map(|id| {
+                Some(SourceSettings {
+                    source: CaptureSource::Sender {
+                        id: id.into(),
+                        name: id.into(),
+                    },
+                    route: ChannelRoute::Merged,
+                })
             })
-        });
-        session.formats = [
+            .into();
+        session.formats = vec![
             Some(Arc::new(Format::sender(44_100, 6))),
             Some(Arc::new(Format::sender(48_000, 2))),
         ];
         session.history_budget_samples = 1024;
         session.paused = false;
         session.configure_capture();
-        assert_eq!(session.shape, Some((48_000, 6, Some(2))));
+        assert_eq!(session.shape, Some((48_000, vec![6, 2])));
         session
             .capture
             .as_mut()
@@ -3398,7 +3700,7 @@ mod tests {
             result,
         });
         session.poll_pending();
-        assert_eq!(session.shape, Some((48_000, 6, Some(2))));
+        assert_eq!(session.shape, Some((48_000, vec![6, 2])));
         assert!(session.generation > before);
         assert!(
             session
@@ -3414,7 +3716,7 @@ mod tests {
     #[test]
     fn frozen_snapshot_keeps_channel_groups_after_live_layout_changes() {
         let mut session = CaptureSession::new();
-        session.sources = [
+        session.sources = vec![
             Some(SourceSettings {
                 source: addon_selection(),
                 route: ChannelRoute::Merged,
@@ -3622,7 +3924,7 @@ mod tests {
                 .source
                 .same_source(&source)
         );
-        let rate = lock(&controller.state).shape.unwrap().0;
+        let rate = lock(&controller.state).shape.as_ref().unwrap().0;
 
         thread::sleep(Duration::from_millis(900));
         assert_eq!(
@@ -3756,7 +4058,7 @@ mod tests {
         {
             let mut session = lock(&controller.state);
             session.sources[1] = Some(SourceSettings::default());
-            session.shape = Some((10, 1, Some(1)));
+            session.shape = Some((10, vec![1, 1]));
             session.generation = 7;
             session.paused = false;
             session.next_retry = Instant::now() + Duration::from_secs(3600);
@@ -3864,11 +4166,11 @@ mod tests {
         session.formats[0] = Some(Arc::new(Format::sender(10, 2)));
         session.configure_capture();
         assert!(session.capture.as_ref().unwrap().retain_silence());
-        assert_eq!(session.shape, Some((10, 2, None)));
+        assert_eq!(session.shape, Some((10, vec![2])));
         session.formats[0] = Some(Arc::new(Format::sender(20, 1)));
         session.configure_capture();
         assert!(session.capture.as_ref().unwrap().retain_silence());
-        assert_eq!(session.shape, Some((20, 1, None)));
+        assert_eq!(session.shape, Some((20, vec![1])));
     }
 
     #[test]
@@ -3972,7 +4274,7 @@ mod tests {
         {
             let mut session = lock(&controller.state);
             session.sources[1] = Some(SourceSettings::default());
-            session.shape = Some((10, 1, Some(1)));
+            session.shape = Some((10, vec![1, 1]));
             session.generation = 7;
             let mut capture =
                 SynchronizedCapture::new(10, 1, Some(1), DurationChoice::Minutes10).unwrap();
@@ -4015,7 +4317,7 @@ mod tests {
         {
             let mut session = lock(&controller.state);
             session.sources[1] = Some(SourceSettings::default());
-            session.shape = Some((10, 1, Some(1)));
+            session.shape = Some((10, vec![1, 1]));
             let mut capture =
                 SynchronizedCapture::new(10, 1, Some(1), DurationChoice::Seconds20).unwrap();
             let input: Vec<_> = (1..=95)
@@ -4061,7 +4363,7 @@ mod tests {
         {
             let mut session = lock(&controller.state);
             session.sources[1] = Some(SourceSettings::default());
-            session.shape = Some((10, 1, Some(1)));
+            session.shape = Some((10, vec![1, 1]));
             let mut capture =
                 SynchronizedCapture::new(10, 1, Some(1), DurationChoice::Minutes5).unwrap();
             let input: Vec<_> = (1..=500)

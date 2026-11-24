@@ -162,14 +162,14 @@ struct Request {
     frames: Range<u64>,
     bins: usize,
     rows: Vec<RowSource>,
-    /// By logical lane: what its pair rows are made from.
-    pairs: [Option<PairGroup>; 2],
+    /// By logical lane: what its pair rows are made from. A lane past the end has none.
+    pairs: Vec<Option<PairGroup>>,
 }
 
 struct Job {
     request: Request,
-    /// The audio to read, by logical lane.
-    tracks: [Option<FrozenTrack>; 2],
+    /// The audio to read, by logical lane. A lane past the end has none.
+    tracks: Vec<Option<FrozenTrack>>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -313,7 +313,7 @@ impl WaveformColors {
         &mut self,
         coloring: WaveformColoring,
         wanted: Option<Request>,
-        pin: impl FnOnce(&Request) -> Option<[Option<FrozenTrack>; 2]>,
+        pin: impl FnOnce(&Request) -> Option<Vec<Option<FrozenTrack>>>,
         ctx: &egui::Context,
     ) {
         if coloring != WaveformColoring::Frequency {
@@ -667,17 +667,24 @@ impl Recorder {
                     frames: self.visible_frames.clone(),
                     bins,
                     rows: self.peak_rows.clone(),
-                    pairs: [0, 1].map(|lane| self.lane_pair(lane).cloned()),
+                    pairs: (0..self.lane_count())
+                        .map(|lane| self.lane_pair(lane).cloned())
+                        .collect(),
                 })
             })
             .flatten();
         let editing = self.editing.as_ref();
         let controller = &self.controller;
+        let lane_count = self.lane_count();
         self.waveform_colors.update(
             coloring,
             wanted,
             |request| match editing {
-                Some(edit) => Some([0, 1].map(|lane| edit.track(lane).cloned())),
+                Some(edit) => Some(
+                    (0..lane_count)
+                        .map(|lane| edit.track(lane).cloned())
+                        .collect(),
+                ),
                 None => controller
                     .try_freeze_frames(request.frames.clone())
                     .filter(|(_, _, generation)| *generation == request.generation)
@@ -897,7 +904,11 @@ mod tests {
         );
     }
 
-    fn job(tracks: [Option<FrozenTrack>; 2], rows: Vec<RowSource>, frames: Range<u64>) -> Job {
+    fn job(
+        tracks: impl Into<Vec<Option<FrozenTrack>>>,
+        rows: Vec<RowSource>,
+        frames: Range<u64>,
+    ) -> Job {
         Job {
             request: Request {
                 generation: 1,
@@ -905,9 +916,9 @@ mod tests {
                 frames,
                 bins: 8,
                 rows,
-                pairs: [None, None],
+                pairs: vec![None, None],
             },
-            tracks,
+            tracks: tracks.into(),
             cancel: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1278,7 +1289,7 @@ mod tests {
             frames: 0..RATE as u64 * 3,
             bins: 64,
             rows: rows.clone(),
-            pairs: [None, None],
+            pairs: vec![None, None],
         };
         // The waveform itself, drawn as the window draws it with a single colour.
         let mut low = vec![0.0; 64];

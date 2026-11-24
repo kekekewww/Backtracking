@@ -44,6 +44,12 @@
 //!   (default when only the Atmos add-on is) or `off`. Lane B takes `atmos` as well. To see a
 //!   missing source: `stopped` (the add-on from `quits`, which has stopped), `gone` (the test
 //!   tone no longer offers it) or `uninstalled` (no such add-on).
+//! - `BACKTRACKING_TEST_LANES`: every lane, in place of the two above, separated by `,`:
+//!   `<source>[:<route>][*<count>]`. A source is `tone`, `atmos`, `sender`, `sender-7.1.4`,
+//!   `sender-spectrum` or `system`; a route `merged` (the default; `all` for `system`), `left`,
+//!   `right`, `side` or `all`; `*<count>` repeats the lane. `tone:left*64` is 64 mono lanes of
+//!   the test tone. Lanes A and B are written as older versions read them, and every lane to
+//!   `capture-lanes-v1`.
 //!
 //! Seeding also writes packages to drop on the window into `<LOCALAPPDATA>\packages`:
 //! `tone-0.2.0.btaddon` (the test tone with a newer version), `quits.btaddon`,
@@ -58,7 +64,7 @@ use backtracking_core::{ChannelRoute, SenderEndpoint, capture_clock_ns};
 
 use crate::addons::{AddonManager, AddonState};
 use crate::controller::{CaptureSource, SourceSettings};
-use crate::preferences::{Key, Preferences, serialize_sources};
+use crate::preferences::{Key, Preferences, serialize_lanes, serialize_sources};
 
 const ADDON_ID: &str = "com.example.test-tone";
 const QUITS_ID: &str = "com.example.quits";
@@ -102,6 +108,7 @@ fn preference_key(name: &str) -> Option<Key> {
         "waveform-only" => Key::WaveformOnly,
         "meter-unit" => Key::Meter,
         "meter-b-unit" => Key::MeterB,
+        "meter-units-after-b-v1" => Key::MeterUnitsAfterB,
         "transparency-percent" => Key::Transparency,
         "show-level-meters" => Key::ShowMeters,
         "always-on-top" => Key::AlwaysOnTop,
@@ -491,9 +498,20 @@ fn seed_test_profile() {
         },
     );
     let preferences = Preferences::in_data_root(&root);
-    preferences
-        .save(Key::CaptureSources, &serialize_sources(&[lane_a, lane_b]))
-        .unwrap();
+    match std::env::var("BACKTRACKING_TEST_LANES") {
+        Ok(lanes) => {
+            let lanes = test_lanes(&lanes, &tone, &atmos, &spectrum_sender);
+            preferences
+                .save(Key::CaptureSources, &serialize_sources(&lanes))
+                .unwrap();
+            preferences
+                .save(Key::CaptureLanes, &serialize_lanes(&lanes))
+                .unwrap();
+        }
+        Err(_) => preferences
+            .save(Key::CaptureSources, &serialize_sources(&[lane_a, lane_b]))
+            .unwrap(),
+    }
     // Exports stay in the test folder, and the window does not sit above the user's.
     let exports = folder.join("exports");
     preferences
@@ -520,6 +538,64 @@ fn seed_test_profile() {
         folder.display(),
         packages.display()
     );
+}
+
+/// The lanes `BACKTRACKING_TEST_LANES` names (see the module's notes).
+fn test_lanes(
+    text: &str,
+    tone: &SourceSettings,
+    atmos: &SourceSettings,
+    spectrum_sender: &SourceSettings,
+) -> Vec<Option<SourceSettings>> {
+    let sender = |id: &str, name: &str| CaptureSource::Sender {
+        id: id.into(),
+        name: name.into(),
+    };
+    let mut lanes = Vec::new();
+    for lane in text
+        .split(',')
+        .map(str::trim)
+        .filter(|lane| !lane.is_empty())
+    {
+        let (lane, count) = match lane.split_once('*') {
+            Some((lane, count)) => (lane, count.trim().parse::<usize>().unwrap()),
+            None => (lane, 1),
+        };
+        let (source, route) = match lane.split_once(':') {
+            Some((source, route)) => (source.trim(), Some(route.trim())),
+            None => (lane.trim(), None),
+        };
+        let source = match source {
+            "tone" => tone.source.clone(),
+            "atmos" => atmos.source.clone(),
+            "sender" => sender(STEREO_SENDER_ID, STEREO_SENDER_NAME),
+            "sender-7.1.4" => sender(WIDE_SENDER_ID, WIDE_SENDER_NAME),
+            "sender-spectrum" => spectrum_sender.source.clone(),
+            "system" => CaptureSource::System,
+            other => panic!(
+                "a lane is tone, atmos, sender, sender-7.1.4, sender-spectrum or system, not {other}"
+            ),
+        };
+        let route = match route {
+            None if matches!(source, CaptureSource::System) => ChannelRoute::AllChannels,
+            None | Some("merged") => ChannelRoute::Merged,
+            Some("left") => ChannelRoute::Left,
+            Some("right") => ChannelRoute::Right,
+            Some("side") => ChannelRoute::Side,
+            Some("all") => ChannelRoute::AllChannels,
+            Some(other) => panic!("a route is merged, left, right, side or all, not {other}"),
+        };
+        lanes.extend(std::iter::repeat_n(
+            Some(SourceSettings { source, route }),
+            count,
+        ));
+    }
+    assert!(
+        (1..=crate::controller::MAX_LANES).contains(&lanes.len()),
+        "BACKTRACKING_TEST_LANES names 1 to 64 lanes, not {}",
+        lanes.len()
+    );
+    lanes
 }
 
 #[test]
