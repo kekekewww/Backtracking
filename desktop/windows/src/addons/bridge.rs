@@ -39,6 +39,7 @@ enum WireCommand {
     Stop(String),
     Send { id: String, message: HostMessage },
     Clips(HostMessage),
+    ControlAllowed { id: String, allowed: bool },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -317,6 +318,10 @@ fn dispatch(handle: &AddonHandle, command: WireCommand, stopping: &AtomicBool) -
             )
             .map(|()| ResponseData::Done)
         }
+        WireCommand::ControlAllowed { id, allowed } => {
+            await_reply(handle.set_control_allowed(&id, allowed), stopping)
+                .map(|()| ResponseData::Done)
+        }
     }
 }
 
@@ -494,7 +499,15 @@ fn forward(root: &Path, command: Command, stopping: &AtomicBool) {
         Command::Error(error, reply) => {
             let _ = reply.send(Err(error));
         }
-        Command::Shutdown => {}
+        Command::ControlAllowed(id, allowed, reply) => {
+            let _ = reply.send(request_done(
+                root,
+                WireCommand::ControlAllowed { id, allowed },
+                stopping,
+            ));
+        }
+        // Control requests are carried out by the primary window, which answers them itself.
+        Command::ControlReply { .. } | Command::Shutdown => {}
     }
 }
 
@@ -512,10 +525,11 @@ fn reject(command: Command, error: String) {
         | Command::Stop(_, reply)
         | Command::Send(_, _, reply)
         | Command::Clips(_, reply)
-        | Command::Error(_, reply) => {
+        | Command::Error(_, reply)
+        | Command::ControlAllowed(_, _, reply) => {
             let _ = reply.send(Err(error));
         }
-        Command::Shutdown => {}
+        Command::ControlReply { .. } | Command::Shutdown => {}
     }
 }
 
@@ -812,6 +826,8 @@ mod tests {
                 sources: vec![source],
                 settings: Vec::new(),
                 actions: Vec::new(),
+                control_allowed: false,
+                control_asked: false,
             }],
         };
         let shared = Arc::new(Shared {

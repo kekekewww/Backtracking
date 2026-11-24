@@ -251,6 +251,19 @@ Options 的 **Hotkeys／快速鍵** 頁列出所有鍵盤快速鍵，都可以�
 
 想自己寫附加元件，請看 [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md)。
 
+### 讓附加元件控制 Backtracking（Windows 桌面版）
+
+具有 `control` 功能的附加元件可以像坐在視窗前的人一樣操作 Backtracking，例如讓 AI 助理或腳本替你暫停、選取並存檔。
+
+- 預設不允許。在 Options 的 **Add-ons** 頁，這種附加元件會多一個勾選框 **允許此附加元件控制 Backtracking（開始與暫停錄音、選取、儲存檔案、變更來源）／Let this add-on control Backtracking (start and pause recording, select, save files, change sources)**。未勾選時，它的每個要求都會被拒絕；若它曾經要求過，勾選框下方會註明 **它要求控制 Backtracking，已被拒絕／It asked to control Backtracking and was refused**。安裝確認畫面也會列出這項功能。
+- 允許後，它可以讀取 Backtracking 目前的狀態（是否在擷取、各來源、保留的長度、選區、目前顯示的範圍、存檔資料夾），開始、暫停與清除擷取，框選一段、選擇分開編輯的列、縮放，把選區存成 WAV 檔，試聽選區，以及新增或移除來源。
+- 存檔等同把選區拖出視窗：寫出的檔案和 **Save** 對同一個選區寫出的相同，附加元件會收到每個檔案的路徑、來源字母、聲道數、取樣率與長度。
+- 新增或移除來源和在 **Sources** 頁操作一樣，會重新開始記錄歷史，原本保留的音訊會消失。需要的部分請先存檔。
+- 附加元件動手時，狀態列會註明是誰做的，例如 **已開始擷取 · 由 Example control 操作／Capture started · by Example control**；它框選的選區顯示為 **Selection · 由 Example control 操作**。
+- 你正在拖曳、拖出或存檔時，附加元件的要求會被告知「忙碌中」，不會打斷你。
+- 它不能切換自己或其他附加元件的這個勾選框，不能安裝、移除、啟用或停用附加元件，不能更改其他設定、開啟檔案、結束 Backtracking 或更新。
+- 隨時取消勾選即可收回；還在等待的要求會被拒絕。這個選擇依附加元件分別保存，重新開啟 Backtracking 後仍有效；移除附加元件後就會忘記，重新安裝時又是不允許。
+
 ### 多聲道來源（Windows 桌面版與插件）
 
 **擷取系統、應用程式或麥克風的所有聲道。** 系統播放、單一應用程式或麥克風的裝置超過兩個聲道時（例如 5.1 或 7.1 喇叭），Options → Sources 的 **Channel route** 會多一個 **All channels／所有聲道**，選了之後每個聲道各成一列，聲道名稱來自 Windows 的喇叭配置（`FL`、`FR`、`FC`、`LFE` 等）。裝置只有一或兩個聲道時不會列出這個選項；之前選過、但裝置現在只有立體聲時，Backtracking 改用合併聲道擷取，並在來源下方說明。只有一或兩個聲道的來源仍是一列或 L／R 兩列，不會變成多聲道軌道。
@@ -555,6 +568,19 @@ An add-on is a separate program that Backtracking starts and captures audio from
 **Use an add-on's look.** An add-on with the `appearance` capability can offer a look for the window: colors for the waveform, the selection, the backgrounds, the border, the flags and more, and the border width, corner rounding and the thickness of the waveform's line. A look is off until you choose it: on the **Appearance** page of Options, pick a running add-on that offers one under **Look from add-on**. Only one look is on at a time, and **None** brings back Backtracking's own look. The choice is saved. When that add-on is not running or offers no look, the window shows its own look and the row says the add-on is not offering one right now; its look comes back when it does. A look changes only how the window looks: capture, selection, export, files, shortcuts, layout (other than the border width), text, and the recording, waiting, paused and error marks stay as they are. While a look is on, its border width replaces yours (the window keeps its size and the waveform area adjusts), but a border color you chose yourself still wins over the look's, and your background transparency still applies. Backtracking ignores any value that would make the waveform, the selection, the flags, the playhead, channel names or the capture status hard to see, and uses its own there instead.
 
 To write an add-on, see [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md).
+
+### Let an add-on control Backtracking (Windows desktop)
+
+An add-on with the `control` capability can work Backtracking the way a person at the window does, so that an AI assistant or a script can, for example, pause, select and save for you.
+
+- It is off until you allow it. On the **Add-ons** page of Options such an add-on has a check box, **Let this add-on control Backtracking (start and pause recording, select, save files, change sources)**. While it is clear, every request from the add-on is refused; when the add-on has asked, the line under the box says **It asked to control Backtracking and was refused**. The install confirmation lists the capability too.
+- Once allowed, it can read what Backtracking is doing (whether it is capturing, the sources, how much is held, the selection, what the window shows, the save folder), start, pause and clear capture, select a stretch, choose the rows to edit separately, zoom, save the selection as WAV files, play the selection, and add or remove sources.
+- Saving is the add-on's way to drag a clip out of the window: it writes the files **Save** writes for the same selection, and the add-on is told each file's path, lane letter, channel count, sample rate and length.
+- Adding or removing a source starts a new history, as it does on the **Sources** page: the audio held until then is gone. Save what you want to keep first.
+- While an add-on acts, the status line says which one, for example **Capture started · by Example control**; a selection it made reads **Selection · by Example control**.
+- While you are dragging, dragging out or saving, its requests are told Backtracking is busy rather than interrupting you.
+- It cannot change its own check box or another add-on's, install, remove, enable or disable add-ons, change other options, open files, quit Backtracking, or update it.
+- Clear the box at any time to take control back; requests still waiting are refused. The choice is kept for each add-on when Backtracking restarts, and forgotten when the add-on is removed: installed again, it starts off.
 
 ### Multichannel sources (Windows desktop and plug-ins)
 

@@ -25,6 +25,7 @@ installing and offers nothing else to the add-on.
 | `actions` | Declare named buttons. Backtracking shows them and tells the add-on when one is pressed. |
 | `clips` | Be told the paths of every clip Backtracking exports. |
 | `appearance` | Offer colors and a few drawing values that the user can choose to apply. |
+| `control` | Drive Backtracking once the user allows it on the Add-ons page: read its state, start, pause and clear capture, select, zoom, save files, play the selection, and add or remove sources (section 4.4). |
 
 An add-on runs with the user's own permissions and is not sandboxed. The capabilities describe
 what Backtracking does for the add-on, not what the program is able to do on the computer. The
@@ -110,9 +111,10 @@ message has a `type`.
 Both sides ignore message types and fields they do not know, so later contract versions can add
 them.
 
-There are no request numbers. The add-on reports its state with `describe`; when something the host
-asked for changes that state, the add-on sends `describe` again. When it cannot do what was asked,
-it sends `message` with level `error`.
+There are no request numbers, except in the requests of the `control` capability (section 4.4).
+The add-on reports its state with `describe`; when something the host asked for changes that state,
+the add-on sends `describe` again. When it cannot do what was asked, it sends `message` with level
+`error`.
 
 ### 4.1 Handshake
 
@@ -405,11 +407,149 @@ showing it. They do not stop the add-on.
 | `select_format` | The user picks a format for a source. | `source`, `format` |
 | `transport` | The user presses play, pause or stop, or moves the position. | `source`, `command` (`play`, `pause`, `stop`, `seek`), `position` (seconds, with `seek`) |
 | `clip_exported` | Backtracking has written a clip (`clips`). | `files` (absolute paths), `sample_rate`, `frames` |
+| `control_access` | Right after `welcome`, and whenever the user changes the switch (`control`). | `allowed` |
+| `control_reply` | A `control` request is answered (`control`). | `id`, and `result` or `error` |
 | `quit` | The add-on should exit. | none |
 
 Backtracking remembers the format the user picked for each source. After an add-on's first
 `describe` it sends `select_format` again when the remembered format is offered and differs from
 the one in use, so an add-on does not have to store that choice itself.
+
+### 4.4 Control
+
+An add-on with the `control` capability can drive Backtracking the way a person at the window
+does: read what it is doing, pause and start capture, select a stretch, save it as files, and
+change the sources. This is how an assistant or a script works with Backtracking from outside it.
+
+**Consent.** Declaring `control` is not enough. Each add-on that declares it gets its own switch
+on the Add-ons page, "Let this add-on control Backtracking (start and pause recording, select,
+save files, change sources)", which is off when the add-on is installed. While it is off every
+request is refused with `not_allowed`, and the Add-ons page notes that the add-on asked. The
+choice is kept per add-on id across restarts and updates, and forgotten when the add-on is
+removed. The install screen lists the capability. The host tells the add-on where it stands with
+`control_access`, right after `welcome` and again whenever the user changes the switch:
+
+```json
+{"type":"control_access","allowed":false}
+```
+
+Switching it off refuses every request that is still waiting with `not_allowed`. While an add-on
+acts, the status line under the waveform says so, for example "Saved snapshot 3 WAV files in
+D:\Clips · by Example control", and a selection the add-on made reads "Selection · by Example
+control".
+
+**Requests and replies.** The add-on sends `control` with an `id` it chooses (a string of 1 to
+64 characters without control characters) and a `command`; the command's fields sit beside it.
+The host answers every request exactly once with `control_reply` carrying the same `id` and either
+`result` or `error`, never both. Replies can arrive in a different order from the requests.
+
+```json
+{"type":"control","id":"c1","command":"select","from_seconds_ago":2,"to_seconds_ago":0}
+{"type":"control_reply","id":"c1","result":{"state":{…}}}
+{"type":"control_reply","id":"c2","error":{"code":"busy","message":"Backtracking is busy with a save being written; try again shortly"}}
+```
+
+A request that cannot be read (no id, an unknown command, a field of the wrong type) is answered
+with an error rather than closing the connection. Its reply has `"id":null` when the request had
+no usable id. A line that is not JSON at all, or longer than 65 536 bytes, still closes the
+connection as in section 4.
+
+**Commands.** Times are seconds; frames count from the start of the capture at its sample rate;
+lanes are named by their letters, `A` to `BL`; rows count from 1 at the top of a lane, as their
+tooltips do.
+
+| `command` | Fields | What it does |
+| --- | --- | --- |
+| `get_state` | none | Nothing; the reply carries the state. |
+| `list_sources` | none | The reply adds `sources`: what can be added as a lane, each with `id`, `kind` and `name`. |
+| `start_capture` | none | Starts or resumes capture, as the toolbar's start button does. |
+| `pause_capture` | none | Pauses capture; the audio held stays. |
+| `clear_history` | none | Throws the audio held away, as Clear does. |
+| `select` | `from_seconds_ago` and optional `to_seconds_ago` (default 0), or `start_frame` and `end_frame` | Selects that stretch, as a drag across the waveform does. Seconds count back from the newest audio held. A stretch longer than what is held is cut to it; the reply says what was selected. |
+| `clear_selection` | none | Drops the selection, as Escape does. |
+| `choose_rows` | `lane`, or `first` and `last` (each `{"lane":"A","row":1}`), or neither | Which rows the selection covers: every row of one lane, the rows from `first` to `last`, or with neither every row ("Edit separately" off). Turns "Edit separately" on when needed. |
+| `set_view` | `seconds`, or `start_frame` and `end_frame`, or neither | Shows the newest `seconds`, those frames, or everything held. |
+| `save` | optional `folder` (absolute; made when missing) | Writes the selection, or everything held when nothing is selected, as WAV files, exactly as Save does, into `folder` or the folder Save uses. |
+| `play_preview` | none | Plays the selection, as Space does. |
+| `stop_preview` | none | Stops it. |
+| `add_source` | `source`, an `id` from `list_sources` | Adds it as the next lane. |
+| `remove_source` | `lane` | Removes that lane; the lanes after it move up a letter. The only lane cannot be removed. |
+
+`save` is an add-on's way to drag a clip out of the window: the files are the ones Save writes
+for the same selection and rows. Its reply comes only once every file is completely written, and
+lists them:
+
+```json
+{"type":"control_reply","id":"c4","result":{
+  "folder":"D:\\Clips",
+  "files":[
+    {"path":"D:\\Clips\\Backtracking_Test tone_A_2026-11-24_16-50-28_2.0s.wav","kind":"wav","lane":"A","channels":2,"sample_rate":48000,"frames":96000},
+    {"path":"D:\\Clips\\Backtracking_Test tone_B_2026-11-24_16-50-28_2.0s.wav","kind":"wav","lane":"B","channels":2,"sample_rate":48000,"frames":96000}
+  ],
+  "state":{…}}}
+```
+
+`kind` is `wav`, or `positions` for the positions file written beside a lane's object audio.
+`lane`, `channels`, `sample_rate` and `frames` are left out when they are not known.
+
+`add_source` and `remove_source` start a new, empty history, as changing the sources on the
+Sources page does: the audio held until then is gone. Their reply says so with
+`"history_restarted":true`. Save first what should be kept.
+
+**State.** Every successful reply holds `state`, read after the command:
+
+```json
+{"capturing":false,"recording":false,"problem":null,"sample_rate":48000,
+ "lanes":[
+   {"lane":"A","source":{"id":"addon\tcom.example.test-tone\tmain","kind":"addon","name":"Test tone"},"channels":2,"route":"merged","problem":null},
+   {"lane":"B","source":{"id":"addon\tcom.example.test-tone\tmain","kind":"addon","name":"Test tone"},"channels":1,"route":"left","problem":null}],
+ "history":{"start_frame":0,"end_frame":327840,"seconds":6.83},
+ "selection":{"start_frame":233760,"end_frame":329760,"seconds":2.0,"from_seconds_ago":2.0,"to_seconds_ago":0.0},
+ "view":{"start_frame":0,"end_frame":327840,"seconds":6.83},
+ "separate_rows":false,"chosen_rows":[],"preview_playing":false,
+ "save_folder":"D:\\Clips","drag_folder":"C:\\Users\\me\\AppData\\Local\\Backtracking\\exports\\output",
+ "busy":null}
+```
+
+`capturing` is true when capture is on, `recording` when audio is also arriving. `problem` says
+what stops capture. `sample_rate` is 0 before any audio has arrived. A lane's `source.kind` is
+`system`, `default-microphone`, `microphone`, `application`, `sender` or `addon`, and `route` is
+`merged`, `left`, `right`, `center`, `mid`, `side` or `all`. `chosen_rows` lists the rows the
+selection covers while `separate_rows` is on (`lane`, `row`, `label`); empty means every row.
+`busy` says why commands that change something would be refused now, when they would.
+
+**Errors.** `code` is stable and meant for programs; `message` is for people and may change.
+
+| `code` | When |
+| --- | --- |
+| `not_declared` | The add-on's manifest does not declare `control`. |
+| `not_allowed` | The user has not switched control on for this add-on, or switched it off while the request waited. |
+| `invalid_request` | No usable `id`, no `command`, a field of the wrong type or out of range, or both forms of a command's fields at once. |
+| `request_too_large` | The line is longer than 16 384 bytes. |
+| `unknown_command` | This Backtracking does not know the command. |
+| `too_many_requests` | 8 requests from this add-on are already waiting for replies. |
+| `duplicate_id` | A request with this `id` is still waiting for its reply. |
+| `busy` | A drag in the window, a drag-out or a save is under way. `get_state`, `list_sources` and `stop_preview` are answered anyway. |
+| `not_found` | No such lane, row or source, or frames outside the audio held. |
+| `no_audio` | Nothing has been captured yet, or the stretch holds no audio. |
+| `no_selection` | `play_preview` without a selection. |
+| `failed` | The command was tried and did not work; `message` says why. |
+| `timeout` | No answer within the time below. The command may still finish. |
+
+**Limits.** A request is at most 16 384 bytes. At most 8 requests from one add-on wait for replies
+at once. Every request is answered within 10 seconds, or 120 seconds for `save`, if necessary
+with `timeout`; a reply that would come later is dropped.
+
+**Not offered.** There is no command for the add-on's own switch or any other add-on's, for
+installing, removing, enabling or disabling add-ons, for other Options, for opening files, for
+quitting, or for updates. Those stay with the user.
+
+Rust add-ons use `Client::control(&command)`, which picks ids, matches each reply to its request
+and waits a little longer than the host's limit, or `Client::send_control` and
+`Client::wait_control` to have several requests waiting. `Client::control_allowed` holds the last
+`control_access`. `crates/backtracking-addon/examples/control_example.rs` is a complete add-on.
+A Model Context Protocol server can be written as such an add-on, so that an AI assistant works
+with Backtracking through these commands.
 
 ## 5. Audio: the Sender stream
 
@@ -480,5 +620,8 @@ with them.
 `contract` is a whole number. Additions that old add-ons and old hosts can ignore (new message
 types, new optional fields) do not change it. A new capability does not change it either: an
 add-on that declares one is refused by a Backtracking that does not know it, and installs on one
-that does. A change that would break an existing add-on raises the number, and the host keeps
+that does. `control` was added this way: a Backtracking from before it, such as the released 0.2.1, shows
+a package that declares it as broken, with the message that a newer Backtracking is needed. New commands, state
+fields and error codes may be added to `control` later; ignore fields you do not know and treat
+an unknown `code` like `failed`. A change that would break an existing add-on raises the number, and the host keeps
 accepting the previous number for at least one release.

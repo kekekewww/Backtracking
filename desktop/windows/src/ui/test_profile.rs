@@ -40,6 +40,12 @@
 //!   in that crate (`cargo build --locked --release --example theme_example`) into
 //!   `<LOCALAPPDATA>\packages\theme.btaddon`, and waits until it offers its look. Choose the look with `addon-look=com.example.theme` in
 //!   `BACKTRACKING_TEST_PREFERENCES`, or with the harness's `look=` step.
+//!   `control` installs and enables the example control add-on (`com.example.control`) packed
+//!   the same way from `examples/control-package` and the `control_example` example. Its
+//!   control switch stays off, as for any new add-on.
+//! - `BACKTRACKING_TEST_EXTRA_PACKAGES`: more packages to install and enable, separated by `;`.
+//! - `BACKTRACKING_TEST_ALLOW_CONTROL`: add-on ids whose control switch is turned on, separated
+//!   by `,`, for tests that are not about asking the user.
 //! - `BACKTRACKING_TEST_LANE_A`: `tone` (default when the test tone is installed), `atmos`
 //!   (default when only the Atmos add-on is) or `off`. Lane B takes `atmos` as well. To see a
 //!   missing source: `stopped` (the add-on from `quits`, which has stopped), `gone` (the test
@@ -173,28 +179,40 @@ fn theme_package(work: &Path, output: &Path) -> PathBuf {
     if let Some(path) = std::env::var_os("BACKTRACKING_TEST_THEME_PACKAGE") {
         return PathBuf::from(path);
     }
+    example_package(work, "theme", output)
+}
+
+/// An example add-on of the SDK crate, `theme` or `control`, packed from its package folder
+/// and the built example program into `output`.
+fn example_package(work: &Path, name: &str, output: &Path) -> PathBuf {
     let addon = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/backtracking-addon");
+    let example = format!("{name}_example");
     let program = ["release", "debug"]
         .into_iter()
-        .map(|profile| addon.join("target").join(profile).join("examples/theme_example.exe"))
+        .map(|profile| {
+            addon
+                .join("target")
+                .join(profile)
+                .join(format!("examples/{example}.exe"))
+        })
         .find(|program| program.is_file())
         .unwrap_or_else(|| {
             panic!(
                 "build the example first: cargo build --locked --release --manifest-path \
-                 crates/backtracking-addon/Cargo.toml --example theme_example"
+                 crates/backtracking-addon/Cargo.toml --example {example}"
             )
         });
-    let folder = work.join("theme-package");
+    let folder = work.join(format!("{name}-package"));
     if folder.exists() {
         fs::remove_dir_all(&folder).unwrap();
     }
     fs::create_dir_all(folder.join("bin")).unwrap();
     fs::copy(
-        addon.join("examples/theme-package/addon.json"),
+        addon.join(format!("examples/{name}-package/addon.json")),
         folder.join("addon.json"),
     )
     .unwrap();
-    fs::copy(program, folder.join("bin/theme-example.exe")).unwrap();
+    fs::copy(program, folder.join(format!("bin/{name}-example.exe"))).unwrap();
     if output.exists() {
         fs::remove_file(output).unwrap();
     }
@@ -224,9 +242,10 @@ fn seed_test_profile() {
         .collect();
     for name in &wanted {
         assert!(
-            ["tone", "tone-opens", "quits", "broken", "atmos", "theme", "none"].contains(name),
-            "BACKTRACKING_TEST_ADDONS takes tone, tone-opens, quits, broken, atmos, theme or none, \
-             not {name}"
+            ["tone", "tone-opens", "quits", "broken", "atmos", "theme", "control", "none"]
+                .contains(name),
+            "BACKTRACKING_TEST_ADDONS takes tone, tone-opens, quits, broken, atmos, theme, \
+             control or none, not {name}"
         );
     }
     let tone_installed = wanted.contains(&"tone") || wanted.contains(&"tone-opens");
@@ -274,6 +293,9 @@ fn seed_test_profile() {
     let theme = wanted
         .contains(&"theme")
         .then(|| theme_package(&work, &packages.join("theme.btaddon")));
+    let control = wanted
+        .contains(&"control")
+        .then(|| example_package(&work, "control", &packages.join("control.btaddon")));
     // A file the Atmos add-on cannot decode, to see an add-on's error message.
     fs::write(
         packages.join("not-audio.ec3"),
@@ -400,6 +422,29 @@ fn seed_test_profile() {
             },
             "the example appearance add-on offers its look",
         );
+    }
+    let extra = std::env::var_os("BACKTRACKING_TEST_EXTRA_PACKAGES").unwrap_or_default();
+    for path in control.into_iter().chain(
+        extra
+            .to_string_lossy()
+            .split(';')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from),
+    ) {
+        let inspected = reply(handle.inspect(path.clone()));
+        let id = inspected.info.manifest.id.clone();
+        reply(handle.install(path, inspected.identity));
+        reply(handle.set_enabled(&id, true));
+    }
+    // Only for tests that are not about asking the user: their consent is a click otherwise.
+    for id in std::env::var("BACKTRACKING_TEST_ALLOW_CONTROL")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        reply(handle.set_control_allowed(id, true));
     }
     if wanted.contains(&"quits") {
         // Its program says hello as the test tone, is refused and exits with an error.

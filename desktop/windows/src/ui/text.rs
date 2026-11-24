@@ -20,6 +20,15 @@ const BILINGUAL_FALLBACK_TO_MERGED: &str =
 const BILINGUAL_POSITIONS_TRIMMED: &str =
     "Position history was trimmed to its memory limit. / 位置歷史已依記憶體上限刪減。";
 
+/// Something an add-on did through `control` that the status line notes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ControlNote {
+    Started,
+    Paused,
+    Cleared,
+    SourcesChanged,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Language {
     English,
@@ -1132,6 +1141,54 @@ impl Language {
                     "提供視窗的顏色與線條樣式，可在「選項」中啟用",
                 )
                 .to_owned(),
+            Capability::Control => self
+                .pick(
+                    "Control Backtracking: start and pause recording, select, save files and \
+                     change sources, once you allow it on the Add-ons page",
+                    "控制 Backtracking：開始與暫停錄音、選取、儲存檔案、變更來源，須先在「附加元件」頁面允許",
+                )
+                .to_owned(),
+        }
+    }
+
+    /// The per-add-on switch for the `control` capability. Off until the user turns it on.
+    pub(crate) fn allow_control(self) -> &'static str {
+        self.pick(
+            "Let this add-on control Backtracking (start and pause recording, select, save files, change sources)",
+            "允許此附加元件控制 Backtracking（開始與暫停錄音、選取、儲存檔案、變更來源）",
+        )
+    }
+
+    /// Under the switch while it is off, once the add-on has asked.
+    pub(crate) fn control_asked(self) -> &'static str {
+        self.pick(
+            "It asked to control Backtracking and was refused",
+            "它要求控制 Backtracking，已被拒絕",
+        )
+    }
+
+    /// Ends a status line about something an add-on did through `control`. With nothing
+    /// before it (after "Paused", say) it names the add-on alone.
+    pub(crate) fn by_addon(self, what: &str, addon: &str) -> String {
+        match (self, what.is_empty()) {
+            (Self::English, false) => format!("{what} · by {addon}"),
+            (Self::English, true) => format!("by {addon}"),
+            (Self::TraditionalChinese, false) => format!("{what} · 由 {addon} 操作"),
+            (Self::TraditionalChinese, true) => format!("由 {addon} 操作"),
+        }
+    }
+
+    /// What an add-on did through `control`, for the status line.
+    pub(crate) fn control_note(self, note: ControlNote) -> &'static str {
+        match note {
+            ControlNote::Started => self.pick("Capture started", "已開始擷取"),
+            // The status line already starts with "Paused".
+            ControlNote::Paused => "",
+            ControlNote::Cleared => self.pick("Cleared", "已清除"),
+            ControlNote::SourcesChanged => self.pick(
+                "Sources changed, recording started over",
+                "來源已變更，重新開始錄音",
+            ),
         }
     }
 

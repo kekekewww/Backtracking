@@ -2710,6 +2710,8 @@ mod tests {
                 message: None,
                 settings: Vec::new(),
                 actions: Vec::new(),
+                control_allowed: false,
+                control_asked: false,
                 sources: vec![Source {
                     id: "main".into(),
                     name: "Six channels".into(),

@@ -967,6 +967,8 @@ mod tests {
             sources: Vec::new(),
             settings: Vec::new(),
             actions: Vec::new(),
+            control_allowed: false,
+            control_asked: false,
         }
     }
 

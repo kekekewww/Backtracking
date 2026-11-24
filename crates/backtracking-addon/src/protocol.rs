@@ -13,6 +13,13 @@ pub use appearance::{
     MAX_APPEARANCE_MESSAGES_PER_SECOND, MAX_APPEARANCE_ROWS, MAX_SPECTRUM_STOPS,
     MIN_SPECTRUM_STOPS,
 };
+mod control;
+pub use control::{
+    codes as control_codes, ControlCommand, ControlError, ControlReply, ControlResult,
+    ControlState, FrameSpan, LaneState, RowRef, RowState, SavedFile, SelectionState, SourceInfo,
+    CONTROL_COMMANDS, CONTROL_REPLY_WITHIN, CONTROL_SAVE_REPLY_WITHIN, MAX_CONTROL_ID_CHARS,
+    MAX_CONTROL_IN_FLIGHT, MAX_CONTROL_REQUEST_BYTES,
+};
 
 const MAX_CHANNEL_LABEL_CHARS: usize = 24;
 
@@ -57,6 +64,18 @@ pub enum AddonMessage {
     },
     /// Replaces all appearance overrides from this add-on.
     Appearance(Appearance),
+    /// Asks Backtracking to do something (capability `control`). The host answers with a
+    /// `control_reply` carrying the same `id`. Encoded and decoded by hand: the command's
+    /// fields sit beside `type` and `id` on the line.
+    #[serde(skip)]
+    Control { id: String, command: ControlCommand },
+    /// A `control` line the host refuses as it reads it, with the error it replies with and
+    /// the request's `id` when it had a usable one. Decoding produces it; it is never sent.
+    #[serde(skip)]
+    ControlRefused {
+        id: Option<String>,
+        error: ControlError,
+    },
     /// A later contract 1 message that this implementation ignores.
     #[serde(other)]
     Unknown,
@@ -98,6 +117,13 @@ pub enum HostMessage {
         files: Vec<String>,
         sample_rate: u32,
         frames: u64,
+    },
+    /// The answer to one `control` request.
+    ControlReply(ControlReply),
+    /// Whether the user lets this add-on control Backtracking now. Sent after `welcome` to an
+    /// add-on that declares `control`, and again whenever the user changes it.
+    ControlAccess {
+        allowed: bool,
     },
     Quit,
     /// A later contract 1 message that this implementation ignores.
@@ -336,6 +362,12 @@ impl AddonMessage {
                 count_limit("positions.channels", channels.len(), 64)?;
             }
             Self::Appearance(appearance) => appearance.validate()?,
+            Self::Control { id, command } => {
+                control::request_line(id, command)?;
+            }
+            Self::ControlRefused { .. } => {
+                return invalid("a refused control request is never sent");
+            }
             Self::Unknown => {}
         }
         Ok(())
@@ -371,7 +403,12 @@ impl HostMessage {
                     absolute_path("clip_exported.files", path)?;
                 }
             }
-            Self::Rejected { .. } | Self::RunAction { .. } | Self::Quit | Self::Unknown => {}
+            Self::ControlReply(reply) => reply.validate()?,
+            Self::Rejected { .. }
+            | Self::RunAction { .. }
+            | Self::ControlAccess { .. }
+            | Self::Quit
+            | Self::Unknown => {}
         }
         Ok(())
     }
@@ -500,6 +537,9 @@ impl Setting {
 }
 
 pub fn encode_addon(message: &AddonMessage) -> Result<Vec<u8>> {
+    if let AddonMessage::Control { id, command } = message {
+        return control::request_line(id, command);
+    }
     message.validate()?;
     encode(message)
 }
@@ -519,6 +559,17 @@ pub fn decode_addon(line: &[u8]) -> Result<AddonMessage> {
                 return Ok(appearance::decode_appearance(&fields)
                     .map(AddonMessage::Appearance)
                     .unwrap_or(AddonMessage::Unknown));
+            }
+            // A bad request is answered with an error, not a reason to close the connection.
+            Some("control") => {
+                return Ok(match control::decode_control(line, &fields) {
+                    control::Decoded::Request { id, command } => {
+                        AddonMessage::Control { id, command }
+                    }
+                    control::Decoded::Refused { id, error } => {
+                        AddonMessage::ControlRefused { id, error }
+                    }
+                });
             }
             _ => {}
         }

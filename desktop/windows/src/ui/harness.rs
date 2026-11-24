@@ -88,7 +88,8 @@ use backtracking_addon::protocol::TransportCommand;
 use backtracking_core::Lane;
 use eframe::egui;
 
-use super::{OptionsSection, Recorder, RowSource, hotkeys_page, rows_between};
+use super::commands::{Action as WindowAction, Ran};
+use super::{OptionsSection, Recorder, hotkeys_page};
 use crate::controller::{CaptureSource, Controller};
 use crate::hotkeys::{Action, Binding};
 use crate::preferences::{PairRender, WaveformColoring, WideExportMode, parse_gradient};
@@ -817,73 +818,35 @@ impl Recorder {
     }
 
     fn apply_test_step(&mut self, step: &Step, ctx: &egui::Context) -> Result<(), String> {
-        let rate = u64::from(self.sample_rate.max(1));
-        let frames = |seconds: f64| (seconds * rate as f64).round() as u64;
-        let history = self.history_frames.clone();
-        if history.is_empty() && matches!(step, Step::Zoom(_) | Step::Select(..)) {
-            return Err("no audio yet".into());
-        }
+        // The steps that an add-on's control requests can also do go through one layer.
         match step {
-            Step::Zoom(seconds) => {
-                let count = frames(*seconds).max(1);
-                self.set_visible_frames(history.end.saturating_sub(count), count);
+            &Step::Zoom(seconds) => {
+                self.run_action(WindowAction::ZoomNewest(seconds))?;
             }
             &Step::Select(from, to) => {
-                let start = history
-                    .end
-                    .saturating_sub(frames(from.max(to)))
-                    .max(history.start);
-                let end = history
-                    .end
-                    .saturating_sub(frames(from.min(to)))
-                    .max(start + 1);
-                // As a finished drag does: freeze the audio, then keep the range.
-                self.begin_editing();
-                self.last_interaction = Instant::now();
-                let flags = self.flag_update(
-                    start..end,
-                    self.selection_rows.clone(),
-                    self.selection_whole.clone(),
-                );
-                self.apply_flags(flags);
-                self.selection = Some(start..end);
-                self.invalidate_export();
+                self.run_action(WindowAction::SelectBack { from, to })?;
             }
             &Step::SelectLane(lane) => {
-                let plan = self
-                    .lanes
-                    .iter()
-                    .find(|plan| plan.lane == lane)
-                    .ok_or("the window does not show that lane")?;
-                let last = plan.rows().checked_sub(1).ok_or("the lane has no rows")?;
-                let rows = rows_between(&self.lanes, plan.row(0), plan.row(last));
-                self.choose_test_rows(rows)?;
+                self.run_action(WindowAction::ChooseLane(lane))?;
             }
             &Step::Rows(first_lane, first, last_lane, last) => {
-                let row = |lane: usize, row: usize| {
-                    self.lanes
-                        .iter()
-                        .find(|plan| plan.lane == lane)
-                        .filter(|plan| row < plan.rows())
-                        .map(|plan| plan.row(row))
-                        .ok_or_else(|| format!("the window has no row {} in that lane", row + 1))
-                };
-                let rows =
-                    rows_between(&self.lanes, row(first_lane, first)?, row(last_lane, last)?);
-                self.choose_test_rows(rows)?;
+                self.run_action(WindowAction::ChooseRows(first_lane, first, last_lane, last))?;
             }
             &Step::Separate(on) => {
-                if self.row_count() < 2 {
-                    return Err("editing separately needs more than one row".into());
-                }
-                if self.separate_rows != on {
-                    self.toggle_separate_rows();
-                }
+                self.run_action(WindowAction::Separate(on))?;
             }
             Step::Save(folder) => {
-                fs::create_dir_all(folder)
-                    .map_err(|error| format!("{}: {error}", folder.display()))?;
-                self.save_snapshot_to(folder.clone());
+                let saved = self.run_action(WindowAction::Save {
+                    folder: folder.clone(),
+                    tag: None,
+                });
+                // A folder that cannot be made is the step's error. A save that cannot start
+                // says why on the status line, which the log keeps, as it always did.
+                if let Err(refusal) = saved
+                    && !folder.is_dir()
+                {
+                    return Err(refusal.message);
+                }
                 ctx.request_repaint();
             }
             &Step::Scroll(lane, row) => self.scroll_lane_to(lane, row),
@@ -975,9 +938,7 @@ impl Recorder {
             Step::DragPrepare(folder) => {
                 fs::create_dir_all(folder)
                     .map_err(|error| format!("{}: {error}", folder.display()))?;
-                // As a drag past the window's edge does: freeze, then write the clip.
-                self.invalidate_export();
-                self.start_export();
+                self.run_action(WindowAction::DragPrepare)?;
                 if let Some(harness) = self.harness.as_mut() {
                     harness.drag_copy = Some(folder.clone());
                 }
@@ -1012,8 +973,9 @@ impl Recorder {
                 ctx.request_repaint();
             }
             Step::PreviewPlan => {
-                let note = self.describe_preview();
-                if let Some(harness) = self.harness.as_mut() {
+                if let Ran::Note(note) = self.run_action(WindowAction::PreviewPlan)?
+                    && let Some(harness) = self.harness.as_mut()
+                {
                     harness.notes.push(note);
                 }
             }
@@ -1052,11 +1014,11 @@ impl Recorder {
                         found.ok_or_else(|| format!("no source is called {name}"))?
                     }
                 };
-                self.add_source(source)?;
+                self.run_action(WindowAction::AddSource(source))?;
                 ctx.request_repaint();
             }
             &Step::RemoveSource(lane) => {
-                self.remove_source(lane)?;
+                self.run_action(WindowAction::RemoveSource(lane))?;
                 ctx.request_repaint();
             }
             &Step::OptionsScroll(points) => {
@@ -1115,7 +1077,7 @@ impl Recorder {
 
     /// What Space would play now, for the log: the plan lane by lane, and whether the preview
     /// could be prepared. The preview made is dropped unplayed.
-    fn describe_preview(&mut self) -> String {
+    pub(super) fn describe_preview(&mut self) -> String {
         let Some(selection) = self.selection.clone() else {
             return "preview: no selection".into();
         };
@@ -1159,26 +1121,6 @@ impl Recorder {
         )
     }
 
-    /// Makes `rows` what the next selection covers, as the drag that crossed them would. A
-    /// selection already made moves onto them.
-    fn choose_test_rows(&mut self, rows: Vec<RowSource>) -> Result<(), String> {
-        if !self.rows_separate() {
-            return Err("rows are chosen only with separate=on".into());
-        }
-        self.choose_rows(rows);
-        if let Some(selection) = self.selection.clone() {
-            let flags = self.flag_update(
-                selection,
-                self.selection_rows.clone(),
-                self.selection_whole.clone(),
-            );
-            self.apply_flags(flags);
-            self.stop_preview();
-            self.invalidate_export();
-        }
-        Ok(())
-    }
-
     /// The add-on and source id of the lane's add-on source.
     fn lane_addon_source(&self, lane: usize) -> Result<(String, String), String> {
         match self
@@ -1199,15 +1141,16 @@ impl Recorder {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct WavHeader {
-    channels: u16,
-    rate: u32,
-    bits: u16,
-    frames: u64,
+pub(super) struct WavHeader {
+    pub(super) channels: u16,
+    pub(super) rate: u32,
+    pub(super) bits: u16,
+    pub(super) frames: u64,
 }
 
-/// Reads the format and length of a RIFF or RF64 WAV file.
-fn wav_header(bytes: &[u8]) -> Option<WavHeader> {
+/// Reads the format and length of a RIFF or RF64 WAV file. A control `save` lists the files
+/// it wrote from these headers too.
+pub(super) fn wav_header(bytes: &[u8]) -> Option<WavHeader> {
     let u16_at = |at: usize| Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?));
     let u32_at = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
     let u64_at = |at: usize| Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?));

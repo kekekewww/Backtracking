@@ -38,6 +38,8 @@ pub(crate) struct RowExport<'a> {
 pub(crate) struct ExportResult {
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) objects_in_mono: bool,
+    /// By path: the index in `tracks` of the track it holds, when that is known.
+    pub(crate) tracks: Vec<Option<usize>>,
 }
 
 /// Writes a frozen clip on a worker thread: of each of the 1 to `MAX_LANES` tracks, the rows in
@@ -88,6 +90,7 @@ pub(crate) fn export_rows(
     }
     let mut objects_in_mono = false;
     let mut paths = Vec::new();
+    let mut path_tracks = Vec::new();
     let write: io::Result<()> = (|| {
         if tracks.iter().all(|track| track.channels() <= 2) && narrowed.iter().all(Option::is_none)
         {
@@ -103,6 +106,12 @@ pub(crate) fn export_rows(
                 fades,
                 file_labels,
             )?;
+            // One file a track, in order.
+            path_tracks = if paths.len() == tracks.len() {
+                (0..tracks.len()).map(Some).collect()
+            } else {
+                vec![None; paths.len()]
+            };
         } else {
             for (lane, track) in tracks.iter().enumerate() {
                 let files = if track.channels() > 2 {
@@ -145,6 +154,7 @@ pub(crate) fn export_rows(
                         &file_labels[lane..=lane],
                     )?
                 };
+                path_tracks.extend(std::iter::repeat_n(Some(lane), files.len()));
                 paths.extend(files);
             }
         }
@@ -170,6 +180,7 @@ pub(crate) fn export_rows(
     Ok(ExportResult {
         paths,
         objects_in_mono,
+        tracks: path_tracks,
     })
 }
 

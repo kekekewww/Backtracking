@@ -68,6 +68,7 @@ use winit::{
 
 mod addon_sources;
 mod addons_page;
+mod commands;
 mod harness;
 mod hotkeys_page;
 mod look;
@@ -317,6 +318,7 @@ pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
                 repaint.request_repaint_after_for(Duration::from_millis(1), egui::ViewportId::ROOT);
             }));
             recorder.wake_on_new_looks(&context.egui_ctx);
+            recorder.wake_on_control(&context.egui_ctx);
             recorder.options_in_taskbar = show_options_on_start;
             if show_options_on_start {
                 recorder.open_options(&context.egui_ctx);
@@ -640,6 +642,12 @@ struct Recorder {
     /// The window may grow to give a stacked lane's rows room. Off when a test asked for a size.
     auto_grow: bool,
     harness: Option<harness::Harness>,
+    /// The add-on save whose files `snapshot_save` is writing.
+    snapshot_save_tag: Option<u64>,
+    /// Control requests from add-ons being carried out (`commands`).
+    control: commands::Control,
+    /// The add-on that made the selection, named on the status line until it changes.
+    selection_by: Option<String>,
 }
 
 enum Gesture {
@@ -1889,6 +1897,8 @@ struct SnapshotSpec {
     /// By logical lane: `rows` hold every row the window drew of it, so it is saved whole.
     /// A lane past the end is not.
     whole: Vec<bool>,
+    /// Marks a save an add-on asked for, so its reply can list the files (`commands`).
+    tag: Option<u64>,
 }
 
 /// How a clip's files are written: their format, each lane's channels and source name, and
@@ -2003,6 +2013,7 @@ impl SnapshotSpec {
         )
         .and_then(|mut clip| {
             clip.export_options = self.export_options;
+            clip.tag = self.tag;
             clip.with_rows(&self.rows, groups)
         })
         .map(|clip| clip.whole_lanes(&self.whole))
@@ -2307,6 +2318,8 @@ struct WavClip {
     /// By snapshot: the position tracks frozen with the audio, when the clip was made from a
     /// frozen view.
     positions: Vec<Option<FrozenPositionTrack>>,
+    /// The save an add-on asked for, from `SnapshotSpec::tag`.
+    tag: Option<u64>,
 }
 
 /// The rows of one lane a clip writes.
@@ -2356,6 +2369,7 @@ impl WavClip {
             rows: vec![RowChoice::default(); count],
             only: None,
             positions: vec![None; count],
+            tag: None,
         })
     }
 
@@ -2520,11 +2534,17 @@ impl WavClip {
             &options,
             &rows,
         )?;
+        let lanes = written
+            .tracks
+            .iter()
+            .map(|track| track.and_then(|track| saved.get(track)).map(|&index| self.lanes[index]))
+            .collect();
         let mut result = ExportedWav {
             paths: written.paths,
             objects_in_mono: written.objects_in_mono,
             keep,
             flags: self.flags,
+            lanes,
         };
         if !keep {
             for path in &mut result.paths {
@@ -2542,6 +2562,8 @@ struct ExportedWav {
     objects_in_mono: bool,
     keep: bool,
     flags: Option<FlagUpdate>,
+    /// By path: the logical lane whose audio it holds, when that is known.
+    lanes: Vec<Option<usize>>,
 }
 
 type WavPayload = Arc<std::sync::Mutex<Option<WavClip>>>;
@@ -2797,6 +2819,9 @@ impl Recorder {
             test_copy: false,
             auto_grow: true,
             harness: None,
+            snapshot_save_tag: None,
+            control: commands::Control::default(),
+            selection_by: None,
         }
     }
 
@@ -3320,6 +3345,7 @@ impl Recorder {
 
     fn reset_snapshot(&mut self) {
         self.selection = None;
+        self.selection_by = None;
         self.fades = Fades::NONE;
         self.discard_editing();
         self.live_revision = None;
@@ -3748,6 +3774,7 @@ impl Recorder {
                 || self.preview.is_some(),
             // Add-on manager replies arrive without a repaint of their own.
             polling: self.source_list_worker.is_some()
+                || self.control.waiting()
                 || self.addons_page.waiting()
                 || self.addon_sources.waiting()
                 // The frozen activity says which rows a frozen view shows.
@@ -4412,6 +4439,10 @@ impl Recorder {
             let selection = match self.selected_rows().filter(|_| selecting) {
                 Some(rows) => format!("Selection · {}", self.rows_name(rows)),
                 None => "Selection".to_owned(),
+            };
+            let selection = match self.selection_by.as_deref().filter(|_| selecting) {
+                Some(addon) => Language::current().by_addon(&selection, addon),
+                None => selection,
             };
             if paused {
                 format!("{selection} / Paused")
@@ -6277,8 +6308,14 @@ impl Recorder {
     /// Saves the selection, or everything held without one, into `output`: the Save command
     /// writes to the saved-snapshot folder, and a test copy's `save=` step to its own.
     fn save_snapshot_to(&mut self, output: PathBuf) {
+        let _ = self.save_snapshot_tagged(output, None);
+    }
+
+    /// As `save_snapshot_to`; `tag` marks the files of a save an add-on asked for. False when
+    /// nothing was queued.
+    fn save_snapshot_tagged(&mut self, output: PathBuf, tag: Option<u64>) -> bool {
         if self.gesture.is_some() {
-            return;
+            return false;
         }
         self.controller.poll();
         self.sync_generation();
@@ -6308,6 +6345,7 @@ impl Recorder {
             export_options: self.export_options(),
             // Separate rows save the selection's own rows, and every row without a selection.
             rows,
+            tag,
         };
         if let Some(edit) = &self.editing {
             if let Some(clip) = spec.clip(Arc::clone(&edit.snapshots), &edit.lanes, &edit.groups) {
@@ -6315,7 +6353,7 @@ impl Recorder {
                     .push_back(clip.with_positions(&edit.positions));
             } else {
                 self.message = "The selected audio is unavailable.".into();
-                return;
+                return false;
             }
         } else if let Some(request) = &mut self.edit_request {
             request.saves.push(spec);
@@ -6331,6 +6369,7 @@ impl Recorder {
             self.clear_snapshot();
         }
         self.collect_snapshot_saves();
+        true
     }
 
     fn export_options(&self) -> ExportOptions {
@@ -6511,6 +6550,8 @@ impl Recorder {
             return;
         }
         if let Some(worker) = self.snapshot_save.take() {
+            let tag = self.snapshot_save_tag.take();
+            let mut saved = None;
             self.message = match worker.join() {
                 Ok(Ok(mut file)) => {
                     if let Some(flags) = file.flags.take() {
@@ -6519,20 +6560,28 @@ impl Recorder {
                     if let Some(harness) = &mut self.harness {
                         harness.note_saved(&file.paths);
                     }
-                    file.saved_message(Language::current(), true)
+                    let message = file.saved_message(Language::current(), true);
+                    saved = Some(file);
+                    message
                 }
                 Ok(Err(error)) => format!("Could not save snapshot: {error}"),
                 Err(_) => "Snapshot worker stopped unexpectedly.".into(),
             };
+            if let Some(tag) = tag {
+                let outcome = saved.ok_or_else(|| self.message.clone());
+                self.finish_control_save(tag, outcome);
+            }
             // The log holds what the status line says, saved or not.
             if let Some(harness) = &mut self.harness {
                 harness.note(format!("status: {}", self.message));
             }
         }
         if let Some(clip) = self.pending_snapshot_saves.pop_front() {
+            let tag = clip.tag;
             match spawn_wav_write("backtracking-snapshot", clip, true) {
                 Ok(worker) => {
                     self.snapshot_save = Some(worker);
+                    self.snapshot_save_tag = tag;
                     self.message = "Saving snapshot…".into();
                 }
                 Err((error, clip)) => {
@@ -6715,6 +6764,8 @@ impl Recorder {
                     }
                 }
                 self.edge_scroll = None;
+                // The user's own drag: the selection is no longer the add-on's.
+                self.selection_by = None;
                 self.gesture = Some(Gesture::Select {
                     anchor,
                     cursor,
@@ -8478,6 +8529,8 @@ impl eframe::App for Recorder {
         }
         self.collect_export();
         self.collect_snapshot_saves();
+        // Add-ons' control requests, after the state above is current.
+        self.run_control_calls(ctx);
         self.clean_output_folder();
         if self
             .auto_resume_remaining()
@@ -10647,10 +10700,15 @@ mod tests {
             export_options: ExportOptions::default(),
             rows: Vec::new(),
             whole: vec![false; 2],
+            tag: Some(7),
         };
         let clip = spec.frozen_clip(&snapshot).unwrap();
+        assert_eq!(clip.tag, Some(7));
         drop(snapshot);
         let files = clip.write(false).unwrap();
+        // A control save's reply names each file's lane.
+        assert_eq!(files.lanes.len(), files.paths.len());
+        assert!(files.lanes.iter().all(Option::is_some), "{:?}", files.lanes);
         // The objects on show, which have no positions and so are written in mono and say so,
         // then the pair, made from the bed frozen with them.
         assert_eq!(files.paths.len(), 5);
@@ -10706,9 +10764,12 @@ mod tests {
             export_options: ExportOptions::default(),
             rows: Vec::new(),
             whole: vec![false; 2],
+            tag: None,
         };
         let files = spec.frozen_clip(&snapshot).unwrap().write(false).unwrap();
         assert_eq!(files.paths.len(), 1);
+        // The one file holds lane B's audio.
+        assert_eq!(files.lanes, [Some(1)]);
         let wav = std::fs::read(&files.paths[0]).unwrap();
         assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 2);
         assert_eq!(
@@ -13199,6 +13260,7 @@ mod tests {
             objects_in_mono,
             keep: true,
             flags: None,
+            lanes: Vec::new(),
         };
         let english = Language::English;
         assert_eq!(

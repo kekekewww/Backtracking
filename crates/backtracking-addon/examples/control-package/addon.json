@@ -1,0 +1,13 @@
+{
+  "contract": 1,
+  "id": "com.example.control",
+  "name": "Example control",
+  "version": "0.1.0",
+  "author": "Backtracking contributors",
+  "description": "Once you allow it, pauses, selects the last two seconds, saves them and starts recording again.",
+  "license": "Apache-2.0",
+  "capabilities": ["control", "settings", "actions"],
+  "run": {
+    "windows-x86_64": { "program": "bin/control-example.exe", "args": [] }
+  }
+}

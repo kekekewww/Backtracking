@@ -16,6 +16,8 @@ pub enum Capability {
     Actions,
     Clips,
     Appearance,
+    /// Ask Backtracking to capture, select, save and change sources, once the user allows it.
+    Control,
 }
 
 /// File types accepted by an add-on with the `open-files` capability.
@@ -320,15 +322,17 @@ mod tests {
             "settings",
             "actions",
             "clips",
-            "appearance"
+            "appearance",
+            "control"
         ]);
         value["open_files"] = json!({"description":"Audio files","extensions":["wav","flac1"]});
         value["run"][current_platform().unwrap()] = json!({"program":"bin/tone"});
         let manifest = parse(&value).unwrap();
         assert!(manifest.current_run().unwrap().args.is_empty());
         assert_eq!(manifest.current_run().unwrap().program, "bin/tone");
-        assert_eq!(manifest.capabilities.len(), 6);
+        assert_eq!(manifest.capabilities.len(), 7);
         assert!(manifest.capabilities.contains(&Capability::Appearance));
+        assert!(manifest.capabilities.contains(&Capability::Control));
         value["name"] = json!("音".repeat(80));
         value["author"] = json!("a".repeat(80));
         value["version"] = json!("v".repeat(32));

@@ -1,14 +1,18 @@
 //! A synchronous connection helper for add-on authors.
 use crate::protocol::{
-    self, AddonMessage, Appearance, HostMessage, MAX_APPEARANCE_MESSAGES_PER_SECOND,
+    self, AddonMessage, Appearance, ControlCommand, ControlError, ControlReply, ControlResult,
+    HostMessage, MAX_APPEARANCE_MESSAGES_PER_SECOND, MAX_CONTROL_IN_FLIGHT,
 };
 use crate::transport::{below_rate_limit, Wire};
 use crate::{Error, Result};
 use serde_json::Value;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// How much longer than the host's own bound [`Client::control`] waits for a reply.
+const CONTROL_MARGIN: Duration = Duration::from_secs(5);
 
 pub struct Client {
     wire: Wire,
@@ -18,6 +22,14 @@ pub struct Client {
     /// When `positions` were sent in the last second, for each source.
     position_updates: BTreeMap<String, VecDeque<Instant>>,
     appearance_updates: VecDeque<Instant>,
+    /// Host messages that arrived while waiting for a control reply, for `try_recv`.
+    inbox: VecDeque<HostMessage>,
+    /// Control requests sent and not answered yet.
+    pending_control: BTreeSet<String>,
+    /// Replies that arrived while waiting for another one, for `wait_control`.
+    control_replies: BTreeMap<String, ControlReply>,
+    next_control: u64,
+    control_allowed: Option<bool>,
 }
 
 impl Client {
@@ -95,6 +107,11 @@ impl Client {
                             transport_updates: VecDeque::new(),
                             position_updates: BTreeMap::new(),
                             appearance_updates: VecDeque::new(),
+                            inbox: VecDeque::new(),
+                            pending_control: BTreeSet::new(),
+                            control_replies: BTreeMap::new(),
+                            next_control: 1,
+                            control_allowed: None,
                         })
                     }
                     HostMessage::Welcome { .. } => {
@@ -187,11 +204,130 @@ impl Client {
     }
 
     /// Return immediately when no complete host message is available; also flush queued writes.
+    /// Replies to requests sent with [`Client::send_control`] are kept for
+    /// [`Client::wait_control`] and not returned here.
     pub fn try_recv(&mut self) -> Result<Option<HostMessage>> {
-        self.wire
+        if let Some(message) = self.inbox.pop_front() {
+            return Ok(Some(message));
+        }
+        loop {
+            match self.read_one()? {
+                Some(HostMessage::ControlReply(reply)) if self.claim(&reply) => {
+                    let id = reply.id.clone().unwrap_or_default();
+                    self.control_replies.insert(id, reply);
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
+    fn read_one(&mut self) -> Result<Option<HostMessage>> {
+        let message = self
+            .wire
             .receive()?
             .map(|line| protocol::decode_host(&line))
-            .transpose()
+            .transpose()?;
+        if let Some(HostMessage::ControlAccess { allowed }) = &message {
+            self.control_allowed = Some(*allowed);
+        }
+        Ok(message)
+    }
+
+    /// Whether `reply` answers a request still waiting; it then stops waiting.
+    fn claim(&mut self, reply: &ControlReply) -> bool {
+        reply
+            .id
+            .as_ref()
+            .is_some_and(|id| self.pending_control.remove(id))
+    }
+
+    /// Whether the user lets this add-on control Backtracking, as the host last said in
+    /// `control_access`. `None` until the host has said, which it does right after `welcome`
+    /// for an add-on that declares `control`.
+    pub fn control_allowed(&self) -> Option<bool> {
+        self.control_allowed
+    }
+
+    /// Send a control request and return the id it was given. Declare the `control`
+    /// capability. Read the reply with [`Client::wait_control`].
+    pub fn send_control(&mut self, command: &ControlCommand) -> Result<String> {
+        if self.pending_control.len() >= MAX_CONTROL_IN_FLIGHT {
+            return Err(Error::new(format!(
+                "Wait for a reply first: at most {MAX_CONTROL_IN_FLIGHT} control requests may \
+                 wait at once"
+            )));
+        }
+        let id = format!("c{}", self.next_control);
+        self.next_control += 1;
+        self.send(&AddonMessage::Control {
+            id: id.clone(),
+            command: command.clone(),
+        })?;
+        self.pending_control.insert(id.clone());
+        Ok(id)
+    }
+
+    /// Wait at most `timeout` for the reply to the request `id`. Other host messages that
+    /// arrive meanwhile are kept for [`Client::try_recv`].
+    pub fn wait_control(&mut self, id: &str, timeout: Duration) -> Result<ControlReply> {
+        let started = Instant::now();
+        loop {
+            if let Some(reply) = self.control_replies.remove(id) {
+                return Ok(reply);
+            }
+            if !self.pending_control.contains(id) {
+                return Err(Error::new(format!(
+                    "No control request {id:?} is waiting for a reply"
+                )));
+            }
+            match self.read_one()? {
+                Some(HostMessage::ControlReply(reply)) if self.claim(&reply) => {
+                    if reply.id.as_deref() == Some(id) {
+                        return Ok(reply);
+                    }
+                    let other = reply.id.clone().unwrap_or_default();
+                    self.control_replies.insert(other, reply);
+                    continue;
+                }
+                Some(message) => {
+                    self.inbox.push_back(message);
+                    continue;
+                }
+                None => {}
+            }
+            if self.is_disconnected() {
+                self.pending_control.remove(id);
+                return Err(Error::new("The host disconnected before replying"));
+            }
+            if started.elapsed() >= timeout {
+                // A late reply is then returned by try_recv like any message.
+                self.pending_control.remove(id);
+                return Err(Error::new(format!(
+                    "No reply to control request {id:?} within {} ms",
+                    timeout.as_millis()
+                )));
+            }
+            std::thread::sleep(
+                Duration::from_millis(1).min(timeout.saturating_sub(started.elapsed())),
+            );
+        }
+    }
+
+    /// Send `command` and wait for its reply, a little longer than the host's own bound.
+    /// The outer error is a connection problem; the inner one is the host's answer, with a
+    /// stable `code` from [`protocol::control_codes`].
+    pub fn control(
+        &mut self,
+        command: &ControlCommand,
+    ) -> Result<std::result::Result<ControlResult, ControlError>> {
+        let id = self.send_control(command)?;
+        let reply = self.wait_control(&id, command.reply_within() + CONTROL_MARGIN)?;
+        match reply.outcome() {
+            Err(error) => Ok(Err(error.clone())),
+            Ok(result) => Ok(Ok(serde_json::from_value(result.clone()).map_err(|error| {
+                Error::new(format!("The host's control result is not understood: {error}"))
+            })?)),
+        }
     }
 
     /// Wait for at most `timeout`, returning None on timeout or disconnection.
