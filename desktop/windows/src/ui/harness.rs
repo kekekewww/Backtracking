@@ -5,10 +5,19 @@
 //! - `BACKTRACKING_TEST_SCREENSHOT=<file.png>` turns it on.
 //! - `BACKTRACKING_TEST_SCREENSHOT_DELAY_MS=<ms>` is how long the app runs first (default 4000).
 //! - `BACKTRACKING_TEST_VIEW=<steps>` is done when the delay has passed, before the picture.
-//!   Steps are separated by `;`. Times are seconds back from the newest audio:
+//!   Steps are separated by `;`. Times are seconds back from the newest audio, and a lane is
+//!   named by its letter, `A` to `BL` in either case, or by its index from 0:
 //!   `zoom=<seconds>` shows only that much; `select=<from>-<to>` selects that stretch, as a
-//!   drag would; `scroll=<lane>:<row>` scrolls a stacked lane (A is 0) to that row;
+//!   drag would; `scroll=<lane>:<row>` scrolls a stacked lane (A is 0) to that row, or, with
+//!   more than two lanes, whose rows all scroll as one, the whole plot so that row is on top;
 //!   `group=<lane>:<group id>` shows another channel group.
+//!   `add-source=<name>` adds the source of that name (or the first whose name contains it,
+//!   ignoring case, `Test tone` say) as the next lane, and `remove-source=<lane>` removes a
+//!   lane, as the Sources page's Add source and Remove do; both wait until the steps before
+//!   them have settled. `meters=open` opens the list of every lane's meter, as the "+N" button
+//!   beside the meters does. `options-scroll=<points>` scrolls the Options page that far
+//!   down, once the steps before it have settled; much past the end shows an empty page, so
+//!   stay near the page's real length.
 //!   `separate=<on|off>` edits rows on their own or together, as Right Ctrl does.
 //!   `rows=<lane>:<first>-<last>` makes the next `select=` cover those rows of the lane, as a
 //!   drag from the first row to the last does; rows count from 1, top down, as in the row
@@ -59,6 +68,13 @@
 //!   audio.
 //!   `look=<add-on id|none>` chooses that add-on's look, or the window's own, as the
 //!   "Look from add-on" row on the Appearance page does, and keeps the choice.
+//!   `waveform-color=<single|frequency>` colours the waveform in one colour or by frequency, and
+//!   `gradient=<#rrggbb@position,...|default>` makes those stops (2 to 8, positions from 0 for
+//!   the lowest frequencies to 1 for the highest, as in the `waveform-gradient-v1` settings
+//!   file) the user's own gradient, or puts the default back, as the Appearance page's
+//!   "Waveform color" rows do; both keep the choice. The picture waits for the colours, unless
+//!   `color-wait=off` came first: then it is taken while a read may be in flight, as a person
+//!   watching the live view sees it (`color-wait=on` waits again).
 //!
 //! The picture is `<file.png>`; `<file.png>.log` gets the frame times and any problem.
 
@@ -69,11 +85,14 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use backtracking_addon::protocol::TransportCommand;
+use backtracking_core::Lane;
 use eframe::egui;
 
-use super::{OptionsSection, Recorder, RowSource, hotkeys_page, rows_between};
+use super::commands::{Action as WindowAction, Ran};
+use super::{OptionsSection, Recorder, hotkeys_page};
+use crate::controller::{CaptureSource, Controller};
 use crate::hotkeys::{Action, Binding};
-use crate::preferences::{PairRender, WideExportMode};
+use crate::preferences::{PairRender, WaveformColoring, WideExportMode, parse_gradient};
 
 pub(super) const SCREENSHOT: &str = "BACKTRACKING_TEST_SCREENSHOT";
 const SCREENSHOT_DELAY: &str = "BACKTRACKING_TEST_SCREENSHOT_DELAY_MS";
@@ -129,6 +148,20 @@ pub(super) enum Step {
     Key(Binding),
     /// The add-on whose look the window takes, or none.
     Look(Option<String>),
+    /// How the waveform is coloured.
+    WaveformColor(WaveformColoring),
+    /// The user's own gradient for colouring by frequency, or none for the default.
+    Gradient(Option<backtracking_ui::Spectrum>),
+    /// Whether steps and the picture wait for the colours by frequency in flight.
+    ColorWait(bool),
+    /// Adds the source of this name as the next lane, as the Sources page's Add source does.
+    AddSource(String),
+    /// Removes this lane, as its Remove button on the Sources page does.
+    RemoveSource(usize),
+    /// Opens the list of every lane's meter, as the "+N" button beside the meters does.
+    OpenMeters,
+    /// Scrolls the Options page this many points down, as the wheel would.
+    OptionsScroll(f32),
 }
 
 impl Step {
@@ -153,6 +186,11 @@ impl Step {
                 | Self::SelectLane(_)
                 // Each press gets frames of its own, after what it acts on.
                 | Self::Key(_)
+                // The lanes change, so the steps after them count the new ones.
+                | Self::AddSource(_)
+                | Self::RemoveSource(_)
+                // The page has to be on show before it can scroll.
+                | Self::OptionsScroll(_)
         )
     }
 }
@@ -210,6 +248,29 @@ fn write_picture(output: &Path, image: &egui::ColorImage) -> PictureResult {
         .map(|()| size)
 }
 
+/// The source of `choices` whose name is `name`, or else the first whose name contains it,
+/// ignoring case.
+fn source_named(choices: &[CaptureSource], name: &str) -> Option<CaptureSource> {
+    let wanted = name.trim().to_lowercase();
+    let label = |source: &&CaptureSource| source.label().to_lowercase();
+    choices
+        .iter()
+        .find(|source| label(source) == wanted)
+        .or_else(|| choices.iter().find(|source| label(source).contains(&wanted)))
+        .cloned()
+}
+
+/// A lane named by its letter, A to BL in either case, or by its index from 0.
+fn parse_lane(text: &str) -> Result<usize, String> {
+    let text = text.trim();
+    text.parse::<usize>()
+        .ok()
+        .and_then(Lane::from_index)
+        .or_else(|| Lane::from_letter(&text.to_ascii_uppercase()))
+        .map(Lane::index)
+        .ok_or_else(|| format!("{text} is not a lane"))
+}
+
 pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
     text.split(';')
         .map(str::trim)
@@ -223,6 +284,9 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
             }
             if step == "open-export-mode" {
                 return Ok(Step::OpenExportMode);
+            }
+            if step == "meters=open" {
+                return Ok(Step::OpenMeters);
             }
             let (name, value) = step
                 .split_once('=')
@@ -238,11 +302,7 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                 text.split_once(':')
                     .ok_or_else(|| format!("{step} needs <lane>:<value>"))
             }
-            let lane = |text: &str| match text.trim() {
-                "0" | "A" | "a" => Ok(0),
-                "1" | "B" | "b" => Ok(1),
-                other => Err(format!("{other} is not a lane")),
-            };
+            let lane = parse_lane;
             match name.trim() {
                 "zoom" => Ok(Step::Zoom(number(value)?)),
                 "select" => {
@@ -382,6 +442,34 @@ pub(super) fn parse_steps(text: &str) -> Result<Vec<Step>, String> {
                     "none" => Ok(Step::Look(None)),
                     id => Ok(Step::Look(Some(id.to_owned()))),
                 },
+                "waveform-color" => WaveformColoring::from_preference(value.trim())
+                    .map(Step::WaveformColor)
+                    .ok_or_else(|| format!("{value} is not single or frequency")),
+                "gradient" => match value.trim() {
+                    "default" => Ok(Step::Gradient(None)),
+                    stops => parse_gradient(stops)
+                        .map(|gradient| Step::Gradient(Some(gradient)))
+                        .ok_or_else(|| {
+                            format!("{stops} is not 2 to 8 stops like #e8302c@0,#2c68ec@1")
+                        }),
+                },
+                "color-wait" => match value.trim() {
+                    "on" => Ok(Step::ColorWait(true)),
+                    "off" => Ok(Step::ColorWait(false)),
+                    other => Err(format!("{other} is not on or off")),
+                },
+                "add-source" => match value.trim() {
+                    "" => Err(format!("{step} needs the name of a source")),
+                    name => Ok(Step::AddSource(name.to_owned())),
+                },
+                "remove-source" => Ok(Step::RemoveSource(lane(value)?)),
+                "options-scroll" => value
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|points| points.is_finite() && *points >= 0.0)
+                    .map(Step::OptionsScroll)
+                    .ok_or_else(|| format!("{value} is not a number of points")),
                 other => Err(format!("unknown step {other}")),
             }
         })
@@ -415,6 +503,8 @@ pub(super) struct Harness {
     hold: Duration,
     /// A `drag-prepare=` waits for the drag's files and copies them here.
     drag_copy: Option<PathBuf>,
+    /// Steps and the picture wait for the colours by frequency in flight (`color-wait=`).
+    color_wait: bool,
 }
 
 impl Harness {
@@ -516,6 +606,7 @@ impl Harness {
             options_shot: None,
             hold: Duration::ZERO,
             drag_copy: None,
+            color_wait: true,
         })
     }
 
@@ -657,6 +748,8 @@ impl Recorder {
         let settled = now.duration_since(applied) >= SETTLE + harness.hold
             && self.edit_request.is_none()
             && self.edit_preview.is_none()
+            // Colours by frequency are read off the window's thread.
+            && (!harness.color_wait || !self.waveform_colors.busy())
             // Dropped files are read in the next pass, and the manager answers after that.
             && harness.main_drops.is_empty()
             && harness.main_keys.is_empty()
@@ -725,73 +818,35 @@ impl Recorder {
     }
 
     fn apply_test_step(&mut self, step: &Step, ctx: &egui::Context) -> Result<(), String> {
-        let rate = u64::from(self.sample_rate.max(1));
-        let frames = |seconds: f64| (seconds * rate as f64).round() as u64;
-        let history = self.history_frames.clone();
-        if history.is_empty() && matches!(step, Step::Zoom(_) | Step::Select(..)) {
-            return Err("no audio yet".into());
-        }
+        // The steps that an add-on's control requests can also do go through one layer.
         match step {
-            Step::Zoom(seconds) => {
-                let count = frames(*seconds).max(1);
-                self.set_visible_frames(history.end.saturating_sub(count), count);
+            &Step::Zoom(seconds) => {
+                self.run_action(WindowAction::ZoomNewest(seconds))?;
             }
             &Step::Select(from, to) => {
-                let start = history
-                    .end
-                    .saturating_sub(frames(from.max(to)))
-                    .max(history.start);
-                let end = history
-                    .end
-                    .saturating_sub(frames(from.min(to)))
-                    .max(start + 1);
-                // As a finished drag does: freeze the audio, then keep the range.
-                self.begin_editing();
-                self.last_interaction = Instant::now();
-                let flags = self.flag_update(
-                    start..end,
-                    self.selection_rows.clone(),
-                    self.selection_whole,
-                );
-                self.apply_flags(flags);
-                self.selection = Some(start..end);
-                self.invalidate_export();
+                self.run_action(WindowAction::SelectBack { from, to })?;
             }
             &Step::SelectLane(lane) => {
-                let plan = self
-                    .lanes
-                    .iter()
-                    .find(|plan| plan.lane == lane)
-                    .ok_or("the window does not show that lane")?;
-                let last = plan.rows().checked_sub(1).ok_or("the lane has no rows")?;
-                let rows = rows_between(&self.lanes, plan.row(0), plan.row(last));
-                self.choose_test_rows(rows)?;
+                self.run_action(WindowAction::ChooseLane(lane))?;
             }
             &Step::Rows(first_lane, first, last_lane, last) => {
-                let row = |lane: usize, row: usize| {
-                    self.lanes
-                        .iter()
-                        .find(|plan| plan.lane == lane)
-                        .filter(|plan| row < plan.rows())
-                        .map(|plan| plan.row(row))
-                        .ok_or_else(|| format!("the window has no row {} in that lane", row + 1))
-                };
-                let rows =
-                    rows_between(&self.lanes, row(first_lane, first)?, row(last_lane, last)?);
-                self.choose_test_rows(rows)?;
+                self.run_action(WindowAction::ChooseRows(first_lane, first, last_lane, last))?;
             }
             &Step::Separate(on) => {
-                if self.row_count() < 2 {
-                    return Err("editing separately needs more than one row".into());
-                }
-                if self.separate_rows != on {
-                    self.toggle_separate_rows();
-                }
+                self.run_action(WindowAction::Separate(on))?;
             }
             Step::Save(folder) => {
-                fs::create_dir_all(folder)
-                    .map_err(|error| format!("{}: {error}", folder.display()))?;
-                self.save_snapshot_to(folder.clone());
+                let saved = self.run_action(WindowAction::Save {
+                    folder: folder.clone(),
+                    tag: None,
+                });
+                // A folder that cannot be made is the step's error. A save that cannot start
+                // says why on the status line, which the log keeps, as it always did.
+                if let Err(refusal) = saved
+                    && !folder.is_dir()
+                {
+                    return Err(refusal.message);
+                }
                 ctx.request_repaint();
             }
             &Step::Scroll(lane, row) => self.scroll_lane_to(lane, row),
@@ -883,9 +938,7 @@ impl Recorder {
             Step::DragPrepare(folder) => {
                 fs::create_dir_all(folder)
                     .map_err(|error| format!("{}: {error}", folder.display()))?;
-                // As a drag past the window's edge does: freeze, then write the clip.
-                self.invalidate_export();
-                self.start_export();
+                self.run_action(WindowAction::DragPrepare)?;
                 if let Some(harness) = self.harness.as_mut() {
                     harness.drag_copy = Some(folder.clone());
                 }
@@ -920,13 +973,68 @@ impl Recorder {
                 ctx.request_repaint();
             }
             Step::PreviewPlan => {
-                let note = self.describe_preview();
-                if let Some(harness) = self.harness.as_mut() {
+                if let Ran::Note(note) = self.run_action(WindowAction::PreviewPlan)?
+                    && let Some(harness) = self.harness.as_mut()
+                {
                     harness.notes.push(note);
                 }
             }
             Step::Look(choice) => {
                 self.choose_look(choice.clone());
+                ctx.request_repaint();
+            }
+            &Step::WaveformColor(coloring) => {
+                self.set_waveform_coloring(coloring);
+                ctx.request_repaint();
+            }
+            Step::Gradient(gradient) => {
+                self.set_waveform_gradient(gradient.clone());
+                self.save_waveform_gradient();
+                ctx.request_repaint();
+            }
+            &Step::ColorWait(wait) => {
+                if let Some(harness) = self.harness.as_mut() {
+                    harness.color_wait = wait;
+                }
+            }
+            Step::AddSource(name) => {
+                // The Sources page lists what it last scanned; a name it has not seen yet is
+                // looked for in a fresh scan, as opening the list does.
+                let source = match source_named(&self.available_sources, name) {
+                    Some(source) => source,
+                    None => {
+                        let listed = match self.controller.addons() {
+                            Some(addons) => {
+                                Controller::available_sources_with_addons(&addons.snapshot())
+                            }
+                            None => Controller::available_sources(),
+                        };
+                        let found = source_named(&listed, name);
+                        self.available_sources = listed;
+                        found.ok_or_else(|| format!("no source is called {name}"))?
+                    }
+                };
+                self.run_action(WindowAction::AddSource(source))?;
+                ctx.request_repaint();
+            }
+            &Step::RemoveSource(lane) => {
+                self.run_action(WindowAction::RemoveSource(lane))?;
+                ctx.request_repaint();
+            }
+            &Step::OptionsScroll(points) => {
+                if !self.options_open {
+                    return Err("the Options window is not open".into());
+                }
+                self.options_scroll = Some(points);
+                ctx.request_repaint();
+            }
+            Step::OpenMeters => {
+                if self.lane_count() <= 2 {
+                    return Err("the meters all show with one or two sources".into());
+                }
+                if !self.meter_list_open {
+                    self.toggle_meter_list();
+                }
                 ctx.request_repaint();
             }
         }
@@ -969,7 +1077,7 @@ impl Recorder {
 
     /// What Space would play now, for the log: the plan lane by lane, and whether the preview
     /// could be prepared. The preview made is dropped unplayed.
-    fn describe_preview(&mut self) -> String {
+    pub(super) fn describe_preview(&mut self) -> String {
         let Some(selection) = self.selection.clone() else {
             return "preview: no selection".into();
         };
@@ -1013,23 +1121,6 @@ impl Recorder {
         )
     }
 
-    /// Makes `rows` what the next selection covers, as the drag that crossed them would. A
-    /// selection already made moves onto them.
-    fn choose_test_rows(&mut self, rows: Vec<RowSource>) -> Result<(), String> {
-        if !self.rows_separate() {
-            return Err("rows are chosen only with separate=on".into());
-        }
-        self.choose_rows(rows);
-        if let Some(selection) = self.selection.clone() {
-            let flags =
-                self.flag_update(selection, self.selection_rows.clone(), self.selection_whole);
-            self.apply_flags(flags);
-            self.stop_preview();
-            self.invalidate_export();
-        }
-        Ok(())
-    }
-
     /// The add-on and source id of the lane's add-on source.
     fn lane_addon_source(&self, lane: usize) -> Result<(String, String), String> {
         match self
@@ -1050,15 +1141,16 @@ impl Recorder {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct WavHeader {
-    channels: u16,
-    rate: u32,
-    bits: u16,
-    frames: u64,
+pub(super) struct WavHeader {
+    pub(super) channels: u16,
+    pub(super) rate: u32,
+    pub(super) bits: u16,
+    pub(super) frames: u64,
 }
 
-/// Reads the format and length of a RIFF or RF64 WAV file.
-fn wav_header(bytes: &[u8]) -> Option<WavHeader> {
+/// Reads the format and length of a RIFF or RF64 WAV file. A control `save` lists the files
+/// it wrote from these headers too.
+pub(super) fn wav_header(bytes: &[u8]) -> Option<WavHeader> {
     let u16_at = |at: usize| Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?));
     let u32_at = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
     let u64_at = |at: usize| Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?));
@@ -1441,6 +1533,110 @@ mod tests {
     }
 
     #[test]
+    fn waveform_color_steps_choose_the_colouring_and_the_gradient() {
+        use backtracking_ui::{Spectrum, SpectrumStop};
+        let stop = |position, [r, g, b]: [u8; 3]| SpectrumStop {
+            position,
+            color: egui::Color32::from_rgb(r, g, b),
+        };
+        assert_eq!(
+            parse_steps(
+                "waveform-color=frequency; gradient=#e8302c@0,#28c85a@0.5,#2c68ec@1; \
+                 gradient=default;waveform-color=single;color-wait=off;color-wait=on"
+            )
+            .unwrap(),
+            [
+                Step::WaveformColor(WaveformColoring::Frequency),
+                Step::Gradient(Some(
+                    Spectrum::new([
+                        stop(0.0, [232, 48, 44]),
+                        stop(0.5, [40, 200, 90]),
+                        stop(1.0, [44, 104, 236]),
+                    ])
+                    .unwrap()
+                )),
+                Step::Gradient(None),
+                Step::WaveformColor(WaveformColoring::Single),
+                Step::ColorWait(false),
+                Step::ColorWait(true),
+            ]
+        );
+        assert!(!Step::Gradient(None).waits());
+        for bad in [
+            "waveform-color=rainbow",
+            "gradient=",
+            "gradient=#e8302c@0",
+            "gradient=red@0,blue@1",
+            "color-wait=maybe",
+        ] {
+            assert!(parse_steps(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn lanes_are_named_by_letter_up_to_bl_or_by_index() {
+        for (text, lane) in [
+            ("A", 0),
+            ("b", 1),
+            ("C", 2),
+            ("z", 25),
+            ("AA", 26),
+            ("ab", 27),
+            ("BL", 63),
+            (" bl ", 63),
+            ("0", 0),
+            ("2", 2),
+            ("63", 63),
+        ] {
+            assert_eq!(parse_lane(text), Ok(lane), "{text}");
+        }
+        for bad in ["", "BM", "64", "-1", "A1", "Lane A", "ZZ"] {
+            assert!(parse_lane(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            parse_steps("separate=on;select-lane=E;rows=C:2-BL:1;scroll=AB:3").unwrap(),
+            [
+                Step::Separate(true),
+                Step::SelectLane(4),
+                Step::Rows(2, 1, 63, 0),
+                Step::Scroll(27, 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn source_list_steps_add_and_remove_lanes_and_open_the_meters() {
+        let steps = parse_steps(
+            "add-source= Test tone ;remove-source=B;meters=open;options=sources;options-scroll=400",
+        )
+        .unwrap();
+        assert_eq!(
+            steps,
+            [
+                Step::AddSource("Test tone".into()),
+                Step::RemoveSource(1),
+                Step::OpenMeters,
+                Step::Options(OptionsSection::Sources, None),
+                Step::OptionsScroll(400.0),
+            ]
+        );
+        assert!(steps[0].waits() && steps[1].waits() && steps[4].waits());
+        assert!(!steps[2].waits());
+        for bad in ["add-source=", "remove-source=BM", "options-scroll=-3", "meters=shut"] {
+            assert!(parse_steps(bad).is_err(), "{bad}");
+        }
+        let tone = CaptureSource::Addon {
+            addon_id: "com.example.test-tone".into(),
+            source_id: "main".into(),
+            name: "Test tone".into(),
+        };
+        let choices = [CaptureSource::System, tone.clone()];
+        assert_eq!(source_named(&choices, "test TONE"), Some(tone.clone()));
+        assert_eq!(source_named(&choices, "tone"), Some(tone));
+        assert_eq!(source_named(&choices, "microphone"), None);
+    }
+
+    #[test]
     fn view_steps_are_read_in_order_and_bad_ones_are_named() {
         assert_eq!(
             parse_steps("zoom=2.5; select=1.5-0.25;scroll=A:4;group=b:objects").unwrap(),
@@ -1475,7 +1671,7 @@ mod tests {
             "rows=A:0-2",
             "rows=A:3",
             "rows=3-5",
-            "rows=A:1-C:2",
+            "rows=A:1-BM:2",
             "rows=A:x-2",
         ] {
             assert!(parse_steps(bad).is_err(), "{bad}");
@@ -1581,7 +1777,7 @@ mod tests {
             "transport=A",
             "wait=soon",
             "open=nocolon",
-            "format=C:x",
+            "format=BM:x",
         ] {
             assert!(parse_steps(bad).is_err(), "{bad}");
         }
@@ -1592,7 +1788,7 @@ mod tests {
             "zoom",
             "zoom=-1",
             "select=2",
-            "scroll=C:1",
+            "scroll=BM:1",
             "spin=1",
             "options=plugins",
             "options=addons:820",

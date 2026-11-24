@@ -61,11 +61,7 @@ impl FrozenCapture {
         let end = first_frame
             .checked_add((interleaved.len() / channels) as u64)
             .ok_or(CaptureError::BufferTooLarge)?;
-        let layout = Layout {
-            page_frames: sample_rate as usize,
-            channels,
-            a_channels: channels,
-        };
+        let layout = Layout::new(sample_rate as usize, &[channels]);
         Ok(Self {
             sample_rate,
             layout,
@@ -92,35 +88,25 @@ impl FrozenCapture {
         (self.frames.end - self.frames.start) as usize
     }
 
+    /// How many lanes the capture recorded, from 1 to 64.
     pub fn track_count(&self) -> usize {
-        1 + usize::from(self.layout.a_channels < self.layout.channels)
+        self.layout.lane_count()
     }
 
-    fn track_channels(&self, lane: usize) -> Option<Range<usize>> {
-        let Layout {
-            channels,
-            a_channels,
-            ..
-        } = self.layout;
-        match lane {
-            0 => Some(0..a_channels),
-            1 if a_channels < channels => Some(a_channels..channels),
-            _ => None,
-        }
-    }
-
-    /// One lane of this view. It shares the same pages.
+    /// One lane of this view, or `None` past the last lane. It shares the same pages.
     pub fn track(&self, lane: usize) -> Option<FrozenTrack> {
         Some(FrozenTrack {
-            channels: self.track_channels(lane)?,
+            channels: self.layout.lane(lane)?,
             lane,
             capture: self.clone(),
         })
     }
 
-    /// Every lane of this view, lane A first.
+    /// Every lane of this view in order, lane A first, all over the same frames.
     pub fn tracks(&self) -> Vec<FrozenTrack> {
-        (0..2).filter_map(|lane| self.track(lane)).collect()
+        (0..self.track_count())
+            .filter_map(|lane| self.track(lane))
+            .collect()
     }
 
     fn clamp(&self, frames: Range<u64>) -> Range<u64> {
@@ -316,7 +302,7 @@ impl FrozenTrack {
 
     /// This lane's audio of `frames` in order, as runs of whole interleaved frames
     /// that each end where a page does. A lane that is the capture's only
-    /// one borrows the pages; with two lanes each run is a de-interleaved copy.
+    /// one borrows the pages; with more lanes each run is a de-interleaved copy.
     /// Frames outside the track are left out.
     pub fn chunks(&self, frames: Range<u64>) -> impl Iterator<Item = Cow<'_, [f32]>> {
         let stride = self.capture.layout.channels;
@@ -448,6 +434,30 @@ impl FrozenTrack {
                 side,
             )
         })
+    }
+
+    /// Writes the band energies of one row of this track for each chronological bin of the
+    /// part of `frames` it holds, and returns that frame count. It shares the band cache of
+    /// the live capture's pages. See [`Capture::track_spectrum_range`](super::Capture::track_spectrum_range).
+    pub fn spectrum(
+        &self,
+        row: crate::waveform::SpectrumRow<'_>,
+        frames: Range<u64>,
+        bins: &mut [crate::waveform::SpectrumBin],
+    ) -> usize {
+        let Some(members) = row.members(self.channels.clone()) else {
+            bins.fill(None);
+            return 0;
+        };
+        let frames = self.capture.clamp(frames);
+        history::spectrum::bins(
+            self.capture.pages(frames.clone()),
+            self.capture.layout,
+            self.capture.sample_rate,
+            &members,
+            frames,
+            bins,
+        )
     }
 
     /// Copies the whole lane into one owned buffer.
@@ -730,39 +740,54 @@ mod tests {
     }
 
     fn flat_lanes(capture: &Capture) -> Vec<Snapshot> {
-        (0..2)
+        (0..capture.lane_count())
             .filter_map(|lane| capture.track_snapshot(lane))
             .collect()
     }
 
+    /// A capture of lanes `widths` wide, built the way the apps build it: one or two lanes
+    /// through the pair constructor, more through the lane list.
+    fn capture_of_lanes(rate: u32, widths: &[usize], retention: DurationChoice) -> Capture {
+        match *widths {
+            [a] => Capture::new_tracks(rate, a, None, retention),
+            [a, b] => Capture::new_tracks(rate, a, Some(b), retention),
+            _ => Capture::new_lanes(rate, widths, retention),
+        }
+        .unwrap()
+    }
+
     #[test]
     fn frozen_views_match_flat_copies_through_random_capture_histories() {
+        // Low rates keep the histories small while every block spans several pages.
+        // Pages of 256 frames are whole peak blocks; the others end in a partial one.
+        random_capture_histories(&[(150, &[1]), (256, &[2]), (190, &[1, 2]), (300, &[2, 2])]);
+    }
+
+    #[test]
+    fn frozen_views_match_flat_copies_through_random_many_lane_histories() {
+        random_capture_histories(&[
+            (170, &[1, 2, 1]),
+            (256, &[2, 12, 1]),
+            (130, &[1; 9]),
+            (200, &[3, 1, 2, 2]),
+        ]);
+    }
+
+    fn random_capture_histories(cases: &[(u32, &[usize])]) {
         const RETENTIONS: [DurationChoice; 3] = [
             DurationChoice::Seconds10,
             DurationChoice::Seconds20,
             DurationChoice::Seconds30,
         ];
-        // Low rates keep the histories small while every block spans several pages.
-        // Pages of 256 frames are whole peak blocks; the others end in a partial one.
-        for (case, (rate, a_channels, b_channels)) in [
-            (150, 1, None),
-            (256, 2, None),
-            (190, 1, Some(2)),
-            (300, 2, Some(2)),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (case, &(rate, widths)) in cases.iter().enumerate() {
             for seed in 1..=2u64 {
                 let mut random = Random(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) + case as u64);
-                let mut capture =
-                    Capture::new_tracks(rate, a_channels, b_channels, DurationChoice::Seconds20)
-                        .unwrap();
-                let channels = a_channels + b_channels.unwrap_or(0);
+                let mut capture = capture_of_lanes(rate, widths, DurationChoice::Seconds20);
+                let channels: usize = widths.iter().sum();
                 // Views taken earlier, with the flat copies of that moment.
                 let mut frozen: Vec<(FrozenCapture, Snapshot, Vec<Snapshot>)> = Vec::new();
                 for step in 0..140 {
-                    let context = format!("case {case}, seed {seed}, step {step}");
+                    let context = format!("case {case} {widths:?}, seed {seed}, step {step}");
                     match random.below(20) {
                         0..=7 => {
                             let frames = 1 + random.below(500) as usize;
@@ -1067,13 +1092,51 @@ mod tests {
     #[test]
     fn extrema_from_the_peak_cache_equal_a_brute_force_scan() {
         let mut random = Random(7);
-        for (rate, a_channels, b_channels) in
-            [(1_000, 2, Some(1)), (441, 1, None), (128, 2, Some(2))]
-        {
-            let channels = a_channels + b_channels.unwrap_or(0);
-            let mut capture =
-                Capture::new_tracks(rate, a_channels, b_channels, DurationChoice::Seconds30)
-                    .unwrap();
+        extrema_match_a_scan(&mut random, &[(1_000, &[2, 1]), (441, &[1]), (128, &[2, 2])]);
+    }
+
+    #[test]
+    fn extrema_of_many_mixed_width_lanes_equal_a_brute_force_scan() {
+        let mut random = Random(11);
+        extrema_match_a_scan(
+            &mut random,
+            &[(1_000, &[2, 12, 1]), (441, &[1, 1, 1]), (128, &[2; 8]), (100, &[1; 64])],
+        );
+        // Every channel of every lane, wide or narrow, against the same scan.
+        let widths = [2, 12, 1, 3, 2];
+        let channels: usize = widths.iter().sum();
+        let mut capture = Capture::new_lanes(300, &widths, DurationChoice::Seconds30).unwrap();
+        let audio: Vec<f32> = (0..1_733 * channels).map(|_| random.sample()).collect();
+        capture.push_interleaved(&audio).unwrap();
+        let view = capture.freeze();
+        let frames = view.frame_range();
+        let mut first = 0;
+        for (lane, track) in view.tracks().iter().enumerate() {
+            assert_eq!(track.channels(), widths[lane]);
+            for _ in 0..40 {
+                let range = random.range(&frames, 300);
+                let relative = range.start as usize..range.end as usize;
+                for channel in 0..track.channels() {
+                    let expected = waveform::extrema(
+                        audio[relative.start * channels..relative.end * channels]
+                            .chunks_exact(channels)
+                            .map(|frame| frame[first + channel]),
+                    );
+                    let context = format!("lane {lane} channel {channel} {range:?}");
+                    assert_eq!(track.channel_extrema(channel, range.clone()), expected, "{context}");
+                    let (mut low, mut high) = ([0.0; 1], [0.0; 1]);
+                    capture.track_channel_waveform_range(lane, channel, range.clone(), &mut low, &mut high);
+                    assert_eq!((low[0], high[0]), expected, "{context}");
+                }
+            }
+            first += track.channels();
+        }
+    }
+
+    fn extrema_match_a_scan(random: &mut Random, cases: &[(u32, &[usize])]) {
+        for &(rate, widths) in cases {
+            let channels: usize = widths.iter().sum();
+            let mut capture = capture_of_lanes(rate, widths, DurationChoice::Seconds30);
             let audio: Vec<f32> = (0..(rate as usize * 12 + 77) * channels)
                 .map(|_| random.sample())
                 .collect();

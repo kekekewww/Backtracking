@@ -94,6 +94,119 @@ impl WaveformLayout {
     }
 }
 
+/// How the waveform is colored: in the theme color, as it always was, or by what each moment
+/// of it holds from low to high frequencies, as on the desktop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WaveformColoring {
+    #[default]
+    Single,
+    Frequency,
+}
+
+impl WaveformColoring {
+    pub(crate) const ALL: [Self; 2] = [Self::Single, Self::Frequency];
+
+    #[cfg(feature = "editor")]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Single => "Single color",
+            Self::Frequency => "By frequency",
+        }
+    }
+
+    /// The value kept in the project, the same as the desktop's preference.
+    fn stored(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Frequency => "frequency",
+        }
+    }
+}
+
+/// One color of a [`WaveformGradient`], at `position` from the lowest band (0) to the highest
+/// (1).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GradientStop {
+    pub(crate) position: f32,
+    pub(crate) rgb: [u8; 3],
+}
+
+impl PartialEq for GradientStop {
+    // Positions are finite and never -0, so their bits compare as the numbers do.
+    fn eq(&self, other: &Self) -> bool {
+        self.position.to_bits() == other.position.to_bits() && self.rgb == other.rgb
+    }
+}
+
+impl Eq for GradientStop {}
+
+/// The user's own gradient for coloring by frequency: 2 to 8 stops, sorted by position, as
+/// `backtracking_ui::Spectrum` takes them. Kept here, without the editor's types, so that a
+/// build without the editor reads and writes the same project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WaveformGradient {
+    stops: Vec<GradientStop>,
+}
+
+impl WaveformGradient {
+    pub(crate) const MIN_STOPS: usize = 2;
+    pub(crate) const MAX_STOPS: usize = 8;
+
+    /// Sorts the stops by position, keeping the given order of stops at one position. `None`
+    /// unless there are 2 to 8 and each lies in 0 to 1.
+    pub(crate) fn new(stops: impl IntoIterator<Item = GradientStop>) -> Option<Self> {
+        let mut stops: Vec<_> = stops.into_iter().take(Self::MAX_STOPS + 1).collect();
+        if !(Self::MIN_STOPS..=Self::MAX_STOPS).contains(&stops.len())
+            || !stops.iter().all(|stop| (0.0..=1.0).contains(&stop.position))
+        {
+            return None;
+        }
+        for stop in &mut stops {
+            // -0 is 0.
+            stop.position += 0.0;
+        }
+        stops.sort_by(|a, b| a.position.total_cmp(&b.position));
+        Some(Self { stops })
+    }
+
+    pub(crate) fn stops(&self) -> &[GradientStop] {
+        &self.stops
+    }
+
+    /// The value kept in the project, in the desktop's `waveform-gradient-v1` form: each stop
+    /// as `#rrggbb@position`, lowest first, separated by commas, `#e8302c@0,#2c68ec@1` say.
+    fn stored(&self) -> String {
+        self.stops
+            .iter()
+            .map(|stop| {
+                let [r, g, b] = stop.rgb;
+                format!("#{r:02x}{g:02x}{b:02x}@{}", stop.position)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Reads [`Self::stored`]'s text, as the desktop does. `None` for anything else.
+    fn parse(text: &str) -> Option<Self> {
+        let stops = text
+            .split(',')
+            .map(|stop| {
+                let (color, position) = stop.trim().split_once('@')?;
+                let hex = color.trim().strip_prefix('#')?;
+                if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return None;
+                }
+                let channel = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).ok();
+                Some(GradientStop {
+                    position: position.trim().parse().ok()?,
+                    rgb: [channel(0)?, channel(2)?, channel(4)?],
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Self::new(stops)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CaptureInput {
     #[default]
@@ -190,6 +303,9 @@ pub(crate) struct SessionSettings {
     pub(crate) wide_export: WideExportMode,
     pub(crate) show_waveform_only: bool,
     pub(crate) waveform_layout: WaveformLayout,
+    pub(crate) waveform_coloring: WaveformColoring,
+    /// The gradient the user made for coloring by frequency, or `None` for the default.
+    pub(crate) waveform_gradient: Option<WaveformGradient>,
     pub(crate) show_bar_lines: bool,
     pub(crate) show_seconds_lines: bool,
     pub(crate) seconds_interval: u32,
@@ -238,6 +354,8 @@ impl Default for SessionSettings {
             wide_export: WideExportMode::default(),
             show_waveform_only: false,
             waveform_layout: WaveformLayout::default(),
+            waveform_coloring: WaveformColoring::default(),
+            waveform_gradient: None,
             show_bar_lines: false,
             show_seconds_lines: false,
             seconds_interval: 5,
@@ -366,6 +484,19 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
             } else {
                 defaults.waveform_layout
             },
+            // Projects saved before these choices existed, and any value this version does
+            // not know, draw in a single color with the default gradient kept for later.
+            waveform_coloring: fields
+                .get("waveform_color")
+                .and_then(|value| {
+                    WaveformColoring::ALL
+                        .into_iter()
+                        .find(|coloring| coloring.stored() == value)
+                })
+                .unwrap_or(defaults.waveform_coloring),
+            waveform_gradient: fields
+                .get("waveform_gradient")
+                .and_then(|value| WaveformGradient::parse(value)),
             show_bar_lines: fields.get("show_bar_lines").is_some_and(|value| value == "true"),
             show_seconds_lines: fields.get("show_seconds_lines").is_some_and(|value| value == "true"),
             seconds_interval: fields
@@ -451,6 +582,10 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
                 .into(),
             ),
             (
+                "waveform_color".into(),
+                settings.waveform_coloring.stored().into(),
+            ),
+            (
                 "wav_sample_rate".into(),
                 settings.wav_profile.sample_rate.to_string(),
             ),
@@ -509,6 +644,10 @@ impl PersistentField<'_, PersistedFields> for SettingsStore {
             && let Ok(color) = serialize_field(&color)
         {
             fields.insert("border_color".into(), color);
+        }
+        // Absent is the default gradient, as an empty preference is on the desktop.
+        if let Some(gradient) = &settings.waveform_gradient {
+            fields.insert("waveform_gradient".into(), gradient.stored());
         }
         if let Some(id) = settings.sender_id {
             fields.insert("sender_instance_id".into(), id);
@@ -731,5 +870,139 @@ mod tests {
         ]));
         assert_eq!(settings.lock().pair_render, PairRender::Stereo);
         assert_eq!(settings.lock().wide_export, WideExportMode::BinauralFiles);
+    }
+
+    fn stop(position: f32, rgb: [u8; 3]) -> GradientStop {
+        GradientStop { position, rgb }
+    }
+
+    /// The fields an editor with every waveform color choice made writes.
+    fn colored_fields() -> (PersistedFields, WaveformGradient) {
+        let gradient = WaveformGradient::new([
+            stop(0.0, [232, 48, 44]),
+            stop(1.0 / 3.0, [250, 200, 40]),
+            stop(0.62, [40, 200, 90]),
+            stop(1.0, [44, 104, 236]),
+        ])
+        .unwrap();
+        let source = SettingsStore::default();
+        {
+            let mut settings = source.lock();
+            settings.waveform_coloring = WaveformColoring::Frequency;
+            settings.waveform_gradient = Some(gradient.clone());
+            settings.waveform_layout = WaveformLayout::Stereo;
+            settings.accent = [224, 90, 155];
+            settings.border_color = Some([210, 180, 50]);
+        }
+        (source.map(Clone::clone), gradient)
+    }
+
+    #[test]
+    fn a_project_saved_before_waveform_colors_restores_a_single_color_and_the_rest() {
+        let settings = SettingsStore::default();
+        // What an older version writes: every field it had, none of the color fields.
+        let mut older = SettingsStore::default().map(Clone::clone);
+        older.remove("waveform_color");
+        older.remove("waveform_gradient");
+        older.insert("waveform_layout".into(), "stereo".into());
+        older.insert("accent_rgb".into(), serialize_field(&[224u8, 90, 155]).unwrap());
+        settings.set(older);
+        let restored = settings.lock().clone();
+        assert_eq!(restored.waveform_coloring, WaveformColoring::Single);
+        assert_eq!(restored.waveform_gradient, None);
+        assert_eq!(restored.waveform_layout, WaveformLayout::Stereo);
+        assert_eq!(restored.accent, [224, 90, 155]);
+        // Saving it again writes a single color and no gradient.
+        let fields = settings.map(Clone::clone);
+        assert_eq!(fields["waveform_color"], "single");
+        assert!(!fields.contains_key("waveform_gradient"));
+        settings.set(BTreeMap::new());
+        assert_eq!(*settings.lock(), SessionSettings::default());
+    }
+
+    #[test]
+    fn waveform_colors_round_trip_in_the_desktops_form() {
+        let (fields, gradient) = colored_fields();
+        assert_eq!(fields["waveform_color"], "frequency");
+        // The desktop's waveform-gradient-v1 text for the same gradient.
+        assert_eq!(
+            fields["waveform_gradient"],
+            "#e8302c@0,#fac828@0.33333334,#28c85a@0.62,#2c68ec@1"
+        );
+        let restored = SettingsStore::default();
+        restored.set(fields.clone());
+        assert_eq!(restored.lock().waveform_coloring, WaveformColoring::Frequency);
+        assert_eq!(restored.lock().waveform_gradient.as_ref(), Some(&gradient));
+        assert_eq!(restored.map(Clone::clone), fields);
+        // Single color keeps the gradient the user made, for when they turn it back on.
+        restored.lock().waveform_coloring = WaveformColoring::Single;
+        let single = restored.map(Clone::clone);
+        assert_eq!(single["waveform_color"], "single");
+        let again = SettingsStore::default();
+        again.set(single);
+        assert_eq!(again.lock().waveform_coloring, WaveformColoring::Single);
+        assert_eq!(again.lock().waveform_gradient.as_ref(), Some(&gradient));
+    }
+
+    #[test]
+    fn the_color_fields_leave_every_other_setting_as_an_older_version_reads_it() {
+        // An older version looks up only the fields it knows, so the fields below are all it
+        // sees of a project saved with colors: they must restore exactly as without them.
+        let (fields, _) = colored_fields();
+        let mut without = fields.clone();
+        without.remove("waveform_color");
+        without.remove("waveform_gradient");
+        let with_colors = SettingsStore::default();
+        with_colors.set(fields);
+        let older_view = SettingsStore::default();
+        older_view.set(without);
+        let expected = SessionSettings {
+            waveform_coloring: WaveformColoring::Frequency,
+            waveform_gradient: with_colors.lock().waveform_gradient.clone(),
+            ..older_view.lock().clone()
+        };
+        assert_eq!(*with_colors.lock(), expected);
+        assert_eq!(older_view.lock().waveform_layout, WaveformLayout::Stereo);
+        assert_eq!(older_view.lock().border_color, Some([210, 180, 50]));
+    }
+
+    #[test]
+    fn unknown_or_damaged_color_fields_read_as_the_defaults() {
+        let settings = SettingsStore::default();
+        for bad in ["Frequency", "spectral", "", "1", " frequency"] {
+            settings.set(BTreeMap::from([("waveform_color".into(), bad.into())]));
+            assert_eq!(settings.lock().waveform_coloring, WaveformColoring::Single, "{bad:?}");
+        }
+        for bad in [
+            "#e8302c@0",
+            "#e8302c@0,#2c68ec@1.5",
+            "#e8302c@0,#2c68ec@-0.1",
+            "#e8302c@0,#2c68ec@NaN",
+            "#e8302c@0,#2c68ec@inf",
+            "#e8302c@0,#2c68ec",
+            "#e8302c@0,2c68ec@1",
+            "#e8302c@0,#2c68zz@1",
+            "#e8302c@0,#2c68e@1",
+            "#e8302c@0,#+c68ec1@1",
+            "#e8302c@0,,#2c68ec@1",
+            "",
+            &["#e8302c@0.5"; 9].join(","),
+            "not a gradient",
+        ] {
+            settings.set(BTreeMap::from([("waveform_gradient".into(), bad.to_owned())]));
+            assert_eq!(settings.lock().waveform_gradient, None, "{bad:?}");
+        }
+        // Stops may come in any order and with spaces, as the desktop reads them.
+        settings.set(BTreeMap::from([(
+            "waveform_gradient".into(),
+            " #2C68EC@1 , #E8302C@-0 ".into(),
+        )]));
+        let gradient = settings.lock().waveform_gradient.clone().unwrap();
+        assert_eq!(gradient.stops(), [stop(0.0, [232, 48, 44]), stop(1.0, [44, 104, 236])]);
+        assert_eq!(gradient.stored(), "#e8302c@0,#2c68ec@1");
+        // Eight stops are the most; stops at one position keep their order.
+        let eight = WaveformGradient::new((0..8).map(|index| stop(0.5, [index, 0, 0]))).unwrap();
+        assert_eq!(eight.stops().iter().map(|stop| stop.rgb[0]).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(WaveformGradient::parse(&eight.stored()), Some(eight));
     }
 }

@@ -132,6 +132,66 @@ impl StatusMark {
     }
 }
 
+/// How the waveform is coloured: in one colour, as it always was, or by what each moment of it
+/// holds from low to high frequencies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WaveformColoring {
+    #[default]
+    Single,
+    Frequency,
+}
+
+impl WaveformColoring {
+    pub(crate) const ALL: [Self; 2] = [Self::Single, Self::Frequency];
+
+    /// The value written to preferences.
+    pub(crate) fn preference(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Frequency => "frequency",
+        }
+    }
+
+    pub(crate) fn from_preference(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|coloring| coloring.preference() == text)
+    }
+}
+
+/// The user's own gradient for "By frequency" as it is stored: each stop as `#rrggbb@position`,
+/// lowest first, separated by commas, for example `#e8302c@0,#2c68ec@1`. Positions run from
+/// 0 (the lowest band) to 1 (the highest).
+pub(crate) fn serialize_gradient(spectrum: &backtracking_ui::Spectrum) -> String {
+    spectrum
+        .stops()
+        .iter()
+        .map(|stop| {
+            let [r, g, b, _] = stop.color.to_array();
+            format!("#{r:02x}{g:02x}{b:02x}@{}", stop.position)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Reads [`serialize_gradient`]'s text. `None` for anything else: too few or too many stops,
+/// a colour that is not `#rrggbb`, or a position outside 0 to 1.
+pub(crate) fn parse_gradient(text: &str) -> Option<backtracking_ui::Spectrum> {
+    let stops = text
+        .split(',')
+        .map(|stop| {
+            let (color, position) = stop.trim().split_once('@')?;
+            let [r, g, b] = parse_accent(color)?;
+            let position: f32 = position.trim().parse().ok()?;
+            Some(backtracking_ui::SpectrumStop {
+                position,
+                color: eframe::egui::Color32::from_rgb(r, g, b),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    backtracking_ui::Spectrum::new(stops).ok()
+}
+
 /// The widths the waveform border can have, in points.
 pub(crate) const BORDER_WIDTHS: [u8; 4] = [1, 2, 3, 4];
 
@@ -162,8 +222,10 @@ pub(crate) enum Key {
     Accent,
     Meter,
     MeterB,
+    MeterUnitsAfterB,
     SplitWaveform,
     CaptureSources,
+    CaptureLanes,
     SourceNames,
     WavSampleRate,
     WavSampleFormat,
@@ -190,6 +252,8 @@ pub(crate) enum Key {
     SnapshotTarget,
     WindowPosition,
     AddonLook,
+    WaveformColor,
+    WaveformGradient,
 }
 
 impl Key {
@@ -204,8 +268,14 @@ impl Key {
             Self::Accent => "theme-color",
             Self::Meter => "meter-unit",
             Self::MeterB => "meter-b-unit",
+            // The units of lanes C, D, … one per line; A and B keep the two files above.
+            Self::MeterUnitsAfterB => "meter-units-after-b-v1",
             Self::SplitWaveform => "split-waveform",
+            // Lanes A and B as two lines (`off` for no lane B), as version 0.2.1 reads them.
             Self::CaptureSources => "capture-sources",
+            // Every lane, one line each (`serialize_lanes`); used while its first two lanes
+            // match `capture-sources`, so a change made by an older version wins.
+            Self::CaptureLanes => "capture-lanes-v1",
             Self::SourceNames => "source-file-names",
             Self::WavSampleRate => "wav-sample-rate",
             Self::WavSampleFormat => "wav-sample-format",
@@ -235,6 +305,10 @@ impl Key {
             Self::WindowPosition => "window-position",
             // The id of the add-on whose look is on; absent or empty is the app's own look.
             Self::AddonLook => "addon-look",
+            // `single` or `frequency`; anything else is a single colour.
+            Self::WaveformColor => "waveform-color",
+            // The user's own gradient (`serialize_gradient`); absent or empty is the default.
+            Self::WaveformGradient => "waveform-gradient-v1",
         }
     }
 }
@@ -246,10 +320,14 @@ pub(crate) struct Settings {
     pub(crate) retain_silence: bool,
     pub(crate) transparency: u8,
     pub(crate) accent: [u8; 3],
-    pub(crate) meter_mode: MeterMode,
-    pub(crate) meter_b_mode: MeterMode,
+    /// The meter unit of lanes A, B, C, …: at least two, and one for each lane C on that has
+    /// one stored.
+    pub(crate) meter_modes: Vec<MeterMode>,
     pub(crate) split_waveform: bool,
-    pub(crate) sources: [Option<SourceSettings>; 2],
+    /// The lanes as stored: lanes A and B, `None` for a lane that is off, from
+    /// `capture-sources`, or every lane from `capture-lanes-v1`. The controller takes the
+    /// lanes that are on ([`crate::controller::compact_sources`]).
+    pub(crate) sources: Vec<Option<SourceSettings>>,
     pub(crate) source_names: SourceNames,
     pub(crate) wav_profile: WavExportProfile,
     pub(crate) wav_force_mono: bool,
@@ -277,6 +355,9 @@ pub(crate) struct Settings {
     pub(crate) window_position: Option<[i32; 2]>,
     /// The add-on whose look the window takes while it offers one.
     pub(crate) addon_look: Option<String>,
+    pub(crate) waveform_coloring: WaveformColoring,
+    /// The gradient the user made for "By frequency", or `None` when they made none.
+    pub(crate) waveform_gradient: Option<backtracking_ui::Spectrum>,
 }
 
 impl Default for Settings {
@@ -292,10 +373,9 @@ impl Default for Settings {
             retain_silence: false,
             transparency: 0,
             accent: DEFAULT_ACCENT,
-            meter_mode: MeterMode::Dbfs,
-            meter_b_mode: MeterMode::Dbfs,
+            meter_modes: vec![MeterMode::Dbfs; 2],
             split_waveform: false,
-            sources: [
+            sources: vec![
                 Some(SourceSettings {
                     source: CaptureSource::System,
                     route: ChannelRoute::Merged,
@@ -327,6 +407,8 @@ impl Default for Settings {
             snapshot_target: None,
             window_position: None,
             addon_look: None,
+            waveform_coloring: WaveformColoring::Single,
+            waveform_gradient: None,
         }
     }
 }
@@ -376,15 +458,32 @@ impl Preferences {
         if let Some(accent) = self.read(Key::Accent).as_deref().and_then(parse_accent) {
             settings.accent = accent;
         }
-        settings.meter_mode = self.meter_mode(Key::Meter);
-        settings.meter_b_mode = self.meter_mode(Key::MeterB);
+        settings.meter_modes = vec![self.meter_mode(Key::Meter), self.meter_mode(Key::MeterB)];
+        if let Some(units) = self.read(Key::MeterUnitsAfterB) {
+            settings.meter_modes.extend(
+                units
+                    .lines()
+                    .take(crate::controller::MAX_LANES - 2)
+                    .map(parse_meter_mode),
+            );
+        }
         settings.split_waveform = self.read_number::<u8>(Key::SplitWaveform) == Some(1);
-        if let Some(sources) = self
+        let pair = self
             .read(Key::CaptureSources)
             .as_deref()
-            .and_then(parse_sources)
+            .and_then(parse_sources);
+        if let Some(pair) = &pair {
+            settings.sources = pair.to_vec();
+        }
+        if let Some(lanes) = self
+            .read(Key::CaptureLanes)
+            .as_deref()
+            .and_then(parse_lanes)
+            && pair
+                .as_ref()
+                .is_some_and(|pair| lanes_match_pair(&lanes, pair))
         {
-            settings.sources = sources;
+            settings.sources = lanes.into_iter().map(Some).collect();
         }
         if let Some(names) = self.read(Key::SourceNames) {
             settings.source_names = SourceNames::parse(&names);
@@ -471,6 +570,14 @@ impl Preferences {
             .read(Key::AddonLook)
             .map(|id| id.trim().to_owned())
             .filter(|id| !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control));
+        settings.waveform_coloring = self
+            .read(Key::WaveformColor)
+            .and_then(|text| WaveformColoring::from_preference(text.trim()))
+            .unwrap_or_default();
+        settings.waveform_gradient = self
+            .read(Key::WaveformGradient)
+            .as_deref()
+            .and_then(parse_gradient);
         settings
     }
 
@@ -486,11 +593,9 @@ impl Preferences {
     }
 
     fn meter_mode(&self, key: Key) -> MeterMode {
-        match self.read(key).as_deref().map(str::trim) {
-            Some("VU") => MeterMode::Vu,
-            Some("LUFS") => MeterMode::Lufs,
-            _ => MeterMode::Dbfs,
-        }
+        self.read(key)
+            .as_deref()
+            .map_or(MeterMode::Dbfs, parse_meter_mode)
     }
 
     fn read_absolute_path(&self, key: Key) -> Option<PathBuf> {
@@ -841,101 +946,161 @@ impl SourceNames {
     }
 }
 
-pub(crate) fn serialize_sources(sources: &[Option<SourceSettings>; 2]) -> String {
-    fn encode_slot(settings: Option<&SourceSettings>) -> String {
-        let Some(settings) = settings else {
-            return "off".into();
-        };
-        let route = settings.route as u32;
-        match &settings.source {
-            CaptureSource::System => format!("{route}\tsystem"),
-            CaptureSource::DefaultMicrophone => format!("{route}\tdefault-mic"),
-            CaptureSource::Microphone { id, name } => {
-                format!("{route}\tmic\t{}\t{}", encode_text(id), encode_text(name))
+/// The `meter-unit` text of a unit; anything unknown is dBFS.
+fn parse_meter_mode(text: &str) -> MeterMode {
+    match text.trim() {
+        "VU" => MeterMode::Vu,
+        "LUFS" => MeterMode::Lufs,
+        _ => MeterMode::Dbfs,
+    }
+}
+
+/// `meter-units-after-b-v1`: the units of lanes C, D, … (`modes[2..]`), one per line. Empty
+/// with two lanes or fewer.
+pub(crate) fn serialize_meter_units_after_b(modes: &[MeterMode]) -> String {
+    modes
+        .iter()
+        .skip(2)
+        .map(|mode| mode.unit())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `capture-sources`, the file version 0.2.1 reads: lanes A and B as two lines, `off` when
+/// there is no lane B. Lanes that are off are skipped, as in `capture-lanes-v1`, and lanes
+/// after B are left out; `capture-lanes-v1` holds them.
+pub(crate) fn serialize_sources(sources: &[Option<SourceSettings>]) -> String {
+    let mut lanes = sources.iter().flatten();
+    format!(
+        "{}\n{}",
+        encode_slot(lanes.next()),
+        encode_slot(lanes.next())
+    )
+}
+
+/// `capture-lanes-v1`: one line per lane that is on, in order, each as a line of
+/// `capture-sources` is written.
+pub(crate) fn serialize_lanes(sources: &[Option<SourceSettings>]) -> String {
+    sources
+        .iter()
+        .flatten()
+        .map(|settings| encode_slot(Some(settings)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Reads [`serialize_lanes`]: 1 to `MAX_LANES` lanes, or `None` when any line is not a lane.
+fn parse_lanes(value: &str) -> Option<Vec<SourceSettings>> {
+    let lanes = value.lines().map(parse_slot).collect::<Option<Vec<_>>>()?;
+    (1..=crate::controller::MAX_LANES)
+        .contains(&lanes.len())
+        .then_some(lanes)
+}
+
+/// Whether `lanes` begins with the lanes A and B of `capture-sources`. When an older version
+/// changed those two since `capture-lanes-v1` was written, that change is kept instead.
+fn lanes_match_pair(lanes: &[SourceSettings], pair: &[Option<SourceSettings>; 2]) -> bool {
+    pair.iter()
+        .enumerate()
+        .all(|(index, stored)| match (lanes.get(index), stored) {
+            (None, None) => true,
+            (Some(lane), Some(stored)) => {
+                lane.route == stored.route && lane.source.same_source(&stored.source)
             }
-            CaptureSource::Application { path, name } => {
-                format!("{route}\tapp\t{}\t{}", encode_text(path), encode_text(name))
+            _ => false,
+        })
+}
+
+fn encode_slot(settings: Option<&SourceSettings>) -> String {
+    let Some(settings) = settings else {
+        return "off".into();
+    };
+    let route = settings.route as u32;
+    match &settings.source {
+        CaptureSource::System => format!("{route}\tsystem"),
+        CaptureSource::DefaultMicrophone => format!("{route}\tdefault-mic"),
+        CaptureSource::Microphone { id, name } => {
+            format!("{route}\tmic\t{}\t{}", encode_text(id), encode_text(name))
+        }
+        CaptureSource::Application { path, name } => {
+            format!("{route}\tapp\t{}\t{}", encode_text(path), encode_text(name))
+        }
+        CaptureSource::Sender { id, name } => {
+            format!(
+                "{route}\tsender\t{}\t{}",
+                encode_text(id),
+                encode_text(name)
+            )
+        }
+        CaptureSource::Addon {
+            addon_id,
+            source_id,
+            name,
+        } => {
+            format!(
+                "{route}\taddon\t{}\t{}\t{}",
+                encode_text(addon_id),
+                encode_text(source_id),
+                encode_text(name)
+            )
+        }
+    }
+}
+
+fn parse_slot(line: &str) -> Option<SourceSettings> {
+    let mut fields = line.split('\t');
+    let route = ChannelRoute::from_code(fields.next()?.parse().ok()?)?;
+    let source = match fields.next()? {
+        "system" => CaptureSource::System,
+        "default-mic" => CaptureSource::DefaultMicrophone,
+        "mic" => CaptureSource::Microphone {
+            id: decode_text(fields.next()?)?,
+            name: decode_text(fields.next()?)?,
+        },
+        "app" => CaptureSource::Application {
+            path: decode_text(fields.next()?)?,
+            name: decode_text(fields.next()?)?,
+        },
+        "sender" => CaptureSource::Sender {
+            id: decode_text(fields.next()?)?,
+            name: decode_text(fields.next()?)?,
+        },
+        "addon" => {
+            let addon_id = decode_text(fields.next()?)?;
+            let source_id = decode_text(fields.next()?)?;
+            backtracking_addon::manifest::validate_id(&addon_id).ok()?;
+            if source_id.len() > 64
+                || !source_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+            {
+                return None;
             }
-            CaptureSource::Sender { id, name } => {
-                format!(
-                    "{route}\tsender\t{}\t{}",
-                    encode_text(id),
-                    encode_text(name)
-                )
+            let encoded_name = fields.next()?;
+            let name = if encoded_name.is_empty() {
+                String::new()
+            } else {
+                decode_text(encoded_name)?
+            };
+            if name.chars().count() > 120 || name.chars().any(char::is_control) {
+                return None;
             }
             CaptureSource::Addon {
                 addon_id,
                 source_id,
                 name,
-            } => {
-                format!(
-                    "{route}\taddon\t{}\t{}\t{}",
-                    encode_text(addon_id),
-                    encode_text(source_id),
-                    encode_text(name)
-                )
             }
         }
-    }
-    format!(
-        "{}\n{}",
-        encode_slot(sources[0].as_ref()),
-        encode_slot(sources[1].as_ref()),
-    )
+        _ => return None,
+    };
+    fields
+        .next()
+        .is_none()
+        .then_some(SourceSettings { source, route })
 }
 
+/// Reads `capture-sources`: lanes A and B, lane B `None` when it is `off`.
 fn parse_sources(value: &str) -> Option<[Option<SourceSettings>; 2]> {
-    fn parse_slot(line: &str) -> Option<SourceSettings> {
-        let mut fields = line.split('\t');
-        let route = ChannelRoute::from_code(fields.next()?.parse().ok()?)?;
-        let source = match fields.next()? {
-            "system" => CaptureSource::System,
-            "default-mic" => CaptureSource::DefaultMicrophone,
-            "mic" => CaptureSource::Microphone {
-                id: decode_text(fields.next()?)?,
-                name: decode_text(fields.next()?)?,
-            },
-            "app" => CaptureSource::Application {
-                path: decode_text(fields.next()?)?,
-                name: decode_text(fields.next()?)?,
-            },
-            "sender" => CaptureSource::Sender {
-                id: decode_text(fields.next()?)?,
-                name: decode_text(fields.next()?)?,
-            },
-            "addon" => {
-                let addon_id = decode_text(fields.next()?)?;
-                let source_id = decode_text(fields.next()?)?;
-                backtracking_addon::manifest::validate_id(&addon_id).ok()?;
-                if source_id.len() > 64
-                    || !source_id.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
-                    })
-                {
-                    return None;
-                }
-                let encoded_name = fields.next()?;
-                let name = if encoded_name.is_empty() {
-                    String::new()
-                } else {
-                    decode_text(encoded_name)?
-                };
-                if name.chars().count() > 120 || name.chars().any(char::is_control) {
-                    return None;
-                }
-                CaptureSource::Addon {
-                    addon_id,
-                    source_id,
-                    name,
-                }
-            }
-            _ => return None,
-        };
-        fields
-            .next()
-            .is_none()
-            .then_some(SourceSettings { source, route })
-    }
     let (a, b) = value.split_once('\n')?;
     Some([
         Some(parse_slot(a)?),
@@ -1306,6 +1471,219 @@ mod tests {
         assert_eq!(store.load().sources, lanes);
     }
 
+    /// A different source and route for every lane up to 64.
+    fn varied_lane(index: usize) -> SourceSettings {
+        let route = [
+            ChannelRoute::Merged,
+            ChannelRoute::Left,
+            ChannelRoute::Right,
+            ChannelRoute::Side,
+            ChannelRoute::AllChannels,
+        ][index % 5];
+        let source = match index % 6 {
+            0 => CaptureSource::System,
+            1 => CaptureSource::DefaultMicrophone,
+            2 => CaptureSource::Sender {
+                id: format!("c1c1-{index:04x}"),
+                name: format!("Sender {index}"),
+            },
+            3 => CaptureSource::Addon {
+                addon_id: "com.example.test-tone".into(),
+                source_id: format!("stream-{index}"),
+                name: format!("Stream {index}"),
+            },
+            4 => CaptureSource::Microphone {
+                id: format!("{{0.0.1.00000000}}.{index}"),
+                name: format!("Mic {index} – 麥克風"),
+            },
+            _ => CaptureSource::Application {
+                path: format!(r"C:\Apps\player{index}.exe"),
+                name: format!("Player {index}"),
+            },
+        };
+        SourceSettings { source, route }
+    }
+
+    /// Saves the lanes as the Options page does.
+    fn save_lanes(store: &Preferences, lanes: &[Option<SourceSettings>]) {
+        store
+            .save(Key::CaptureSources, &serialize_sources(lanes))
+            .unwrap();
+        store
+            .save(Key::CaptureLanes, &serialize_lanes(lanes))
+            .unwrap();
+    }
+
+    #[test]
+    fn one_two_three_and_sixty_four_lanes_round_trip() {
+        for count in [1, 2, 3, 64] {
+            let store = workspace_preferences(&format!("lanes-{count}"));
+            let lanes: Vec<_> = (0..count).map(|index| Some(varied_lane(index))).collect();
+            save_lanes(&store, &lanes);
+            let loaded = store.load().sources;
+            assert_eq!(
+                crate::controller::compact_sources(loaded.clone()),
+                lanes,
+                "{count} lanes"
+            );
+            assert_eq!(loaded, lanes, "{count} lanes");
+        }
+        // Lanes that are off are not written.
+        let store = workspace_preferences("lanes-off");
+        let a = Some(varied_lane(0));
+        let c = Some(varied_lane(2));
+        save_lanes(&store, &[a.clone(), None, c.clone()]);
+        assert_eq!(
+            serialize_lanes(&[a.clone(), None, c.clone()])
+                .lines()
+                .count(),
+            2
+        );
+        assert_eq!(
+            crate::controller::compact_sources(store.load().sources),
+            [a, c]
+        );
+    }
+
+    #[test]
+    fn a_folder_from_version_0_2_1_loads_unchanged() {
+        let store = workspace_preferences("lanes-0.2.1");
+        // What version 0.2.1 writes, byte for byte: lane A, then lane B or `off`.
+        store.save(Key::CaptureSources, "7\tsystem\noff").unwrap();
+        store.save(Key::Meter, "VU").unwrap();
+        store.save(Key::MeterB, "LUFS").unwrap();
+        let settings = store.load();
+        assert_eq!(
+            settings.sources,
+            [
+                Some(SourceSettings {
+                    source: CaptureSource::System,
+                    route: ChannelRoute::AllChannels,
+                }),
+                None
+            ]
+        );
+        assert_eq!(settings.meter_modes, [MeterMode::Vu, MeterMode::Lufs]);
+        let b = varied_lane(2);
+        store
+            .save(
+                Key::CaptureSources,
+                &format!("5\tdefault-mic\n{}", encode_slot(Some(&b))),
+            )
+            .unwrap();
+        assert_eq!(
+            store.load().sources,
+            [
+                Some(SourceSettings {
+                    source: CaptureSource::DefaultMicrophone,
+                    route: ChannelRoute::Merged,
+                }),
+                Some(b)
+            ]
+        );
+        // And an empty folder starts as before: system audio, Merged, and no lane B.
+        let empty = workspace_preferences("lanes-empty").load();
+        assert_eq!(empty.sources, Settings::default().sources);
+        assert_eq!(empty.meter_modes, [MeterMode::Dbfs; 2]);
+    }
+
+    #[test]
+    fn version_0_2_1_reads_lanes_a_and_b_of_more_lanes_and_its_changes_win() {
+        let lanes: Vec<_> = (0..64).map(|index| Some(varied_lane(index))).collect();
+        // `parse_sources` is the reader of version 0.2.1, line for line.
+        for count in [1, 2, 3, 64] {
+            let written = serialize_sources(&lanes[..count]);
+            assert_eq!(written.lines().count(), 2, "{count} lanes");
+            let b = if count == 1 { None } else { lanes[1].clone() };
+            assert_eq!(parse_sources(&written), Some([lanes[0].clone(), b]));
+        }
+        assert!(serialize_sources(&lanes[..1]).ends_with("\noff"));
+        // Version 0.2.1 sets lane B to another source: back on this version, its two lanes
+        // are used and the lanes after B, which it never saw, are dropped.
+        let store = workspace_preferences("lanes-downgrade");
+        save_lanes(&store, &lanes[..3]);
+        let other = Some(varied_lane(4));
+        store
+            .save(
+                Key::CaptureSources,
+                &serialize_sources(&[lanes[0].clone(), other.clone()]),
+            )
+            .unwrap();
+        assert_eq!(store.load().sources, [lanes[0].clone(), other]);
+        // It turns lane B off: one lane.
+        save_lanes(&store, &lanes[..3]);
+        store
+            .save(Key::CaptureSources, &serialize_sources(&lanes[..1]))
+            .unwrap();
+        assert_eq!(store.load().sources, [lanes[0].clone(), None]);
+        // It changes only lane B's route: that counts as a change too.
+        save_lanes(&store, &lanes[..3]);
+        let mut rerouted = lanes[1].clone().unwrap();
+        rerouted.route = ChannelRoute::Merged;
+        store
+            .save(
+                Key::CaptureSources,
+                &serialize_sources(&[lanes[0].clone(), Some(rerouted.clone())]),
+            )
+            .unwrap();
+        assert_eq!(store.load().sources, [lanes[0].clone(), Some(rerouted)]);
+    }
+
+    #[test]
+    fn unreadable_lane_files_leave_lanes_a_and_b() {
+        let lanes: Vec<_> = (0..3).map(|index| Some(varied_lane(index))).collect();
+        let pair = vec![lanes[0].clone(), lanes[1].clone()];
+        let [a, b] = [0, 1].map(|lane| encode_slot(lanes[lane].as_ref()));
+        let too_many = vec![a.clone(); 65].join("\n");
+        for (label, garbage) in [
+            ("empty", String::new()),
+            ("text", "not a lane".to_owned()),
+            ("off", format!("{a}\noff\n{b}")),
+            ("bad-route", "9\tsystem".to_owned()),
+            ("too-many", too_many),
+            ("binary", "\u{0}\u{1}\u{2}".to_owned()),
+        ] {
+            let store = workspace_preferences(&format!("lanes-garbage-{label}"));
+            save_lanes(&store, &lanes);
+            store.save(Key::CaptureLanes, &garbage).unwrap();
+            assert_eq!(store.load().sources, pair, "{label}");
+        }
+        // Without a readable `capture-sources` the lanes file is not used either.
+        let store = workspace_preferences("lanes-garbage-pair");
+        save_lanes(&store, &lanes);
+        store.save(Key::CaptureSources, "garbage").unwrap();
+        assert_eq!(store.load().sources, Settings::default().sources);
+    }
+
+    #[test]
+    fn meter_units_after_lane_b_round_trip_beside_the_old_two() {
+        let store = workspace_preferences("meter-units-after-b");
+        let mut modes = vec![
+            MeterMode::Vu,
+            MeterMode::Dbfs,
+            MeterMode::Lufs,
+            MeterMode::Vu,
+        ];
+        store.save(Key::Meter, modes[0].unit()).unwrap();
+        store.save(Key::MeterB, modes[1].unit()).unwrap();
+        store
+            .save(
+                Key::MeterUnitsAfterB,
+                &serialize_meter_units_after_b(&modes),
+            )
+            .unwrap();
+        assert_eq!(store.load().meter_modes, modes);
+        assert_eq!(serialize_meter_units_after_b(&modes[..2]), "");
+        // An unknown line is decibels, and no more than 64 lanes are read.
+        store.save(Key::MeterUnitsAfterB, "LUFS\nloud\nVU").unwrap();
+        modes.insert(3, MeterMode::Dbfs);
+        assert_eq!(store.load().meter_modes, modes);
+        store
+            .save(Key::MeterUnitsAfterB, &vec!["VU"; 100].join("\n"))
+            .unwrap();
+        assert_eq!(store.load().meter_modes.len(), crate::controller::MAX_LANES);
+    }
+
     #[test]
     fn the_chosen_addon_look_round_trips_and_none_clears_it() {
         let preferences = workspace_preferences("addon-look");
@@ -1335,6 +1713,103 @@ mod tests {
             preferences.save(Key::AddonLook, bad).unwrap();
             assert_eq!(preferences.load().addon_look, None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_waveform_colouring_and_gradient_round_trip_and_garbage_reads_as_the_default() {
+        use backtracking_ui::{Spectrum, SpectrumStop};
+        use eframe::egui::Color32;
+
+        let preferences = workspace_preferences("waveform-color");
+        let settings = preferences.load();
+        assert_eq!(settings.waveform_coloring, WaveformColoring::Single);
+        assert_eq!(settings.waveform_gradient, None);
+
+        let gradient = Spectrum::new([
+            SpectrumStop {
+                position: 0.0,
+                color: Color32::from_rgb(232, 48, 44),
+            },
+            SpectrumStop {
+                position: 1.0 / 3.0,
+                color: Color32::from_rgb(250, 200, 40),
+            },
+            SpectrumStop {
+                position: 0.62,
+                color: Color32::from_rgb(40, 200, 90),
+            },
+            SpectrumStop {
+                position: 1.0,
+                color: Color32::from_rgb(44, 104, 236),
+            },
+        ])
+        .unwrap();
+        let writer = PreferenceWriter::new(preferences.clone()).unwrap();
+        writer.save(Key::WaveformColor, "frequency").unwrap();
+        writer
+            .save(Key::WaveformGradient, &serialize_gradient(&gradient))
+            .unwrap();
+        writer.flush().unwrap();
+        let settings = preferences.load();
+        assert_eq!(settings.waveform_coloring, WaveformColoring::Frequency);
+        assert_eq!(settings.waveform_gradient.as_ref(), Some(&gradient));
+        for (key, file) in [
+            (Key::WaveformColor, "waveform-color"),
+            (Key::WaveformGradient, "waveform-gradient-v1"),
+        ] {
+            assert_eq!(key.filename(), file);
+            assert!(preferences.directory.as_ref().unwrap().join(file).is_file());
+        }
+        assert_eq!(
+            preferences.read(Key::WaveformGradient).as_deref(),
+            Some("#e8302c@0,#fac828@0.33333334,#28c85a@0.62,#2c68ec@1")
+        );
+        // Reset writes an empty file, which is the default gradient again.
+        writer.save(Key::WaveformGradient, "").unwrap();
+        writer.save(Key::WaveformColor, "single").unwrap();
+        writer.flush().unwrap();
+        let settings = preferences.load();
+        assert_eq!(settings.waveform_coloring, WaveformColoring::Single);
+        assert_eq!(settings.waveform_gradient, None);
+
+        for bad in ["Frequency", "spectral", "", "1"] {
+            preferences.save(Key::WaveformColor, bad).unwrap();
+            assert_eq!(
+                preferences.load().waveform_coloring,
+                WaveformColoring::Single,
+                "{bad:?}"
+            );
+        }
+        preferences
+            .save(Key::WaveformColor, " frequency\n")
+            .unwrap();
+        assert_eq!(
+            preferences.load().waveform_coloring,
+            WaveformColoring::Frequency
+        );
+        for bad in [
+            "#e8302c@0",
+            "#e8302c@0,#2c68ec@1.5",
+            "#e8302c@0,#2c68ec@-0.1",
+            "#e8302c@0,#2c68ec@NaN",
+            "#e8302c@0,#2c68ec",
+            "#e8302c@0,2c68ec@1",
+            "#e8302c@0,#2c68zz@1",
+            "#e8302c@0,,#2c68ec@1",
+            &["#e8302c@0.5"; 9].join(","),
+            "not a gradient",
+        ] {
+            preferences.save(Key::WaveformGradient, bad).unwrap();
+            assert_eq!(preferences.load().waveform_gradient, None, "{bad:?}");
+        }
+        // Stops may be written in any order and with spaces; they read back sorted.
+        preferences
+            .save(Key::WaveformGradient, " #2C68EC@1 , #E8302C@0 ")
+            .unwrap();
+        assert_eq!(
+            preferences.load().waveform_gradient,
+            Some(Spectrum::default())
+        );
     }
 
     #[test]
@@ -1491,7 +1966,7 @@ mod tests {
         assert_eq!(parse_sources(&serialize_sources(&sources)), Some(sources));
         let one_source = Settings::default().sources;
         assert_eq!(
-            parse_sources(&serialize_sources(&one_source)),
+            parse_sources(&serialize_sources(&one_source)).map(Vec::from),
             Some(one_source)
         );
         assert_eq!(parse_sources("off\noff"), None);

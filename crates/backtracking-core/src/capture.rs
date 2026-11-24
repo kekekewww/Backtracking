@@ -5,13 +5,15 @@ mod history;
 mod channel_cache_bench;
 #[cfg(test)]
 mod channel_cache_tests;
+#[cfg(test)]
+mod push_bench;
 
 use std::collections::VecDeque;
 use std::time::Instant;
 use std::{error::Error, fmt, ops::Range};
 
 use crate::meter::{Meter, MeterReadings};
-use crate::waveform::WaveformView;
+use crate::waveform::{SpectrumBin, SpectrumRow, WaveformView};
 pub use frozen::{FrozenCapture, FrozenTrack};
 use history::{History, Layout};
 
@@ -132,10 +134,18 @@ impl Snapshot {
     }
 }
 
+/// The most lanes one capture holds: one per channel of the 64 it can hold in all.
+pub const MAX_LANES: usize = 64;
+
+/// One lane's channels within a frame and its meter.
+struct LaneMeter {
+    channels: Range<usize>,
+    meter: Meter,
+}
+
 pub struct Capture {
     sample_rate: u32,
     channels: usize,
-    a_channels: usize,
     retention_frames: usize,
     max_buffer_samples: usize,
     history: History,
@@ -150,8 +160,8 @@ pub struct Capture {
     gate_recording: bool,
     state: CaptureState,
     revision: u64,
-    meter: Meter,
-    meter_b: Option<Meter>,
+    /// Every lane in order, lane A first; never empty.
+    lanes: Vec<LaneMeter>,
 }
 
 enum JoinFade {
@@ -260,18 +270,56 @@ impl Capture {
         retention: DurationChoice,
         max_buffer_samples: usize,
     ) -> Result<Self, CaptureError> {
+        let lanes = [a_channels, b_channels.unwrap_or(0)];
+        let lanes = &lanes[..1 + usize::from(b_channels.is_some())];
+        Self::new_lanes_with_budget(sample_rate, lanes, retention, max_buffer_samples)
+    }
+
+    /// Creates a shared history for `lane_channels.len()` independently metered lanes, lane
+    /// `i` with `lane_channels[i]` channels side by side in each interleaved frame, lane A
+    /// first. There are 1 to [`MAX_LANES`] lanes of 1 to 64 channels each, and at most 64
+    /// channels in all; anything else is [`CaptureError::InvalidChannelCount`].
+    ///
+    /// Every lane shares one sample rate, frame index, retention and sample budget, the bar
+    /// markers, pause, clear and revision, and one silence gate: quiet stretches are left out
+    /// only while every lane is quiet, so the lanes stay sample-aligned. One or two lanes
+    /// behave exactly as [`Self::new_tracks`] does.
+    pub fn new_lanes(
+        sample_rate: u32,
+        lane_channels: &[usize],
+        retention: DurationChoice,
+    ) -> Result<Self, CaptureError> {
+        Self::new_lanes_with_budget(
+            sample_rate,
+            lane_channels,
+            retention,
+            DEFAULT_MAX_BUFFER_SAMPLES,
+        )
+    }
+
+    /// [`Self::new_lanes`] with a limit on retained interleaved samples, shared by every
+    /// lane: the retention is shortened to `max_buffer_samples / total channels` frames when
+    /// the requested duration would exceed it. See [`Self::new_with_budget`] for the memory
+    /// excluded from that budget.
+    pub fn new_lanes_with_budget(
+        sample_rate: u32,
+        lane_channels: &[usize],
+        retention: DurationChoice,
+        max_buffer_samples: usize,
+    ) -> Result<Self, CaptureError> {
         if sample_rate == 0 {
             return Err(CaptureError::InvalidSampleRate);
         }
-        if !(1..=64).contains(&a_channels)
-            || b_channels.is_some_and(|channels| !(1..=64).contains(&channels))
+        if lane_channels.is_empty()
+            || lane_channels.len() > MAX_LANES
+            || lane_channels.iter().any(|channels| !(1..=64).contains(channels))
         {
             return Err(CaptureError::InvalidChannelCount);
         }
-        let channels = a_channels
-            .checked_add(b_channels.unwrap_or(0))
-            .filter(|&channels| channels <= 64)
-            .ok_or(CaptureError::InvalidChannelCount)?;
+        let channels: usize = lane_channels.iter().sum();
+        if channels > 64 {
+            return Err(CaptureError::InvalidChannelCount);
+        }
         let budget_frames = max_buffer_samples / channels;
         if budget_frames == 0 {
             return Err(CaptureError::BufferTooLarge);
@@ -280,14 +328,22 @@ impl Capture {
             .saturating_mul(retention.seconds() as usize)
             .min(budget_frames);
         let frames_for_ms = |ms| (u64::from(sample_rate) * u64::from(ms)).div_ceil(1_000) as usize;
+        let history = History::new(sample_rate as usize, lane_channels, budget_frames)?;
+        let lanes = history
+            .layout()
+            .lanes()
+            .map(|channels| {
+                let meter = Meter::new(sample_rate, channels.len())?;
+                Ok(LaneMeter { channels, meter })
+            })
+            .collect::<Result<_, CaptureError>>()?;
 
         Ok(Self {
             sample_rate,
             channels,
-            a_channels,
             retention_frames,
             max_buffer_samples,
-            history: History::new(sample_rate as usize, channels, a_channels, budget_frames)?,
+            history,
             pre_roll: FrameRing::new(frames_for_ms(PRE_ROLL_MS), channels)?,
             bar_markers: VecDeque::new(),
             pending_bars: VecDeque::new(),
@@ -299,11 +355,52 @@ impl Capture {
             gate_recording: false,
             state: CaptureState::Waiting,
             revision: 0,
-            meter: Meter::new(sample_rate, a_channels)?,
-            meter_b: b_channels
-                .map(|channels| Meter::new(sample_rate, channels))
-                .transpose()?,
+            lanes,
         })
+    }
+
+    /// How many lanes this capture records, from 1 to [`MAX_LANES`].
+    pub fn lane_count(&self) -> usize {
+        self.lanes.len()
+    }
+
+    fn begin_meter_block(&mut self, now: Instant) {
+        for lane in &mut self.lanes {
+            lane.meter.begin_block(now);
+        }
+    }
+
+    fn end_meter_block(&mut self, now: Instant) {
+        for lane in &mut self.lanes {
+            lane.meter.end_block(now);
+        }
+    }
+
+    fn reset_meters(&mut self) {
+        for lane in &mut self.lanes {
+            lane.meter.reset();
+        }
+    }
+
+    /// Meters each lane's part of `frame` and returns the frame's peak across every lane,
+    /// which the one silence gate shared by all lanes follows.
+    #[inline]
+    fn meter_frame(lanes: &mut [LaneMeter], frame: &[f32]) -> f32 {
+        // One or two lanes split the frame as captures did before lanes could be more.
+        match lanes {
+            [a] => a.meter.push_frame(frame),
+            [a, b] => {
+                let (first, second) = frame.split_at(b.channels.start);
+                a.meter.push_frame(first).max(b.meter.push_frame(second))
+            }
+            lanes => {
+                let mut peak = 0.0f32;
+                for lane in lanes {
+                    peak = peak.max(lane.meter.push_frame(&frame[lane.channels.clone()]));
+                }
+                peak
+            }
+        }
     }
 
     pub fn push_interleaved(&mut self, samples: &[f32]) -> Result<(), CaptureError> {
@@ -349,11 +446,7 @@ impl Capture {
         zero.try_reserve_exact(self.channels)
             .map_err(|_| CaptureError::AllocationFailed)?;
         zero.resize(self.channels, 0.0);
-        let now = Instant::now();
-        self.meter.begin_block(now);
-        if let Some(meter) = &mut self.meter_b {
-            meter.begin_block(now);
-        }
+        self.begin_meter_block(Instant::now());
         let prefix = if matches!(self.join_fade, JoinFade::None) {
             0
         } else {
@@ -377,25 +470,14 @@ impl Capture {
             // An input gap this long is already stale to the meters. Short gaps
             // still replay every frame, preserving their release/window behavior.
             if bulk >= u64::from(self.sample_rate) {
-                self.meter.reset();
-                if let Some(meter) = &mut self.meter_b {
-                    meter.reset();
-                }
+                self.reset_meters();
             } else {
-                let (a, b) = zero.split_at(self.a_channels);
                 for _ in 0..bulk {
-                    self.meter.push_frame(a);
-                    if let Some(meter) = &mut self.meter_b {
-                        meter.push_frame(b);
-                    }
+                    Self::meter_frame(&mut self.lanes, &zero);
                 }
             }
         }
-        let now = Instant::now();
-        self.meter.end_block(now);
-        if let Some(meter) = &mut self.meter_b {
-            meter.end_block(now);
-        }
+        self.end_meter_block(Instant::now());
         if retained != 0 {
             self.revision = self.revision.wrapping_add(1);
             self.prune_bars();
@@ -437,22 +519,14 @@ impl Capture {
             return Ok(());
         }
 
-        let now = Instant::now();
-        self.meter.begin_block(now);
-        if let Some(meter) = &mut self.meter_b {
-            meter.begin_block(now);
-        }
+        self.begin_meter_block(Instant::now());
         let previous_end = self.history.total_frames();
         let result = self.retain_frames(frames, bars, observe);
         if self.history.total_frames() != previous_end {
             self.revision = self.revision.wrapping_add(1);
             self.prune_bars();
         }
-        let now = Instant::now();
-        self.meter.end_block(now);
-        if let Some(meter) = &mut self.meter_b {
-            meter.end_block(now);
-        }
+        self.end_meter_block(Instant::now());
         result
     }
 
@@ -469,11 +543,7 @@ impl Capture {
                 bars.next();
                 bar_here |= bar == offset;
             }
-            let (a, b) = frame.split_at(self.a_channels);
-            let mut peak = self.meter.push_frame(a);
-            if let Some(meter) = &mut self.meter_b {
-                peak = peak.max(meter.push_frame(b));
-            }
+            let peak = Self::meter_frame(&mut self.lanes, frame);
 
             if self.retain_silence {
                 let retained_frame = self.history.total_frames();
@@ -602,10 +672,7 @@ impl Capture {
         self.join_fade = JoinFade::None;
         self.pre_roll.clear();
         self.pending_bars.clear();
-        self.meter.reset();
-        if let Some(meter) = &mut self.meter_b {
-            meter.reset();
-        }
+        self.reset_meters();
     }
 
     pub fn resume(&mut self) {
@@ -642,29 +709,22 @@ impl Capture {
         self.state
     }
 
+    /// The meter of lane A.
     pub fn meter_readings(&self) -> MeterReadings {
-        self.meter.readings(Instant::now())
+        self.lanes[0].meter.readings(Instant::now())
     }
 
+    /// The meter of `lane`, or `None` past the last lane.
     pub fn track_meter_readings(&self, lane: usize) -> Option<MeterReadings> {
-        match lane {
-            0 => Some(self.meter_readings()),
-            1 => self
-                .meter_b
-                .as_ref()
-                .map(|meter| meter.readings(Instant::now())),
-            _ => None,
-        }
+        let lane = self.lanes.get(lane)?;
+        Some(lane.meter.readings(Instant::now()))
     }
 
     fn track_range(&self, lane: usize) -> Option<Range<usize>> {
-        match lane {
-            0 => Some(0..self.a_channels),
-            1 if self.a_channels < self.channels => Some(self.a_channels..self.channels),
-            _ => None,
-        }
+        self.lanes.get(lane).map(|lane| lane.channels.clone())
     }
 
+    /// The channels of `lane`, or `None` past the last lane.
     pub fn track_channels(&self, lane: usize) -> Option<usize> {
         self.track_range(lane).map(|range| range.len())
     }
@@ -823,6 +883,42 @@ impl Capture {
         })
     }
 
+    /// Writes the band energies of one waveform row of `lane` for each chronological bin of
+    /// the retained part of `range`, and returns its frame count. The bins are the waveform
+    /// calls' bins over the same range, so bin `i` colours waveform column `i`. A bin is
+    /// `None` where it has no audio (silence included). An invalid lane or row clears `bins`
+    /// and returns 0.
+    ///
+    /// Band energies are built per page and channel by the first read that needs them, then
+    /// cached for later reads and frozen copies, so a first read of a long history is slow
+    /// (about half a second for 10 minutes of 48 kHz stereo in a release build; a cached read
+    /// of the same takes about 2 ms): prefer a frozen copy off the audio thread's lock for
+    /// that. See [`SpectrumRow`] for the
+    /// rows and [`crate::waveform::SPECTRUM_BAND_EDGES_HZ`] for the bands.
+    pub fn track_spectrum_range(
+        &self,
+        lane: usize,
+        row: SpectrumRow<'_>,
+        range: Range<u64>,
+        bins: &mut [SpectrumBin],
+    ) -> usize {
+        let Some(members) = self.track_range(lane).and_then(|track| row.members(track)) else {
+            bins.fill(None);
+            return 0;
+        };
+        let retained = self.frame_range();
+        let range = range.start.max(retained.start)..range.end.min(retained.end);
+        self.history
+            .spectrum(self.sample_rate, &members, range, bins)
+    }
+
+    /// How many retained pages hold band energies that a spectrum read, of this capture or of
+    /// a frozen copy, has started. Zero until something reads a spectrum, which is how an app
+    /// that never colours its waveform by frequency can check it never paid for one.
+    pub fn spectrum_cache_pages(&self) -> usize {
+        self.history.spectrum_pages()
+    }
+
     fn waveform_for(
         &self,
         trace: usize,
@@ -875,10 +971,7 @@ impl Capture {
         self.quiet_frames = 0;
         self.gate_recording = false;
         self.join_fade = JoinFade::None;
-        self.meter.reset();
-        if let Some(meter) = &mut self.meter_b {
-            meter.reset();
-        }
+        self.reset_meters();
         if self.state == CaptureState::Recording {
             self.state = CaptureState::Waiting;
         }
@@ -1060,6 +1153,218 @@ mod tests {
             Capture::new_with_budget(100, 1, DurationChoice::Seconds10, 0),
             Err(CaptureError::BufferTooLarge),
         ));
+    }
+
+    #[test]
+    fn lane_lists_hold_up_to_sixty_four_lanes_and_sixty_four_channels() {
+        for widths in [
+            &[][..],
+            &[0],
+            &[65],
+            &[2, 0, 1],
+            &[1; MAX_LANES + 1],
+            &[32, 32, 1],
+            &[60, 2, 2, 1],
+        ] {
+            assert!(
+                matches!(
+                    Capture::new_lanes(100, widths, DurationChoice::Seconds10),
+                    Err(CaptureError::InvalidChannelCount),
+                ),
+                "{widths:?}"
+            );
+        }
+        assert_eq!(
+            CaptureError::InvalidChannelCount.to_string(),
+            "each lane must have 1 to 64 channels, at most 64 in total"
+        );
+        assert!(matches!(
+            Capture::new_lanes(0, &[1, 1, 1], DurationChoice::Seconds10),
+            Err(CaptureError::InvalidSampleRate),
+        ));
+        assert!(matches!(
+            Capture::new_lanes_with_budget(100, &[2, 12, 1], DurationChoice::Seconds10, 14),
+            Err(CaptureError::BufferTooLarge),
+        ));
+        for widths in [&[1; MAX_LANES][..], &[64], &[2, 12, 1], &[32, 32], &[1, 2, 3, 58]] {
+            let capture = Capture::new_lanes(100, widths, DurationChoice::Seconds10).unwrap();
+            assert_eq!(capture.lane_count(), widths.len());
+            for (lane, &width) in widths.iter().enumerate() {
+                assert_eq!(capture.track_channels(lane), Some(width), "{widths:?}");
+                assert!(capture.track_meter_readings(lane).is_some());
+            }
+            // Past the last lane there is nothing to read, and nothing panics.
+            let past = widths.len();
+            assert_eq!(capture.track_channels(past), None);
+            assert!(capture.track_meter_readings(past).is_none());
+            assert!(capture.track_snapshot(past).is_none());
+            assert_eq!(capture.active_channels(past), 0);
+            let (mut low, mut high) = ([9.0; 3], [9.0; 3]);
+            let range = 0..u64::MAX;
+            assert_eq!(
+                capture.track_waveform_range(past, WaveformView::Merged, range.clone(), &mut low, &mut high),
+                0
+            );
+            assert_eq!((low, high), ([0.0; 3], [0.0; 3]));
+            assert_eq!(capture.track_channel_waveform_range(past, 0, range, &mut low, &mut high), 0);
+        }
+        // The pair constructors are the same captures as one or two lanes.
+        let layout = |capture: Capture| {
+            let layout = capture.history.layout();
+            (capture.lane_count(), layout.page_frames, layout.channels, layout.lane_starts)
+        };
+        assert_eq!(
+            layout(Capture::new_tracks(100, 2, Some(12), DurationChoice::Seconds10).unwrap()),
+            (2, 100, 14, 0b101)
+        );
+        assert_eq!(
+            layout(Capture::new_lanes(100, &[2, 12], DurationChoice::Seconds10).unwrap()),
+            (2, 100, 14, 0b101)
+        );
+        assert_eq!(layout(Capture::new(100, 3, DurationChoice::Seconds10).unwrap()), (1, 100, 3, 1));
+        assert_eq!(
+            layout(Capture::new_lanes(100, &[2, 12, 1], DurationChoice::Seconds10).unwrap()),
+            (3, 100, 15, 1 | 1 << 2 | 1 << 14)
+        );
+    }
+
+    /// Interleaves `lanes`, each of `widths[i]` channels, into whole frames of all of them.
+    fn interleave(widths: &[usize], lanes: &[Vec<f32>]) -> Vec<f32> {
+        let frames = lanes[0].len() / widths[0];
+        (0..frames)
+            .flat_map(|frame| {
+                lanes
+                    .iter()
+                    .zip(widths)
+                    .flat_map(move |(lane, &width)| lane[frame * width..(frame + 1) * width].iter().copied())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mixed_width_lanes_keep_their_own_channels_views_and_meters() {
+        let widths = [2, 12, 1];
+        let frames = 1_337;
+        let lanes: Vec<Vec<f32>> = widths
+            .iter()
+            .enumerate()
+            .map(|(lane, &width)| {
+                (0..frames * width)
+                    .map(|i| ((i * 31 + lane * 7) % 409) as f32 / 409.0 * (lane + 1) as f32 * 0.25 - 0.1)
+                    .collect()
+            })
+            .collect();
+        let mut capture = Capture::new_lanes(1_000, &widths, DurationChoice::Seconds10).unwrap();
+        capture.set_retain_silence(true);
+        capture.push_interleaved(&interleave(&widths, &lanes)).unwrap();
+        assert_eq!(capture.frame_range(), 0..frames as u64);
+        let frozen = capture.freeze();
+        assert_eq!(frozen.track_count(), 3);
+        assert!(frozen.track(3).is_none());
+        for (lane, (&width, samples)) in widths.iter().zip(&lanes).enumerate() {
+            let alone = FrozenTrack::from_interleaved(1_000, width, 0, samples).unwrap();
+            let snapshot = capture.track_snapshot(lane).unwrap();
+            assert_eq!(snapshot.channels, width);
+            assert_eq!(&snapshot.samples, samples);
+            let track = frozen.track(lane).unwrap();
+            assert_eq!(track.snapshot(), snapshot);
+            for view in [WaveformView::Merged, WaveformView::Left, WaveformView::Right] {
+                for (range, bins) in [(0..frames as u64, 7), (129..1_024, 300), (5..6, 1)] {
+                    let mut expected = (vec![0.0; bins], vec![0.0; bins]);
+                    alone.waveform(view, range.clone(), &mut expected.0, &mut expected.1);
+                    let mut live = (vec![9.0; bins], vec![9.0; bins]);
+                    capture.track_waveform_range(lane, view, range.clone(), &mut live.0, &mut live.1);
+                    assert_eq!(live, expected, "lane {lane} {view:?} {range:?}");
+                    let mut held = (vec![9.0; bins], vec![9.0; bins]);
+                    track.waveform(view, range.clone(), &mut held.0, &mut held.1);
+                    assert_eq!(held, expected, "lane {lane} {view:?} {range:?}");
+                }
+            }
+            for channel in 0..width {
+                let mut expected = (vec![0.0; 50], vec![0.0; 50]);
+                alone.channel_waveform(channel, 0..frames as u64, &mut expected.0, &mut expected.1);
+                let mut live = (vec![9.0; 50], vec![9.0; 50]);
+                capture.track_channel_waveform_range(lane, channel, 0..frames as u64, &mut live.0, &mut live.1);
+                assert_eq!(live, expected, "lane {lane} channel {channel}");
+            }
+            assert_eq!(capture.active_channels(lane), alone.active_channels(), "lane {lane}");
+            // Each lane is metered on its own channels: louder lanes read higher.
+            let peak = capture.track_meter_readings(lane).unwrap().peak_dbfs;
+            if lane > 0 {
+                assert!(peak > capture.track_meter_readings(lane - 1).unwrap().peak_dbfs, "lane {lane}");
+            }
+        }
+    }
+
+    #[test]
+    fn sixty_four_mono_lanes_each_hold_their_own_channel() {
+        let widths = [1; MAX_LANES];
+        let mut capture = Capture::new_lanes(1_000, &widths, DurationChoice::Seconds10).unwrap();
+        capture.set_retain_silence(true);
+        let frames = 700;
+        let audio: Vec<f32> = (0..frames * MAX_LANES)
+            .map(|i| {
+                let (frame, lane) = (i / MAX_LANES, i % MAX_LANES);
+                (lane + 1) as f32 / 64.0 * if frame % 2 == 0 { 1.0 } else { -0.5 }
+            })
+            .collect();
+        capture.push_interleaved(&audio).unwrap();
+        let frozen = capture.freeze();
+        assert_eq!(frozen.track_count(), MAX_LANES);
+        for lane in 0..MAX_LANES {
+            let level = (lane + 1) as f32 / 64.0;
+            let expected: Vec<f32> = audio.iter().skip(lane).step_by(MAX_LANES).copied().collect();
+            assert_eq!(capture.track_snapshot(lane).unwrap().samples, expected);
+            assert_eq!(frozen.track(lane).unwrap().snapshot().samples, expected);
+            for view in [WaveformView::Merged, WaveformView::Left, WaveformView::Right] {
+                let (mut low, mut high) = ([0.0; 1], [0.0; 1]);
+                capture.track_waveform(lane, view, &mut low, &mut high);
+                assert_eq!((low[0], high[0]), (-0.5 * level, level), "lane {lane}");
+            }
+        }
+    }
+
+    #[test]
+    fn one_loud_lane_among_quiet_ones_opens_the_shared_gate_for_every_lane() {
+        let widths = [1, 2, 1, 3, 1];
+        let channels: usize = widths.iter().sum();
+        let mut capture = Capture::new_lanes(1_000, &widths, DurationChoice::Seconds10).unwrap();
+        capture.push_interleaved(&vec![0.0; 60 * channels]).unwrap();
+        assert_eq!(capture.state(), CaptureState::Waiting);
+        // Only lane D, the fourth, has something to say, on its last channel.
+        let mut loud = vec![0.0; channels];
+        loud[6] = 0.75;
+        capture.push_interleaved(&loud).unwrap();
+        assert_eq!(capture.state(), CaptureState::Recording);
+        assert_eq!(capture.frame_range(), 0..41);
+        for (lane, &width) in widths.iter().enumerate() {
+            let snapshot = capture.track_snapshot(lane).unwrap();
+            assert_eq!(snapshot.frame_range(), 0..41, "lane {lane}");
+            let mut last = vec![0.0; width];
+            if lane == 3 {
+                last[2] = 0.75;
+            }
+            assert_eq!(snapshot.frames(40..41).unwrap(), last, "lane {lane}");
+            let peak = capture.track_meter_readings(lane).unwrap().peak_dbfs;
+            if lane == 3 {
+                assert!(peak > -3.0, "{peak}");
+            } else {
+                assert!(peak < -60.0, "lane {lane}: {peak}");
+            }
+        }
+        // The gate closes only once every lane has been quiet long enough.
+        let mut quiet_but_one = vec![0.0; channels];
+        quiet_but_one[0] = 0.5;
+        capture.push_interleaved(&quiet_but_one.repeat(400)).unwrap();
+        assert_eq!(capture.state(), CaptureState::Recording);
+        assert_eq!(capture.frame_range(), 0..441);
+        capture.push_interleaved(&vec![0.0; 2_000 * channels]).unwrap();
+        assert_eq!(capture.state(), CaptureState::Waiting);
+        let kept = capture.frame_range();
+        assert!(kept.end < 2_441, "{kept:?}");
+        for lane in 0..widths.len() {
+            assert_eq!(capture.track_snapshot(lane).unwrap().frame_range(), kept);
+        }
     }
 
     #[test]

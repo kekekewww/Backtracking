@@ -1,7 +1,8 @@
-//! An appearance-only add-on with a slowly changing border color.
+//! An appearance-only add-on with a slowly changing border color and a gradient for coloring
+//! the waveform by frequency.
 
 use backtracking_addon::client::Client;
-use backtracking_addon::protocol::{Appearance, HostMessage};
+use backtracking_addon::protocol::{Appearance, HostMessage, SpectrumStop};
 use backtracking_addon::Result;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -20,6 +21,22 @@ fn main() -> Result<()> {
         ]),
         numbers: BTreeMap::from([("border_width".into(), 2.0)]),
         rows: BTreeMap::from([("LFE".into(), [255, 160, 88, 255])]),
+        // Used only when the user colors the waveform by frequency and has no gradient of
+        // their own: orange for low frequencies, through yellow, to sky blue for high ones.
+        spectrum: vec![
+            SpectrumStop {
+                color: [255, 140, 60, 255],
+                position: 0.0,
+            },
+            SpectrumStop {
+                color: [240, 220, 90, 255],
+                position: 0.45,
+            },
+            SpectrumStop {
+                color: [110, 200, 255, 255],
+                position: 1.0,
+            },
+        ],
     };
     client.send_appearance(&appearance)?;
 

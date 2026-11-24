@@ -99,6 +99,33 @@ macOS 桌面版可從選單列顯示或隱藏視窗、暫停或恢復擷取、�
 
 **保留／History／Buffer** 可選 10、20、30、60 秒或 3、5、10 分鐘，預設為 20 秒。這是即時歷史的音訊長度。預設壓縮靜音時，兩段各 5 秒、相隔一分鐘的聲音會接在一起，中間只保留偵測需要的短緩衝；開啟保留安靜片段後，已知安靜時間也占用 History。非常小聲的內容在預設模式可能低於門檻。縮短會裁掉即時歷史最舊的部分，事後加長只增加接下來可保留的長度；固定編輯素材不因此重切。
 
+### 依頻率為波形上色（Windows 桌面版）
+
+在 Options 的 **Appearance** 頁，把 **波形顏色／Waveform color** 設為 **依頻率／By frequency**，波形的每個時刻會依它含有的聲音上色：低頻偏向第一個顏色，高頻偏向最後一個。預設由低頻的紅色到高頻的藍色，所以低沉的嗡聲偏紅、鈸聲偏藍，完整的混音落在兩者之間。預設的 **單一顏色／Single color** 照舊以一種顏色繪製。
+
+**頻率顏色／Frequency colors** 顯示漸層，並為每個顏色列一行，由低到高。按顏色可以更改它；拖曳中間顏色的滑桿，可在相鄰兩色之間移動它；**移除／Remove** 拿掉一個中間顏色；**新增顏色／Add color** 在最寬的間隔加入一個。漸層有 2 到 8 個顏色，**重設／Reset** 恢復預設。在波形背景上不易看清的顏色，會在它的位置改用預設顏色繪製，下方也會註明。
+
+有選區時，選區保留它的顏色，其餘波形變暗並偏灰，讓選區更明顯。
+
+附加元件的外觀（見「附加元件」）也可以提供這組顏色。只有在開啟依頻率、而且你沒有自己的顏色時才會使用，顏色下方會註明來自哪個附加元件。更改其中任何一個顏色，它們就以外觀的顏色為起點成為你自己的；之後按 **重設／Reset** 會改回外觀的顏色。附加元件無法替你開啟依頻率上色。
+
+目前只有 Windows 桌面版提供，macOS 桌面版尚未支援。
+
+### 多個來源（Windows 桌面版）
+
+Windows 桌面版可以同時擷取 A、B 以外的更多來源，最多 64 個，各占一條波形列，依序以 A、B、C……Z、AA……BL 命名。
+
+- 在 Options 的 **Sources** 頁，每個來源各有一段，標題為 **Source A**、**Source B** 等，下方是與以往相同的音訊來源、聲道路由與檔名欄位。清單最下方的 **新增來源／Add source** 選單列出可用來源，選擇後會加在清單最後。已有 64 個來源時，這個選單無法使用，並說明原因。
+- 來源超過一個時，每段標題右側有 **移除／Remove**。移除後，後面的來源會往前遞補一個字母，例如移除 B 後，原本的 C 變成 B，它的音量表單位也跟著移動。只剩一個來源時不能移除。來源 B 之後的每個來源也可在音訊來源選單選 **Off**，效果與移除相同。目前不能調整來源順序。
+- 新增、移除或更換來源會重新開始記錄歷史，頁面底部也會註明。
+- 所有來源合計最多 64 個聲道。頁面底部顯示目前使用了幾個（**N of 64 channels in use／已使用 N 個聲道，上限 64 個**）。超過上限的來源無法開始，原因會寫在該來源那一段，正常視窗的狀態列也會顯示，並以該來源的字母開頭；波形左側的字母改為警示色。
+- 保留歷史的記憶體由所有聲道共用（電腦記憶體的八分之一，介於 256 MiB 與 2 GiB 之間）。聲道越多，能保留的時間越短；放不下所選的保留時間時，**Capture** 頁和 **Sources** 頁會寫出實際能保留多久，例如 **With 64 channels, memory holds the latest 2 minutes 54 seconds.**。
+- 超過兩個來源時，波形左側顯示每個來源的字母；多聲道來源在字母旁再列出各聲道名稱。將游標移到字母上，會顯示該來源是什麼與它的狀態。
+- 列數多到在視窗內每列放不下 14 像素時，整個波形區會一起上下捲動：在波形左右邊緣或右側捲軸上捲動滑鼠滾輪，或拖曳捲軸。在波形中間捲動仍是縮放。框選、旗標、拖出與[分開編輯](#分開編輯)在捲動後的列上照常使用；分開編輯時拖到波形上下緣會自動捲動。視窗會先長高，最多到 560 像素，放不下時才捲動。
+- 工具列只顯示放得下的音量表，其餘收在 **+N** 按鈕；按下它會列出每個來源的音量表，按其他地方或 `Esc` 關閉。
+- 匯出、拖出與快照為每個來源各寫一個 WAV 檔，檔名含該來源的字母，例如 `Backtracking_Spotify_C_….wav`。
+- 一或兩個來源時，畫面與以往相同。macOS 桌面版與 VST3／CLAP 插件仍維持原本的來源數量。
+
 ### 即時音量表
 
 齒輪旁的音量表顯示目前輸入的音訊，預設模式是 dBFS。從齒輪選單的音量表設定切換單位。macOS 桌面版也可直接點擊讀值切換。暫停錄音或目前無可用讀值時，顯示 `—`。
@@ -223,6 +250,32 @@ Options 的 **Hotkeys／快速鍵** 頁列出所有鍵盤快速鍵，都可以�
 **使用附加元件的外觀。** 具有 `appearance` 功能的附加元件可以為視窗提供一套外觀：波形、選區、背景、外框、旗標等的顏色，以及外框寬度、圓角和波形線條的粗細。外觀預設不會套用：到 Options 的 **Appearance** 頁，在 **附加元件的外觀／Look from add-on** 選擇一個正在提供外觀的執行中附加元件。一次只會套用一個外觀，選 **無／None** 即恢復 Backtracking 自己的外觀。這個選擇會被保存；若該附加元件沒有執行或目前沒有提供外觀，視窗會使用自己的外觀，這一列也會註明它目前沒有提供外觀，等它再次提供時就會自動套用。外觀只會改變視窗的樣子：擷取、選取、匯出、檔案、快捷鍵、版面（外框寬度除外）、文字，以及錄音、等待、暫停與錯誤的標記都維持原樣。外觀啟用期間，它的外框寬度會取代你設定的寬度（視窗大小不變，波形區域隨之調整），但你自己選的外框顏色仍優先於外觀的外框顏色，背景透明度也仍依你的設定。若某個值會讓波形、選區、旗標、播放線、聲道名稱或擷取狀態標記難以看清，Backtracking 會忽略那個值，改用自己的。
 
 想自己寫附加元件，請看 [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md)。
+
+### 讓附加元件控制 Backtracking（Windows 桌面版）
+
+具有 `control` 功能的附加元件可以像坐在視窗前的人一樣操作 Backtracking，例如讓 AI 助理或腳本替你暫停、選取並存檔。
+
+- 預設不允許。在 Options 的 **Add-ons** 頁，這種附加元件會多一個勾選框 **允許此附加元件控制 Backtracking（開始與暫停錄音、選取、儲存檔案、變更來源）／Let this add-on control Backtracking (start and pause recording, select, save files, change sources)**。未勾選時，它的每個要求都會被拒絕；若它曾經要求過，勾選框下方會註明 **它要求控制 Backtracking，已被拒絕／It asked to control Backtracking and was refused**。安裝確認畫面也會列出這項功能。
+- 允許後，它可以讀取 Backtracking 目前的狀態（是否在擷取、各來源、保留的長度、選區、目前顯示的範圍、存檔資料夾），開始、暫停與清除擷取，框選一段、選擇分開編輯的列、縮放，把選區存成 WAV 檔，試聽選區，以及新增或移除來源。
+- 存檔等同把選區拖出視窗：寫出的檔案和 **Save** 對同一個選區寫出的相同，附加元件會收到每個檔案的路徑、來源字母、聲道數、取樣率與長度。
+- 新增或移除來源和在 **Sources** 頁操作一樣，會重新開始記錄歷史，原本保留的音訊會消失。需要的部分請先存檔。
+- 附加元件動手時，狀態列會註明是誰做的，例如 **已開始擷取 · 由 Example control 操作／Capture started · by Example control**；它框選的選區顯示為 **Selection · 由 Example control 操作**。
+- 你正在拖曳、拖出或存檔時，附加元件的要求會被告知「忙碌中」，不會打斷你。
+- 它不能切換自己或其他附加元件的這個勾選框，不能安裝、移除、啟用或停用附加元件，不能更改其他設定、開啟檔案、結束 Backtracking 或更新。
+- 隨時取消勾選即可收回；還在等待的要求會被拒絕。這個選擇依附加元件分別保存，重新開啟 Backtracking 後仍有效；移除附加元件後就會忘記，重新安裝時又是不允許。
+
+### 讓 AI 助理使用 Backtracking（Windows 桌面版）
+
+**Backtracking Agent** 附加元件讓 Claude Code、Claude Desktop 或其他 MCP 用戶端透過上述的控制使用 Backtracking：讀取 Backtracking 保留的內容、暫停與開始錄音、框選一段、存成 WAV 檔、試聽，以及新增或移除來源。安裝檔請從 [`addons/backtracking-agent`](../addons/backtracking-agent/README.md) 建置。
+
+1. 像其他附加元件一樣安裝 `backtracking-agent.btaddon`。
+2. 在 **Add-ons** 頁勾選 Backtracking Agent 的 **允許此附加元件控制 Backtracking／Let this add-on control Backtracking**。勾選之前，用戶端可以連上，但每個要求都會被拒絕，附加元件的區塊也會這樣註明。
+3. 按 **Copy Claude Code command**，在終端機執行複製的指令；或按 **Copy Claude Desktop entry**，把它加進 Claude Desktop 的設定。兩者都會以 `--stdio` 啟動附加元件的程式，它會自己找到執行中的附加元件。
+
+- 用戶端操作時，Backtracking 必須開著，而且這個附加元件要啟用。否則用戶端會立刻收到說明。
+- 附加元件只在這台電腦上（`127.0.0.1`）服務，而且要有它的權杖（token）。以 `--stdio` 啟動的用戶端會自己讀取權杖；需要 `http://` 位址的用戶端，可按 **Show connection details** 顯示權杖 2 分鐘，按 **New token** 可換一個新的。
+- 透過用戶端新增或移除來源，和上述一樣會重新開始記錄歷史。用戶端做的每件事，狀態列都會註明 **· 由 Backtracking Agent 操作／· by Backtracking Agent**。
+- 附加元件區塊的文字只有英文。
 
 ### 多聲道來源（Windows 桌面版與插件）
 
@@ -377,6 +430,33 @@ In the full interface, the toolbar's **Play/Pause** icon shows the available act
 
 **History / Buffer** offers 10/20/30/60 seconds or 3/5/10 minutes and defaults to 20 seconds. With default silence compression, two five-second sounds a minute apart join with only a short gap; Keep quiet sections also counts known silence against History. Very quiet input may fall below the default gate. Shortening trims the oldest live audio; lengthening gives future audio more room. Fixed editing material is not recut.
 
+### Color the waveform by frequency (Windows desktop)
+
+On the **Appearance** page of Options, set **Waveform color** to **By frequency** to color each moment of the waveform by the sound it holds: low frequencies toward the first color, high frequencies toward the last. The default runs from red for low to blue for high, so a low hum reads red, a hi-hat blue, and a full mix lands in between. **Single color**, the default, draws the waveform in one color as before.
+
+**Frequency colors** shows the gradient and one row for each color, lowest first. Click a color to change it, drag a middle color's slider to move it between its neighbors, **Remove** takes a middle color out, and **Add color** puts a new one in the widest gap. A gradient has 2 to 8 colors. **Reset** brings back the default. A color too hard to see on the waveform's background is drawn in the default color at its place, and a note under the colors says so.
+
+While there is a selection, the selected part keeps its colors and the rest of the waveform dims toward gray, so the selection stands out.
+
+A look from an add-on (see Add-ons) can supply these colors. They are used only while By frequency is on and you have no colors of your own, and a note under the colors names the add-on. Changing any of them makes them your own, starting from the look's; **Reset** then goes back to the look's colors. An add-on cannot turn By frequency on for you.
+
+Only the Windows desktop app has this for now; the macOS app does not yet.
+
+### More than two sources (Windows desktop)
+
+The Windows desktop app can capture more sources than A and B at once, up to 64. Each gets its own lane, lettered in order A, B, C … Z, AA … BL.
+
+- On the **Sources** page of Options, each source has a section headed **Source A**, **Source B** and so on, with the same Audio source, Channel route and File name fields as before. Below the list, the **Add source** menu lists the sources you can pick; the one you choose is added at the end. With 64 sources the menu is unavailable and says why.
+- While there is more than one source, each heading has **Remove** at its right. The sources after it move up a letter: remove B and C becomes B, taking its meter unit with it. The only source left cannot be removed. Choosing **Off** for any source after A does the same as Remove. Sources cannot be reordered yet.
+- Adding, removing or changing a source starts a new history; the foot of the page says so.
+- All sources together hold at most 64 channels. The foot of the page shows how many are in use (**N of 64 channels in use**). A source past the limit cannot start: the reason shows in its own section, and on the status line of the full window, led by its letter. Its letter beside the waveform turns amber.
+- The memory for history is shared by every channel (one eighth of the computer's memory, from 256 MiB to 2 GiB). The more channels, the shorter the history; when the chosen length does not fit, the **Capture** and **Sources** pages say how much does, for example **With 64 channels, memory holds the latest 2 minutes 54 seconds.**
+- With more than two sources, each lane's letter shows at the left of the waveform; a multichannel source lists its channel names beside its letter. Hover over a letter to see which source it is and how it is doing.
+- When there are more rows than fit at 14 pixels each, the whole waveform scrolls up and down as one: turn the wheel over its left margin or the scroll bar on the right, or drag the bar. The wheel over the waveform itself still zooms. Selecting, flags, dragging out and [Edit separately](#edit-separately) work on scrolled rows; while editing separately, a drag past the top or bottom edge scrolls. The window first grows taller, up to 560 pixels, and scrolls only past that.
+- The toolbar shows the meters that fit and gathers the rest behind a **+N** button. Click it to see every source's meter; click elsewhere or press `Esc` to close the list.
+- Exports, drags and snapshots write a WAV file for each source, named with its letter, for example `Backtracking_Spotify_C_….wav`.
+- With one or two sources the window looks as before. The macOS app and the VST3 and CLAP plug-ins keep the sources they had.
+
 ### Live audio meter
 
 The meter next to the gear reads the incoming audio signal and defaults to dBFS. Choose the unit in the gear menu. In the macOS desktop app, you can also click the readout to switch units. The meter displays `—` while paused or when a reading is unavailable.
@@ -501,6 +581,32 @@ An add-on is a separate program that Backtracking starts and captures audio from
 **Use an add-on's look.** An add-on with the `appearance` capability can offer a look for the window: colors for the waveform, the selection, the backgrounds, the border, the flags and more, and the border width, corner rounding and the thickness of the waveform's line. A look is off until you choose it: on the **Appearance** page of Options, pick a running add-on that offers one under **Look from add-on**. Only one look is on at a time, and **None** brings back Backtracking's own look. The choice is saved. When that add-on is not running or offers no look, the window shows its own look and the row says the add-on is not offering one right now; its look comes back when it does. A look changes only how the window looks: capture, selection, export, files, shortcuts, layout (other than the border width), text, and the recording, waiting, paused and error marks stay as they are. While a look is on, its border width replaces yours (the window keeps its size and the waveform area adjusts), but a border color you chose yourself still wins over the look's, and your background transparency still applies. Backtracking ignores any value that would make the waveform, the selection, the flags, the playhead, channel names or the capture status hard to see, and uses its own there instead.
 
 To write an add-on, see [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md).
+
+### Let an add-on control Backtracking (Windows desktop)
+
+An add-on with the `control` capability can work Backtracking the way a person at the window does, so that an AI assistant or a script can, for example, pause, select and save for you.
+
+- It is off until you allow it. On the **Add-ons** page of Options such an add-on has a check box, **Let this add-on control Backtracking (start and pause recording, select, save files, change sources)**. While it is clear, every request from the add-on is refused; when the add-on has asked, the line under the box says **It asked to control Backtracking and was refused**. The install confirmation lists the capability too.
+- Once allowed, it can read what Backtracking is doing (whether it is capturing, the sources, how much is held, the selection, what the window shows, the save folder), start, pause and clear capture, select a stretch, choose the rows to edit separately, zoom, save the selection as WAV files, play the selection, and add or remove sources.
+- Saving is the add-on's way to drag a clip out of the window: it writes the files **Save** writes for the same selection, and the add-on is told each file's path, lane letter, channel count, sample rate and length.
+- Adding or removing a source starts a new history, as it does on the **Sources** page: the audio held until then is gone. Save what you want to keep first.
+- While an add-on acts, the status line says which one, for example **Capture started · by Example control**; a selection it made reads **Selection · by Example control**.
+- While you are dragging, dragging out or saving, its requests are told Backtracking is busy rather than interrupting you.
+- It cannot change its own check box or another add-on's, install, remove, enable or disable add-ons, change other options, open files, quit Backtracking, or update it.
+- Clear the box at any time to take control back; requests still waiting are refused. The choice is kept for each add-on when Backtracking restarts, and forgotten when the add-on is removed: installed again, it starts off.
+
+### Let an AI agent use Backtracking (Windows desktop)
+
+The **Backtracking Agent** add-on lets Claude Code, Claude Desktop or another MCP client use Backtracking through the control described above. The client can read what Backtracking holds, pause and start recording, select a stretch, save it as WAV files, play it, and add or remove sources. Build the package from [`addons/backtracking-agent`](../addons/backtracking-agent/README.md).
+
+1. Install `backtracking-agent.btaddon` as any add-on.
+2. On the **Add-ons** page, switch on **Let this add-on control Backtracking** under Backtracking Agent. Until you do, the client can connect, but every request is refused, and the card says so.
+3. Press **Copy Claude Code command** and run it in a terminal, or press **Copy Claude Desktop entry** and add it to Claude Desktop's configuration. Both start the add-on's program with `--stdio`, which finds the running add-on by itself.
+
+- Backtracking must be running with the add-on on whenever the client works. If it is not, the client is told so at once.
+- The add-on serves the client only on this computer (`127.0.0.1`), and only with its token. Clients started with `--stdio` read the token themselves; **Show connection details** shows it for 2 minutes for clients that need the `http://` address, and **New token** replaces it.
+- Adding or removing a source through the client starts a new history, as above. The status line says **· by Backtracking Agent** for everything the client does.
+- The add-on's card is in English only.
 
 ### Multichannel sources (Windows desktop and plug-ins)
 

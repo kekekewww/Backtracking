@@ -11,7 +11,7 @@ use crate::clip_export::{self, ExportOptions};
 use crate::context_menu::{self, WindowCommand};
 use crate::controller::{
     CaptureSource, ChannelWaveform, Controller, EditSnapshot, LaneGroup, LaneMeterReadings,
-    SourceSettings,
+    SourceSettings, Sources, compact_sources,
 };
 use crate::file_drag;
 use crate::hotkeys::{Action, Binding, Hotkeys, Modifiers, Scope};
@@ -19,8 +19,8 @@ use crate::lane_key;
 use crate::playback::PreviewPlayer;
 use crate::preferences::{
     BORDER_WIDTHS, DEFAULT_ACCENT, Key, MeterMode, PairRender, PreferenceWriter, Preferences,
-    Settings, SourceNames, StatusMark, WideExportMode, serialize_sources,
-    wav_sample_format_preference,
+    Settings, SourceNames, StatusMark, WaveformColoring, WideExportMode, serialize_lanes,
+    serialize_meter_units_after_b, serialize_sources, wav_sample_format_preference,
 };
 use crate::snapshot_hotkey::{self, SnapshotHotkey};
 use crate::startup;
@@ -29,7 +29,7 @@ use crate::updater::UpdateOptions;
 use crate::window_order;
 use backtracking_core::waveform::{PairGroup, PairSide, PreviewLane};
 use backtracking_core::{
-    AutoResumeDelay, ChannelRoute, DurationChoice, Fades, FrozenTrack, Lane, Preview,
+    AutoResumeDelay, ChannelRoute, DurationChoice, Fades, FrozenTrack, Lane, MAX_LANES, Preview,
     SOURCE_NAME_LIMIT, TakeLabel, WavExportProfile, WaveformView, cleanup, file_name_source,
     waveform,
 };
@@ -40,10 +40,12 @@ use backtracking_ui::{
     TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS, WAV_SAMPLE_RATES, accent_color,
     add_system_font_fallbacks, configure_options_menu, configure_options_style, dragged_fades,
     fade_end_at, fade_waveform_bins, fit_frame_range, flag_handle_at, icon_button, meter_number,
-    muted_accent, options_choice, options_control_width, options_field, options_group_heading,
+    muted_accent, options_choice, options_control_right, options_control_width, options_field,
+    options_group_heading,
     options_heading_text, options_list, options_menu_height, options_navigation_item, options_note,
-    options_value, paint_fades, paint_guide_lines, paint_playhead, paint_transport_glyph,
-    paint_waveform_trace, remeasure_options_menu, status_led, waveform_press,
+    options_value, paint_colored_waveform_trace, paint_fades, paint_guide_lines, paint_playhead,
+    paint_transport_glyph, paint_waveform_trace, remeasure_options_menu, status_led, trace_bin,
+    waveform_press,
 };
 use eframe::egui::{
     self, Color32, CursorIcon, PointerButton, Pos2, Rect, ResizeDirection, Stroke, Vec2,
@@ -66,9 +68,11 @@ use winit::{
 
 mod addon_sources;
 mod addons_page;
+mod commands;
 mod harness;
 mod hotkeys_page;
 mod look;
+mod spectrum;
 #[cfg(test)]
 mod test_profile;
 mod text;
@@ -77,6 +81,7 @@ use addon_sources::AddonSources;
 use addons_page::{AddonsPage, PageRequest};
 use hotkeys_page::HotkeysPage;
 use look::AddonLook;
+use spectrum::WaveformColors;
 use text::Language;
 
 /// How often the window looks at work that only reports progress when asked.
@@ -313,6 +318,7 @@ pub(crate) fn run(controller: Controller, primary: bool) -> eframe::Result<()> {
                 repaint.request_repaint_after_for(Duration::from_millis(1), egui::ViewportId::ROOT);
             }));
             recorder.wake_on_new_looks(&context.egui_ctx);
+            recorder.wake_on_control(&context.egui_ctx);
             recorder.options_in_taskbar = show_options_on_start;
             if show_options_on_start {
                 recorder.open_options(&context.egui_ctx);
@@ -515,7 +521,15 @@ struct Recorder {
     theme: Theme,
     /// The add-on whose look `theme` is, when the user chose one.
     look: AddonLook,
-    meter_modes: [MeterMode; 2],
+    /// The waveform's colour: one colour, or by frequency (see `spectrum`).
+    waveform_coloring: WaveformColoring,
+    /// The user's own gradient for colouring by frequency, and the one last written.
+    waveform_gradient: Option<backtracking_ui::Spectrum>,
+    saved_waveform_gradient: Option<backtracking_ui::Spectrum>,
+    /// The colours read for the rows on screen, while the waveform is coloured by frequency.
+    waveform_colors: WaveformColors,
+    /// By logical lane, one for every lane there can be.
+    meter_modes: Vec<MeterMode>,
     split_waveform: bool,
     wav_profile: WavExportProfile,
     wav_force_mono: bool,
@@ -526,8 +540,9 @@ struct Recorder {
     pair_render: PairRender,
     /// A system, application or microphone lane on All channels shows only its active rows.
     hide_silent: bool,
-    /// What each logical lane knows of its active channels, while capture runs.
-    activity: [ChannelActivity; 2],
+    /// What each logical lane knows of its active channels, while capture runs; one for
+    /// every lane there can be.
+    activity: Vec<ChannelActivity>,
     /// Head models for binaural preview, one per sample rate, made once and kept.
     head_models: Vec<Arc<HeadModel>>,
     /// The names the user gave sources for their files.
@@ -539,14 +554,23 @@ struct Recorder {
     peak_rows: Vec<RowSource>,
     /// How each lane on screen is drawn, worked out once per pass.
     lanes: Vec<LanePlan>,
-    /// The first row on screen of each logical lane that scrolls.
-    lane_first_row: [usize; 2],
-    /// A scroll thumb being dragged: its lane and where on the thumb it was grabbed.
-    scroll_drag: Option<(usize, f32)>,
+    /// The first row on screen of each logical lane that scrolls; one for every lane there
+    /// can be.
+    lane_first_row: Vec<usize>,
+    /// With more than two lanes, the first row on screen of the plot's one column of rows.
+    plot_first_row: usize,
+    /// A scroll thumb being dragged: what it scrolls and where on the thumb it was grabbed.
+    scroll_drag: Option<(ScrollTarget, f32)>,
     /// Presses here belong to a lane's group switch or scroll bar, not to the timeline.
     lane_controls: Vec<Rect>,
-    /// The wheel scrolls a lane's rows here instead of zooming.
-    lane_scroll_zones: Vec<(usize, Rect)>,
+    /// The wheel scrolls a lane's rows, or the plot's, here instead of zooming.
+    lane_scroll_zones: Vec<(ScrollTarget, Rect)>,
+    /// The list of every lane's meter is open, from the "+N" button beside the meters.
+    meter_list_open: bool,
+    /// Where that list is on screen while it is open: presses and the wheel there are its own.
+    meter_list_rect: Option<Rect>,
+    /// Where the Options page scrolls to on its next pass, for the test harness.
+    options_scroll: Option<f32>,
     growth: Option<WindowGrowth>,
     plot_rect: Rect,
     editing: Option<FrozenEdit>,
@@ -580,7 +604,7 @@ struct Recorder {
     selection_rows: Vec<RowSource>,
     /// By logical lane: whether `selection_rows` held every row of that lane when the
     /// selection was made. Such a lane is saved and dragged out whole.
-    selection_whole: [bool; 2],
+    selection_whole: Vec<bool>,
     /// The row a drag-out without a selection takes while rows are separate.
     drag_row: Option<RowSource>,
     /// While a drag selecting rows is past the edge of a lane that scrolls, when that lane
@@ -618,6 +642,12 @@ struct Recorder {
     /// The window may grow to give a stacked lane's rows room. Off when a test asked for a size.
     auto_grow: bool,
     harness: Option<harness::Harness>,
+    /// The add-on save whose files `snapshot_save` is writing.
+    snapshot_save_tag: Option<u64>,
+    /// Control requests from add-ons being carried out (`commands`).
+    control: commands::Control,
+    /// The add-on that made the selection, named on the status line until it changes.
+    selection_by: Option<String>,
 }
 
 enum Gesture {
@@ -746,7 +776,11 @@ impl CaptureIndicator {
 }
 
 /// The source failure the user has to read: the capture error, or else one lane's problem.
-fn capture_problem(error: Option<&str>, lanes: [Option<&str>; 2], dual: bool) -> Option<String> {
+fn capture_problem<'a>(
+    error: Option<&str>,
+    lanes: impl IntoIterator<Item = Option<&'a str>>,
+    dual: bool,
+) -> Option<String> {
     if let Some(error) = error {
         return Some(error.to_owned());
     }
@@ -758,6 +792,32 @@ fn capture_problem(error: Option<&str>, lanes: [Option<&str>; 2], dual: bool) ->
             status.to_owned()
         })
     })
+}
+
+/// What the full window's status line says of the lanes' problems, by lane: the first one,
+/// named by its lane's letter when there is more than one lane (`dual`), and how many other
+/// lanes have one.
+fn lanes_problem<'a>(
+    lanes: impl IntoIterator<Item = Option<&'a str>>,
+    dual: bool,
+    language: Language,
+) -> Option<String> {
+    let problems: Vec<(usize, &str)> = lanes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(lane, status)| Some((lane, status?)))
+        .collect();
+    let (&(lane, first), rest) = problems.split_first()?;
+    let mut text = if dual {
+        language.lane_problem(lane_name(lane), first)
+    } else {
+        first.to_owned()
+    };
+    if !rest.is_empty() {
+        text.push_str(" · ");
+        text.push_str(&language.more_lane_problems(rest.len()));
+    }
+    Some(text)
 }
 
 /// `remaining` is the time until capture resumes by itself, when it is going to.
@@ -918,6 +978,70 @@ impl RowSource {
             Self::Pair(lane, PairSide::Right),
         ]
     }
+}
+
+/// What a scroll bar, or the wheel over the plot's margins, scrolls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollTarget {
+    /// The rows of one stacked logical lane, with one or two lanes.
+    Lane(usize),
+    /// Every row of the plot as one column, with more than two lanes.
+    Plot,
+}
+
+/// With more than two lanes, the plot's left margin holds each lane's letter in a column of
+/// this width, wide enough for "BL", and a stacked lane's channel names after it.
+const LETTER_COLUMN: f32 = 12.0;
+/// The margin for letters alone, with more than two lanes and none stacked.
+const LETTER_GUTTER: f32 = 16.0;
+/// The margin for letters and channel names, with more than two lanes and one stacked.
+const LETTERED_GUTTER: f32 = LETTER_COLUMN + stack::LABEL_GUTTER - 4.0;
+
+/// The plot's left margin for `lanes` lanes, any of them `stacked`, when it needs more than
+/// the usual inset (see `Recorder::label_gutter`).
+fn label_gutter(lanes: usize, stacked: bool) -> Option<f32> {
+    match (lanes > 2, stacked) {
+        (false, false) => None,
+        (false, true) => Some(stack::LABEL_GUTTER),
+        (true, false) => Some(LETTER_GUTTER),
+        (true, true) => Some(LETTERED_GUTTER),
+    }
+}
+
+/// The rows a plot of `lanes` asks the window to grow for: a stacked lane's rows, as always,
+/// and with more than two lanes every row, so many lanes get room before they scroll.
+fn wanted_height(specs: &[stack::LaneRows]) -> Option<f32> {
+    stack::comfortable_height(specs).or_else(|| {
+        (specs.len() > 2).then(|| {
+            specs.iter().map(|lane| lane.rows).sum::<usize>() as f32
+                * stack::COMFORTABLE_ROW_HEIGHT
+        })
+    })
+}
+
+/// Whether a drag past the edge of the plot's column of rows, `offset` below its top, should
+/// scroll it: `Some(true)` down, `Some(false)` up, when it has more rows that way.
+fn column_edge(column: &LaneBox, offset: f32) -> Option<bool> {
+    if !column.scrolls() {
+        return None;
+    }
+    if offset < column.top && column.first > 0 {
+        Some(false)
+    } else if offset >= column.top + column.height && column.first + column.shown < column.rows {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// The row of the plot's column, counted from its top, that row `row` of lane `lane` is.
+fn column_row(lanes: &[LanePlan], lane: usize, row: usize) -> usize {
+    lanes
+        .iter()
+        .take_while(|plan| plan.lane != lane)
+        .map(LanePlan::rows)
+        .sum::<usize>()
+        + row
 }
 
 /// How one lane is drawn: as before, or one row per channel of the group on show.
@@ -1146,8 +1270,8 @@ fn shown_channels(group: &LaneGroup, active: Option<u64>) -> Vec<usize> {
 fn frozen_activity(
     snapshots: &Arc<[FrozenTrack]>,
     lanes: &[usize],
-    hiding: [bool; 2],
-) -> Option<JoinHandle<[Option<u64>; 2]>> {
+    hiding: Vec<bool>,
+) -> Option<JoinHandle<Vec<Option<u64>>>> {
     if !hiding.contains(&true) {
         return None;
     }
@@ -1156,15 +1280,17 @@ fn frozen_activity(
     thread::Builder::new()
         .name("backtracking-frozen-activity".into())
         .spawn(move || {
-            std::array::from_fn(|lane| {
-                let index = lanes.iter().position(|&held| held == lane)?;
-                let track = snapshots.get(index).filter(|_| hiding[lane])?;
-                Some(if track.channels() > 2 {
-                    track.active_channels()
-                } else {
-                    0
+            (0..hiding.len())
+                .map(|lane| {
+                    let index = lanes.iter().position(|&held| held == lane)?;
+                    let track = snapshots.get(index).filter(|_| hiding[lane])?;
+                    Some(if track.channels() > 2 {
+                        track.active_channels()
+                    } else {
+                        0
+                    })
                 })
-            })
+                .collect()
         })
         .ok()
 }
@@ -1325,59 +1451,77 @@ fn row_drag(
 /// The rows a choice of rows names, by logical lane: what a selection writes and plays.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ChosenRows {
-    /// The one lane the rows lie in, or `None` when they lie in both.
+    /// The one lane the rows lie in, or `None` when they lie in more than one.
     lane: Option<usize>,
-    /// By logical lane: the lane-native channels of the channel rows chosen, in order, or
-    /// `None` for the whole lane. Empty when only the pair is chosen.
-    native: [Option<Vec<usize>>; 2],
-    /// By logical lane: whether the pair (either of its rows) is chosen.
-    pair: [bool; 2],
+    /// By logical lane, up to the last lane the rows lie in: the lane-native channels of the
+    /// channel rows chosen, in order, or `None` for the whole lane. Empty when only the pair
+    /// is chosen. A lane past the end has no rows chosen.
+    native: Vec<Option<Vec<usize>>>,
+    /// By logical lane, up to the last lane the rows lie in: whether the pair (either of its
+    /// rows) is chosen.
+    pair: Vec<bool>,
 }
 
 /// What `rows` name, or `None` when no rows are named, which means every row.
 fn chosen_rows(rows: &[RowSource]) -> Option<ChosenRows> {
-    let lanes: Vec<usize> = (0..2)
+    let count = rows.iter().map(|row| row.lane() + 1).max()?;
+    let lanes: Vec<usize> = (0..count)
         .filter(|&lane| rows.iter().any(|row| row.lane() == lane))
         .collect();
     let lane = match lanes.as_slice() {
-        [] => return None,
         [lane] => Some(*lane),
         _ => None,
     };
     let in_lane = |lane: usize| rows.iter().filter(move |row| row.lane() == lane);
-    let pair =
-        std::array::from_fn(|lane| in_lane(lane).any(|row| matches!(row, RowSource::Pair(..))));
-    let native: [Option<Vec<usize>>; 2] = std::array::from_fn(|lane| {
-        in_lane(lane).next()?;
-        let mut channels = Vec::new();
-        for row in in_lane(lane) {
-            match *row {
-                RowSource::View(_, WaveformView::Left) => channels.push(0),
-                RowSource::View(_, WaveformView::Right) => channels.push(1),
-                // A merged row is the whole lane.
-                RowSource::View(..) => return None,
-                RowSource::Channel(_, channel) => channels.push(channel),
-                RowSource::Pair(..) => {}
+    let pair = (0..count)
+        .map(|lane| in_lane(lane).any(|row| matches!(row, RowSource::Pair(..))))
+        .collect();
+    let native: Vec<Option<Vec<usize>>> = (0..count)
+        .map(|lane| {
+            in_lane(lane).next()?;
+            let mut channels = Vec::new();
+            for row in in_lane(lane) {
+                match *row {
+                    RowSource::View(_, WaveformView::Left) => channels.push(0),
+                    RowSource::View(_, WaveformView::Right) => channels.push(1),
+                    // A merged row is the whole lane.
+                    RowSource::View(..) => return None,
+                    RowSource::Channel(_, channel) => channels.push(channel),
+                    RowSource::Pair(..) => {}
+                }
             }
-        }
-        channels.sort_unstable();
-        channels.dedup();
-        Some(channels)
-    });
+            channels.sort_unstable();
+            channels.dedup();
+            Some(channels)
+        })
+        .collect();
     Some(ChosenRows { lane, native, pair })
 }
 
-/// By logical lane: whether `rows` hold every row `lanes` draw of that lane. Such a lane is
-/// written whole, as it is when rows are not separate.
-fn lanes_chosen_whole(lanes: &[LanePlan], rows: &[RowSource]) -> [bool; 2] {
-    std::array::from_fn(|lane| {
-        lanes
-            .iter()
-            .find(|plan| plan.lane == lane)
-            .is_some_and(|plan| {
-                plan.rows() > 0 && (0..plan.rows()).all(|row| rows.contains(&plan.row(row)))
-            })
-    })
+impl ChosenRows {
+    /// What these rows choose of logical lane `lane`.
+    fn lane_choice(&self, lane: usize) -> RowChoice {
+        RowChoice {
+            channels: self.native.get(lane).cloned().flatten(),
+            pair: self.pair.get(lane).copied().unwrap_or(false),
+        }
+    }
+}
+
+/// By logical lane, up to the last lane `lanes` draw: whether `rows` hold every row `lanes`
+/// draw of that lane. Such a lane is written whole, as it is when rows are not separate.
+fn lanes_chosen_whole(lanes: &[LanePlan], rows: &[RowSource]) -> Vec<bool> {
+    let count = lanes.iter().map(|plan| plan.lane + 1).max().unwrap_or(0);
+    (0..count)
+        .map(|lane| {
+            lanes
+                .iter()
+                .find(|plan| plan.lane == lane)
+                .is_some_and(|plan| {
+                    plan.rows() > 0 && (0..plan.rows()).all(|row| rows.contains(&plan.row(row)))
+                })
+        })
+        .collect()
 }
 
 /// Takes this pass's lanes, `planned`, in place of `lanes`, and starts a lane whose group
@@ -1387,7 +1531,7 @@ fn lanes_chosen_whole(lanes: &[LanePlan], rows: &[RowSource]) -> [bool; 2] {
 /// shows once it ends.
 fn take_plans(
     lanes: &mut Vec<LanePlan>,
-    first_row: &mut [usize; 2],
+    first_row: &mut [usize],
     planned: Vec<LanePlan>,
     gesture: bool,
 ) -> Option<Vec<LanePlan>> {
@@ -1404,8 +1548,8 @@ fn take_plans(
                 }
                 _ => false,
             });
-        if !same {
-            first_row[plan.lane] = 0;
+        if let Some(first_row) = first_row.get_mut(plan.lane).filter(|_| !same) {
+            *first_row = 0;
         }
     }
     Some(std::mem::replace(lanes, planned))
@@ -1420,7 +1564,7 @@ fn carry_rows(
     old: &[LanePlan],
     new: &[LanePlan],
     rows: &[RowSource],
-    whole: &mut [bool; 2],
+    whole: &mut [bool],
 ) -> Vec<RowSource> {
     fn kind(lanes: &[LanePlan], lane: usize) -> Option<&LaneKind> {
         lanes
@@ -1581,9 +1725,10 @@ enum WindowFit {
 
 /// What a window `window` points tall does for lanes laid out as `specs`, which have `current`
 /// points of it, and what it then remembers in `growth`. It grows once when a lane starts
-/// stacking rows, and again for rows that appear later while the user has not resized it
-/// since it last grew; rows that go never shrink it. It goes back when no lane stacks any
-/// more, unless the user resized it meanwhile. `cap` is the tallest it may grow to, asked only
+/// stacking rows, or a third lane is added (`wanted_height`), and again for rows that appear
+/// later while the user has not resized it since it last grew; rows that go never shrink it.
+/// It goes back when no lane stacks any more and two lanes or fewer are left, unless the user
+/// resized it meanwhile. `cap` is the tallest it may grow to, asked only
 /// when it grows. While the user drags the window (`window_drag`), or a pointer gesture on the
 /// waveform is in progress (`gesture`), it stays as it is.
 #[allow(clippy::too_many_arguments)]
@@ -1600,7 +1745,7 @@ fn fit_window(
     if window_drag || gesture {
         return WindowFit::Stay;
     }
-    let wanted = stack::comfortable_height(specs);
+    let wanted = wanted_height(specs);
     let regrow = match (wanted, *growth) {
         (Some(wanted), Some(grown)) => {
             wanted > current + 0.5
@@ -1659,29 +1804,31 @@ struct FrozenEdit {
     export_options: ExportOptions,
     /// Channel groups frozen with the audio, by logical lane: every group, not only the one on
     /// show.
-    groups: [Vec<LaneGroup>; 2],
-    shown_groups: [Option<String>; 2],
+    groups: Vec<Vec<LaneGroup>>,
+    shown_groups: Vec<Option<String>>,
     /// Position tracks frozen with the audio, by logical lane.
-    positions: [FrozenPositionTrack; 2],
-    /// Which channels of each logical lane are active in the frozen audio, once known.
-    activity: [Option<u64>; 2],
+    positions: Vec<FrozenPositionTrack>,
+    /// Which channels of each logical lane are active in the frozen audio, once known. A lane
+    /// past the end is not known.
+    activity: Vec<Option<u64>>,
     /// The answer for `activity`, worked out off the window's thread.
-    activity_job: Option<JoinHandle<[Option<u64>; 2]>>,
+    activity_job: Option<JoinHandle<Vec<Option<u64>>>>,
 }
 
 impl FrozenEdit {
     /// The rows `rows` choose, by snapshot (physical order): the lane-native channels of the
     /// channel rows and whether the pair is chosen. No rows choose every row of every lane.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn row_choice(&self, rows: &[RowSource]) -> [RowChoice; 2] {
+    fn row_choice(&self, rows: &[RowSource]) -> Vec<RowChoice> {
         let chosen = chosen_rows(rows);
-        std::array::from_fn(|index| match (chosen.as_ref(), self.lanes.get(index)) {
-            (Some(chosen), Some(&lane)) if lane < 2 => RowChoice {
-                channels: chosen.native[lane].clone(),
-                pair: chosen.pair[lane],
-            },
-            _ => RowChoice::default(),
-        })
+        self.lanes
+            .iter()
+            .map(|&lane| {
+                chosen
+                    .as_ref()
+                    .map_or_else(RowChoice::default, |chosen| chosen.lane_choice(lane))
+            })
+            .collect()
     }
 
     /// Collects the frozen activity once it is worked out. True while it is still coming.
@@ -1723,8 +1870,8 @@ struct EditPreviewKey {
     frames: Range<u64>,
     /// The rows on screen, in drawing order.
     rows: Vec<RowSource>,
-    /// By logical lane: what its pair rows are made from.
-    pairs: [Option<PairGroup>; 2],
+    /// By logical lane: what its pair rows are made from. A lane past the end has none.
+    pairs: Vec<Option<PairGroup>>,
     bins: usize,
 }
 
@@ -1748,39 +1895,45 @@ struct SnapshotSpec {
     /// The rows saved, or none for every row.
     rows: Vec<RowSource>,
     /// By logical lane: `rows` hold every row the window drew of it, so it is saved whole.
-    whole: [bool; 2],
+    /// A lane past the end is not.
+    whole: Vec<bool>,
+    /// Marks a save an add-on asked for, so its reply can list the files (`commands`).
+    tag: Option<u64>,
 }
 
 /// How a clip's files are written: their format, each lane's channels and source name, and
-/// which lanes are saved. Routes, names and `lane` count logical lanes, 0 for A and 1 for B.
+/// which lanes are saved. Routes, names and `lane` count logical lanes, 0 for A, 1 for B and
+/// so on; routes hold one for every lane, and a lane past the end of names or `hide_silent` has
+/// no name and shows its silent rows.
 #[derive(Clone, Debug, PartialEq)]
 struct ClipFormat {
     profile: WavExportProfile,
-    routes: [ChannelRoute; 2],
+    routes: Vec<ChannelRoute>,
     force_mono: bool,
     /// What each lane's source is called in its file name.
-    names: [String; 2],
-    /// One lane of a two-lane recording, or `None` for every lane.
+    names: Vec<String>,
+    /// One lane of a recording of several, or `None` for every lane.
     lane: Option<usize>,
     /// The L/R pair of a wide lane is written binaural rather than as the stereo fold-down.
     pair_binaural: bool,
     /// By logical lane: the lane hides its silent rows, so written whole it writes only the
     /// channels active in its frozen audio, and the pair.
-    hide_silent: [bool; 2],
+    hide_silent: Vec<bool>,
 }
 
 impl ClipFormat {
     /// Every lane, with no source names.
     #[cfg(test)]
-    fn unnamed(routes: [ChannelRoute; 2], force_mono: bool) -> Self {
+    fn unnamed(routes: impl Into<Vec<ChannelRoute>>, force_mono: bool) -> Self {
+        let routes = routes.into();
         Self {
             profile: WavExportProfile::default(),
+            names: vec![String::new(); routes.len()],
+            hide_silent: vec![false; routes.len()],
             routes,
             force_mono,
-            names: Default::default(),
             lane: None,
             pair_binaural: false,
-            hide_silent: [false; 2],
         }
     }
 }
@@ -1841,9 +1994,9 @@ impl SnapshotSpec {
         mut self,
         snapshots: Arc<[FrozenTrack]>,
         lanes: &[usize],
-        groups: &[Vec<LaneGroup>; 2],
+        groups: &[Vec<LaneGroup>],
     ) -> Option<WavClip> {
-        if lanes.len() != snapshots.len() || lanes.iter().any(|&lane| lane > 1) {
+        if lanes.len() != snapshots.len() || lanes.iter().any(|&lane| lane >= MAX_LANES) {
             return None;
         }
         if let Some(flags) = &mut self.flags {
@@ -1860,34 +2013,37 @@ impl SnapshotSpec {
         )
         .and_then(|mut clip| {
             clip.export_options = self.export_options;
+            clip.tag = self.tag;
             clip.with_rows(&self.rows, groups)
         })
-        .map(|clip| clip.whole_lanes(self.whole))
+        .map(|clip| clip.whole_lanes(&self.whole))
     }
 }
 
-fn physical_routes(routes: [ChannelRoute; 2], lanes: &[usize]) -> [ChannelRoute; 2] {
-    std::array::from_fn(|index| {
-        lanes
-            .get(index)
-            .and_then(|&lane| routes.get(lane))
-            .copied()
-            .unwrap_or(ChannelRoute::Merged)
-    })
+/// By physical lane (snapshot order): the route of the logical lane each one holds.
+fn physical_routes(routes: &[ChannelRoute], lanes: &[usize]) -> Vec<ChannelRoute> {
+    lanes
+        .iter()
+        .map(|&lane| routes.get(lane).copied().unwrap_or(ChannelRoute::Merged))
+        .collect()
 }
 
-fn snapshot_groups(snapshot: &EditSnapshot) -> [Option<crate::controller::LaneGroup>; 2] {
-    std::array::from_fn(|index| {
-        let &lane = snapshot.lanes.get(index)?;
-        if lane > 1 {
-            return None;
-        }
-        snapshot.shown_groups[lane]
-            .as_ref()
-            .and_then(|id| snapshot.groups[lane].iter().find(|group| &group.id == id))
-            .or_else(|| snapshot.groups[lane].first())
-            .cloned()
-    })
+/// By physical lane (snapshot order): the group on show of the logical lane each one holds.
+fn snapshot_groups(snapshot: &EditSnapshot) -> Vec<Option<crate::controller::LaneGroup>> {
+    snapshot
+        .lanes
+        .iter()
+        .map(|&lane| {
+            let groups = snapshot.groups.get(lane)?;
+            snapshot
+                .shown_groups
+                .get(lane)
+                .and_then(Option::as_ref)
+                .and_then(|id| groups.iter().find(|group| &group.id == id))
+                .or_else(|| groups.first())
+                .cloned()
+        })
+        .collect()
 }
 
 fn edit_preview(
@@ -1945,7 +2101,8 @@ struct FlagUpdate {
     /// rows are edited separately. Empty marks every row.
     rows: Vec<RowSource>,
     /// By logical lane: whether `rows` held every row of that lane when the flags were left.
-    whole: [bool; 2],
+    /// A lane past the end did not.
+    whole: Vec<bool>,
 }
 
 fn snapshot_source(
@@ -1965,7 +2122,9 @@ fn snapshot_source(
 fn edit_snapshot_matches(snapshot: &EditSnapshot, generation: u64) -> bool {
     snapshot.generation == generation
         && snapshot.lanes.len() == snapshot.snapshots.len()
-        && matches!(snapshot.lanes.as_slice(), [0] | [1] | [0, 1])
+        // One or more logical lanes, in order, each once.
+        && snapshot.lanes.last().is_some_and(|&last| last < MAX_LANES)
+        && snapshot.lanes.windows(2).all(|pair| pair[0] < pair[1])
         && snapshot.snapshots.first().is_some_and(|first| {
             !first.frame_range().is_empty()
                 && snapshot.snapshots.iter().all(|next| {
@@ -2140,7 +2299,7 @@ struct ExportJob {
 
 struct WavClip {
     snapshots: Arc<[FrozenTrack]>,
-    /// The logical lane, 0 for A and 1 for B, of each snapshot.
+    /// The logical lane, 0 for A, 1 for B and so on, of each snapshot.
     lanes: Vec<usize>,
     frames: Range<usize>,
     fades: Fades,
@@ -2150,12 +2309,17 @@ struct WavClip {
     /// `groups` holds, by snapshot, the group on show when the clip was made.
     export_options: ExportOptions,
     /// By snapshot: every channel group frozen with the audio, not only the one on show.
-    groups: [Vec<LaneGroup>; 2],
+    groups: Vec<Vec<LaneGroup>>,
     /// By snapshot: the rows chosen, as lane-native channels and the pair.
-    rows: [RowChoice; 2],
+    rows: Vec<RowChoice>,
+    /// The logical lanes the chosen rows lie in, when rows were chosen in more than one: only
+    /// these are written. `None` writes every lane (or the one in `format.lane`).
+    only: Option<Vec<usize>>,
     /// By snapshot: the position tracks frozen with the audio, when the clip was made from a
     /// frozen view.
-    positions: [Option<FrozenPositionTrack>; 2],
+    positions: Vec<Option<FrozenPositionTrack>>,
+    /// The save an add-on asked for, from `SnapshotSpec::tag`.
+    tag: Option<u64>,
 }
 
 /// The rows of one lane a clip writes.
@@ -2191,6 +2355,7 @@ impl WavClip {
         }
         let start = usize::try_from(selected.start - visible.start).ok()?;
         let end = usize::try_from(selected.end - visible.start).ok()?;
+        let count = snapshots.len();
         Some(Self {
             snapshots,
             lanes: lanes.to_vec(),
@@ -2200,20 +2365,21 @@ impl WavClip {
             format,
             flags,
             export_options: ExportOptions::default(),
-            groups: Default::default(),
-            rows: Default::default(),
-            positions: [None, None],
+            groups: vec![Vec::new(); count],
+            rows: vec![RowChoice::default(); count],
+            only: None,
+            positions: vec![None; count],
+            tag: None,
         })
     }
 
     /// Hands the clip the position tracks frozen with its audio, by logical lane.
-    fn with_positions(mut self, positions: &[FrozenPositionTrack; 2]) -> Self {
-        self.positions = std::array::from_fn(|index| {
-            self.lanes
-                .get(index)
-                .and_then(|&lane| positions.get(lane))
-                .cloned()
-        });
+    fn with_positions(mut self, positions: &[FrozenPositionTrack]) -> Self {
+        self.positions = self
+            .lanes
+            .iter()
+            .map(|&lane| positions.get(lane).cloned())
+            .collect();
         self
     }
 
@@ -2221,14 +2387,12 @@ impl WavClip {
     /// of a lane only the channels of its rows. `groups` are the channel groups frozen with
     /// the audio, by logical lane; the rows' own group names their files, even when another
     /// group is on show now.
-    fn with_rows(mut self, rows: &[RowSource], groups: &[Vec<LaneGroup>; 2]) -> Option<Self> {
-        self.groups = std::array::from_fn(|index| {
-            self.lanes
-                .get(index)
-                .and_then(|&lane| groups.get(lane))
-                .cloned()
-                .unwrap_or_default()
-        });
+    fn with_rows(mut self, rows: &[RowSource], groups: &[Vec<LaneGroup>]) -> Option<Self> {
+        self.groups = self
+            .lanes
+            .iter()
+            .map(|&lane| groups.get(lane).cloned().unwrap_or_default())
+            .collect();
         let Some(chosen) = chosen_rows(rows) else {
             return Some(self);
         };
@@ -2237,26 +2401,34 @@ impl WavClip {
                 return None;
             }
             self.format.lane = Some(lane);
+        } else {
+            // Rows in some lanes of many: the lanes without a chosen row are left out, as a
+            // lane is when the rows lie in one other lane.
+            let mut only: Vec<usize> = rows.iter().map(|row| row.lane()).collect();
+            only.sort_unstable();
+            only.dedup();
+            if only.iter().any(|lane| !self.lanes.contains(lane)) {
+                return None;
+            }
+            self.only = Some(only);
         }
         for (index, &lane) in self.lanes.iter().enumerate() {
-            let channels = chosen.native[lane].clone();
+            let choice = chosen.lane_choice(lane);
             let track = self.snapshots.get(index)?;
-            if channels
+            if choice
+                .channels
                 .as_ref()
                 .is_some_and(|channels| channels.iter().any(|&channel| channel >= track.channels()))
             {
                 return None;
             }
-            self.rows[index] = RowChoice {
-                channels,
-                pair: chosen.pair[lane],
-            };
+            self.rows[index] = choice;
         }
         Some(self)
     }
 
     /// Writes the lanes in `whole` (by logical lane) whole: their rows were every row drawn.
-    fn whole_lanes(mut self, whole: [bool; 2]) -> Self {
+    fn whole_lanes(mut self, whole: &[bool]) -> Self {
         for (index, &lane) in self.lanes.iter().enumerate() {
             if whole.get(lane).copied().unwrap_or(false) {
                 self.rows[index] = RowChoice::default();
@@ -2271,7 +2443,8 @@ impl WavClip {
         let Some(track) = self.snapshots.get(index) else {
             return LaneWrite::default();
         };
-        let choice = &self.rows[index];
+        let default = RowChoice::default();
+        let choice = self.rows.get(index).unwrap_or(&default);
         let active = (track.channels() > 2
             && choice.channels.is_none()
             && self
@@ -2282,77 +2455,96 @@ impl WavClip {
         lane_write(
             track.channels(),
             choice,
-            &self.groups[index],
-            self.export_options.groups[index].as_ref(),
+            self.groups.get(index).map_or(&[], Vec::as_slice),
+            self.export_options
+                .groups
+                .get(index)
+                .and_then(Option::as_ref),
             active,
         )
     }
 
     /// The snapshots written: every one, or the one of the lane saved on its own.
-    fn saved(&self) -> Range<usize> {
+    /// The snapshots written, in order: the one lane chosen, the lanes the chosen rows lie in,
+    /// or every lane.
+    fn saved(&self) -> Vec<usize> {
         let one = self
             .format
             .lane
             .and_then(|lane| self.lanes.iter().position(|&held| held == lane));
-        one.map_or(0..self.snapshots.len(), |index| index..index + 1)
+        if let Some(index) = one {
+            return vec![index];
+        }
+        (0..self.snapshots.len())
+            .filter(|&index| {
+                self.only
+                    .as_ref()
+                    .is_none_or(|only| only.contains(&self.lanes[index]))
+            })
+            .collect()
     }
 
     fn write(self, keep: bool) -> io::Result<ExportedWav> {
         let format = &self.format;
         let saved = self.saved();
-        // A lane saved on its own keeps its letter, so its file still says which lane it was.
-        let labels: Vec<_> = self.lanes[saved.clone()]
+        // Every file of a recording of several lanes carries its lane's letter. A lane saved
+        // on its own keeps it, so its file still says which lane it was.
+        let labels: Vec<_> = saved
             .iter()
-            .map(|&lane| {
-                let letter = (self.snapshots.len() == 2)
+            .map(|&index| self.lanes[index])
+            .map(|lane| {
+                let letter = (self.snapshots.len() >= 2)
                     .then(|| Lane::from_index(lane))
                     .flatten();
-                TakeLabel::new(format.names[lane].as_str(), letter)
+                TakeLabel::new(format.names.get(lane).map_or("", String::as_str), letter)
             })
             .collect();
-        let routes = physical_routes(format.routes, &self.lanes);
+        let routes = physical_routes(&format.routes, &self.lanes);
         // Everything is held by snapshot, so it moves along with the snapshots written: a
         // B-only save hands B's rows, groups and positions over in the first place.
-        let writes: [LaneWrite; 2] = std::array::from_fn(|slot| {
-            if saved.start + slot < saved.end {
-                self.lane_write(saved.start + slot)
-            } else {
-                LaneWrite::default()
-            }
-        });
+        let writes: Vec<LaneWrite> = saved.iter().map(|&index| self.lane_write(index)).collect();
         let mut options = self.export_options.clone();
-        options.groups = std::array::from_fn(|slot| writes[slot].shown.clone());
-        let rows: [clip_export::RowExport<'_>; 2] = std::array::from_fn(|slot| {
-            let write = &writes[slot];
-            clip_export::RowExport {
+        options.groups = writes.iter().map(|write| write.shown.clone()).collect();
+        let rows: Vec<clip_export::RowExport<'_>> = writes
+            .iter()
+            .zip(saved.iter().copied())
+            .map(|(write, index)| clip_export::RowExport {
                 channels: write.channels.clone(),
                 pair: write.pair,
                 pair_binaural: format.pair_binaural,
                 bed: write.bed.as_ref(),
-                positions: self
-                    .positions
-                    .get(saved.start + slot)
-                    .filter(|_| saved.start + slot < saved.end)
-                    .and_then(Option::as_ref),
-            }
-        });
+                positions: self.positions.get(index).and_then(Option::as_ref),
+            })
+            .collect();
+        // Frozen tracks share the capture's pages, so the copies are cheap.
+        let snapshots: Vec<FrozenTrack> = saved
+            .iter()
+            .map(|&index| self.snapshots[index].clone())
+            .collect();
+        let routes: Vec<ChannelRoute> = saved.iter().map(|&index| routes[index]).collect();
         let written = clip_export::export_rows(
             &self.output,
-            &self.snapshots[saved.clone()],
+            &snapshots,
             self.frames.clone(),
             self.fades,
             format.profile,
-            &routes[saved],
+            &routes,
             format.force_mono,
             &labels,
             &options,
             &rows,
         )?;
+        let lanes = written
+            .tracks
+            .iter()
+            .map(|track| track.and_then(|track| saved.get(track)).map(|&index| self.lanes[index]))
+            .collect();
         let mut result = ExportedWav {
             paths: written.paths,
             objects_in_mono: written.objects_in_mono,
             keep,
             flags: self.flags,
+            lanes,
         };
         if !keep {
             for path in &mut result.paths {
@@ -2370,6 +2562,8 @@ struct ExportedWav {
     objects_in_mono: bool,
     keep: bool,
     flags: Option<FlagUpdate>,
+    /// By path: the logical lane whose audio it holds, when that is known.
+    lanes: Vec<Option<usize>>,
 }
 
 type WavPayload = Arc<std::sync::Mutex<Option<WavClip>>>;
@@ -2546,7 +2740,11 @@ impl Recorder {
             saved_accent: accent_color(settings.accent),
             theme: Theme::default(),
             look: AddonLook::new(settings.addon_look),
-            meter_modes: [settings.meter_mode, settings.meter_b_mode],
+            waveform_coloring: settings.waveform_coloring,
+            saved_waveform_gradient: settings.waveform_gradient.clone(),
+            waveform_gradient: settings.waveform_gradient,
+            waveform_colors: WaveformColors::default(),
+            meter_modes: lane_meter_modes(settings.meter_modes),
             split_waveform: settings.split_waveform,
             wav_profile: settings.wav_profile,
             wav_force_mono: settings.wav_force_mono,
@@ -2554,7 +2752,7 @@ impl Recorder {
             force_wide_export_menu: false,
             pair_render: settings.pair_render,
             hide_silent: settings.hide_silent_channels,
-            activity: Default::default(),
+            activity: vec![ChannelActivity::default(); MAX_LANES],
             head_models: Vec::new(),
             source_names: settings.source_names,
             last_interaction: Instant::now(),
@@ -2562,10 +2760,14 @@ impl Recorder {
             peaks: Vec::new(),
             peak_rows: Vec::new(),
             lanes: Vec::new(),
-            lane_first_row: [0; 2],
+            lane_first_row: vec![0; MAX_LANES],
+            plot_first_row: 0,
             scroll_drag: None,
             lane_controls: Vec::new(),
             lane_scroll_zones: Vec::new(),
+            meter_list_open: false,
+            meter_list_rect: None,
+            options_scroll: None,
             growth: None,
             plot_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(610.0, DEFAULT_WAVEFORM_HEIGHT)),
             editing: None,
@@ -2589,7 +2791,7 @@ impl Recorder {
             selection: None,
             separate_rows: false,
             selection_rows: Vec::new(),
-            selection_whole: [false; 2],
+            selection_whole: vec![false; MAX_LANES],
             drag_row: None,
             edge_scroll: None,
             lane_key: None,
@@ -2617,6 +2819,9 @@ impl Recorder {
             test_copy: false,
             auto_grow: true,
             harness: None,
+            snapshot_save_tag: None,
+            control: commands::Control::default(),
+            selection_by: None,
         }
     }
 
@@ -2628,6 +2833,30 @@ impl Recorder {
     fn save_preference(&mut self, key: Key, value: impl AsRef<str>) {
         if let Err(error) = self.write_preference(key, value.as_ref()) {
             self.message = format!("Could not save settings: {error}");
+        }
+    }
+
+    /// Saves the lanes: A and B as older versions read them, and every lane in full.
+    fn save_sources(&mut self, sources: &[Option<SourceSettings>]) {
+        self.save_preference(Key::CaptureSources, serialize_sources(sources));
+        self.save_preference(Key::CaptureLanes, serialize_lanes(sources));
+    }
+
+    /// Saves the meter unit of `lane`: lanes A and B under the keys older versions read, the
+    /// lanes after them one line each, up to the last that is not in decibels.
+    fn save_meter_mode(&mut self, lane: usize) {
+        match lane {
+            0 => self.save_preference(Key::Meter, self.meter_modes[0].unit()),
+            1 => self.save_preference(Key::MeterB, self.meter_modes[1].unit()),
+            _ => {
+                let kept = self
+                    .meter_modes
+                    .iter()
+                    .rposition(|&mode| mode != MeterMode::Dbfs)
+                    .map_or(0, |last| last + 1);
+                let units = serialize_meter_units_after_b(&self.meter_modes[..kept]);
+                self.save_preference(Key::MeterUnitsAfterB, units);
+            }
         }
     }
 
@@ -2815,8 +3044,14 @@ impl Recorder {
         self.refresh_waveform();
     }
 
+    /// Whether there is more than one lane, so each one is named by its letter.
     fn dual_source(&self) -> bool {
-        self.controller.sources()[1].is_some()
+        self.lane_count() > 1
+    }
+
+    /// How many lanes there are, from 1 to `MAX_LANES`.
+    fn lane_count(&self) -> usize {
+        self.controller.lane_count()
     }
 
     /// How many rows the lanes draw, on screen or scrolled out.
@@ -3008,7 +3243,9 @@ impl Recorder {
         let activity_job = frozen_activity(
             &snapshots,
             &snapshot.lanes,
-            [0, 1].map(|lane| self.hides_silent_rows(lane)),
+            (0..self.lane_count())
+                .map(|lane| self.hides_silent_rows(lane))
+                .collect(),
         );
         let frames = snapshots[0].frame_range();
         if let Some(selection) = &mut self.selection {
@@ -3028,7 +3265,7 @@ impl Recorder {
             groups,
             shown_groups,
             positions: snapshot.positions,
-            activity: [None; 2],
+            activity: Vec::new(),
             activity_job,
         });
         if let Some((_, arrived)) = &mut self.edit_opening {
@@ -3063,7 +3300,7 @@ impl Recorder {
                 peaks.low.fill(0.0);
                 peaks.high.fill(0.0);
             }
-            self.lane_first_row = [0; 2];
+            self.lane_first_row.fill(0);
             self.scroll_drag = None;
         }
     }
@@ -3072,7 +3309,7 @@ impl Recorder {
         &mut self,
         frames: Range<u64>,
         rows: Vec<RowSource>,
-        whole: [bool; 2],
+        whole: Vec<bool>,
     ) -> FlagUpdate {
         self.flag_order += 1;
         FlagUpdate {
@@ -3108,6 +3345,7 @@ impl Recorder {
 
     fn reset_snapshot(&mut self) {
         self.selection = None;
+        self.selection_by = None;
         self.fades = Fades::NONE;
         self.discard_editing();
         self.live_revision = None;
@@ -3245,9 +3483,9 @@ impl Recorder {
             })
             .collect::<Option<_>>()
             .ok_or(SELECTION_UNAVAILABLE)?;
-        let positions: [Option<&FrozenPositionTrack>; 2] =
-            std::array::from_fn(|index| positions.get(index).and_then(Option::as_ref));
-        Preview::with_positions(
+        let positions: Vec<Option<&FrozenPositionTrack>> =
+            positions.iter().map(Option::as_ref).collect();
+        Preview::with_lane_positions(
             &lanes,
             frames,
             model,
@@ -3536,6 +3774,7 @@ impl Recorder {
                 || self.preview.is_some(),
             // Add-on manager replies arrive without a repaint of their own.
             polling: self.source_list_worker.is_some()
+                || self.control.waiting()
                 || self.addons_page.waiting()
                 || self.addon_sources.waiting()
                 // The frozen activity says which rows a frozen view shows.
@@ -3574,7 +3813,7 @@ impl Recorder {
                 .map(|started| ctx.input(|input| input.time) - started),
             meters_live: !self.waveform_only
                 && self.show_meters
-                && (meter_shown(0) || (self.dual_source() && meter_shown(1))),
+                && (0..self.lane_count()).any(meter_shown),
             fine_edit: Some(now.saturating_duration_since(self.last_interaction))
                 .filter(|&since| since < FINE_EDIT_SETTLE),
             waveform: (live && self.live_revision != Some(self.controller.revision()))
@@ -3630,7 +3869,9 @@ impl Recorder {
         let key = EditPreviewKey {
             frames: visible,
             rows: self.visible_rows(),
-            pairs: [0, 1].map(|lane| self.lane_pair(lane).cloned()),
+            pairs: (0..self.lane_count())
+                .map(|lane| self.lane_pair(lane).cloned())
+                .collect(),
             bins: policy.bins,
         };
         if let Some(job) = &self.edit_preview
@@ -3714,7 +3955,7 @@ impl Recorder {
     fn lane_plans(&self) -> Vec<LanePlan> {
         let dual = self.dual_source();
         let edit = self.editing.as_ref();
-        (0..if dual { 2 } else { 1 })
+        (0..self.lane_count())
             .map(|lane| {
                 let channels = edit
                     .and_then(|edit| edit.track(lane))
@@ -3723,8 +3964,8 @@ impl Recorder {
                 if let Some(channels) = channels.filter(|&channels| channels > 2) {
                     let (groups, shown) = match edit {
                         Some(edit) => (
-                            edit.groups[lane].as_slice(),
-                            edit.shown_groups[lane].as_deref(),
+                            edit.groups.get(lane).map_or(&[][..], Vec::as_slice),
+                            edit.shown_groups.get(lane).and_then(Option::as_deref),
                         ),
                         None => (
                             self.controller.lane_groups(lane),
@@ -3794,8 +4035,11 @@ impl Recorder {
         if !self.hides_silent_rows(lane) {
             return None;
         }
-        let live = self.activity[lane].shown;
-        let frozen = self.editing.as_ref().and_then(|edit| edit.activity[lane]);
+        let live = self.activity.get(lane).and_then(|activity| activity.shown);
+        let frozen = self
+            .editing
+            .as_ref()
+            .and_then(|edit| edit.activity.get(lane).copied().flatten());
         Some(frozen.or(live).unwrap_or(0))
     }
 
@@ -3803,12 +4047,16 @@ impl Recorder {
     /// active, while capture runs. The answer comes from the channel activity worker and never
     /// makes the window wait.
     fn update_activity(&mut self) {
-        let hiding = [0, 1].map(|lane| self.hides_silent_rows(lane));
+        let hiding: Vec<bool> = (0..self.lane_count())
+            .map(|lane| self.hides_silent_rows(lane))
+            .collect();
         if let Some(edit) = &mut self.editing {
             // Hiding turned on while the view is frozen: work out the frozen activity now.
             if !edit.poll_activity()
-                && (0..2).any(|lane| {
-                    hiding[lane] && edit.activity[lane].is_none() && edit.lanes.contains(&lane)
+                && (0..hiding.len()).any(|lane| {
+                    hiding[lane]
+                        && edit.activity.get(lane).copied().flatten().is_none()
+                        && edit.lanes.contains(&lane)
                 })
             {
                 edit.activity_job = frozen_activity(&edit.snapshots, &edit.lanes, hiding);
@@ -3820,7 +4068,7 @@ impl Recorder {
         }
         let now = Instant::now();
         let generation = self.controller.generation();
-        for lane in 0..2 {
+        for lane in 0..self.activity.len() {
             if !self.hides_silent_rows(lane) {
                 self.activity[lane] = ChannelActivity::default();
                 continue;
@@ -3870,9 +4118,16 @@ impl Recorder {
             self.next_refresh = Instant::now();
         }
         // A taller window shows more rows; never leave empty space below the last one.
-        let boxes = self.lane_boxes(self.timeline_rect(self.plot_rect).height());
+        let height = self.timeline_rect(self.plot_rect).height();
+        if let Some(column) = self.column(height) {
+            self.plot_first_row = column.first;
+            return;
+        }
+        let boxes = self.lane_boxes(height);
         for (plan, lane_box) in self.lanes.iter().zip(&boxes) {
-            self.lane_first_row[plan.lane] = lane_box.first;
+            if let Some(first_row) = self.lane_first_row.get_mut(plan.lane) {
+                *first_row = lane_box.first;
+            }
         }
     }
 
@@ -3888,9 +4143,32 @@ impl Recorder {
             .and_then(LanePlan::pair_group)
     }
 
+    /// Whether the plot's rows scroll as one column rather than lane by lane: with more than
+    /// two lanes, which could otherwise each scroll on their own or be squeezed to nothing.
+    fn scrolls_as_column(&self) -> bool {
+        self.lanes.len() > 2
+    }
+
+    /// The plot's rows as one column in a plot area this high, while they scroll as one.
+    fn column(&self, height: f32) -> Option<LaneBox> {
+        if !self.scrolls_as_column() {
+            return None;
+        }
+        let specs: Vec<_> = self.lanes.iter().map(LanePlan::spec).collect();
+        Some(stack::lay_out_column(height, &specs, self.plot_first_row).1)
+    }
+
+    /// The plot's column of rows when it has more than fit and scrolls.
+    fn scrolling_column(&self, height: f32) -> Option<LaneBox> {
+        self.column(height).filter(LaneBox::scrolls)
+    }
+
     /// Where each lane's rows go in a plot area this high.
     fn lane_boxes(&self, height: f32) -> Vec<LaneBox> {
         let specs: Vec<_> = self.lanes.iter().map(LanePlan::spec).collect();
+        if self.scrolls_as_column() {
+            return stack::lay_out_column(height, &specs, self.plot_first_row).0;
+        }
         let first: Vec<_> = self
             .lanes
             .iter()
@@ -3909,13 +4187,32 @@ impl Recorder {
             .collect()
     }
 
+    /// Scrolls a stacked lane so `row` is its first on screen; with more than two lanes, the
+    /// whole plot, so that row of the lane is at its top.
     fn scroll_lane_to(&mut self, lane: usize, row: usize) {
+        if self.scrolls_as_column() {
+            self.scroll_plot_to(column_row(&self.lanes, lane, row));
+            return;
+        }
         let Some(slot) = self.lane_first_row.get_mut(lane) else {
             return;
         };
         if *slot != row {
             *slot = row;
             // Clamped to the lane's last page, then rendered on the next pass.
+            self.update_lanes();
+            self.live_revision = None;
+            self.next_refresh = Instant::now();
+            self.last_interaction = Instant::now();
+        }
+    }
+
+    /// Scrolls the plot's column of rows so row `first` of it is at the top, or as near as the
+    /// last row allows.
+    fn scroll_plot_to(&mut self, first: usize) {
+        if self.plot_first_row != first {
+            self.plot_first_row = first;
+            // Clamped to the last page, then rendered on the next pass.
             self.update_lanes();
             self.live_revision = None;
             self.next_refresh = Instant::now();
@@ -4005,10 +4302,31 @@ impl Recorder {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.options_button(ui, !interaction_blocked && self.gesture.is_none());
                 if self.show_meters {
-                    if self.dual_source() {
-                        self.meter_readout(ui, 1);
+                    // Right to left: the last lane's readout first. One or two lanes always
+                    // show every readout; past that, those of the first lanes that fit, and a
+                    // "+N" button for the list of every lane's meter.
+                    let count = self.lane_count();
+                    let shown = if count <= 2 {
+                        count
+                    } else {
+                        let spacing = ui.spacing().item_spacing.x;
+                        meters_shown(
+                            count,
+                            ui.available_width(),
+                            METER_WIDTH_SHARED + spacing,
+                            MORE_METERS_WIDTH + spacing,
+                        )
+                    };
+                    if shown < count {
+                        self.more_meters_button(ui, count - shown, interaction_blocked);
+                    } else {
+                        self.close_meter_list();
                     }
-                    self.meter_readout(ui, 0);
+                    for lane in (0..shown).rev() {
+                        self.meter_readout(ui, lane);
+                    }
+                } else {
+                    self.close_meter_list();
                 }
             });
         });
@@ -4097,7 +4415,7 @@ impl Recorder {
             self.controller
                 .error()
                 .map(|error| language.source_message(error)),
-            [0, 1].map(|lane| {
+            (0..self.lane_count()).map(|lane| {
                 self.controller
                     .source_status(lane)
                     .map(|status| language.source_message(status))
@@ -4122,15 +4440,35 @@ impl Recorder {
                 Some(rows) => format!("Selection · {}", self.rows_name(rows)),
                 None => "Selection".to_owned(),
             };
+            let selection = match self.selection_by.as_deref().filter(|_| selecting) {
+                Some(addon) => Language::current().by_addon(&selection, addon),
+                None => selection,
+            };
             if paused {
                 format!("{selection} / Paused")
             } else {
                 selection
             }
         } else {
+            // A lane's problem stays in view, before the last message, until it is solved.
+            let language = Language::current();
+            let problem = lanes_problem(
+                (0..self.lane_count()).map(|lane| {
+                    self.controller
+                        .source_status(lane)
+                        .map(|status| language.source_message(status))
+                }),
+                self.dual_source(),
+                language,
+            );
+            let message = match problem {
+                Some(problem) if self.message.is_empty() => problem,
+                Some(problem) => format!("{problem} · {}", self.message),
+                None => self.message.clone(),
+            };
             idle_status(
                 paused.then(|| paused_status(self.auto_resume_remaining())),
-                &self.message,
+                &message,
             )
         }
     }
@@ -4268,7 +4606,11 @@ impl Recorder {
         } else {
             format!("{number} {}", mode.unit())
         };
-        let width = if self.dual_source() { 91.0 } else { 102.0 };
+        let width = if self.dual_source() {
+            METER_WIDTH_SHARED
+        } else {
+            102.0
+        };
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 24.0), egui::Sense::hover());
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Status, true, &text));
         if unmeasured {
@@ -4289,6 +4631,112 @@ impl Recorder {
             egui::FontId::monospace(if self.dual_source() { 10.0 } else { 12.0 }),
             ui.visuals().text_color(),
         );
+    }
+
+    /// The "+N" button beside the meters that do not fit, `hidden` of them, and the list of
+    /// every lane's meter it opens and closes.
+    fn more_meters_button(&mut self, ui: &mut egui::Ui, hidden: usize, menu_open: bool) {
+        let language = Language::current();
+        let text = format!("+{hidden}");
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(MORE_METERS_WIDTH, 24.0),
+            if menu_open {
+                egui::Sense::hover()
+            } else {
+                egui::Sense::click()
+            },
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::Role::Button,
+                !menu_open,
+                self.meter_list_open,
+                language.more_meters(hidden),
+            )
+        });
+        if response.clicked() {
+            self.toggle_meter_list();
+        }
+        let hovered = response.hovered();
+        response.on_hover_text(language.more_meters(hidden));
+        let visuals = ui.visuals();
+        let fill = if self.meter_list_open || hovered {
+            visuals.widgets.hovered.bg_fill
+        } else {
+            visuals.widgets.inactive.bg_fill
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, 5.0, fill);
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::monospace(10.0),
+            ui.visuals().text_color(),
+        );
+        if self.meter_list_open {
+            self.meter_list(ui.ctx(), rect);
+        } else {
+            self.meter_list_rect = None;
+        }
+    }
+
+    /// Opens or closes the list of every lane's meter, as the "+N" button does.
+    fn toggle_meter_list(&mut self) {
+        self.meter_list_open = !self.meter_list_open;
+        self.last_interaction = Instant::now();
+    }
+
+    fn close_meter_list(&mut self) {
+        self.meter_list_open = false;
+        self.meter_list_rect = None;
+    }
+
+    /// Every lane's meter, in rows under the "+N" button at `anchor`, inside the window. A
+    /// press outside the list and its button, or Escape, closes it.
+    fn meter_list(&mut self, ctx: &egui::Context, anchor: Rect) {
+        let window = ctx.content_rect();
+        let count = self.lane_count();
+        let each = METER_WIDTH_SHARED + 4.0;
+        let columns = (((window.width() - 24.0) / each).floor() as usize).clamp(1, 6);
+        let width = columns as f32 * each - 4.0;
+        let top = anchor.bottom() + 4.0;
+        let max_height = (window.bottom() - top - 16.0).max(30.0);
+        let shown = egui::Area::new(egui::Id::unique("meter-list"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .fixed_pos(Pos2::new(anchor.right(), top))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(max_height)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = Vec2::splat(4.0);
+                            for row in (0..count).collect::<Vec<_>>().chunks(columns) {
+                                ui.horizontal(|ui| {
+                                    ui.set_width(width);
+                                    for &lane in row {
+                                        self.meter_readout(ui, lane);
+                                    }
+                                });
+                            }
+                        });
+                });
+            });
+        let area = shown.response.rect;
+        self.meter_list_rect = Some(area);
+        let (pressed, escape) = ctx.input(|input| {
+            let pressed = input.pointer.any_pressed()
+                && input
+                    .pointer
+                    .interact_pos()
+                    .is_some_and(|point| !area.contains(point) && !anchor.contains(point));
+            (pressed, input.key_pressed(egui::Key::Escape))
+        });
+        if pressed || escape {
+            self.meter_list_open = false;
+            self.meter_list_rect = None;
+        }
     }
 
     fn pin_button(&mut self, ui: &mut egui::Ui, menu_open: bool) {
@@ -4596,9 +5044,7 @@ impl Recorder {
                 ui.add_space(2.0);
                 ui.separator();
                 ui.add_space(6.0);
-                egui::ScrollArea::vertical()
-                    .id_salt(self.options_section)
-                    .auto_shrink([false, false])
+                options_page_area(self.options_section, self.options_scroll.take())
                     .show(ui, |ui| {
                         options_list(ui, |ui| match self.options_section {
                             OptionsSection::Actions => {
@@ -4886,6 +5332,7 @@ impl Recorder {
         });
         self.accent_settings(ui);
         self.addon_look_settings(ui);
+        self.waveform_color_settings(ui);
         ui.separator();
         options_group_heading(ui, "Show");
         if ui
@@ -5026,7 +5473,7 @@ impl Recorder {
             });
         });
         let dual = self.dual_source();
-        for lane in 0..if dual { 2 } else { 1 } {
+        for lane in 0..self.lane_count() {
             let label = if dual {
                 format!("Meter {}", lane_name(lane))
             } else {
@@ -5042,10 +5489,7 @@ impl Recorder {
                             .into_iter()
                             .map(|mode| (mode, mode.unit().to_owned())),
                     ) {
-                        self.save_preference(
-                            if lane == 0 { Key::Meter } else { Key::MeterB },
-                            self.meter_modes[lane].unit(),
-                        );
+                        self.save_meter_mode(lane);
                     }
                 })
             });
@@ -5079,13 +5523,24 @@ impl Recorder {
         let scanning = self.source_list_worker.is_some();
         let mut source_menu_opened = false;
         let mut open_menu = None;
+        // One section per lane, in order, then the control that adds one. A lane after A also
+        // offers Off, as lane B always did; Off and Remove take the lane out.
         let mut sources = self.controller.sources().clone();
-        let dual = sources[1].is_some();
+        let count = sources.len();
+        let dual = count > 1;
         let mut names_changed = false;
+        let mut added = None;
+        let channels_in_use: usize = (0..count)
+            .filter_map(|lane| self.controller.track_channels(lane))
+            .sum();
         ui.add_enabled_ui(self.gesture.is_none(), |ui| {
             for (lane, settings) in sources.iter_mut().enumerate() {
                 ui.push_id(lane, |ui| {
-                    options_group_heading(ui, &format!("Source {}", lane_name(lane)));
+                    let title = format!("Source {}", lane_name(lane));
+                    if source_heading(ui, &title, dual, language, lane) {
+                        *settings = None;
+                        return;
+                    }
                     let configured = settings.clone();
                     let mut source = configured.as_ref().map(|settings| settings.source.clone());
                     options_field(ui, "Audio source", |ui| {
@@ -5115,38 +5570,23 @@ impl Recorder {
                             .width(width)
                             .height(options_menu_height(
                                 ui,
-                                choices.len() + usize::from(lane == 1),
+                                choices.len() + usize::from(lane > 0),
                             ))
                             .truncate()
                             .show_ui(ui, |ui| {
                                 configure_options_menu(ui, width);
                                 open_menu = Some(ui.layer_id());
-                                if lane == 1 {
+                                if lane > 0 {
                                     ui.selectable_value(&mut source, None, "Off");
                                 }
                                 source_menu_opened |= !was_open;
-                                if !was_open || scanning {
-                                    ui.spinner();
-                                    return;
-                                }
-                                for choice in choices {
-                                    let selected = source
-                                        .as_ref()
-                                        .is_some_and(|source| choice.same_source(source));
-                                    let label = source_picker_label(choice, choices);
-                                    let row = ui.selectable_label(selected, label.as_ref());
-                                    if row.clicked() && !selected {
-                                        source = Some(choice.clone());
-                                    }
-                                    match choice {
-                                        CaptureSource::Application { path, .. } => {
-                                            row.on_hover_text(path);
-                                        }
-                                        CaptureSource::Sender { id, .. } => {
-                                            row.on_hover_text(format!("Sender instance {id}"));
-                                        }
-                                        _ => {}
-                                    }
+                                if let Some(choice) = source_menu_rows(
+                                    ui,
+                                    choices,
+                                    !was_open || scanning,
+                                    source.as_ref(),
+                                ) {
+                                    source = Some(choice);
                                 }
                             })
                             .response
@@ -5256,11 +5696,54 @@ impl Recorder {
                     if !covered && let Some(status) = self.controller.source_status(lane) {
                         options_note(ui, language.source_message(status));
                     }
-                    if lane == 0 {
-                        ui.separator();
-                    }
+                    ui.separator();
                 });
             }
+            // Adding a lane: the same list of sources, from which a choice becomes the next
+            // lane. Past the last lane there can be, it says why there is no more.
+            let full = count >= MAX_LANES;
+            options_field(ui, language.add_source_field(), |ui| {
+                let menu = "add-source";
+                let width = options_control_width(ui);
+                let text = if full {
+                    language.no_more_sources()
+                } else {
+                    language.choose_source()
+                };
+                ui.add_enabled_ui(!full, |ui| {
+                    // Asked of the same `ui` the list is made in: its id is part of the
+                    // list's own.
+                    let was_open = egui::ComboBox::is_open(
+                        ui.ctx(),
+                        ui.make_persistent_id(egui::IdSalt::new(menu)),
+                    );
+                    egui::ComboBox::from_id_salt(menu)
+                        .selected_text(text)
+                        .width(width)
+                        .height(options_menu_height(ui, choices.len()))
+                        .truncate()
+                        .show_ui(ui, |ui| {
+                            configure_options_menu(ui, width);
+                            open_menu = Some(ui.layer_id());
+                            source_menu_opened |= !was_open;
+                            added = source_menu_rows(ui, choices, !was_open || scanning, None);
+                        })
+                        .response
+                        .on_hover_text(language.add_source_tip())
+                        .on_disabled_hover_text(language.sources_full());
+                });
+            });
+            if full {
+                options_note(ui, language.sources_full());
+            }
+            options_note(ui, language.channels_in_use(channels_in_use));
+            if channels_in_use >= CHANNEL_LIMIT && !full {
+                options_note(ui, language.channels_full());
+            }
+            if let Some(note) = history_note.as_deref() {
+                options_note(ui, note);
+            }
+            options_note(ui, language.sources_restart_history(dual));
         });
         self.source_menu = open_menu;
         if names_changed {
@@ -5269,19 +5752,68 @@ impl Recorder {
         if source_menu_opened {
             self.refresh_source_list();
         }
-        if sources != *self.controller.sources() {
-            if sources[1].is_none() {
-                // The next pair of sources starts with every row edited together.
-                self.separate_rows = false;
-            }
-            self.save_preference(Key::CaptureSources, serialize_sources(&sources));
-            self.controller.set_sources(sources);
-            self.sync_generation();
+        if let Some(source) = added {
+            sources.push(Some(SourceSettings {
+                source,
+                route: ChannelRoute::Merged,
+            }));
         }
+        // A lane turned off is taken out, and the lanes after it move up.
+        self.apply_sources(sources);
         if go_to_addons {
             self.options_section = OptionsSection::Addons;
         }
         action
+    }
+
+    /// Records `sources` from now on, as the Sources page leaves them. A lane that is `None`
+    /// is taken out and the lanes after it move up a letter, their meter units with them. Any
+    /// change starts a new, empty history (`Controller::set_sources`) and is kept.
+    fn apply_sources(&mut self, sources: Sources) {
+        let moving = lanes_moving_up(&sources);
+        let sources = compact_sources(sources);
+        if sources == *self.controller.sources() {
+            return;
+        }
+        if !moving.is_empty() {
+            shift_meter_modes(&mut self.meter_modes, &moving);
+            // Lane A, lane B, and every lane after B.
+            for lane in 0..3 {
+                self.save_meter_mode(lane);
+            }
+        }
+        if sources.len() < 2 {
+            // The next pair of sources starts with every row edited together.
+            self.separate_rows = false;
+        }
+        self.save_sources(&sources);
+        self.controller.set_sources(sources);
+        self.sync_generation();
+    }
+
+    /// The Sources page's "Add source": `source` becomes the next lane.
+    fn add_source(&mut self, source: CaptureSource) -> Result<(), String> {
+        let mut sources = self.controller.sources().clone();
+        if sources.len() >= MAX_LANES {
+            return Err(Language::current().sources_full().into());
+        }
+        sources.push(Some(SourceSettings {
+            source,
+            route: ChannelRoute::Merged,
+        }));
+        self.apply_sources(sources);
+        Ok(())
+    }
+
+    /// A lane's Remove button on the Sources page: the lanes after it move up a letter.
+    fn remove_source(&mut self, lane: usize) -> Result<(), String> {
+        let mut sources = self.controller.sources().clone();
+        if sources.len() < 2 || lane >= sources.len() {
+            return Err("only a lane among two or more can be removed".into());
+        }
+        sources[lane] = None;
+        self.apply_sources(sources);
+        Ok(())
     }
 
     /// Sends a file to an add-on and says so in the status line when that fails.
@@ -5776,8 +6308,14 @@ impl Recorder {
     /// Saves the selection, or everything held without one, into `output`: the Save command
     /// writes to the saved-snapshot folder, and a test copy's `save=` step to its own.
     fn save_snapshot_to(&mut self, output: PathBuf) {
+        let _ = self.save_snapshot_tagged(output, None);
+    }
+
+    /// As `save_snapshot_to`; `tag` marks the files of a save an add-on asked for. False when
+    /// nothing was queued.
+    fn save_snapshot_tagged(&mut self, output: PathBuf, tag: Option<u64>) -> bool {
         if self.gesture.is_some() {
-            return;
+            return false;
         }
         self.controller.poll();
         self.sync_generation();
@@ -5789,9 +6327,9 @@ impl Recorder {
             .unwrap_or_default();
         // A lane the selection held whole when it was made is saved whole.
         let whole = if rows.is_empty() {
-            [false; 2]
+            Vec::new()
         } else {
-            self.selection_whole
+            self.selection_whole.clone()
         };
         let spec = SnapshotSpec {
             whole,
@@ -5803,10 +6341,11 @@ impl Recorder {
             },
             output,
             format: self.clip_format(None),
-            flags: (!has_selection).then(|| self.flag_update(0..0, Vec::new(), [false; 2])),
+            flags: (!has_selection).then(|| self.flag_update(0..0, Vec::new(), Vec::new())),
             export_options: self.export_options(),
             // Separate rows save the selection's own rows, and every row without a selection.
             rows,
+            tag,
         };
         if let Some(edit) = &self.editing {
             if let Some(clip) = spec.clip(Arc::clone(&edit.snapshots), &edit.lanes, &edit.groups) {
@@ -5814,7 +6353,7 @@ impl Recorder {
                     .push_back(clip.with_positions(&edit.positions));
             } else {
                 self.message = "The selected audio is unavailable.".into();
-                return;
+                return false;
             }
         } else if let Some(request) = &mut self.edit_request {
             request.saves.push(spec);
@@ -5830,18 +6369,18 @@ impl Recorder {
             self.clear_snapshot();
         }
         self.collect_snapshot_saves();
+        true
     }
 
     fn export_options(&self) -> ExportOptions {
         let mut options = self.editing.as_ref().map_or_else(
             || ExportOptions {
-                groups: std::array::from_fn(|index| {
-                    self.controller
-                        .active_lanes()
-                        .get(index)
-                        .and_then(|&lane| self.controller.shown_group(lane))
-                        .cloned()
-                }),
+                groups: self
+                    .controller
+                    .active_lanes()
+                    .iter()
+                    .map(|&lane| self.controller.shown_group(lane).cloned())
+                    .collect(),
                 wide_mode: self.wide_export,
                 addons: self.controller.addons().cloned(),
             },
@@ -5865,12 +6404,16 @@ impl Recorder {
         // A lane the selection held whole when it was made is dragged out whole; without a
         // selection, the row the drag took is the lane whole when it is all the lane shows.
         let whole = if self.selection.is_some() {
-            self.selection_whole
+            self.selection_whole.clone()
         } else {
             lanes_chosen_whole(&self.lanes, &rows)
         };
         let flags = if self.selection.is_none() {
-            Some(self.flag_update(snapshots.first()?.frame_range(), rows.clone(), whole))
+            Some(self.flag_update(
+                snapshots.first()?.frame_range(),
+                rows.clone(),
+                whole.clone(),
+            ))
         } else {
             None
         };
@@ -5879,7 +6422,11 @@ impl Recorder {
             |edit| edit.lanes.as_slice(),
         );
         let groups = self.editing.as_ref().map_or_else(
-            || [0, 1].map(|lane| self.controller.lane_groups(lane).to_vec()),
+            || {
+                (0..self.lane_count())
+                    .map(|lane| self.controller.lane_groups(lane).to_vec())
+                    .collect()
+            },
             |edit| edit.groups.clone(),
         );
         WavClip::new(
@@ -5899,7 +6446,7 @@ impl Recorder {
             clip.export_options = self.export_options();
             clip.with_rows(&rows, &groups)
         })
-        .map(|clip| clip.whole_lanes(whole))
+        .map(|clip| clip.whole_lanes(&whole))
         .map(|clip| match &self.editing {
             Some(edit) if Arc::ptr_eq(&edit.snapshots, &clip.snapshots) => {
                 clip.with_positions(&edit.positions)
@@ -5908,30 +6455,40 @@ impl Recorder {
         })
     }
 
-    /// How a clip of the current recording is written. `lane` saves only that one of two lanes.
+    /// How a clip of the current recording is written. `lane` saves only that one of the lanes.
     fn clip_format(&self, lane: Option<usize>) -> ClipFormat {
         let sources = self.controller.sources();
         ClipFormat {
             profile: self.wav_profile,
             routes: self.routes(),
             force_mono: self.wav_force_mono,
-            names: sources.each_ref().map(|settings| {
-                settings.as_ref().map_or_else(String::new, |settings| {
-                    source_file_name(&self.source_names, &settings.source).to_owned()
+            names: sources
+                .iter()
+                .map(|settings| {
+                    settings.as_ref().map_or_else(String::new, |settings| {
+                        source_file_name(&self.source_names, &settings.source).to_owned()
+                    })
                 })
-            }),
+                .collect(),
             lane,
             pair_binaural: self.pair_render.binaural(),
-            hide_silent: [0, 1].map(|lane| self.hides_silent_rows(lane)),
+            hide_silent: (0..sources.len())
+                .map(|lane| self.hides_silent_rows(lane))
+                .collect(),
         }
     }
 
-    fn routes(&self) -> [ChannelRoute; 2] {
-        self.controller.sources().each_ref().map(|settings| {
-            settings
-                .as_ref()
-                .map_or(ChannelRoute::Merged, |settings| settings.route)
-        })
+    /// By logical lane: each lane's route.
+    fn routes(&self) -> Vec<ChannelRoute> {
+        self.controller
+            .sources()
+            .iter()
+            .map(|settings| {
+                settings
+                    .as_ref()
+                    .map_or(ChannelRoute::Merged, |settings| settings.route)
+            })
+            .collect()
     }
 
     fn collect_snapshot_saves(&mut self) {
@@ -5993,6 +6550,8 @@ impl Recorder {
             return;
         }
         if let Some(worker) = self.snapshot_save.take() {
+            let tag = self.snapshot_save_tag.take();
+            let mut saved = None;
             self.message = match worker.join() {
                 Ok(Ok(mut file)) => {
                     if let Some(flags) = file.flags.take() {
@@ -6001,20 +6560,28 @@ impl Recorder {
                     if let Some(harness) = &mut self.harness {
                         harness.note_saved(&file.paths);
                     }
-                    file.saved_message(Language::current(), true)
+                    let message = file.saved_message(Language::current(), true);
+                    saved = Some(file);
+                    message
                 }
                 Ok(Err(error)) => format!("Could not save snapshot: {error}"),
                 Err(_) => "Snapshot worker stopped unexpectedly.".into(),
             };
+            if let Some(tag) = tag {
+                let outcome = saved.ok_or_else(|| self.message.clone());
+                self.finish_control_save(tag, outcome);
+            }
             // The log holds what the status line says, saved or not.
             if let Some(harness) = &mut self.harness {
                 harness.note(format!("status: {}", self.message));
             }
         }
         if let Some(clip) = self.pending_snapshot_saves.pop_front() {
+            let tag = clip.tag;
             match spawn_wav_write("backtracking-snapshot", clip, true) {
                 Ok(worker) => {
                     self.snapshot_save = Some(worker);
+                    self.snapshot_save_tag = tag;
                     self.message = "Saving snapshot…".into();
                 }
                 Err((error, clip)) => {
@@ -6081,19 +6648,22 @@ impl Recorder {
     fn timeline_rect(&self, rect: Rect) -> Rect {
         if self.waveform_only {
             rect.shrink2(Vec2::new(WAVEFORM_INSET, 0.0))
-        } else if self.stacked() {
-            // Channel names need a wider column than "L" and "R".
+        } else if let Some(gutter) = self.label_gutter() {
+            // Channel names need a wider column than "L" and "R", and many lanes their letters.
             let inner = rect.shrink(WAVEFORM_INSET);
             Rect::from_min_max(
-                Pos2::new(
-                    (rect.left() + stack::LABEL_GUTTER).min(inner.right()),
-                    inner.top(),
-                ),
+                Pos2::new((rect.left() + gutter).min(inner.right()), inner.top()),
                 inner.max,
             )
         } else {
             rect.shrink(WAVEFORM_INSET)
         }
+    }
+
+    /// The plot's left margin when its labels need more than the usual inset: a stacked lane's
+    /// channel names, and with more than two lanes every lane's letter.
+    fn label_gutter(&self) -> Option<f32> {
+        label_gutter(self.lanes.len(), self.stacked())
     }
 
     fn audio_rect(&self, rect: Rect) -> Rect {
@@ -6152,6 +6722,7 @@ impl Recorder {
                     && !self
                         .lane_controls
                         .iter()
+                        .chain(&self.meter_list_rect)
                         .any(|control| control.contains(*point))
             })
         {
@@ -6179,7 +6750,7 @@ impl Recorder {
                 if let Some(flags) = resize.and(self.flags.as_ref()).filter(|_| !resizing) {
                     // One taken back from flags covers the rows they were left on.
                     self.selection_rows = flags.rows.clone();
-                    self.selection_whole = flags.whole;
+                    self.selection_whole = flags.whole.clone();
                 } else if !resizing {
                     // A new selection covers the rows its drag crosses, from the one it starts
                     // in, whenever rows are separate.
@@ -6193,6 +6764,8 @@ impl Recorder {
                     }
                 }
                 self.edge_scroll = None;
+                // The user's own drag: the selection is no longer the add-on's.
+                self.selection_by = None;
                 self.gesture = Some(Gesture::Select {
                     anchor,
                     cursor,
@@ -6291,7 +6864,7 @@ impl Recorder {
                         let flags = self.flag_update(
                             range.clone(),
                             self.selection_rows.clone(),
-                            self.selection_whole,
+                            self.selection_whole.clone(),
                         );
                         self.apply_flags(flags);
                         // A resized selection keeps the ramps at its flags; a new one has none.
@@ -6369,6 +6942,28 @@ impl Recorder {
     fn drag_across_rows(&mut self, audio: Rect, y: f32, at: RowSource) -> RowSource {
         let boxes = self.lane_boxes(audio.height());
         let offset = y - audio.top();
+        // With more than two lanes the whole plot scrolls, a row at a time, the same way.
+        if self.rows_separate()
+            && let Some(column) = self.scrolling_column(audio.height())
+        {
+            let Some(down) = column_edge(&column, offset) else {
+                self.edge_scroll = None;
+                return row_at_height(&self.lanes, &boxes, offset).unwrap_or(at);
+            };
+            let now = Instant::now();
+            if self.edge_scroll.is_some_and(|next| now < next) {
+                return at;
+            }
+            self.edge_scroll = Some(now + EDGE_SCROLL_STEP);
+            self.scroll_plot_to(if down {
+                column.first + 1
+            } else {
+                column.first.saturating_sub(1)
+            });
+            // The row that came into view at that edge.
+            let boxes = self.lane_boxes(audio.height());
+            return row_at_height(&self.lanes, &boxes, offset).unwrap_or(at);
+        }
         let step = if self.rows_separate() {
             row_drag(&self.lanes, &boxes, at, offset)
         } else {
@@ -6596,12 +7191,39 @@ impl Recorder {
         )
     }
 
-    /// Group switches, scroll bars and the wheel over a stacked lane's margins. Returns the
-    /// tooltip for what is under the pointer.
+    /// What scrolls in a plot area this high, with the box its scroll bar follows: with more
+    /// than two lanes the plot's column of rows when it has more than fit, else each stacked
+    /// lane that has.
+    fn scroll_boxes(&self, height: f32) -> Vec<(ScrollTarget, LaneBox)> {
+        if self.scrolls_as_column() {
+            return self
+                .scrolling_column(height)
+                .map(|column| (ScrollTarget::Plot, column))
+                .into_iter()
+                .collect();
+        }
+        self.lanes
+            .iter()
+            .zip(self.lane_boxes(height))
+            .filter(|(_, lane_box)| lane_box.scrolls())
+            .map(|(plan, lane_box)| (ScrollTarget::Lane(plan.lane), lane_box))
+            .collect()
+    }
+
+    fn scroll_to(&mut self, target: ScrollTarget, first: usize) {
+        match target {
+            ScrollTarget::Lane(lane) => self.scroll_lane_to(lane, first),
+            ScrollTarget::Plot => self.scroll_plot_to(first),
+        }
+    }
+
+    /// Group switches, scroll bars and the wheel over a stacked lane's margins, or with more
+    /// than two lanes over the plot's. Returns the tooltip for what is under the pointer.
     fn interact_lanes(&mut self, ui: &egui::Ui, rect: Rect) -> Option<String> {
         self.lane_controls.clear();
         self.lane_scroll_zones.clear();
-        if !self.stacked() || self.history_frames.is_empty() {
+        let many = self.scrolls_as_column();
+        if !(self.stacked() || many) || self.history_frames.is_empty() {
             self.scroll_drag = None;
             return None;
         }
@@ -6611,16 +7233,15 @@ impl Recorder {
         let chips = self.group_chips(ui, rect, &boxes);
         self.lane_controls
             .extend(chips.iter().map(|chip| chip.rect));
-        for (plan, lane_box) in self.lanes.iter().zip(&boxes) {
-            if lane_box.scrolls() {
-                let track = self.scroll_track(rect, lane_box);
-                self.lane_controls.push(track);
-                self.lane_scroll_zones.push((plan.lane, track));
-                self.lane_scroll_zones.push((
-                    plan.lane,
-                    Rect::from_x_y_ranges(rect.left()..=inner.left(), track.y_range()),
-                ));
-            }
+        let scrolling = self.scroll_boxes(inner.height());
+        for (target, lane_box) in &scrolling {
+            let track = self.scroll_track(rect, lane_box);
+            self.lane_controls.push(track);
+            self.lane_scroll_zones.push((*target, track));
+            self.lane_scroll_zones.push((
+                *target,
+                Rect::from_x_y_ranges(rect.left()..=inner.left(), track.y_range()),
+            ));
         }
         let (hover, position, press, down, steps) = ui.input(|input| {
             let mut press = None;
@@ -6651,21 +7272,27 @@ impl Recorder {
                 steps,
             )
         });
+        // A lane's box, or the plot's column while it scrolls.
         let by_lane: Vec<(usize, LaneBox)> = self
             .lanes
             .iter()
             .map(|plan| plan.lane)
             .zip(boxes.iter().copied())
             .collect();
-        let lane_box = |lane: usize| {
-            by_lane
+        let target_box = |target: ScrollTarget| match target {
+            ScrollTarget::Plot => scrolling.first().map(|(_, column)| *column),
+            ScrollTarget::Lane(lane) => by_lane
                 .iter()
                 .find(|(logical, _)| *logical == lane)
-                .map(|(_, lane_box)| *lane_box)
+                .map(|(_, lane_box)| *lane_box),
         };
 
         if self.gesture.is_none()
-            && let Some(point) = press
+            && let Some(point) = press.filter(|point| {
+                !self
+                    .meter_list_rect
+                    .is_some_and(|list| list.contains(*point))
+            })
         {
             if let Some(chip) = chips.iter().find(|chip| chip.rect.contains(point)) {
                 if !chip.current {
@@ -6674,11 +7301,11 @@ impl Recorder {
                         self.message = error;
                     }
                 }
-            } else if let Some(&(lane, _)) = self
+            } else if let Some(&(target, _)) = self
                 .lane_scroll_zones
                 .iter()
                 .find(|(_, zone)| zone.contains(point) && zone.left() >= inner.right())
-                && let Some(lane_box) = lane_box(lane)
+                && let Some(lane_box) = target_box(target)
             {
                 let thumb = lane_box.thumb();
                 let (top, bottom) = (inner.top() + thumb.start, inner.top() + thumb.end);
@@ -6688,36 +7315,40 @@ impl Recorder {
                     // A press beside the thumb brings it there.
                     (bottom - top) / 2.0
                 };
-                self.scroll_drag = Some((lane, grab));
+                self.scroll_drag = Some((target, grab));
             }
         }
-        if let Some((lane, grab)) = self.scroll_drag {
+        if let Some((target, grab)) = self.scroll_drag {
             if down
                 && let Some(point) = position
-                && let Some(lane_box) = lane_box(lane)
+                && let Some(lane_box) = target_box(target)
             {
                 let first = lane_box.first_for_thumb(point.y - grab - inner.top());
-                self.scroll_lane_to(lane, first);
+                self.scroll_to(target, first);
             } else if !down {
                 self.scroll_drag = None;
             }
         }
         if steps != 0.0
-            && let Some(point) = hover
-            && let Some(&(lane, _)) = self
+            && let Some(point) = hover.filter(|point| {
+                !self
+                    .meter_list_rect
+                    .is_some_and(|list| list.contains(*point))
+            })
+            && let Some(&(target, _)) = self
                 .lane_scroll_zones
                 .iter()
                 .find(|(_, zone)| zone.contains(point))
-            && let Some(lane_box) = lane_box(lane)
+            && let Some(lane_box) = target_box(target)
         {
-            // At least one row for each turn of the wheel; up shows earlier channels.
+            // At least one row for each turn of the wheel; up shows earlier rows.
             let rows = steps.abs().ceil().max(1.0) as usize;
             let first = if steps > 0.0 {
                 lane_box.first.saturating_sub(rows)
             } else {
                 lane_box.first + rows
             };
-            self.scroll_lane_to(lane, first);
+            self.scroll_to(target, first);
         }
 
         let point = hover?;
@@ -6741,21 +7372,53 @@ impl Recorder {
         }
         let (index, row) = stack::row_at(&boxes, point.y - inner.top())?;
         let plan = self.lanes.get(index)?;
-        let mut text = if let RowSource::Pair(_, side) = plan.row(row) {
-            language.pair_row(side == PairSide::Left).to_owned()
-        } else {
-            let (group, row) = plan.group_channel(row)?;
+        // With more than two lanes a row's label names its lane's source, and its problem.
+        let mut lines = Vec::new();
+        if many {
+            lines.push(self.lane_tip(plan.lane));
+        }
+        if let RowSource::Pair(_, side) = plan.row(row) {
+            lines.push(language.pair_row(side == PairSide::Left).to_owned());
+        } else if let Some((group, row)) = plan.group_channel(row) {
             let label = group
                 .labels
                 .get(row)
                 .map_or_else(|| (row + 1).to_string(), Clone::clone);
-            language.channel(row + 1, group.channels.len(), &label)
-        };
-        if boxes[index].scrolls() {
-            text.push('\n');
-            text.push_str(language.scroll_hint());
+            lines.push(language.channel(row + 1, group.channels.len(), &label));
         }
-        Some(text)
+        if lines.is_empty() {
+            return None;
+        }
+        if !scrolling.is_empty() && many {
+            lines.push(language.plot_scroll_hint().to_owned());
+        } else if boxes[index].scrolls() {
+            lines.push(language.scroll_hint().to_owned());
+        }
+        Some(lines.join("\n"))
+    }
+
+    /// The tooltip line that names logical lane `lane`: its letter, the source picked for it
+    /// and its route when that is not Merged, and the source's problem when it has one.
+    fn lane_tip(&self, lane: usize) -> String {
+        let language = Language::current();
+        let name = self
+            .controller
+            .sources()
+            .get(lane)
+            .and_then(Option::as_ref)
+            .map_or_else(String::new, |settings| {
+                let label = source_picker_label(&settings.source, &self.available_sources);
+                match settings.route {
+                    ChannelRoute::Merged => label.into_owned(),
+                    route => format!("{label} · {}", route_label(route, language)),
+                }
+            });
+        let mut tip = language.lane_source(lane_name(lane), &name);
+        if let Some(status) = self.controller.source_status(lane) {
+            tip.push('\n');
+            tip.push_str(language.source_message(status));
+        }
+        tip
     }
 
     fn interact_timeline(&mut self, ui: &egui::Ui, rect: Rect) -> bool {
@@ -6815,6 +7478,9 @@ impl Recorder {
                         .lane_scroll_zones
                         .iter()
                         .any(|(_, zone)| zone.contains(*point))
+                    && !self
+                        .meter_list_rect
+                        .is_some_and(|list| list.contains(*point))
             })
         {
             let requested = self.zoom_frames.as_ref().unwrap_or(&self.history_frames);
@@ -7017,8 +7683,11 @@ impl Recorder {
             Some(start as f32..end as f32)
         });
         let stacked = self.stacked();
+        let many = self.scrolls_as_column();
         let rows: usize = boxes.iter().map(|lane| lane.shown).sum();
         let dual = self.dual_source();
+        // Colouring by frequency: the band colours, once for every row.
+        let palette = self.waveform_palette();
         for (plan, lane_box) in self.lanes.iter().zip(&boxes) {
             for index in lane_box.visible() {
                 let top = audio.top() + lane_box.row_top(index).unwrap_or_default();
@@ -7062,7 +7731,11 @@ impl Recorder {
                             .or_else(|| Some((channel + 1).to_string())),
                             None => Some(self.row_name(source)),
                         },
-                        (_, RowSource::View(lane, view)) if rows == 2 || stacked => {
+                        // Past two lanes every row names its lane, or they could not be told
+                        // apart.
+                        (_, RowSource::View(lane, view))
+                            if rows == 2 || stacked || self.lanes.len() > 2 =>
+                        {
                             Some(match view {
                                 _ if dual => lane_name(lane).to_owned(),
                                 WaveformView::Left => "L".to_owned(),
@@ -7072,15 +7745,37 @@ impl Recorder {
                         }
                         _ => None,
                     };
-                    if let Some(label) = label.filter(|label| {
-                        !label.is_empty() && lane_box.row_height >= stack::LABELLED_ROW_HEIGHT
-                    }) {
+                    let labelled = lane_box.row_height >= stack::LABELLED_ROW_HEIGHT;
+                    // A lane's letter is amber while its source has a problem.
+                    let letter_color = if self.controller.source_status(plan.lane).is_some() {
+                        ERROR_LED
+                    } else {
+                        theme.row_label
+                    };
+                    // Past two lanes a stacked lane's channel names move right of a column of
+                    // letters, and its letter stands on its first row on screen.
+                    let stacked_many = many && plan.stacked();
+                    if let Some(label) = label.filter(|label| !label.is_empty() && labelled) {
+                        let (x, color) = match source {
+                            _ if stacked_many => (rect.left() + 1.0 + LETTER_COLUMN, theme.row_label),
+                            RowSource::View(..) if dual => (rect.left() + 1.0, letter_color),
+                            _ => (rect.left() + 1.0, theme.row_label),
+                        };
                         painter.text(
-                            Pos2::new(rect.left() + 1.0, row.center().y),
+                            Pos2::new(x, row.center().y),
                             egui::Align2::LEFT_CENTER,
                             label,
                             egui::FontId::monospace(8.0),
-                            theme.row_label,
+                            color,
+                        );
+                    }
+                    if stacked_many && labelled && index == lane_box.first {
+                        painter.text(
+                            Pos2::new(rect.left() + 1.0, row.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            lane_name(plan.lane),
+                            egui::FontId::monospace(8.0),
+                            letter_color,
                         );
                     }
                 }
@@ -7115,12 +7810,19 @@ impl Recorder {
                         .group_channel(index)
                         .and_then(|(group, channel)| group.labels.get(channel))
                         .map(String::as_str);
+                    let colors = palette
+                        .as_ref()
+                        .map(|palette| self.row_column_colors(source, peaks.low.len(), palette));
                     self.paint_waveform(
                         &painter,
                         row,
                         peaks,
                         highlight.as_ref().filter(|_| selected),
                         channel,
+                        colors.as_deref().map(|colors| ColumnColors {
+                            colors,
+                            selection_shown: highlight.is_some(),
+                        }),
                     );
                 }
                 if let Some(range) = row_selection {
@@ -7138,7 +7840,7 @@ impl Recorder {
                 }
             }
         }
-        if stacked {
+        if stacked || self.scrolls_as_column() {
             self.paint_lane_furniture(ui, &painter, rect, audio, &boxes);
         }
         if separate && let [_, lane_b] = boxes.as_slice() {
@@ -7220,7 +7922,8 @@ impl Recorder {
         }
     }
 
-    /// The line between two lanes, the scroll bars and the group switches of stacked lanes.
+    /// The line between two lanes, the scroll bars and the group switches of stacked lanes,
+    /// and with more than two lanes the plot's scroll bar.
     fn paint_lane_furniture(
         &self,
         ui: &egui::Ui,
@@ -7230,18 +7933,22 @@ impl Recorder {
         boxes: &[LaneBox],
     ) {
         let hover = ui.input(|input| input.pointer.hover_pos());
-        for lane_box in boxes.iter().skip(1) {
-            painter.hline(
-                rect.left() + 1.0..=audio.right(),
-                audio.top() + lane_box.top,
-                Stroke::new(1.0, Color32::from_white_alpha(36)),
-            );
-        }
-        for (plan, lane_box) in self.lanes.iter().zip(boxes) {
-            if !lane_box.scrolls() {
-                continue;
+        let many = self.scrolls_as_column();
+        if self.stacked() {
+            for lane_box in boxes.iter().skip(1) {
+                // With many lanes, only a lane whose first row is on screen has its line.
+                if many && (lane_box.shown == 0 || lane_box.first > 0) {
+                    continue;
+                }
+                painter.hline(
+                    rect.left() + 1.0..=audio.right(),
+                    audio.top() + lane_box.top,
+                    Stroke::new(1.0, Color32::from_white_alpha(36)),
+                );
             }
-            let track = self.scroll_track(rect, lane_box);
+        }
+        for (target, lane_box) in self.scroll_boxes(audio.height()) {
+            let track = self.scroll_track(rect, &lane_box);
             let x = track.center().x - 1.5..=track.center().x + 1.5;
             painter.rect_filled(
                 Rect::from_x_y_ranges(x.clone(), track.y_range()),
@@ -7249,7 +7956,7 @@ impl Recorder {
                 Color32::from_white_alpha(18),
             );
             let thumb = lane_box.thumb();
-            let active = self.scroll_drag.is_some_and(|(lane, _)| lane == plan.lane)
+            let active = self.scroll_drag.is_some_and(|(held, _)| held == target)
                 || hover.is_some_and(|point| track.contains(point));
             painter.rect_filled(
                 Rect::from_x_y_ranges(x, audio.top() + thumb.start..=audio.top() + thumb.end),
@@ -7259,7 +7966,7 @@ impl Recorder {
         }
         // The same dark backing as the waveform-only status mark keeps the switch readable.
         let chips = self.group_chips(ui, rect, boxes);
-        for lane in [0, 1] {
+        for lane in 0..self.lane_count() {
             let lane_chips: Vec<_> = chips.iter().filter(|chip| chip.lane == lane).collect();
             let (Some(start), Some(end)) = (lane_chips.first(), lane_chips.last()) else {
                 continue;
@@ -7398,11 +8105,12 @@ impl Recorder {
         peaks: &WaveformPeaks,
         selection: Option<&Range<f32>>,
         channel: Option<&str>,
+        colors: Option<ColumnColors<'_>>,
     ) {
         let policy = self.display_policy(audio, self.visible_frames.clone());
         let geometry =
             waveform::waveform_geometry(&peaks.low, &peaks.high, self.visible_frames.clone());
-        paint_row_waveform(
+        paint_colored_row_waveform(
             painter,
             audio,
             &geometry,
@@ -7411,14 +8119,26 @@ impl Recorder {
             &self.theme,
             self.accent,
             channel,
+            colors,
         );
     }
+}
+
+/// A row's colours while the waveform is coloured by frequency.
+#[derive(Clone, Copy)]
+struct ColumnColors<'a> {
+    /// One for each bin the row's geometry was made from; `None` draws that column in the
+    /// single colour.
+    colors: &'a [Option<Color32>],
+    /// A selection is on screen, on this row or another: what lies outside it is dimmed.
+    selection_shown: bool,
 }
 
 /// Paints one row's waveform `geometry` across `audio` as `theme` draws it for this accent:
 /// in the colour of the row's `channel` (its label) or the waveform's, and in the selected
 /// colour across `selection`, given as fractions of the row's width.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn paint_row_waveform(
     painter: &egui::Painter,
     audio: Rect,
@@ -7429,10 +8149,37 @@ fn paint_row_waveform(
     accent: Color32,
     channel: Option<&str>,
 ) {
+    paint_colored_row_waveform(
+        painter, audio, geometry, stroke, selection, theme, accent, channel, None,
+    );
+}
+
+/// [`paint_row_waveform`], with each column in its frequency colour when `colors` has one for
+/// it. That colour wins over the look's waveform and row colours; inside `selection` it is
+/// drawn in full and, while a selection is shown, dimmed everywhere else
+/// (`spectrum::unselected_color`). Columns without one take the row's single colour, treated
+/// the same way.
+#[allow(clippy::too_many_arguments)]
+fn paint_colored_row_waveform(
+    painter: &egui::Painter,
+    audio: Rect,
+    geometry: &waveform::WaveformGeometry,
+    stroke: f32,
+    selection: Option<&Range<f32>>,
+    theme: &Theme,
+    accent: Color32,
+    channel: Option<&str>,
+    colors: Option<ColumnColors<'_>>,
+) {
     let color = theme.row_waveform(channel, accent);
+    let single = color;
     let selected = theme.waveform_selected(accent, SELECTION_CONTRAST);
     let painter = painter.with_clip_rect(audio);
-    let paint_range = |range: Range<f32>, color| {
+    let outside: fn(Color32) -> Color32 = match colors {
+        Some(colors) if colors.selection_shown => spectrum::unselected_color,
+        _ => std::convert::identity,
+    };
+    let paint_range = |range: Range<f32>, color, tint: fn(Color32) -> Color32| {
         if range.is_empty() {
             return;
         }
@@ -7440,21 +8187,32 @@ fn paint_row_waveform(
             audio.left() + range.start * audio.width()..=audio.left() + range.end * audio.width(),
             audio.y_range(),
         );
-        paint_waveform_geometry(
-            &painter.with_clip_rect(clip),
-            audio,
-            geometry,
-            stroke,
-            color,
-            theme,
-        );
+        let painter = painter.with_clip_rect(clip);
+        match colors {
+            // A column without its colour yet takes the waveform's single colour, dimmed or
+            // not like its neighbours, so the selection reads the same across it.
+            Some(colors) => paint_colored_waveform_geometry(
+                &painter,
+                audio,
+                geometry,
+                stroke,
+                color,
+                theme,
+                |x| {
+                    let column = trace_bin(x, colors.colors.len());
+                    let own = colors.colors.get(column).copied().flatten();
+                    Some(tint(own.unwrap_or(single)))
+                },
+            ),
+            None => paint_waveform_geometry(&painter, audio, geometry, stroke, color, theme),
+        }
     };
     if let Some(range) = selection.filter(|range| range.start < range.end) {
-        paint_range(0.0..range.start, color);
-        paint_range(range.clone(), selected);
-        paint_range(range.end..1.0, color);
+        paint_range(0.0..range.start, color, outside);
+        paint_range(range.clone(), selected, spectrum::selected_color);
+        paint_range(range.end..1.0, color, outside);
     } else {
-        paint_range(0.0..1.0, color);
+        paint_range(0.0..1.0, color, outside);
     }
 }
 
@@ -7606,6 +8364,38 @@ fn paint_waveform_geometry(
     );
 }
 
+/// [`paint_waveform_geometry`] with the colour `color_at` gives each column and sample, and
+/// `color` where it gives none.
+fn paint_colored_waveform_geometry(
+    painter: &egui::Painter,
+    audio: Rect,
+    geometry: &waveform::WaveformGeometry,
+    stroke: f32,
+    color: Color32,
+    theme: &Theme,
+    color_at: impl Fn(f32) -> Option<Color32>,
+) {
+    let position = |x, value| {
+        Pos2::new(
+            audio.left() + x * audio.width(),
+            audio.center().y - value * audio.height() * 0.47,
+        )
+    };
+    let stroke = theme.waveform_stroke(stroke);
+    paint_colored_waveform_trace(
+        painter,
+        geometry,
+        position,
+        &TraceStyle {
+            stroke: Stroke::new(stroke, color),
+            fill: theme.waveform_fill(color),
+            lone_sample: LoneSample::Dot(stroke * 0.55),
+        },
+        color_at,
+        |color| theme.waveform_fill(color),
+    );
+}
+
 impl eframe::App for Recorder {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0; 4]
@@ -7721,6 +8511,7 @@ impl eframe::App for Recorder {
         }
         if !ctx.input(|input| input.pointer.any_down()) {
             self.save_accent();
+            self.save_waveform_gradient();
         }
         self.controller_busy = !self.controller.poll();
         self.sync_generation();
@@ -7738,6 +8529,8 @@ impl eframe::App for Recorder {
         }
         self.collect_export();
         self.collect_snapshot_saves();
+        // Add-ons' control requests, after the state above is current.
+        self.run_control_calls(ctx);
         self.clean_output_folder();
         if self
             .auto_resume_remaining()
@@ -7798,6 +8591,8 @@ impl eframe::App for Recorder {
                 let interaction_blocked = window_drag.is_some();
                 if !self.waveform_only {
                     self.controls(ui, interaction_blocked);
+                } else {
+                    self.close_meter_list();
                 }
                 // Alt over a flag of the selection offers its fade, not a window move.
                 let fade_hover = !interaction_blocked
@@ -7843,6 +8638,7 @@ impl eframe::App for Recorder {
                 self.update_lanes();
                 self.fit_window_to_rows(ui.ctx(), frame);
                 self.refresh_waveform();
+                self.refresh_waveform_colors(ui.ctx());
                 if !self.waveform_only {
                     self.full_waveform_height = rect.height() - 2.0 * WAVEFORM_INSET;
                     self.full_window_size = ui.ctx().viewport_rect().size();
@@ -7927,6 +8723,7 @@ impl eframe::App for Recorder {
 impl Drop for Recorder {
     fn drop(&mut self) {
         self.save_accent();
+        self.save_waveform_gradient();
         self.save_window_position();
         if let Some(request) = self.edit_request.take()
             && !request.saves.is_empty()
@@ -8001,15 +8798,15 @@ struct PreviewPart {
 fn preview_plan(
     snapshots: &[FrozenTrack],
     lanes: &[usize],
-    groups: &[Vec<LaneGroup>; 2],
-    shown: &[Option<String>; 2],
-    routes: [ChannelRoute; 2],
+    groups: &[Vec<LaneGroup>],
+    shown: &[Option<String>],
+    routes: impl AsRef<[ChannelRoute]>,
     rows: Option<&[RowSource]>,
 ) -> Result<Vec<PreviewPart>, &'static str> {
-    if lanes.len() != snapshots.len() || lanes.iter().any(|&lane| lane > 1) {
+    if lanes.len() != snapshots.len() || lanes.iter().any(|&lane| lane >= MAX_LANES) {
         return Err(SELECTION_UNAVAILABLE);
     }
-    let routes = physical_routes(routes, lanes);
+    let routes = physical_routes(routes.as_ref(), lanes);
     let chosen = rows.and_then(chosen_rows);
     let mut parts = Vec::new();
     for (index, (track, &lane)) in snapshots.iter().zip(lanes).enumerate() {
@@ -8023,10 +8820,10 @@ fn preview_plan(
             continue;
         }
         let channels = track.channels();
-        let native = chosen
+        let choice = chosen
             .as_ref()
-            .and_then(|chosen| chosen.native[lane].clone());
-        let pair = chosen.as_ref().is_some_and(|chosen| chosen.pair[lane]);
+            .map_or_else(RowChoice::default, |chosen| chosen.lane_choice(lane));
+        let (native, pair) = (choice.channels, choice.pair);
         let route = routes[index];
         if channels <= 2 {
             // Both sides, or a merged row, play the lane as it always played.
@@ -8041,7 +8838,8 @@ fn preview_plan(
             });
             continue;
         }
-        let lane_groups = &groups[lane];
+        let lane_groups = groups.get(lane).map_or(&[][..], Vec::as_slice);
+        let shown = shown.get(lane).and_then(Option::as_deref);
         let whole = |group: LaneGroup| -> Result<PreviewPart, &'static str> {
             Ok(PreviewPart {
                 index,
@@ -8057,7 +8855,7 @@ fn preview_plan(
         };
         let part = match native {
             // The lane chosen whole plays the group on show; the pair plays its Channels group.
-            None if !pair => whole(group_on_show(lane_groups, shown[lane].as_deref(), channels).0)?,
+            None if !pair => whole(group_on_show(lane_groups, shown, channels).0)?,
             Some(native) if !pair && !native.is_empty() => {
                 let group = lane_groups
                     .iter()
@@ -8112,8 +8910,31 @@ fn source_file_name<'a>(names: &'a SourceNames, source: &'a CaptureSource) -> &'
         .unwrap_or_else(|| source.default_file_name())
 }
 
+/// How wide each meter readout is while there is more than one lane.
+const METER_WIDTH_SHARED: f32 = 91.0;
+/// How wide the "+N" button for the meters that do not fit is.
+const MORE_METERS_WIDTH: f32 = 34.0;
+
+/// How many of `count` lanes' readouts (more than two) the toolbar shows in `available` points,
+/// each taking `each`: every one when they all fit, else as many as fit beside the "+N" button,
+/// which takes `more`, and at least one.
+fn meters_shown(count: usize, available: f32, each: f32, more: f32) -> usize {
+    let fit = |width: f32| (width.max(0.0) / each) as usize;
+    if fit(available) >= count {
+        count
+    } else {
+        fit(available - more).clamp(1, count.saturating_sub(1).max(1))
+    }
+}
+
 fn lane_name(lane: usize) -> &'static str {
-    if lane == 0 { "A" } else { "B" }
+    Lane::from_index(lane).map_or("?", Lane::letter)
+}
+
+/// One meter unit for every lane there can be: `modes` as stored, decibels for the rest.
+fn lane_meter_modes(mut modes: Vec<MeterMode>) -> Vec<MeterMode> {
+    modes.resize(MAX_LANES, MeterMode::Dbfs);
+    modes
 }
 
 /// The files dropped on the window being drawn, in this pass.
@@ -8126,6 +8947,108 @@ fn dropped_paths(ctx: &egui::Context) -> Vec<PathBuf> {
             .map(|file| egui::DroppedFile::path(file.as_ref()).to_path_buf())
             .collect()
     })
+}
+
+/// The scrolling area of an Options page, scrolled to `offset` when the test harness asks for
+/// it (egui keeps it in range).
+fn options_page_area(section: OptionsSection, offset: Option<f32>) -> egui::ScrollArea {
+    let area = egui::ScrollArea::vertical()
+        .id_salt(section)
+        .auto_shrink([false, false]);
+    match offset {
+        Some(offset) => area.vertical_scroll_offset(offset),
+        None => area,
+    }
+}
+
+/// The most channels all lanes together hold (`controller::layout::lane_fits`).
+const CHANNEL_LIMIT: usize = 64;
+
+/// A lane's heading on the Sources page, with a Remove button at its right while there is more
+/// than one lane (`removable`). The heading takes the room it always did; the button sits on
+/// its line, its right edge under the controls'. True when the button was pressed.
+fn source_heading(
+    ui: &mut egui::Ui,
+    title: &str,
+    removable: bool,
+    language: Language,
+    lane: usize,
+) -> bool {
+    let right = options_control_right(ui);
+    let top = ui.cursor().top();
+    options_group_heading(ui, title);
+    if !removable {
+        return false;
+    }
+    // The heading's own line, from below the space above it to its bottom. A child that is not
+    // allocated in the page leaves the rows below where they were.
+    let line = Rect::from_x_y_ranges(
+        ui.max_rect().left()..=right,
+        top + 2.0..=ui.min_rect().bottom(),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(line)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    child
+        .small_button(language.remove_source())
+        .on_hover_text(language.remove_source_tip(lane_name(lane)))
+        .clicked()
+}
+
+/// The rows of an audio source list: a spinner while the list is being made (`loading`), else
+/// every choice, with an application's path or a Sender's id on hover. Returns the choice
+/// clicked, unless it is `selected` already.
+fn source_menu_rows(
+    ui: &mut egui::Ui,
+    choices: &[CaptureSource],
+    loading: bool,
+    selected: Option<&CaptureSource>,
+) -> Option<CaptureSource> {
+    if loading {
+        ui.spinner();
+        return None;
+    }
+    let mut picked = None;
+    for choice in choices {
+        let is_selected = selected.is_some_and(|source| choice.same_source(source));
+        let label = source_picker_label(choice, choices);
+        let row = ui.selectable_label(is_selected, label.as_ref());
+        if row.clicked() && !is_selected {
+            picked = Some(choice.clone());
+        }
+        match choice {
+            CaptureSource::Application { path, .. } => {
+                row.on_hover_text(path);
+            }
+            CaptureSource::Sender { id, .. } => {
+                row.on_hover_text(format!("Sender instance {id}"));
+            }
+            _ => {}
+        }
+    }
+    picked
+}
+
+/// The lanes of `sources` that are switched off (`None`) and have a lane after them that is
+/// on, which moves up into their place: these are the lanes whose meter unit goes with them.
+fn lanes_moving_up(sources: &[Option<SourceSettings>]) -> Vec<usize> {
+    let Some(last) = sources.iter().rposition(Option::is_some) else {
+        return Vec::new();
+    };
+    (0..last).filter(|&lane| sources[lane].is_none()).collect()
+}
+
+/// `modes` (by lane) after the lanes in `removed` are taken out and the lanes after each move
+/// up, with decibels for the lanes freed at the end.
+fn shift_meter_modes(modes: &mut Vec<MeterMode>, removed: &[usize]) {
+    for &lane in removed.iter().rev() {
+        if lane < modes.len() {
+            modes.remove(lane);
+            modes.push(MeterMode::Dbfs);
+        }
+    }
 }
 
 fn source_picker_label<'a>(
@@ -8530,9 +9453,11 @@ mod tests {
             generation,
             bar_markers: vec![101],
             lanes: vec![0, 1],
-            groups: std::array::from_fn(|_| Vec::new()),
-            shown_groups: [None, None],
-            positions: std::array::from_fn(|_| backtracking_core::PositionTrack::new().freeze()),
+            groups: (0..2).map(|_| Vec::new()).collect(),
+            shown_groups: vec![None, None],
+            positions: (0..2)
+                .map(|_| backtracking_core::PositionTrack::new().freeze())
+                .collect(),
             snapshots: vec![
                 FrozenTrack::from_interleaved(48000, 1, 100, &[0.1; 4]).unwrap(),
                 FrozenTrack::from_interleaved(48000, 1, second_first, &[-0.1; 4]).unwrap(),
@@ -9364,7 +10289,7 @@ mod tests {
                         groups: Default::default(),
                         shown_groups: Default::default(),
                         positions: no_positions(),
-                        activity: [None; 2],
+                        activity: vec![None; 2],
                         activity_job: None,
                     },
                     observed: observed.clone()
@@ -9496,7 +10421,7 @@ mod tests {
                 RowSource::View(0, WaveformView::Left),
                 RowSource::View(0, WaveformView::Right),
             ],
-            pairs: [None, None],
+            pairs: vec![None, None],
             bins: 2,
         };
         let peaks = edit_preview(&[stereo], &[0], &key);
@@ -9737,7 +10662,7 @@ mod tests {
             generation: 1,
             lanes: vec![1],
             bar_markers: Vec::new(),
-            groups: [
+            groups: vec![
                 Vec::new(),
                 vec![
                     LaneGroup {
@@ -9761,8 +10686,10 @@ mod tests {
                     },
                 ],
             ],
-            shown_groups: [None, Some("objects".into())],
-            positions: std::array::from_fn(|_| backtracking_core::PositionTrack::new().freeze()),
+            shown_groups: vec![None, Some("objects".into())],
+            positions: (0..2)
+                .map(|_| backtracking_core::PositionTrack::new().freeze())
+                .collect(),
         };
         let spec = SnapshotSpec {
             selection: None,
@@ -9772,11 +10699,16 @@ mod tests {
             flags: None,
             export_options: ExportOptions::default(),
             rows: Vec::new(),
-            whole: [false; 2],
+            whole: vec![false; 2],
+            tag: Some(7),
         };
         let clip = spec.frozen_clip(&snapshot).unwrap();
+        assert_eq!(clip.tag, Some(7));
         drop(snapshot);
         let files = clip.write(false).unwrap();
+        // A control save's reply names each file's lane.
+        assert_eq!(files.lanes.len(), files.paths.len());
+        assert!(files.lanes.iter().all(Option::is_some), "{:?}", files.lanes);
         // The objects on show, which have no positions and so are written in mono and say so,
         // then the pair, made from the bed frozen with them.
         assert_eq!(files.paths.len(), 5);
@@ -9817,9 +10749,11 @@ mod tests {
             generation: 1,
             lanes: vec![1],
             bar_markers: Vec::new(),
-            groups: [Vec::new(), Vec::new()],
-            shown_groups: [None, None],
-            positions: std::array::from_fn(|_| backtracking_core::PositionTrack::new().freeze()),
+            groups: vec![Vec::new(), Vec::new()],
+            shown_groups: vec![None, None],
+            positions: (0..2)
+                .map(|_| backtracking_core::PositionTrack::new().freeze())
+                .collect(),
         };
         let spec = SnapshotSpec {
             selection: None,
@@ -9829,10 +10763,13 @@ mod tests {
             flags: None,
             export_options: ExportOptions::default(),
             rows: Vec::new(),
-            whole: [false; 2],
+            whole: vec![false; 2],
+            tag: None,
         };
         let files = spec.frozen_clip(&snapshot).unwrap().write(false).unwrap();
         assert_eq!(files.paths.len(), 1);
+        // The one file holds lane B's audio.
+        assert_eq!(files.lanes, [Some(1)]);
         let wav = std::fs::read(&files.paths[0]).unwrap();
         assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 2);
         assert_eq!(
@@ -9910,7 +10847,7 @@ mod tests {
             rows: (4..7)
                 .map(|channel| RowSource::Channel(0, channel))
                 .collect(),
-            pairs: [None, None],
+            pairs: vec![None, None],
             bins: 2,
         };
         let peaks = edit_preview(&[track], &[0], &key);
@@ -9951,7 +10888,7 @@ mod tests {
         let pair: Arc<[FrozenTrack]> = vec![lane(), lane()].into();
         let single: Arc<[FrozenTrack]> = vec![lane()].into();
         let named = |lane| ClipFormat {
-            names: ["System audio".into(), "Vocal mic".into()],
+            names: vec!["System audio".into(), "Vocal mic".into()],
             lane,
             ..ClipFormat::unnamed([ChannelRoute::Merged; 2], false)
         };
@@ -10008,6 +10945,141 @@ mod tests {
             .is_none()
         );
         std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn three_lanes_write_one_file_each_lettered_a_b_and_c() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let folder = std::env::temp_dir().join(format!(
+            "Backtracking-three-lanes-{}-{nonce}",
+            std::process::id()
+        ));
+        // A mono lane, a stereo lane and a 6-channel lane, 4 frames each.
+        let track = |channels: usize, value: f32| {
+            FrozenTrack::from_interleaved(48_000, channels, 10, &vec![value; channels * 4]).unwrap()
+        };
+        let tracks: Arc<[FrozenTrack]> = vec![track(1, 0.25), track(2, 0.5), track(6, 0.75)].into();
+        let format = ClipFormat {
+            names: vec!["Mic".into(), "Tone".into(), "Bed".into()],
+            ..ClipFormat::unnamed([ChannelRoute::Merged; 3], false)
+        };
+        let mut clip = WavClip::new(
+            Arc::clone(&tracks),
+            &[0, 1, 2],
+            None,
+            Fades::NONE,
+            folder.clone(),
+            format.clone(),
+            None,
+        )
+        .unwrap();
+        clip.export_options.wide_mode = WideExportMode::Multichannel;
+        let written = clip.write(true).unwrap();
+        let mut found: Vec<_> = written
+            .paths
+            .iter()
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                let wav = std::fs::read(path).unwrap();
+                let field = |at: usize| u16::from_le_bytes(wav[at..at + 2].try_into().unwrap());
+                let (channels, bits) = (field(22), field(34));
+                let data = wav.windows(4).position(|tag| tag == b"data").unwrap();
+                let bytes = u32::from_le_bytes(wav[data + 4..data + 8].try_into().unwrap());
+                (
+                    name,
+                    channels,
+                    bytes / (u32::from(channels) * u32::from(bits) / 8),
+                )
+            })
+            .collect();
+        found.sort();
+        // The wide lane C is written whole, with its stereo pair beside it.
+        assert_eq!(found.len(), 4, "{found:?}");
+        for ((name, channels, frames), (prefix, suffix, wanted)) in found.iter().zip([
+            ("Backtracking_Bed_C_2", "s-Stereo.wav", 2),
+            ("Backtracking_Bed_C_2", "s.wav", 6),
+            ("Backtracking_Mic_A_2", "s.wav", 1),
+            ("Backtracking_Tone_B_2", "s.wav", 2),
+        ]) {
+            assert!(
+                name.starts_with(prefix) && name.ends_with(suffix),
+                "{found:?}"
+            );
+            assert_eq!((*channels, *frames), (wanted, 4), "{name}");
+        }
+        // Lane C saved on its own keeps its letter; a fourth lane is refused.
+        let lane_c = WavClip::new(
+            Arc::clone(&tracks),
+            &[0, 1, 2],
+            None,
+            Fades::NONE,
+            folder.clone(),
+            ClipFormat {
+                lane: Some(2),
+                ..format.clone()
+            },
+            None,
+        )
+        .unwrap()
+        .write(true)
+        .unwrap();
+        assert!(!lane_c.paths.is_empty());
+        for path in &lane_c.paths {
+            let name = path.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with("Backtracking_Bed_C_2"), "{name}");
+        }
+        assert!(
+            WavClip::new(
+                tracks,
+                &[0, 1, 3],
+                None,
+                Fades::NONE,
+                folder.clone(),
+                format,
+                None
+            )
+            .is_none()
+        );
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn three_lanes_preview_each_lane_and_play_chosen_rows_of_one() {
+        let snapshots = vec![
+            FrozenTrack::from_interleaved(48_000, 2, 0, &[0.5; 400]).unwrap(),
+            FrozenTrack::from_interleaved(48_000, 1, 0, &[0.25; 200]).unwrap(),
+            FrozenTrack::from_interleaved(48_000, 2, 0, &[0.75; 400]).unwrap(),
+        ];
+        let groups = vec![Vec::new(); 3];
+        let shown = vec![None; 3];
+        let routes = [ChannelRoute::Merged; 3];
+        let every = preview_plan(&snapshots, &[0, 1, 2], &groups, &shown, routes, None).unwrap();
+        assert_eq!(
+            every.iter().map(|part| part.index).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        // The right side of lane C alone.
+        let rows = [RowSource::View(2, WaveformView::Right)];
+        let one = preview_plan(&snapshots, &[0, 1, 2], &groups, &shown, routes, Some(&rows));
+        let one = one.unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!((one[0].index, one[0].selected.clone()), (2, Some(vec![1])));
+        let lanes: Vec<PreviewLane<'_>> = every
+            .iter()
+            .map(|part| PreviewLane {
+                track: &snapshots[part.index],
+                route: part.route,
+                group: part.group.as_ref(),
+                selected: part.selected.as_deref(),
+            })
+            .collect();
+        assert!(
+            Preview::with_lane_positions(&lanes, 0..100, None, false, Fades::NONE, &[]).is_some()
+        );
+        assert!(Preview::new(&snapshots, 0..100, &routes, false, Fades::NONE).is_some());
     }
 
     #[test]
@@ -10084,8 +11156,10 @@ mod tests {
         }
     }
 
-    fn no_positions() -> [FrozenPositionTrack; 2] {
-        std::array::from_fn(|_| backtracking_core::PositionTrack::new().freeze())
+    fn no_positions() -> Vec<FrozenPositionTrack> {
+        (0..2)
+            .map(|_| backtracking_core::PositionTrack::new().freeze())
+            .collect()
     }
 
     fn views_plan(lane: usize, views: &[WaveformView]) -> LanePlan {
@@ -10134,7 +11208,7 @@ mod tests {
             std::process::id()
         ));
         let format = ClipFormat {
-            names: ["Tone".into(), "Music".into()],
+            names: vec!["Tone".into(), "Music".into()],
             ..ClipFormat::unnamed([ChannelRoute::Merged; 2], false)
         };
         let mut clip = WavClip::new(
@@ -10148,11 +11222,10 @@ mod tests {
         )
         .unwrap();
         // The group on show is the first, as it is on screen.
-        clip.export_options.groups = std::array::from_fn(|index| {
-            lanes
-                .get(index)
-                .and_then(|&lane| groups[lane].first().cloned())
-        });
+        clip.export_options.groups = lanes
+            .iter()
+            .map(|&lane| groups[lane].first().cloned())
+            .collect();
         clip.export_options.wide_mode = wide_mode;
         let files = clip.with_rows(rows, groups).unwrap().write(false).unwrap();
         let written = files
@@ -10177,6 +11250,58 @@ mod tests {
         drop(files);
         let _ = std::fs::remove_dir_all(folder);
         written
+    }
+
+    #[test]
+    fn rows_chosen_in_some_of_many_lanes_write_only_those_lanes() {
+        let snapshots: Arc<[FrozenTrack]> = (0..4).map(|_| numbered(2)).collect();
+        let lanes = [0, 1, 2, 3];
+        let write = |rows: &[RowSource]| {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let folder = std::env::temp_dir().join(format!(
+                "Backtracking-many-lanes-{}-{nonce}",
+                std::process::id()
+            ));
+            let format = ClipFormat {
+                names: ["Tone", "Music", "Voice", "Room"].map(String::from).to_vec(),
+                ..ClipFormat::unnamed([ChannelRoute::Merged; 4], false)
+            };
+            let clip = WavClip::new(
+                Arc::clone(&snapshots),
+                &lanes,
+                Some(&(101..105)),
+                Fades::NONE,
+                folder.clone(),
+                format,
+                None,
+            )
+            .unwrap();
+            let files = clip.with_rows(rows, &[]).unwrap().write(false).unwrap();
+            let mut names: Vec<String> = files
+                .paths
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            drop(files);
+            let _ = std::fs::remove_dir_all(folder);
+            names
+        };
+        let merged = |lane| RowSource::View(lane, WaveformView::Merged);
+        // Rows of B and D: A and C are left out, and each file keeps its lane's letter.
+        let names = write(&[merged(1), merged(3)]);
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names[0].starts_with("Backtracking_Music_B_"), "{names:?}");
+        assert!(names[1].starts_with("Backtracking_Room_D_"), "{names:?}");
+        // Rows of one lane write that lane, as before.
+        let names = write(&[merged(2)]);
+        assert_eq!(names.len(), 1);
+        assert!(names[0].starts_with("Backtracking_Voice_C_"), "{names:?}");
+        // No rows chosen: every lane.
+        assert_eq!(write(&[]).len(), 4);
     }
 
     #[test]
@@ -10438,12 +11563,12 @@ mod tests {
         // What the rows write and play: the pair, and the lane-native channels.
         let export = chosen_rows(&[pair[0], pair[1], a(6), a(2)]).unwrap();
         assert_eq!(export.lane, Some(0));
-        assert_eq!(export.pair, [true, false]);
+        assert_eq!(export.pair, [true]);
         assert_eq!(export.native[0], Some(vec![2, 6]));
         let channels = chosen_rows(&[a(6), a(2)]).unwrap();
         assert_eq!(
             (channels.pair, channels.native[0].clone()),
-            ([false, false], Some(vec![2, 6]))
+            (vec![false], Some(vec![2, 6]))
         );
         let only_pair = chosen_rows(&pair).unwrap();
         assert_eq!(only_pair.native[0], Some(Vec::new()));
@@ -10491,10 +11616,10 @@ mod tests {
             bars: Vec::new(),
             retention_seconds: 20.0,
             export_options: ExportOptions::default(),
-            groups: [vec![windows_71()], Vec::new()],
+            groups: vec![vec![windows_71()], Vec::new()],
             shown_groups: Default::default(),
             positions: no_positions(),
-            activity: [None; 2],
+            activity: vec![None; 2],
             activity_job: None,
         };
         let pair = RowSource::pair(1);
@@ -10514,7 +11639,7 @@ mod tests {
                 pair: true
             }
         );
-        assert_eq!(choice[1], RowChoice::default());
+        assert_eq!(choice.len(), 1);
         let both = edit(vec![0, 1]);
         let choice = both.row_choice(&rows);
         assert_eq!(
@@ -10571,7 +11696,7 @@ mod tests {
                 RowSource::Pair(0, PairSide::Right),
                 RowSource::Channel(0, 2),
             ],
-            pairs: [Some(pair.clone()), None],
+            pairs: vec![Some(pair.clone()), None],
             bins: 4,
         };
         let peaks = edit_preview(std::slice::from_ref(&track), &[0], &key);
@@ -10584,7 +11709,7 @@ mod tests {
         assert_eq!(peaks[2].high, [0.03; 4]);
         // Without its group a pair row stays flat rather than show other audio.
         let lost = EditPreviewKey {
-            pairs: [None, None],
+            pairs: vec![None, None],
             ..key
         };
         assert_eq!(edit_preview(&[track], &[0], &lost)[0].high, [0.0; 4]);
@@ -11280,7 +12405,7 @@ mod tests {
         };
         let file_names = |lane| {
             let format = ClipFormat {
-                names: ["Test tone".into(), "System audio".into()],
+                names: vec!["Test tone".into(), "System audio".into()],
                 lane,
                 ..ClipFormat::unnamed([ChannelRoute::Merged; 2], false)
             };
@@ -11294,7 +12419,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            clip.export_options.groups = [Some(bed.clone()), None];
+            clip.export_options.groups = vec![Some(bed.clone()), None];
             clip.export_options.wide_mode = crate::preferences::WideExportMode::MonoFiles;
             let files = clip.write(false).unwrap();
             files
@@ -11521,7 +12646,7 @@ mod tests {
             };
             let clip = |rows: &[RowSource], mode| {
                 let format = ClipFormat {
-                    names: ["Music".into(), "Tone".into()],
+                    names: vec!["Music".into(), "Tone".into()],
                     ..ClipFormat::unnamed([ChannelRoute::Merged; 2], false)
                 };
                 let mut clip = WavClip::new(
@@ -11535,7 +12660,7 @@ mod tests {
                 )
                 .unwrap();
                 // By snapshot: the bed is on show in lane B.
-                clip.export_options.groups = lanes.map(|lane| (lane == 1).then(bed_group));
+                clip.export_options.groups = lanes.map(|lane| (lane == 1).then(bed_group)).into();
                 clip.export_options.wide_mode = mode;
                 clip.with_rows(rows, &groups)
                     .unwrap()
@@ -11576,7 +12701,7 @@ mod tests {
             assert!(!names[0].contains("-Ch"), "{swapped} {names:?}");
             // Every row of B chosen is B written whole: the bed and the pair.
             let whole = clip(&[RowSource::Channel(1, 0)], WideExportMode::MonoFiles)
-                .whole_lanes([false, true]);
+                .whole_lanes(&[false, true]);
             let (names, _) = written_names(whole);
             assert_eq!(names.len(), 13, "{swapped} {names:?}");
             assert_eq!(names[12], "-Stereo.wav");
@@ -11616,8 +12741,8 @@ mod tests {
         };
         let names = |track: FrozenTrack, hiding: bool, mode| {
             let format = ClipFormat {
-                names: ["System audio".into(), String::new()],
-                hide_silent: [hiding, false],
+                names: vec!["System audio".into(), String::new()],
+                hide_silent: vec![hiding, false],
                 ..ClipFormat::unnamed([ChannelRoute::AllChannels; 2], false)
             };
             let mut clip = WavClip::new(
@@ -11630,7 +12755,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            clip.export_options.groups = [Some(system.clone()), None];
+            clip.export_options.groups = vec![Some(system.clone()), None];
             clip.export_options.wide_mode = mode;
             let clip = clip
                 .with_rows(&[], &[vec![system.clone()], Vec::new()])
@@ -11676,7 +12801,7 @@ mod tests {
             ]
         );
         let format = ClipFormat {
-            hide_silent: [true, false],
+            hide_silent: vec![true, false],
             ..ClipFormat::unnamed([ChannelRoute::AllChannels; 2], false)
         };
         // One multichannel file of a subset holds only those channels.
@@ -11690,7 +12815,7 @@ mod tests {
             None,
         )
         .unwrap();
-        clip.export_options.groups = [Some(system.clone()), None];
+        clip.export_options.groups = vec![Some(system.clone()), None];
         clip.export_options.wide_mode = WideExportMode::Multichannel;
         let folder = clip.output.clone();
         let files = clip.write(false).unwrap();
@@ -11714,7 +12839,7 @@ mod tests {
 
         // An add-on lane never hides rows, so its clip format does not ask for it.
         let format = ClipFormat {
-            names: ["Test tone".into(), String::new()],
+            names: vec!["Test tone".into(), String::new()],
             ..ClipFormat::unnamed([ChannelRoute::Merged; 2], false)
         };
         assert_eq!(format.hide_silent, [false, false]);
@@ -11735,7 +12860,7 @@ mod tests {
             channels: 0..8,
             labels: SYSTEM_71.iter().map(|&label| label.to_owned()).collect(),
         };
-        clip.export_options.groups = [Some(bed.clone()), None];
+        clip.export_options.groups = vec![Some(bed.clone()), None];
         clip.export_options.wide_mode = WideExportMode::MonoFiles;
         let clip = clip.with_rows(&[], &[vec![bed], Vec::new()]).unwrap();
         let (names, _) = written_names(clip);
@@ -11757,10 +12882,7 @@ mod tests {
         // A lane that shows only its pair, while its other rows are hidden, is whole when the
         // pair is chosen; the export then asks the audio which channels have sound.
         let pair_only = [paired_plan(0, bed_group(), Vec::new())];
-        assert_eq!(
-            lanes_chosen_whole(&pair_only, &RowSource::pair(0)),
-            [true, false]
-        );
+        assert_eq!(lanes_chosen_whole(&pair_only, &RowSource::pair(0)), [true]);
     }
 
     fn system_group() -> LaneGroup {
@@ -11878,16 +13000,177 @@ mod tests {
     }
 
     #[test]
+    fn the_meters_that_fit_show_and_the_rest_go_behind_one_button() {
+        let (each, more) = (95.0, 38.0);
+        // One or two lanes, or every meter fitting, show them all.
+        assert_eq!(meters_shown(3, 3.0 * each, each, more), 3);
+        assert_eq!(meters_shown(6, 600.0, each, more), 6);
+        // Six lanes in 400 points: three meters and the "+3" button.
+        assert_eq!(meters_shown(6, 400.0, each, more), 3);
+        // 64 lanes in a wide toolbar still leave room for the button.
+        let shown = meters_shown(64, 1000.0, each, more);
+        assert_eq!(shown, 10);
+        assert!(shown as f32 * each + more <= 1000.0);
+        // Never fewer than one, nor all of them behind the button.
+        assert_eq!(meters_shown(6, 10.0, each, more), 1);
+        assert_eq!(meters_shown(3, 0.0, each, more), 1);
+    }
+
+    #[test]
+    fn removing_a_lane_takes_its_meter_unit_with_it_and_moves_the_later_ones_up() {
+        let tone = || {
+            Some(SourceSettings {
+                source: CaptureSource::System,
+                route: ChannelRoute::Merged,
+            })
+        };
+        // Lane B of four removed: C and D move up into B and C.
+        let sources = vec![tone(), None, tone(), tone()];
+        assert_eq!(lanes_moving_up(&sources), vec![1]);
+        let mut modes = vec![
+            MeterMode::Dbfs,
+            MeterMode::Lufs,
+            MeterMode::Vu,
+            MeterMode::Lufs,
+        ];
+        shift_meter_modes(&mut modes, &lanes_moving_up(&sources));
+        assert_eq!(
+            modes,
+            [MeterMode::Dbfs, MeterMode::Vu, MeterMode::Lufs, MeterMode::Dbfs]
+        );
+        // The last lane removed moves nothing, so every unit stays where it was.
+        assert!(lanes_moving_up(&[tone(), tone(), None]).is_empty());
+        // Two removed at once: B and D of five, so C and E become B and C.
+        let sources = vec![tone(), None, tone(), None, tone()];
+        assert_eq!(lanes_moving_up(&sources), vec![1, 3]);
+        let mut modes = vec![
+            MeterMode::Dbfs,
+            MeterMode::Lufs,
+            MeterMode::Vu,
+            MeterMode::Lufs,
+            MeterMode::Vu,
+        ];
+        shift_meter_modes(&mut modes, &[1, 3]);
+        assert_eq!(
+            modes,
+            [
+                MeterMode::Dbfs,
+                MeterMode::Vu,
+                MeterMode::Vu,
+                MeterMode::Dbfs,
+                MeterMode::Dbfs
+            ]
+        );
+        assert_eq!(
+            compact_sources(sources).len(),
+            3,
+            "the lanes left are the ones whose units were kept"
+        );
+    }
+
+    #[test]
+    fn many_lanes_ask_for_room_and_scroll_as_one_column() {
+        let mono = stack::LaneRows {
+            rows: 1,
+            stacked: false,
+        };
+        // One or two lanes that do not stack ask for nothing, as before.
+        assert_eq!(wanted_height(&[mono, mono]), None);
+        // Three lanes or more ask for a comfortable row each.
+        assert_eq!(
+            wanted_height(&[mono; 3]),
+            Some(3.0 * stack::COMFORTABLE_ROW_HEIGHT)
+        );
+        assert_eq!(
+            wanted_height(&[mono; 64]),
+            Some(64.0 * stack::COMFORTABLE_ROW_HEIGHT)
+        );
+        // A stacked lane asks as it always did.
+        let wide = stack::LaneRows {
+            rows: 14,
+            stacked: true,
+        };
+        assert_eq!(
+            wanted_height(&[wide, mono]),
+            stack::comfortable_height(&[wide, mono])
+        );
+
+        // The plot's margin: none, channel names, letters, letters and names.
+        assert_eq!(label_gutter(1, false), None);
+        assert_eq!(label_gutter(2, false), None);
+        assert_eq!(label_gutter(2, true), Some(stack::LABEL_GUTTER));
+        assert_eq!(label_gutter(3, false), Some(LETTER_GUTTER));
+        assert_eq!(label_gutter(6, true), Some(LETTERED_GUTTER));
+        assert!(LETTERED_GUTTER > stack::LABEL_GUTTER);
+
+        // 64 lanes in 500 points: 35 rows show, and the column scrolls by whole rows.
+        let (boxes, column) = stack::lay_out_column(500.0, &[mono; 64], 40);
+        assert_eq!((column.first, column.shown, column.rows), (29, 35, 64));
+        assert_eq!(column_edge(&column, -1.0), Some(false));
+        assert_eq!(column_edge(&column, 250.0), None);
+        assert_eq!(column_edge(&column, 500.0), None, "the last row is on show");
+        let (_, top) = stack::lay_out_column(500.0, &[mono; 64], 0);
+        assert_eq!(column_edge(&top, -1.0), None);
+        assert_eq!(column_edge(&top, 500.0), Some(true));
+        // Only the lanes on show have rows on screen.
+        let on_show: Vec<usize> = boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, lane)| lane.shown > 0)
+            .map(|(lane, _)| lane)
+            .collect();
+        assert_eq!(on_show, (29..64).collect::<Vec<_>>());
+
+        // A lane's row in the column counts every row of the lanes above it.
+        let lanes = [
+            views_plan(0, &[WaveformView::Merged]),
+            wide_plan(1, bed_group()),
+            views_plan(2, &[WaveformView::Merged]),
+        ];
+        assert_eq!(column_row(&lanes, 0, 0), 0);
+        assert_eq!(column_row(&lanes, 1, 3), 4);
+        assert_eq!(column_row(&lanes, 2, 0), 1 + lanes[1].rows());
+    }
+
+    #[test]
+    fn the_status_line_names_a_lane_problem_by_its_letter_with_more_than_one_lane() {
+        let english = Language::English;
+        assert_eq!(lanes_problem([None, None], true, english), None);
+        assert_eq!(
+            lanes_problem([Some("The device is gone.")], false, english).as_deref(),
+            Some("The device is gone.")
+        );
+        assert_eq!(
+            lanes_problem([None, None, Some("The device is gone.")], true, english).as_deref(),
+            Some("Source C: The device is gone.")
+        );
+        let refused = "Lane G cannot start: it needs 12 channels and 4 are left.";
+        let mut lanes = vec![None; 6];
+        lanes.push(Some(refused));
+        lanes.push(Some("The device is gone."));
+        lanes.push(Some("The device is gone."));
+        assert_eq!(
+            lanes_problem(lanes, true, english).as_deref(),
+            Some("Lane G cannot start: it needs 12 channels and 4 are left. · 2 more sources have a problem")
+        );
+        assert_eq!(
+            lanes_problem([None, Some("裝置已移除。")], true, Language::TraditionalChinese)
+                .as_deref(),
+            Some("來源 B：裝置已移除。")
+        );
+    }
+
+    #[test]
     fn a_lane_selected_whole_stays_whole_as_its_rows_appear_or_go() {
         use crate::preferences::WideExportMode;
 
         let system = system_group();
         let plan = |shown: Vec<usize>| vec![paired_plan(0, system.clone(), shown)];
         // What a save or drag-out of `rows` writes from `track`, a lane that hides silent rows.
-        let saved = |track: FrozenTrack, rows: &[RowSource], whole: [bool; 2]| {
+        let saved = |track: FrozenTrack, rows: &[RowSource], whole: Vec<bool>| {
             let format = ClipFormat {
-                names: ["System audio".into(), String::new()],
-                hide_silent: [true, false],
+                names: vec!["System audio".into(), String::new()],
+                hide_silent: vec![true, false],
                 ..ClipFormat::unnamed([ChannelRoute::AllChannels; 2], false)
             };
             let mut clip = WavClip::new(
@@ -11900,12 +13183,12 @@ mod tests {
                 None,
             )
             .unwrap();
-            clip.export_options.groups = [Some(system.clone()), None];
+            clip.export_options.groups = vec![Some(system.clone()), None];
             clip.export_options.wide_mode = WideExportMode::MonoFiles;
             let clip = clip
                 .with_rows(rows, &[vec![system.clone()], Vec::new()])
                 .unwrap()
-                .whole_lanes(whole);
+                .whole_lanes(&whole);
             written_names(clip).0
         };
 
@@ -11913,18 +13196,18 @@ mod tests {
         let made = plan(vec![2, 3]);
         let every = rows_between(&made, made[0].row(0), made[0].row(3));
         let mut whole = lanes_chosen_whole(&made, &every);
-        assert_eq!(whole, [true, false]);
+        assert_eq!(whole, [true]);
         // Then Ls is found active and its row appears. The lane stays whole and covers it.
         let appeared = plan(vec![2, 3, 6]);
         let rows = carry_rows(&made, &appeared, &every, &mut whole);
-        assert_eq!(whole, [true, false]);
+        assert_eq!(whole, [true]);
         assert_eq!(
             rows,
             rows_between(&appeared, appeared[0].row(0), appeared[0].row(4))
         );
         // Saved whole: every active channel, Ls included, and the pair.
         assert_eq!(
-            saved(system_71(&[2, 3, 6]), &rows, whole),
+            saved(system_71(&[2, 3, 6]), &rows, whole.clone()),
             [
                 "-Ch03_FC.wav",
                 "-Ch04_LFE.wav",
@@ -11935,7 +13218,7 @@ mod tests {
         // A row that goes leaves the lane whole too.
         let went = plan(vec![2]);
         let rows = carry_rows(&appeared, &went, &rows, &mut whole);
-        assert_eq!(whole, [true, false]);
+        assert_eq!(whole, [true]);
         assert_eq!(rows, rows_between(&went, went[0].row(0), went[0].row(2)));
 
         // A selection of some rows keeps exactly those, even once they are all the lane shows:
@@ -11943,10 +13226,10 @@ mod tests {
         let made = plan(vec![0, 1, 2]);
         let some = rows_between(&made, made[0].row(0), made[0].row(3));
         let mut whole = lanes_chosen_whole(&made, &some);
-        assert_eq!(whole, [false, false]);
+        assert_eq!(whole, [false]);
         let pair_only = plan(Vec::new());
         let rows = carry_rows(&made, &pair_only, &some, &mut whole);
-        assert_eq!(whole, [false, false]);
+        assert_eq!(whole, [false]);
         assert_eq!(rows, some);
         assert_eq!(
             saved(system_71(&[0, 1]), &rows, whole),
@@ -11960,12 +13243,12 @@ mod tests {
         let shown_objects = [wide_plan(0, objects)];
         let all_bed = rows_between(&bed, bed[0].row(0), bed[0].row(11));
         let mut whole = lanes_chosen_whole(&bed, &all_bed);
-        assert_eq!(whole, [true, false]);
+        assert_eq!(whole, [true]);
         let rows = carry_rows(&bed, &shown_objects, &all_bed, &mut whole);
-        assert_eq!(whole, [false, false]);
+        assert_eq!(whole, [false]);
         assert_eq!(rows, all_bed);
         let rows = carry_rows(&shown_objects, &bed, &rows, &mut whole);
-        assert_eq!(whole, [false, false]);
+        assert_eq!(whole, [false]);
         assert_eq!(rows, all_bed);
     }
 
@@ -11977,6 +13260,7 @@ mod tests {
             objects_in_mono,
             keep: true,
             flags: None,
+            lanes: Vec::new(),
         };
         let english = Language::English;
         assert_eq!(

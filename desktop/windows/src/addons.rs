@@ -13,8 +13,9 @@ use backtracking_addon::host::{Connection, Host, HostEvent, PositionFilter};
 use backtracking_addon::manifest::{Capability, Manifest, validate_id};
 use backtracking_addon::package::{self, PackageInfo};
 use backtracking_addon::protocol::{
-    Action, AddonMessage, Appearance, ChannelPosition, HostMessage, MessageLevel, Setting,
-    SettingKind, Source, Transport, TransportCommand,
+    Action, AddonMessage, Appearance, ChannelPosition, ControlCommand, ControlError, ControlReply,
+    ControlResult, HostMessage, MAX_CONTROL_IN_FLIGHT, MessageLevel, Setting, SettingKind, Source,
+    Transport, TransportCommand, control_codes,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -79,6 +80,23 @@ pub(crate) struct AddonInfo {
     pub(crate) sources: Vec<Source>,
     pub(crate) settings: Vec<AddonSetting>,
     pub(crate) actions: Vec<Action>,
+    /// The user lets this add-on control Backtracking (capability `control`). Saved per id.
+    #[serde(default)]
+    pub(crate) control_allowed: bool,
+    /// The add-on asked to control Backtracking while that was off, since it last started.
+    #[serde(default)]
+    pub(crate) control_asked: bool,
+}
+
+/// One control request an add-on sent, for the main window to carry out.
+#[derive(Clone, Debug)]
+pub(crate) struct ControlCall {
+    pub(crate) addon_id: String,
+    pub(crate) addon_name: String,
+    /// Which run of the add-on asked; a reply to an earlier run is dropped.
+    pub(crate) run: u64,
+    pub(crate) request_id: String,
+    pub(crate) command: ControlCommand,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -174,6 +192,9 @@ struct Shared {
     callbacks: Mutex<Vec<ChangeCallback>>,
     appearance_callbacks: Mutex<Vec<ChangeCallback>>,
     positions: Mutex<PositionJournal>,
+    /// Control requests accepted and not yet taken by the main window.
+    control_calls: Mutex<VecDeque<ControlCall>>,
+    control_callbacks: Mutex<Vec<ChangeCallback>>,
 }
 
 impl Shared {
@@ -280,6 +301,48 @@ impl AddonHandle {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(callback);
+    }
+
+    /// Subscribe a repaint of the main window to new control requests.
+    pub(crate) fn subscribe_control(&self, callback: ChangeCallback) {
+        self.shared
+            .control_callbacks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(callback);
+    }
+
+    /// Take the control requests waiting to be carried out, oldest first. Answer each one
+    /// with [`AddonHandle::control_reply`]. Empty in a secondary capture window.
+    pub(crate) fn take_control_calls(&self) -> Vec<ControlCall> {
+        self.shared
+            .control_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
+    }
+
+    /// Answer a control request. A reply after the request timed out is dropped.
+    pub(crate) fn control_reply(
+        &self,
+        call: &ControlCall,
+        outcome: Result<ControlResult, ControlError>,
+    ) {
+        let reply = match outcome {
+            Ok(result) => ControlReply::success(call.request_id.clone(), &result),
+            Err(error) => ControlReply::failure(Some(call.request_id.clone()), error),
+        };
+        let _ = self.commands.send(Command::ControlReply {
+            addon_id: call.addon_id.clone(),
+            run: call.run,
+            reply,
+        });
+    }
+
+    /// Switch "Let this add-on control Backtracking" for one add-on, and save it.
+    pub(crate) fn set_control_allowed(&self, id: &str, allowed: bool) -> AddonReply<()> {
+        self.request(|reply| Command::ControlAllowed(id.into(), allowed, reply))
     }
 
     pub(crate) fn inspect(&self, path: PathBuf) -> AddonReply<InspectedPackage> {
@@ -493,6 +556,12 @@ enum Command {
     Send(String, HostMessage, Reply<()>),
     Clips(HostMessage, Reply<()>),
     Error(String, Reply<()>),
+    ControlAllowed(String, bool, Reply<()>),
+    ControlReply {
+        addon_id: String,
+        run: u64,
+        reply: ControlReply,
+    },
     Shutdown,
 }
 
@@ -502,6 +571,9 @@ struct SavedAddon {
     enabled: bool,
     settings: BTreeMap<String, Value>,
     formats: BTreeMap<String, String>,
+    /// "Let this add-on control Backtracking". Off unless the user switched it on.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    control: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -541,6 +613,10 @@ struct Runtime {
     disconnected_at: Option<Instant>,
     stop: Option<(Instant, AddonState)>,
     restart_after_stop: bool,
+    /// Numbers this run, so a reply meant for an earlier run is dropped.
+    run: u64,
+    /// Control requests waiting for the main window's reply, with when they time out.
+    control: BTreeMap<String, Instant>,
 }
 
 struct Entry {
@@ -568,6 +644,8 @@ impl Entry {
                 sources: Vec::new(),
                 settings: Vec::new(),
                 actions: Vec::new(),
+                control_allowed: false,
+                control_asked: false,
             },
             runtime: None,
             restarts: RestartPolicy::default(),
@@ -650,6 +728,7 @@ struct Worker {
     inspections: Vec<PendingInspection>,
     operations: Vec<Operation>,
     shutting_down: bool,
+    runs: u64,
 }
 
 impl Worker {
@@ -670,10 +749,10 @@ impl Worker {
                 .to_string_lossy()
                 .into_owned();
             let enabled = saved.addons.get(&id).is_some_and(|value| value.enabled);
-            entries.insert(
-                id.clone(),
-                Entry::from_manifest(id, installed.manifest.map_err(|e| e.to_string()), enabled),
-            );
+            let mut entry =
+                Entry::from_manifest(id.clone(), installed.manifest.map_err(|e| e.to_string()), enabled);
+            entry.info.control_allowed = saved.addons.get(&id).is_some_and(|value| value.control);
+            entries.insert(id, entry);
         }
         Ok(Self {
             root,
@@ -686,6 +765,7 @@ impl Worker {
             inspections: Vec::new(),
             operations: Vec::new(),
             shutting_down: false,
+            runs: 0,
         })
     }
 
@@ -867,7 +947,179 @@ impl Worker {
             Command::Error(reason, reply) => {
                 let _ = reply.send(Err(reason));
             }
+            Command::ControlAllowed(id, allowed, reply) => {
+                let result = self.available(&id).and_then(|()| {
+                    let mut saved = self.saved.clone();
+                    saved.addons.entry(id.clone()).or_default().control = allowed;
+                    self.store(saved)?;
+                    self.set_control_access(&id, allowed);
+                    Ok(())
+                });
+                let _ = reply.send(result);
+            }
+            Command::ControlReply {
+                addon_id,
+                run,
+                reply,
+            } => {
+                let Some(runtime) = self
+                    .entries
+                    .get_mut(&addon_id)
+                    .and_then(|entry| entry.runtime.as_mut())
+                    .filter(|runtime| runtime.run == run)
+                else {
+                    return;
+                };
+                let waiting = reply
+                    .id
+                    .as_ref()
+                    .is_some_and(|request| runtime.control.remove(request).is_some());
+                if waiting {
+                    if let Some(connection) = &mut runtime.connection {
+                        let _ = connection.send(&HostMessage::ControlReply(reply));
+                    }
+                }
+            }
             Command::Shutdown => self.shutdown(),
+        }
+    }
+
+    /// Apply the user's switch: tell a running add-on, and on revoking refuse what it asked.
+    fn set_control_access(&mut self, id: &str, allowed: bool) {
+        let Some(entry) = self.entries.get_mut(id) else {
+            return;
+        };
+        entry.info.control_allowed = allowed;
+        if allowed {
+            entry.info.control_asked = false;
+        }
+        let declared = has_capability(&entry.info, Capability::Control);
+        let Some(runtime) = entry.runtime.as_mut() else {
+            return;
+        };
+        let mut refused = Vec::new();
+        if !allowed {
+            self.shared
+                .control_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|call| call.addon_id != id);
+            refused.extend(std::mem::take(&mut runtime.control).into_keys());
+        }
+        if let Some(connection) = &mut runtime.connection {
+            for request in refused {
+                let _ = connection.send(&HostMessage::ControlReply(ControlReply::failure(
+                    Some(request),
+                    not_allowed(),
+                )));
+            }
+            if declared {
+                let _ = connection.send(&HostMessage::ControlAccess { allowed });
+            }
+        }
+    }
+
+    /// Check a control request and queue it for the main window, or answer it at once.
+    fn control_request(
+        &mut self,
+        id: &str,
+        request: Option<String>,
+        command: Result<ControlCommand, ControlError>,
+    ) {
+        let entry = self.entries.get_mut(id).unwrap();
+        let Some(runtime) = entry.runtime.as_mut() else {
+            return;
+        };
+        let refusal = if !has_capability(&entry.info, Capability::Control) {
+            Some(ControlError::new(
+                control_codes::NOT_DECLARED,
+                "Declare the control capability in addon.json to send control requests",
+            ))
+        } else if !entry.info.control_allowed {
+            entry.info.control_asked = true;
+            Some(not_allowed())
+        } else {
+            match (&request, &command) {
+                (_, Err(error)) => Some(error.clone()),
+                (None, _) => Some(ControlError::new(
+                    control_codes::INVALID_REQUEST,
+                    "A control request needs an id",
+                )),
+                (Some(request), Ok(_)) if runtime.control.contains_key(request) => {
+                    Some(ControlError::new(
+                        control_codes::DUPLICATE_ID,
+                        "A request with this id is still waiting for its reply",
+                    ))
+                }
+                (Some(_), Ok(_)) if runtime.control.len() >= MAX_CONTROL_IN_FLIGHT => {
+                    Some(ControlError::new(
+                        control_codes::TOO_MANY_REQUESTS,
+                        format!(
+                            "At most {MAX_CONTROL_IN_FLIGHT} control requests may wait for their \
+                             replies at once"
+                        ),
+                    ))
+                }
+                _ => None,
+            }
+        };
+        if let Some(error) = refusal {
+            if let Some(connection) = &mut runtime.connection {
+                let _ = connection.send(&HostMessage::ControlReply(ControlReply::failure(
+                    request, error,
+                )));
+            }
+            return;
+        }
+        let (Some(request), Ok(command)) = (request, command) else {
+            return;
+        };
+        runtime
+            .control
+            .insert(request.clone(), Instant::now() + command.reply_within());
+        let addon_name = entry
+            .info
+            .manifest
+            .as_ref()
+            .map_or_else(|| id.to_owned(), |manifest| manifest.name.clone());
+        self.shared
+            .control_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(ControlCall {
+                addon_id: id.into(),
+                addon_name,
+                run: runtime.run,
+                request_id: request,
+                command,
+            });
+        notify(&self.shared.control_callbacks);
+    }
+
+    /// Answer the requests the main window did not answer in time.
+    fn expire_control(&mut self, now: Instant) {
+        for entry in self.entries.values_mut() {
+            let Some(runtime) = entry.runtime.as_mut() else {
+                continue;
+            };
+            let late: Vec<String> = runtime
+                .control
+                .iter()
+                .filter(|(_, deadline)| now >= **deadline)
+                .map(|(request, _)| request.clone())
+                .collect();
+            for request in late {
+                runtime.control.remove(&request);
+                if let Some(connection) = &mut runtime.connection {
+                    let _ = connection.send(&HostMessage::ControlReply(ControlReply::failure(
+                        Some(request),
+                        ControlError::new(
+                            control_codes::TIMEOUT,
+                            "Backtracking did not finish this in time; it may still happen",
+                        ),
+                    )));
+                }
+            }
         }
     }
 
@@ -938,6 +1190,7 @@ impl Worker {
             ];
             let started = Instant::now();
             let process = AddonProcess::launch(&cwd.join(&run.program), &run.args, &cwd, &env)?;
+            self.runs += 1;
             Ok::<_, String>(Runtime {
                 process,
                 started,
@@ -946,6 +1199,8 @@ impl Worker {
                 disconnected_at: None,
                 stop: None,
                 restart_after_stop: false,
+                run: self.runs,
+                control: BTreeMap::new(),
             })
         })();
         match result {
@@ -953,6 +1208,7 @@ impl Worker {
                 entry.info.pid = Some(runtime.process.id());
                 entry.info.state = AddonState::Starting;
                 entry.info.message = None;
+                entry.info.control_asked = false;
                 entry.runtime = Some(runtime);
                 Ok(())
             }
@@ -1068,6 +1324,12 @@ impl Worker {
                                     && !hello_expired(runtime.started, Instant::now(), false)
                                     && runtime.connection.is_none()
                                 {
+                                    // An add-on that may ask learns at once whether it may.
+                                    if has_capability(&entry.info, Capability::Control) {
+                                        let _ = connection.send(&HostMessage::ControlAccess {
+                                            allowed: entry.info.control_allowed,
+                                        });
+                                    }
                                     runtime.connection = Some(connection);
                                     entry.info.state = AddonState::Running;
                                     continue;
@@ -1081,6 +1343,7 @@ impl Worker {
             }
             Err(reason) => self.error = Some(format!("Add-on listener failed: {reason}")),
         }
+        self.expire_control(Instant::now());
         let ids: Vec<_> = self.entries.keys().cloned().collect();
         for id in ids {
             if self.shutting_down
@@ -1208,6 +1471,21 @@ impl Worker {
     }
 
     fn receive(&mut self, id: &str, message: AddonMessage) -> Result<(), String> {
+        // A control request is answered, never a reason to stop the add-on.
+        match message {
+            AddonMessage::Control {
+                id: request,
+                command,
+            } => {
+                self.control_request(id, Some(request), Ok(command));
+                return Ok(());
+            }
+            AddonMessage::ControlRefused { id: request, error } => {
+                self.control_request(id, request, Err(error));
+                return Ok(());
+            }
+            _ => {}
+        }
         message.validate().map_err(|e| e.to_string())?;
         let entry = self.entries.get_mut(id).unwrap();
         match message {
@@ -1334,6 +1612,7 @@ impl Worker {
                     entry.appearance = (!appearance.is_empty()).then_some(appearance);
                 }
             }
+            AddonMessage::Control { .. } | AddonMessage::ControlRefused { .. } => {}
             AddonMessage::Unknown => {}
         }
         Ok(())
@@ -1426,19 +1705,14 @@ impl Worker {
                 } => match result.try_recv() {
                     Ok(result) => {
                         if let Ok(info) = &result {
-                            let enabled = self
-                                .saved
-                                .addons
-                                .get(&id)
-                                .is_some_and(|saved| saved.enabled);
-                            self.entries.insert(
-                                id.clone(),
-                                Entry::from_manifest(
-                                    id.clone(),
-                                    Ok(info.manifest.clone()),
-                                    enabled,
-                                ),
-                            );
+                            let saved = self.saved.addons.get(&id);
+                            let enabled = saved.is_some_and(|saved| saved.enabled);
+                            // An update keeps the user's control choice; removal forgets it.
+                            let control = saved.is_some_and(|saved| saved.control);
+                            let mut entry =
+                                Entry::from_manifest(id.clone(), Ok(info.manifest.clone()), enabled);
+                            entry.info.control_allowed = control;
+                            self.entries.insert(id.clone(), entry);
                         }
                         if !self.shutting_down && restart {
                             let _ = self.start(&id);
@@ -1512,6 +1786,8 @@ impl Worker {
                                 saved.addons.remove(&id);
                             } else if let Some(saved) = saved.addons.get_mut(&id) {
                                 saved.enabled = false;
+                                // Installing it again asks the user again.
+                                saved.control = false;
                             }
                             let stored = self.store(saved);
                             let _ = reply.send(result.and(stored));
@@ -1607,11 +1883,20 @@ fn reject_command(command: Command, reason: &str) {
         | Command::Stop(_, reply)
         | Command::Send(_, _, reply)
         | Command::Clips(_, reply)
-        | Command::Error(_, reply) => {
+        | Command::Error(_, reply)
+        | Command::ControlAllowed(_, _, reply) => {
             let _ = reply.send(Err(reason.into()));
         }
-        Command::Shutdown => {}
+        Command::ControlReply { .. } | Command::Shutdown => {}
     }
+}
+
+fn not_allowed() -> ControlError {
+    ControlError::new(
+        control_codes::NOT_ALLOWED,
+        "The user has not let this add-on control Backtracking. They can switch it on in \
+         Options, Add-ons",
+    )
 }
 
 fn has_capability(info: &AddonInfo, capability: Capability) -> bool {
@@ -1995,11 +2280,12 @@ mod tests {
         let (handle, id) = appearance_fixture(&mut worker, Capability::Source);
         let before = handle.snapshot();
         let initial = handle.try_appearances().unwrap();
-        offer_appearance(
-            &mut worker,
-            &id,
+        for offer in [
             r##"{"type":"appearance","colors":{"waveform":"#67e7b5"}}"##,
-        );
+            r##"{"type":"appearance","spectrum":[{"color":"#ff8c3c","position":0},{"color":"#6ec8ff","position":1}]}"##,
+        ] {
+            offer_appearance(&mut worker, &id, offer);
+        }
         assert!(initial.is_empty());
         assert!(Arc::ptr_eq(&initial, &handle.try_appearances().unwrap()));
         assert!(Arc::ptr_eq(&before, &handle.snapshot()));
@@ -2049,10 +2335,24 @@ mod tests {
         assert!(replaced[&id].rows.is_empty());
         assert_eq!(replaced[&id].numbers["border_width"], 8.0);
 
+        // A gradient alone is an offer; the next offer without one clears it.
+        let gradient = r##"{"type":"appearance","spectrum":[{"color":"#ff8c3c","position":0},{"color":"#6ec8ff80","position":1}]}"##;
+        offer_appearance(&mut worker, &id, gradient);
+        let spectrum = &handle.try_appearances().unwrap()[&id].spectrum;
+        assert_eq!(spectrum.len(), 2);
+        assert_eq!(spectrum[1].color, [110, 200, 255, 128]);
+        assert_eq!(spectrum[1].position, 1.0);
+        offer_appearance(
+            &mut worker,
+            &id,
+            r#"{"type":"appearance","numbers":{"border_width":9}}"#,
+        );
+        assert!(handle.try_appearances().unwrap()[&id].spectrum.is_empty());
+
         offer_appearance(&mut worker, &id, r#"{"type":"appearance"}"#);
         assert!(handle.try_appearances().unwrap().is_empty());
         assert!(Arc::ptr_eq(&summary, &handle.snapshot()));
-        assert_eq!(repaints.load(Ordering::Relaxed), 3);
+        assert_eq!(repaints.load(Ordering::Relaxed), 5);
         assert_eq!(capture_wakes.load(Ordering::Relaxed), 0);
         assert!(!dir.0.join(STATE_FILE).exists());
     }
@@ -2118,10 +2418,11 @@ mod tests {
         };
         assert_eq!(initial[&id].colors["border"], [255, 255, 255, 128]);
 
+        // Secondary windows take the gradient as well.
         offer_appearance(
             &mut worker,
             &id,
-            r##"{"type":"appearance","colors":{"border":"#a1b2c3d4"}}"##,
+            r##"{"type":"appearance","colors":{"border":"#a1b2c3d4"},"spectrum":[{"color":"#ff8c3c","position":0},{"color":"#f0dc5a","position":0.45},{"color":"#6ec8ff","position":1}]}"##,
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         let changed = loop {
@@ -2137,6 +2438,19 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(changed[&id].colors["border"], [161, 178, 195, 212]);
+        let stops: Vec<_> = changed[&id]
+            .spectrum
+            .iter()
+            .map(|stop| (stop.color, stop.position))
+            .collect();
+        assert_eq!(
+            stops,
+            [
+                ([255, 140, 60, 255], 0.0),
+                ([240, 220, 90, 255], 0.45),
+                ([110, 200, 255, 255], 1.0)
+            ]
+        );
         assert!(Arc::ptr_eq(&summary, &proxy.snapshot()));
 
         drop(primary);
@@ -2473,6 +2787,8 @@ mod tests {
                     disconnected_at: None,
                     stop: Some((Instant::now(), AddonState::Stopped)),
                     restart_after_stop: false,
+                    run: 1,
+                    control: BTreeMap::new(),
                 }),
                 restarts: RestartPolicy::default(),
                 position_filter: PositionFilter::default(),
@@ -2489,6 +2805,313 @@ mod tests {
                 .unwrap()
                 .contains("Injected termination failure")
         );
+    }
+
+    /// A running entry with a real connection: the add-on side is an SDK client.
+    fn connected_control_fixture(
+        worker: &mut Worker,
+        capabilities: Vec<Capability>,
+    ) -> (String, backtracking_addon::client::Client) {
+        let executable = std::env::current_exe().unwrap();
+        let process = AddonProcess::launch(
+            &executable,
+            &[
+                "--exact".into(),
+                "addons::process::tests::helper_child".into(),
+            ],
+            executable.parent().unwrap(),
+            &[("BACKTRACKING_PROCESS_UNIT_TEST_CHILD".into(), "1".into())],
+        )
+        .unwrap();
+        let mut info = info(capabilities);
+        info.sources.clear();
+        let id = info.id.clone();
+        let token = random_token().unwrap();
+        worker
+            .host
+            .expect_addon(&id, &token, BTreeMap::new())
+            .unwrap();
+        let port = worker.host.port();
+        let data = worker.root.clone();
+        let client_id = id.clone();
+        let client = thread::spawn(move || {
+            backtracking_addon::client::Client::connect(
+                port,
+                &token,
+                data,
+                &client_id,
+                "1",
+                Duration::from_secs(5),
+            )
+            .unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let connection = loop {
+            if let Some(HostEvent::Connected(connection)) =
+                worker.host.poll().unwrap().into_iter().next()
+            {
+                break connection;
+            }
+            assert!(Instant::now() < deadline, "the client did not connect");
+            thread::sleep(Duration::from_millis(2));
+        };
+        worker.runs += 1;
+        worker.entries.insert(
+            id.clone(),
+            Entry {
+                info,
+                runtime: Some(Runtime {
+                    process,
+                    started: Instant::now(),
+                    connection: Some(connection),
+                    described: true,
+                    disconnected_at: None,
+                    stop: None,
+                    restart_after_stop: false,
+                    run: worker.runs,
+                    control: BTreeMap::new(),
+                }),
+                restarts: RestartPolicy::default(),
+                position_filter: PositionFilter::default(),
+                appearance: None,
+            },
+        );
+        (id, client.join().unwrap())
+    }
+
+    fn send_control(worker: &mut Worker, id: &str, line: &str) {
+        let message = backtracking_addon::protocol::decode_addon(line.as_bytes()).unwrap();
+        worker.receive(id, message).unwrap();
+        // The add-on is never stopped for a control request, good or bad.
+        assert_eq!(worker.entries[id].info.state, AddonState::Running);
+    }
+
+    /// The next control message the add-on gets, as its JSON.
+    fn next_control(worker: &mut Worker, client: &mut backtracking_addon::client::Client) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            worker.poll();
+            if let Some(message) = client.try_recv().unwrap() {
+                let line = backtracking_addon::protocol::encode_host(&message).unwrap();
+                return serde_json::from_slice(&line).unwrap();
+            }
+            assert!(Instant::now() < deadline, "no control message arrived");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn control_requests_are_refused_until_allowed_then_queued_and_answered_once() {
+        let dir = TestDir::new();
+        let mut worker = worker(&dir.0);
+        let (commands, _) = mpsc::channel();
+        let handle = AddonHandle {
+            commands,
+            shared: worker.shared.clone(),
+        };
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = wakes.clone();
+        handle.subscribe_control(Arc::new(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+
+        // Without the capability every request gets not_declared.
+        let (undeclared, mut client) = connected_control_fixture(&mut worker, Vec::new());
+        send_control(
+            &mut worker,
+            &undeclared,
+            r#"{"type":"control","id":"1","command":"get_state"}"#,
+        );
+        let reply = next_control(&mut worker, &mut client);
+        assert_eq!(reply["type"], "control_reply");
+        assert_eq!(reply["id"], "1");
+        assert_eq!(reply["error"]["code"], "not_declared");
+        worker.entries.clear();
+
+        let (id, mut client) = connected_control_fixture(&mut worker, vec![Capability::Control]);
+        // Off by default: refused, and the page can say it asked.
+        send_control(
+            &mut worker,
+            &id,
+            r#"{"type":"control","id":"a","command":"pause_capture"}"#,
+        );
+        let reply = next_control(&mut worker, &mut client);
+        assert_eq!(reply["error"]["code"], "not_allowed");
+        assert!(worker.entries[&id].info.control_asked);
+        assert!(handle.take_control_calls().is_empty());
+
+        let (reply, result) = mpsc::channel();
+        worker.command(Command::ControlAllowed(id.clone(), true, reply));
+        result.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(
+            next_control(&mut worker, &mut client),
+            json!({"type":"control_access","allowed":true})
+        );
+        assert!(worker.entries[&id].info.control_allowed);
+        assert!(!worker.entries[&id].info.control_asked);
+        let saved = fs::read_to_string(dir.0.join(STATE_FILE)).unwrap();
+        assert!(saved.contains("\"control\": true"), "{saved}");
+
+        // A bad request is answered from what the SDK read, not queued.
+        send_control(
+            &mut worker,
+            &id,
+            r#"{"type":"control","id":"b","command":"open_options"}"#,
+        );
+        assert_eq!(
+            next_control(&mut worker, &mut client)["error"]["code"],
+            "unknown_command"
+        );
+
+        send_control(
+            &mut worker,
+            &id,
+            r#"{"type":"control","id":"c","command":"select","from_seconds_ago":2}"#,
+        );
+        send_control(
+            &mut worker,
+            &id,
+            r#"{"type":"control","id":"c","command":"get_state"}"#,
+        );
+        assert_eq!(
+            next_control(&mut worker, &mut client)["error"]["code"],
+            "duplicate_id"
+        );
+        let calls = handle.take_control_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request_id, "c");
+        assert_eq!(calls[0].addon_name, "Test");
+        assert_eq!(
+            calls[0].command,
+            ControlCommand::Select {
+                from_seconds_ago: Some(2.0),
+                to_seconds_ago: None,
+                start_frame: None,
+                end_frame: None,
+            }
+        );
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // The main window's reply reaches the add-on once; a second one is dropped.
+        let state = ControlResult::default();
+        for _ in 0..2 {
+            let (addon_id, run) = (calls[0].addon_id.clone(), calls[0].run);
+            worker.command(Command::ControlReply {
+                addon_id,
+                run,
+                reply: ControlReply::success("c", &state),
+            });
+        }
+        let reply = next_control(&mut worker, &mut client);
+        assert_eq!(reply["id"], "c");
+        assert!(reply["result"]["state"].is_object());
+        assert!(worker.entries[&id].runtime.as_ref().unwrap().control.is_empty());
+
+        // At most eight wait at once.
+        for index in 0..=MAX_CONTROL_IN_FLIGHT {
+            send_control(
+                &mut worker,
+                &id,
+                &format!(r#"{{"type":"control","id":"f{index}","command":"get_state"}}"#),
+            );
+        }
+        let reply = next_control(&mut worker, &mut client);
+        assert_eq!(reply["id"], format!("f{MAX_CONTROL_IN_FLIGHT}"));
+        assert_eq!(reply["error"]["code"], "too_many_requests");
+
+        // Unanswered requests time out with an error.
+        for deadline in worker
+            .entries
+            .get_mut(&id)
+            .unwrap()
+            .runtime
+            .as_mut()
+            .unwrap()
+            .control
+            .values_mut()
+            .take(1)
+        {
+            *deadline = Instant::now();
+        }
+        let reply = next_control(&mut worker, &mut client);
+        assert_eq!(reply["error"]["code"], "timeout");
+
+        // Revoking refuses what is still waiting and empties the queue.
+        let (reply, result) = mpsc::channel();
+        worker.command(Command::ControlAllowed(id.clone(), false, reply));
+        result.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        let mut refused = 0;
+        loop {
+            let message = next_control(&mut worker, &mut client);
+            if message["type"] == "control_access" {
+                assert_eq!(message["allowed"], false);
+                break;
+            }
+            assert_eq!(message["error"]["code"], "not_allowed");
+            refused += 1;
+        }
+        assert_eq!(refused, MAX_CONTROL_IN_FLIGHT - 1);
+        assert!(handle.take_control_calls().is_empty());
+        assert!(!worker.entries[&id].info.control_allowed);
+    }
+
+    #[test]
+    fn the_control_choice_survives_a_restart_and_is_forgotten_on_removal() {
+        let dir = TestDir::new();
+        let folder = dir.0.join("package");
+        fs::create_dir(&folder).unwrap();
+        let mut manifest = info(vec![Capability::Control]).manifest.unwrap();
+        manifest.id = "com.example.control".into();
+        fs::write(
+            folder.join("addon.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(folder.join("test.exe"), b"package fixture").unwrap();
+        let path = dir.0.join("control.btaddon");
+        package::pack(&folder, &path).unwrap();
+        package::install(&path, dir.0.join("addons")).unwrap();
+        let id = "com.example.control";
+        let allowed = |manager: &AddonManager| {
+            manager
+                .handle()
+                .snapshot()
+                .addon(id)
+                .map(|addon| addon.control_allowed)
+        };
+        let wait_for = |manager: &AddonManager, wanted: Option<bool>| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while allowed(manager) != wanted && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(allowed(manager), wanted);
+        };
+
+        let manager = AddonManager::new(dir.0.clone()).unwrap();
+        wait_for(&manager, Some(false));
+        manager
+            .handle()
+            .set_control_allowed(id, true)
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        wait_for(&manager, Some(true));
+        drop(manager);
+
+        let manager = AddonManager::new(dir.0.clone()).unwrap();
+        wait_for(&manager, Some(true));
+        manager
+            .handle()
+            .remove(id, false)
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        wait_for(&manager, None);
+        drop(manager);
+
+        package::install(&path, dir.0.join("addons")).unwrap();
+        let manager = AddonManager::new(dir.0.clone()).unwrap();
+        wait_for(&manager, Some(false));
     }
 
     #[test]
@@ -2768,6 +3391,7 @@ mod tests {
                         ("mute".into(), json!(true)),
                     ]),
                     formats: BTreeMap::from([("main".into(), "5.1".into())]),
+                    control: true,
                 },
             )]),
         };

@@ -676,37 +676,59 @@ fn clip_seconds(frames: usize, sample_rate: u32) -> f64 {
     frames as f64 / f64::from(sample_rate.max(1))
 }
 
-/// A lane of a two-source recording.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Lane {
-    A,
-    B,
-}
+/// The letters of lanes 1 to 64, as spreadsheet columns count: `A` to `Z`, then `AA` to `BL`.
+const LANE_LETTERS: [&str; crate::MAX_LANES] = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
+    "S", "T", "U", "V", "W", "X", "Y", "Z", "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI",
+    "AJ", "AK", "AL", "AM", "AN", "AO", "AP", "AQ", "AR", "AS", "AT", "AU", "AV", "AW", "AX",
+    "AY", "AZ", "BA", "BB", "BC", "BD", "BE", "BF", "BG", "BH", "BI", "BJ", "BK", "BL",
+];
+
+/// A lane of a recording with several sources: one of [`crate::MAX_LANES`], lettered `A` to
+/// `Z`, then `AA`, `AB`, … up to `BL` for lane 64. Lanes A and B are the two of a pair.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Lane(u8);
 
 impl Lane {
+    /// The first lane.
+    pub const A: Self = Self(0);
+    /// The second lane.
+    pub const B: Self = Self(1);
     pub const BOTH: [Self; 2] = [Self::A, Self::B];
 
-    /// The lane at `index` of a recording's tracks: 0 is A and 1 is B.
+    /// The lane at `index` of a recording's tracks: 0 is A, 1 is B, up to 63, which is BL.
+    /// `None` from [`crate::MAX_LANES`] on.
     pub const fn from_index(index: usize) -> Option<Self> {
-        match index {
-            0 => Some(Self::A),
-            1 => Some(Self::B),
-            _ => None,
+        if index < crate::MAX_LANES {
+            Some(Self(index as u8))
+        } else {
+            None
         }
     }
 
+    /// The lane whose [`letter`](Self::letter) is exactly `letter`: one or two capital
+    /// ASCII letters from `A` to `BL`. Anything else, lower case included, is `None`.
+    pub fn from_letter(letter: &str) -> Option<Self> {
+        LANE_LETTERS
+            .iter()
+            .position(|&known| known == letter)
+            .and_then(Self::from_index)
+    }
+
+    /// The lane's position among a recording's tracks, from 0 to 63.
     pub const fn index(self) -> usize {
-        match self {
-            Self::A => 0,
-            Self::B => 1,
-        }
+        self.0 as usize
     }
 
+    /// The lane's letters as file names and the interface show them: `A`, `B`, … `BL`.
     pub const fn letter(self) -> &'static str {
-        match self {
-            Self::A => "A",
-            Self::B => "B",
-        }
+        LANE_LETTERS[self.0 as usize]
+    }
+}
+
+impl std::fmt::Debug for Lane {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.letter())
     }
 }
 
@@ -722,7 +744,8 @@ pub struct TakeLabel {
     /// The name of the source the audio came from. Characters a file name cannot hold are
     /// left out when the name is written, and an empty name leaves the field out.
     pub source: String,
-    /// The lane, given whenever two sources were recording, even if only this one is exported.
+    /// The lane, given whenever two or more sources were recording, even if only this one is
+    /// exported.
     pub lane: Option<Lane>,
 }
 
@@ -829,10 +852,11 @@ fn dated_take_at(time: TakeTime, seconds: f64, tempo_bpm: Option<f64>) -> String
 }
 
 /// Whether `name` is a file name this module's WAV exports produce: the form with a source
-/// and lane, the form without a source whose pairs end in `-A` and `-B`, or the first
-/// `Backtracking-<milliseconds>-<process>-<serial>` one, each optionally followed by the
-/// `-ChNN_<label>` of one channel of a wide lane. Housekeeping asks before it removes
-/// anything, so a file the user put in an export folder is never touched.
+/// and lane, the form without a source whose lanes end in `-A`, `-B`, … `-BL` (exactly a
+/// [`Lane::letter`]), or the first `Backtracking-<milliseconds>-<process>-<serial>` one,
+/// which only ever ended in `-A` or `-B`, each optionally followed by the `-ChNN_<label>` of
+/// one channel of a wide lane. Housekeeping asks before it removes anything, so a file the
+/// user put in an export folder is never touched.
 pub fn is_export_file_name(name: &str) -> bool {
     if let Some(stem) = name.strip_suffix("-Positions.json") {
         return is_take_stem(stem);
@@ -872,7 +896,13 @@ fn is_channel_suffix(suffix: &str) -> bool {
 /// Whether `stem` is a file name without `.wav` and without a channel suffix.
 fn is_take_stem(stem: &str) -> bool {
     // A lane follows the take only when no source is named.
-    let stem = stem.strip_suffix("-A").or_else(|| stem.strip_suffix("-B")).unwrap_or(stem);
+    let (stem, lane) = match stem.rsplit_once('-') {
+        Some((take, letter)) => match Lane::from_letter(letter) {
+            Some(lane) => (take, Some(lane)),
+            None => (stem, None),
+        },
+        None => (stem, None),
+    };
     if let Some(take) = stem.strip_prefix("Backtracking_") {
         // The source's name may hold underscores itself, so the date can start at any field.
         is_dated_take(take)
@@ -880,6 +910,10 @@ fn is_take_stem(stem: &str) -> bool {
                 .match_indices('_')
                 .any(|(index, _)| index > 0 && is_dated_take(&take[index + 1..]))
     } else if let Some(take) = stem.strip_prefix("Backtracking-") {
+        // These names predate recordings with more than two lanes.
+        if lane.is_some_and(|lane| lane.index() >= 2) {
+            return false;
+        }
         let mut numbers = take.split('-');
         (0..3).all(|_| numbers.next().is_some_and(is_digits)) && numbers.next().is_none()
     } else {
@@ -944,8 +978,8 @@ fn numbered_take(take: &str, attempt: u32) -> String {
     }
 }
 
-/// Exports one or two lanes from the same retained time range.
-/// Both files in a pair share a take name, after their lane letters.
+/// Exports 1 to [`crate::MAX_LANES`] lanes from the same retained time range.
+/// The files of several lanes share a take name, after their lane letters.
 /// The lanes can be owned [`Snapshot`]s or [`FrozenTrack`]s that share a capture's pages.
 pub fn export_tracks_with_profile<T: TrackAudio>(
     output_dir: &Path,
@@ -958,7 +992,7 @@ pub fn export_tracks_with_profile<T: TrackAudio>(
         snapshots,
         frames,
         profile,
-        &[ChannelRoute::Merged; 2][..snapshots.len().min(2)],
+        &vec![ChannelRoute::Merged; snapshots.len()],
         false,
     )
 }
@@ -1144,6 +1178,8 @@ impl<T: TrackAudio + ?Sized> TrackAudio for ChannelSelection<'_, T> {
 }
 
 /// Exports each selected lane to its own WAV using its capture route and output setting.
+/// `routes` has one entry per lane. Several lanes, up to [`crate::MAX_LANES`], must share a
+/// sample rate and frame range; their files share one take name and are all written or none.
 pub fn export_routed_tracks_with_profile<T: TrackAudio>(
     output_dir: &Path,
     snapshots: &[T],
@@ -1193,7 +1229,8 @@ pub fn export_routed_tracks_with_fades<T: TrackAudio>(
 }
 
 /// Like [`export_routed_tracks_with_fades`], naming each file after the label of its lane:
-/// `labels` has one entry per track. The two files of a pair need different labels.
+/// `labels` has one entry per track. The files of several lanes need different labels.
+/// There are 1 to [`crate::MAX_LANES`] tracks.
 #[allow(clippy::too_many_arguments)]
 pub fn export_labelled_tracks<T: TrackAudio>(
     output_dir: &Path,
@@ -1206,23 +1243,23 @@ pub fn export_labelled_tracks<T: TrackAudio>(
     fades: Fades,
     labels: &[TakeLabel],
 ) -> io::Result<Vec<PathBuf>> {
-    match snapshots {
-        [one] => export_routed_track_refs(
-            output_dir, &[one], frames, profile, routes, force_mono, tempo_bpm, fades, labels,
-        ),
-        [a, b] => export_routed_track_refs(
-            output_dir, &[a, b], frames, profile, routes, force_mono, tempo_bpm, fades, labels,
-        ),
-        _ => Err(invalid_tracks()),
+    if !(1..=crate::MAX_LANES).contains(&snapshots.len()) {
+        return Err(invalid_tracks());
     }
+    let tracks: Vec<&T> = snapshots.iter().collect();
+    export_routed_track_refs(
+        output_dir, &tracks, frames, profile, routes, force_mono, tempo_bpm, fades, labels,
+    )
 }
 
 impl TakeLabel {
     /// Labels for `count` tracks that carry no source names: a single file has no lane, the
-    /// two files of a pair are lanes A and B.
+    /// files of 2 to [`crate::MAX_LANES`] lanes are lettered A, B, … in order.
     pub(crate) fn unnamed_lanes(count: usize) -> Vec<Self> {
         match count {
-            2 => Lane::BOTH.map(|lane| Self::unnamed(Some(lane))).to_vec(),
+            2..=crate::MAX_LANES => (0..count)
+                .map(|index| Self::unnamed(Lane::from_index(index)))
+                .collect(),
             count => vec![Self::unnamed(None); count],
         }
     }
@@ -1248,77 +1285,145 @@ pub(crate) fn export_routed_track_refs<T: TrackAudio>(
             })
             .map(|path| vec![path])
         }
-        ([a, b], [route_a, route_b], [label_a, label_b])
-            if a.sample_rate() == b.sample_rate()
-                && a.frame_range() == b.frame_range()
-                // Two files of one take under one name would keep colliding with each other.
-                && label_a.file_stem("", 1) != label_b.file_stem("", 1) =>
+        _ if (2..=crate::MAX_LANES).contains(&snapshots.len())
+            && routes.len() == snapshots.len()
+            && labels.len() == snapshots.len()
+            && snapshots.iter().all(|track| {
+                track.sample_rate() == snapshots[0].sample_rate()
+                    && track.frame_range() == snapshots[0].frame_range()
+            })
+            // Two files of one take under one name would keep colliding with each other.
+            && labels.iter().enumerate().all(|(i, label)| {
+                labels[..i]
+                    .iter()
+                    .all(|earlier| earlier.file_stem("", 1) != label.file_stem("", 1))
+            }) =>
         {
-            check_track_clip(*a, &frames)?;
-            check_track_clip(*b, &frames)?;
-            let a_map = WavChannelMap::from_route(*route_a, a.channels(), force_mono)?;
-            let b_map = WavChannelMap::from_route(*route_b, b.channels(), force_mono)?;
-            fs::create_dir_all(output_dir)?;
-            let take = dated_take(
-                clip_seconds(frames.end - frames.start, a.sample_rate()),
-                tempo_bpm,
-            );
-            // The lanes are written at the same time, so each resamples on half the threads.
-            let threads = (resampling_threads() / 2).max(1);
-            let mut attempt = 0;
-            loop {
-                // Both lanes of a take share one name, so a clash on either file moves the pair on.
-                attempt += 1;
-                let a_path = output_dir.join(format!("{}.wav", label_a.file_stem(&take, attempt)));
-                let b_path = output_dir.join(format!("{}.wav", label_b.file_stem(&take, attempt)));
-                // Both names are claimed before any audio is written.
-                let a_file = match with_track_clip(*a, &frames, fades, |clip| {
-                    WavFile::create(&a_path, clip, profile, a_map)
-                }) {
-                    Ok(file) => file,
-                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-                    Err(err) => return Err(err),
-                };
-                let b_file = match with_track_clip(*b, &frames, fades, |clip| {
-                    WavFile::create(&b_path, clip, profile, b_map)
-                }) {
-                    Ok(file) => file,
-                    Err(err) => {
-                        a_file.discard()?;
-                        if err.kind() == io::ErrorKind::AlreadyExists {
-                            continue;
-                        }
-                        return Err(err);
-                    }
-                };
-                let (a_written, b_written) = thread::scope(|scope| {
-                    let lane_frames = &frames;
-                    let b_writer = scope.spawn(move || {
-                        with_track_clip(*b, lane_frames, fades, |clip| b_file.write(clip, threads))
-                    });
-                    let a_written =
-                        with_track_clip(*a, lane_frames, fades, |clip| a_file.write(clip, threads));
-                    (a_written, b_writer.join())
-                });
-                let b_written = b_written.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                // A lane that could not be written removed its own file. Its partner goes
-                // too, so half of a pair is never left behind.
-                return match (a_written, b_written) {
-                    (Ok(()), Ok(())) => Ok(vec![a_path, b_path]),
-                    (Err(err), b_written) => {
-                        if b_written.is_ok() {
-                            fs::remove_file(&b_path)?;
-                        }
-                        Err(err)
-                    }
-                    (Ok(()), Err(err)) => {
-                        fs::remove_file(&a_path)?;
-                        Err(err)
-                    }
-                };
-            }
+            export_aligned_lanes(
+                output_dir, snapshots, frames, profile, routes, force_mono, tempo_bpm, fades,
+                labels,
+            )
         }
         _ => Err(invalid_tracks()),
+    }
+}
+
+/// Writes 2 to [`crate::MAX_LANES`] lanes of one take, already checked to share a sample rate,
+/// a frame range and none of their names, to one file each under one take name. Every name is
+/// claimed before any audio is written, and if any lane fails, no file of the take is left.
+#[allow(clippy::too_many_arguments)]
+fn export_aligned_lanes<T: TrackAudio>(
+    output_dir: &Path,
+    snapshots: &[&T],
+    frames: Range<usize>,
+    profile: WavExportProfile,
+    routes: &[ChannelRoute],
+    force_mono: bool,
+    tempo_bpm: Option<f64>,
+    fades: Fades,
+    labels: &[TakeLabel],
+) -> io::Result<Vec<PathBuf>> {
+    for track in snapshots {
+        check_track_clip(*track, &frames)?;
+    }
+    let maps = snapshots
+        .iter()
+        .zip(routes)
+        .map(|(track, route)| WavChannelMap::from_route(*route, track.channels(), force_mono))
+        .collect::<io::Result<Vec<_>>>()?;
+    fs::create_dir_all(output_dir)?;
+    let take = dated_take(
+        clip_seconds(frames.end - frames.start, snapshots[0].sample_rate()),
+        tempo_bpm,
+    );
+    // The lanes are written at the same time on up to as many workers as there are resampling
+    // threads, at least two as for a pair, and each worker resamples on its share of them.
+    let total = resampling_threads();
+    let workers = snapshots.len().min(total.max(2));
+    let threads = (total / workers).max(1);
+    let mut attempt = 0;
+    'attempts: loop {
+        // All lanes of a take share one name, so a clash on any file moves them all on.
+        attempt += 1;
+        let paths: Vec<PathBuf> = labels
+            .iter()
+            .map(|label| output_dir.join(format!("{}.wav", label.file_stem(&take, attempt))))
+            .collect();
+        // Every name is claimed before any audio is written.
+        let mut files = Vec::with_capacity(paths.len());
+        for ((track, path), map) in snapshots.iter().zip(&paths).zip(&maps) {
+            match with_track_clip(*track, &frames, fades, |clip| {
+                WavFile::create(path, clip, profile, *map)
+            }) {
+                Ok(file) => files.push(file),
+                Err(err) => {
+                    // Try every removal even when an earlier file cannot be removed.
+                    files
+                        .into_iter()
+                        .map(WavFile::discard)
+                        .fold(Ok(()), |first, next| first.and(next))?;
+                    if err.kind() == io::ErrorKind::AlreadyExists {
+                        continue 'attempts;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        // Worker `w` writes lanes `w`, `w + workers`, … in turn; worker 0 runs here.
+        let mut queues: Vec<Vec<_>> = (0..workers).map(|_| Vec::new()).collect();
+        for (lane, file) in files.into_iter().enumerate() {
+            queues[lane % workers].push((lane, file));
+        }
+        let lane_frames = &frames;
+        let write = |queue: Vec<(usize, WavFile<'_>)>| -> Vec<(usize, io::Result<()>)> {
+            queue
+                .into_iter()
+                .map(|(lane, file)| {
+                    let written = with_track_clip(snapshots[lane], lane_frames, fades, |clip| {
+                        file.write(clip, threads)
+                    });
+                    (lane, written)
+                })
+                .collect()
+        };
+        let write = &write;
+        let mut queues = queues.into_iter();
+        let first = queues.next().expect("at least one worker");
+        let (inline, joined) = thread::scope(|scope| {
+            let writers: Vec<_> = queues.map(|queue| scope.spawn(move || write(queue))).collect();
+            let inline = write(first);
+            let joined: Vec<_> = writers.into_iter().map(|writer| writer.join()).collect();
+            (inline, joined)
+        });
+        let mut results: Vec<Option<io::Result<()>>> = (0..paths.len()).map(|_| None).collect();
+        for (lane, written) in inline {
+            results[lane] = Some(written);
+        }
+        for written in joined {
+            let written = written.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            for (lane, written) in written {
+                results[lane] = Some(written);
+            }
+        }
+        let results: Vec<io::Result<()>> = results
+            .into_iter()
+            .map(|written| written.expect("every lane written"))
+            .collect();
+        if results.iter().all(Result::is_ok) {
+            return Ok(paths);
+        }
+        // A lane that could not be written removed its own file. The other lanes' files go
+        // too, so part of a take is never left behind.
+        paths
+            .iter()
+            .zip(&results)
+            .filter(|(_, written)| written.is_ok())
+            .map(|(path, _)| fs::remove_file(path))
+            .fold(Ok(()), |first: io::Result<()>, next| first.and(next))?;
+        return Err(results
+            .into_iter()
+            .find_map(Result::err)
+            .expect("a lane that failed"));
     }
 }
 
@@ -1934,7 +2039,8 @@ mod tests {
             "Backtracking_notes.wav",
             "Backtracking_2026-11-14_15-32-07_12.4s.mp3",
             "Backtracking_2026-11-14_15-32-07_12.4s",
-            "Backtracking_2026-11-14_15-32-07_12.4s-C.wav",
+            // Lane C exists now; lane 65 still does not.
+            "Backtracking_2026-11-14_15-32-07_12.4s-BM.wav",
             "Backtracking_2026-11-14_15-32-07_12.4s_final.wav",
             "Backtracking_2026-11-14_15-32-07_12.4s_120bpm_2_3.wav",
             "Backtracking_2026-11-14_15-32_12.4s.wav",
@@ -2239,6 +2345,247 @@ mod tests {
         assert!(export(&[lane.clone(), lane.clone()], &same).is_err());
         assert!(export(&[lane.clone(), lane.clone()], &[TakeLabel::default()]).is_err());
         assert!(export(&[lane], &[]).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn lane_letters_run_from_a_to_bl_and_read_back() {
+        let letters: Vec<_> = (0..crate::MAX_LANES)
+            .map(|index| Lane::from_index(index).unwrap().letter())
+            .collect();
+        assert_eq!((letters[0], letters[1], letters[2], letters[25]), ("A", "B", "C", "Z"));
+        assert_eq!(
+            (letters[26], letters[27], letters[51], letters[52], letters[63]),
+            ("AA", "AB", "AZ", "BA", "BL")
+        );
+        for (index, &letter) in letters.iter().enumerate() {
+            let lane = Lane::from_letter(letter).unwrap();
+            assert_eq!(lane.index(), index);
+            assert_eq!(Lane::from_index(index), Some(lane));
+            assert_eq!(format!("{lane:?}"), letter);
+            // Spreadsheet column order: shorter names first, then alphabetical.
+            if index > 0 {
+                let previous = letters[index - 1];
+                assert!((previous.len(), previous) < (letter.len(), letter), "{letter}");
+            }
+        }
+        assert_eq!(Lane::from_index(crate::MAX_LANES), None);
+        assert_eq!((Lane::A.index(), Lane::B.index()), (0, 1));
+        assert_eq!(Lane::BOTH.map(Lane::letter), ["A", "B"]);
+        assert_eq!(format!("{:?}", Some(Lane::B)), "Some(B)");
+        for not_a_lane in ["", "a", "b", "BM", "CA", "ZZ", "AAA", "A ", " A", "-A", "A-", "Ä", "1", "@"] {
+            assert_eq!(Lane::from_letter(not_a_lane), None, "{not_a_lane:?}");
+        }
+    }
+
+    #[test]
+    fn every_lane_letter_is_recognised_and_near_misses_are_not() {
+        let time = TakeTime { year: 2026, month: 11, day: 14, hour: 15, minute: 32, second: 7 };
+        let take = dated_take_at(time, 12.44, Some(120.0));
+        for index in 0..crate::MAX_LANES {
+            for source in ["", "Spotify", "Mic_2"] {
+                for attempt in [1, 2] {
+                    let label = TakeLabel::new(source, Lane::from_index(index));
+                    let stem = label.file_stem(&take, attempt);
+                    for name in [
+                        format!("{stem}.wav"),
+                        format!("{stem}-Positions.json"),
+                        format!("{stem}-Stereo.wav"),
+                        format!("{stem}{}.wav", TakeLabel::channel_suffix(4, "Ls")),
+                    ] {
+                        assert!(is_export_file_name(&name), "{name}");
+                    }
+                }
+            }
+        }
+        let take = "Backtracking_2026-11-14_15-32-07_12.4s";
+        for name in [
+            format!("{take}-C.wav"),
+            format!("{take}-BL.wav"),
+            format!("{take}_2-AA-Ch03_FC.wav"),
+        ] {
+            assert!(is_export_file_name(&name), "{name}");
+        }
+        // Only a whole lane letter after the last dash counts, and the first, undated form
+        // never had more than lanes A and B.
+        for other in [
+            format!("{take}-BM.wav"),
+            format!("{take}-CA.wav"),
+            format!("{take}-ZZ.wav"),
+            format!("{take}-AAA.wav"),
+            format!("{take}-c.wav"),
+            format!("{take}-aa.wav"),
+            format!("{take}-C1.wav"),
+            format!("{take}-.wav"),
+            format!("{take}-C-C.wav"),
+            format!("{take}-A-B.wav"),
+            format!("{take}-C_2.wav"),
+            format!("{take}C.wav"),
+            format!("{take}_C.wav"),
+            format!("{take}- C.wav"),
+            format!("{take}-C .wav"),
+            format!("{take}-C.mp3"),
+            "Backtracking-1763100000000-4242-7-C.wav".into(),
+            "Backtracking-1763100000000-4242-7-BL.wav".into(),
+            "Backtracking-1763100000000-4242-C.wav".into(),
+            "Kick_2026-11-14_15-32-07_12.4s-C.wav".into(),
+            "Backtracking_Spotify-C.wav".into(),
+            "Backtracking-C.wav".into(),
+        ] {
+            assert!(!is_export_file_name(&other), "{other}");
+        }
+    }
+
+    #[test]
+    fn several_lanes_export_one_file_each_with_the_same_frames_under_one_take() {
+        use crate::{Capture, DurationChoice};
+        let profile = WavExportProfile::default();
+        let widths = [2, 12, 1];
+        let mut capture = Capture::new_lanes(48_000, &widths, DurationChoice::Seconds10).unwrap();
+        capture.set_retain_silence(true);
+        let samples: Vec<f32> = (0..9_600 * 15)
+            .map(|i| ((i * 7) % 997) as f32 / 997.0 - 0.5)
+            .collect();
+        capture.push_interleaved(&samples).unwrap();
+        let frozen = capture.freeze();
+        let tracks: Vec<_> = (0..3).map(|lane| frozen.track(lane).unwrap()).collect();
+        let take_name = || format!("Backtracking_{}", dated_take(0.1, None));
+        loop {
+            let dir = test_dir("lanes");
+            let take = take_name();
+            // Only lane C of the first name is taken: the take must not be split across names.
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(format!("{take}-C.wav")), b"keep").unwrap();
+            let paths = export_tracks_with_profile(&dir, &tracks, 2_400..7_200, profile).unwrap();
+            if take_name() != take {
+                fs::remove_dir_all(&dir).unwrap();
+                continue;
+            }
+            let names: Vec<_> = paths.iter().map(|path| file_name(path)).collect();
+            assert_eq!(
+                names,
+                ["A", "B", "C"].map(|letter| format!("{take}_2-{letter}.wav"))
+            );
+            for ((path, track), channels) in paths.iter().zip(&tracks).zip(widths) {
+                assert!(is_export_file_name(file_name(path)));
+                let wav = fs::read(path).unwrap();
+                let format = wav_chunk(&wav, b"fmt ");
+                assert_eq!(usize::from(u16::from_le_bytes(format[2..4].try_into().unwrap())), channels);
+                // The same frames of every lane, as the capture holds them side by side.
+                assert_eq!(
+                    decoded_wav_samples(&wav),
+                    track.snapshot().samples[2_400 * channels..7_200 * channels]
+                );
+            }
+            assert!(!dir.join(format!("{take}-A.wav")).exists());
+            assert_eq!(fs::read(dir.join(format!("{take}-C.wav"))).unwrap(), b"keep");
+            fs::remove_dir_all(dir).unwrap();
+            break;
+        }
+    }
+
+    #[test]
+    fn labelled_lanes_share_a_take_and_refuse_clashing_or_unaligned_lanes() {
+        let dir = test_dir("labelled-lanes");
+        let profile = WavExportProfile::default();
+        let lane = Snapshot {
+            sample_rate: 48_000,
+            channels: 1,
+            samples: vec![0.25; 4_800],
+            first_frame: 0,
+        };
+        let export = |tracks: &[Snapshot], labels: &[TakeLabel]| {
+            export_labelled_tracks(
+                &dir,
+                tracks,
+                0..4_800,
+                profile,
+                &vec![ChannelRoute::Merged; tracks.len()],
+                false,
+                None,
+                Fades::NONE,
+                labels,
+            )
+        };
+        let labels: Vec<_> = ["Spotify", "Vocal mic", "", "Synth"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, source)| TakeLabel::new(source, Lane::from_index(index)))
+            .collect();
+        let paths = export(&vec![lane.clone(); 4], &labels).unwrap();
+        let names: Vec<_> = paths.iter().map(|path| file_name(path)).collect();
+        let take = names[0].strip_prefix("Backtracking_Spotify_A_").unwrap().strip_suffix(".wav").unwrap();
+        assert_eq!(names[1], format!("Backtracking_Vocal mic_B_{take}.wav"));
+        assert_eq!(names[2], format!("Backtracking_{take}-C.wav"));
+        assert_eq!(names[3], format!("Backtracking_Synth_D_{take}.wav"));
+        for name in &names {
+            assert!(is_export_file_name(name), "{name}");
+        }
+        let before = fs::read_dir(&dir).unwrap().count();
+        // Two lanes that would ask for one name, a label or route short, lanes that do not
+        // line up, and more lanes than a capture holds are all refused before any file is made.
+        let clash = [labels[0].clone(), labels[2].clone(), TakeLabel::new("", Lane::from_index(2))];
+        assert!(export(&vec![lane.clone(); 3], &clash).is_err());
+        assert!(export(&vec![lane.clone(); 3], &labels[..2]).is_err());
+        let routes_short = export_labelled_tracks(
+            &dir, &vec![lane.clone(); 3], 0..4_800, profile, &[ChannelRoute::Merged; 2], false,
+            None, Fades::NONE, &labels[..3],
+        );
+        assert!(routes_short.is_err());
+        let other_rate = Snapshot { sample_rate: 44_100, ..lane.clone() };
+        assert!(export(&[lane.clone(), lane.clone(), other_rate], &labels[..3]).is_err());
+        let later = Snapshot { first_frame: 1, ..lane.clone() };
+        assert!(export(&[lane.clone(), lane.clone(), later], &labels[..3]).is_err());
+        let too_many = vec![lane.clone(); crate::MAX_LANES + 1];
+        assert!(export(&too_many, &TakeLabel::unnamed_lanes(too_many.len())).is_err());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), before);
+        // Every lane of a full capture gets its own letter.
+        let all = export(&vec![lane; crate::MAX_LANES], &TakeLabel::unnamed_lanes(crate::MAX_LANES))
+            .unwrap();
+        assert!(file_name(&all[63]).ends_with("-BL.wav"));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), before + crate::MAX_LANES);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A lane that cannot be read once its file is claimed, as when its pages go away.
+    struct FailingLane {
+        track: Snapshot,
+        fails: bool,
+    }
+
+    impl TrackAudio for FailingLane {
+        fn sample_rate(&self) -> u32 {
+            self.track.sample_rate
+        }
+        fn channels(&self) -> usize {
+            self.track.channels
+        }
+        fn frame_range(&self) -> Range<u64> {
+            TrackAudio::frame_range(&self.track)
+        }
+        fn read_frames(&self, first: usize, output: &mut [f32]) -> bool {
+            !self.fails && TrackAudio::read_frames(&self.track, first, output)
+        }
+    }
+
+    #[test]
+    fn one_lane_that_fails_to_write_removes_every_file_of_the_take() {
+        let dir = test_dir("lane-failure");
+        let track = Snapshot {
+            sample_rate: 48_000,
+            channels: 2,
+            samples: vec![0.5; 9_600],
+            first_frame: 0,
+        };
+        for failing in [0, 3, 4] {
+            let lanes: Vec<_> = (0..5)
+                .map(|lane| FailingLane { track: track.clone(), fails: lane == failing })
+                .collect();
+            let error = export_tracks_with_profile(&dir, &lanes, 0..4_800, WavExportProfile::default())
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "lane {failing}");
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "lane {failing}");
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 

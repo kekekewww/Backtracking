@@ -43,6 +43,10 @@ pub const MAX_APPEARANCE_ROWS: usize = 64;
 /// The rolling one-second limit for appearance messages from one add-on.
 pub const MAX_APPEARANCE_MESSAGES_PER_SECOND: usize = 10;
 
+/// The fewest and the most stops an appearance's `spectrum` can have.
+pub const MIN_SPECTRUM_STOPS: usize = 2;
+pub const MAX_SPECTRUM_STOPS: usize = 8;
+
 /// A complete set of appearance overrides. Missing entries use the app's own look.
 /// Colors are stored as red, green, blue and alpha, with alpha 255 for opaque colors.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -54,13 +58,78 @@ pub struct Appearance {
     pub numbers: BTreeMap<String, f64>,
     #[serde(with = "hex_colors", skip_serializing_if = "BTreeMap::is_empty")]
     pub rows: BTreeMap<String, [u8; 4]>,
+    /// The gradient for coloring the waveform by frequency, lowest frequencies first: empty
+    /// for none, otherwise [`MIN_SPECTRUM_STOPS`] to [`MAX_SPECTRUM_STOPS`] stops in order of
+    /// position. Backtracking draws these colors opaque.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub spectrum: Vec<SpectrumStop>,
+}
+
+/// One color of an appearance's `spectrum`, at `position` on the axis from the lowest
+/// frequencies (0) to the highest (1).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpectrumStop {
+    #[serde(with = "hex_color")]
+    pub color: [u8; 4],
+    pub position: f64,
 }
 
 impl Appearance {
     /// Whether the add-on offers any overrides.
     pub fn is_empty(&self) -> bool {
-        self.colors.is_empty() && self.numbers.is_empty() && self.rows.is_empty()
+        self.colors.is_empty()
+            && self.numbers.is_empty()
+            && self.rows.is_empty()
+            && self.spectrum.is_empty()
     }
+
+    /// Fails when `spectrum` is not empty and is not a gradient the host accepts, which the
+    /// host would drop as a whole.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.spectrum.is_empty() || valid_spectrum(&self.spectrum) {
+            return Ok(());
+        }
+        Err(crate::Error::new(format!(
+            "appearance.spectrum must have {MIN_SPECTRUM_STOPS} to {MAX_SPECTRUM_STOPS} stops \
+             with finite positions from 0 to 1 that never decrease"
+        )))
+    }
+}
+
+/// Whether `stops` is a gradient the host keeps.
+fn valid_spectrum(stops: &[SpectrumStop]) -> bool {
+    (MIN_SPECTRUM_STOPS..=MAX_SPECTRUM_STOPS).contains(&stops.len())
+        && stops
+            .iter()
+            .all(|stop| stop.position.is_finite() && (0.0..=1.0).contains(&stop.position))
+        && stops
+            .windows(2)
+            .all(|pair| pair[0].position <= pair[1].position)
+}
+
+/// `None` when `spectrum` is not a list, which ignores the message. A list that is not a
+/// valid gradient, in count, order or any one stop, is dropped as a whole.
+fn decode_spectrum(fields: &RawFields<'_>) -> Option<Vec<SpectrumStop>> {
+    let Some(raw) = fields.get("spectrum") else {
+        return Some(Vec::new());
+    };
+    let entries: Vec<&RawValue> = serde_json::from_str(raw.get()).ok()?;
+    if entries.len() > MAX_SPECTRUM_STOPS {
+        return Some(Vec::new());
+    }
+    let stops = entries
+        .into_iter()
+        .map(|entry| {
+            let stop: RawFields = serde_json::from_str(entry.get()).ok()?;
+            let hex: String = serde_json::from_str(stop.get("color")?.get()).ok()?;
+            Some(SpectrumStop {
+                color: parse_color(&hex)?,
+                position: finite_number(stop.get("position")?)?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .filter(|stops| valid_spectrum(stops));
+    Some(stops.unwrap_or_default())
 }
 
 pub(super) fn decode_appearance(fields: &RawFields<'_>) -> Option<Appearance> {
@@ -84,10 +153,12 @@ pub(super) fn decode_appearance(fields: &RawFields<'_>) -> Option<Appearance> {
         .filter_map(color_entry)
         .take(MAX_APPEARANCE_ROWS)
         .collect();
+    let spectrum = decode_spectrum(fields)?;
     Some(Appearance {
         colors,
         numbers,
         rows,
+        spectrum,
     })
 }
 
@@ -115,6 +186,32 @@ fn parse_color(hex: &str) -> Option<[u8; 4]> {
     Some(rgba)
 }
 
+fn hex([r, g, b, a]: [u8; 4]) -> String {
+    if a == 255 {
+        format!("#{r:02x}{g:02x}{b:02x}")
+    } else {
+        format!("#{r:02x}{g:02x}{b:02x}{a:02x}")
+    }
+}
+
+mod hex_color {
+    use super::*;
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        color: &[u8; 4],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex(*color))
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<[u8; 4], D::Error> {
+        parse_color(&String::deserialize(deserializer)?)
+            .ok_or_else(|| serde::de::Error::custom("expected #rrggbb or #rrggbbaa"))
+    }
+}
+
 mod hex_colors {
     use super::*;
 
@@ -122,14 +219,7 @@ mod hex_colors {
         colors: &BTreeMap<String, [u8; 4]>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        serializer.collect_map(colors.iter().map(|(name, &[r, g, b, a])| {
-            let color = if a == 255 {
-                format!("#{r:02x}{g:02x}{b:02x}")
-            } else {
-                format!("#{r:02x}{g:02x}{b:02x}{a:02x}")
-            };
-            (name, color)
-        }))
+        serializer.collect_map(colors.iter().map(|(name, &color)| (name, hex(color))))
     }
 
     pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(

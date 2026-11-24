@@ -12,6 +12,7 @@ pub(super) struct PairBlocks {
 struct Fold<'a> {
     group: &'a PairGroup,
     lane: usize,
+    lanes: usize,
     stride: usize,
     offset: usize,
 }
@@ -44,7 +45,10 @@ impl Fold<'_> {
         let PagePeaks::Wide(wide) = &page.peaks else {
             unreachable!("pair on a narrow lane")
         };
-        let slots = wide.channels.pairs.get_or_init(Box::default);
+        let slots = wide
+            .channels
+            .pairs
+            .get_or_init(|| (0..self.lanes).map(|_| Mutex::new(None)).collect());
         let mut slot = slots[self.lane].lock().unwrap_or_else(|e| e.into_inner());
         if !slot
             .as_ref()
@@ -79,7 +83,8 @@ pub(in crate::capture) fn extrema<'a>(
         group,
         stride: layout.channels,
         lane,
-        offset: group.first + if lane == 0 { 0 } else { layout.a_channels },
+        lanes: layout.lane_count(),
+        offset: group.first + layout.lane(lane).expect("a lane of the layout").start,
     };
     let mut bounds = Bounds::EMPTY;
     for (page, frames) in pages {
@@ -184,7 +189,7 @@ mod tests {
 
     #[test]
     fn frozen_prefixes_extend_the_same_cache_and_edits_detach_it() {
-        let mut history = History::new(257, 3, 3, 1028).unwrap();
+        let mut history = History::new(257, &[3], 1028).unwrap();
         let group = PairGroup::new(0, &labels(&["FL", "FR", "FC"])).unwrap();
         let append = |history: &mut History, n: usize| {
             for _ in 0..n {

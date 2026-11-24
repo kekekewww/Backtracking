@@ -80,10 +80,13 @@ You can try this in a browser, with nothing to install: [open the live demo](htt
 - **Editing never stops the recording.** Selecting, moving flags, zooming and panning work on a fixed copy of the audio while capture continues in the background.
 - **One lane at a time.** With two sources, tap the right `Ctrl` key (right `Command` on a Mac) to select, preview, fade and drag out A or B on its own.
 - **Files named after their source.** Desktop WAVs are named like `Backtracking_Spotify_A_…`. Give each device its own name in **Options → Sources**, and the name follows it to either lane.
+- **Up to 64 sources.** In the Windows desktop app, **Add source** in **Options → Sources** records more sources at once, up to 64 lanes and 64 channels in all. Their history shares one memory budget, so it gets shorter as channels are added, and each file carries its lane's letter. The macOS app and the plug-ins are unchanged.
 - **Plug-in to desktop.** Tick **Send to Backtracking desktop** in a plug-in instance and the desktop app lists that track as a source.
 - **More than one recorder.** **New capture window** opens extra desktop recorders, each with its own source.
+- **AI agents.** In the Windows desktop app, the [Backtracking Agent](addons/backtracking-agent/README.md) add-on lets Claude Code, Claude Desktop or another MCP client pause and start recording, select, save files and change sources, once you allow it on the **Add-ons** page.
 - **WAV the way you need it.** 44.1, 48 or 96 kHz, in 16-bit PCM, 24-bit PCM or 32-bit float. The default is 48 kHz, 32-bit float.
 - **Readable levels.** The live meter shows dBFS, VU or momentary LUFS, and the waveform can be merged or split into L/R.
+- **Color by frequency.** In the Windows desktop app, **Waveform color: By frequency** colors the waveform from its low to its high frequencies, red to blue by default, in colors you can change.
 - **Your look.** Accent color, border width, background transparency, and whether the app name, meters and capture status mark are shown.
 - **A tidy disk.** A snapshot is saved to one folder only. **Delete old drag-and-drop files**, Off by default, removes drag-and-drop WAVs after 10, 20, 30, 60 or 90 days.
 - **Signed updates.** The desktop apps can install later releases from **Options → Updates**.

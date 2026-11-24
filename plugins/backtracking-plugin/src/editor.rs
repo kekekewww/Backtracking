@@ -17,13 +17,14 @@ use backtracking_core::{
 use backtracking_ui::stack::{self, LaneBox};
 use backtracking_ui::{
     CENTER_LINE, FadeEnd, FlagReach, LoneSample, OPTIONS_NAVIGATION_WIDTH, PLOT_BACKGROUND,
-    RECORDING_DIM, RECORDING_LIT, TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS,
+    RECORDING_DIM, RECORDING_LIT, SpectrumPalette, TraceStyle, TransportGlyph, WAV_SAMPLE_FORMATS,
     WAV_SAMPLE_RATES, accent_color, configure_options_style, dragged_fades, fade_end_at,
     fade_waveform_bins, fit_frame_range, flag_handle_at, icon_button, meter_number, muted_accent,
     options_choice, options_control_width, options_field, options_group_heading,
     options_heading_text, options_list, options_navigation_item, options_note, options_value,
-    paint_fades, paint_guide_lines, paint_playhead, paint_transport_glyph, paint_waveform_trace,
-    selected_waveform_color, status_led, waveform_press,
+    paint_colored_waveform_trace, paint_fades, paint_guide_lines, paint_playhead,
+    paint_transport_glyph, paint_waveform_trace, selected_waveform_color, status_led, trace_bin,
+    waveform_press,
 };
 use egui::{Color32, CursorIcon, PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use nice_plug::context::gui::GuiContext;
@@ -36,7 +37,8 @@ use nice_plug_egui::{
 use crate::session::{EditingSnapshot, Session, WaveformPeaks, WaveformTimeline, waveform_views};
 use crate::settings::{
     BORDER_WIDTHS, CaptureInput, DEFAULT_ACCENT, MeterMode, PairRender, SessionSettings,
-    StatusMark, TRANSPARENCY_LEVELS, WIDE_EXPORT_MODES, WaveformLayout, wide_export_label,
+    StatusMark, TRANSPARENCY_LEVELS, WIDE_EXPORT_MODES, WaveformColoring, WaveformLayout,
+    wide_export_label,
 };
 use crate::surround::{WideLayout, WideRow, WideSave};
 
@@ -49,6 +51,10 @@ use preview::{
     PreviewKey, PreviewRequest, PreviewResult, PreviewWorker, RowsKey, RowsRequest, RowsResult,
     RowsWorker,
 };
+mod spectrum;
+#[cfg(test)]
+mod spectrum_tests;
+use spectrum::{ColorRow, WaveformColors};
 
 const REFRESH: Duration = Duration::from_millis(80);
 const RECORDING_BLINK: Duration = Duration::from_millis(500);
@@ -147,6 +153,8 @@ pub struct CaptureUi {
     waveform_only: bool,
     /// Made the first time a binaural preview needs it.
     head_model: Option<Arc<HeadModel>>,
+    /// The colors read for the rows on screen, while the waveform is colored by frequency.
+    waveform_colors: WaveformColors,
     /// Keeps a Chinese, Japanese or Korean input method from swallowing Space and the other keys.
     #[cfg(target_os = "windows")]
     input_method: win_ime::InputMethod,
@@ -788,6 +796,7 @@ impl NiceEguiApp for CaptureUi {
             self.show_options(ui, frame, &mut settings);
         }
         self.apply_waveform_size(ui, rect.height(), settings.show_waveform_only);
+        self.refresh_waveform_colors(settings.waveform_coloring);
         let configured_seconds = settings.retention.seconds() as f32;
         let row_tip = self.interact_lanes(ui, rect, !settings_open);
         if !canceled_selection {
@@ -849,6 +858,8 @@ impl NiceEguiApp for CaptureUi {
         // Nothing would show the preview or stop it.
         self.stop_preview();
         self.discard_drag_preparation();
+        // Nothing would draw the colors; the next window reads them again.
+        self.waveform_colors.stop();
         if !self.native_dragging.load(Ordering::Acquire) {
             self.session.end_waveform_gesture(self.selection.is_some());
         }
@@ -874,7 +885,9 @@ impl Drop for CaptureUi {
 
 impl CaptureUi {
     fn new(session: Arc<Session>, editor_state: Arc<EguiEditorState>) -> Self {
+        let window = editor_state.clone();
         Self {
+            waveform_colors: WaveformColors::new(Arc::new(move || window.is_open())),
             session, editor_state,
             product_icon: None,
             peaks: std::array::from_fn(|_| WaveformPeaks::default()),
@@ -1248,6 +1261,61 @@ impl CaptureUi {
             }
         }
         self.timeline = timeline;
+    }
+
+    /// The row `row` of a mono or stereo capture is drawn from, top to bottom.
+    fn color_row(&self, row: usize) -> ColorRow {
+        if self.timeline.b_channels.is_some() {
+            return ColorRow::View(row, waveform::WaveformView::Merged);
+        }
+        let views = waveform_views(self.peak_layout, self.timeline.channels);
+        ColorRow::View(0, views.get(row).copied().unwrap_or_default())
+    }
+
+    /// The rows drawn now and the bins each is drawn in.
+    fn color_rows(&self) -> (Vec<ColorRow>, usize) {
+        if self.timeline.wide.is_some() {
+            let rows = self.rows.iter().map(|&row| wide_color_row(row)).collect();
+            return (rows, self.row_peaks.first().map_or(0, |peaks| peaks.minimum.len()));
+        }
+        let count = if self.timeline.b_channels.is_some() {
+            2
+        } else {
+            waveform_views(self.peak_layout, self.timeline.channels).len()
+        };
+        ((0..count).map(|row| self.color_row(row)).collect(), self.peaks[0].minimum.len())
+    }
+
+    /// Asks for the colors of the rows drawn now, once per pass, from the pinned edit while a
+    /// selection is edited and from the live capture otherwise. With a single color this only
+    /// lets go of what coloring by frequency had.
+    fn refresh_waveform_colors(&mut self, coloring: WaveformColoring) {
+        if coloring != WaveformColoring::Frequency {
+            self.waveform_colors.update(coloring, None, |_| None);
+            return;
+        }
+        let editing = self.session.editing_snapshot();
+        let (rows, bins) = self.color_rows();
+        let wanted = (bins > 0 && !rows.is_empty() && !self.peak_frames.is_empty()).then(|| {
+            spectrum::Request {
+                epoch: self.timeline.epoch,
+                edit: editing.as_ref().map(|editing| editing.token),
+                frames: self.peak_frames.clone(),
+                bins,
+                rows,
+                group: self.timeline.wide.as_ref().map(|wide| wide.group.clone()),
+            }
+        });
+        let session = &self.session;
+        self.waveform_colors.update(coloring, wanted, |request| match &editing {
+            Some(editing) => {
+                (editing.timeline.epoch == request.epoch).then(|| editing.snapshots.clone())
+            }
+            None => session
+                .try_freeze_frames(request.frames.clone())
+                .filter(|(epoch, _)| *epoch == request.epoch)
+                .map(|(_, tracks)| tracks),
+        });
     }
 
     /// Asks for the rows on screen of a pinned wide capture and shows them once they are read.
@@ -1714,6 +1782,8 @@ impl CaptureUi {
         }
         let selection_clip = explicit_range.as_ref().and_then(|range|
             waveform_selection_clip(audio_rect, &self.peak_frames, range));
+        // Coloring by frequency: the band colors, once for every row.
+        let palette = spectrum::waveform_palette(settings);
         let trace = RowTrace {
             audio_rect,
             range: explicit_range.as_ref(),
@@ -1722,6 +1792,7 @@ impl CaptureUi {
             color,
             selected_color,
             selection_clip,
+            palette: palette.as_ref(),
         };
         if let Some(wide) = &self.timeline.wide {
             let hover = ui.input(|input| input.pointer.hover_pos());
@@ -1746,7 +1817,7 @@ impl CaptureUi {
                 if width <= 0.0 {
                     continue;
                 }
-                self.paint_row(&painter, &trace, peaks, middle, extent);
+                self.paint_row(&painter, &trace, peaks, middle, extent, self.color_row(row));
             }
         }
         if width > 0.0 {
@@ -1785,7 +1856,8 @@ impl CaptureUi {
     }
 
     /// One row's waveform about `middle`, tapered the way the clip is written, with its
-    /// selection drawn over it.
+    /// selection drawn over it. While the waveform is colored by frequency, each column takes
+    /// the color read for `row` there.
     fn paint_row(
         &self,
         painter: &egui::Painter,
@@ -1793,6 +1865,7 @@ impl CaptureUi {
         peaks: &WaveformPeaks,
         middle: f32,
         extent: f32,
+        row: ColorRow,
     ) {
         let tapered;
         let peaks = match trace.range {
@@ -1813,25 +1886,36 @@ impl CaptureUi {
         };
         let geometry =
             waveform::waveform_geometry(&peaks.minimum, &peaks.maximum, self.peak_frames.clone());
-        paint_waveform_geometry(
-            painter,
-            &geometry,
-            trace.audio_rect,
-            middle,
-            extent,
-            trace.stroke,
-            trace.color,
-        );
-        if let Some(clip) = trace.selection_clip {
+        if let Some(palette) = trace.palette {
+            let colors = self.waveform_colors.row_colors(
+                row,
+                &self.peak_frames,
+                peaks.minimum.len(),
+                palette,
+                self.timeline.sample_rate,
+            );
+            paint_colored_row(painter, trace, &geometry, middle, extent, &colors);
+        } else {
             paint_waveform_geometry(
-                &painter.with_clip_rect(clip),
+                painter,
                 &geometry,
                 trace.audio_rect,
                 middle,
                 extent,
                 trace.stroke,
-                trace.selected_color,
+                trace.color,
             );
+            if let Some(clip) = trace.selection_clip {
+                paint_waveform_geometry(
+                    &painter.with_clip_rect(clip),
+                    &geometry,
+                    trace.audio_rect,
+                    middle,
+                    extent,
+                    trace.stroke,
+                    trace.selected_color,
+                );
+            }
         }
         if let Some(range) = trace.range {
             // Full scale is drawn at the height paint_waveform_geometry uses.
@@ -1913,7 +1997,8 @@ impl CaptureUi {
                     .position(|shown| *shown == source)
                     .and_then(|position| self.row_peaks.get(position))
                 {
-                    self.paint_row(painter, trace, peaks, middle, lane_box.row_height * 0.47);
+                    let extent = lane_box.row_height * 0.47;
+                    self.paint_row(painter, trace, peaks, middle, extent, wide_color_row(source));
                 }
             }
         }
@@ -2634,6 +2719,17 @@ struct RowTrace<'a> {
     color: Color32,
     selected_color: Color32,
     selection_clip: Option<Rect>,
+    /// The band colors while the waveform is colored by frequency.
+    palette: Option<&'a SpectrumPalette>,
+}
+
+/// The row of a capture wider than stereo that the colors of `row` are read for.
+fn wide_color_row(row: WideRow) -> ColorRow {
+    match row {
+        WideRow::Pair(side) => ColorRow::Pair(0, side),
+        WideRow::Channel(channel) => ColorRow::Channel(0, channel),
+        WideRow::Sidechain => ColorRow::View(1, waveform::WaveformView::Merged),
+    }
 }
 
 /// The lanes of a capture wider than stereo: L, R and one row per channel, which scroll when
@@ -2958,6 +3054,7 @@ fn appearance_page(ui: &mut egui::Ui, settings: &mut SessionSettings, wide: bool
             }
         });
     });
+    spectrum::waveform_color_options(ui, settings);
     ui.separator();
     options_group_heading(ui, "Show");
     ui.checkbox(&mut settings.show_title, "App name in the toolbar");
@@ -3152,6 +3249,52 @@ fn paint_waveform_geometry(
         fill: Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 96),
         lone_sample: LoneSample::Dash(stroke_width.max(1.0)),
     });
+}
+
+/// [`paint_waveform_geometry`] with the color `color_at` gives each column and sample, and
+/// `color` where it gives none. The fill under each is the one the theme color has.
+#[allow(clippy::too_many_arguments)]
+fn paint_colored_waveform_geometry(
+    painter: &egui::Painter, geometry: &waveform::WaveformGeometry, rect: Rect,
+    middle: f32, extent: f32, stroke_width: f32, color: Color32,
+    color_at: impl Fn(f32) -> Option<Color32>,
+) {
+    let position = |x: f32, value: f32| Pos2::new(rect.left() + rect.width() * x, middle - value * extent);
+    let style = TraceStyle {
+        stroke: Stroke::new(stroke_width, color),
+        fill: spectrum::trace_fill(color),
+        lone_sample: LoneSample::Dash(stroke_width.max(1.0)),
+    };
+    paint_colored_waveform_trace(painter, geometry, position, &style, color_at, spectrum::trace_fill);
+}
+
+/// One row's `geometry` with each column in its frequency color, as on the desktop: in full
+/// inside the selection and, while one is on screen, dimmed toward grey outside it. A column
+/// whose color has not come in yet takes the theme color, treated the same way. `colors` has
+/// one entry per bin the geometry was made from.
+fn paint_colored_row(
+    painter: &egui::Painter, trace: &RowTrace<'_>, geometry: &waveform::WaveformGeometry,
+    middle: f32, extent: f32, colors: &[Option<Color32>],
+) {
+    let paint = |painter: &egui::Painter, tint: fn(Color32) -> Color32| {
+        paint_colored_waveform_geometry(
+            painter, geometry, trace.audio_rect, middle, extent, trace.stroke, trace.color,
+            |x| {
+                let own = colors.get(trace_bin(x, colors.len())).copied().flatten();
+                Some(tint(own.unwrap_or(trace.color)))
+            },
+        );
+    };
+    let Some(clip) = trace.selection_clip else {
+        paint(painter, std::convert::identity);
+        return;
+    };
+    let whole = painter.clip_rect();
+    let left = Rect::from_x_y_ranges(whole.left()..=clip.left(), whole.y_range());
+    let right = Rect::from_x_y_ranges(clip.right()..=whole.right(), whole.y_range());
+    paint(&painter.with_clip_rect(left), spectrum::unselected_color);
+    paint(&painter.with_clip_rect(clip), std::convert::identity);
+    paint(&painter.with_clip_rect(right), spectrum::unselected_color);
 }
 
 #[cfg(test)]

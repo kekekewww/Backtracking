@@ -41,12 +41,61 @@ lists it for each platform. Only the Windows path has been run against the app.
 Declare `"appearance"` in `addon.json` and send a complete `protocol::Appearance`
 with `Client::send_appearance`. Its color maps use RGBA bytes. Use
 `APPEARANCE_COLOR_NAMES` and `APPEARANCE_NUMBER_RANGES` from `protocol` for the
-supported names and values. Each message replaces the previous offer. Send
+supported names and values. `Appearance::spectrum` is an optional gradient for
+coloring the waveform by frequency: 2 to 8 `SpectrumStop`s, positions from 0 (low)
+to 1 (high) in order. `Client::send_appearance` returns an error for a spectrum
+the host would drop. Each message replaces the previous offer. Send
 `Appearance::default()` to clear it. The client allows up to ten updates per second.
 The user chooses whether to apply the offer in Options > Appearance.
 
 Build with `cargo build --locked --release --example theme_example`. Copy the
 resulting `theme_example.exe` to `examples/theme-package/bin/theme-example.exe`
 and run `btaddon-pack` on `examples/theme-package`. The example offers waveform
-colors and updates its border color four times per second until the host tells
-it to quit. [Example source](examples/theme_example.rs) · [Package manifest](examples/theme-package/addon.json)
+colors and a three-stop spectrum, and updates its border color four times per
+second until the host tells it to quit. [Example source](examples/theme_example.rs) · [Package manifest](examples/theme-package/addon.json)
+
+## Control example
+
+Declare `"control"` in `addon.json` to drive Backtracking: read its state, pause
+and start capture, select, save files and change sources (contract section 4.4).
+Nothing works until the user switches control on for your add-on on the Add-ons
+page; until then every request is refused with `not_allowed`.
+`Client::control_allowed` says what the host last sent in `control_access`.
+
+`Client::control(&command)` sends one request and waits for its reply. The outer
+`Result` is a connection problem; the inner one is the host's answer, a
+`ControlResult` with the state after the command, or a `ControlError` whose `code`
+is one of `protocol::control_codes`. It waits the host's own limit plus five
+seconds: ten seconds, or two minutes for `save`, whose reply comes once every file
+is written. To have several requests waiting, use `Client::send_control`, which
+returns the id it chose, and `Client::wait_control(id, timeout)`. At most
+`MAX_CONTROL_IN_FLIGHT` (8) wait at once. Other host messages that arrive while
+you wait are kept for `Client::try_recv`, so poll it as usual. `Client` is
+synchronous: use it from one thread.
+
+```rust
+use backtracking_addon::protocol::ControlCommand;
+
+// In a function returning Result<_, Box<dyn std::error::Error>>.
+client.control(&ControlCommand::PauseCapture)??;
+client.control(&ControlCommand::select_seconds_ago(2.0, 0.0))??;
+let saved = client.control(&ControlCommand::save(Some(r"D:\Clips".into())))??;
+for file in saved.files.unwrap_or_default() {
+    println!("{} lane {:?}, {:?} frames", file.path, file.lane, file.frames);
+}
+```
+
+Build with `cargo build --locked --release --example control_example`, copy
+`control_example.exe` to `examples/control-package/bin/control-example.exe` and
+run `btaddon-pack` on `examples/control-package`. Once allowed, the example reads
+the state, pauses, selects the last two seconds, saves them, clears the selection
+and starts capture again, writing every request and reply to `transcript.log` in
+its data folder. It saves to the folder in its `folder` setting, else to
+`BACKTRACKING_CONTROL_EXAMPLE_FOLDER`, else to `saved` in its data folder. Its
+"Run again" button repeats the sequence. [Example source](examples/control_example.rs) · [Package manifest](examples/control-package/addon.json)
+
+Contract 1 hosts from before `control` refuse a package that declares it. In this
+crate, `Capability`, `AddonMessage` and `HostMessage` gained variants
+(`Capability::Control`, `AddonMessage::Control`, `AddonMessage::ControlRefused`,
+`HostMessage::ControlReply`, `HostMessage::ControlAccess`), so an exhaustive
+`match` on them needs a new arm.

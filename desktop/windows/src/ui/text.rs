@@ -11,7 +11,7 @@ use backtracking_addon::manifest::{Capability, OpenFiles};
 use backtracking_addon::protocol::MessageLevel;
 
 use crate::hotkeys::{Action, BindingError, ReservedShortcut};
-use crate::preferences::WideExportMode;
+use crate::preferences::{WaveformColoring, WideExportMode};
 
 /// Lines the capture code (`controller.rs`) writes in both languages at once, word for word.
 /// A test checks that the capture code still writes them so.
@@ -19,6 +19,15 @@ const BILINGUAL_FALLBACK_TO_MERGED: &str =
     "All channels is unavailable. Using Merged. / 目前無法擷取所有聲道，已改用合併聲道。";
 const BILINGUAL_POSITIONS_TRIMMED: &str =
     "Position history was trimmed to its memory limit. / 位置歷史已依記憶體上限刪減。";
+
+/// Something an add-on did through `control` that the status line notes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ControlNote {
+    Started,
+    Paused,
+    Cleared,
+    SourcesChanged,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Language {
@@ -165,6 +174,15 @@ impl Language {
         match message {
             BILINGUAL_FALLBACK_TO_MERGED => self.all_channels_fallback(),
             BILINGUAL_POSITIONS_TRIMMED => self.positions_trimmed(),
+            // A lane past the channel limit, named in both languages by the capture code
+            // (`controller::lane_fits`): "Lane C cannot start: … / 來源 C 無法開始：…".
+            _ if message.starts_with("Lane ") && message.contains(" cannot start: ") => {
+                match (self, message.split_once(" / ")) {
+                    (Self::English, Some((english, _))) => english,
+                    (Self::TraditionalChinese, Some((_, chinese))) => chinese,
+                    (_, None) => message,
+                }
+            }
             _ => message,
         }
     }
@@ -177,6 +195,126 @@ impl Language {
                 format!("With {channels} channels, memory holds the latest {length}.")
             }
             Self::TraditionalChinese => format!("{channels} 個聲道時，記憶體可保留最近 {length}。"),
+        }
+    }
+
+    /// The first line of the tooltip over a lane's rows, when there are more than two lanes.
+    pub(crate) fn lane_source(self, letter: &str, name: &str) -> String {
+        match self {
+            Self::English => format!("Source {letter}: {name}"),
+            Self::TraditionalChinese => format!("來源 {letter}：{name}"),
+        }
+    }
+
+    /// The tooltip line of a plot whose rows of every lane scroll as one.
+    pub(crate) fn plot_scroll_hint(self) -> &'static str {
+        self.pick(
+            "Scroll here or drag the bar on the right to see the other sources.",
+            "在這裡捲動，或拖曳右側的捲軸，查看其他來源。",
+        )
+    }
+
+    /// A lane's problem on the status line, named by its letter. A message that already names
+    /// the lane is left as it is.
+    pub(crate) fn lane_problem(self, letter: &str, text: &str) -> String {
+        if text.starts_with(&format!("Lane {letter} ")) || text.starts_with(&format!("來源 {letter} "))
+        {
+            return text.to_owned();
+        }
+        match self {
+            Self::English => format!("Source {letter}: {text}"),
+            Self::TraditionalChinese => format!("來源 {letter}：{text}"),
+        }
+    }
+
+    /// After the first lane's problem on the status line: how many other lanes have one.
+    pub(crate) fn more_lane_problems(self, count: usize) -> String {
+        match (self, count) {
+            (Self::English, 1) => "1 more source has a problem".to_owned(),
+            (Self::English, count) => format!("{count} more sources have a problem"),
+            (Self::TraditionalChinese, count) => format!("另有 {count} 個來源有問題"),
+        }
+    }
+
+    /// The Sources page's control under the list that adds a lane.
+    pub(crate) fn add_source_field(self) -> &'static str {
+        self.pick("Add source", "新增來源")
+    }
+
+    pub(crate) fn choose_source(self) -> &'static str {
+        self.pick("Choose a source", "選擇來源")
+    }
+
+    pub(crate) fn no_more_sources(self) -> &'static str {
+        self.pick("No more sources", "無法再新增")
+    }
+
+    pub(crate) fn add_source_tip(self) -> &'static str {
+        self.pick(
+            "The source you choose is added at the end of the list and recorded with the others.",
+            "選擇的來源會加在清單最後，與其他來源一起擷取。",
+        )
+    }
+
+    pub(crate) fn sources_full(self) -> &'static str {
+        self.pick(
+            "64 sources is the most the app can hold.",
+            "最多只能有 64 個來源。",
+        )
+    }
+
+    /// How many of the 64 channels the lanes use together.
+    pub(crate) fn channels_in_use(self, channels: usize) -> String {
+        match self {
+            Self::English => format!("{channels} of 64 channels in use"),
+            Self::TraditionalChinese => format!("已使用 {channels} 個聲道，上限 64 個"),
+        }
+    }
+
+    pub(crate) fn channels_full(self) -> &'static str {
+        self.pick(
+            "All 64 channels are in use. A source added now cannot start.",
+            "64 個聲道已全部使用，現在新增的來源無法開始。",
+        )
+    }
+
+    /// At the foot of the Sources page. With more than one lane (`dual`) it also says that
+    /// removing a lane moves the later ones up.
+    pub(crate) fn sources_restart_history(self, dual: bool) -> &'static str {
+        match (self, dual) {
+            (Self::English, false) => "Adding, removing or changing a source starts a new history.",
+            (Self::English, true) => {
+                "Adding, removing or changing a source starts a new history. Removing a source \
+                 moves the ones after it up a letter."
+            }
+            (Self::TraditionalChinese, false) => "新增、移除或更換來源會重新開始記錄歷史。",
+            (Self::TraditionalChinese, true) => {
+                "新增、移除或更換來源會重新開始記錄歷史。移除來源後，後面的來源會往前遞補一個字母。"
+            }
+        }
+    }
+
+    pub(crate) fn remove_source(self) -> &'static str {
+        self.pick("Remove", "移除")
+    }
+
+    pub(crate) fn remove_source_tip(self, letter: &str) -> String {
+        match self {
+            Self::English => format!("Remove source {letter}. The sources after it move up."),
+            Self::TraditionalChinese => format!("移除來源 {letter}，後面的來源會往前遞補。"),
+        }
+    }
+
+    /// The "+N" button beside the meters that fit, `hidden` meters not shown.
+    pub(crate) fn more_meters(self, hidden: usize) -> String {
+        match (self, hidden) {
+            (Self::English, 1) => "1 more meter. Click to see every source's meter.".to_owned(),
+            (Self::English, hidden) => {
+                format!("{hidden} more meters. Click to see every source's meter.")
+            }
+            (Self::TraditionalChinese, hidden) => {
+                format!("還有 {hidden} 個電平表。按一下可查看所有來源的電平表。")
+            }
         }
     }
 
@@ -575,6 +713,92 @@ impl Language {
         }
     }
 
+    // Waveform colour on the Appearance page.
+
+    pub(crate) fn waveform_color_field(self) -> &'static str {
+        self.pick("Waveform color", "波形顏色")
+    }
+
+    pub(crate) fn waveform_coloring(self, coloring: WaveformColoring) -> &'static str {
+        match coloring {
+            WaveformColoring::Single => self.pick("Single color", "單一顏色"),
+            WaveformColoring::Frequency => self.pick("By frequency", "依頻率"),
+        }
+    }
+
+    pub(crate) fn gradient_field(self) -> &'static str {
+        self.pick("Frequency colors", "頻率顏色")
+    }
+
+    /// Under the gradient's left end, and beside its lowest stop.
+    pub(crate) fn gradient_low(self) -> &'static str {
+        self.pick("Low", "低頻")
+    }
+
+    /// Under the gradient's right end, and beside its highest stop.
+    pub(crate) fn gradient_high(self) -> &'static str {
+        self.pick("High", "高頻")
+    }
+
+    /// The tooltip of a middle stop's position.
+    pub(crate) fn gradient_position(self) -> &'static str {
+        self.pick(
+            "Where this color sits between the lowest and the highest frequencies",
+            "這個顏色在最低頻與最高頻之間的位置",
+        )
+    }
+
+    pub(crate) fn gradient_remove(self) -> &'static str {
+        self.pick("Remove", "移除")
+    }
+
+    pub(crate) fn gradient_add(self) -> &'static str {
+        self.pick("Add color", "新增顏色")
+    }
+
+    pub(crate) fn gradient_reset(self) -> &'static str {
+        self.pick("Reset", "重設")
+    }
+
+    pub(crate) fn gradient_note(self) -> &'static str {
+        self.pick(
+            "Each moment of the waveform mixes these colors by how much of its sound is low or high.",
+            "波形的每個時刻，依其聲音中低頻與高頻的多寡混合這些顏色。",
+        )
+    }
+
+    /// The user has no gradient of their own and the chosen look of `addon` offers one.
+    pub(crate) fn gradient_from_look(self, addon: &str) -> String {
+        match self {
+            Self::English => format!(
+                "These colors come from the look of {addon}. Changing one makes them your own."
+            ),
+            Self::TraditionalChinese => {
+                format!("這些顏色來自 {addon} 的外觀。修改其中任何一個，它們就成為你自己的顏色。")
+            }
+        }
+    }
+
+    /// The user's own gradient is drawn instead of the one the chosen look of `addon` offers.
+    pub(crate) fn gradient_own_over_look(self, addon: &str) -> String {
+        match self {
+            Self::English => format!(
+                "Your own colors are used instead of the ones from the look of {addon}. Reset uses the look's colors again."
+            ),
+            Self::TraditionalChinese => {
+                format!("目前使用你自己的顏色，而不是 {addon} 外觀的顏色。按「重設」會改回該外觀的顏色。")
+            }
+        }
+    }
+
+    /// Some stop is too dark or faint to see on the plot.
+    pub(crate) fn gradient_illegible(self) -> &'static str {
+        self.pick(
+            "A color too hard to see on the waveform's background is drawn in the default color instead.",
+            "在波形背景上不易看清的顏色，會改用預設顏色繪製。",
+        )
+    }
+
     // The Add-ons page and the screen shown before an install.
 
     pub(crate) fn addons_section(self) -> &'static str {
@@ -917,6 +1141,54 @@ impl Language {
                     "提供視窗的顏色與線條樣式，可在「選項」中啟用",
                 )
                 .to_owned(),
+            Capability::Control => self
+                .pick(
+                    "Control Backtracking: start and pause recording, select, save files and \
+                     change sources, once you allow it on the Add-ons page",
+                    "控制 Backtracking：開始與暫停錄音、選取、儲存檔案、變更來源，須先在「附加元件」頁面允許",
+                )
+                .to_owned(),
+        }
+    }
+
+    /// The per-add-on switch for the `control` capability. Off until the user turns it on.
+    pub(crate) fn allow_control(self) -> &'static str {
+        self.pick(
+            "Let this add-on control Backtracking (start and pause recording, select, save files, change sources)",
+            "允許此附加元件控制 Backtracking（開始與暫停錄音、選取、儲存檔案、變更來源）",
+        )
+    }
+
+    /// Under the switch while it is off, once the add-on has asked.
+    pub(crate) fn control_asked(self) -> &'static str {
+        self.pick(
+            "It asked to control Backtracking and was refused",
+            "它要求控制 Backtracking，已被拒絕",
+        )
+    }
+
+    /// Ends a status line about something an add-on did through `control`. With nothing
+    /// before it (after "Paused", say) it names the add-on alone.
+    pub(crate) fn by_addon(self, what: &str, addon: &str) -> String {
+        match (self, what.is_empty()) {
+            (Self::English, false) => format!("{what} · by {addon}"),
+            (Self::English, true) => format!("by {addon}"),
+            (Self::TraditionalChinese, false) => format!("{what} · 由 {addon} 操作"),
+            (Self::TraditionalChinese, true) => format!("由 {addon} 操作"),
+        }
+    }
+
+    /// What an add-on did through `control`, for the status line.
+    pub(crate) fn control_note(self, note: ControlNote) -> &'static str {
+        match note {
+            ControlNote::Started => self.pick("Capture started", "已開始擷取"),
+            // The status line already starts with "Paused".
+            ControlNote::Paused => "",
+            ControlNote::Cleared => self.pick("Cleared", "已清除"),
+            ControlNote::SourcesChanged => self.pick(
+                "Sources changed, recording started over",
+                "來源已變更，重新開始錄音",
+            ),
         }
     }
 
@@ -1325,6 +1597,58 @@ mod tests {
     }
 
     #[test]
+    fn the_source_list_and_meter_texts_exist_in_both_languages() {
+        for text in [
+            super::Language::plot_scroll_hint,
+            super::Language::add_source_field,
+            super::Language::choose_source,
+            super::Language::no_more_sources,
+            super::Language::add_source_tip,
+            super::Language::sources_full,
+            super::Language::channels_full,
+            super::Language::remove_source,
+        ] {
+            assert_ne!(text(English), text(TraditionalChinese));
+            assert!(text(TraditionalChinese).chars().any(|c| c as u32 >= 0x3000));
+            assert!(!text(English).ends_with('。') && !text(English).is_empty());
+        }
+        for dual in [false, true] {
+            assert_ne!(
+                English.sources_restart_history(dual),
+                TraditionalChinese.sources_restart_history(dual)
+            );
+        }
+        assert!(English.sources_restart_history(true).contains("move"));
+        assert!(!English.sources_restart_history(false).contains("move"));
+        assert_eq!(English.channels_in_use(12), "12 of 64 channels in use");
+        assert_eq!(English.lane_source("C", "Speakers"), "Source C: Speakers");
+        assert_eq!(TraditionalChinese.lane_source("C", "喇叭"), "來源 C：喇叭");
+        assert_eq!(English.more_meters(1), "1 more meter. Click to see every source's meter.");
+        assert!(English.more_meters(5).starts_with("5 more meters"));
+        assert!(TraditionalChinese.more_meters(5).contains('5'));
+        assert_eq!(English.more_lane_problems(1), "1 more source has a problem");
+        assert_eq!(English.more_lane_problems(3), "3 more sources have a problem");
+        assert_ne!(English.remove_source_tip("B"), TraditionalChinese.remove_source_tip("B"));
+    }
+
+    #[test]
+    fn a_lane_problem_names_its_lane_once() {
+        assert_eq!(
+            English.lane_problem("C", "The device was unplugged."),
+            "Source C: The device was unplugged."
+        );
+        assert_eq!(
+            TraditionalChinese.lane_problem("C", "裝置已拔除。"),
+            "來源 C：裝置已拔除。"
+        );
+        // The capture code's refusal already names the lane.
+        let refused = "Lane G cannot start: all 64 channels are in use.";
+        assert_eq!(English.lane_problem("G", refused), refused);
+        let refused = "來源 G 無法開始：64 個聲道已用完。";
+        assert_eq!(TraditionalChinese.lane_problem("G", refused), refused);
+    }
+
+    #[test]
     fn export_modes_and_saved_files_read_as_the_spec_says_in_both_languages() {
         let labels =
             |language: super::Language| WideExportMode::ALL.map(|m| language.wide_export_mode(m));
@@ -1399,6 +1723,38 @@ mod tests {
         assert_eq!(
             TraditionalChinese.source_message(super::BILINGUAL_FALLBACK_TO_MERGED),
             "目前無法擷取所有聲道，已改用合併聲道。"
+        );
+        // A lane past the channel limit is named in this language. Lane B's English line is
+        // the one older versions wrote.
+        let lane_b = crate::controller::lane_fits(1, 64, 1).unwrap_err();
+        assert_eq!(
+            English.source_message(&lane_b),
+            "Lane B cannot start: lanes A and B would contain 65 channels; the limit is 64"
+        );
+        assert_eq!(
+            TraditionalChinese.source_message(&lane_b),
+            "來源 B 無法開始：來源 A 與 B 合計會有 65 個聲道，上限為 64。"
+        );
+        let lane_c = crate::controller::lane_fits(2, 60, 8).unwrap_err();
+        assert_eq!(
+            English.source_message(&lane_c),
+            "Lane C cannot start: lanes A to C would contain 68 channels; the limit is 64"
+        );
+        assert_eq!(
+            TraditionalChinese.source_message(&lane_c),
+            "來源 C 無法開始：來源 A 到 C 合計會有 68 個聲道，上限為 64。"
+        );
+        let lane_bl = crate::controller::lane_fits(63, 64, 1).unwrap_err();
+        assert!(
+            English
+                .source_message(&lane_bl)
+                .starts_with("Lane BL cannot start: lanes A to BL would contain 65 channels"),
+            "{lane_bl}"
+        );
+        assert!(
+            TraditionalChinese
+                .source_message(&lane_bl)
+                .starts_with("來源 BL 無法開始")
         );
         // Anything else is left as it came.
         assert_eq!(
@@ -1716,6 +2072,58 @@ mod tests {
         assert_eq!(English.look_field(), "Look from add-on");
         assert!(English.look_not_offered("Example appearance").starts_with("Example appearance "));
         assert!(TraditionalChinese.look_not_offered("Example appearance").starts_with("Example appearance "));
+    }
+
+    #[test]
+    fn every_waveform_color_text_exists_in_both_languages_and_differs() {
+        use crate::preferences::WaveformColoring;
+        let pairs = [
+            super::Language::waveform_color_field,
+            super::Language::gradient_field,
+            super::Language::gradient_low,
+            super::Language::gradient_high,
+            super::Language::gradient_position,
+            super::Language::gradient_remove,
+            super::Language::gradient_add,
+            super::Language::gradient_reset,
+            super::Language::gradient_note,
+            super::Language::gradient_illegible,
+        ]
+        .into_iter()
+        .map(|text| (text(English), text(TraditionalChinese)))
+        .chain(WaveformColoring::ALL.map(|coloring| {
+            (
+                English.waveform_coloring(coloring),
+                TraditionalChinese.waveform_coloring(coloring),
+            )
+        }));
+        for (english, chinese) in pairs {
+            assert!(!english.is_empty() && !chinese.is_empty());
+            assert_ne!(english, chinese);
+            assert!(chinese.chars().any(|c| c as u32 >= 0x3000), "{chinese}");
+        }
+        assert_eq!(
+            WaveformColoring::ALL.map(|coloring| English.waveform_coloring(coloring)),
+            ["Single color", "By frequency"]
+        );
+        // Where the colours come from, naming the add-on whose look offers them.
+        for text in [
+            super::Language::gradient_from_look,
+            super::Language::gradient_own_over_look,
+        ] {
+            let (english, chinese) = (
+                text(English, "Example appearance"),
+                text(TraditionalChinese, "Example appearance"),
+            );
+            assert_ne!(english, chinese);
+            assert!(english.contains("Example appearance"), "{english}");
+            assert!(chinese.contains("Example appearance"), "{chinese}");
+            assert!(chinese.chars().any(|c| c as u32 >= 0x3000), "{chinese}");
+        }
+        assert_ne!(
+            English.gradient_from_look("A"),
+            English.gradient_own_over_look("A")
+        );
     }
 
     #[test]

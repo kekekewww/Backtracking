@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     ops::{Deref, DerefMut, Range},
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -10,11 +11,11 @@ use crate::waveform::WaveformView;
 #[cfg(test)]
 mod cache_tests;
 pub(super) mod pair;
+pub(super) mod spectrum;
 
 const BASE_SECONDS: usize = 60;
 pub(super) const PEAK_FRAMES: usize = 128;
 const CHANNEL_PEAK_FRAMES: usize = 16;
-const TRACES: usize = 7;
 
 #[derive(Clone, Copy)]
 pub(super) struct Bounds {
@@ -54,30 +55,102 @@ impl Bounds {
 pub(super) struct Layout {
     pub(super) page_frames: usize,
     pub(super) channels: usize,
-    pub(super) a_channels: usize,
+    /// Bit `c` is set where a lane starts at channel `c`. Bit zero is always set, and each
+    /// lane runs up to the next set bit or to `channels`.
+    pub(super) lane_starts: u64,
+}
+
+/// The lane starts of lanes `widths` channels wide, side by side from channel zero. The
+/// widths must be nonzero and add up to at most 64.
+pub(super) fn lane_starts(widths: &[usize]) -> u64 {
+    let mut starts = 0;
+    let mut channel = 0;
+    for &width in widths {
+        starts |= 1 << channel;
+        channel += width;
+    }
+    starts
+}
+
+/// The channels of each lane in turn, from the lane starts of a [`Layout`].
+#[derive(Clone)]
+pub(super) struct Lanes {
+    starts: u64,
+    channels: usize,
+}
+
+impl Iterator for Lanes {
+    type Item = Range<usize>;
+
+    fn next(&mut self) -> Option<Range<usize>> {
+        if self.starts == 0 {
+            return None;
+        }
+        let start = self.starts.trailing_zeros() as usize;
+        self.starts &= self.starts - 1;
+        let end = if self.starts == 0 {
+            self.channels
+        } else {
+            self.starts.trailing_zeros() as usize
+        };
+        Some(start..end)
+    }
 }
 
 impl Layout {
-    fn extra_channels(self) -> usize {
-        self.a_channels.saturating_sub(2) + (self.channels - self.a_channels).saturating_sub(2)
+    /// A layout of one lane per entry of `widths`, which must be nonzero and add up to at
+    /// most 64.
+    pub(super) fn new(page_frames: usize, widths: &[usize]) -> Self {
+        Self {
+            page_frames,
+            channels: widths.iter().sum(),
+            lane_starts: lane_starts(widths),
+        }
     }
 
-    /// The first two channels of each lane already have left/right peak traces.
-    fn channel_trace(self, channel: usize) -> Result<usize, usize> {
-        let (lane, local, preceding) = if channel < self.a_channels {
-            (0, channel, 0)
-        } else {
-            (
-                1,
-                channel - self.a_channels,
-                self.a_channels.saturating_sub(2),
-            )
-        };
-        if local < 2 {
-            Ok(2 + lane * 3 + local)
-        } else {
-            Err(preceding + local - 2)
+    pub(super) fn lane_count(self) -> usize {
+        self.lane_starts.count_ones() as usize
+    }
+
+    /// The channels of every lane, lane zero first.
+    pub(super) fn lanes(self) -> Lanes {
+        Lanes {
+            starts: self.lane_starts,
+            channels: self.channels,
         }
+    }
+
+    /// The channels of `lane` within a frame, or `None` past the last lane.
+    pub(super) fn lane(self, lane: usize) -> Option<Range<usize>> {
+        self.lanes().nth(lane)
+    }
+
+    /// Peak traces per 128-frame block: every channel, then each lane's merged, left and
+    /// right views.
+    pub(super) fn traces(self) -> usize {
+        1 + 3 * self.lane_count()
+    }
+
+    fn extra_channels(self) -> usize {
+        self.lanes().map(|lane| lane.len().saturating_sub(2)).sum()
+    }
+
+    /// The first two channels of each lane already have left/right peak traces. The others
+    /// are numbered in channel order among the extra channels of every lane.
+    fn channel_trace(self, channel: usize) -> Result<usize, usize> {
+        let mut preceding = 0;
+        for (lane, track) in self.lanes().enumerate() {
+            if track.contains(&channel) {
+                let local = channel - track.start;
+                return if local < 2 {
+                    Ok(2 + lane * 3 + local)
+                } else {
+                    Err(preceding + local - 2)
+                };
+            }
+            preceding += track.len().saturating_sub(2);
+        }
+        unreachable!("channel {channel} is outside the layout")
     }
 
     /// The waveform trace of one lane's view. Trace zero spans every channel.
@@ -104,14 +177,45 @@ struct ChannelBlocks {
 #[derive(Default)]
 struct SharedPeaks {
     native: OnceLock<Box<[Mutex<ChannelBlocks>]>>,
-    pairs: OnceLock<Box<[Mutex<Option<pair::PairBlocks>>; 2]>>,
+    /// One slot per lane.
+    pairs: OnceLock<Box<[Mutex<Option<pair::PairBlocks>>]>>,
 }
 
 type ChannelPeaks = Arc<SharedPeaks>;
 
+/// Which channels of a whole page carry audio, for every channel of every lane at once:
+/// bit `c` of `known` is set once channel `c`'s bit of `active` has been worked out.
+#[derive(Default)]
+struct Activity {
+    known: AtomicU64,
+    active: AtomicU64,
+}
+
+impl Activity {
+    /// The activity of the `track.len()` channels from `track.start`, with bit zero for the
+    /// first, working it out with `mask` the first time it is asked for. Two readers that
+    /// race both work out the same bits.
+    fn get_or_init(&self, track: &Range<usize>, mask: impl FnOnce() -> u64) -> u64 {
+        let full = u64::MAX >> (64 - track.len());
+        let lane = full << track.start;
+        if self.known.load(Ordering::Acquire) & lane == lane {
+            return (self.active.load(Ordering::Relaxed) >> track.start) & full;
+        }
+        let mask = mask() & full;
+        self.active.fetch_or(mask << track.start, Ordering::Relaxed);
+        self.known.fetch_or(lane, Ordering::Release);
+        mask
+    }
+
+    fn clear(&mut self) {
+        *self.known.get_mut() = 0;
+        *self.active.get_mut() = 0;
+    }
+}
+
 struct WidePeaks {
-    activity: [OnceLock<u64>; 2],
-    traces: Vec<[Bounds; TRACES]>,
+    activity: Activity,
+    traces: Vec<Bounds>,
     capacity_frames: usize,
     // Prefix copies share this even before its first read. Only complete blocks
     // are stored, so appending can extend it without changing a frozen prefix.
@@ -119,14 +223,15 @@ struct WidePeaks {
 }
 
 // Vec's unused capacity values let this enum fit in the original Vec's space.
-// Mono/stereo lanes keep the original allocation and peak-building path.
+// Layouts whose every lane is mono or stereo keep a single allocation per page.
+// Each complete 128-frame block adds `Layout::traces` bounds, in trace order.
 enum PagePeaks {
-    Traces(Vec<[Bounds; TRACES]>),
+    Traces(Vec<Bounds>),
     Wide(Box<WidePeaks>),
 }
 
 impl Deref for PagePeaks {
-    type Target = Vec<[Bounds; TRACES]>;
+    type Target = Vec<Bounds>;
 
     fn deref(&self) -> &Self::Target {
         match self {
@@ -146,7 +251,7 @@ impl DerefMut for PagePeaks {
 }
 
 impl PagePeaks {
-    fn new(traces: Vec<[Bounds; TRACES]>, layout: Layout, capacity_frames: usize) -> Self {
+    fn new(traces: Vec<Bounds>, layout: Layout, capacity_frames: usize) -> Self {
         if layout.extra_channels() == 0 {
             Self::Traces(traces)
         } else {
@@ -159,8 +264,9 @@ impl PagePeaks {
         }
     }
 
-    fn prefix(&self, blocks: usize) -> Self {
-        let traces = self[..blocks].to_vec();
+    /// A copy of the first `bounds` entries, sharing the channel caches.
+    fn prefix(&self, bounds: usize) -> Self {
+        let traces = self[..bounds].to_vec();
         match self {
             Self::Traces(_) => Self::Traces(traces),
             Self::Wide(wide) => Self::Wide(Box::new(WidePeaks {
@@ -176,7 +282,7 @@ impl PagePeaks {
     /// allocated vectors when no frozen prefix still shares them.
     fn invalidate_channels(&mut self) {
         if let Self::Wide(wide) = self {
-            wide.activity = Default::default();
+            wide.activity.clear();
             if let Some(cache) = Arc::get_mut(&mut wide.channels) {
                 cache.pairs.take();
                 if let Some(channels) = cache.native.get_mut() {
@@ -198,6 +304,8 @@ pub(super) struct Page {
     first_frame: u64,
     samples: Vec<f32>,
     peaks: PagePeaks,
+    /// Frequency bands, built by the first read that asks for them.
+    bands: Arc<spectrum::BandCache>,
 }
 
 impl Page {
@@ -208,12 +316,13 @@ impl Page {
             .try_reserve_exact(page_frames * layout.channels)
             .map_err(|_| CaptureError::AllocationFailed)?;
         peaks
-            .try_reserve_exact(page_frames / PEAK_FRAMES)
+            .try_reserve_exact(page_frames / PEAK_FRAMES * layout.traces())
             .map_err(|_| CaptureError::AllocationFailed)?;
         Ok(Self {
             first_frame: 0,
             samples,
             peaks: PagePeaks::new(peaks, layout, page_frames),
+            bands: Arc::default(),
         })
     }
 
@@ -227,14 +336,14 @@ impl Page {
         page.first_frame = first_frame;
         page.samples.extend_from_slice(samples);
         for block in 0..page.frames(layout.channels) / PEAK_FRAMES {
-            let bounds = page.summarize(block, layout.channels, layout.a_channels);
-            page.peaks.push(bounds);
+            page.push_summary(block, layout);
         }
         Ok(page)
     }
 
     fn reset(&mut self, first_frame: u64) {
         self.peaks.invalidate_channels();
+        self.invalidate_bands();
         self.first_frame = first_frame;
         self.samples.clear();
         self.peaks.clear();
@@ -249,11 +358,12 @@ impl Page {
     }
 
     /// An owned copy of the first `frames` frames and the peak blocks they complete.
-    fn prefix(&self, frames: usize, channels: usize) -> Self {
+    fn prefix(&self, frames: usize, layout: Layout) -> Self {
         Self {
             first_frame: self.first_frame,
-            samples: self.samples[..frames * channels].to_vec(),
-            peaks: self.peaks.prefix(frames / PEAK_FRAMES),
+            samples: self.samples[..frames * layout.channels].to_vec(),
+            peaks: self.peaks.prefix(frames / PEAK_FRAMES * layout.traces()),
+            bands: Arc::clone(&self.bands),
         }
     }
 
@@ -272,27 +382,12 @@ impl Page {
         &self.samples[frames.start * channels..frames.end * channels]
     }
 
-    fn summarize(&self, block: usize, channels: usize, a_channels: usize) -> [Bounds; TRACES] {
-        let mut peaks = [Bounds::EMPTY; TRACES];
-        let start = block * PEAK_FRAMES * channels;
-        let samples = &self.samples[start..start + PEAK_FRAMES * channels];
-        for frame in samples.chunks_exact(channels) {
-            for &sample in frame {
-                peaks[0].add(sample);
-            }
-            for (lane, track) in [&frame[..a_channels], &frame[a_channels..]]
-                .into_iter()
-                .enumerate()
-            {
-                if let Some(&left) = track.first() {
-                    let right = track.get(1).copied().unwrap_or(left);
-                    peaks[1 + lane * 3].add(WaveformView::Merged.sample(track));
-                    peaks[2 + lane * 3].add(left);
-                    peaks[3 + lane * 3].add(right);
-                }
-            }
-        }
-        peaks
+    /// Appends the peak traces of complete block `block`, which must be the next one.
+    fn push_summary(&mut self, block: usize, layout: Layout) {
+        let first = self.peaks.len();
+        debug_assert_eq!(first, block * layout.traces());
+        self.peaks.resize(first + layout.traces(), Bounds::EMPTY);
+        summarize(&self.samples, block, layout, &mut self.peaks[first..]);
     }
 
     /// Adds the extrema of `frames` to `bounds`: whole 128 frame blocks come from the
@@ -304,7 +399,8 @@ impl Page {
             let first_cached = first_block * PEAK_FRAMES;
             let last_cached = last_block * PEAK_FRAMES;
             self.scan(layout, trace, frames.start..first_cached, bounds);
-            for block in &self.peaks[first_block..last_block] {
+            let stride = layout.traces();
+            for block in self.peaks[first_block * stride..last_block * stride].chunks_exact(stride) {
                 bounds.combine(block[trace]);
             }
             self.scan(layout, trace, last_cached..frames.end, bounds);
@@ -321,11 +417,7 @@ impl Page {
             }
             return;
         }
-        let track = if trace <= 3 {
-            0..layout.a_channels
-        } else {
-            layout.a_channels..layout.channels
-        };
+        let track = layout.lane((trace - 1) / 3).expect("a trace of a lane");
         let view = WaveformView::from_code(((trace - 1) % 3) as u32).expect("valid waveform view");
         for frame in samples.chunks_exact(layout.channels) {
             bounds.add(view.sample(&frame[track.clone()]));
@@ -441,6 +533,78 @@ impl Page {
     }
 }
 
+/// Writes the peak traces of block `block` of the interleaved `samples` to `peaks`, which
+/// holds one entry per trace of `layout`. Mono and stereo lanes take their own loops; every
+/// trace is the same as [`WaveformView::sample`] would give, bit for bit.
+fn summarize(samples: &[f32], block: usize, layout: Layout, peaks: &mut [Bounds]) {
+    let channels = layout.channels;
+    let start = block * PEAK_FRAMES * channels;
+    let samples = &samples[start..start + PEAK_FRAMES * channels];
+    if layout.lane_count() <= 2 {
+        summarize_pair(samples, layout, peaks);
+        return;
+    }
+    let (all, lanes) = peaks.split_first_mut().expect("a trace of every channel");
+    *all = Bounds::EMPTY;
+    for &sample in samples {
+        all.add(sample);
+    }
+    for (track, peaks) in layout.lanes().zip(lanes.chunks_exact_mut(3)) {
+        let [merged, left, right] = peaks else {
+            unreachable!("three traces per lane")
+        };
+        (*merged, *left, *right) = (Bounds::EMPTY, Bounds::EMPTY, Bounds::EMPTY);
+        let frames = samples.chunks_exact(channels);
+        match track.len() {
+            1 => {
+                for frame in frames {
+                    left.add(frame[track.start]);
+                }
+                (*merged, *right) = (*left, *left);
+            }
+            2 => {
+                for frame in frames {
+                    let (l, r) = (frame[track.start], frame[track.start + 1]);
+                    merged.add(l * 0.5 + r * 0.5);
+                    left.add(l);
+                    right.add(r);
+                }
+            }
+            _ => {
+                for frame in frames {
+                    let track = &frame[track.clone()];
+                    merged.add(WaveformView::Merged.sample(track));
+                    left.add(track[0]);
+                    right.add(track[1]);
+                }
+            }
+        }
+    }
+}
+
+/// The traces of one block of a layout of one or two lanes, in a single pass over its frames,
+/// as captures always worked them out before lanes could be more than two.
+fn summarize_pair(samples: &[f32], layout: Layout, peaks: &mut [Bounds]) {
+    const PAIR_TRACES: usize = 7;
+    let channels = layout.channels;
+    let split = layout.lane(1).map_or(channels, |lane| lane.start);
+    let mut traces = [Bounds::EMPTY; PAIR_TRACES];
+    for frame in samples.chunks_exact(channels) {
+        for &sample in frame {
+            traces[0].add(sample);
+        }
+        for (lane, track) in [&frame[..split], &frame[split..]].into_iter().enumerate() {
+            if let Some(&left) = track.first() {
+                let right = track.get(1).copied().unwrap_or(left);
+                traces[1 + lane * 3].add(WaveformView::Merged.sample(track));
+                traces[2 + lane * 3].add(left);
+                traces[3 + lane * 3].add(right);
+            }
+        }
+    }
+    peaks.copy_from_slice(&traces[..peaks.len()]);
+}
+
 /// Pairs each page with the frames of `range` it holds.
 pub(super) fn page_ranges<'a>(
     pages: impl Iterator<Item = &'a Page>,
@@ -502,7 +666,7 @@ pub(super) fn active_channels<'a>(
             mask
         };
         active |= if frames == (0..layout.page_frames) {
-            *wide.activity[usize::from(track.start != 0)].get_or_init(bounds_mask)
+            wide.activity.get_or_init(&track, bounds_mask)
         } else {
             bounds_mask()
         };
@@ -572,22 +736,18 @@ pub(super) struct History {
 }
 
 impl History {
+    /// A history of one lane per entry of `widths`, each nonzero, at most 64 channels in all.
     pub(super) fn new(
         page_frames: usize,
-        channels: usize,
-        a_channels: usize,
+        widths: &[usize],
         budget_frames: usize,
     ) -> Result<Self, CaptureError> {
         let page_frames = page_frames.min(budget_frames);
+        let layout = Layout::new(page_frames, widths);
         page_frames
-            .checked_mul(channels)
+            .checked_mul(layout.channels)
             .ok_or(CaptureError::BufferTooLarge)?;
         let base_pages = BASE_SECONDS.min(budget_frames / page_frames);
-        let layout = Layout {
-            page_frames,
-            channels,
-            a_channels,
-        };
         let free = (0..base_pages)
             .map(|_| Page::new(page_frames, layout))
             .collect::<Result<Vec<_>, _>>()?;
@@ -705,11 +865,7 @@ impl History {
     }
 
     pub(super) fn push(&mut self, frame: &[f32], gain: f32) {
-        let Layout {
-            channels,
-            a_channels,
-            ..
-        } = self.layout;
+        let layout = self.layout;
         let page = self.open.as_mut().expect("capacity was reserved");
         if gain == 1.0 {
             page.samples.extend_from_slice(frame);
@@ -718,10 +874,9 @@ impl History {
                 .extend(frame.iter().map(|&sample| sample * gain));
         }
         self.end += 1;
-        let frames = page.samples.len() / channels;
+        let frames = page.samples.len() / layout.channels;
         if frames % PEAK_FRAMES == 0 {
-            let bounds = page.summarize(frames / PEAK_FRAMES - 1, channels, a_channels);
-            page.peaks.push(bounds);
+            page.push_summary(frames / PEAK_FRAMES - 1, layout);
         }
     }
 
@@ -751,14 +906,13 @@ impl History {
         }
         let mut remaining = frames - skipped;
         let zero = Bounds { min: 0.0, max: 0.0 };
-        let mut zero_peaks = [Bounds::EMPTY; TRACES];
+        let layout = self.layout;
         let Layout {
             page_frames,
             channels,
-            a_channels,
-        } = self.layout;
-        let traces = if a_channels < channels { TRACES } else { 4 };
-        zero_peaks[..traces].fill(zero);
+            ..
+        } = layout;
+        let traces = layout.traces();
         while remaining != 0 {
             self.ensure_append_capacity()?;
             let page = self.open.as_mut().expect("capacity was reserved");
@@ -767,14 +921,14 @@ impl History {
             page.samples
                 .resize((previous_frames + count) * channels, 0.0);
             let completed_blocks = (previous_frames + count) / PEAK_FRAMES;
-            while page.peaks.len() < completed_blocks {
-                let block = page.peaks.len();
-                let bounds = if block * PEAK_FRAMES < previous_frames {
-                    page.summarize(block, channels, a_channels)
+            while page.peaks.len() < completed_blocks * traces {
+                let block = page.peaks.len() / traces;
+                if block * PEAK_FRAMES < previous_frames {
+                    page.push_summary(block, layout);
                 } else {
-                    zero_peaks
-                };
-                page.peaks.push(bounds);
+                    let first = page.peaks.len();
+                    page.peaks.resize(first + traces, zero);
+                }
             }
             self.end += count as u64;
             remaining -= count as u64;
@@ -860,7 +1014,7 @@ impl History {
         let (sealed, open) = self.page_indices(range);
         let tail = self.open.as_ref().filter(|_| open).map(|page| {
             let frames = page.overlap(range, self.layout.channels).end;
-            Arc::new(page.prefix(frames, self.layout.channels))
+            Arc::new(page.prefix(frames, self.layout))
         });
         self.sealed.range(sealed).cloned().chain(tail).collect()
     }
@@ -879,17 +1033,16 @@ impl History {
         for index in sealed.clone() {
             self.unshare(index)?;
         }
-        let Layout {
-            channels,
-            a_channels,
-            ..
-        } = self.layout;
+        let layout = self.layout;
+        let channels = layout.channels;
+        let traces = layout.traces();
         let sealed = self
             .sealed
             .range_mut(sealed)
             .map(|page| Arc::get_mut(page).expect("the faded pages are not shared"));
         for page in sealed.chain(self.open.as_mut().filter(|_| open)) {
             page.peaks.invalidate_channels();
+            page.invalidate_bands();
             let start = start.saturating_sub(page.first_frame) as usize;
             for (offset, frame) in page
                 .samples
@@ -903,8 +1056,9 @@ impl History {
                     *sample *= gain;
                 }
             }
-            for block in start / PEAK_FRAMES..page.peaks.len() {
-                page.peaks[block] = page.summarize(block, channels, a_channels);
+            for block in start / PEAK_FRAMES..page.peaks.len() / traces {
+                let peaks = &mut page.peaks[block * traces..(block + 1) * traces];
+                summarize(&page.samples, block, layout, peaks);
             }
         }
         Ok(())
@@ -920,5 +1074,33 @@ impl History {
 
     pub(super) fn channel_extrema(&self, channel: usize, range: Range<u64>) -> (f32, f32) {
         channel_extrema(self.pages(range), self.layout, channel)
+    }
+
+    /// How many held pages, sealed or open, a spectrum read has started band energies for.
+    pub(super) fn spectrum_pages(&self) -> usize {
+        self.sealed
+            .iter()
+            .map(|page| &**page)
+            .chain(self.open.iter())
+            .filter(|page| page.bands.is_started())
+            .count()
+    }
+
+    /// See [`spectrum::bins`]. `range` must lie inside the retained frames.
+    pub(super) fn spectrum(
+        &self,
+        sample_rate: u32,
+        members: &[(usize, f32)],
+        range: Range<u64>,
+        bins: &mut [crate::waveform::SpectrumBin],
+    ) -> usize {
+        spectrum::bins(
+            self.pages(range.clone()),
+            self.layout,
+            sample_rate,
+            members,
+            range,
+            bins,
+        )
     }
 }

@@ -4,7 +4,8 @@
 //! row per channel of the group on show. All rows on screen are the same height. When they
 //! cannot all have at least `MIN_ROW_HEIGHT`, the mono and stereo rows keep their place, each
 //! wide lane shows as many of its rows as fit (in proportion to its size, at least one) and
-//! the rest are reached by scrolling that lane.
+//! the rest are reached by scrolling that lane. A plot of many lanes can instead scroll all
+//! of its rows as one column (`lay_out_column`).
 
 use std::ops::Range;
 
@@ -160,6 +161,78 @@ pub fn lay_out(height: f32, lanes: &[LaneRows], first: &[usize]) -> Vec<LaneBox>
             lane_box
         })
         .collect()
+}
+
+/// Places the lanes one above the other in `height` as one column of rows that scrolls as a
+/// whole, for a plot with more lanes than per-lane scrolling suits. When every row has at
+/// least `MIN_ROW_HEIGHT` this is [`lay_out`] with no lane scrolled. Otherwise as many whole
+/// rows as fit are on screen, each at least `MIN_ROW_HEIGHT` tall (or the one row there is
+/// room for, squeezed), from row `first` of the column; `first` is limited so the last row is
+/// never followed by empty space. Each lane's box holds the part of the lane on screen, so a
+/// lane can start part way down its rows; a lane above or below the rows on screen shows
+/// none. The second value is the column itself, as if it were one lane of every row: its
+/// `first`, `shown` and `thumb` drive the plot's scroll bar.
+pub fn lay_out_column(height: f32, lanes: &[LaneRows], first: usize) -> (Vec<LaneBox>, LaneBox) {
+    let height = height.max(0.0);
+    let total: usize = lanes.iter().map(|lane| lane.rows).sum();
+    let fitting = (height / MIN_ROW_HEIGHT).floor() as usize;
+    if total <= fitting {
+        let boxes = lay_out(height, lanes, &[]);
+        let row_height = boxes.first().map_or(0.0, |lane| lane.row_height);
+        let column = LaneBox {
+            top: 0.0,
+            height,
+            rows: total,
+            first: 0,
+            shown: total,
+            row_height,
+        };
+        return (boxes, column);
+    }
+    let shown = fitting.max(1).min(total);
+    let row_height = height / shown as f32;
+    let first = first.min(total - shown);
+    let end = first + shown;
+    let mut start = 0;
+    let boxes = lanes
+        .iter()
+        .map(|lane| {
+            let lane_end = start + lane.rows;
+            let (from, to) = (start.max(first), lane_end.min(end));
+            let lane_box = if from < to {
+                LaneBox {
+                    top: (from - first) as f32 * row_height,
+                    height: (to - from) as f32 * row_height,
+                    rows: lane.rows,
+                    first: from - start,
+                    shown: to - from,
+                    row_height,
+                }
+            } else {
+                // Scrolled out: above the rows on screen, every row is past; below, none is.
+                let above = lane_end <= first;
+                LaneBox {
+                    top: if above { 0.0 } else { height },
+                    height: 0.0,
+                    rows: lane.rows,
+                    first: if above { lane.rows } else { 0 },
+                    shown: 0,
+                    row_height,
+                }
+            };
+            start = lane_end;
+            lane_box
+        })
+        .collect();
+    let column = LaneBox {
+        top: 0.0,
+        height,
+        rows: total,
+        first,
+        shown,
+        row_height,
+    };
+    (boxes, column)
 }
 
 /// The lane (index into `boxes`) and row under a height measured like the boxes' tops.
@@ -364,6 +437,85 @@ mod tests {
         assert_eq!(lane.first_for_thumb(500.0), 33);
         let many = lay_out(48.0, &[wide(64)], &[0])[0];
         assert!(many.thumb().end - many.thumb().start >= MIN_THUMB);
+    }
+
+    #[test]
+    fn a_column_that_fits_is_laid_out_as_before() {
+        let lanes = [narrow(1), wide(8), narrow(1)];
+        for height in [140.0, 200.0, 560.0] {
+            let (boxes, column) = lay_out_column(height, &lanes, 5);
+            assert_eq!(boxes, lay_out(height, &lanes, &[]));
+            assert_eq!((column.rows, column.first, column.shown), (10, 0, 10));
+            assert!(!column.scrolls());
+        }
+    }
+
+    #[test]
+    fn a_column_too_tall_scrolls_whole_rows_at_least_the_minimum_high() {
+        // Sixty-four mono lanes in the tallest grown window's plot.
+        let lanes = vec![narrow(1); 64];
+        let (boxes, column) = lay_out_column(500.0, &lanes, 0);
+        assert_eq!((column.rows, column.first, column.shown), (64, 0, 35));
+        assert!(column.scrolls());
+        assert!(column.row_height >= MIN_ROW_HEIGHT && column.row_height < MIN_ROW_HEIGHT * 2.0);
+        assert_eq!(boxes.iter().filter(|lane| lane.shown == 1).count(), 35);
+        assert!(close(boxes[34].top + boxes[34].height, 500.0));
+        // Lanes below the rows on screen show none and sit at the bottom.
+        assert_eq!((boxes[35].shown, boxes[35].first), (0, 0));
+        assert!(close(boxes[63].top, 500.0) && close(boxes[63].height, 0.0));
+        // Scrolled to the middle and past the end, which stops at the last row.
+        let (boxes, column) = lay_out_column(500.0, &lanes, 20);
+        assert_eq!(column.visible(), 20..55);
+        assert_eq!((boxes[19].shown, boxes[19].first), (0, 1));
+        assert!(close(boxes[20].top, 0.0));
+        let (boxes, column) = lay_out_column(500.0, &lanes, 99);
+        assert_eq!(column.visible(), 29..64);
+        assert!(close(boxes[63].top + boxes[63].height, 500.0));
+        // Every row on screen is found where it is drawn.
+        for y in [0.0, 13.0, 250.0, 499.9] {
+            let (lane, row) = row_at(&boxes, y).unwrap();
+            assert_eq!(row, 0);
+            assert_eq!(lane, 29 + (y / column.row_height) as usize);
+        }
+    }
+
+    #[test]
+    fn a_column_shows_part_of_a_wide_lane_and_its_rows_in_order() {
+        // A, a 7.1.4 lane with its pair (14 rows), then C: 16 rows in 100 points.
+        let lanes = [narrow(1), wide(14), narrow(1)];
+        let (boxes, column) = lay_out_column(100.0, &lanes, 4);
+        assert_eq!(column.shown, 7);
+        assert_eq!(column.visible(), 4..11);
+        assert_eq!(boxes[0].shown, 0);
+        let b = boxes[1];
+        assert_eq!((b.first, b.shown), (3, 7));
+        assert_eq!(b.visible(), 3..10);
+        assert!(close(b.top, 0.0) && close(b.height, 100.0));
+        assert_eq!(boxes[2].shown, 0);
+        // The bottom: the last rows of B, then C.
+        let (boxes, column) = lay_out_column(100.0, &lanes, 50);
+        assert_eq!(column.visible(), 9..16);
+        assert_eq!(boxes[1].visible(), 8..14);
+        assert_eq!(boxes[2].visible(), 0..1);
+        assert!(close(boxes[2].top, 6.0 * column.row_height));
+        // The column's thumb follows its first row both ways, as a lane's does.
+        for first in [0, 3, 9] {
+            let (_, column) = lay_out_column(100.0, &lanes, first);
+            assert_eq!(column.first_for_thumb(column.thumb().start), first);
+        }
+    }
+
+    #[test]
+    fn a_column_too_small_for_one_row_squeezes_it() {
+        let (boxes, column) = lay_out_column(10.0, &[narrow(1), narrow(1), narrow(1)], 1);
+        assert_eq!((column.first, column.shown), (1, 1));
+        assert!(close(column.row_height, 10.0));
+        assert_eq!(boxes[1].shown, 1);
+        let (boxes, column) = lay_out_column(0.0, &[narrow(1), narrow(1), narrow(1)], 0);
+        assert_eq!(column.shown, 1);
+        assert!(close(boxes[0].height, 0.0));
+        let (boxes, column) = lay_out_column(100.0, &[], 3);
+        assert!(boxes.is_empty() && column.rows == 0);
     }
 
     #[test]

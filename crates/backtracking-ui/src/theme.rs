@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use egui::Color32;
 
+use crate::spectrum::{Spectrum, SpectrumStop};
+
 /// The backing of the waveform plot.
 pub const PLOT_BACKGROUND: Color32 = Color32::from_rgb(22, 26, 29);
 /// The zero line through each waveform row.
@@ -377,6 +379,36 @@ impl Theme {
             self.reset(token);
         }
         self
+    }
+
+    /// `spectrum` with every stop that would be hard to see on this look's plot put back to
+    /// the window's own colour at its position ([`Spectrum::default`]), and the rest kept.
+    ///
+    /// A stop is held to what [`Self::legible`] asks of the waveform's colour: at least
+    /// [`MIN_ALPHA`] and [`GRAPHIC_CONTRAST`] on both backings the plot can sit on, its own and
+    /// the panel's (`panel_fill` where the look leaves the panel alone). The window's own
+    /// gradient passes on the window's own backings and is not checked, as the accent is not.
+    /// Colours between two stops lie between them in linear light, so on a dark backing they
+    /// read at least as well as the darker of the two.
+    pub fn legible_spectrum(&self, spectrum: &Spectrum, panel_fill: Color32) -> Spectrum {
+        let own = Spectrum::default();
+        let plot = opaque(self.plot_background);
+        let panel = opaque(self.panel_background.unwrap_or(panel_fill));
+        let reads = |color: Color32| {
+            color.a() >= MIN_ALPHA
+                && [plot, panel].into_iter().all(|backing| {
+                    contrast_ratio(over(color, backing), backing) >= GRAPHIC_CONTRAST
+                })
+        };
+        let stops = spectrum.stops().iter().map(|stop| SpectrumStop {
+            position: stop.position,
+            color: if reads(stop.color) {
+                stop.color
+            } else {
+                own.at(stop.position)
+            },
+        });
+        Spectrum::new(stops).unwrap_or(own)
     }
 
     /// Whether every pair this look has a part in passes, as [`Self::legible`] leaves it.
@@ -1249,5 +1281,67 @@ mod tests {
                 assert_eq!(theme.center_line, color);
             }
         }
+    }
+
+    fn stop(position: f32, color: Color32) -> SpectrumStop {
+        SpectrumStop { position, color }
+    }
+
+    #[test]
+    fn the_default_gradient_reads_on_the_windows_backings_and_is_kept() {
+        let theme = Theme::default();
+        let own = Spectrum::default();
+        assert_eq!(theme.legible_spectrum(&own, PANEL_FILL), own);
+        for color in [Spectrum::DEFAULT_LOW, Spectrum::DEFAULT_HIGH] {
+            for backing in [PLOT_BACKGROUND, PANEL_FILL] {
+                // Red is about 4.1 : 1 and blue about 3.6 : 1 on both.
+                assert!(
+                    contrast_ratio(color, backing) > 3.5,
+                    "{color:?} on {backing:?}"
+                );
+            }
+        }
+        // Pure blue only just reaches the line on the dark backings.
+        assert!(contrast_ratio(Color32::from_rgb(0, 0, 255), PANEL_FILL) < 2.05);
+    }
+
+    #[test]
+    fn a_gradient_stop_lost_on_the_plot_takes_the_windows_colour_there() {
+        let theme = Theme::default();
+        let green = Color32::from_rgb(40, 200, 90);
+        let spectrum = Spectrum::new([
+            stop(0.0, Color32::from_rgb(30, 10, 60)),
+            stop(0.4, green),
+            stop(0.7, Color32::from_rgba_unmultiplied(255, 255, 255, 60)),
+            stop(1.0, Color32::from_rgb(250, 230, 60)),
+        ])
+        .unwrap();
+        let checked = theme.legible_spectrum(&spectrum, PANEL_FILL);
+        let own = Spectrum::default();
+        let colors: Vec<_> = checked.stops().iter().map(|stop| stop.color).collect();
+        assert_eq!(
+            colors,
+            [
+                own.at(0.0),
+                green,
+                own.at(0.7),
+                Color32::from_rgb(250, 230, 60)
+            ]
+        );
+        let positions: Vec<_> = checked.stops().iter().map(|stop| stop.position).collect();
+        assert_eq!(positions, [0.0, 0.4, 0.7, 1.0]);
+        // Every colour drawn reads on both backings.
+        for stop in checked.stops() {
+            assert!(reads_on_both(&theme, stop.color), "{stop:?}");
+        }
+        // On a look's light plot, the light stop is the one that goes.
+        let light = Theme {
+            plot_background: Color32::WHITE,
+            panel_background: Some(Color32::from_gray(235)),
+            ..Theme::default()
+        };
+        let checked = light.legible_spectrum(&spectrum, PANEL_FILL);
+        assert_eq!(checked.stops()[0].color, Color32::from_rgb(30, 10, 60));
+        assert_eq!(checked.stops()[3].color, own.at(1.0));
     }
 }

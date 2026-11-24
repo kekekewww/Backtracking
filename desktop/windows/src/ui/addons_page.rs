@@ -35,6 +35,8 @@ const OFF: Color32 = Color32::from_gray(110);
 const TEXT_SETTING_LIMIT: usize = 200;
 /// The add-on's own key in `problems`, beside its settings' keys.
 const ADDON_KEY: &str = "";
+/// The "Let this add-on control Backtracking" switch's key in `problems`.
+const CONTROL_KEY: &str = "control:";
 
 /// True for a file named like an add-on package. Its contents are checked by `inspect`.
 pub(super) fn is_package(path: &Path) -> bool {
@@ -270,6 +272,9 @@ enum Purpose {
     Switch {
         on: bool,
     },
+    Control {
+        on: bool,
+    },
     Start,
     Change {
         key: String,
@@ -329,6 +334,11 @@ enum ReviewChoice {
 #[derive(Debug, PartialEq)]
 enum Intent {
     Switch {
+        id: String,
+        on: bool,
+    },
+    /// "Let this add-on control Backtracking" switched.
+    Control {
         id: String,
         on: bool,
     },
@@ -392,6 +402,15 @@ impl AddonsPage {
             match (request.purpose, result) {
                 (Purpose::Switch { .. } | Purpose::Start | Purpose::EnableAfterInstall, Ok(())) => {
                     self.problems.remove(&(id, ADDON_KEY.into()));
+                }
+                (Purpose::Control { .. }, Ok(())) => {
+                    self.problems.remove(&(id, CONTROL_KEY.into()));
+                }
+                (Purpose::Control { on }, Err(reason)) => {
+                    self.problems.insert(
+                        (id, CONTROL_KEY.into()),
+                        language.could_not_switch(on, &reason),
+                    );
                 }
                 (Purpose::Start, Err(reason)) => {
                     self.problems
@@ -605,6 +624,15 @@ impl AddonsPage {
                     reply,
                 });
             }
+            Intent::Control { id, on } => {
+                self.problems.remove(&(id.clone(), CONTROL_KEY.into()));
+                let reply = handle.set_control_allowed(&id, on);
+                self.requests.push(Request {
+                    id,
+                    purpose: Purpose::Control { on },
+                    reply,
+                });
+            }
             Intent::Start { id } => {
                 self.problems.remove(&(id.clone(), ADDON_KEY.into()));
                 let reply = handle.start(&id);
@@ -758,6 +786,50 @@ impl AddonsPage {
         Ok(())
     }
 
+    /// "Let this add-on control Backtracking", for an add-on that declares `control`. It is
+    /// off until the user turns it on, and it is kept for the add-on until it is removed.
+    fn control_switch(&mut self, ui: &mut egui::Ui, addon: &AddonInfo, language: Language) {
+        let declared = addon.manifest.as_ref().is_some_and(|manifest| {
+            manifest
+                .capabilities
+                .contains(&backtracking_addon::manifest::Capability::Control)
+        });
+        if !declared {
+            return;
+        }
+        let changing = self
+            .requests
+            .iter()
+            .find_map(|request| match request.purpose {
+                Purpose::Control { on } if request.id == addon.id => Some(on),
+                _ => None,
+            });
+        let mut allowed = changing.unwrap_or(addon.control_allowed);
+        let can_change = changing.is_none()
+            && self
+                .removal
+                .as_ref()
+                .is_none_or(|removal| removal.id != addon.id);
+        if ui
+            .add_enabled(
+                can_change,
+                egui::Checkbox::new(&mut allowed, language.allow_control()),
+            )
+            .changed()
+        {
+            self.intents.push(Intent::Control {
+                id: addon.id.clone(),
+                on: allowed,
+            });
+        }
+        if !addon.control_allowed && addon.control_asked && changing.is_none() {
+            options_note(ui, language.control_asked());
+        }
+        if let Some(problem) = self.problems.get(&(addon.id.clone(), CONTROL_KEY.into())) {
+            problem_line(ui, problem);
+        }
+    }
+
     fn addon_card(
         &mut self,
         ui: &mut egui::Ui,
@@ -849,6 +921,7 @@ impl AddonsPage {
                 if let Some(problem) = self.problems.get(&(addon.id.clone(), ADDON_KEY.into())) {
                     problem_line(ui, problem);
                 }
+                self.control_switch(ui, addon, language);
 
                 let described = !addon.settings.is_empty() || !addon.actions.is_empty();
                 if addon.state == AddonState::Running {
@@ -1339,6 +1412,8 @@ mod tests {
             sources: Vec::new(),
             settings: Vec::new(),
             actions: Vec::new(),
+            control_allowed: false,
+            control_asked: false,
         }
     }
 

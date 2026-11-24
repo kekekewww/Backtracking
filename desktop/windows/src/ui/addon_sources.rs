@@ -1002,6 +1002,8 @@ mod tests {
             sources: vec![source("main")],
             settings: Vec::new(),
             actions: Vec::new(),
+            control_allowed: false,
+            control_asked: false,
         }
     }
 

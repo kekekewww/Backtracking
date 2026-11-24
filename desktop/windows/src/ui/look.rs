@@ -18,7 +18,9 @@ use std::time::Duration;
 use backtracking_addon::protocol::{
     APPEARANCE_COLOR_NAMES, APPEARANCE_NUMBER_RANGES, Appearance, MAX_APPEARANCE_ROWS,
 };
-use backtracking_ui::{Legibility, Theme, options_choice, options_field, options_note};
+use backtracking_ui::{
+    Legibility, Spectrum, SpectrumStop, Theme, options_choice, options_field, options_note,
+};
 use eframe::egui::{self, Color32};
 
 use super::{CaptureIndicator, Recorder, SELECTION_CONTRAST, text::Language};
@@ -124,6 +126,17 @@ pub(super) fn theme_from(appearance: &Appearance) -> Theme {
         .map(|(label, &rgba)| (label.clone(), color(rgba)))
         .collect();
     theme
+}
+
+/// The gradient an offer sets for colouring by frequency, before it is checked: its stops in
+/// the order given, drawn opaque as the user's own are. `None` when it sets none, or one the
+/// contract would not have let through.
+pub(super) fn spectrum_from(appearance: &Appearance) -> Option<Spectrum> {
+    let stops = appearance.spectrum.iter().map(|stop| SpectrumStop {
+        position: stop.position as f32,
+        color: opaque(stop.color),
+    });
+    Spectrum::new(stops).ok()
 }
 
 const INDICATORS: [CaptureIndicator; 4] = [
@@ -290,6 +303,21 @@ impl AddonLook {
         }
         self.shown = theme.clone();
         Some(theme)
+    }
+
+    /// The gradient the chosen look offers for "Waveform color: By frequency" (its
+    /// `spectrum`), which the window draws with while the user has not made their own
+    /// (`spectrum::chosen_spectrum`). `None` while no look is chosen or the chosen one offers
+    /// no gradient. The stops are as offered, opaque; they are checked as every stop is, by
+    /// `Theme::legible_spectrum`, when drawn.
+    pub(super) fn offered_spectrum(&self) -> Option<Spectrum> {
+        spectrum_from(self.offers.get(self.chosen.as_ref()?)?)
+    }
+
+    /// The chosen add-on's name while its look offers a gradient.
+    pub(super) fn spectrum_offered_by(&self) -> Option<String> {
+        let id = self.chosen.as_ref()?;
+        self.offered_spectrum().map(|_| self.name(id))
     }
 
     /// The add-ons that offer a look now, by id and name, in id order.
@@ -493,6 +521,7 @@ mod tests {
                 .map(|(name, value)| ((*name).to_owned(), *value))
                 .collect(),
             rows: BTreeMap::new(),
+            spectrum: Vec::new(),
         }
     }
 
@@ -604,6 +633,53 @@ mod tests {
         assert!(look.choose(None));
         assert_eq!(look.update(None, ACCENT), Some(Theme::default()));
         assert!(!look.choose(None));
+    }
+
+    #[test]
+    fn the_chosen_look_offers_its_gradient_opaque_and_nothing_else_does() {
+        use backtracking_addon::protocol::SpectrumStop as OfferedStop;
+        let offered = |stops: &[([u8; 4], f64)]| Appearance {
+            spectrum: stops
+                .iter()
+                .map(|&(color, position)| OfferedStop { color, position })
+                .collect(),
+            ..blue()
+        };
+        let warm = offered(&[([255, 140, 60, 255], 0.0), ([110, 200, 255, 90], 1.0)]);
+        let expected = Spectrum::two(
+            Color32::from_rgb(255, 140, 60),
+            Color32::from_rgb(110, 200, 255),
+        );
+        assert_eq!(spectrum_from(&warm), Some(expected.clone()));
+        assert_eq!(spectrum_from(&blue()), None);
+        // Stops the contract drops as a whole, should one arrive by another way.
+        for bad in [
+            offered(&[([255, 0, 0, 255], 0.0)]),
+            offered(&[([255, 0, 0, 255], 0.0), ([0, 0, 255, 255], 1.5)]),
+            offered(&[([255, 0, 0, 255], f64::NAN), ([0, 0, 255, 255], 1.0)]),
+            offered(&[([255, 0, 0, 255], 0.5); 9]),
+        ] {
+            assert_eq!(spectrum_from(&bad), None, "{bad:?}");
+        }
+
+        let mut look = AddonLook::new(None);
+        look.names = Arc::new(AddonSnapshot {
+            revision: 1,
+            addons: vec![addon("com.example.theme", "Example appearance")],
+            error: None,
+        });
+        let both = offers(&[("com.example.theme", warm), ("com.example.other", blue())]);
+        look.update(Some(both), ACCENT);
+        assert_eq!(look.offered_spectrum(), None, "no look chosen");
+        assert_eq!(look.spectrum_offered_by(), None);
+        look.choose(Some("com.example.theme".into()));
+        assert_eq!(look.offered_spectrum(), Some(expected));
+        assert_eq!(look.spectrum_offered_by().as_deref(), Some("Example appearance"));
+        look.choose(Some("com.example.other".into()));
+        assert_eq!(look.offered_spectrum(), None, "its look has no gradient");
+        assert_eq!(look.spectrum_offered_by(), None);
+        look.choose(Some("com.example.gone".into()));
+        assert_eq!(look.offered_spectrum(), None, "not offering a look");
     }
 
     #[test]
@@ -891,6 +967,8 @@ mod tests {
             sources: Vec::new(),
             settings: Vec::new(),
             actions: Vec::new(),
+            control_allowed: false,
+            control_asked: false,
         }
     }
 

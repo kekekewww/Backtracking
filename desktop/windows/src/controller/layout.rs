@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 
 use backtracking_addon::protocol::Source;
-use backtracking_core::{DEFAULT_MAX_BUFFER_SAMPLES, MeterReadings};
+use backtracking_core::{DEFAULT_MAX_BUFFER_SAMPLES, Lane, MeterReadings};
 
 /// A contiguous group in the lane's captured channel order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,16 +111,42 @@ pub(crate) fn machine_history_budget_samples() -> usize {
 }
 
 pub(crate) fn combined_channels(a: usize, b: Option<usize>) -> Result<(), String> {
-    if !(1..=64).contains(&a) || b.is_some_and(|channels| !(1..=64).contains(&channels)) {
+    if !(1..=64).contains(&a) {
         return Err("Each lane must contain between 1 and 64 channels".into());
     }
-    if a + b.unwrap_or(0) > 64 {
-        return Err(format!(
-            "Lane B cannot start: lanes A and B would contain {} channels; the limit is 64",
-            a + b.unwrap_or(0)
-        ));
+    b.map_or(Ok(()), |b| lane_fits(1, a, b))
+}
+
+/// Whether logical lane `lane`, `width` channels wide, can start after the lanes ahead of it
+/// that record, which hold `before` channels: every lane holds 1 to 64 channels, and all of
+/// them together at most 64. The refusal names the lane, in English and Traditional Chinese
+/// on one line (`Language::source_message` shows one of them).
+pub(crate) fn lane_fits(lane: usize, before: usize, width: usize) -> Result<(), String> {
+    if !(1..=64).contains(&width) {
+        return Err("Each lane must contain between 1 and 64 channels".into());
     }
-    Ok(())
+    let total = before + width;
+    if total <= 64 {
+        return Ok(());
+    }
+    let letter = |index: usize| Lane::from_index(index).map_or("?", Lane::letter);
+    let (english, chinese) = if lane <= 1 {
+        (
+            format!("lanes A and {}", letter(lane)),
+            format!("來源 A 與 {}", letter(lane)),
+        )
+    } else {
+        (
+            format!("lanes A to {}", letter(lane)),
+            format!("來源 A 到 {}", letter(lane)),
+        )
+    };
+    Err(format!(
+        "Lane {} cannot start: {english} would contain {total} channels; the limit is 64 \
+         / 來源 {} 無法開始：{chinese} 合計會有 {total} 個聲道，上限為 64。",
+        letter(lane),
+        letter(lane),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -248,6 +274,36 @@ mod tests {
         for count in [0, 65, usize::MAX] {
             assert!(combined_channels(count, None).is_err());
             assert!(combined_channels(1, Some(count)).is_err());
+        }
+    }
+
+    #[test]
+    fn any_lane_past_sixty_four_channels_in_all_is_refused_by_its_letter() {
+        assert!(lane_fits(0, 0, 64).is_ok());
+        assert!(lane_fits(63, 63, 1).is_ok());
+        assert!(lane_fits(2, 32, 32).is_ok());
+        let refused = lane_fits(2, 60, 5).unwrap_err();
+        assert!(
+            refused.starts_with(
+                "Lane C cannot start: lanes A to C would contain 65 channels; the limit is 64 / "
+            ),
+            "{refused}"
+        );
+        assert!(refused.ends_with("來源 C 無法開始：來源 A 到 C 合計會有 65 個聲道，上限為 64。"));
+        assert!(
+            lane_fits(63, 64, 1)
+                .unwrap_err()
+                .starts_with("Lane BL cannot start: lanes A to BL would contain 65 channels")
+        );
+        // Lane B keeps the line older versions wrote, in English.
+        assert!(lane_fits(1, 64, 1).unwrap_err().starts_with(
+            "Lane B cannot start: lanes A and B would contain 65 channels; the limit is 64 / "
+        ));
+        for width in [0, 65] {
+            assert_eq!(
+                lane_fits(5, 0, width).unwrap_err(),
+                "Each lane must contain between 1 and 64 channels"
+            );
         }
     }
 
