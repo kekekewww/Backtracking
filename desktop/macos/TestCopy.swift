@@ -163,9 +163,11 @@ final class TestCopyConfig: @unchecked Sendable {
             home.appendingPathComponent("Backtracking/saved", isDirectory: true),
         ].map { $0.resolvingSymlinksInPath().standardizedFileURL }
 
-        let resolvedPath = resolved.path
+        // The disk does not tell case apart, and resolving keeps the case given, so paths are
+        // compared in lower case.
+        let resolvedPath = resolved.path.lowercased()
         for bad in forbidden {
-            if resolvedPath == bad.path {
+            if resolvedPath == bad.path.lowercased() {
                 return .failure(refusal)
             }
         }
@@ -174,12 +176,13 @@ final class TestCopyConfig: @unchecked Sendable {
             home.appendingPathComponent("Library/Preferences", isDirectory: true),
             home.appendingPathComponent("Library/Application Support/Backtracking", isDirectory: true),
             home.appendingPathComponent("Backtracking", isDirectory: true),
-        ].map { $0.resolvingSymlinksInPath().standardizedFileURL.path }
+        ].map { $0.resolvingSymlinksInPath().standardizedFileURL.path.lowercased() }
         if realData.contains(where: { resolvedPath.hasPrefix($0.hasSuffix("/") ? $0 : $0 + "/") }) {
             return .failure(refusal)
         }
         // Reject ancestor folders of the user's home (e.g. "/" or "/Users").
-        if home.path == resolvedPath || home.path.hasPrefix(resolvedPath.hasSuffix("/") ? resolvedPath : resolvedPath + "/") {
+        let homePath = home.path.lowercased()
+        if homePath == resolvedPath || homePath.hasPrefix(resolvedPath.hasSuffix("/") ? resolvedPath : resolvedPath + "/") {
             return .failure(refusal)
         }
         return .success(resolved)

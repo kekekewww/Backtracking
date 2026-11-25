@@ -51,6 +51,17 @@ if "$script" "$source_app" "$dotted" dotted >/dev/null 2>&1; then fail "a destin
 if "$script" "$source_app" "$work/./dot" dot >/dev/null 2>&1; then fail "a destination with . was taken"; fi
 [[ ! -e "$work/dot" ]] || fail "the . destination made a folder"
 
+# The disk does not tell case apart: the real locations in another case are refused too,
+# before anything is made there.
+for inside in "library/preferences" "LIBRARY/Application Support/backtracking" "backtracking/output"; do
+  target="$real_home/$inside/bt-test-copy-case-$$"
+  if "$script" "$source_app" "$target" cased >/dev/null 2>&1; then fail "a copy was made inside $inside"; fi
+  [[ ! -e "$target" ]] || fail "$target was created"
+done
+# An empty destination is refused before anything is made.
+if (cd "$work" && "$script" "$source_app" "" empty >/dev/null 2>&1); then fail "an empty destination was taken"; fi
+[[ ! -e "$work/Backtracking-empty.app" ]] || fail "the empty destination made a copy"
+
 # The copy may not be, hold or lie in the source; the source stays whole.
 same_dir="$work/same"
 mkdir -p "$same_dir"
@@ -58,6 +69,8 @@ ditto "$source_app" "$same_dir/Backtracking-same.app"
 source_sum="$(find "$same_dir/Backtracking-same.app" -type f -exec shasum {} + | sort | shasum)"
 if "$script" "$same_dir/Backtracking-same.app" "$same_dir" same >/dev/null 2>&1; then fail "a copy over its own source was taken"; fi
 if "$script" "$same_dir/Backtracking-same.app" "$same_dir/Backtracking-same.app/Contents" inside >/dev/null 2>&1; then fail "a copy inside its source was taken"; fi
+# The same source named in another case.
+if "$script" "$same_dir/backtracking-same.app" "$same_dir" same >/dev/null 2>&1; then fail "a copy over its own source in another case was taken"; fi
 [[ "$(find "$same_dir/Backtracking-same.app" -type f -exec shasum {} + | sort | shasum)" == "$source_sum" ]] || fail "the source changed"
 [[ ! -e "$same_dir/Backtracking-same.app/Contents/Backtracking-inside.app" ]] || fail "a copy was made inside the source"
 

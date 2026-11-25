@@ -40,6 +40,7 @@ fi
 source_app="$1"
 destination="$2"
 raw_name="$3"
+[[ -n "$destination" ]] || fail "Give a destination folder."
 
 [[ -d "$source_app" && -f "$source_app/Contents/Info.plist" ]] || fail "$source_app is not an app bundle."
 [[ -f "$source_app/Contents/MacOS/bt-addon-guard" ]] || fail "$source_app has no Contents/MacOS/bt-addon-guard."
@@ -66,9 +67,14 @@ while [[ ! -d "$existing" ]]; do
   existing="$(dirname -- "$existing")"
 done
 destination="$(cd -- "$existing" && pwd -P)$rest"
+# The disk does not tell case apart, and pwd -P keeps the case it was given, so paths are
+# compared in lower case.
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+# Whether $1 is $2 or lies inside it.
+within() { local a b; a="$(lower "$1")"; b="$(lower "$2")"; [[ "$a" == "$b" || "$a" == "$b/"* ]]; }
 refuse_real() {
   for real in "$real_home/Library/Preferences" "$real_home/Library/Application Support/Backtracking" "$real_home/Backtracking"; do
-    if [[ "$1" == "$real" || "$1" == "$real/"* ]]; then
+    if within "$1" "$real"; then
       fail "A test copy cannot be made inside $real, which holds the user's real settings or recordings."
     fi
   done
@@ -78,7 +84,7 @@ refuse_real "$destination"
 id="$prefix$name"
 copy="$destination/Backtracking-$name.app"
 # The copy may not be the source, hold it, or lie inside it.
-if [[ "$copy" == "$source_app" || "$copy" == "$source_app/"* || "$source_app" == "$copy/"* ]]; then
+if within "$copy" "$source_app" || within "$source_app" "$copy"; then
   fail "The test copy $copy would overlap the source $source_app."
 fi
 # Only a test copy this script made is replaced.
@@ -91,7 +97,7 @@ mkdir -p -- "$destination"
 # Check where the folder really is now that it exists.
 real_destination="$(cd -- "$destination" && pwd -P)"
 refuse_real "$real_destination"
-[[ "$real_destination" == "$destination" ]] || fail "The destination resolved to $real_destination; give that path instead."
+[[ "$(lower "$real_destination")" == "$(lower "$destination")" ]] || fail "The destination resolved to $real_destination; give that path instead."
 rm -rf -- "$copy"
 ditto "$source_app" "$copy"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $id" "$copy/Contents/Info.plist"

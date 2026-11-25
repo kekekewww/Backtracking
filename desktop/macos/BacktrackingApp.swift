@@ -3612,6 +3612,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         for path in inside + allowed {
             try FileManager.default.createDirectory(at: fakeHome.appendingPathComponent(path), withIntermediateDirectories: true)
         }
+        // The same folders named in another case are refused too.
+        let cased = ["library/preferences/copy", "LIBRARY/Application Support/backtracking/copy", "BACKTRACKING/copy", "library"]
+        let acceptedCased = cased.filter {
+            if case .success = TestCopyConfig.validateDataDirectory(fakeHome.appendingPathComponent($0).path, realHome: fakeHome) { return true }
+            return false
+        }
+        guard acceptedCased.isEmpty else {
+            throw CaptureError("Test-copy data folders in another case accepted: \(acceptedCased)")
+        }
         let accepted = (inside + allowed).filter {
             if case .success = TestCopyConfig.validateDataDirectory(fakeHome.appendingPathComponent($0).path, realHome: fakeHome) { return true }
             return false
