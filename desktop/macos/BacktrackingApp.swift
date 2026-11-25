@@ -65,6 +65,12 @@ func verifyMacOptions() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyOptions()
 }
+
+@MainActor
+func verifyMacTerminationSaves() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyTerminationSaves()
+}
 #else
 @main
 enum BacktrackingApp {
@@ -1933,6 +1939,87 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             throw CaptureError("The Options or waveform rows do not match the loaded sources")
         }
     }
+
+    /// Two explicit saves are waiting for a freeze that has not finished when the app exits.
+    /// Both must still reach disk with their own range and every lane's channels.
+    static func verifyTerminationSaves() throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-exit-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        // Add-on lanes without a running add-on open no system input, so no permission is involved.
+        let lanes = [
+            CaptureLane(source: .addon(addonID: "verify.exit", sourceID: "a"), route: .merged),
+            CaptureLane(source: .addon(addonID: "verify.exit", sourceID: "b"), route: .merged)
+        ]
+        let tap = try SystemAudioTap(history: 10, lanes: lanes)
+        controller.captureLanes = lanes
+        controller.tap = tap
+        defer { controller.tap = nil }
+        let frames = 4_800
+        let levels: [[Float]] = [[0.25, -0.5], [0.125, 0.375]]
+        for (lane, level) in levels.enumerated() {
+            let samples = (0..<frames).flatMap { _ in level }
+            let accepted = tap.withCaptureRead { core in
+                samples.withUnsafeBufferPointer {
+                    bt_tracks_push_interleaved(core, UInt32(lane), $0.baseAddress, UInt32(frames),
+                                               1_000_000_000, SystemAudioTap.timelineRate)
+                }
+            }
+            guard accepted == UInt32(frames) else { throw CaptureError("Exit verification lane \(lane) lost input") }
+        }
+        let (first, end) = tap.withCaptureSnapshot { (bt_tracks_first_frame($0), bt_tracks_end_frame($0)) }
+        guard end > first + 1_100 else { throw CaptureError("Exit verification retained too little audio") }
+        // The editing freeze is still running on the capture queue when the app quits.
+        tap.readCapture(poll: false, { _ in Thread.sleep(forTimeInterval: 0.3); return 0 }) { _ in }
+        let selected = scratch.appendingPathComponent("selected", isDirectory: true)
+        let whole = scratch.appendingPathComponent("whole", isDirectory: true)
+        try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: whole, withIntermediateDirectories: true)
+        let noFades = BtFades(fade_in: 0, fade_out: 0)
+        controller.pendingSnapshots = [
+            PendingSnapshotSave(range: (first + 100)..<(first + 1_100), fades: noFades, rows: nil,
+                                directory: selected.path, ticket: nil, controlCall: nil),
+            PendingSnapshotSave(range: nil, fades: noFades, rows: nil,
+                                directory: whole.path, ticket: nil, controlCall: nil)
+        ]
+        let started = ProcessInfo.processInfo.systemUptime
+        controller.queuePendingSnapshotsForTermination()
+        controller.worker.sync {}
+        let waited = ProcessInfo.processInfo.systemUptime - started
+        guard controller.pendingSnapshots.isEmpty else { throw CaptureError("Exit left saves in the queue") }
+
+        func check(_ folder: URL, frames expected: Int) throws {
+            let files = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
+                .filter { $0.pathExtension == "wav" }
+            guard files.count == levels.count else {
+                throw CaptureError("Exit save in \(folder.lastPathComponent) wrote \(files.count) WAV files, expected \(levels.count) (waited \(String(format: "%.2f", waited)) s)")
+            }
+            var seen: Set<Int> = []
+            for url in files {
+                let file = try AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: false)
+                let count = AVAudioFrameCount(file.length)
+                guard file.length == Int64(expected), file.processingFormat.channelCount == 2,
+                      let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: count) else {
+                    throw CaptureError("Exit save \(url.lastPathComponent) has \(file.length) frames / \(file.processingFormat.channelCount) ch, expected \(expected) / 2")
+                }
+                try file.read(into: buffer)
+                guard let data = buffer.floatChannelData,
+                      let lane = levels.firstIndex(where: { level in
+                          level.indices.allSatisfy { channel in
+                              (0..<Int(count)).allSatisfy { abs(data[channel][$0] - level[channel]) < 0.00001 }
+                          }
+                      }) else {
+                    throw CaptureError("Exit save \(url.lastPathComponent) does not carry one lane's channels")
+                }
+                seen.insert(lane)
+            }
+            guard seen.count == levels.count else { throw CaptureError("Exit save in \(folder.lastPathComponent) repeated a lane") }
+        }
+        try check(selected, frames: 1_000)
+        try check(whole, frames: Int(end - first))
+    }
     #endif
 
     private func beginCaptureAfterUpdate() {
@@ -2052,6 +2139,21 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             bt_cleanup_free(cleanup)
             self.cleanup = nil
         }
+        queuePendingSnapshotsForTermination()
+        addonHost?.shutdownAndFree(timeoutMs: 2500)
+        addonHost = nil
+        waveform?.endPreview()
+        tap = nil
+        waveform?.discardPreparedFile()
+        // Worker jobs dispatch their completion asynchronously and never wait for this thread.
+        worker.sync {
+            for url in pendingProvisionalWAVs.urls { try? FileManager.default.removeItem(at: url) }
+            pendingProvisionalWAVs.urls.removeAll()
+        }
+    }
+
+    /// Explicit saves that are still waiting for frozen audio are written before the app exits.
+    private func queuePendingSnapshotsForTermination() {
         if !pendingSnapshots.isEmpty, let tap {
             let queued = pendingSnapshots
             pendingSnapshots.removeAll()
@@ -2060,13 +2162,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             let groups = (0..<tap.laneCount).map { tap.channelGroups(for: $0) }
             let frozenPos = tap.freezePositions()
             let shownIDs = currentShownGroupIDs()
-            let sem = DispatchSemaphore(value: 0)
-            var frozen: WAVExport?
-            tap.readCapture({ WAVExport(core: $0, routes: routes, channelNames: labels, channelGroups: groups, positions: frozenPos) }) { mat in
-                frozen = mat
-                sem.signal()
+            // readCapture delivers on the main queue, which this thread is blocking; freeze inline instead.
+            // The capture queue is serial, so this runs after any freeze still in flight.
+            let frozen = tap.withCaptureSnapshot {
+                WAVExport(core: $0, routes: routes, channelNames: labels, channelGroups: groups, positions: frozenPos)
             }
-            _ = sem.wait(timeout: .now() + 2.0)
             if let frozen {
                 for req in queued {
                     let range = req.range ?? frozen.span
@@ -2087,16 +2187,6 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                     }
                 }
             }
-        }
-        addonHost?.shutdownAndFree(timeoutMs: 2500)
-        addonHost = nil
-        waveform?.endPreview()
-        tap = nil
-        waveform?.discardPreparedFile()
-        // Worker jobs dispatch their completion asynchronously and never wait for this thread.
-        worker.sync {
-            for url in pendingProvisionalWAVs.urls { try? FileManager.default.removeItem(at: url) }
-            pendingProvisionalWAVs.urls.removeAll()
         }
     }
 

@@ -28,12 +28,13 @@ enum Verify {
     static func main() throws {
         try verifyMacCaptureRouting()
         try verifyMacOptions()
+        try verifyMacTerminationSaves()
         try verifyFrequencyColors()
         try verifyRecorderHotkeys()
         try verifyRowStackAndActivity()
         try verifyThemeAndReadability()
         try verifyStageBAddonsAndLook()
-        print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options, hotkeys, row layout, silent channel tracking, theme, add-on host, look readability and positions passed.")
+        print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options, exit saves, hotkeys, row layout, silent channel tracking, theme, add-on host, look readability and positions passed.")
     }
 
     static func verifyFrequencyColors() throws {
