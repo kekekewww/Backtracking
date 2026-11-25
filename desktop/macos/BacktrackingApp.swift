@@ -79,6 +79,12 @@ func verifyMacChipToolTips() throws {
 }
 
 @MainActor
+func verifyMacClipExportedAtExportRate() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyClipExportedAtExportRate()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -951,6 +957,19 @@ private final class ClipExportLedger: @unchecked Sendable {
         let urls: [URL]
         let sampleRate: UInt32
         let frames: UInt64
+
+        /// A clip of `sourceFrames` at `sourceRate` written at `sampleRate`: `frames` counts the
+        /// files' own frames, rounded as Windows `clip_export::export_rows` does.
+        init(urls: [URL], sampleRate: UInt32, sourceFrames: UInt64, sourceRate: UInt32) {
+            self.urls = urls
+            self.sampleRate = sampleRate
+            let rate = UInt64(max(1, sourceRate))
+            let (scaled, overflow) = sourceFrames.multipliedReportingOverflow(by: UInt64(sampleRate))
+            let rounded = overflow
+                ? UInt64((Double(sourceFrames) * Double(sampleRate) / Double(rate)).rounded())
+                : (scaled + rate / 2) / rate
+            frames = max(rounded, sourceFrames == 0 ? 0 : 1)
+        }
     }
     private let lock = NSLock()
     private var next: UInt64 = 0
@@ -2205,6 +2224,60 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
+    /// A save at 44.1 kHz tells the add-ons the rate and frame count its WAV files really have.
+    /// It goes through `saveSnapshot` and the main queue, so it runs after the other checks.
+    static func verifyClipExportedAtExportRate() throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-clip-rate-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        let root = scratch.appendingPathComponent("addons-root", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        guard let host = AddonHostClient(dataRoot: root.path, appVersion: "0.2.1", primary: true) else {
+            throw CaptureError("AddonHostClient failed to start")
+        }
+        controller.attach(addonHost: host)
+        defer { host.shutdownAndFree(); controller.addonHost = nil }
+        func spin(_ seconds: Double, until done: () -> Bool) {
+            let deadline = ProcessInfo.processInfo.systemUptime + seconds
+            while !done() && ProcessInfo.processInfo.systemUptime < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+                host.pollSnapshot()
+            }
+        }
+        spin(3) { host.snapshot.ready }
+        let lanes = [CaptureLane(source: .addon(addonID: "verify.rate", sourceID: "a"), route: .merged)]
+        let tap = try SystemAudioTap(history: 10, lanes: lanes)
+        controller.captureLanes = lanes
+        controller.tap = tap
+        defer { controller.tap = nil }
+        let frames = 4_800
+        let samples = [Float](repeating: 0.25, count: frames * 2)
+        let accepted = tap.withCaptureRead { core in
+            samples.withUnsafeBufferPointer {
+                bt_tracks_push_interleaved(core, 0, $0.baseAddress, UInt32(frames), 1_000_000_000, SystemAudioTap.timelineRate)
+            }
+        }
+        guard accepted == UInt32(frames) else { throw CaptureError("Clip rate verification lost input") }
+        controller.exportSampleRate = 44_100
+        let folder = scratch.appendingPathComponent("saved", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        controller.saveSnapshot(into: folder.path)
+        spin(5) { host.verifyEvents.contains("clip_exported answered") }
+        let wavs = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "wav" }
+        guard let url = wavs.first, wavs.count == 1 else {
+            throw CaptureError("The 44.1 kHz save wrote \(wavs.count) WAV files")
+        }
+        let file = try AVAudioFile(forReading: url)
+        let expected = "clip_exported 44100 \(file.length) 1"
+        let sent = host.verifyEvents.filter { $0.hasPrefix("clip_exported ") && $0 != "clip_exported answered" }
+        guard file.fileFormat.sampleRate == 44_100, sent == [expected] else {
+            throw CaptureError("A \(file.fileFormat.sampleRate) Hz WAV of \(file.length) frames was announced as \(sent), expected [\(expected)]")
+        }
+    }
+
     /// A test copy opens only test-copy windows and never offers or asks for Input Monitoring.
     static func verifyTestCopyIsolation() throws {
         let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-copy-\(UUID().uuidString)", isDirectory: true)
@@ -2682,7 +2755,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                                            pairBinaural: binaural, shownGroupIDs: shownIDs)
                 if !written.urls.isEmpty {
                     ledger.add(ClipExportLedger.Clip(urls: written.urls, sampleRate: sampleRate,
-                                                     frames: range.upperBound - range.lowerBound), as: token)
+                                                     sourceFrames: range.upperBound - range.lowerBound,
+                                                     sourceRate: frozen.sampleRate), as: token)
                 }
             }
         }
@@ -5778,7 +5852,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             if provisional { pendingProvisionalWAVs.urls.formUnion(urls) }
             // Windows announces a save from the thread that wrote it; listing it here lets quitting do the same.
             if !provisional, !urls.isEmpty {
-                ledger.add(ClipExportLedger.Clip(urls: urls, sampleRate: sampleRate, frames: frameCount), as: token)
+                ledger.add(ClipExportLedger.Clip(urls: urls, sampleRate: sampleRate, sourceFrames: frameCount,
+                                                 sourceRate: job.sampleRate), as: token)
             }
             DispatchQueue.main.async {
                 let clip = ledger.take(token)
@@ -6458,6 +6533,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 executeControlCalls(calls)
             }
         }
+    }
+
+    /// Files dragged out were written at the export rate in force when they were prepared.
+    func notifyDraggedClip(urls: [URL], sourceFrames: UInt64, sourceRate: UInt32) {
+        notifyClipExported(ClipExportLedger.Clip(urls: urls, sampleRate: exportSampleRate,
+                                                 sourceFrames: sourceFrames, sourceRate: sourceRate))
     }
 
     func notifyClipExported(_ clip: ClipExportLedger.Clip,
@@ -9378,7 +9459,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             let frames = pendingDragMarker.map { $0.range.upperBound - $0.range.lowerBound }
                 ?? (retainedFrames.upperBound - retainedFrames.lowerBound)
             if !exportedURLs.isEmpty {
-                controller?.notifyClipExported(ClipExportLedger.Clip(urls: exportedURLs, sampleRate: sampleRate, frames: frames))
+                controller?.notifyDraggedClip(urls: exportedURLs, sourceFrames: frames, sourceRate: sampleRate)
             }
             readyFiles.removeAll()
             if let pendingDragMarker {

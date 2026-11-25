@@ -40,7 +40,8 @@ enum Verify {
         try AddonHostClient.verifyTicketCompletions()
         try AddonHostClient.verifyControlGate()
         try verifyMacControlBatchSnapshotSync()
-        print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options, test-copy isolation, flag drags keeping rows, chip tooltips, exit saves, hotkeys, row layout, silent channel tracking, theme, add-on host, ticket completions, control grant checks, control batch window sync, look readability and positions passed.")
+        try verifyMacClipExportedAtExportRate()
+        print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options, test-copy isolation, flag drags keeping rows, chip tooltips, exit saves, hotkeys, row layout, silent channel tracking, theme, add-on host, ticket completions, control grant checks, control batch window sync, clip_exported rates, look readability and positions passed.")
     }
 
     static func verifyFrequencyColors() throws {
