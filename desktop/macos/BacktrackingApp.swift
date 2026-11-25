@@ -3867,7 +3867,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             window.recalculateKeyViewLoop()
             guard let oldPage = page("Add-ons"), let firstField = editable(oldPage).first else { throw CaptureError("No Add-ons fields") }
             window.initialFirstResponder = firstField
-            weak var oldView = oldPage
+            weak let oldView = oldPage
             controller.reloadAddonsTab()
             RunLoop.main.run(until: Date().addingTimeInterval(0.05))
             guard let old = oldView else { throw CaptureError("The old page was let go at once") }
