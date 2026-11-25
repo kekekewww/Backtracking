@@ -2754,6 +2754,32 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         } catch let error as CaptureError {
             problems.append(error.operation)
         }
+        // Channels of the bed and an object at once play the bed's pair, as the pair alone does.
+        let bedAndObject = try render(frozen, [.channel(lane: 0, index: 2), .channel(lane: 0, index: 3)], shown: "bed")
+        if !same(bedAndObject, try render(frozen, pair, shown: "bed")) { problems.append("bed and object rows do not play the pair") }
+        // Hiding silent rows does not change what a whole lane plays.
+        let hiding = try { () -> [Float] in
+            guard let slot = bt_preview_slot_new_local() else { throw CaptureError("No preview slot") }
+            defer { bt_preview_slot_clear(slot); bt_preview_slot_free(slot) }
+            if let failure = frozen.play(in: slot, range: frozen.span, forceMono: false, fades: noFades, selectedRows: nil,
+                                         hideSilentLanes: [0], pairBinaural: false, shownGroupIDs: ["objects"]) {
+                throw CaptureError(failure)
+            }
+            var left = [Float](repeating: 0, count: 4_096), right = left
+            _ = bt_preview_slot_render(slot, &left, &right, 4_096, 48_000)
+            return zip(left, right).flatMap { [$0, $1] }
+        }()
+        if !same(hiding, wholeObjects) { problems.append("hiding silent rows changed the whole-lane preview") }
+        // One side of a stereo lane plays that side alone.
+        let stereoCore = try capture([2], { f, c in c == 0 ? 0.3 * sinf(Float(f) * 0.05) : 0.1 * sinf(Float(f) * 0.11) })
+        defer { bt_tracks_free(stereoCore) }
+        guard let stereo = WAVExport(core: stereoCore, routes: [.merged]) else { throw CaptureError("Could not freeze") }
+        let left = try render(stereo, [.stereoSide(lane: 0, side: 0)], shown: nil)
+        let right = try render(stereo, [.stereoSide(lane: 0, side: 1)], shown: nil)
+        let both = try render(stereo, nil, shown: nil)
+        if same(left, right) || same(left, both) || loudness(left) < 0.2 {
+            problems.append("one side of a stereo lane does not play alone")
+        }
         guard problems.isEmpty else { throw CaptureError("Preview plan: " + problems.joined(separator: "; ")) }
     }
 
@@ -3372,6 +3398,30 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         } else {
             problems.append("no Enabled switch")
         }
+        // The control switch of an add-on that declares control does the same.
+        let manifest = AddonManifest(contract: 1, id: "verify.control-switch", name: "Verify", version: "1.0", author: "Verify",
+            description: "", homepage: nil, license: nil, capabilities: ["control"], open_files: nil)
+        let controllable = AddonRecord(id: "verify.control-switch", manifest: manifest, enabled: true, state: "stopped", reason: nil,
+            pid: nil, message: nil, sources: [], settings: [], actions: [], control_allowed: false, control_asked: false)
+        func controlSwitch() -> NSButton? {
+            controls(controller.makeAddonCardGroup(controllable)).compactMap { $0 as? NSButton }.first { $0.title.hasPrefix("Let this add-on control") }
+        }
+        if let control = controlSwitch() {
+            control.state = .on
+            controller.addonControlAllowedChanged(control)
+            let held = controlSwitch()
+            let deadline = ProcessInfo.processInfo.systemUptime + 3
+            while controller.addonControlChanging["verify.control-switch"] != nil && ProcessInfo.processInfo.systemUptime < deadline {
+                host.pollSnapshot()
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            let after = controlSwitch()
+            if control.isEnabled || held?.isEnabled != false || held?.state != .on || after?.isEnabled != true {
+                problems.append("control switch: live \(control.isEnabled), waiting \(String(describing: held?.isEnabled)), answered \(String(describing: after?.isEnabled))")
+            }
+        } else {
+            problems.append("no control switch for an add-on that declares control")
+        }
         let link = AddonFormatting.linkIsOpenable
         if link("https://example.com/\u{7}a") || link("https://example.com/a\u{85}") || !link("https://example.com/it's") {
             problems.append("link checks")
@@ -3467,7 +3517,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         tap.readCapture(poll: false, { _ in Thread.sleep(forTimeInterval: 0.3); return 0 }) { _ in }
         controller.executeSingleControlCall(host: host, call: call("select", "slow"))
         controller.selectFreezeWaits = controller.selectFreezeWaits.map { ($0.0, 0) }
-        controller.answerSelectFreezeWaits()
+        controller.pollAddonHost() // the window's poll answers what ran out of time
         let slow = host.verifyEvents.first { $0.hasPrefix("control_reply slow ") }
         RunLoop.main.run(until: Date().addingTimeInterval(0.5)) // the slow freeze lands
         // A select whose selection is cleared before its freeze lands answers no_audio too.
@@ -3909,7 +3959,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         // The user picks other sources: a new capture, which records something else.
         controller.reconnectConfiguredSources()
         let reason = "The capture source changed before this snapshot was ready."
-        guard host.verifyEvents.contains("control_reply s failed"), controller.notice == reason else {
+        guard host.verifyEvents.contains("control_reply s failed"), host.verifyEvents.contains("control_message s \(reason)"),
+              controller.notice == reason else {
             throw CaptureError("A dropped save told the add-on \(host.verifyEvents) and the window \(controller.notice ?? "nothing")")
         }
         guard let new = controller.tap, new !== old else { throw CaptureError("Changing sources did not make a new capture") }
@@ -3923,6 +3974,22 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let files = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil).filter { $0.pathExtension == "wav" }
         guard files.isEmpty, controller.pendingSnapshotReads.isEmpty else {
             throw CaptureError("A save of the old sources wrote \(files.count) WAV files from the new ones at exit")
+        }
+        // A save of a selection dropped the same way is named a selection.
+        let (first, end) = new.withCaptureSnapshot { (bt_tracks_first_frame($0), bt_tracks_end_frame($0)) }
+        let view = WaveformView(frame: NSRect(x: 0, y: 0, width: 400, height: 100))
+        view.controller = controller
+        controller.waveform = view
+        defer { controller.waveform = nil }
+        view.verifyShow(rows: WaveformRow.layout(widths: [2], labels: [[]], stereo: false), laneWidths: [2], frames: first..<end)
+        view.applyProgrammaticSelection((first + 100)..<(first + 1_000))
+        new.readCapture(poll: false, { _ in Thread.sleep(forTimeInterval: 0.3); return 0 }) { _ in }
+        controller.executeSingleControlCall(host: host, call: AddonControlCall(addon_id: "verify.change", addon_name: "Verify",
+                                                                           run: 1, request_id: "s2", command: saveCommand))
+        controller.reconnectConfiguredSources()
+        let selectionReason = "The capture source changed before this selection was ready."
+        guard host.verifyEvents.contains("control_message s2 \(selectionReason)") else {
+            throw CaptureError("A dropped save of a selection told the add-on \(host.verifyEvents)")
         }
     }
 
