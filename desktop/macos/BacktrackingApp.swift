@@ -177,6 +177,10 @@ func verifyMacControlSaveReply() throws {
 @MainActor
 func verifyMacOptionsRebuild(step: String) throws {
     _ = NSApplication.shared
+    if ["typed-values", "deferred", "sources-name"].contains(step) {
+        try BacktrackingController.verifyOptionsRebuildKeepsTyping(step: step)
+        return
+    }
     try BacktrackingController.verifyOptionsRebuildWhileTyping(step: step)
 }
 
@@ -524,6 +528,7 @@ private final class OptionsPopUpButton: NSPopUpButton, NSTableViewDataSource, NS
     /// Stands in for a list a verification cannot open.
     static var verifyShown: Bool?
     #endif
+
 
     func reloadChoicesIfOpen() {
         guard choicePopover?.isShown == true, let table = choiceTable else { return }
@@ -1994,13 +1999,22 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var pendingSnapshotReads: [SnapshotRead] = []
     private var pendingLookControlsRebuild = false
     private var selectFreezeWaits: [(AddonControlCall, TimeInterval)] = []
-    private var pendingAddonsTabReload = false
-    private var pendingSourcesTabRebuild = false
+    /// Options pages to build again from the latest state, by label, once that is safe.
+    private var pendingOptionsPages: Set<String> = []
+    private var pendingAddonsTabReload: Bool {
+        get { pendingOptionsPages.contains("Add-ons") }
+        set { if newValue { pendingOptionsPages.insert("Add-ons") } else { pendingOptionsPages.remove("Add-ons") } }
+    }
+    private var pendingSourcesTabRebuild: Bool {
+        get { pendingOptionsPages.contains("Sources") }
+        set { if newValue { pendingOptionsPages.insert("Sources") } else { pendingOptionsPages.remove("Sources") } }
+    }
     #if BACKTRACKING_CAPTURE_VERIFY
     /// Stand-ins for the Options window, which a verification does not open.
     private var verifyOptionsPage: String?
     private var verifyEditingText: Bool?
     private var verifyAddonsTabReloads = 0
+    private var verifyPagesBuilt = 0
     private var verifySourcesTabRebuilds = 0
     private var verifyLookControlRebuilds = 0
     private var verifyLookRecomputes = 0
@@ -2304,10 +2318,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         tabs.addTabViewItem(hotkeys)
         tabs.selectTabViewItem(sources)
         controller.optionTabs = tabs
-        let replacement = controller.makeSourceTab()
-        controller.replaceOptionsTab(with: replacement)
+        let original = tabs.selectedTabViewItem
+        controller.rebuildOptionsPage("Sources")
+        let replacement = tabs.selectedTabViewItem
         let rows = WaveformRow.layout(widths: [1, 2, 3], labels: [[], [], ["FL", "FR", "FC"]], stereo: false)
-        guard tabs.selectedTabViewItem === replacement, replacement.view?.superview != nil,
+        guard let replacement, replacement !== original, replacement.label == "Sources", replacement.view?.superview != nil,
               tabs.tabViewItems.map(\.label) == ["Sources", "Appearance", "Hotkeys"],
               controller.sourcePopups.count == 3, controller.addSourcePopup != nil,
               controller.optionsMeterPopups.count == 3, controller.meterModes == [.dbfs, .vu, .lufs],
@@ -3614,10 +3629,124 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let reopened = controller.verifyAddonsTabReloads
         // A page rebuilt by another path (adding a source rebuilds Sources) leaves nothing to do later.
         controller.pendingSourcesTabRebuild = true
-        controller.replaceOptionsTab(with: controller.makeSourceTab())
+        controller.rebuildOptionsPage("Sources")
         let sourcesLeft = controller.pendingSourcesTabRebuild
         guard hidden == 0, shown == 1, again == 1, closed == 1, reopened == 2, !controller.pendingAddonsTabReload, !sourcesLeft else {
             throw CaptureError("Hidden Add-ons page reloads: hidden \(hidden), shown \(shown), again \(again), closed \(closed), reopened \(reopened)")
+        }
+    }
+
+    /// V10-M1/M2: a page rebuilt while one of its fields is being typed into sends what was typed
+    /// first, through the old page's own controls; the new page's controls are all registered;
+    /// a rebuild that has to wait is done once, later, from the latest state, and never by
+    /// itself over and over. Runs in the child, as the crash checks do.
+    static func verifyOptionsRebuildKeepsTyping(step: String) throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-typing-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        guard let host = AddonHostClient(dataRoot: scratch.path, appVersion: "0.2.1", primary: true) else {
+            throw CaptureError("AddonHostClient failed to start")
+        }
+        controller.attach(addonHost: host)
+        defer { host.shutdownAndFree(); controller.addonHost = nil }
+        let ready = ProcessInfo.processInfo.systemUptime + 3
+        while !host.snapshot.ready && ProcessInfo.processInfo.systemUptime < ready {
+            host.pollSnapshot(); Thread.sleep(forTimeInterval: 0.01)
+        }
+        let text = AddonSettingEntry(declaration: AddonSettingDeclaration(key: "folder", label: "Save to folder", help: nil,
+            kind: "text", defaultValue: .string(""), options: nil, min: nil, max: nil, step: nil), value: .string("/tmp"))
+        let number = AddonSettingEntry(declaration: AddonSettingDeclaration(key: "gain", label: "Gain", help: nil,
+            kind: "number", defaultValue: .double(0.5), options: nil, min: 0, max: 1, step: 0.1), value: .double(0.5))
+        let addon = AddonRecord(id: "verify.typing", manifest: nil, enabled: true, state: "running", reason: nil, pid: 1,
+            message: nil, sources: [], settings: [text, number], actions: [], control_allowed: false, control_asked: false)
+        host.verifyReceive(AddonSnapshot(schema: 1, generation: 9_000, ready: true, error: nil, addons: [addon], appearances: [:], completed: []))
+        controller.syncAddonSnapshotUI()
+        controller.captureLanes = [CaptureLane(source: .addon(addonID: "verify.typing", sourceID: "main"), route: .merged)]
+        let window = controller.makeOptionsPanel()
+        controller.optionsPanel = window
+        defer { controller.optionsPanel = nil; window.close() }
+        func category(_ label: String) -> NSButton? { controller.optionCategoryButtons.first { $0.title == label } }
+        func editable(_ view: NSView) -> [NSTextField] {
+            ((view as? NSTextField).flatMap { $0.isEditable ? [$0] : nil } ?? []) + view.subviews.flatMap(editable)
+        }
+        func page(_ label: String) -> NSView? { controller.optionTabs?.tabViewItems.first { $0.label == label }?.view }
+        /// Every field and setting control on the Add-ons page is the one the registers hold.
+        func addonsRegistered() -> Bool {
+            guard let view = page("Add-ons") else { return false }
+            let fields = editable(view)
+            let registered = Set(controller.addonSettingTextFields.keys.map(ObjectIdentifier.init))
+                .union(controller.addonSettingNumberFields.keys.map(ObjectIdentifier.init))
+            let controls = controller.addonSettingControls.values.flatMap { $0 }
+            return fields.count == 2 && fields.allSatisfy { registered.contains(ObjectIdentifier($0)) }
+                && controls.allSatisfy { $0.isDescendant(of: view) } && registered.count == 2
+        }
+        func type(_ value: String, into field: NSTextField) throws {
+            guard window.makeFirstResponder(field), let editor = window.firstResponder as? NSTextView else {
+                throw CaptureError("Could not type into \(field.placeholderString ?? "a field")")
+            }
+            editor.selectAll(nil)
+            editor.insertText(value, replacementRange: editor.selectedRange())
+        }
+        switch step {
+        case "typed-values":
+            guard let addons = category("Add-ons") else { throw CaptureError("No Add-ons category") }
+            controller.selectOptionCategory(addons)
+            for (index, value) in ["/typed", "0.8"].enumerated() {
+                guard let view = page("Add-ons") else { throw CaptureError("No Add-ons page") }
+                let fields = editable(view)
+                guard fields.count == 2 else { throw CaptureError("The Add-ons page has \(fields.count) fields") }
+                try type(value, into: fields[index])
+                controller.reloadAddonsTab()
+            }
+            let sent = (controller.addonSettingDrafts["verify.typing:folder"], controller.addonSettingDrafts["verify.typing:gain"])
+            guard sent.0 == .string("/typed"), sent.1 == .double(0.8), addonsRegistered() else {
+                throw CaptureError("Typed values reached the host as \(sent); the new page is registered: \(addonsRegistered())")
+            }
+        case "deferred":
+            guard let addons = category("Add-ons") else { throw CaptureError("No Add-ons category") }
+            controller.selectOptionCategory(addons)
+            // A responder on the old page that will not let go: the rebuild waits, once.
+            let holder = StubbornResponder(frame: NSRect(x: 0, y: 0, width: 10, height: 10))
+            page("Add-ons")?.addSubview(holder)
+            _ = window.makeFirstResponder(holder)
+            let before = controller.verifyPagesBuilt
+            controller.reloadAddonsTab()
+            controller.reloadAddonsTab()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+            let whileHeld = controller.verifyPagesBuilt - before
+            let waiting = controller.pendingAddonsTabReload
+            // Meanwhile the add-on's setting changes; once the holder lets go, one rebuild shows it.
+            let changed = AddonRecord(id: "verify.typing", manifest: nil, enabled: true, state: "running", reason: nil, pid: 1,
+                message: nil, sources: [], settings: [AddonSettingEntry(declaration: text.declaration, value: .string("/latest")), number],
+                actions: [], control_allowed: false, control_asked: false)
+            host.verifyReceive(AddonSnapshot(schema: 1, generation: 9_001, ready: true, error: nil, addons: [changed], appearances: [:], completed: []))
+            holder.letGo = true
+            controller.verifyOptionsPage = "Add-ons"
+            controller.syncAddonSnapshotUI()
+            controller.syncAddonSnapshotUI()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+            let built = controller.verifyPagesBuilt - before
+            let shown = page("Add-ons").map(editable)?.first?.stringValue
+            guard whileHeld == 0, waiting, built == 1, shown == "/latest", addonsRegistered(), !controller.pendingAddonsTabReload else {
+                throw CaptureError("Held rebuild: built \(whileHeld) while held (pending \(waiting)), \(built) in all, shows \(shown ?? "-"), registered \(addonsRegistered())")
+            }
+        default: // "sources-name"
+            guard let sources = category("Sources") else { throw CaptureError("No Sources category") }
+            controller.selectOptionCategory(sources)
+            guard let field = page("Sources").map(editable)?.first(where: { controller.fileNameFields.contains($0) }) else {
+                throw CaptureError("No File name field")
+            }
+            try type("Typed name", into: field)
+            controller.rebuildSourcesTab()
+            let named = controller.sourceFileNames[CaptureSource.addon(addonID: "verify.typing", sourceID: "main").key]
+            let fields = page("Sources").map(editable) ?? []
+            let registered = controller.fileNameFields.allSatisfy { field in fields.contains { $0 === field } }
+            guard named == "Typed name", registered, !controller.fileNameFields.isEmpty,
+                  controller.fileNameFields.first?.stringValue == "Typed name" else {
+                throw CaptureError("Sources rebuild while naming: saved \(named ?? "-"), registered \(registered)")
+            }
         }
     }
 
@@ -3667,7 +3796,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         guard typedInto != nil, window.firstResponder is NSTextView else { throw CaptureError("The Text setting could not be typed into") }
         // The page is rebuilt while the field is being typed into, by whichever path does it.
-        autoreleasepool {
+        try autoreleasepool {
             switch step {
             case "close-reopen":
                 window.close()
@@ -3679,8 +3808,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 (window.firstResponder as? NSTextView)?.string = "/new"
                 window.close()
                 _ = window.makeFirstResponder(nil)
-                if controller.addonSettingDrafts["verify.n1:folder"] == nil {
-                    fputs("note: ending the edit did not send the field\n", stderr)
+                if controller.addonSettingDrafts["verify.n1:folder"] != .string("/new") {
+                    throw CaptureError("Closing the window over the Text field did not send what was typed")
                 }
             default:
                 controller.reloadAddonsTab()
@@ -4760,13 +4889,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     /// The page about to be seen shows the latest snapshot: a rebuild put off while it was hidden
     /// is done now.
     private func catchUpOptionsPage() {
-        guard let label = optionTabs?.selectedTabViewItem?.label else { return }
-        if label == "Add-ons", pendingAddonsTabReload {
-            pendingAddonsTabReload = false
-            reloadAddonsTab()
-        } else if label == "Sources", pendingSourcesTabRebuild {
-            pendingSourcesTabRebuild = false
-            rebuildSourcesTab()
+        guard let label = optionTabs?.selectedTabViewItem?.label, pendingOptionsPages.contains(label) else { return }
+        switch label {
+        case "Add-ons": reloadAddonsTab()
+        case "Sources": rebuildSourcesTab()
+        default: rebuildOptionsPage(label)
         }
     }
 
@@ -5063,7 +5190,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     private func reloadHotkeysTab() {
         guard optionTabs != nil else { return }
-        replaceOptionsTab(with: makeHotkeysTab())
+        rebuildOptionsPage("Hotkeys")
     }
 
     /// Whether `responder` is `view` or inside it; a field editor counts as the field it edits.
@@ -5075,38 +5202,59 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     private var endingEditingForOptionsRebuild = false
 
-    /// Puts `page` in place of the page with its label. AppKit keeps unretained pointers to the
-    /// view being edited (the field editor's client, the tab item's remembered first responder),
-    /// so a page is never taken away while one of its fields is the first responder: editing
-    /// ends first, or, inside that field's own end-of-editing, the swap waits a turn (N1).
-    private func replaceOptionsTab(with page: NSTabViewItem) {
+    /// A fresh page for `label`, built from the state now.
+    private func makeOptionsPage(_ label: String) -> NSTabViewItem? {
+        #if BACKTRACKING_CAPTURE_VERIFY
+        verifyPagesBuilt += 1
+        #endif
+        switch label {
+        case "Actions": return makeActionTab()
+        case "Hotkeys": return makeHotkeysTab()
+        case "Capture": return makeCaptureTab()
+        case "Sources": return makeSourceTab()
+        case "Appearance": return makeAppearanceTab()
+        case "Export": return makeExportTab()
+        case "Add-ons": return makeAddonsTab()
+        case "Updates": return independentWindow ? nil : makeUpdateTab()
+        default: return nil
+        }
+    }
+
+    /// Builds the Options page `label` again from the latest state. AppKit keeps unretained
+    /// pointers to the view being edited (the field editor's client, the tab item's remembered
+    /// first responder), so a field of the old page that is being edited finishes first, while
+    /// the old page's controls are still registered, so what was typed is sent as usual (N1,
+    /// V10-M1). Only then is the new page built. When the edit cannot finish now (inside that
+    /// field's own end of editing, or a responder that will not let go) the page is only marked
+    /// to be built again; the poll, a category switch or reopening Options does it later. Every
+    /// request for one page in the meantime comes to one rebuild, from the state then.
+    private func rebuildOptionsPage(_ label: String) {
         guard let tabs = optionTabs,
-              let index = tabs.tabViewItems.firstIndex(where: { $0.label == page.label }) else { return }
-        let previous = tabs.tabViewItem(at: index)
-        if let window = tabs.window, Self.responder(window.firstResponder, isInside: previous.view) {
+              tabs.tabViewItems.contains(where: { $0.label == label }) else { return }
+        if let window = tabs.window, let previous = tabs.tabViewItems.first(where: { $0.label == label }),
+           Self.responder(window.firstResponder, isInside: previous.view) {
             if endingEditingForOptionsRebuild {
-                DispatchQueue.main.async { [weak self] in self?.replaceOptionsTab(with: page) }
+                pendingOptionsPages.insert(label)
                 return
             }
             endingEditingForOptionsRebuild = true
             let ended = window.makeFirstResponder(nil)
             endingEditingForOptionsRebuild = false
             if !ended || Self.responder(window.firstResponder, isInside: previous.view) {
-                DispatchQueue.main.async { [weak self] in self?.replaceOptionsTab(with: page) }
+                DispatchQueue.main.async { [weak self] in self?.rebuildOptionsPage(label) }
                 return
             }
-            // Ending the edit may itself have rebuilt this page.
-            guard tabs.tabViewItems.contains(where: { $0 === previous }) else { return }
         }
-        previous.initialFirstResponder = nil
-        // A page rebuilt by any path shows the latest state; a rebuild put off for it is done.
-        if page.label == "Sources" { pendingSourcesTabRebuild = false }
-        if page.label == "Add-ons" { pendingAddonsTabReload = false }
-        let selected = tabs.selectedTabViewItem === previous
-        let offset = (previous.view as? NSScrollView)?.contentView.bounds.origin ?? .zero
+        guard let index = tabs.tabViewItems.firstIndex(where: { $0.label == label }) else { return }
+        let current = tabs.tabViewItem(at: index)
+        guard let page = makeOptionsPage(label) else { return }
+        pendingOptionsPages.remove(label)
+        current.initialFirstResponder = nil
+        let selected = tabs.selectedTabViewItem === current
+        let offset = (current.view as? NSScrollView)?.contentView.bounds.origin ?? .zero
         tabs.insertTabViewItem(page, at: index)
         if selected { tabs.selectTabViewItem(page) }
-        tabs.removeTabViewItem(previous)
+        tabs.removeTabViewItem(current)
         if selected, let scroll = page.view as? NSScrollView {
             scroll.layoutSubtreeIfNeeded()
             scroll.contentView.scroll(to: offset)
@@ -5670,8 +5818,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         defaults.set(captureLanes.map { ["source": $0.source.key, "route": Int($0.route.rawValue)] }, forKey: "captureLanes")
         saveMeterModes()
         if rebuildOptions, optionTabs != nil {
-            replaceOptionsTab(with: makeSourceTab())
-            replaceOptionsTab(with: makeAppearanceTab())
+            rebuildOptionsPage("Sources")
+            rebuildOptionsPage("Appearance")
         }
         reconnectConfiguredSources()
     }
@@ -5830,7 +5978,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     /// Package 9 & 20 / TL-41..43: Frequency colors editor matching Windows spectrum.rs (user > look > default).
     private func refreshFrequencyGradientControls() {
         guard let controls = frequencyGradientControls else { return }
-        // As with whole pages (replaceOptionsTab), nothing being edited is taken away under AppKit.
+        // As with whole pages (rebuildOptionsPage), nothing being edited is taken away under AppKit.
         if let window = controls.window, Self.responder(window.firstResponder, isInside: controls) {
             _ = window.makeFirstResponder(nil)
         }
@@ -8128,7 +8276,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         #if BACKTRACKING_CAPTURE_VERIFY
         verifySourcesTabRebuilds += 1
         #endif
-        replaceOptionsTab(with: makeSourceTab())
+        rebuildOptionsPage("Sources")
         refreshSourceOptions()
     }
 
@@ -8179,6 +8327,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 reloadAddonsTab()
                 addonsRebuilt = true
             }
+        }
+        // Other pages whose rebuild had to wait (an edit that would not finish) are done the same way.
+        for label in pendingOptionsPages.subtracting(["Add-ons", "Sources"]).sorted()
+            where optionsPageShown(label) && !userIsHandlingControls && !editingOptionsText {
+            rebuildOptionsPage(label)
         }
         guard snap.generation != lastAddonSnapshotForUI.generation else { return }
         let prev = lastAddonSnapshotForUI
@@ -8454,7 +8607,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         verifyAddonsTabReloads += 1
         #endif
         guard optionTabs != nil else { return }
-        replaceOptionsTab(with: makeAddonsTab())
+        rebuildOptionsPage("Add-ons")
     }
 
     private func openAddonsOptionsTab() {
@@ -8508,7 +8661,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             } else if runningOpeners.count > 1 {
                 addonPendingDropChoice = (url, runningOpeners)
                 openSourcesOptionsTab()
-                replaceOptionsTab(with: makeSourceTab())
+                rebuildOptionsPage("Sources")
                 refreshSourceOptions()
                 return true
             } else {
@@ -9352,7 +9505,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             if case .failure(let reason) = result {
                 self.addonPendingFormats.removeValue(forKey: slotKey)
                 self.addonSourceProblems[addonID] = "Could not choose \(label): \(reason)"
-                self.replaceOptionsTab(with: self.makeSourceTab())
+                self.rebuildOptionsPage("Sources")
                 self.refreshSourceOptions()
             }
         }
@@ -9406,14 +9559,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let opener = choice.openers[sender.tag]
         let url = choice.url
         addonPendingDropChoice = nil
-        replaceOptionsTab(with: makeSourceTab())
+        rebuildOptionsPage("Sources")
         refreshSourceOptions()
         openFileWithAddon(id: opener.id, url: url)
     }
 
     @objc private func cancelAddonDropOpener() {
         addonPendingDropChoice = nil
-        replaceOptionsTab(with: makeSourceTab())
+        rebuildOptionsPage("Sources")
         refreshSourceOptions()
     }
 
@@ -9783,6 +9936,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 }
 
 #if BACKTRACKING_CAPTURE_VERIFY
+/// A first responder that will not let go until told to.
+private final class StubbornResponder: NSView {
+    var letGo = false
+    override var acceptsFirstResponder: Bool { true }
+    override func resignFirstResponder() -> Bool { letGo }
+}
+
 extension WaveformView {
     /// Shows `rows` over `frames` as if a read had just arrived.
     func verifyShow(rows: [WaveformRow], laneWidths: [UInt32], frames: Range<UInt64>) {
