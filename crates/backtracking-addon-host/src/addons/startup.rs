@@ -11,6 +11,7 @@ use backtracking_addon::{manifest::validate_id, package::transaction_id};
 #[derive(Clone)]
 pub(super) struct PrimaryLease {
     _file: Arc<File>,
+    pub(super) directory: Arc<File>,
     root: PathBuf,
 }
 
@@ -18,22 +19,26 @@ impl PrimaryLease {
     pub(super) fn acquire(root: &Path) -> Result<Self, String> {
         // Keep this file in place. Windows releases its exclusive handle after a
         // crash, and task clones keep it locked until every operation has ended.
-        let file = OpenOptions::new()
+        let directory = OpenOptions::new()
             .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(root.join(".addon-host.lock"))
-            .map_err(|error| {
-                format!("Cannot own the add-on folder; another add-on host may be running: {error}")
-            })?;
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(root)
+            .map_err(|error| format!("Cannot open the add-on data root: {error}"))?;
+        let file = super::data_removal::open_at(
+            &directory,
+            c".addon-host.lock",
+            libc::O_RDWR | libc::O_CREAT,
+            0o600,
+        )
+        .map_err(|error| {
+            format!("Cannot own the add-on folder; another add-on host may be running: {error}")
+        })?;
         file.try_lock().map_err(|e| {
             format!("Cannot own the add-on folder; another add-on host may be running: {e}")
         })?;
         Ok(Self {
             _file: Arc::new(file),
+            directory: Arc::new(directory),
             root: root.to_owned(),
         })
     }

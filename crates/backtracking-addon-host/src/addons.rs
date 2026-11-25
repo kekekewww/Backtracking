@@ -25,6 +25,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 mod bridge;
+mod data_removal;
 
 mod process;
 mod startup;
@@ -771,6 +772,11 @@ impl Drop for PreparedPackage {
     }
 }
 
+/// Only created once the package transaction has committed.
+struct RemovedPackage {
+    data_cleanup: Result<(), String>,
+}
+
 enum Operation {
     StopForInstall {
         id: String,
@@ -792,7 +798,7 @@ enum Operation {
     Remove {
         id: String,
         delete_data: bool,
-        result: AddonReply<()>,
+        result: AddonReply<RemovedPackage>,
         reply: Reply<()>,
     },
 }
@@ -811,6 +817,7 @@ impl Operation {
 struct Worker {
     root: PathBuf,
     primary_lease: startup::PrimaryLease,
+    remove_package: fn(&Path, &str) -> backtracking_addon::Result<()>,
     host: Host,
     shared: Arc<Shared>,
     entries: BTreeMap<String, Entry>,
@@ -851,6 +858,7 @@ impl Worker {
         Ok(Self {
             root,
             primary_lease,
+            remove_package: |addons, id| package::remove(addons, id),
             host,
             shared,
             entries,
@@ -1853,17 +1861,21 @@ impl Worker {
                         });
                     } else {
                         let root = self.root.clone();
+                        let data_root = self.primary_lease.directory.clone();
+                        let remove_package = self.remove_package;
                         let remove_id = id.clone();
                         let (send, result) = mpsc::channel();
                         spawn_task(
                             "remove add-on",
                             move || {
-                                package::remove(root.join("addons"), &remove_id)
+                                remove_package(&root.join("addons"), &remove_id)
                                     .map_err(|e| e.to_string())?;
-                                if delete_data {
-                                    remove_data(&root, &remove_id)?;
-                                }
-                                Ok(())
+                                let data_cleanup = if delete_data {
+                                    data_removal::remove(&data_root, &remove_id)
+                                } else {
+                                    Ok(())
+                                };
+                                Ok(RemovedPackage { data_cleanup })
                             },
                             send,
                             self.primary_lease.clone(),
@@ -1882,22 +1894,22 @@ impl Worker {
                     result,
                     reply,
                 } => match result.try_recv() {
-                    Ok(result) => {
-                        if !self.root.join("addons").join(&id).exists() {
-                            self.entries.remove(&id);
-                            let mut saved = self.saved.clone();
-                            if delete_data && result.is_ok() {
-                                saved.addons.remove(&id);
-                            } else if let Some(saved) = saved.addons.get_mut(&id) {
-                                saved.enabled = false;
-                                // Installing it again asks the user again.
-                                saved.control = false;
-                            }
-                            let stored = self.store(saved);
-                            let _ = reply.send(result.and(stored));
-                        } else {
-                            let _ = reply.send(result);
+                    Ok(Ok(RemovedPackage { data_cleanup })) => {
+                        self.entries.remove(&id);
+                        let mut saved = self.saved.clone();
+                        if delete_data && data_cleanup.is_ok() {
+                            saved.addons.remove(&id);
+                        } else if let Some(saved) = saved.addons.get_mut(&id) {
+                            saved.enabled = false;
+                            saved.control = false;
                         }
+                        let stored = self.store(saved);
+                        let _ = reply.send(data_cleanup.and(stored));
+                    }
+                    Ok(Err(reason)) => {
+                        // A failed package transaction may leave only its private backup.
+                        // Keep this entry and its preferences so the handle can retry.
+                        let _ = reply.send(Err(reason));
                     }
                     Err(mpsc::TryRecvError::Empty) => self.operations.push(Operation::Remove {
                         id,
@@ -2255,26 +2267,6 @@ fn write_saved(root: &Path, saved: &SavedState) -> Result<(), String> {
     result.map_err(|e| format!("Cannot save add-on preferences: {e}"))
 }
 
-fn remove_data(root: &Path, id: &str) -> Result<(), String> {
-    validate_id(id).map_err(|e| e.to_string())?;
-    let parent = root.join("addon-data");
-    let target = parent.join(id);
-    let metadata = match fs::symlink_metadata(&target) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.to_string()),
-    };
-    if metadata.file_type().is_symlink() {
-        return Err("The add-on data folder is a reparse point; remove it manually".into());
-    }
-    let parent = fs::canonicalize(parent).map_err(|e| e.to_string())?;
-    let target = fs::canonicalize(target).map_err(|e| e.to_string())?;
-    if target.parent() != Some(parent.as_path()) {
-        return Err("The add-on data folder escapes its parent".into());
-    }
-    fs::remove_dir_all(target).map_err(|e| e.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2282,10 +2274,10 @@ mod tests {
     use backtracking_addon::protocol::{ChannelGroup, Format, TransportState};
     use serde_json::json;
 
-    struct TestDir(PathBuf);
+    pub(super) struct TestDir(pub(super) PathBuf);
 
     impl TestDir {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
                 "backtracking-addon-host-{}",
                 random_token().unwrap()
@@ -2499,8 +2491,85 @@ mod tests {
             assert!(unrelated.is_dir());
             assert_eq!(fs::read_to_string(data.join("keep")).unwrap(), "private");
             drop(manager);
-            package::remove(&addons, id).unwrap();
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remove_v3_repeated_sdk_remove_is_idempotent() {
+        let dir = TestDir::new();
+        let addons = dir.0.join("addons");
+        let id = "com.example.test";
+        write_backup_fixture(&addons.join(id), id);
+        for _ in 0..2 {
+            package::remove(&addons, id).unwrap();
+            assert!(package::list_installed(&addons).unwrap().is_empty());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remove_v3_same_handle_retries_after_backup_move_error() {
+        let dir = TestDir::new();
+        let id = "com.example.test";
+        let addons = dir.0.join("addons");
+        let target = addons.join(id);
+        let backup = addons.join(format!(".{id}.backup-1-2"));
+        write_backup_fixture(&backup, id);
+        fs::create_dir(&target).unwrap();
+        let data = dir.0.join("addon-data").join(id);
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("keep"), "data").unwrap();
+
+        let mut worker = worker(&dir.0);
+        let mut saved = SavedState::default();
+        saved.addons.insert(
+            id.into(),
+            SavedAddon {
+                control: true,
+                settings: BTreeMap::from([("level".into(), json!(3))]),
+                ..Default::default()
+            },
+        );
+        worker.store(saved.clone()).unwrap();
+        let (commands, receive) = mpsc::channel();
+        let handle = AddonHandle {
+            commands,
+            shared: worker.shared.clone(),
+        };
+        // Only the first package job is simulated. Fail at the backup rename
+        // after the broken visible slot is empty. The retry runs the real SDK.
+        worker.remove_package = |addons, id| {
+            let visible = addons.join(id);
+            if visible.try_exists()? {
+                fs::remove_dir(&visible)?;
+                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+            }
+            package::remove(addons, id)
+        };
+        let thread = thread::spawn(move || worker.run(receive));
+        let error = handle
+            .remove(id, true)
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error,
+            std::io::Error::from_raw_os_error(libc::EIO).to_string()
+        );
+        assert!(handle.snapshot().addon(id).is_some());
+        assert_eq!(read_saved(&dir.0).unwrap(), saved);
+        assert!(backup.is_dir() && data.join("keep").is_file() && !target.exists());
+
+        handle
+            .remove(id, true)
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        drop(handle);
+        thread.join().unwrap();
+        assert!(!backup.exists() && !target.exists() && !data.exists());
+        assert_eq!(read_saved(&dir.0).unwrap(), SavedState::default());
     }
 
     #[cfg(target_os = "macos")]
@@ -4037,6 +4106,18 @@ mod tests {
         // A malformed data target produces a real removal failure after the
         // program folder has been removed successfully.
         fs::write(dir.0.join("addon-data/com.example.test"), b"not a folder").unwrap();
+        let id = "com.example.test";
+        let mut saved = SavedState::default();
+        let settings = BTreeMap::from([("gain".into(), json!(2))]);
+        saved.addons.insert(
+            id.into(),
+            SavedAddon {
+                control: true,
+                settings: settings.clone(),
+                ..Default::default()
+            },
+        );
+        write_saved(&dir.0, &saved).unwrap();
         let manager = AddonManager::new(dir.0.clone(), "test").unwrap();
         let handle = manager.handle();
         assert!(
@@ -4051,6 +4132,9 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(handle.snapshot().addon("com.example.test").is_none());
+        let retained = &read_saved(&dir.0).unwrap().addons[id];
+        assert_eq!(retained.settings, settings);
+        assert!(!retained.enabled && !retained.control);
         assert!(!dir.0.join("addons/com.example.test").exists());
         assert!(dir.0.join("addon-data/com.example.test").exists());
     }
