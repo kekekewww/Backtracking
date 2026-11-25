@@ -1,15 +1,14 @@
 //! Combined archive for the macOS application (core + add-on host).
+#![cfg(unix)]
+mod addons;
 pub use backtracking_core as core;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
 
-pub struct BtAddonHost {
-    _root: String,
-    _version: String,
-    _role: u32,
-}
-
+mod commands;
+mod host;
+pub use host::BtAddonHost;
 unsafe fn input<'a>(p: *const c_char) -> Option<&'a str> {
     if p.is_null() {
         return None;
@@ -35,30 +34,31 @@ pub unsafe extern "C" fn bt_addon_host_new(
     if role > 1 || !Path::new(root).is_absolute() || version.is_empty() {
         return std::ptr::null_mut();
     }
-    Box::into_raw(Box::new(BtAddonHost {
-        _root: root.into(),
-        _version: version.into(),
-        _role: role,
-    }))
+    BtAddonHost::new(root.into(), version.into(), role)
+        .map_or(std::ptr::null_mut(), |h| Box::into_raw(Box::new(h)))
 }
-
 #[unsafe(no_mangle)]
-pub extern "C" fn bt_addon_host_generation(_: *const BtAddonHost) -> u64 {
-    0
+pub unsafe extern "C" fn bt_addon_host_generation(h: *const BtAddonHost) -> u64 {
+    unsafe { h.as_ref() }.map_or(0, BtAddonHost::generation)
 }
-
 #[unsafe(no_mangle)]
-pub extern "C" fn bt_addon_host_snapshot(_: *const BtAddonHost) -> *mut c_char {
-    output(
-        json!({"schema":1,"ready":false,"error":"Host implementation pending","generation":0,"addons":[],"appearances":{},"completed":[]}),
-    )
+pub unsafe extern "C" fn bt_addon_host_snapshot(h: *const BtAddonHost) -> *mut c_char {
+    output(unsafe { h.as_ref() }.map_or_else(
+        || host::failure("invalid_request", "Missing host"),
+        BtAddonHost::snapshot,
+    ))
 }
-
 #[unsafe(no_mangle)]
-pub extern "C" fn bt_addon_host_command(_: *const BtAddonHost, _: *const c_char) -> *mut c_char {
-    output(json!({"schema":1,"ok":false,"code":"failed","message":"Host implementation pending"}))
+pub unsafe extern "C" fn bt_addon_host_command(
+    h: *const BtAddonHost,
+    p: *const c_char,
+) -> *mut c_char {
+    let request = unsafe { input(p) }.and_then(|s| serde_json::from_str(s).ok());
+    output(match (unsafe { h.as_ref() }, request) {
+        (Some(h), Some(v)) => h.command(v),
+        _ => host::failure("invalid_request", "Invalid host or command JSON"),
+    })
 }
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bt_addon_string_free(p: *mut c_char) {
     if !p.is_null() {
@@ -71,3 +71,6 @@ pub unsafe extern "C" fn bt_addon_host_free(h: *mut BtAddonHost) {
         drop(unsafe { Box::from_raw(h) });
     }
 }
+
+pub mod seed;
+pub mod test_home;

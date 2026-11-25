@@ -10,3 +10,7 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 backtracking-core = { path = "../backtracking-core" }
 serde_json = "=1.0.154"
+serde = {version = "=1.0.229", features=["derive","rc"]}
+sha2 = "=0.10.9"
+libc = "=0.2.191"
+backtracking-addon = { path = "../backtracking-addon", features=["install"] }
