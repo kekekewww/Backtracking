@@ -111,6 +111,12 @@ fn replace_install(stage: &Path, target: &Path, addons: &Path, id: &str) -> Resu
                 target.display()
             )));
         }
+        #[cfg(target_os = "macos")]
+        if swap_directories(stage, target)? {
+            // The previous version now occupies the private stage.
+            let _ = fs::remove_dir_all(stage);
+            return Ok(());
+        }
         let backup = unused_path(addons, id, "backup");
         fs::rename(target, &backup)?;
         if let Err(error) = fs::rename(stage, target) {
@@ -131,6 +137,48 @@ fn replace_install(stage: &Path, target: &Path, addons: &Path, id: &str) -> Resu
         fs::rename(stage, target)?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn swap_directories(stage: &Path, target: &Path) -> std::io::Result<bool> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    extern "C" {
+        fn renamex_np(
+            from: *const std::ffi::c_char,
+            to: *const std::ffi::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+    let from = CString::new(stage.as_os_str().as_bytes())?;
+    let to = CString::new(target.as_os_str().as_bytes())?;
+    const RENAME_SWAP: u32 = 2;
+    if unsafe { renamex_np(from.as_ptr(), to.as_ptr(), RENAME_SWAP) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::Unsupported {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+/// Validate an installed or privately renamed program folder against its intended id.
+pub fn validate_installed_folder(path: &Path, id: &str) -> Result<Manifest> {
+    reject_link(path)?;
+    #[cfg(target_os = "macos")]
+    if !fs::symlink_metadata(path.join("addon.json"))?.is_file() {
+        return Err(Error::new("Expected addon.json to be a regular file."));
+    }
+    let manifest = read_folder_manifest(path)?;
+    if id != manifest.id {
+        return Err(Error::new(format!(
+            "Folder {} does not match manifest id {}. Reinstall the add-on.",
+            path.display(),
+            manifest.id
+        )));
+    }
+    validate_folder_programs(path, &manifest)?;
+    Ok(manifest)
 }
 
 /// Read each installed folder. Unreadable entries and invalid manifests are returned individually.
@@ -180,19 +228,7 @@ fn list_installed_entries(
             continue;
         }
         let path = entry.path();
-        let manifest = (|| {
-            reject_link(&path)?;
-            let manifest = read_folder_manifest(&path)?;
-            if entry.file_name().to_str() != Some(manifest.id.as_str()) {
-                return Err(Error::new(format!(
-                    "Folder {} does not match manifest id {}. Reinstall the add-on.",
-                    path.display(),
-                    manifest.id
-                )));
-            }
-            validate_folder_programs(&path, &manifest)?;
-            Ok(manifest)
-        })();
+        let manifest = validate_installed_folder(&path, entry.file_name().to_str().unwrap_or(""));
         installed.push(InstalledAddon { path, manifest });
     }
     installed.sort_by(|a, b| a.path.cmp(&b.path));
@@ -681,6 +717,21 @@ mod tests {
     use serde_json::json;
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rc1_directory_exchange_publishes_whole_stage() {
+        let dir = TestDir::new();
+        let old = dir.0.join("com.example.test");
+        let new = dir.0.join(".com.example.test.install-1-1");
+        for (folder, contents) in [(&old, "old"), (&new, "new")] {
+            fs::create_dir(folder).unwrap();
+            fs::write(folder.join(contents), contents).unwrap();
+        }
+        assert!(swap_directories(&new, &old).unwrap());
+        assert_eq!(fs::read(old.join("new")).unwrap(), b"new");
+        assert_eq!(fs::read(new.join("old")).unwrap(), b"old");
+    }
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 

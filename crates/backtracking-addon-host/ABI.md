@@ -50,7 +50,10 @@ take_result. All other operations in the table return tickets. Consuming a compl
 ticket with take_result updates the completed list and generation.
 take_control, positions_since and control_reply return the value envelope immediately
 and do not allocate a ticket or advance generation. control_reply acknowledges admission
-to the worker; the worker drops a stale run or expired request. A ticket is scoped to its handle. Before readiness callers may receive busy.
+to the worker. Echo addon_id, run and the opaque request_id from take_control unchanged.
+The host maps that dispatch back to the original add-on wire id. Reuse of a completed
+wire id starts a fresh dispatch. Stale replies are dropped and a reply accepted at or
+after its deadline yields one timeout. A ticket is scoped to its handle. Before readiness callers may receive busy.
 
 |op|additional fields or return value|
 |---|---|
@@ -70,6 +73,9 @@ to the worker; the worker drops a stale run or expired request. A ticket is scop
 |control_reply|addon_id, run, request_id, exactly one of result (ControlResult) or error ({code,message})|
 |positions_since|cursor (u64, initially zero); returns {cursor,positions:[{sequence,addon_id,source_id,time,channels}]} with Sender clock nanoseconds|
 |take_result|ticket (u64); immediate, returns busy if pending, not_found if unknown|
+
+Package review accepts regular input files up to 1 GiB, including ZIP overhead.
+The SDK enforces its separate 512 MiB unpacked limit.
 
 A fresh install is disabled. If its id was absent from snapshot.addons before
 installation, the app calls set_enabled(id, true) after install succeeds to enable

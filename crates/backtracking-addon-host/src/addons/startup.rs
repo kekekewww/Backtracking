@@ -45,7 +45,10 @@ impl PrimaryLease {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err("The add-ons folder is a symbolic link or reparse point".into());
             }
-            Ok(_) => cleanup_entries(&addons, stale_addon_entry)?,
+            Ok(_) => {
+                recover_backups(&addons)?;
+                cleanup_entries(&addons, stale_addon_entry)?;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.to_string()),
         }
@@ -68,20 +71,65 @@ fn stale_addon_entry(name: &str) -> Option<bool> {
     if let Some(id) = name.strip_suffix(".lock") {
         return validate_id(id).is_ok().then_some(false);
     }
-    [".backup-", ".install-"]
-        .iter()
-        .any(|separator| {
-            name.rsplit_once(separator).is_some_and(|(id, suffix)| {
-                validate_id(id).is_ok()
-                    && suffix.split_once('-').is_some_and(|(pid, sequence)| {
-                        pid.bytes().all(|byte| byte.is_ascii_digit())
-                            && sequence.bytes().all(|byte| byte.is_ascii_digit())
-                            && pid.parse::<u32>().is_ok()
-                            && sequence.parse::<u64>().is_ok()
-                    })
-            })
-        })
-        .then_some(true)
+    transaction_id(name, ".install-").map(|_| true)
+}
+
+fn transaction_id<'a>(name: &'a str, separator: &str) -> Option<&'a str> {
+    let (id, suffix) = name.rsplit_once(separator)?;
+    validate_id(id).ok()?;
+    let (pid, sequence) = suffix.split_once('-')?;
+    if !suffix.bytes().all(|b| b == b'-' || b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse::<u32>().ok()?;
+    sequence.parse::<u64>().ok()?;
+    Some(id)
+}
+
+fn recover_backups(addons: &Path) -> Result<(), String> {
+    use backtracking_addon::package::validate_installed_folder;
+    let mut groups = std::collections::BTreeMap::<String, Vec<PathBuf>>::new();
+    for entry in fs::read_dir(addons).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        if let Some(id) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix('.'))
+            .and_then(|n| transaction_id(n, ".backup-"))
+        {
+            groups.entry(id.into()).or_default().push(entry.path());
+        }
+    }
+    for (id, backups) in groups {
+        let target = addons.join(&id);
+        match fs::symlink_metadata(&target) {
+            Ok(_) if validate_installed_folder(&target, &id).is_ok() => {
+                for backup in backups {
+                    if fs::symlink_metadata(&backup)
+                        .map_err(|e| e.to_string())?
+                        .is_dir()
+                    {
+                        fs::remove_dir_all(backup).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut valid = backups
+                    .iter()
+                    .filter(|p| validate_installed_folder(p, &id).is_ok());
+                let Some(previous) = valid.next() else {
+                    return Err(format!("Cannot recover {id}: no valid backup"));
+                };
+                if valid.next().is_some() {
+                    return Err(format!("Cannot recover {id}: multiple valid backups"));
+                }
+                fs::rename(previous, target).map_err(|e| e.to_string())?;
+            }
+            Ok(_) => {} // Preserve the backup if the visible package needs repair.
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
 }
 
 fn cleanup_entries(root: &Path, matches: impl Fn(&str) -> Option<bool>) -> Result<(), String> {

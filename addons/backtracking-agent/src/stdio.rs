@@ -64,6 +64,13 @@ struct Forwarder {
     connection: Arc<Mutex<Option<Connection>>>,
 }
 
+/// Use a parsed numeric socket address as the only source for the outgoing URL.
+fn local_mcp_url(url: &str) -> Option<String> {
+    let authority = url.strip_prefix("http://")?.strip_suffix("/mcp")?;
+    let addr: std::net::SocketAddr = authority.parse().ok()?;
+    (addr.ip().is_loopback() && addr.port() != 0).then(|| format!("http://{addr}/mcp"))
+}
+
 impl Forwarder {
     fn not_running(&self, why: &str) -> String {
         format!(
@@ -94,12 +101,19 @@ impl Forwarder {
         if let Some(old) = slot.take() {
             let _ = old.service.cancel().await;
         }
-        if !endpoint.is_current() {
+        if !endpoint.is_current(&self.endpoint_path) {
             return Err(self.not_running("the connection file is from a run that has ended"));
         }
-        let config = StreamableHttpClientTransportConfig::with_uri(endpoint.url.clone())
-            .auth_header(endpoint.token.clone());
-        let transport = StreamableHttpClientTransport::from_config(config);
+        let url = local_mcp_url(&endpoint.url)
+            .ok_or_else(|| self.not_running("expected a local HTTP MCP endpoint"))?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| e.to_string())?;
+        let config =
+            StreamableHttpClientTransportConfig::with_uri(url).auth_header(endpoint.token.clone());
+        let transport = StreamableHttpClientTransport::with_client(client, config);
         let service = match tokio::time::timeout(CONNECT_WITHIN, ().serve(transport)).await {
             Ok(Ok(service)) => service,
             Ok(Err(error)) => {
@@ -190,5 +204,28 @@ impl ServerHandler for Forwarder {
             ));
         }
         Ok(self.forward(request).await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_mcp_url;
+
+    #[test]
+    fn rc1_stdio_accepts_only_numeric_loopback_mcp() {
+        for url in ["http://127.0.0.1:1234/mcp", "http://[::1]:80/mcp"] {
+            assert_eq!(local_mcp_url(url).as_deref(), Some(url));
+        }
+        for url in [
+            "http://192.0.2.1:80/mcp",
+            "http://localhost:80/mcp",
+            "https://127.0.0.1:443/mcp",
+            "http://127.0.0.1:0/mcp",
+            "http://127.0.0.1:80/other",
+            "http://user@127.0.0.1:80/mcp",
+            "http://127.0.0.1:80/mcp?q=1",
+        ] {
+            assert!(local_mcp_url(url).is_none());
+        }
     }
 }

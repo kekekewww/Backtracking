@@ -627,6 +627,75 @@ fn hello_expired(started: Instant, now: Instant, connected: bool) -> bool {
     !connected && now.saturating_duration_since(started) >= HELLO_TIMEOUT
 }
 
+// The add-on owns wire ids and may reuse them. The application echoes a
+// per-dispatch request_id together with the run, both already in the C ABI.
+#[derive(Default)]
+struct PendingControls {
+    next: u64,
+    by_wire: BTreeMap<String, PendingControl>,
+}
+
+struct PendingControl {
+    dispatch: String,
+    deadline: Instant,
+}
+
+impl PendingControls {
+    fn insert(&mut self, wire: String, deadline: Instant) -> Option<String> {
+        self.next = self.next.checked_add(1)?;
+        let dispatch = self.next.to_string();
+        self.by_wire.insert(
+            wire,
+            PendingControl {
+                dispatch: dispatch.clone(),
+                deadline,
+            },
+        );
+        Some(dispatch)
+    }
+
+    fn revoke(&mut self) -> impl Iterator<Item = String> {
+        // Keep the dispatch counter across a revoke and re-grant in the same run.
+        std::mem::take(&mut self.by_wire).into_keys()
+    }
+
+    fn expire(&mut self, now: Instant) -> Vec<(String, ControlReply)> {
+        let mut expired = Vec::new();
+        self.by_wire.retain(|wire, pending| {
+            if now < pending.deadline {
+                return true;
+            }
+            expired.push((pending.dispatch.clone(), timeout_reply(wire.clone())));
+            false
+        });
+        expired
+    }
+
+    fn complete(&mut self, mut reply: ControlReply, now: Instant) -> Option<ControlReply> {
+        let echoed = reply.id.as_ref()?;
+        let (wire, _) = self
+            .by_wire
+            .iter()
+            .find(|(_, pending)| pending.dispatch == *echoed)?;
+        let (wire, pending) = self.by_wire.remove_entry(&wire.clone())?;
+        if now >= pending.deadline {
+            return Some(timeout_reply(wire));
+        }
+        reply.id = Some(wire);
+        Some(reply)
+    }
+}
+
+fn timeout_reply(wire: String) -> ControlReply {
+    ControlReply::failure(
+        Some(wire),
+        ControlError::new(
+            control_codes::TIMEOUT,
+            "Backtracking did not finish this in time; it may still happen",
+        ),
+    )
+}
+
 struct Runtime {
     process: AddonProcess,
     started: Instant,
@@ -638,7 +707,7 @@ struct Runtime {
     /// Numbers this run, so a reply meant for an earlier run is dropped.
     run: u64,
     /// Control requests waiting for the main window's reply, with when they time out.
-    control: BTreeMap<String, Instant>,
+    control: PendingControls,
 }
 
 struct Entry {
@@ -1000,11 +1069,7 @@ impl Worker {
                 else {
                     return;
                 };
-                let waiting = reply
-                    .id
-                    .as_ref()
-                    .is_some_and(|request| runtime.control.remove(request).is_some());
-                if waiting {
+                if let Some(reply) = runtime.control.complete(reply, Instant::now()) {
                     if let Some(connection) = &mut runtime.connection {
                         let _ = connection.send(&HostMessage::ControlReply(reply));
                     }
@@ -1032,7 +1097,7 @@ impl Worker {
         };
         let mut refused = Vec::new();
         if !allowed {
-            refused.extend(std::mem::take(&mut runtime.control).into_keys());
+            refused.extend(runtime.control.revoke());
         }
         if let Some(connection) = &mut runtime.connection {
             for request in refused {
@@ -1073,13 +1138,13 @@ impl Worker {
                     control_codes::INVALID_REQUEST,
                     "A control request needs an id",
                 )),
-                (Some(request), Ok(_)) if runtime.control.contains_key(request) => {
+                (Some(request), Ok(_)) if runtime.control.by_wire.contains_key(request) => {
                     Some(ControlError::new(
                         control_codes::DUPLICATE_ID,
                         "A request with this id is still waiting for its reply",
                     ))
                 }
-                (Some(_), Ok(_)) if runtime.control.len() >= MAX_CONTROL_IN_FLIGHT => {
+                (Some(_), Ok(_)) if runtime.control.by_wire.len() >= MAX_CONTROL_IN_FLIGHT => {
                     Some(ControlError::new(
                         control_codes::TOO_MANY_REQUESTS,
                         format!(
@@ -1102,9 +1167,18 @@ impl Worker {
         let (Some(request), Ok(command)) = (request, command) else {
             return;
         };
-        runtime
+        let Some(dispatch) = runtime
             .control
-            .insert(request.clone(), Instant::now() + command.reply_within());
+            .insert(request.clone(), Instant::now() + command.reply_within())
+        else {
+            if let Some(connection) = &mut runtime.connection {
+                let _ = connection.send(&HostMessage::ControlReply(ControlReply::failure(
+                    Some(request),
+                    ControlError::new(control_codes::FAILED, "Control request sequence exhausted"),
+                )));
+            }
+            return;
+        };
         let addon_name = entry
             .info
             .manifest
@@ -1118,7 +1192,7 @@ impl Worker {
                 addon_id: id.into(),
                 addon_name,
                 run: runtime.run,
-                request_id: request,
+                request_id: dispatch,
                 command,
             });
         notify(&self.shared.control_callbacks);
@@ -1130,23 +1204,10 @@ impl Worker {
             let Some(runtime) = entry.runtime.as_mut() else {
                 continue;
             };
-            let late: Vec<String> = runtime
-                .control
-                .iter()
-                .filter(|(_, deadline)| now >= **deadline)
-                .map(|(request, _)| request.clone())
-                .collect();
-            for request in late {
-                self.shared.discard_control(&entry.info.id, Some(&request));
-                runtime.control.remove(&request);
+            for (dispatch, reply) in runtime.control.expire(now) {
+                self.shared.discard_control(&entry.info.id, Some(&dispatch));
                 if let Some(connection) = &mut runtime.connection {
-                    let _ = connection.send(&HostMessage::ControlReply(ControlReply::failure(
-                        Some(request),
-                        ControlError::new(
-                            control_codes::TIMEOUT,
-                            "Backtracking did not finish this in time; it may still happen",
-                        ),
-                    )));
+                    let _ = connection.send(&HostMessage::ControlReply(reply));
                 }
             }
         }
@@ -1230,7 +1291,7 @@ impl Worker {
                 stop: None,
                 restart_after_stop: false,
                 run: self.runs,
-                control: BTreeMap::new(),
+                control: PendingControls::default(),
             })
         })();
         match result {
@@ -1868,6 +1929,21 @@ fn spawn_task<T: Send + 'static>(
     }
 }
 
+// Allow ZIP headers and compressed representation overhead above the 512 MiB unpacked limit.
+const MAX_PACKAGE_INPUT: u64 = 1024 * 1024 * 1024;
+
+fn copy_package_input(
+    input: &mut impl Read,
+    out: &mut impl Write,
+    limit: u64,
+) -> Result<(), String> {
+    let n = std::io::copy(&mut input.take(limit), out).map_err(|e| e.to_string())?;
+    if n == limit && input.read(&mut [0]).map_err(|e| e.to_string())? != 0 {
+        return Err("Add-on package exceeds the input size limit".into());
+    }
+    Ok(())
+}
+
 fn prepare_package(root: &Path, original: &Path) -> Result<PreparedPackage, String> {
     if !original
         .extension()
@@ -1879,15 +1955,23 @@ fn prepare_package(root: &Path, original: &Path) -> Result<PreparedPackage, Stri
     // Hash and inspect the same private bytes, so replacing the download cannot
     // change the package between checking its identity and installing it.
     let path = root.join(format!(".install-{}.btaddon", random_token()?));
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(original)
+        .map_err(|e| e.to_string())?;
+    let meta = input.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() || meta.len() > MAX_PACKAGE_INPUT {
+        return Err("Expected a regular add-on package of at most 1 GiB".into());
+    }
+    let mut output = OpenOptions::new()
+        .mode(0o600)
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
     let result = (|| {
-        let mut input = File::open(original).map_err(|e| e.to_string())?;
-        let mut output = OpenOptions::new()
-            .mode(0o600)
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .map_err(|e| e.to_string())?;
-        std::io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
+        copy_package_input(&mut input, &mut output, MAX_PACKAGE_INPUT)?;
         #[cfg(target_os = "macos")]
         package::quarantine::Quarantine::read(&input)
             .and_then(|q| q.apply(&output))
@@ -2214,6 +2298,181 @@ mod tests {
     impl Drop for TestDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn rc1_control_deadline_before_equal_after_once() {
+        let deadline = Instant::now();
+        let tick = Duration::from_nanos(1);
+        for (now, late) in [
+            (deadline - tick, false),
+            (deadline, true),
+            (deadline + tick, true),
+        ] {
+            let mut controls = PendingControls::default();
+            let token = controls.insert("wire".into(), deadline).unwrap();
+            let reply = ControlReply::success(token, &ControlResult::default());
+            let outcome = controls.complete(reply.clone(), now).unwrap();
+            assert_eq!(outcome.id.as_deref(), Some("wire"));
+            assert_eq!(
+                outcome.error.as_ref().map(|e| e.code.as_str()),
+                late.then_some(control_codes::TIMEOUT)
+            );
+            assert!(controls.complete(reply, now).is_none());
+            assert!(controls.expire(deadline).is_empty());
+        }
+        // Polling may win the race with the receiver, also with one wire reply.
+        let mut controls = PendingControls::default();
+        let dispatch = controls.insert("wire".into(), deadline).unwrap();
+        assert!(controls.expire(deadline - tick).is_empty());
+        let expired = controls.expire(deadline);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, dispatch);
+        assert_eq!(
+            expired[0].1.error.as_ref().unwrap().code,
+            control_codes::TIMEOUT
+        );
+        assert!(
+            controls
+                .complete(
+                    ControlReply::success(dispatch, &ControlResult::default()),
+                    deadline
+                )
+                .is_none()
+        );
+        assert!(controls.expire(deadline + tick).is_empty());
+    }
+
+    #[test]
+    fn rc1_reused_control_id_and_regrant_reject_stale_dispatch() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        let mut controls = PendingControls::default();
+        let issue = |c: &mut PendingControls| {
+            ControlReply::success(
+                c.insert("same".into(), deadline).unwrap(),
+                &ControlResult::default(),
+            )
+        };
+        let old = issue(&mut controls);
+        assert_eq!(
+            controls.complete(old.clone(), now).unwrap().id.as_deref(),
+            Some("same")
+        );
+        let current = issue(&mut controls);
+        assert!(controls.complete(old, now).is_none());
+        assert_eq!(
+            controls.complete(current, now).unwrap().id.as_deref(),
+            Some("same")
+        );
+        let revoked = issue(&mut controls);
+        assert_eq!(controls.revoke().collect::<Vec<_>>(), ["same"]);
+        let regranted = issue(&mut controls);
+        assert!(controls.complete(revoked, now).is_none());
+        assert!(controls.complete(regranted, now).is_some());
+    }
+
+    #[test]
+    fn rc1_input_copy_checks_type_length_and_stream_growth() {
+        let root = TestDir::new();
+        let path = root.0.join("fixture.btaddon");
+        fs::create_dir(&path).unwrap();
+        assert!(prepare_package(&root.0, &path).is_err());
+        fs::remove_dir(&path).unwrap();
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_PACKAGE_INPUT + 1)
+            .unwrap();
+        assert!(
+            prepare_package(&root.0, &path)
+                .err()
+                .unwrap()
+                .contains("1 GiB")
+        );
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 1);
+        for size in [3, 4, 5] {
+            let data = vec![0; size];
+            let mut copy = Vec::new();
+            assert_eq!(
+                copy_package_input(&mut data.as_slice(), &mut copy, 4).is_ok(),
+                size <= 4
+            );
+            assert_eq!(copy.len(), size.min(4));
+        }
+    }
+
+    #[test]
+    fn rc1_startup_restores_complete_version_across_swap_and_retry() {
+        for phase in 0..4 {
+            let dir = TestDir::new();
+            let lease = startup::PrimaryLease::acquire(&dir.0).unwrap();
+            let addons = dir.0.join("addons");
+            let target = addons.join("com.example.test");
+            let stage = addons.join(".com.example.test.install-1-1");
+            let backup = addons.join(".com.example.test.backup-1-2");
+            let mut manifest = info(Vec::new()).manifest.unwrap();
+            let program = manifest.run.values().next().unwrap().program.clone();
+            for (folder, version) in [(&target, "1"), (&stage, "2")] {
+                fs::create_dir_all(folder.join(&program).parent().unwrap()).unwrap();
+                manifest.version = version.into();
+                fs::write(
+                    folder.join("addon.json"),
+                    serde_json::to_vec(&manifest).unwrap(),
+                )
+                .unwrap();
+                fs::write(folder.join(&program), version).unwrap();
+            }
+            if phase > 0 {
+                fs::rename(&target, &backup).unwrap();
+            }
+            if phase > 1 {
+                fs::rename(&stage, &target).unwrap();
+            }
+            if phase > 2 {
+                fs::remove_dir_all(&backup).unwrap();
+            }
+            let wanted = if phase < 2 { "1" } else { "2" };
+            for _ in 0..2 {
+                lease.cleanup().unwrap();
+                assert_eq!(
+                    package::validate_installed_folder(&target, "com.example.test")
+                        .unwrap()
+                        .version,
+                    wanted
+                );
+                assert_eq!(fs::read_to_string(target.join(&program)).unwrap(), wanted);
+                assert!(!stage.exists() && !backup.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn rc1_ambiguous_backups_remain_available_on_retry() {
+        let dir = TestDir::new();
+        let addons = dir.0.join("addons");
+        let lease = startup::PrimaryLease::acquire(&dir.0).unwrap();
+        let manifest = info(Vec::new()).manifest.unwrap();
+        let program = &manifest.run.values().next().unwrap().program;
+        for suffix in ["2-1", "2-2"] {
+            let folder = addons.join(format!(".{}.backup-{suffix}", manifest.id));
+            fs::create_dir_all(folder.join(program).parent().unwrap()).unwrap();
+            fs::write(
+                folder.join("addon.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            fs::write(folder.join(program), suffix).unwrap();
+        }
+        for _ in 0..2 {
+            assert!(
+                lease
+                    .cleanup()
+                    .unwrap_err()
+                    .contains("multiple valid backups")
+            );
+            assert_eq!(fs::read_dir(&addons).unwrap().count(), 2);
+            assert!(!addons.join(&manifest.id).exists());
         }
     }
 
@@ -2838,7 +3097,7 @@ mod tests {
                     stop: Some((Instant::now(), AddonState::Stopped)),
                     restart_after_stop: false,
                     run: 1,
-                    control: BTreeMap::new(),
+                    control: PendingControls::default(),
                 }),
                 restarts: RestartPolicy::default(),
                 position_filter: PositionFilter::default(),
@@ -2919,7 +3178,7 @@ mod tests {
                     stop: None,
                     restart_after_stop: false,
                     run: worker.runs,
-                    control: BTreeMap::new(),
+                    control: PendingControls::default(),
                 }),
                 restarts: RestartPolicy::default(),
                 position_filter: PositionFilter::default(),
@@ -3032,7 +3291,7 @@ mod tests {
         );
         let calls = handle.take_control_calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].request_id, "c");
+        assert!(!calls[0].request_id.is_empty());
         assert_eq!(calls[0].addon_name, "Test");
         assert_eq!(
             calls[0].command,
@@ -3052,7 +3311,7 @@ mod tests {
             worker.command(Command::ControlReply {
                 addon_id,
                 run,
-                reply: ControlReply::success("c", &state),
+                reply: ControlReply::success(calls[0].request_id.clone(), &state),
             });
         }
         let reply = next_control(&mut worker, &mut client);
@@ -3064,6 +3323,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .control
+                .by_wire
                 .is_empty()
         );
 
@@ -3080,7 +3340,7 @@ mod tests {
         assert_eq!(reply["error"]["code"], "too_many_requests");
 
         // Unanswered requests time out with an error.
-        for deadline in worker
+        for pending in worker
             .entries
             .get_mut(&id)
             .unwrap()
@@ -3088,10 +3348,11 @@ mod tests {
             .as_mut()
             .unwrap()
             .control
+            .by_wire
             .values_mut()
             .take(1)
         {
-            *deadline = Instant::now();
+            pending.deadline = Instant::now();
         }
         let reply = next_control(&mut worker, &mut client);
         assert_eq!(reply["error"]["code"], "timeout");
