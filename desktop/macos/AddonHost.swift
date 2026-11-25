@@ -639,6 +639,8 @@ final class AddonHostClient {
     private var callbacks: [UInt64: (Data) -> Void] = [:]
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
+    /// Receives each newly read snapshot before the completions it carries run, so they see it.
+    var onSnapshot: ((AddonSnapshot) -> Void)?
     let dataRoot: String
     let isPrimary: Bool
     #if BACKTRACKING_CAPTURE_VERIFY
@@ -691,6 +693,7 @@ final class AddonHostClient {
         }
         snapshot = parsed
         lastGeneration = parsed.generation
+        onSnapshot?(parsed)
         if !parsed.completed.isEmpty {
             for ticket in parsed.completed {
                 let resultData = rawCommand(["schema": 1, "op": "take_result", "ticket": ticket])
@@ -1565,6 +1568,9 @@ enum AddonFormatting {
 
 #if BACKTRACKING_CAPTURE_VERIFY
 extension AddonHostClient {
+    /// The host's own generation counter, read without polling.
+    var verifyHostGeneration: UInt64? { handle.map { bt_addon_host_generation($0) } }
+
     /// Ticket B completes after the poll read its snapshot but before the poll finished.
     /// The host then stays quiet; B's completion must still run, exactly once, like A's.
     static func verifyTicketCompletions() throws {

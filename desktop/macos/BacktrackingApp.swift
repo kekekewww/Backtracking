@@ -73,6 +73,12 @@ func verifyMacTestCopyIsolation() throws {
 }
 
 @MainActor
+func verifyMacControlBatchSnapshotSync() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyControlBatchSnapshotSync()
+}
+
+@MainActor
 func verifyMacTerminationSaves() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTerminationSaves()
@@ -1938,11 +1944,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let appVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.1"
         let addonRoot = TestCopyConfig.current.addonDataRoot.path
         try? FileManager.default.createDirectory(atPath: addonRoot, withIntermediateDirectories: true)
-        addonHost = AddonHostClient(dataRoot: addonRoot, appVersion: appVersion, primary: !independentWindow)
-        if let snap = addonHost?.snapshot {
-            currentAddonSnapshot = snap
-            lastAddonSnapshotForUI = snap
-        }
+        attach(addonHost: AddonHostClient(dataRoot: addonRoot, appVersion: appVersion, primary: !independentWindow))
         recomputeLook(refreshAppearanceTab: false)
         if independentWindow || testCopy { beginCaptureAfterUpdate() }
         else { startupUpdater.checkAtLaunch { [weak self] in self?.beginCaptureAfterUpdate() } }
@@ -1988,6 +1990,79 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
               controller.optionsMeterPopups.count == 3, controller.meterModes == [.dbfs, .vu, .lufs],
               rows.map(\.view) == [0, 0, 67, 68, 3, 4, 5], rows.last?.title == "C · FC" else {
             throw CaptureError("The Options or waveform rows do not match the loaded sources")
+        }
+    }
+
+    /// The grant check before each control request can read a newer add-on snapshot than the window
+    /// shows. The window must catch up after the batch, and stay caught up when the next poll finds
+    /// nothing new; a completion must see the snapshot that carried it.
+    static func verifyControlBatchSnapshotSync() throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-batch-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        let root = scratch.appendingPathComponent("addons-root", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        guard let host = AddonHostClient(dataRoot: root.path, appVersion: "0.2.1", primary: true) else {
+            throw CaptureError("AddonHostClient failed to start")
+        }
+        controller.attach(addonHost: host)
+        defer { host.shutdownAndFree(); controller.addonHost = nil }
+        func pump(for seconds: Double, until done: () -> Bool = { false }) {
+            let deadline = ProcessInfo.processInfo.systemUptime + seconds
+            while !done() && ProcessInfo.processInfo.systemUptime < deadline {
+                controller.pollAddonHost()
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+        }
+        func waitForHost(past generation: UInt64) -> Bool {
+            let deadline = ProcessInfo.processInfo.systemUptime + 2
+            while (host.verifyHostGeneration ?? generation) == generation && ProcessInfo.processInfo.systemUptime < deadline {
+                Thread.sleep(forTimeInterval: 0.002)
+            }
+            return (host.verifyHostGeneration ?? generation) != generation
+        }
+        pump(for: 3) { host.snapshot.ready }
+        pump(for: 0.3)
+        guard host.snapshot.ready, let quiet = host.verifyHostGeneration else { throw CaptureError("Add-on host did not become ready") }
+        let command = AddonControlCommand(command: "get_state", from_seconds_ago: nil, to_seconds_ago: nil,
+            start_frame: nil, end_frame: nil, lane: nil, first: nil, last: nil, seconds: nil, folder: nil, source: nil)
+        let call = AddonControlCall(addon_id: "verify.batch", addon_name: "Verify", run: 1, request_id: "1", command: command)
+        var problems: [String] = []
+
+        // A command finishes while the window is idle; the grant check of the next batch reads it.
+        var seenByCompletion: UInt64?
+        var carrying: UInt64?
+        host.inspect(path: scratch.appendingPathComponent("missing-1.btaddon").path) { _ in
+            seenByCompletion = currentAddonSnapshot.generation
+            carrying = host.snapshot.generation
+        }
+        guard waitForHost(past: quiet) else { throw CaptureError("The inspect command never finished") }
+        controller.executeControlCalls([call])
+        if seenByCompletion == nil || seenByCompletion != carrying {
+            problems.append("completion saw snapshot \(seenByCompletion.map(String.init) ?? "none"), carried by \(carrying.map(String.init) ?? "none")")
+        }
+        if controller.lastAddonSnapshotForUI.generation != host.snapshot.generation {
+            problems.append("after the batch the window shows \(controller.lastAddonSnapshotForUI.generation), host snapshot \(host.snapshot.generation)")
+        }
+
+        // The poll takes a result, which advances the host once more; the batch's check reads that,
+        // and the poll after it finds nothing new.
+        pump(for: 0.3)
+        var done = false
+        host.inspect(path: scratch.appendingPathComponent("missing-2.btaddon").path) { _ in done = true }
+        guard let before = host.verifyHostGeneration, waitForHost(past: before) else { throw CaptureError("The second inspect never finished") }
+        controller.pollAddonHost()
+        guard done else { throw CaptureError("The second inspect's completion did not run") }
+        controller.executeControlCalls([call])
+        controller.pollAddonHost()
+        if controller.lastAddonSnapshotForUI.generation != host.snapshot.generation
+            || host.snapshot.generation != host.verifyHostGeneration {
+            problems.append("a quiet poll left the window at \(controller.lastAddonSnapshotForUI.generation), host snapshot \(host.snapshot.generation), host \(host.verifyHostGeneration ?? 0)")
+        }
+        guard problems.isEmpty else {
+            throw CaptureError("Control batch left the window behind the add-on host: " + problems.joined(separator: "; "))
         }
     }
 
@@ -5997,50 +6072,67 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     // MARK: - Stage B: Add-on Host Polling, Channel Groups (Pkg 3), Add-ons Page (Pkg 16/21),
     // Add-on Sources (Pkg 18), Positions & Clip Exported (Pkg 19), Look (Pkg 20), Control (Pkg 17)
 
+    private func attach(addonHost host: AddonHostClient?) {
+        addonHost = host
+        // A completion that redraws must already see the snapshot that carried it.
+        host?.onSnapshot = { currentAddonSnapshot = $0 }
+        if let snap = host?.snapshot {
+            currentAddonSnapshot = snap
+            lastAddonSnapshotForUI = snap
+        }
+    }
+
+    /// Brings the window up to the host's latest snapshot. Any read of the snapshot (a poll, or the
+    /// grant check before each control request) can advance it, so this compares generations
+    /// with what the window last showed instead of trusting one poll's answer.
+    private func syncAddonSnapshotUI() {
+        guard let host = addonHost else { return }
+        let snap = host.snapshot
+        currentAddonSnapshot = snap
+        guard snap.generation != lastAddonSnapshotForUI.generation else { return }
+        let prev = lastAddonSnapshotForUI
+        lastAddonSnapshotForUI = snap
+        if prev.appearances != snap.appearances || prev.addons.map(\.id) != snap.addons.map(\.id) {
+            recomputeLook(refreshAppearanceTab: true)
+        }
+        // Refresh cached source choices if any running add-on sources changed.
+        let sourcesChanged = !prev.addons.elementsEqual(snap.addons) { a, b in
+            a.id == b.id && a.state == b.state && a.sources == b.sources
+        }
+        if sourcesChanged {
+            cachedSourceChoices = nil
+            if !paused, captureLanes.contains(where: { $0.source.isAddon }) {
+                if tap?.refreshSources() == true { reconnectConfiguredSources() }
+            }
+            refreshWaveform()
+        }
+        let optionsVisible = optionsPanel?.isVisible == true
+        if optionsVisible, let tabs = optionTabs {
+            let selectedLabel = tabs.selectedTabViewItem?.label
+            if selectedLabel == "Add-ons" && !(optionsPanel?.firstResponder is NSTextView) {
+                reloadAddonsTab()
+            } else if selectedLabel == "Sources" && sourcesChanged {
+                let sourcesStructureChanged = !prev.addons.elementsEqual(snap.addons) { a, b in
+                    a.id == b.id && a.state == b.state && a.sources.elementsEqual(b.sources) { s1, s2 in
+                        s1.id == s2.id && s1.format == s2.format && s1.formats == s2.formats
+                            && s1.sender == s2.sender && s1.groups == s2.groups
+                    }
+                }
+                if sourcesStructureChanged {
+                    replaceOptionsTab(with: makeSourceTab())
+                    refreshSourceOptions()
+                } else {
+                    refreshAddonTransportControls()
+                }
+            }
+        }
+        waveform?.needsDisplay = true
+    }
+
     private func pollAddonHost() {
         guard let host = addonHost else { return }
-        let changed = host.pollSnapshot()
-        if changed {
-            let snap = host.snapshot
-            currentAddonSnapshot = snap
-            let prev = lastAddonSnapshotForUI
-            lastAddonSnapshotForUI = snap
-            if prev.appearances != snap.appearances || prev.addons.map(\.id) != snap.addons.map(\.id) {
-                recomputeLook(refreshAppearanceTab: true)
-            }
-            // Refresh cached source choices if any running add-on sources changed.
-            let sourcesChanged = !prev.addons.elementsEqual(snap.addons) { a, b in
-                a.id == b.id && a.state == b.state && a.sources == b.sources
-            }
-            if sourcesChanged {
-                cachedSourceChoices = nil
-                if !paused, captureLanes.contains(where: { $0.source.isAddon }) {
-                    if tap?.refreshSources() == true { reconnectConfiguredSources() }
-                }
-                refreshWaveform()
-            }
-            let optionsVisible = optionsPanel?.isVisible == true
-            if optionsVisible, let tabs = optionTabs {
-                let selectedLabel = tabs.selectedTabViewItem?.label
-                if selectedLabel == "Add-ons" && !(optionsPanel?.firstResponder is NSTextView) {
-                    reloadAddonsTab()
-                } else if selectedLabel == "Sources" && sourcesChanged {
-                    let sourcesStructureChanged = !prev.addons.elementsEqual(snap.addons) { a, b in
-                        a.id == b.id && a.state == b.state && a.sources.elementsEqual(b.sources) { s1, s2 in
-                            s1.id == s2.id && s1.format == s2.format && s1.formats == s2.formats
-                                && s1.sender == s2.sender && s1.groups == s2.groups
-                        }
-                    }
-                    if sourcesStructureChanged {
-                        replaceOptionsTab(with: makeSourceTab())
-                        refreshSourceOptions()
-                    } else {
-                        refreshAddonTransportControls()
-                    }
-                }
-            }
-            waveform?.needsDisplay = true
-        }
+        host.pollSnapshot()
+        syncAddonSnapshotUI()
         // Lightweight transport position refresh on Sources tab & main window chip.
         let now = ProcessInfo.processInfo.systemUptime
         if now - lastAddonTransportUIRefresh >= 0.2 {
@@ -7282,6 +7374,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             }
             executeSingleControlCall(host: host, call: call)
         }
+        // The grant checks may have read a newer snapshot than the window shows.
+        syncAddonSnapshotUI()
     }
 
     private func executeSingleControlCall(host: AddonHostClient, call: AddonControlCall) {
