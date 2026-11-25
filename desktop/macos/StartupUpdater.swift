@@ -807,7 +807,9 @@ enum StartupUpdaterVerification {
         if args.count == 3, args[1] == updateRecoveryFlag {
             let dir = URL(fileURLWithPath: args[2], isDirectory: true)
             let recovered = dir.appendingPathComponent("recovered")
-            precondition(FileManager.default.fileExists(atPath: recovered.path))
+            // The test waits for this child before it removes its folder; should the folder be
+            // gone anyway, the child ends with a status instead of a crash report.
+            guard FileManager.default.fileExists(atPath: recovered.path) else { exit(3) }
             try? FileManager.default.removeItem(at: dir)
             return true
         }
@@ -857,6 +859,15 @@ enum StartupUpdaterVerification {
         )
         try JSONEncoder().encode(transaction).write(to: transactionDirectory.appendingPathComponent(UpdateTransaction.name))
         applyUpdate(at: transactionDirectory)
+        // A failed update starts the original app with the recovery flag; that child reads the
+        // transaction folder and then removes it. Wait for it before this test removes the root.
+        if !succeeds {
+            let deadline = Date().addingTimeInterval(15)
+            while fm.fileExists(atPath: transactionDirectory.path), Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            precondition(!fm.fileExists(atPath: transactionDirectory.path), "The recovery child did not finish")
+        }
         let plist = installed.appendingPathComponent("Contents/Info.plist")
         let fields = try PropertyListSerialization.propertyList(from: Data(contentsOf: plist), format: nil) as? [String: Any]
         precondition(fields?["CFBundleShortVersionString"] as? String == (succeeds ? "0.1.6" : "0.1.5"))
