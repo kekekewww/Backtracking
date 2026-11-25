@@ -13,6 +13,9 @@
 #
 # Start the copy with BACKTRACKING_TEST_INSTANCE and BACKTRACKING_TEST_DATA_DIR set; the app
 # refuses to run as a test copy from a bundle that still has the installed app's identifier.
+#
+# BACKTRACKING_TEST_COPY_ALSO_REFUSE names one more folder no test copy may be made in, besides
+# the user's real settings and recordings folders. It can only add a refusal.
 set -euo pipefail
 
 prefix=com.backtracking.audio.capture.testcopy.
@@ -70,14 +73,15 @@ destination="$(cd -- "$existing" && pwd -P)$rest"
 # The disk does not tell case apart and stores names in one Unicode form, while pwd -P keeps the
 # spelling it was given; tr leaves non-ASCII letters alone and == does not normalize. So folders
 # that exist are compared by device and inode; only the part of a path that does not exist yet is
-# compared as text, in lower case.
+# compared as text, in lower case. stat -L: a folder that is a symlink, such as recordings kept on
+# another disk, is the folder it leads to.
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 # The device and inode of $1 and of every folder above it, from the nearest one that exists.
 ancestor_ids() {
   local path="$1"
   while [[ ! -e "$path" ]]; do path="$(dirname -- "$path")"; done
   while :; do
-    stat -f '%d:%i' -- "$path"
+    stat -L -f '%d:%i' -- "$path"
     [[ "$path" == / ]] && break
     path="$(dirname -- "$path")"
   done
@@ -86,8 +90,9 @@ ancestor_ids() {
 within() {
   if [[ -e "$2" ]]; then
     local id
-    id="$(stat -f '%d:%i' -- "$2")"
-    ancestor_ids "$1" | grep -qx -- "$id"
+    id="$(stat -L -f '%d:%i' -- "$2")"
+    # Not a pipe: grep -q stops reading at a match, which under pipefail could fail the pipe.
+    grep -qx -- "$id" < <(ancestor_ids "$1")
   else
     local a b
     a="$(lower "$1")"; b="$(lower "$2")"
@@ -95,7 +100,9 @@ within() {
   fi
 }
 refuse_real() {
-  for real in "$real_home/Library/Preferences" "$real_home/Library/Application Support/Backtracking" "$real_home/Backtracking"; do
+  local real
+  for real in "$real_home/Library/Preferences" "$real_home/Library/Application Support/Backtracking" "$real_home/Backtracking" \
+      ${BACKTRACKING_TEST_COPY_ALSO_REFUSE:+"$BACKTRACKING_TEST_COPY_ALSO_REFUSE"}; do
     if within "$1" "$real"; then
       fail "A test copy cannot be made inside $real, which holds the user's real settings or recordings."
     fi

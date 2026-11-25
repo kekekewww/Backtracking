@@ -87,6 +87,20 @@ for spelled in "$nfd" "$upper"; do
 done
 [[ "$(find "$work/$nfc/Backtracking-same.app" -type f -exec shasum {} + | sort | shasum)" == "$unicode_sum" ]] || fail "the source spelled outside ASCII changed"
 
+# A real folder that is a symlink, as when recordings are kept on another disk, is refused by
+# where it leads, however the destination is spelled, and nothing is made there.
+mkdir -p "$work/elsewhere"
+ln -s "$work/elsewhere" "$work/linked"
+for target in "$work/elsewhere" "$work/elsewhere/sub" "$work/linked" "$work/linked/sub"; do
+  status=0
+  BACKTRACKING_TEST_COPY_ALSO_REFUSE="$work/linked" "$script" "$source_app" "$target" linked >/dev/null 2>&1 || status=$?
+  [[ $status -eq 2 ]] || fail "a copy into $target, inside a refused folder that is a symlink, ended with status $status"
+done
+[[ -z "$(ls -A "$work/elsewhere")" ]] || fail "something was made inside the refused folder that is a symlink"
+# The extra refused folder refuses nothing outside it.
+BACKTRACKING_TEST_COPY_ALSO_REFUSE="$work/linked" "$script" "$source_app" "$work/beside" beside >/dev/null 2>&1 \
+  || fail "a copy beside the refused folder was not made"
+
 # Something at the copy's path that is not a test copy is left alone.
 mkdir -p "$work/taken"
 ditto "$source_app" "$work/taken/Backtracking-taken.app"

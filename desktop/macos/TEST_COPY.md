@@ -14,7 +14,9 @@ The script copies the bundle to `<folder>/Backtracking-<name>.app`. It sets `CFB
 to `com.backtracking.audio.capture.testcopy.<name>`, signs `bt-addon-guard` and then the app ad
 hoc, and prints the copy's path and identifier. `<name>` keeps letters, digits and `-`. The
 script refuses a folder inside `~/Library/Preferences`, `~/Library/Application Support/Backtracking`
-or `~/Backtracking`.
+or `~/Backtracking`. One of these that is a symlink, such as recordings kept on another disk, is
+refused by the folder it leads to. `BACKTRACKING_TEST_COPY_ALSO_REFUSE=<folder>` adds one more
+folder to refuse.
 
 Start the copy's executable with the usual test variables:
 
