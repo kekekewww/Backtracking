@@ -1,4 +1,9 @@
 use crate::{FrozenPositionTrack, Position, PositionKey, PositionTrack};
+#[no_mangle]
+pub extern "C" fn bt_capture_clock_ns() -> u64 {
+    crate::capture_clock_ns()
+}
+
 #[repr(C)]
 pub struct BtPositionKey {
     frame: u64,
@@ -108,4 +113,39 @@ pub unsafe extern "C" fn bt_frozen_positions_read(
         }
     }
     keys.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn freezing_is_independent_and_truncated_reads_return_the_full_count() {
+        unsafe {
+            let live = bt_positions_new();
+            for frame in [10, 20, 30] {
+                assert!(bt_positions_insert(
+                    live,
+                    0,
+                    BtPositionKey {
+                        frame,
+                        x: 1.,
+                        y: 0.,
+                        z: 0.,
+                        size: 0.,
+                        gain: 1.
+                    }
+                ));
+            }
+            let frozen = bt_positions_freeze(live);
+            bt_positions_clear(live);
+            bt_positions_free(live);
+            let mut out = std::mem::MaybeUninit::uninit();
+            assert_eq!(
+                bt_frozen_positions_read(frozen, 0, 15, 30, out.as_mut_ptr(), 1),
+                2
+            );
+            assert_eq!(out.assume_init().frame, 10);
+            bt_frozen_positions_free(frozen);
+        }
+    }
 }

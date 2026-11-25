@@ -8,6 +8,8 @@ extern "C" {
 typedef struct BtPositionTrack BtPositionTrack;
 typedef struct BtFrozenPositions BtFrozenPositions;
 typedef struct { uint64_t frame; double x,y,z,size,gain; } BtPositionKey;
+/* Same monotonic nanosecond clock as Sender audio packets and positions_since. */
+uint64_t bt_capture_clock_ns(void);
 /* One track per lane. Serialize access to a mutable track. */
 BtPositionTrack *bt_positions_new(void);
 void bt_positions_free(BtPositionTrack *);
