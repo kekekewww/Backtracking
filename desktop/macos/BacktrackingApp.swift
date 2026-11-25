@@ -3191,7 +3191,44 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             }
         }
         guard controller.pendingSnapshotReads.isEmpty else { throw CaptureError("Exit left a save waiting for its freeze") }
+        try verifyTerminationAfterSourceChange()
         try verifyTerminationAnnouncesClips()
+    }
+
+    /// A save waits for a freeze of one capture; the sources change, then the app quits. The save
+    /// is dropped with that capture, never written from the new sources' audio.
+    static func verifyTerminationAfterSourceChange() throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-exit-change-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        let lanes = [CaptureLane(source: .addon(addonID: "verify.change", sourceID: "a"), route: .merged)]
+        controller.captureLanes = lanes
+        let old = try SystemAudioTap(history: 10, lanes: lanes)
+        controller.tap = old
+        let samples = [Float](repeating: 0.25, count: 4_800 * 2)
+        _ = old.withCaptureRead { core in
+            samples.withUnsafeBufferPointer { bt_tracks_push_interleaved(core, 0, $0.baseAddress, 4_800, 1_000_000_000, SystemAudioTap.timelineRate) }
+        }
+        old.readCapture(poll: false, { _ in Thread.sleep(forTimeInterval: 0.3); return 0 }) { _ in }
+        let folder = scratch.appendingPathComponent("saved", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        controller.saveSnapshot(into: folder.path)
+        // The user picks other sources: a new capture, which records something else.
+        controller.reconnectConfiguredSources()
+        guard let new = controller.tap, new !== old else { throw CaptureError("Changing sources did not make a new capture") }
+        defer { controller.tap = nil }
+        let other = [Float](repeating: -0.75, count: 4_800 * 2)
+        _ = new.withCaptureRead { core in
+            other.withUnsafeBufferPointer { bt_tracks_push_interleaved(core, 0, $0.baseAddress, 4_800, 1_000_000_000, SystemAudioTap.timelineRate) }
+        }
+        controller.queuePendingSnapshotsForTermination()
+        controller.worker.sync {}
+        let files = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil).filter { $0.pathExtension == "wav" }
+        guard files.isEmpty, controller.pendingSnapshotReads.isEmpty else {
+            throw CaptureError("A save of the old sources wrote \(files.count) WAV files from the new ones at exit")
+        }
     }
 
     /// Quitting while two saves wait for the window's freeze, after the oldest audio they asked for
@@ -3457,8 +3494,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let current = ObjectIdentifier(tap)
         // A save that asked for its own freeze writes that freeze, as Windows does with the read it requested.
         var jobs: [(WAVExport, PendingSnapshotSave)] = ownReads.compactMap { entry in
-            let own = entry.read.tap == current ? entry.read.material : nil
-            return (own ?? freezeNow()).map { ($0, entry.save) }
+            // Only the audio that read froze, never what is captured now (Windows `ui.rs:8746-8754`).
+            entry.read.material.map { ($0, entry.save) }
         }
         // A save waiting for the window's freeze writes the first one that holds it, as it would have
         // when that freeze arrived; freezing again now could miss audio that has aged out since.
@@ -4826,10 +4863,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func reconnectConfiguredSources() {
-        let hadPending = !pendingSnapshots.isEmpty
+        let hadPending = !pendingSnapshots.isEmpty || !pendingSnapshotReads.isEmpty
         if hadPending {
             failPendingSnapshots("The capture source changed before this selection was ready.")
         }
+        // Freezes of the capture being replaced no longer serve a save (Windows drops them with it).
+        abandonSnapshotReads("The capture source changed before this selection was ready.")
         let wasRunning = !paused
         if wasRunning { pauseCapture() }
         editing = false
@@ -7111,6 +7150,18 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     func onEditMaterialUnavailable() {
         answerSelectFreezeWaits()
         failPendingSnapshots("No audio available for this selection.")
+    }
+
+    private func abandonSnapshotReads(_ reason: String) {
+        let abandoned = pendingSnapshotReads
+        pendingSnapshotReads.removeAll()
+        editingFreezeReads.removeAll()
+        for entry in abandoned {
+            if let call = entry.save.controlCall {
+                addonHost?.controlReply(call: call, error: AddonControlError(code: "failed", message: reason))
+            }
+        }
+        if !abandoned.isEmpty { setNotice(reason) }
     }
 
     private func failPendingSnapshots(_ reason: String) {
