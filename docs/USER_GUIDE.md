@@ -20,7 +20,7 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 ### 開啟設定
 
-點擊工具列的齒輪可開啟 **Options**。在插件視窗內按滑鼠右鍵也會開啟 Options；Windows／macOS 桌面版的右鍵則開啟選單，依序為 **Pause／Resume／Retry capture**、**Clear**、**Save snapshot**、**Edit separately／分開編輯**（macOS 為 **Edit A and B separately**）、**Show waveform only**、**Keep on top**、**Options…** 與 **Quit**。桌面版視窗有焦點時，按 `Space` 可暫停或恢復擷取，按 `Delete`（Mac 鍵盤為 `Fn` + `Delete`）清除目前錄音；有選區時，`Space` 改為試聽選區，`Delete` 則先取消選區。波形有一列以上時（macOS 為擷取兩個來源時），單獨輕按右側 `Ctrl`（Mac 為右側 `Command`）可切換[分開編輯](#分開編輯)。這些是預設按鍵，Windows 桌面版可在 Options 的 **Hotkeys／快速鍵** 頁變更，見[快速鍵](#快速鍵windows-桌面版)。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
+點擊工具列的齒輪可開啟 **Options**。在插件視窗內按滑鼠右鍵也會開啟 Options；Windows／macOS 桌面版的右鍵則開啟選單，依序為 **Pause／Resume／Retry capture**、**Clear**、**Save snapshot**、**Edit separately／分開編輯**、**Show waveform only**、**Keep on top**、**Options…** 與 **Quit**。桌面版視窗有焦點時，按 `Space` 可暫停或恢復擷取，按 `Delete`（Mac 鍵盤為 `Fn` + `Delete`）清除目前錄音；有選區時，`Space` 改為試聽選區，`Delete` 則先取消選區。波形有一列以上時，單獨輕按右側 `Ctrl`（Mac 為右側 `Command`）可切換[分開編輯](#分開編輯)。這些是預設按鍵，Windows 桌面版可在 Options 的 **Hotkeys／快速鍵** 頁變更，見[快速鍵](#快速鍵windows-桌面版)。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
 
 Options 左側是分類，右側以一列一項的直向清單顯示設定。頁標題使用較大粗體，分組與欄位有明確層級，主要文字至少 15。保留時間、自動續錄、透明度和 WAV 格式使用下拉選單；少於 10 項時依實際項目數決定高度，最多顯示 10 列，超過則在選單內捲動。右側內容較長時向下捲動。桌面設定視窗可調整大小，底部關閉按鈕維持可見。插件會向 DAW 要求放大設定視窗，關閉後恢復原尺寸。
 
@@ -109,7 +109,7 @@ macOS 桌面版可從選單列顯示或隱藏視窗、暫停或恢復擷取、�
 
 附加元件的外觀（見「附加元件」）也可以提供這組顏色。只有在開啟依頻率、而且你沒有自己的顏色時才會使用，顏色下方會註明來自哪個附加元件。更改其中任何一個顏色，它們就以外觀的顏色為起點成為你自己的；之後按 **重設／Reset** 會改回外觀的顏色。附加元件無法替你開啟依頻率上色。
 
-目前只有 Windows 桌面版提供，macOS 桌面版尚未支援。
+從目前原始碼建置的 macOS 版也可設定頻率著色與漸層，詳見下方的 macOS 桌面版說明。
 
 ### 多個來源（Windows 桌面版）
 
@@ -124,7 +124,17 @@ Windows 桌面版可以同時擷取 A、B 以外的更多來源，最多 64 個�
 - 列數多到在視窗內每列放不下 14 像素時，整個波形區會一起上下捲動：在波形左右邊緣或右側捲軸上捲動滑鼠滾輪，或拖曳捲軸。在波形中間捲動仍是縮放。框選、旗標、拖出與[分開編輯](#分開編輯)在捲動後的列上照常使用；分開編輯時拖到波形上下緣會自動捲動。視窗會先長高，最多到 560 像素，放不下時才捲動。
 - 工具列只顯示放得下的音量表，其餘收在 **+N** 按鈕；按下它會列出每個來源的音量表，按其他地方或 `Esc` 關閉。
 - 匯出、拖出與快照為每個來源各寫一個 WAV 檔，檔名含該來源的字母，例如 `Backtracking_Spotify_C_….wav`。
-- 一或兩個來源時，畫面與以往相同。macOS 桌面版與 VST3／CLAP 插件仍維持原本的來源數量。
+- VST3／CLAP 插件維持原有的來源數量。
+
+### macOS 桌面版（從原始碼建置）
+
+目前原始碼的 macOS 版在 Options → **Sources** 提供 **Add source** 和 **Remove**，最多 64 個來源，合計最多 64 個聲道。來源從 A 編到 BL。使用 **All channels** 可保留多聲道來源，波形顯示立體聲 L/R 混合列及個別聲道。波形列放不下時，在左右邊緣捲動可瀏覽其他列。**Edit separately** 可選單一列，L/R 混合列視為一組。
+
+Options → **Capture** 可選多聲道來源的 L/R 聲音為立體聲或雙耳音訊，並提供 **Hide silent channels**。Options → **Export** 可選每聲道一個雙耳或單聲道檔、單一多聲道 WAV，或單一雙耳混音；含位置資料的物件群組會同時寫出 `-Positions.json`。Options → **Appearance** 的 **Waveform color** 可切換頻率著色並調整漸層，亦可由 **Look from add-on** 套用附加元件外觀。
+
+Options → **Hotkeys** 可為每個動作設定兩組快捷鍵。全域快照預設用 Fn／Globe 加數字 1 左側的實體鍵，需要「輸入監控」權限。分開編輯預設輕按右側 Command，可用 **Reset** 還原。
+
+Options → **Add-ons** 支援安裝、管理、停用與移除 `.btaddon` 附加元件（檔案存放於 `~/Library/Application Support/Backtracking/addons` 與 `~/Library/Application Support/Backtracking/addon-data`），並支援附加元件音訊來源、格式切換、檔案開啟／拖放、播放控制、聲道群組切換、控制權限核准及 **Backtracking Agent**（MCP）。
 
 ### 即時音量表
 
@@ -162,7 +172,7 @@ Backtracking 視窗有焦點時，按 `Esc` 或 `Backspace` 可取消編輯並�
 
 ### 分開編輯
 
-可以只框選、試聽、淡化、拖出或保存部分波形列：A、B 其中一軌，立體聲來源分成 L／R 兩列時的其中一側，或多聲道來源的部分聲道。在波形上按右鍵選擇 **Edit separately／分開編輯**（macOS 為 **Edit A and B separately**），或在 Backtracking 視窗有焦點時單獨輕按一下右側 `Ctrl`（Mac 為右側 `Command`）；再選一次或再輕按一次，就回到全部一起編輯。這個模式預設關閉，結束程式後不保留。Windows 版需要畫面上有一列以上的波形，macOS 版需要擷取兩個來源。按住超過半秒，或同時按下其他按鍵或滑鼠按鈕，都不算輕按。
+可以只框選、試聽、淡化、拖出或保存部分波形列：A、B 其中一軌，立體聲來源分成 L／R 兩列時的其中一側，或多聲道來源的部分聲道。在波形上按右鍵選擇 **Edit separately／分開編輯**，或在 Backtracking 視窗有焦點時單獨輕按一下右側 `Ctrl`（Mac 為右側 `Command`）；再選一次或再輕按一次，就回到全部一起編輯。這個模式預設關閉，結束程式後不保留。此功能需要畫面上有兩列以上的波形。按住超過半秒，或同時按下其他按鍵或滑鼠按鈕，都不算輕按。
 
 Windows 版開啟這個模式後，選區涵蓋從開始拖曳的那一列到游標所在的那一列：往上或往下拖可納入更多列，拖回來就再放掉。拖過可捲動軌道的上緣或下緣時，軌道會跟著捲動。多聲道軌道最上方的 L 與 R 兩列一律一起選取。macOS 版的選區則屬於開始拖曳的那一軌。
 
@@ -233,13 +243,13 @@ Options 的 **Hotkeys／快速鍵** 頁列出所有鍵盤快速鍵，都可以�
 
 **檔名**。桌面版以來源名稱為 WAV 命名。同時擷取 A 和 B 時為 `Backtracking_<名稱>_A_<日期>_<時間>_<長度>s.wav` 與 `Backtracking_<名稱>_B_…`；只有一個來源時不加 A／B，例如 `Backtracking_Spotify_2026-11-17_09-05-00_12.4s.wav`。分開編輯 A 和 B 時單獨匯出的一軌仍標示 A 或 B。名稱預設為來源清單中的裝置或 App 名稱，不含 `.exe` 等副檔名；系統播放為 `System audio`，Sender 為音軌名稱。要改名時，在 Options → Sources 該來源下方的 **File name** 欄位輸入，欄位下方會顯示檔名的開頭；清空欄位即恢復預設。名稱屬於裝置而不是 A／B：把系統播放命名為 `Loop` 後，不論它在 A 還是 B 擷取，檔名都使用 `Loop`。檔名不能使用的字元（`\ / : * ? " < > |`）會改成空格，名稱最多保留 48 個字元。VST3／CLAP 的檔名不含來源名稱，為 `Backtracking_<日期>_<時間>_<長度>s.wav`，DAW 提供速度時在長度後加上 BPM，例如 `_120bpm`；擷取 A 和 B 時，兩個檔案分別以 `-A`、`-B` 結尾。**Delete old drag-and-drop files** 也認得舊版的檔名。
 
-### 附加元件（Windows 桌面版）
+### 附加元件（桌面版）
 
-附加元件（add-on）是獨立的程式，Backtracking 會啟動它並擷取它送出的音訊。附加元件可以提供新的音訊來源、開啟檔案、有自己的設定與按鈕。附加元件檔案的副檔名是 `.btaddon`。目前只有 Windows 桌面版支援，macOS 桌面版與插件尚未支援。
+附加元件（add-on）是獨立的程式，Backtracking 會啟動它並擷取它送出的音訊。附加元件可以提供新的音訊來源、開啟檔案、提供外觀或控制，並有自己的設定與按鈕。附加元件檔案的副檔名是 `.btaddon`。Windows 與 macOS 桌面版支援附加元件，VST3／CLAP 插件尚未支援。
 
 **安裝。** 把 `.btaddon` 檔拖到 Backtracking 視窗，或在 Options 的 **Add-ons** 頁按 **Install from file…**。Backtracking 先顯示確認畫面：名稱、版本、作者、它會執行的程式、解壓後的大小，以及它要求的功能。按 **Install** 之前不會寫入任何東西。附加元件是以你的權限執行的程式，沒有沙箱，請只安裝你信任的附加元件。裝好後它會立刻啟動，之後每次開啟 Backtracking 也會啟動。
 
-**管理。** **Add-ons** 頁列出每個附加元件的狀態、最新訊息、設定與按鈕。取消勾選 **Enabled** 可停用。**Remove…** 會移除程式，並可選擇一併刪除它保存的資料。附加元件裝在 `%LOCALAPPDATA%\Backtracking\addons`，它的資料在 `%LOCALAPPDATA%\Backtracking\addon-data`。
+**管理。** **Add-ons** 頁列出每個附加元件的狀態、最新訊息、設定與按鈕。取消勾選 **Enabled** 可停用。**Remove…** 會移除程式，並可選擇一併刪除它保存的資料。Windows 裝在 `%LOCALAPPDATA%\Backtracking\addons`（資料在 `%LOCALAPPDATA%\Backtracking\addon-data`）；macOS 裝在 `~/Library/Application Support/Backtracking/addons`（資料在 `~/Library/Application Support/Backtracking/addon-data`）。
 
 **使用附加元件的來源。** 附加元件提供的來源會出現在 Options 的 **Sources** 頁的 **Audio source** 清單。選了這種來源後：
 
@@ -251,7 +261,7 @@ Options 的 **Hotkeys／快速鍵** 頁列出所有鍵盤快速鍵，都可以�
 
 想自己寫附加元件，請看 [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md)。
 
-### 讓附加元件控制 Backtracking（Windows 桌面版）
+### 讓附加元件控制 Backtracking（桌面版）
 
 具有 `control` 功能的附加元件可以像坐在視窗前的人一樣操作 Backtracking，例如讓 AI 助理或腳本替你暫停、選取並存檔。
 
@@ -264,7 +274,7 @@ Options 的 **Hotkeys／快速鍵** 頁列出所有鍵盤快速鍵，都可以�
 - 它不能切換自己或其他附加元件的這個勾選框，不能安裝、移除、啟用或停用附加元件，不能更改其他設定、開啟檔案、結束 Backtracking 或更新。
 - 隨時取消勾選即可收回；還在等待的要求會被拒絕。這個選擇依附加元件分別保存，重新開啟 Backtracking 後仍有效；移除附加元件後就會忘記，重新安裝時又是不允許。
 
-### 讓 AI 助理使用 Backtracking（Windows 桌面版）
+### 讓 AI 助理使用 Backtracking（桌面版）
 
 **Backtracking Agent** 附加元件讓 Claude Code、Claude Desktop 或其他 MCP 用戶端透過上述的控制使用 Backtracking：讀取 Backtracking 保留的內容、暫停與開始錄音、框選一段、存成 WAV 檔、試聽，以及新增或移除來源。安裝檔請從 [`addons/backtracking-agent`](../addons/backtracking-agent/README.md) 建置。
 
@@ -351,7 +361,7 @@ On Windows, route the source to the default playback device. If a DAW uses ASIO,
 
 ### Open settings
 
-Click the gear in the toolbar to open **Options**. Right-clicking inside the plug-in also opens Options. In the Windows and macOS desktop apps, right-clicking opens a menu instead: **Pause / Resume / Retry capture**, **Clear**, **Save snapshot**, **Edit separately** (**Edit A and B separately** in the macOS app), **Show waveform only**, **Keep on top**, **Options…**, and **Quit**. With the desktop window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` previews the selection instead and `Delete` cancels the selection first. With more than one waveform row (two sources in the macOS app), tapping the right `Ctrl` key on its own (the right `Command` key on a Mac) switches [Edit separately](#edit-separately) on or off. These are the default keys; in the Windows desktop app you can change them on the **Hotkeys** page of Options (see [Hotkeys](#hotkeys-windows-desktop)). The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
+Click the gear in the toolbar to open **Options**. Right-clicking inside the plug-in also opens Options. In the Windows and macOS desktop apps, right-clicking opens a menu instead: **Pause / Resume / Retry capture**, **Clear**, **Save snapshot**, **Edit separately**, **Show waveform only**, **Keep on top**, **Options…**, and **Quit**. With the desktop window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` previews the selection instead and `Delete` cancels the selection first. With more than one waveform row, tapping the right `Ctrl` key on its own (the right `Command` key on a Mac) switches [Edit separately](#edit-separately) on or off. These are the default keys; in the Windows desktop app you can change them on the **Hotkeys** page of Options (see [Hotkeys](#hotkeys-windows-desktop)). The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
 
 Choose a category on the left, then use the vertical settings list on the right. Larger bold titles, group headings, and body/control text of at least 15 distinguish hierarchy. History, auto-resume, transparency, and WAV format use dropdowns sized to their item count, up to ten rows before scrolling. Scroll the details pane for longer content. Desktop Options can be resized and keeps Close visible. The plug-in requests a larger editor and restores its prior size when closed.
 
@@ -398,7 +408,7 @@ When you switch modes, the desktop window fits the waveform panel's existing hei
 | Desktop app | Waveform-only minimum size | Full interface minimum size |
 | --- | --- | --- |
 | Windows | 240 × 48 logical pixels | 510 × 132 logical pixels |
-| macOS | 240 × 48 points | 560 × 100 points |
+| macOS | 240 × 48 points | 510 × 132 points |
 
 To restore the full interface, right-click the waveform and turn off **Show waveform only**. Windows/macOS native shadows are disabled in this mode; the optional thin border is controlled separately in Appearance Options. The desktop apps and the plug-in also let you set the border width (1 to 4 px) on the Appearance page of Options, and choose what is shown under **Show**: the app name in the toolbar, the level meters, and the capture status mark (**Always**, **Only when paused or failing** (**Only when paused** in the plug-in), or **Never**). With **Never**, nothing on the window marks a capture failure either.
 
@@ -440,7 +450,7 @@ While there is a selection, the selected part keeps its colors and the rest of t
 
 A look from an add-on (see Add-ons) can supply these colors. They are used only while By frequency is on and you have no colors of your own, and a note under the colors names the add-on. Changing any of them makes them your own, starting from the look's; **Reset** then goes back to the look's colors. An add-on cannot turn By frequency on for you.
 
-Only the Windows desktop app has this for now; the macOS app does not yet.
+The macOS app built from the current source also has frequency coloring and editable gradient stops. See the macOS desktop section below.
 
 ### More than two sources (Windows desktop)
 
@@ -455,7 +465,15 @@ The Windows desktop app can capture more sources than A and B at once, up to 64.
 - When there are more rows than fit at 14 pixels each, the whole waveform scrolls up and down as one: turn the wheel over its left margin or the scroll bar on the right, or drag the bar. The wheel over the waveform itself still zooms. Selecting, flags, dragging out and [Edit separately](#edit-separately) work on scrolled rows; while editing separately, a drag past the top or bottom edge scrolls. The window first grows taller, up to 560 pixels, and scrolls only past that.
 - The toolbar shows the meters that fit and gathers the rest behind a **+N** button. Click it to see every source's meter; click elsewhere or press `Esc` to close the list.
 - Exports, drags and snapshots write a WAV file for each source, named with its letter, for example `Backtracking_Spotify_C_….wav`.
-- With one or two sources the window looks as before. The macOS app and the VST3 and CLAP plug-ins keep the sources they had.
+- The VST3 and CLAP plug-ins keep their original source counts.
+
+### macOS desktop from source
+
+The macOS app built from the current source has **Add source** and **Remove** in Options → **Sources**. It accepts up to 64 sources and 64 channels in total, with lanes lettered A through BL. **All channels** preserves a multichannel source. Its waveform has a stereo L/R pair and one row per channel, with **Hide silent channels** on by default in Options → **Capture**. A left label gutter and a right scrollbar let you scroll rows that do not fit, and the window grows automatically up to 560 points for stacked channels or more than two sources. **Edit separately** supports cross-row selection across channels and sources (with edge auto-scroll) and treats the L/R pair as one target.
+
+Options → **Capture** sets whether the wide L/R pair sounds stereo or binaural and whether silent channels are hidden. Options → **Export** offers one binaural or mono file per channel, one multichannel WAV, or one binaural mix. In Options → **Appearance**, choose **By frequency** under **Waveform color** to enable and edit the gradient (with readability checks against the dark plot background).
+
+Options → **Hotkeys** lets you set up to two shortcuts per action. The default system-wide snapshot shortcut uses Fn/Globe and the physical key left of 1 and requires Input Monitoring permission. While recording **Edit separately**, a **Use a tap of Right Command** button restores or adds the Right Command tap.
 
 ### Live audio meter
 
@@ -493,17 +511,17 @@ Hold `Alt` (`Option` on a Mac) and drag the selection's start flag to fade it in
 
 ### Edit separately
 
-You can select, preview, fade, drag out or save some waveform rows on their own: one of the lanes A and B, one side of a stereo source shown as L and R rows, or some channels of a multichannel source. Right-click the waveform and choose **Edit separately** (**Edit A and B separately** in the macOS app), or, with the Backtracking window focused, tap the right `Ctrl` key on its own (the right `Command` key on a Mac). Choose it or tap again to edit everything together. The mode is off by default and is not kept when you quit. On Windows it needs more than one waveform row on screen; the macOS app needs two sources. Holding the key for more than half a second, or pressing another key or a mouse button with it, is not a tap.
+You can select, preview, fade, drag out or save some waveform rows on their own: one of the lanes A and B, one side of a stereo source shown as L and R rows, or some channels of a multichannel source. Right-click the waveform and choose **Edit separately**, or, with the Backtracking window focused, tap the right `Ctrl` key on its own (the right `Command` key on a Mac). Choose it or tap again to edit everything together. The mode is off by default and is not kept when you quit. It needs more than one waveform row on screen. Holding the key for more than half a second, or pressing another key or a mouse button with it, is not a tap.
 
-On Windows, while the mode is on, a selection covers the rows from the one you start dragging in to the one under the pointer: drag up or down to take in more rows, and back to let them go again. Drag past the top or bottom of a lane that scrolls to scroll it. The L and R rows on top of a multichannel lane are always taken together. In the macOS app a selection belongs to the lane you start dragging in.
+On Windows, while the mode is on, a selection covers the rows from the one you start dragging in to the one under the pointer: drag up or down to take in more rows, and back to let them go again. Drag past the top or bottom of a lane that scrolls to scroll it. The L and R rows on top of a multichannel lane are always taken together. In the macOS app a selection covers the row you start dragging in or the L/R pair.
 
 | Action | Together (default) | Separately |
 | --- | --- | --- |
-| Select | The selection covers every row | The selection covers the rows you drag across (macOS: the lane you start in), and only those rows are highlighted |
+| Select | The selection covers every row | The selection covers the rows you drag across (macOS: the starting row or L/R pair), and only those rows are highlighted |
 | Preview (`Space`) | Plays everything as it exports | Plays the selected rows only |
 | Fade in and out | Applies to everything | Applies to the selected rows only |
 | Drag out a selection | Exports every lane | Exports the selected rows only |
-| Drag out without a selection | Exports all of A and B | Exports all of the row under the pointer (macOS: the lane) |
+| Drag out without a selection | Exports all of A and B | Exports all of the row under the pointer (macOS: the starting row or L/R pair) |
 | **Save snapshot** / global snapshot shortcut | Saves A and B | Saves the selected rows; without a selection it still saves A and B |
 
 There is one selection at a time, and its rows share the flags, which stand on top of the selected rows. The status line and the length label of the full interface name the rows, for example "Selection · C–Ls", and the L and R rows of a multichannel lane as "L/R". Switching keeps the selection: turning the mode off widens it to every row, and turning it on again narrows it back to the rows you dragged across (macOS: the lane it began in). Switching does nothing while you are selecting, dragging out or fading.
@@ -564,13 +582,13 @@ Enable **Export every file as mono** to export each WAV in mono. Stereo Merged a
 
 **File names**. The desktop apps name each WAV after its source. With A and B recording, the files are `Backtracking_<name>_A_<date>_<time>_<length>s.wav` and `Backtracking_<name>_B_…`. With one source the letter is left out, as in `Backtracking_Spotify_2026-11-17_09-05-00_12.4s.wav`. A lane exported on its own while editing A and B separately keeps its letter. The name defaults to the device or app name in the source list, without an extension such as `.exe`: `System audio` for system playback, and the track name for a Sender. To change it, type in the **File name** field under the source in Options → Sources. The note under the field shows how the files will begin. Clear the field to go back to the default. A name belongs to the device, not to A or B: name system playback `Loop` and its files say `Loop` whether it records on A or on B. Characters that file names cannot hold (`\ / : * ? " < > |`) become spaces, and a name keeps at most 48 characters. VST3 and CLAP files carry no source name: `Backtracking_<date>_<time>_<length>s.wav`, with the tempo after the length, as in `_120bpm`, when the DAW reports one. With A and B recording, the two files end in `-A` and `-B`. **Delete old drag-and-drop files** also recognizes the names that earlier versions used.
 
-### Add-ons (Windows desktop)
+### Add-ons (desktop)
 
-An add-on is a separate program that Backtracking starts and captures audio from. An add-on can provide new audio sources, open files, and have its own settings and buttons. Add-on files end in `.btaddon`. Only the Windows desktop app hosts add-ons today; the macOS app and the plug-ins do not.
+An add-on is a separate program that Backtracking starts and captures audio from. An add-on can provide new audio sources, open files, offer a look or control, and have its own settings and buttons. Add-on files end in `.btaddon`. Both the Windows and macOS desktop apps host add-ons; the VST3/CLAP plug-ins do not.
 
 **Install.** Drop a `.btaddon` file on a Backtracking window, or press **Install from file…** on the **Add-ons** page of Options. Backtracking first shows a confirmation: the name, version, author, the program it will run, its unpacked size, and what it asks for. Nothing is written before you press **Install**. An add-on is a program that runs with your own permissions and is not sandboxed, so install only add-ons you trust. Once installed it starts at once, and again each time Backtracking starts.
 
-**Manage.** The **Add-ons** page lists each add-on with its state, its latest message, its settings, and its buttons. Clear **Enabled** to turn one off. **Remove…** removes the program and offers to delete the data it saved as well. Add-ons are installed in `%LOCALAPPDATA%\Backtracking\addons`; their data is in `%LOCALAPPDATA%\Backtracking\addon-data`.
+**Manage.** The **Add-ons** page lists each add-on with its state, its latest message, its settings, and its buttons. Clear **Enabled** to turn one off. **Remove…** removes the program and offers to delete the data it saved as well. On Windows add-ons live in `%LOCALAPPDATA%\Backtracking\addons` and their data in `%LOCALAPPDATA%\Backtracking\addon-data`; on macOS they live in `~/Library/Application Support/Backtracking/addons` and `~/Library/Application Support/Backtracking/addon-data`.
 
 **Use an add-on's source.** Sources that add-ons provide appear in the **Audio source** list on the **Sources** page of Options. With such a source selected:
 
@@ -582,7 +600,7 @@ An add-on is a separate program that Backtracking starts and captures audio from
 
 To write an add-on, see [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md).
 
-### Let an add-on control Backtracking (Windows desktop)
+### Let an add-on control Backtracking (desktop)
 
 An add-on with the `control` capability can work Backtracking the way a person at the window does, so that an AI assistant or a script can, for example, pause, select and save for you.
 
@@ -595,7 +613,7 @@ An add-on with the `control` capability can work Backtracking the way a person a
 - It cannot change its own check box or another add-on's, install, remove, enable or disable add-ons, change other options, open files, quit Backtracking, or update it.
 - Clear the box at any time to take control back; requests still waiting are refused. The choice is kept for each add-on when Backtracking restarts, and forgotten when the add-on is removed: installed again, it starts off.
 
-### Let an AI agent use Backtracking (Windows desktop)
+### Let an AI agent use Backtracking (desktop)
 
 The **Backtracking Agent** add-on lets Claude Code, Claude Desktop or another MCP client use Backtracking through the control described above. The client can read what Backtracking holds, pause and start recording, select a stretch, save it as WAV files, play it, and add or remove sources. Build the package from [`addons/backtracking-agent`](../addons/backtracking-agent/README.md).
 

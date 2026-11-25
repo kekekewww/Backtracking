@@ -31,18 +31,29 @@ private func checkAudio(_ status: OSStatus, _ operation: String) throws {
 /// Comes before a plug-in Sender's name in the source list.
 let senderMark = "【Sender】"
 
+/// Latest snapshot published by AddonHostClient, read on the main actor by capture source helpers.
+@MainActor var currentAddonSnapshot: AddonSnapshot = .empty
+
 enum CaptureSource: Hashable {
     case system
     case microphone(String)
     case application(String)
     case sender(String)
+    case addon(addonID: String, sourceID: String)
 
     init?(key: String) {
         if key == "system" { self = .system }
         else if key.hasPrefix("mic:") { self = .microphone(String(key.dropFirst(4))) }
         else if key.hasPrefix("app:"), key.count > 4 { self = .application(String(key.dropFirst(4))) }
         else if key.hasPrefix("sender:"), key.count > 7 { self = .sender(String(key.dropFirst(7))) }
-        else { return nil }
+        else if key.hasPrefix("addon:") {
+            let rest = key.dropFirst(6)
+            guard let colon = rest.firstIndex(of: ":") else { return nil }
+            let addonID = String(rest[..<colon])
+            let sourceID = String(rest[rest.index(after: colon)...])
+            guard !addonID.isEmpty, !sourceID.isEmpty else { return nil }
+            self = .addon(addonID: addonID, sourceID: sourceID)
+        } else { return nil }
     }
 
     var key: String {
@@ -51,6 +62,17 @@ enum CaptureSource: Hashable {
         case .microphone(let uid): "mic:\(uid)"
         case .application(let identifier): "app:\(identifier)"
         case .sender(let id): "sender:\(id)"
+        case .addon(let addonID, let sourceID): "addon:\(addonID):\(sourceID)"
+        }
+    }
+
+    var controlKind: String {
+        switch self {
+        case .system: "system"
+        case .microphone(let uid): uid.isEmpty ? "default-microphone" : "microphone"
+        case .application: "application"
+        case .sender: "sender"
+        case .addon: "addon"
         }
     }
 
@@ -61,12 +83,22 @@ enum CaptureSource: Hashable {
             if uid.isEmpty { "Default microphone" } else { "Microphone · \(uid)" }
         case .application(let identifier): "Application · \(identifier)"
         case .sender: senderMark
+        case .addon(_, let sourceID): sourceID
         }
     }
 
     var isSender: Bool {
         if case .sender = self { return true }
         return false
+    }
+
+    var isAddon: Bool {
+        if case .addon = self { return true }
+        return false
+    }
+
+    var isSenderBacked: Bool {
+        isSender || isAddon
     }
 
     var isMicrophone: Bool {
@@ -76,7 +108,7 @@ enum CaptureSource: Hashable {
 }
 
 enum CaptureRoute: UInt32, CaseIterable, Sendable {
-    case merged, left, right, center, mid, side
+    case merged, left, right, center, mid, side, allChannels
 
     // UserDefaults stores the Swift raw values. WAV export uses the core route codes.
     var wavRouteCode: UInt32 {
@@ -87,12 +119,14 @@ enum CaptureRoute: UInt32, CaseIterable, Sendable {
         case .mid: 3
         case .side: 4
         case .merged: 5
+        case .allChannels: 7
         }
     }
 
     var label: String {
         switch self {
         case .merged: "Merged"
+        case .allChannels: "All channels"
         case .left: "Left"
         case .right: "Right"
         case .center: "Center"
@@ -100,6 +134,26 @@ enum CaptureRoute: UInt32, CaseIterable, Sendable {
         case .side: "Side"
         }
     }
+
+    var controlName: String {
+        switch self {
+        case .merged: "merged"
+        case .allChannels: "all"
+        case .left: "left"
+        case .right: "right"
+        case .center: "center"
+        case .mid: "mid"
+        case .side: "side"
+        }
+    }
+}
+
+let maximumCaptureLanes = 64
+
+func captureLaneLetter(_ index: Int) -> String {
+    guard let index = UInt32(exactly: index), let label = bt_lane_letter(index) else { return "?" }
+    defer { bt_string_free(label) }
+    return String(cString: label)
 }
 
 struct CaptureLane: Equatable {
@@ -255,10 +309,41 @@ func requestSenderSnapshot(_ id: String) -> Bool {
     id.withCString { bt_sender_request_snapshot($0) != 0 }
 }
 
+struct RunningAppSnapshot: Sendable {
+    let pid: pid_t
+    let bundleIdentifier: String
+    let localizedName: String?
+    let isRegular: Bool
+}
+
+@MainActor
+func snapshotRunningApps() -> [RunningAppSnapshot] {
+    NSWorkspace.shared.runningApplications.compactMap { app in
+        guard app.activationPolicy != .prohibited, let bundle = app.bundleIdentifier else { return nil }
+        return RunningAppSnapshot(
+            pid: app.processIdentifier, bundleIdentifier: bundle,
+            localizedName: app.localizedName, isRegular: app.activationPolicy == .regular
+        )
+    }
+}
+
 @MainActor
 func availableCaptureSources(excluding privateDevices: Set<AudioObjectID>) -> [(source: CaptureSource, title: String)] {
+    scanCaptureSources(
+        excluding: privateDevices,
+        runningApps: snapshotRunningApps(),
+        addonSnapshot: currentAddonSnapshot
+    )
+}
+
+func scanCaptureSources(
+    excluding privateDevices: Set<AudioObjectID>,
+    runningApps apps: [RunningAppSnapshot],
+    addonSnapshot: AddonSnapshot = .empty
+) -> [(source: CaptureSource, title: String)] {
     var choices: [(CaptureSource, String)] = []
-    if defaultDevice(kAudioHardwarePropertyDefaultOutputDevice) != nil {
+    if TestCopyConfig.current.syntheticSystemFormat != nil
+        || defaultDevice(kAudioHardwarePropertyDefaultOutputDevice) != nil {
         choices.append((.system, CaptureSource.system.label))
     }
     let inputDevices = audioObjects(kAudioHardwarePropertyDevices).filter { device in
@@ -269,8 +354,8 @@ func availableCaptureSources(excluding privateDevices: Set<AudioObjectID>) -> [(
     if let device = defaultDevice(kAudioHardwarePropertyDefaultInputDevice), inputDevices.contains(device) {
         choices.append((.microphone(""), CaptureSource.microphone("").label))
     }
-    // Plug-in senders come right after the two fixed entries, as on Windows, so they are not
-    // lost below a long list of devices and apps.
+    // Add-on sources and plug-in senders come right after the two fixed entries, as on Windows,
+    // so they are not lost below a long list of devices and apps.
     let fixedChoices = choices.count
     for device in inputDevices {
         guard let uid = audioString(device, kAudioDevicePropertyDeviceUID), !uid.isEmpty,
@@ -278,11 +363,7 @@ func availableCaptureSources(excluding privateDevices: Set<AudioObjectID>) -> [(
         choices.append((.microphone(uid), name))
     }
 
-    // Workspace metadata names HAL playback clients and associates helper processes with their app.
-    let apps = NSWorkspace.shared.runningApplications.filter {
-        $0.activationPolicy != .prohibited && $0.bundleIdentifier != nil
-    }
-    let appsByPID = Dictionary(apps.map { ($0.processIdentifier, $0) }, uniquingKeysWith: { first, _ in first })
+    let appsByPID = Dictionary(apps.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
     let ownPID = ProcessInfo.processInfo.processIdentifier
     let ownBundle = Bundle.main.bundleIdentifier
     var namesByBundle: [String: String] = [:]
@@ -290,28 +371,45 @@ func availableCaptureSources(excluding privateDevices: Set<AudioObjectID>) -> [(
         guard hasPlaybackStream(object), let pid = processID(object), pid != ownPID else { continue }
         let bundle = audioString(object, kAudioProcessPropertyBundleID)
         var owner = appsByPID[pid]
-        if owner?.activationPolicy != .regular {
+        if owner?.isRegular != true {
             let helperOwner = apps.first { app in
-                guard let identifier = app.bundleIdentifier else { return false }
-                return bundle?.hasPrefix(identifier + ".helper") == true
+                bundle?.hasPrefix(app.bundleIdentifier + ".helper") == true
             }
             let ancestor = helperOwner ?? processLineage(pid).dropFirst()
-                .first(where: { appsByPID[$0]?.activationPolicy == .regular }).flatMap { appsByPID[$0] }
+                .first(where: { appsByPID[$0]?.isRegular == true }).flatMap { appsByPID[$0] }
             owner = ancestor ?? owner ?? apps.first { $0.bundleIdentifier == bundle }
         }
         guard let identifier = owner?.bundleIdentifier ?? bundle, !identifier.isEmpty,
               identifier != ownBundle else { continue }
-        namesByBundle[identifier] = owner?.localizedName ?? NSRunningApplication(processIdentifier: pid)?.localizedName
-            ?? namesByBundle[identifier] ?? identifier
+        namesByBundle[identifier] = owner?.localizedName ?? namesByBundle[identifier] ?? identifier
     }
     let sortedApps = namesByBundle.sorted {
         let order = $0.value.localizedStandardCompare($1.value)
         return order == .orderedSame ? $0.key < $1.key : order == .orderedAscending
     }
     choices += sortedApps.map { (.application($0.key), $0.value) }
-    choices.insert(
-        contentsOf: availableSenders().map { (.sender($0.id), "\(senderMark)\($0.name)") }, at: fixedChoices
-    )
+
+    // ADD-W30: Hide raw Sender entries claimed by running add-on sources, and list add-on sources first.
+    let claimedSenders = addonSnapshot.claimedSenderIDs
+    var addonEntries: [(CaptureSource, String)] = []
+    var seenNames: [String: Int] = [:]
+    for addon in addonSnapshot.addons where addon.isRunning {
+        for source in addon.sources {
+            seenNames[source.name, default: 0] += 1
+        }
+    }
+    for addon in addonSnapshot.addons where addon.isRunning {
+        for source in addon.sources {
+            let title = (seenNames[source.name] ?? 0) > 1
+                ? "\(source.name) (\(addon.displayName))"
+                : source.name
+            addonEntries.append((.addon(addonID: addon.id, sourceID: source.id), title))
+        }
+    }
+    let rawSenderEntries: [(CaptureSource, String)] = availableSenders()
+        .filter { !claimedSenders.contains($0.id) }
+        .map { (.sender($0.id), "\(senderMark)\($0.name)") }
+    choices.insert(contentsOf: addonEntries + rawSenderEntries, at: fixedChoices)
     return choices
 }
 
@@ -340,6 +438,8 @@ func defaultFileName(for source: CaptureSource) -> String {
             .deletingPathExtension().lastPathComponent ?? identifier
     case .sender:
         return "Sender"
+    case .addon(_, let sourceID):
+        return sourceID
     }
 }
 
@@ -359,6 +459,8 @@ private func presentFileName(for source: CaptureSource) -> String? {
         return NSRunningApplication.runningApplications(withBundleIdentifier: identifier).first?.localizedName
     case .sender(let id):
         return availableSenders().first { $0.id == id }?.name
+    case .addon(let addonID, let sourceID):
+        return currentAddonSnapshot.source(addonID: addonID, sourceID: sourceID)?.source.name
     }
 }
 
@@ -419,7 +521,11 @@ private func defaultDevice(_ selector: AudioObjectPropertySelector) -> AudioObje
 }
 
 private func inputChannels(_ device: AudioObjectID) -> Int {
-    var address = property(kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyScopeInput)
+    deviceChannelCount(device, scope: kAudioDevicePropertyScopeInput)
+}
+
+private func deviceChannelCount(_ device: AudioObjectID, scope: AudioObjectPropertyScope) -> Int {
+    var address = property(kAudioDevicePropertyStreamConfiguration, scope)
     var size: UInt32 = 0
     guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size) == noErr, size > 0 else { return 0 }
     let data = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
@@ -516,9 +622,10 @@ private func nominalRate(_ device: AudioObjectID) -> Double {
 
 private enum InputIdentity: Equatable {
     case system(AudioObjectID, Double)
+    case syntheticSystem(String)
     case microphone(AudioObjectID, Double)
     case application([AudioObjectID], AudioObjectID, Double)
-    case sender(String, UInt32, UInt32)
+    case sender(String, UInt32, UInt32, [String]?)
 }
 
 @MainActor
@@ -526,8 +633,21 @@ private func identity(for source: CaptureSource) -> InputIdentity? {
     switch source {
     case .sender(let id):
         return senderDescriptors(audioOnly: true).first { $0.id == id }
-            .map { .sender(id, $0.sampleRate, $0.channels) }
+            .map { .sender(id, $0.sampleRate, $0.channels, nil) }
+    case .addon(let addonID, let sourceID):
+        guard let (_, addonSource) = currentAddonSnapshot.source(addonID: addonID, sourceID: sourceID) else {
+            return nil
+        }
+        let groupLabels = addonSource.allChannelLabels
+        return senderDescriptors(audioOnly: true).first { $0.id == addonSource.sender }
+            .map {
+                let labels = groupLabels.count == Int($0.channels) ? groupLabels : nil
+                return .sender(addonSource.sender, $0.sampleRate, $0.channels, labels)
+            }
     case .system:
+        if let spec = TestCopyConfig.current.syntheticSystemFormat {
+            return .syntheticSystem(spec)
+        }
         return defaultDevice(kAudioHardwarePropertyDefaultOutputDevice).map { .system($0, nominalRate($0)) }
     case .application(let identifier):
         let processes = processObjects(for: identifier)
@@ -544,6 +664,38 @@ private func identity(for source: CaptureSource) -> InputIdentity? {
     }
 }
 
+private func speakerName(_ label: AudioChannelLabel) -> String? {
+    switch label {
+    case kAudioChannelLabel_Left: "FL"
+    case kAudioChannelLabel_Right: "FR"
+    case kAudioChannelLabel_Center: "FC"
+    case kAudioChannelLabel_LFEScreen: "LFE"
+    case kAudioChannelLabel_LeftCenter: "FLc"
+    case kAudioChannelLabel_RightCenter: "FRc"
+    case kAudioChannelLabel_LeftSurround, kAudioChannelLabel_LeftSurroundDirect: "Ls"
+    case kAudioChannelLabel_RightSurround, kAudioChannelLabel_RightSurroundDirect: "Rs"
+    case kAudioChannelLabel_RearSurroundLeft: "Lb"
+    case kAudioChannelLabel_RearSurroundRight: "Rb"
+    case kAudioChannelLabel_CenterSurround: "BC"
+    case kAudioChannelLabel_TopCenterSurround: "TpC"
+    case kAudioChannelLabel_VerticalHeightLeft: "TFL"
+    case kAudioChannelLabel_VerticalHeightCenter: "TpFC"
+    case kAudioChannelLabel_VerticalHeightRight: "TFR"
+    case kAudioChannelLabel_TopBackLeft: "TBL"
+    case kAudioChannelLabel_TopBackCenter: "TpBC"
+    case kAudioChannelLabel_TopBackRight: "TBR"
+    default: nil
+    }
+}
+
+func localizedBilingual(_ text: String) -> String {
+    guard let range = text.range(of: " / ") else { return text }
+    switch AppLanguage.current {
+    case .english: return String(text[..<range.lowerBound])
+    case .zhHant: return String(text[range.upperBound...])
+    }
+}
+
 private struct InputFormat {
     let channels: Int
     let sampleRate: Double
@@ -552,15 +704,63 @@ private struct InputFormat {
     let right: Int?
     let center: Int?
     let mix: [(channel: Int, left: Float, right: Float)]
+    let mixScale: Float
+    let channelNames: [String]
 
-    init(senderChannels: UInt32, sampleRate: UInt32) {
+    init(syntheticChannelNames: [String], sampleRate: Double = 48_000) {
+        channels = syntheticChannelNames.count
+        self.sampleRate = sampleRate
+        planar = false
+        channelNames = syntheticChannelNames
+        left = syntheticChannelNames.firstIndex(of: "FL") ?? 0
+        right = syntheticChannelNames.firstIndex(of: "FR") ?? (channels >= 2 ? 1 : nil)
+        center = syntheticChannelNames.firstIndex(of: "FC")
+        var weights: [(Int, Float, Float)] = []
+        if channels > 2 {
+            var leftSum: Float = 1.0
+            var rightSum: Float = 1.0
+            for (index, name) in syntheticChannelNames.enumerated() where index != left && index != right {
+                let (wl, wr): (Float, Float) = switch name {
+                case "FC": (0.70710677, 0.70710677)
+                case "LFE": (0.5, 0.5)
+                case "Ls", "Lb", "TFL", "TBL": (0.70710677, 0)
+                case "Rs", "Rb", "TFR", "TBR": (0, 0.70710677)
+                default: (0.70710677, 0.70710677)
+                }
+                leftSum += wl
+                rightSum += wr
+                weights.append((index, wl, wr))
+            }
+            let norm = max(1.0, max(leftSum, rightSum))
+            mixScale = norm
+            mix = weights.map { ($0.0, $0.1 / norm, $0.2 / norm) }
+        } else {
+            mixScale = 1.0
+            mix = []
+        }
+    }
+
+    init(senderID: String, senderChannels: UInt32, sampleRate: UInt32, overrideLabels: [String]? = nil) {
         channels = Int(senderChannels)
         self.sampleRate = Double(sampleRate)
         planar = false
         left = 0
-        right = channels == 2 ? 1 : nil
+        right = channels >= 2 ? 1 : nil
         center = nil
         mix = []
+        mixScale = 1.0
+        if let overrideLabels, overrideLabels.count == channels {
+            channelNames = overrideLabels
+            return
+        }
+        let names: [String]
+        if let labels = senderID.withCString({ bt_sender_channel_labels($0) }) {
+            names = String(cString: labels).components(separatedBy: "\t")
+            bt_string_free(labels)
+        } else {
+            names = []
+        }
+        channelNames = names.count == channels ? names : (1...channels).map { "Channel \($0)" }
     }
 
     init(_ stream: AudioStreamBasicDescription, labels: [AudioChannelLabel]) throws {
@@ -579,26 +779,58 @@ private struct InputFormat {
         sampleRate = stream.mSampleRate
         planar = separate
         let exact = labels.count == count ? labels : []
+        channelNames = (0..<count).map { index in
+            guard exact.indices.contains(index), let label = speakerName(exact[index]) else { return "Channel \(index + 1)" }
+            return label
+        }
         left = exact.firstIndex(of: kAudioChannelLabel_Left) ?? 0
         right = exact.firstIndex(of: kAudioChannelLabel_Right) ?? (count >= 2 ? 1 : nil)
         center = exact.firstIndex(of: kAudioChannelLabel_Center)
-        mix = count <= 2 ? [] : exact.enumerated().compactMap { index, label in
-            switch label {
-            case kAudioChannelLabel_LeftSurround, kAudioChannelLabel_LeftSurroundDirect,
-                 kAudioChannelLabel_RearSurroundLeft: (index, 0.70710677, 0)
-            case kAudioChannelLabel_RightSurround, kAudioChannelLabel_RightSurroundDirect,
-                 kAudioChannelLabel_RearSurroundRight: (index, 0, 0.70710677)
-            case kAudioChannelLabel_Center, kAudioChannelLabel_CenterSurround: (index, 0.70710677, 0.70710677)
-            default: nil
+        if count <= 2 {
+            mixScale = 1.0
+            mix = []
+        } else {
+            var leftSum: Float = 1.0
+            var rightSum: Float = 1.0
+            var rawWeights: [(Int, Float, Float)] = []
+            for index in 0..<count where index != left && index != right {
+                let label = exact.indices.contains(index) ? exact[index] : kAudioChannelLabel_Unknown
+                let (wl, wr): (Float, Float) = switch label {
+                case kAudioChannelLabel_LeftSurround, kAudioChannelLabel_LeftSurroundDirect,
+                     kAudioChannelLabel_RearSurroundLeft, kAudioChannelLabel_LeftCenter,
+                     kAudioChannelLabel_VerticalHeightLeft, kAudioChannelLabel_TopBackLeft:
+                    (0.70710677, 0)
+                case kAudioChannelLabel_RightSurround, kAudioChannelLabel_RightSurroundDirect,
+                     kAudioChannelLabel_RearSurroundRight, kAudioChannelLabel_RightCenter,
+                     kAudioChannelLabel_VerticalHeightRight, kAudioChannelLabel_TopBackRight:
+                    (0, 0.70710677)
+                case kAudioChannelLabel_LFEScreen:
+                    (0.5, 0.5)
+                default:
+                    (0.70710677, 0.70710677)
+                }
+                leftSum += wl
+                rightSum += wr
+                rawWeights.append((index, wl, wr))
             }
+            let scale = max(1.0, max(leftSum, rightSum))
+            mixScale = scale
+            mix = rawWeights.map { ($0.0, $0.1 / scale, $0.2 / scale) }
         }
     }
 
-    var mergedChannels: UInt32 { channels == 1 ? 1 : 2 }
+    func width(for route: CaptureRoute) -> UInt32 {
+        switch route {
+        case .merged: UInt32(min(2, channels))
+        case .allChannels: UInt32(channels)
+        default: 1
+        }
+    }
 
     func supports(_ route: CaptureRoute) -> Bool {
         switch route {
         case .merged: true
+        case .allChannels: channels > 2
         case .left: left != nil
         case .right: right != nil
         case .center: center != nil
@@ -633,8 +865,16 @@ private struct InputFormat {
 private final class TimelineHandle: @unchecked Sendable {
     let core: OpaquePointer
 
-    init(history: UInt32, a: UInt32, b: UInt32, retainSilence: Bool = false) throws {
-        guard let core = bt_tracks_new(SystemAudioTap.timelineRate, a, b, history) else {
+    convenience init(history: UInt32, a: UInt32, b: UInt32, retainSilence: Bool = false) throws {
+        let widths = b == 0 ? [a] : [a, b]
+        try self.init(history: history, widths: widths, retainSilence: retainSilence)
+    }
+
+    init(history: UInt32, widths: [UInt32], retainSilence: Bool = false) throws {
+        guard let core = widths.withUnsafeBufferPointer({
+            bt_tracks_new_lanes(SystemAudioTap.timelineRate, $0.baseAddress, $0.count,
+                history, ProcessInfo.processInfo.physicalMemory)
+        }) else {
             throw CaptureError("Could not allocate the capture buffer")
         }
         self.core = core
@@ -682,29 +922,39 @@ private final class LaneProducer {
         while offset < frames {
             let count = min(Self.chunkFrames, frames - offset)
             let packetTime = time &+ UInt64(Double(offset) * 1_000_000_000 / format.sampleRate)
-            // Preserve native samples in the ordinary mono and stereo cases.
-            if route == .merged && format.channels == outputChannels {
+            if (route == .merged || route == .allChannels) && format.channels == outputChannels {
                 if !format.planar || outputChannels == 1 {
                     let start = buffers[0].mData!.assumingMemoryBound(to: Float.self).advanced(by: offset * outputChannels)
                     _ = bt_tracks_push_interleaved(timeline.core, lane, start, UInt32(count), packetTime, format.sampleRate)
                     offset += count
                     continue
                 }
-                let left = buffers[0].mData!.assumingMemoryBound(to: Float.self).advanced(by: offset)
-                let right = buffers[1].mData!.assumingMemoryBound(to: Float.self).advanced(by: offset)
-                _ = bt_tracks_push_planar_stereo(timeline.core, lane, left, right, UInt32(count), packetTime, format.sampleRate)
+                if outputChannels == 2 {
+                    let left = buffers[0].mData!.assumingMemoryBound(to: Float.self).advanced(by: offset)
+                    let right = buffers[1].mData!.assumingMemoryBound(to: Float.self).advanced(by: offset)
+                    _ = bt_tracks_push_planar_stereo(timeline.core, lane, left, right, UInt32(count), packetTime, format.sampleRate)
+                } else {
+                    for frame in 0..<count {
+                        for channel in 0..<outputChannels {
+                            scratch[frame * outputChannels + channel] =
+                                format.sample(buffers, frame: offset + frame, channel: channel)
+                        }
+                    }
+                    _ = bt_tracks_push_interleaved(timeline.core, lane, scratch, UInt32(count), packetTime, format.sampleRate)
+                }
                 offset += count
                 continue
             }
 
+            if route == .allChannels { return }
             for frame in 0..<count {
                 let input = offset + frame
                 let left = format.left.map { format.sample(buffers, frame: input, channel: $0) } ?? 0
                 let right = format.right.map { format.sample(buffers, frame: input, channel: $0) } ?? 0
                 switch route {
                 case .merged:
-                    var mixedLeft = left
-                    var mixedRight = right
+                    var mixedLeft = left / format.mixScale
+                    var mixedRight = right / format.mixScale
                     for part in format.mix {
                         let value = format.sample(buffers, frame: input, channel: part.channel)
                         mixedLeft += value * part.left
@@ -718,6 +968,7 @@ private final class LaneProducer {
                     scratch[frame] = format.center.map { format.sample(buffers, frame: input, channel: $0) } ?? 0
                 case .mid: scratch[frame] = left * 0.5 + right * 0.5
                 case .side: scratch[frame] = left * 0.5 - right * 0.5
+                case .allChannels: break
                 }
             }
             _ = bt_tracks_push_interleaved(timeline.core, lane, scratch, UInt32(count), packetTime, format.sampleRate)
@@ -740,14 +991,116 @@ private protocol NativeInput: AnyObject {
     func stop() throws
 }
 
+private final class SyntheticSystemInput: NativeInput {
+    let format: InputFormat
+    private let width: Int
+    private let stereoOnly: Bool
+    private var producers: [LaneProducer] = []
+    private let queue = DispatchQueue(label: "Backtracking.synthetic-system", qos: .userInitiated)
+    private var timer: DispatchSourceTimer?
+    private var frameIndex: UInt64 = 0
+    private var packetTimestampNs: UInt64 = 0
+    private var running = false
+
+    static func parse(_ spec: String) -> (labels: [String], stereoOnly: Bool)? {
+        let parts = spec.split(separator: ":", maxSplits: 1)
+        guard parts.count == 2 else { return nil }
+        let activity = String(parts[1])
+        guard activity == "all" || activity == "stereo" else { return nil }
+        let labels: [String]
+        switch parts[0] {
+        case "5.1": labels = ["FL", "FR", "FC", "LFE", "Ls", "Rs"]
+        case "7.1": labels = ["FL", "FR", "FC", "LFE", "Lb", "Rb", "Ls", "Rs"]
+        case "7.1.4": labels = ["FL", "FR", "FC", "LFE", "Lb", "Rb", "Ls", "Rs", "TFL", "TFR", "TBL", "TBR"]
+        default: return nil
+        }
+        return (labels, activity == "stereo")
+    }
+
+    init(spec: String) throws {
+        guard let parsed = Self.parse(spec) else {
+            throw CaptureError("Unknown synthetic format \(spec)")
+        }
+        width = parsed.labels.count
+        stereoOnly = parsed.stereoOnly
+        format = InputFormat(syntheticChannelNames: parsed.labels, sampleRate: 48_000)
+    }
+
+    deinit {
+        try? stop()
+    }
+
+    func bind(_ producers: [LaneProducer]) throws {
+        self.producers = producers
+    }
+
+    func start() throws {
+        guard !running else { return }
+        running = true
+        packetTimestampNs = AudioConvertHostTimeToNanos(AudioGetCurrentHostTime())
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        let width = self.width
+        let stereoOnly = self.stereoOnly
+        let format = self.format
+        let producers = self.producers
+        let framesPerPacket = 480
+        var interleaved = [Float](repeating: 0, count: framesPerPacket * width)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.running else { return }
+            let startFrame = self.frameIndex
+            for f in 0..<framesPerPacket {
+                let phaseFrame = Double((startFrame + UInt64(f)) % 48_000)
+                for ch in 0..<width {
+                    let sample: Float
+                    if !stereoOnly || ch < 2 {
+                        let freq = Double(220 + 30 * ch)
+                        sample = Float(sin(2.0 * Double.pi * phaseFrame * freq / 48_000.0)) * 0.25
+                    } else {
+                        sample = 0
+                    }
+                    interleaved[f * width + ch] = sample
+                }
+            }
+            let ts = self.packetTimestampNs
+            self.frameIndex += UInt64(framesPerPacket)
+            self.packetTimestampNs &+= 10_000_000
+            interleaved.withUnsafeMutableBytes { raw in
+                var list = AudioBufferList(
+                    mNumberBuffers: 1,
+                    mBuffers: AudioBuffer(
+                        mNumberChannels: UInt32(width),
+                        mDataByteSize: UInt32(raw.count),
+                        mData: raw.baseAddress
+                    )
+                )
+                withUnsafeMutablePointer(to: &list) { ptr in
+                    let buffers = UnsafeMutableAudioBufferListPointer(ptr)
+                    for producer in producers {
+                        producer.push(buffers, format: format, frameLimit: framesPerPacket, time: ts)
+                    }
+                }
+            }
+        }
+        self.timer = timer
+        timer.resume()
+    }
+
+    func stop() throws {
+        running = false
+        timer?.cancel()
+        timer = nil
+    }
+}
+
 private final class SenderInput: NativeInput {
     let format: InputFormat
     private let id: String
     private var producers: [LaneProducer] = []
 
-    init(id: String, rate: UInt32, channels: UInt32) {
+    init(id: String, rate: UInt32, channels: UInt32, overrideLabels: [String]? = nil) {
         self.id = id
-        format = InputFormat(senderChannels: channels, sampleRate: rate)
+        format = InputFormat(senderID: id, senderChannels: channels, sampleRate: rate, overrideLabels: overrideLabels)
     }
 
     func bind(_ producers: [LaneProducer]) throws { self.producers = producers }
@@ -791,7 +1144,8 @@ private final class PlaybackTap: NativeInput {
         if preferNativeLayout, device != unknownObject,
            let uid = audioString(device, kAudioDevicePropertyDeviceUID) {
             labels = deviceLabels(device, scope: kAudioDevicePropertyScopeOutput)
-            if labels.contains(kAudioChannelLabel_Center) {
+            if deviceChannelCount(device, scope: kAudioDevicePropertyScopeOutput) > 2
+                || labels.contains(kAudioChannelLabel_Center) {
                 if let processes { tap = CATapDescription(processes: processes, deviceUID: uid, stream: 0) }
                 else { tap = CATapDescription(excludingProcesses: [], deviceUID: uid, stream: 0) }
             } else if let processes { tap = CATapDescription(stereoMixdownOfProcesses: processes) }
@@ -930,23 +1284,218 @@ final class SystemAudioTap {
     private let timeline: TimelineHandle
     private let lanes: [CaptureLane]
     private let widths: [UInt32]
+    private let routes: [CaptureRoute]
+    private let laneCapErrors: [String?]
     private var slots: [Slot]
     private var running = false
     private let captureQueue = DispatchQueue(label: "Backtracking.capture")
     private var pollInFlight = false
     private var telemetryVersion: UInt64 = 0
+    private var lastActivityPoll = 0.0
+    private var activeTrackers: [ChannelActivityTracker]
+    private var positionBuffers: [LanePositionBuffer?]
     private(set) var cachedState: UInt32 = 0
-    private(set) var cachedMeters = Array(repeating:
-        BtMeterReadings(peak_dbfs: -Float.infinity, vu: -Float.infinity, momentary_lufs: -Float.infinity), count: 2)
+    private static let silentMeter = BtMeterReadings(
+        peak_dbfs: -Float.infinity, vu: -Float.infinity, momentary_lufs: -Float.infinity)
+    private(set) var cachedMeters: [BtMeterReadings]
     var core: OpaquePointer { timeline.core }
     var laneCount: Int { lanes.count }
-    var captureRoutes: [CaptureRoute] { lanes.map(\.route) }
+    /// The channels of the lanes that start; a lane past the limit holds none (Windows `track_channels`).
+    var totalChannelCount: UInt32 { Self.channelsInUse(widths: widths, capErrors: laneCapErrors) }
+
+    /// Whether source `lane` was refused for the 64-channel limit, whatever language the window shows.
+    func laneCannotStart(_ lane: Int) -> Bool {
+        laneCapErrors.indices.contains(lane) && laneCapErrors[lane] != nil
+    }
+
+    /// Channels the capture core holds for sources that cannot start: one each (Windows holds none).
+    var channelsKeptForRefusedLanes: UInt32 { UInt32(laneCapErrors.filter { $0 != nil }.count) }
+
+    /// The Sources page's count, in English and Traditional Chinese: the channels in use, and the
+    /// ones kept for sources that cannot start, which count toward the 64 too.
+    nonisolated static func channelsInUseNote(used: UInt32, kept: UInt32) -> String {
+        guard kept > 0 else { return "\(used) of 64 channels in use / 已使用 \(used) 個聲道，上限 64 個" }
+        return "\(used) of 64 channels in use, and \(kept) kept for sources that cannot start / 已使用 \(used) 個聲道，另有 \(kept) 個保留給無法開始的來源，上限 64 個"
+    }
+
+    /// The Sources page's line when the 64 channels are taken, in Windows' words, saying so when
+    /// some of them are kept for sources that cannot start.
+    nonisolated static func channelsFullNote(kept: UInt32) -> String {
+        guard kept > 0 else {
+            return "All 64 channels are in use. A source added now cannot start. / 64 個聲道已全部使用，現在新增的來源無法開始。"
+        }
+        return "All 64 channels are in use, \(kept) of them kept for sources that cannot start. A source added now cannot start. / 64 個聲道已全部使用，其中 \(kept) 個保留給無法開始的來源。現在新增的來源無法開始。"
+    }
+
+    /// Why source `lane` cannot be added or changed: the sources would hold `total` channels,
+    /// `kept` of them one for each source that cannot start.
+    nonisolated static func addRefusal(lane: Int, total: UInt32, kept: UInt32) -> String {
+        let letter = captureLaneLetter(lane)
+        guard kept > 0 else {
+            return "Source \(letter) would bring the total to \(total) channels. The limit is 64. / 來源 \(letter) 會使總數變成 \(total) 個聲道，上限為 64。"
+        }
+        return "Source \(letter) would bring the total to \(total) channels, with one channel kept for each source that cannot start. The limit is 64. / 來源 \(letter) 會使總數變成 \(total) 個聲道（每個無法開始的來源保留 1 個），上限為 64。"
+    }
+
+    nonisolated static func channelsInUse(widths: [UInt32], capErrors: [String?]) -> UInt32 {
+        zip(widths, capErrors).reduce(0) { $0 + ($1.1 == nil ? $1.0 : 0) }
+    }
+
+    /// CAP-16: lanes start in order up to 64 channels in all; one that would go past does not
+    /// start, and later ones that still fit do (Windows `controller::lane_fits`). Unlike Windows,
+    /// a lane that does not start still holds one channel in the capture core, which takes at
+    /// most 64 in all; when those placeholders push it past 64 the capture does not open
+    /// (`captureOverLimitMessage`).
+    #if BACKTRACKING_CAPTURE_VERIFY
+    static var verifyRequestedWidths: [UInt32]?
+    #endif
+
+    nonisolated static func acceptLanes(_ requested: [UInt32]) -> (widths: [UInt32], errors: [String?]) {
+        var widths: [UInt32] = []
+        var errors: [String?] = []
+        var total: UInt32 = 0
+        for (index, width) in requested.enumerated() {
+            if total + width <= 64 {
+                total += width
+                widths.append(width)
+                errors.append(nil)
+            } else {
+                errors.append(overLimitMessage(lane: index, total: total + width))
+                widths.append(1)
+            }
+        }
+        return (widths, errors)
+    }
+
+    /// Why the capture cannot open at all, or nil. A lane that does not start still holds one
+    /// channel of the capture core here (Windows leaves it out), so the lanes that start and those
+    /// placeholders can pass 64 together. Then nothing records, and the window says so.
+    nonisolated static func captureOverLimitMessage(_ held: [UInt32]) -> String? {
+        let total = held.reduce(0, +)
+        guard total > 64 else { return nil }
+        return "Capture cannot start: with one channel kept for each source that cannot start, the sources would hold \(total) channels; the limit is 64. Remove a source or choose a narrower route. / 無法開始擷取：每個無法開始的來源保留 1 個聲道後，這些來源合計會有 \(total) 個聲道，上限為 64。請移除一個來源，或選擇聲道較少的路由。"
+    }
+
+    /// Why lane `lane` cannot start after lanes holding `total - width` channels, in English and
+    /// Traditional Chinese on one line, worded as Windows `controller::lane_fits`.
+    nonisolated static func overLimitMessage(lane: Int, total: UInt32) -> String {
+        let letter = captureLaneLetter(lane)
+        let english = lane <= 1 ? "lanes A and \(letter)" : "lanes A to \(letter)"
+        let chinese = lane <= 1 ? "來源 A 與 \(letter)" : "來源 A 到 \(letter)"
+        return "Lane \(letter) cannot start: \(english) would contain \(total) channels; the limit is 64 / 來源 \(letter) 無法開始：\(chinese) 合計會有 \(total) 個聲道，上限為 64。"
+    }
+    var retainedSeconds: Double { Double(bt_tracks_retention_frames(core)) / Self.timelineRate }
+    var captureRoutes: [CaptureRoute] { routes }
+    var captureChannelNames: [[String]] {
+        lanes.indices.map { index in
+            guard widths[index] > 2 else { return [] }
+            if case .addon(let addonID, let sourceID) = lanes[index].source,
+               let (_, src) = currentAddonSnapshot.source(addonID: addonID, sourceID: sourceID) {
+                let labels = src.allChannelLabels
+                if labels.count == Int(widths[index]) {
+                    return labels
+                }
+            }
+            return slots.first(where: { $0.indexes.contains(index) })?.input?.format.channelNames
+                ?? (1...Int(widths[index])).map { "Channel \($0)" }
+        }
+    }
+
+    func channelGroups(for lane: Int) -> [AddonChannelGroup] {
+        guard lanes.indices.contains(lane), widths.indices.contains(lane), widths[lane] > 2 else { return [] }
+        guard case .addon(let addonID, let sourceID) = lanes[lane].source,
+              let (_, src) = currentAddonSnapshot.source(addonID: addonID, sourceID: sourceID),
+              let groups = src.groups, !groups.isEmpty else {
+            return []
+        }
+        let total = groups.reduce(0) { $0 + $1.channels.count }
+        guard total == Int(widths[lane]) else { return [] }
+        return groups
+    }
+
+    func ingestAddonPositions(_ events: [AddonPositionEvent]) -> Bool {
+        guard positionBuffers.contains(where: { $0 != nil }) else { return false }
+        for event in events {
+            for (index, lane) in lanes.enumerated() {
+                guard case .addon(let addonID, let sourceID) = lane.source,
+                      addonID == event.addon_id, sourceID == event.source_id,
+                      let buf = positionBuffers[index] else { continue }
+                buf.enqueue(timeNs: event.time, channels: event.channels)
+            }
+        }
+        var overflowed = false
+        let timeline = self.timeline
+        captureQueue.sync {
+            let first = bt_tracks_first_frame(timeline.core)
+            let end = bt_tracks_end_frame(timeline.core)
+            let retained: Range<UInt64>? = first < end ? first..<end : nil
+            for (index, buf) in positionBuffers.enumerated() {
+                guard let buf else { continue }
+                var evictedFirst: UInt64 = 0
+                let evicted: UInt64? = bt_tracks_take_frame_clock_eviction(
+                    timeline.core, UInt32(index), &evictedFirst
+                ) != 0 ? evictedFirst : nil
+                buf.drain(evictedBefore: evicted, retainedRange: retained) { timeNs in
+                    var frame: UInt64 = 0
+                    let status = bt_tracks_retained_frame_at(timeline.core, UInt32(index), timeNs, &frame)
+                    return (status, frame)
+                }
+                if buf.takeOverflowed() {
+                    overflowed = true
+                }
+            }
+        }
+        return overflowed
+    }
+
+    func clearPositionTracks() {
+        for buf in positionBuffers {
+            buf?.clear()
+        }
+    }
+
+    func freezePositions() -> [Int: FrozenPositionsHandle] {
+        var result: [Int: FrozenPositionsHandle] = [:]
+        for (index, buf) in positionBuffers.enumerated() {
+            if let frozen = buf?.freeze() {
+                result[index] = frozen
+            }
+        }
+        return result
+    }
+
+    func channelCount(for lane: Int) -> UInt32? {
+        widths.indices.contains(lane) ? widths[lane] : nil
+    }
+
+    /// Only wide (>2 ch) system, microphone, and application sources hide silent channels.
+    /// Sender and add-on sources always show every channel.
+    func canHideSilentChannels(for lane: Int) -> Bool {
+        guard lanes.indices.contains(lane), widths.indices.contains(lane) else { return false }
+        return widths[lane] > 2 && !lanes[lane].source.isSenderBacked
+    }
+
+    func isWideSender(lane: Int) -> Bool {
+        guard lanes.indices.contains(lane), widths.indices.contains(lane) else { return false }
+        return lanes[lane].source.isSenderBacked && widths[lane] > 2
+    }
+
+    func liveActiveMask(for lane: Int, hideSilent: Bool) -> UInt64? {
+        guard hideSilent, canHideSilentChannels(for: lane), activeTrackers.indices.contains(lane) else { return nil }
+        return activeTrackers[lane].shown ?? 0
+    }
+
     var privatePlaybackDevices: Set<AudioObjectID> {
         Set(slots.compactMap { ($0.input as? PlaybackTap)?.aggregateID })
     }
 
     init(history: UInt32, lanes: [CaptureLane], retainSilence: Bool = false) throws {
-        guard (1...2).contains(lanes.count) else { throw CaptureError("Capture takes one or two sources") }
+        guard (1...maximumCaptureLanes).contains(lanes.count) else {
+            throw CaptureError("Capture takes 1 to 64 sources")
+        }
+        cachedMeters = Array(repeating: Self.silentMeter, count: lanes.count)
+        activeTrackers = Array(repeating: ChannelActivityTracker(), count: lanes.count)
+        positionBuffers = Array(repeating: nil, count: lanes.count)
         self.lanes = lanes
         var slots: [Slot] = []
         for (index, lane) in lanes.enumerated() {
@@ -961,26 +1510,54 @@ final class SystemAudioTap {
         for index in slots.indices {
             do {
                 slots[index].input = try Self.makeInput(
-                    slots[index].identity, preferNative: slots[index].indexes.contains { lanes[$0].route == .center }
+                    slots[index].identity, preferNative: slots[index].indexes.contains { [.center, .allChannels].contains(lanes[$0].route) }
                 )
             } catch {
                 slots[index].error = error.localizedDescription
-                slots[index].retryAt = ProcessInfo.processInfo.systemUptime + 5
+                slots[index].retryAt = ProcessInfo.processInfo.systemUptime + 2
             }
         }
-        let widths = lanes.enumerated().map { index, lane -> UInt32 in
-            guard lane.route == .merged else { return 1 }
-            return slots.first { $0.indexes.contains(index) }?.input?.format.mergedChannels
-                ?? (lane.source.isMicrophone ? 1 : 2)
+        let formats = lanes.indices.map { index in
+            slots.first(where: { $0.indexes.contains(index) })?.input?.format
         }
-        self.widths = widths
-        self.timeline = try TimelineHandle(history: history, a: widths[0], b: widths.count == 2 ? widths[1] : 0,
-                                           retainSilence: retainSilence)
+        let routes = lanes.enumerated().map { index, lane -> CaptureRoute in
+            // CAP-10: A wide Sender or add-on source (>2 channels) always captures all native channels.
+            if lane.source.isSenderBacked, let format = formats[index], format.channels > 2 {
+                return .allChannels
+            }
+            return lane.route == .allChannels && formats[index]?.supports(.allChannels) == false ? .merged : lane.route
+        }
+        var requestedWidths = lanes.enumerated().map { index, lane -> UInt32 in
+            let route = routes[index]
+            guard let format = formats[index], format.supports(route) else {
+                return route == .merged && !lane.source.isMicrophone ? 2 : 1
+            }
+            return format.width(for: route)
+        }
+        #if BACKTRACKING_CAPTURE_VERIFY
+        // Stands in for sources whose formats a verification cannot open.
+        if let widths = Self.verifyRequestedWidths, widths.count == requestedWidths.count { requestedWidths = widths }
+        #endif
+        let (acceptedWidths, capErrors) = Self.acceptLanes(requestedWidths)
+        if let overLimit = Self.captureOverLimitMessage(acceptedWidths) { throw CaptureError(overLimit) }
+        self.routes = routes
+        self.widths = acceptedWidths
+        self.laneCapErrors = capErrors
+        self.timeline = try TimelineHandle(history: history, widths: acceptedWidths, retainSilence: retainSilence)
         self.slots = slots
+        // Enable frame clock & position tracking for wide add-on lanes (Pkg 19).
+        for (index, lane) in lanes.enumerated() where lane.source.isAddon && acceptedWidths[index] > 2 {
+            if bt_tracks_enable_frame_clock(timeline.core, UInt32(index)) != 0 {
+                self.positionBuffers[index] = LanePositionBuffer()
+            }
+        }
         // A selection preview from any Backtracking is heard in System playback. Those lanes
         // record silence while it plays, so the preview never enters the history.
-        for (index, lane) in lanes.enumerated() where lane.source == .system {
-            bt_tracks_set_preview_silence(timeline.core, UInt32(index), 1)
+        // A test copy neither plays previews nor joins the shared preview gate.
+        if !TestCopyConfig.current.isTestCopy {
+            for (index, lane) in lanes.enumerated() where lane.source == .system {
+                bt_tracks_set_preview_silence(timeline.core, UInt32(index), 1)
+            }
         }
         for index in self.slots.indices { bind(index) }
     }
@@ -993,69 +1570,140 @@ final class SystemAudioTap {
         AVCaptureDevice.requestAccess(for: .audio) { _ in completion() }
     }
 
+    static func estimatedWidth(for lane: CaptureLane) -> UInt32 {
+        guard lane.route == .merged || lane.route == .allChannels else { return 1 }
+        let channels: Int
+        switch identity(for: lane.source) {
+        case .syntheticSystem(let spec):
+            channels = SyntheticSystemInput.parse(spec)?.labels.count ?? 2
+        case .sender(_, _, let count, _): channels = Int(count)
+        case .microphone(let device, _): channels = inputChannels(device)
+        case .system(let device, _), .application(_, let device, _):
+            channels = max(2, deviceChannelCount(device, scope: kAudioDevicePropertyScopeOutput))
+        case nil: channels = lane.source.isMicrophone ? 1 : 2
+        }
+        if (lane.route == .allChannels || lane.source.isSenderBacked), channels > 2 { return UInt32(channels) }
+        return UInt32(max(1, min(2, channels)))
+    }
+
     private static func makeInput(_ identity: InputIdentity?, preferNative: Bool) throws -> NativeInput? {
         switch identity {
+        case .syntheticSystem(let spec): try SyntheticSystemInput(spec: spec)
         case .system(let device, _): try PlaybackTap(processes: nil, device: device, preferNativeLayout: preferNative)
         case .application(let processes, let device, _):
             try PlaybackTap(processes: processes, device: device, preferNativeLayout: preferNative)
         case .microphone(let device, _): try MicrophoneInput(device: device)
-        case .sender(let id, let rate, let channels): SenderInput(id: id, rate: rate, channels: channels)
+        case .sender(let id, let rate, let channels, let labels):
+            SenderInput(id: id, rate: rate, channels: channels, overrideLabels: labels)
         case nil: nil
         }
     }
 
     private func bind(_ index: Int) {
         guard let input = slots[index].input else { return }
-        let available = slots[index].indexes.filter { input.format.supports(lanes[$0].route) }
+        let available = slots[index].indexes.filter { laneCapErrors[$0] == nil && input.format.supports(routes[$0]) }
         let producers = available.map { lane in
-            LaneProducer(timeline: timeline, lane: UInt32(lane), route: lanes[lane].route, outputChannels: widths[lane])
+            LaneProducer(timeline: timeline, lane: UInt32(lane), route: routes[lane], outputChannels: widths[lane])
         }
         guard !producers.isEmpty else { return }
         do { try input.bind(producers) }
         catch {
             slots[index].error = error.localizedDescription
             slots[index].input = nil
-            slots[index].retryAt = ProcessInfo.processInfo.systemUptime + 5
+            slots[index].retryAt = ProcessInfo.processInfo.systemUptime + 2
         }
     }
 
     func supports(_ route: CaptureRoute, lane: Int) -> Bool {
+        guard lanes.indices.contains(lane) else { return false }
+        if isWideSender(lane: lane) { return route == .merged }
         guard let format = slots.first(where: { $0.indexes.contains(lane) })?.input?.format else {
-            return route != .center
+            return route != .center && route != .allChannels
         }
-        if route == .center, format.center == nil, !lanes[lane].source.isMicrophone, !lanes[lane].source.isSender,
+        if format.supports(route) { return true }
+        if (route == .center || route == .allChannels), !lanes[lane].source.isMicrophone, !lanes[lane].source.isSender,
            let device = defaultDevice(kAudioHardwarePropertyDefaultOutputDevice) {
-            // A normal stereo tap can be recreated for an explicitly selected native Center.
-            return deviceLabels(device, scope: kAudioDevicePropertyScopeOutput).contains(kAudioChannelLabel_Center)
+            let labels = deviceLabels(device, scope: kAudioDevicePropertyScopeOutput)
+            return route == .center ? labels.contains(kAudioChannelLabel_Center)
+                : deviceChannelCount(device, scope: kAudioDevicePropertyScopeOutput) > 2
         }
-        return format.supports(route)
+        return false
     }
 
-    var sourceMessage: String? {
-        for slot in slots {
-            if let error = slot.error { return "\(slot.source.label) · \(error)" }
-            if slot.input == nil {
-                if slot.source.isMicrophone, AVCaptureDevice.authorizationStatus(for: .audio) != .authorized {
-                    return "\(slot.source.label) · needs microphone permission"
-                }
-                return "\(slot.source.label) · waiting for the source"
+    /// The short capture status of an add-on source that is not delivering audio, in Windows'
+    /// words (`controller.rs`); the Sources page explains it at length.
+    nonisolated static func addonCaptureStatus(_ addon: AddonRecord?, sourceID: String) -> String {
+        guard let addon else { return "Add-on is not installed" }
+        switch addon.state {
+        case "running":
+            return addon.sources.contains(where: { $0.id == sourceID }) ? "Waiting for add-on audio" : "Add-on source is not available"
+        case "starting": return "Add-on is starting"
+        case "stopping": return "Add-on is stopping"
+        case "stopped": return "Add-on is stopped"
+        case "not_responding": return "Add-on is not responding"
+        default: return "Add-on unavailable: \(addon.reason ?? addon.state)"
+        }
+    }
+
+    func sourceProblem(for lane: Int) -> String? {
+        guard lanes.indices.contains(lane) else { return nil }
+        if let capError = laneCapErrors[lane] {
+            return localizedBilingual(capError)
+        }
+        guard let slot = slots.first(where: { $0.indexes.contains(lane) }) else { return nil }
+        if let error = slot.error { return localizedBilingual(error) }
+        if slot.input == nil {
+            if case .addon(let addonID, let sourceID) = slot.source {
+                return Self.addonCaptureStatus(currentAddonSnapshot.addon(addonID), sourceID: sourceID)
             }
-            if let input = slot.input, let index = slot.indexes.first(where: { !input.format.supports(lanes[$0].route) }) {
-                return "Source \(index == 0 ? "A" : "B") · this source has no \(lanes[index].route.label) channel"
+            if slot.source.isSender {
+                return "Sender audio is unavailable"
             }
+            if slot.source.isMicrophone, AVCaptureDevice.authorizationStatus(for: .audio) != .authorized {
+                return "needs microphone permission"
+            }
+            if case .application(let identifier) = slot.source {
+                return localizedBilingual("Waiting for application to start or allow access (\(identifier)) / 等待應用程式啟動或允許存取（\(identifier)）")
+            }
+            return "waiting for the source"
+        }
+        if let input = slot.input, !lanes[lane].source.isSenderBacked, !input.format.supports(lanes[lane].route) {
+            if lanes[lane].route == .allChannels, routes[lane] == .merged {
+                return "capturing in Merged because this source has fewer than three channels"
+            }
+            return "this source has no \(lanes[lane].route.label) channel"
         }
         return nil
     }
 
+    var sourceMessage: String? {
+        let problems: [(Int, String)] = lanes.indices.compactMap { lane in
+            sourceProblem(for: lane).map { (lane, $0) }
+        }
+        guard let first = problems.first else { return nil }
+        if lanes.count == 1 {
+            return first.1
+        }
+        let letter = captureLaneLetter(first.0)
+        let head = AppLanguage.current == .zhHant ? "來源 \(letter)：\(first.1)" : "Source \(letter): \(first.1)"
+        let extra = problems.count - 1
+        if extra == 0 { return head }
+        if AppLanguage.current == .zhHant {
+            return "\(head) · 另有 \(extra) 個來源有問題"
+        }
+        if extra == 1 { return "\(head) · 1 more source has a problem" }
+        return "\(head) · \(extra) more sources have a problem"
+    }
+
     private func start(_ index: Int) {
         guard let input = slots[index].input,
-              slots[index].indexes.contains(where: { input.format.supports(lanes[$0].route) }) else { return }
+              slots[index].indexes.contains(where: { laneCapErrors[$0] == nil && input.format.supports(routes[$0]) }) else { return }
         do {
             try input.start()
             slots[index].error = nil
         } catch {
             slots[index].error = error.localizedDescription
-            slots[index].retryAt = ProcessInfo.processInfo.systemUptime + 5
+            slots[index].retryAt = ProcessInfo.processInfo.systemUptime + 2
         }
     }
 
@@ -1068,14 +1716,25 @@ final class SystemAudioTap {
         guard !pollInFlight else { return }
         pollInFlight = true
         let version = telemetryVersion
+        let count = laneCount
+        let now = ProcessInfo.processInfo.systemUptime
+        let shouldPollActivity = (now - lastActivityPoll) >= ChannelActivityTracker.pollInterval
+        let wideLanes = shouldPollActivity ? lanes.indices.filter { canHideSilentChannels(for: $0) } : []
+        if shouldPollActivity { lastActivityPoll = now }
         captureQueue.async { [weak self] in
             bt_tracks_poll(timeline.core)
             let state = bt_tracks_state(timeline.core)
-            let meters = [bt_tracks_meter_readings(timeline.core, 0), bt_tracks_meter_readings(timeline.core, 1)]
+            let meters = (0..<count).map { bt_tracks_meter_readings(timeline.core, UInt32($0)) }
+            let activity: [(Int, UInt64)] = wideLanes.map { lane in
+                (lane, bt_tracks_active_channels(timeline.core, UInt32(lane)))
+            }
             DispatchQueue.main.async { [weak self] in
-                if self?.telemetryVersion == version {
-                    self?.cachedState = state
-                    self?.cachedMeters = meters
+                if let self, self.telemetryVersion == version {
+                    self.cachedState = state
+                    self.cachedMeters = meters
+                    for (lane, mask) in activity where self.activeTrackers.indices.contains(lane) {
+                        self.activeTrackers[lane].recordAnswer(mask)
+                    }
                 }
                 self?.pollInFlight = false
             }
@@ -1136,8 +1795,7 @@ final class SystemAudioTap {
         telemetryVersion &+= 1
         bt_tracks_pause(core)
         cachedState = 2
-        cachedMeters = Array(repeating:
-            BtMeterReadings(peak_dbfs: -Float.infinity, vu: -Float.infinity, momentary_lufs: -Float.infinity), count: 2)
+        cachedMeters = Array(repeating: Self.silentMeter, count: laneCount)
         guard running else { return }
         var firstError: Error?
         for input in slots.compactMap(\.input) {
@@ -1154,11 +1812,6 @@ final class SystemAudioTap {
         guard running else { return false }
         let now = ProcessInfo.processInfo.systemUptime
         let identities = lanes.map { identity(for: $0.source) }
-        if identities.count == 2, lanes[0].source != lanes[1].source {
-            // A default device can converge with, or diverge from, an explicitly selected one.
-            let shareProducer = identities[0] != nil && identities[0] == identities[1]
-            if shareProducer != (slots.count == 1) { return true }
-        }
         for index in slots.indices {
             let next = identities[slots[index].indexes[0]]
             let unchanged = next == slots[index].identity
@@ -1172,7 +1825,7 @@ final class SystemAudioTap {
             do { try slots[index].input?.stop() }
             catch {
                 slots[index].error = error.localizedDescription
-                slots[index].retryAt = now + 5
+                slots[index].retryAt = now + 2
                 continue
             }
             slots[index].input = nil
@@ -1180,10 +1833,17 @@ final class SystemAudioTap {
             slots[index].error = nil
             do {
                 let input = try Self.makeInput(
-                    next, preferNative: slots[index].indexes.contains { lanes[$0].route == .center }
+                    next, preferNative: slots[index].indexes.contains { [.center, .allChannels].contains(lanes[$0].route) }
                 )
                 if let input, slots[index].indexes.contains(where: {
-                    lanes[$0].route == .merged && input.format.mergedChannels != widths[$0]
+                    let wanted = lanes[$0].route
+                    let route: CaptureRoute
+                    if lanes[$0].source.isSenderBacked, input.format.channels > 2 {
+                        route = .allChannels
+                    } else {
+                        route = wanted == .allChannels && !input.format.supports(wanted) ? .merged : wanted
+                    }
+                    return route != routes[$0] || (input.format.supports(route) && input.format.width(for: route) != widths[$0])
                 }) {
                     return true
                 }
@@ -1192,7 +1852,7 @@ final class SystemAudioTap {
                 start(index)
             } catch {
                 slots[index].error = error.localizedDescription
-                slots[index].retryAt = now + 5
+                slots[index].retryAt = now + 2
             }
         }
         return false
@@ -1311,7 +1971,7 @@ private func verifyMacRetainSilenceOption() throws {
 
     let disabled = try TimelineHandle(history: 10, a: 1, b: 0, retainSilence: true)
     let disabledProducer = LaneProducer(timeline: disabled, lane: 0, route: .merged, outputChannels: 1)
-    let disabledFormat = InputFormat(senderChannels: 1, sampleRate: 48_000)
+    let disabledFormat = InputFormat(senderID: "", senderChannels: 1, sampleRate: 48_000)
     var disabledBuffers = AudioBufferList(
         mNumberBuffers: 1,
         mBuffers: AudioBuffer(mNumberChannels: 1, mDataByteSize: UInt32(blockFrames * 4), mData: nil)
@@ -1384,7 +2044,158 @@ private func verifyMacRetainSilenceOption() throws {
     }
 }
 
+private func verifyMacMultiSourceCapture() throws {
+    let timeline = try TimelineHandle(history: 10, widths: [1, 2, 6], retainSilence: true)
+    let frames = 4_800
+    let levels: [Float] = [0.125, 0.25, 0.5]
+    for (lane, width) in [1, 2, 6].enumerated() {
+        let samples = [Float](repeating: levels[lane], count: frames * width)
+        let accepted = samples.withUnsafeBufferPointer {
+            bt_tracks_push_interleaved(timeline.core, UInt32(lane), $0.baseAddress,
+                UInt32(frames), 1_000_000_000, SystemAudioTap.timelineRate)
+        }
+        guard accepted == UInt32(frames) else { throw CaptureError("Lane did not accept its full input") }
+    }
+    bt_tracks_pause(timeline.core)
+    let first = bt_tracks_first_frame(timeline.core)
+    let end = bt_tracks_end_frame(timeline.core)
+    guard end - first == UInt64(frames), let frozen = bt_tracks_freeze(timeline.core, first, end) else {
+        throw CaptureError("The three lanes did not retain a shared range")
+    }
+    defer { bt_frozen_free(frozen) }
+    bt_tracks_clear(timeline.core)
+
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("Backtracking-verification-\(UUID())")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let selectionStart = first + 200
+    let selectionEnd = first + 500
+    let fades = BtFades(fade_in: 0, fade_out: 0)
+    let lanes = [
+        BtFrozenLane(index: 0, route: 5, source_name: nil, channel_labels: nil, view: 0),
+        BtFrozenLane(index: 1, route: 5, source_name: nil, channel_labels: nil, view: 0),
+        BtFrozenLane(index: 2, route: 7, source_name: nil, channel_labels: nil, view: 0)
+    ]
+    func export(_ selected: [BtFrozenLane], mode: UInt32 = 2) throws -> [URL] {
+        let paths = folder.path.withCString { path in
+            selected.withUnsafeBufferPointer {
+                bt_frozen_export(frozen, $0.baseAddress, $0.count, selectionStart, selectionEnd,
+                    path, 48_000, 32, 0, mode, 0, fades)
+            }
+        }
+        guard let paths else { throw CaptureError("Aligned export failed") }
+        defer { bt_export_paths_free(paths) }
+        return (0..<bt_export_paths_count(paths)).compactMap { index in
+            bt_export_path(paths, index).map { URL(fileURLWithPath: String(cString: $0)) }
+        }
+    }
+    func checkFile(_ url: URL, lane: Int, width: UInt32) throws {
+        let file = try AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: false)
+        let count = AVAudioFrameCount(selectionEnd - selectionStart)
+        guard file.processingFormat.channelCount == width, file.length == Int64(count),
+              file.processingFormat.sampleRate == 48_000,
+              let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: count) else {
+            throw CaptureError("The frozen WAV has the wrong channels or boundaries")
+        }
+        try file.read(into: buffer)
+        guard let channels = buffer.floatChannelData,
+              url.deletingPathExtension().lastPathComponent.hasSuffix("-\(captureLaneLetter(lane))") else {
+            throw CaptureError("The WAV lost its lane label or sample data")
+        }
+        for channel in 0..<Int(width) {
+            guard abs(channels[channel][0] - levels[lane]) < 0.00001 else {
+                throw CaptureError("The WAV's lane sample does not match its source")
+            }
+        }
+    }
+    let aligned = try export(lanes)
+    guard aligned.count == 4 else { throw CaptureError("Expected three aligned WAVs plus the stereo fold-down") }
+    for lane in lanes.indices {
+        try checkFile(aligned[lane], lane: lane, width: [1, 2, 6][lane])
+    }
+    let isolated = try export([lanes[2]])
+    guard isolated.count == 2 else { throw CaptureError("Expected a multichannel and a stereo WAV for lane C") }
+    try checkFile(isolated[0], lane: 2, width: 6)
+    for (mode, count, width): (UInt32, Int, UInt32) in [(0, 7, 2), (1, 7, 1), (3, 2, 2)] {
+        let urls = try export([lanes[2]], mode: mode)
+        guard urls.count == count,
+              try AVAudioFile(forReading: urls[0]).fileFormat.channelCount == width,
+              urls.last?.lastPathComponent.hasSuffix("-Stereo.wav") == true else {
+            throw CaptureError("The multichannel export mode wrote the wrong files")
+        }
+    }
+    var isolatedRow = lanes[2]
+    isolatedRow.view = 5
+    let rowFiles = try export([isolatedRow], mode: 1)
+    guard rowFiles.count == 1, rowFiles[0].lastPathComponent.contains("-Ch03_"),
+          try AVAudioFile(forReading: rowFiles[0]).fileFormat.channelCount == 1 else {
+        throw CaptureError("Isolated channel export failed")
+    }
+    isolatedRow.view = 67
+    let pairFiles = try export([isolatedRow], mode: 1)
+    guard pairFiles.count == 1, pairFiles[0].lastPathComponent.hasSuffix("-Stereo.wav") else {
+        throw CaptureError("L/R row selection did not export the pair")
+    }
+    var low: Float = 0
+    var high: Float = 0
+    bt_frozen_waveform(frozen, 2, 5, selectionStart, selectionEnd, &low, &high, 1, nil)
+    guard abs(low - levels[2]) < 0.00001, abs(high - levels[2]) < 0.00001 else {
+        throw CaptureError("The isolated row waveform did not use its channel")
+    }
+    bt_frozen_waveform(frozen, 2, 67, selectionStart, selectionEnd, &low, &high, 1, nil)
+    guard high > 0, low == high else { throw CaptureError("The L/R row is missing its fold-down") }
+    guard let slot = bt_preview_slot_new_local() else { throw CaptureError("Could not create a preview slot") }
+    defer { bt_preview_slot_free(slot) }
+    let playing = lanes.withUnsafeBufferPointer {
+        bt_frozen_play(frozen, slot, $0.baseAddress, $0.count, selectionStart, selectionEnd, 0, 0, fades)
+    }
+    var position: UInt64 = 0
+    guard playing == 1, bt_preview_slot_position(slot, &position) == 1, position == selectionStart else {
+        throw CaptureError("Preview did not start at the aligned selection")
+    }
+
+    let maximum = try TimelineHandle(history: 10, widths: Array(repeating: 1, count: 64))
+    guard bt_tracks_channels(maximum.core, 63) == 1, bt_tracks_channels(maximum.core, 64) == 0,
+          captureLaneLetter(63) == "BL" else { throw CaptureError("The 64-source boundary is wrong") }
+    let invalid = [UInt32](repeating: 1, count: 65)
+    guard invalid.withUnsafeBufferPointer({
+        bt_tracks_new_lanes(SystemAudioTap.timelineRate, $0.baseAddress, $0.count, 10, 0)
+    }) == nil else { throw CaptureError("The capture accepted a 65th source") }
+}
+
+private func verifyMacFrequencyCapture() throws {
+    let timeline = try TimelineHandle(history: 10, widths: [2], retainSilence: true)
+    let frames = 9_600
+    let signal = (0..<frames).flatMap { frame -> [Float] in
+        let angle = 2 * Double.pi * Double(frame) / 48_000
+        return [Float(sin(angle * 60)) * 0.5, Float(sin(angle * 10_000)) * 0.5]
+    }
+    let accepted = signal.withUnsafeBufferPointer {
+        bt_tracks_push_interleaved(timeline.core, 0, $0.baseAddress, UInt32(frames),
+            1_000_000_000, SystemAudioTap.timelineRate)
+    }
+    guard accepted == UInt32(frames) else { throw CaptureError("Frequency test input was lost") }
+    bt_tracks_pause(timeline.core)
+    let first = bt_tracks_first_frame(timeline.core)
+    let end = bt_tracks_end_frame(timeline.core)
+    guard let frozen = bt_tracks_freeze(timeline.core, first, end), end - first == UInt64(frames) else {
+        throw CaptureError("Could not freeze the two frequency tones")
+    }
+    defer { bt_frozen_free(frozen) }
+    for (view, expected): (UInt32, Int) in [(1, 0), (2, 5)] {
+        var bands = [Float](repeating: 0, count: 6)
+        bands.withUnsafeMutableBufferPointer {
+            bt_frozen_spectrum(frozen, 0, view, first, end, $0.baseAddress, 1, nil)
+        }
+        guard bands.indices.max(by: { bands[$0] < bands[$1] }) == expected, bands[expected] > 0 else {
+            throw CaptureError("Rust frequency bands did not identify the correct tone")
+        }
+    }
+}
+
 func verifyMacCaptureRouting() throws {
+    try verifyMacMultiSourceCapture()
+    try verifyMacFrequencyCapture()
     try verifyMacWaveformGeometry()
     try verifyMacRetainSilenceOption()
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -1521,8 +2332,9 @@ func verifyMacCaptureRouting() throws {
     )
     let center: Float = 0.4
     let attenuation: Float = 0.70710677
-    let left = 0.25 + center * attenuation
-    let right = -0.5 + center * attenuation
+    let scale: Float = 1 + attenuation
+    let left = (0.25 + center * attenuation) / scale
+    let right = (-0.5 + center * attenuation) / scale
     try check(
         samples: [0.25, -0.5, center], labels: stereo + [kAudioChannelLabel_Center], routes: [.center, .merged],
         captured: [[center], [left, right]], routed: [[center], [left, right]], mono: [[center], [(left + right) * 0.5]]

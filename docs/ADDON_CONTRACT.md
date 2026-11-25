@@ -625,3 +625,15 @@ a package that declares it as broken, with the message that a newer Backtracking
 fields and error codes may be added to `control` later; ignore fields you do not know and treat
 an unknown `code` like `failed`. A change that would break an existing add-on raises the number, and the host keeps
 accepting the previous number for at least one release.
+
+### macOS host paths and execution
+
+On macOS the normal data root is `~/Library/Application Support/Backtracking`.
+The application passes this root (or an isolated test root) to the add-on host.
+Installed folders live in `addons/<id>`, private add-on data in `addon-data/<id>`,
+and Sender registrations in `senders-v1`. Build a package with a matching
+`macos-aarch64` or `macos-x86_64` run entry. Each named run program must exist
+in the archive. The macOS installer gives the selected program owner execute
+permission and preserves the package's quarantine attribute on extracted files.
+An executable must satisfy the operating system's launch and signing requirements.
+Launch errors are reported through the add-on state.

@@ -11,6 +11,36 @@ extern "C" fn bt_preview_slot_new() -> *mut PreviewSlot {
     Box::into_raw(Box::new(PreviewSlot::new()))
 }
 
+/// The gate of this process alone, made once and shared by every local slot.
+pub(crate) fn local_gate() -> &'static crate::preview::PreviewGate {
+    static LOCAL: std::sync::OnceLock<crate::preview::PreviewGate> = std::sync::OnceLock::new();
+    LOCAL.get_or_init(crate::preview::PreviewGate::local)
+}
+
+/// A slot whose renders hold a gate of this process alone, so other Backtracking processes
+/// keep recording System playback while it renders (for checks that render offline). Every
+/// such slot shares one gate; freeing the slot leaves nothing behind.
+#[no_mangle]
+extern "C" fn bt_preview_slot_new_local() -> *mut PreviewSlot {
+    Box::into_raw(Box::new(PreviewSlot::with_gate(local_gate())))
+}
+
+#[cfg(test)]
+mod local_gate_tests {
+    use super::*;
+
+    #[test]
+    fn local_slots_share_one_gate_and_free_cleanly() {
+        let first = local_gate() as *const _;
+        for _ in 0..1_000 {
+            let slot = bt_preview_slot_new_local();
+            assert!(!slot.is_null());
+            unsafe { bt_preview_slot_free(slot) };
+            assert!(std::ptr::eq(local_gate(), first));
+        }
+    }
+}
+
 /// Frees the slot and any preview in it. Nothing may render the slot any more.
 #[no_mangle]
 unsafe extern "C" fn bt_preview_slot_free(slot: *mut PreviewSlot) {

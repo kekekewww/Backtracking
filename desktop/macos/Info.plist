@@ -26,5 +26,18 @@
     <string>Backtracking captures a selected microphone when you enable that source.</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>Backtracking captures recent system audio so you can export samples as WAV files.</string>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>btaddon</string>
+            </array>
+            <key>CFBundleTypeName</key>
+            <string>Backtracking Add-on</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+        </dict>
+    </array>
 </dict>
 </plist>

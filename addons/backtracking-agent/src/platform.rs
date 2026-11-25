@@ -144,7 +144,24 @@ pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
     result
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("/usr/bin/pbcopy")
+        .env("LC_CTYPE", "UTF-8")
+        .stdin(Stdio::piped())
+        .spawn()?;
+    let written = child.stdin.take().unwrap().write_all(text.as_bytes());
+    let status = child.wait()?;
+    written?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("pbcopy exited with {status}")))
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn copy_to_clipboard(_text: &str) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -188,7 +205,27 @@ pub fn process_runs(pid: u32, program: &Path) -> bool {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub fn process_runs(pid: u32, program: &Path) -> bool {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    #[link(name = "proc")]
+    extern "C" {
+        fn proc_pidpath(pid: i32, buf: *mut std::ffi::c_void, size: u32) -> i32;
+    }
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let mut buf = [0u8; 4096];
+    let count = unsafe { proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if count <= 0 {
+        return false;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let running = std::fs::canonicalize(OsStr::from_bytes(&buf[..end]));
+    matches!((running,std::fs::canonicalize(program)),(Ok(a),Ok(b)) if a==b)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn process_runs(pid: u32, _program: &Path) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }

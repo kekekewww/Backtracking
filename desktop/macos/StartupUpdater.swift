@@ -9,7 +9,16 @@ private let updateBundleID = "com.backtracking.audio.capture"
 private let maximumUpdateSize = 128 * 1024 * 1024
 private let applyUpdateFlag = "--backtracking-apply-update"
 private let updateReceiptFlag = "--backtracking-update-receipt"
+private let updateRecoveryFlag = "--backtracking-update-recovery"
 private let skipUpdateFlag = "--backtracking-skip-update"
+private let maxReleaseNotesChars = 8_000
+private let emptyReleaseNotesFallback = "這個版本沒有附上更新內容。"
+
+private func normalizedReleaseNotes(_ raw: String?) -> String {
+    let trimmed = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty { return emptyReleaseNotesFallback }
+    return String(trimmed.prefix(maxReleaseNotesChars))
+}
 
 private enum UpdateFailure: LocalizedError {
     case invalidRelease, invalidSignature, invalidPackage, unconfigured, installation
@@ -153,13 +162,38 @@ private struct UpdateTransaction: Codable {
 
 @MainActor
 final class StartupUpdater: NSObject {
+    private struct AvailableUpdate {
+        let version: String
+        let notes: String
+        let asset: GitHubUpdate.Asset
+        let manifest: UpdateManifest
+        let manifestBytes: Data
+        let signature: Data
+    }
+
     private enum Preference: String { case ask, automatic, manual }
     private enum Choice { case update, later, never }
-    private let defaults = UserDefaults.standard
+    private let isTestCopy: Bool
+    private var defaults: UserDefaults? { isTestCopy ? nil : .standard }
     private var busy = false
+    private var availableUpdate: AvailableUpdate?
+    private var confirmingInstall = false
+    private var releaseNotesExpanded = true
+    private var lastUpdateExpanded = false
     private weak var modePopup: NSPopUpButton?
     private weak var checkButton: NSButton?
     private weak var status: NSTextField?
+    private weak var availableContainer: NSStackView?
+    private weak var lastUpdateContainer: NSStackView?
+    private weak var releaseNotesText: NSTextField?
+    private weak var releaseNotesToggle: NSButton?
+    private weak var lastUpdateText: NSTextField?
+    private weak var lastUpdateToggle: NSButton?
+
+    init(isTestCopy: Bool = false) {
+        self.isTestCopy = isTestCopy
+        super.init()
+    }
 
     private var version: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
@@ -170,9 +204,9 @@ final class StartupUpdater: NSObject {
     }
 
     private var preference: Preference {
-        get { Preference(rawValue: defaults.string(forKey: "updatePreference") ?? "") ?? .ask }
+        get { Preference(rawValue: defaults?.string(forKey: "updatePreference") ?? "") ?? .ask }
         set {
-            defaults.set(newValue.rawValue, forKey: "updatePreference")
+            defaults?.set(newValue.rawValue, forKey: "updatePreference")
             modePopup?.selectItem(at: Self.modes.firstIndex(of: newValue) ?? 0)
         }
     }
@@ -201,10 +235,22 @@ final class StartupUpdater: NSObject {
             let check = NSButton(title: "Check for updates", target: self, action: #selector(checkManually))
             check.isEnabled = !busy
             checkButton = check
-            let notes = NSButton(title: "Last update", target: self, action: #selector(showPreviousNotes))
-            let buttons = NSStackView(views: [check, notes, open])
-            buttons.spacing = 8
-            rows += [mode, buttons, status]
+
+            let avail = NSStackView(views: [])
+            avail.orientation = .vertical
+            avail.alignment = .leading
+            avail.spacing = 8
+            availableContainer = avail
+
+            let last = NSStackView(views: [])
+            last.orientation = .vertical
+            last.alignment = .leading
+            last.spacing = 6
+            lastUpdateContainer = last
+
+            rows += [mode, check, avail, status, last, open]
+            rebuildAvailableSection()
+            rebuildLastUpdateSection()
         }
         let stack = NSStackView(views: rows)
         stack.orientation = .vertical
@@ -217,8 +263,169 @@ final class StartupUpdater: NSObject {
         return tab
     }
 
+    private func rebuildAvailableSection() {
+        guard let container = availableContainer else { return }
+        for view in container.arrangedSubviews {
+            container.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        guard let update = availableUpdate else {
+            container.isHidden = true
+            return
+        }
+        container.isHidden = false
+        let heading = NSTextField(labelWithString: "Available version  v\(update.version)")
+        let toggle = NSButton(
+            title: (releaseNotesExpanded ? "▾ " : "▸ ") + "Release notes",
+            target: self, action: #selector(toggleReleaseNotes)
+        )
+        toggle.isBordered = false
+        toggle.font = .systemFont(ofSize: 14, weight: .semibold)
+        releaseNotesToggle = toggle
+        let notesLabel = NSTextField(wrappingLabelWithString: update.notes)
+        notesLabel.font = .systemFont(ofSize: 13)
+        notesLabel.isSelectable = true
+        notesLabel.isHidden = !releaseNotesExpanded
+        releaseNotesText = notesLabel
+        container.addArrangedSubview(heading)
+        container.addArrangedSubview(toggle)
+        container.addArrangedSubview(notesLabel)
+        if confirmingInstall {
+            let warn = NSTextField(wrappingLabelWithString: "Backtracking will restart and begin a new capture history.")
+            warn.font = .systemFont(ofSize: 13)
+            let installBtn = NSButton(title: "Install and restart", target: self, action: #selector(confirmInstallNow))
+            installBtn.isEnabled = !busy
+            let cancelBtn = NSButton(title: "Cancel", target: self, action: #selector(cancelInstallConfirm))
+            let row = NSStackView(views: [installBtn, cancelBtn])
+            row.spacing = 8
+            container.addArrangedSubview(warn)
+            container.addArrangedSubview(row)
+        } else {
+            let updateBtn = NSButton(title: "Update now…", target: self, action: #selector(requestInstallConfirm))
+            updateBtn.isEnabled = !busy
+            container.addArrangedSubview(updateBtn)
+        }
+    }
+
+    private func rebuildLastUpdateSection() {
+        guard let container = lastUpdateContainer else { return }
+        for view in container.arrangedSubviews {
+            container.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        guard let lastVer = defaults?.string(forKey: "lastUpdateVersion"), !lastVer.isEmpty else {
+            container.isHidden = true
+            return
+        }
+        container.isHidden = false
+        let toggle = NSButton(
+            title: (lastUpdateExpanded ? "▾ " : "▸ ") + "Last update  v\(lastVer)",
+            target: self, action: #selector(toggleLastUpdateNotes)
+        )
+        toggle.isBordered = false
+        toggle.font = .systemFont(ofSize: 14, weight: .semibold)
+        lastUpdateToggle = toggle
+        let notes = normalizedReleaseNotes(defaults?.string(forKey: "lastUpdateNotes"))
+        let notesLabel = NSTextField(wrappingLabelWithString: notes)
+        notesLabel.font = .systemFont(ofSize: 13)
+        notesLabel.isSelectable = true
+        notesLabel.isHidden = !lastUpdateExpanded
+        lastUpdateText = notesLabel
+        container.addArrangedSubview(toggle)
+        container.addArrangedSubview(notesLabel)
+    }
+
+    @objc private func toggleReleaseNotes() {
+        releaseNotesExpanded.toggle()
+        releaseNotesToggle?.title = (releaseNotesExpanded ? "▾ " : "▸ ") + "Release notes"
+        releaseNotesText?.isHidden = !releaseNotesExpanded
+    }
+
+    @objc private func toggleLastUpdateNotes() {
+        lastUpdateExpanded.toggle()
+        let lastVer = defaults?.string(forKey: "lastUpdateVersion") ?? version
+        lastUpdateToggle?.title = (lastUpdateExpanded ? "▾ " : "▸ ") + "Last update  v\(lastVer)"
+        lastUpdateText?.isHidden = !lastUpdateExpanded
+    }
+
+    @objc private func requestInstallConfirm() {
+        confirmingInstall = true
+        rebuildAvailableSection()
+    }
+
+    @objc private func cancelInstallConfirm() {
+        confirmingInstall = false
+        rebuildAvailableSection()
+    }
+
+    @objc private func confirmInstallNow() {
+        guard !busy, let update = availableUpdate else { return }
+        availableUpdate = nil
+        confirmingInstall = false
+        busy = true
+        checkButton?.isEnabled = false
+        rebuildAvailableSection()
+        status?.stringValue = "Downloading and verifying the update…"
+        Task {
+            do {
+                try await prepare(
+                    asset: update.asset, manifest: update.manifest,
+                    manifestBytes: update.manifestBytes, signature: update.signature, notes: update.notes
+                )
+                NSApp.terminate(nil)
+            } catch {
+                busy = false
+                checkButton?.isEnabled = true
+                status?.stringValue = error.localizedDescription
+            }
+        }
+    }
+
+    static func otherLaunchDuringUpdate() -> Bool {
+        let args = CommandLine.arguments
+        if args.count == 3, (args[1] == applyUpdateFlag || args[1] == updateReceiptFlag || args[1] == updateRecoveryFlag) {
+            return false
+        }
+        let installed = Bundle.main.bundleURL.resolvingSymlinksInPath()
+        guard installed.pathExtension == "app" else { return false }
+        let lockURL = installed.deletingLastPathComponent().appendingPathComponent(".Backtracking-update.lock")
+        let fd = open(lockURL.path, O_NOFOLLOW | O_RDWR)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+            flock(fd, LOCK_UN)
+            return false
+        }
+        return errno == EWOULDBLOCK
+    }
+
+    private static func cleanOldTransactions() {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory
+        guard let entries = try? fm.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        ) else { return }
+        let cutoff = Date().addingTimeInterval(-86_400)
+        for url in entries where url.lastPathComponent.hasPrefix("backtracking-update-") {
+            guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isDirectoryKey, .isSymbolicLinkKey]),
+                  vals.isDirectory == true, vals.isSymbolicLink != true,
+                  let modified = vals.contentModificationDate, modified < cutoff else { continue }
+            try? fm.removeItem(at: url)
+        }
+    }
+
     func checkAtLaunch(ready: @escaping @MainActor () -> Void) {
         let arguments = CommandLine.arguments
+        if arguments.count == 3, arguments[1] == updateRecoveryFlag {
+            let directory = URL(fileURLWithPath: arguments[2], isDirectory: true)
+            let recoveredURL = directory.appendingPathComponent("recovered")
+            let message = (try? String(contentsOf: recoveredURL, encoding: .utf8)) ?? "已啟動原版本。"
+            try? FileManager.default.removeItem(at: directory)
+            ready()
+            showNotes(title: "更新未完成", notes: message, buttons: ["OK"])
+            return
+        }
         if arguments.count == 3, arguments[1] == updateReceiptFlag {
             let directory = URL(fileURLWithPath: arguments[2], isDirectory: true)
             let receipt = try? UpdateTransaction.read(directory)
@@ -230,14 +437,16 @@ final class StartupUpdater: NSObject {
                     )
                 } catch { ready(); return }
                 ready()
-                defaults.set(receipt.notes, forKey: "lastUpdateNotes")
-                defaults.set(receipt.nextVersion, forKey: "lastUpdateVersion")
+                defaults?.set(receipt.notes, forKey: "lastUpdateNotes")
+                defaults?.set(receipt.nextVersion, forKey: "lastUpdateVersion")
+                rebuildLastUpdateSection()
                 showNotes(title: "Updated to v\(receipt.nextVersion)", notes: receipt.notes, buttons: ["OK"])
             } else {
                 ready()
             }
             return
         }
+        Self.cleanOldTransactions()
         guard !arguments.contains(skipUpdateFlag), preference != .manual, publicKey != nil else {
             ready()
             return
@@ -251,7 +460,7 @@ final class StartupUpdater: NSObject {
         guard Self.modes.indices.contains(popup.indexOfSelectedItem) else { return }
         preference = Self.modes[popup.indexOfSelectedItem]
         // A new choice forgets the version that was skipped, as on Windows.
-        defaults.removeObject(forKey: "skippedUpdateVersion")
+        defaults?.removeObject(forKey: "skippedUpdateVersion")
     }
 
     @objc private func checkManually() {
@@ -263,12 +472,12 @@ final class StartupUpdater: NSObject {
     }
 
     @objc private func showPreviousNotes() {
-        let version = defaults.string(forKey: "lastUpdateVersion") ?? self.version
-        showNotes(title: "Last update  v\(version)", notes: defaults.string(forKey: "lastUpdateNotes") ?? "", buttons: ["OK"])
+        let version = defaults?.string(forKey: "lastUpdateVersion") ?? self.version
+        showNotes(title: "Last update  v\(version)", notes: defaults?.string(forKey: "lastUpdateNotes") ?? "", buttons: ["OK"])
     }
 
     private func check(startup: Bool) async -> Bool {
-        guard !busy else { return false }
+        guard !busy, !isTestCopy else { return false }
         busy = true
         checkButton?.isEnabled = false
         status?.stringValue = "Checking GitHub Releases…"
@@ -279,7 +488,7 @@ final class StartupUpdater: NSObject {
             let release = try JSONDecoder().decode(GitHubUpdate.self, from: data)
             guard let newVersion = release.version, let candidate = UpdateVersion(newVersion),
                   let current = UpdateVersion(version), candidate > current,
-                  !(startup && defaults.string(forKey: "skippedUpdateVersion") == newVersion) else {
+                  !(startup && defaults?.string(forKey: "skippedUpdateVersion") == newVersion) else {
                 status?.stringValue = "There is no newer stable update."
                 return false
             }
@@ -291,20 +500,29 @@ final class StartupUpdater: NSObject {
             let manifest = try UpdateManifest.verify(manifestBytes, signature: signature, publicKey: publicKey)
             let asset = try release.asset(manifest.artifact)
             guard manifest.version == newVersion, asset.size == manifest.size else { throw UpdateFailure.invalidRelease }
-            let notes = String((release.body ?? "").prefix(65_536))
-            if !startup || preference == .ask {
-                let buttons = startup
-                    ? ["Update and turn on automatic updates", "Ask again for the next version", "Stop asking"]
-                    : ["Install and restart", "Cancel"]
+            let notes = normalizedReleaseNotes(release.body)
+            if !startup {
+                availableUpdate = AvailableUpdate(
+                    version: newVersion, notes: notes, asset: asset,
+                    manifest: manifest, manifestBytes: manifestBytes, signature: signature
+                )
+                confirmingInstall = false
+                releaseNotesExpanded = true
+                rebuildAvailableSection()
+                status?.stringValue = "A signed update is available."
+                return false
+            }
+            if preference == .ask {
+                let buttons = ["Update and turn on automatic updates", "Ask again for the next version", "Stop asking"]
                 switch showNotes(title: "Backtracking v\(newVersion) is available", notes: notes, buttons: buttons) {
                 case .alertFirstButtonReturn:
-                    if startup { preference = .automatic }
+                    preference = .automatic
                 case .alertThirdButtonReturn:
                     preference = .manual
                     status?.stringValue = ""
                     return false
                 default:
-                    if startup { defaults.set(newVersion, forKey: "skippedUpdateVersion") }
+                    defaults?.set(newVersion, forKey: "skippedUpdateVersion")
                     status?.stringValue = ""
                     return false
                 }
@@ -315,9 +533,6 @@ final class StartupUpdater: NSObject {
             return true
         } catch {
             status?.stringValue = error.localizedDescription
-            if !startup {
-                showNotes(title: "Could not update Backtracking", notes: error.localizedDescription, buttons: ["OK"])
-            }
             return false
         }
     }
@@ -478,7 +693,8 @@ private func applyUpdate(at directory: URL) {
     guard lock >= 0 else { _ = try? launch(originalBinary, [skipUpdateFlag]); return }
     defer { close(lock) }
     guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { return }
-    defer { try? fm.removeItem(at: directory) }
+    var keepTransactionDir = false
+    defer { if !keepTransactionDir { try? fm.removeItem(at: directory) } }
     guard original.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String == transaction.previousVersion else { return }
 
     var replacementDirectory: URL?
@@ -525,11 +741,24 @@ private func applyUpdate(at directory: URL) {
         }
         throw UpdateFailure.installation
     } catch {
+        var recoveryNote = "已啟動原版本。\n\n\(error.localizedDescription)"
         if swapped, let replacementDirectory {
-            do { try swap(installed, replacementDirectory.appendingPathComponent("Backtracking.app")) }
-            catch { preserveBackup = true; return }
+            let backup = replacementDirectory.appendingPathComponent("Backtracking.app")
+            do { try swap(installed, backup) }
+            catch {
+                preserveBackup = true
+                recoveryNote = "無法還原原版本。備份位於 \(backup.path)。\n\(error.localizedDescription)"
+                fputs("\(recoveryNote)\n", stderr)
+                return
+            }
         }
-        _ = try? launch(originalBinary, [skipUpdateFlag])
+        let recoveredURL = directory.appendingPathComponent("recovered")
+        if (try? Data(recoveryNote.utf8).write(to: recoveredURL, options: .atomic)) != nil,
+           (try? launch(originalBinary, [updateRecoveryFlag, directory.path])) != nil {
+            keepTransactionDir = true
+        } else {
+            _ = try? launch(originalBinary, [skipUpdateFlag])
+        }
     }
 }
 
@@ -546,6 +775,9 @@ enum StartupUpdaterVerification {
         precondition(UpdateVersion("0.1.5")! < UpdateVersion("0.1.10")!)
         precondition(UpdateVersion("01.1.5") == nil)
         precondition(UpdateVersion("0.1.5-beta") == nil)
+        precondition(normalizedReleaseNotes(nil) == emptyReleaseNotesFallback)
+        precondition(normalizedReleaseNotes("   \n ") == emptyReleaseNotesFallback)
+        precondition(normalizedReleaseNotes(String(repeating: "a", count: 9_000)).count == maxReleaseNotesChars)
 
         let key = Curve25519.Signing.PrivateKey()
         let publicKey = hex(key.publicKey.rawRepresentation)
@@ -572,6 +804,15 @@ enum StartupUpdaterVerification {
     static func respondToChildInvocation() throws -> Bool {
         let args = CommandLine.arguments
         if args.contains(skipUpdateFlag) { return true }
+        if args.count == 3, args[1] == updateRecoveryFlag {
+            let dir = URL(fileURLWithPath: args[2], isDirectory: true)
+            let recovered = dir.appendingPathComponent("recovered")
+            // The test waits for this child before it removes its folder; should the folder be
+            // gone anyway, the child ends with a status instead of a crash report.
+            guard FileManager.default.fileExists(atPath: recovered.path) else { exit(3) }
+            try? FileManager.default.removeItem(at: dir)
+            return true
+        }
         guard args.count == 3, args[1] == updateReceiptFlag else { return false }
         if Bundle.main.object(forInfoDictionaryKey: "FailTestLaunch") as? Bool == true { return true }
         let directory = URL(fileURLWithPath: args[2], isDirectory: true)
@@ -618,6 +859,15 @@ enum StartupUpdaterVerification {
         )
         try JSONEncoder().encode(transaction).write(to: transactionDirectory.appendingPathComponent(UpdateTransaction.name))
         applyUpdate(at: transactionDirectory)
+        // A failed update starts the original app with the recovery flag; that child reads the
+        // transaction folder and then removes it. Wait for it before this test removes the root.
+        if !succeeds {
+            let deadline = Date().addingTimeInterval(15)
+            while fm.fileExists(atPath: transactionDirectory.path), Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            precondition(!fm.fileExists(atPath: transactionDirectory.path), "The recovery child did not finish")
+        }
         let plist = installed.appendingPathComponent("Contents/Info.plist")
         let fields = try PropertyListSerialization.propertyList(from: Data(contentsOf: plist), format: nil) as? [String: Any]
         precondition(fields?["CFBundleShortVersionString"] as? String == (succeeds ? "0.1.6" : "0.1.5"))

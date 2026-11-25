@@ -1,5 +1,8 @@
 //! Inspect, install and build add-on packages without following package paths outside their root.
 
+#[cfg(target_os = "macos")]
+pub mod quarantine;
+
 use crate::manifest::{validate_id, validate_relative_path, Manifest};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,10 +45,14 @@ pub fn inspect(path: impl AsRef<Path>) -> Result<PackageInfo> {
 /// An invalid package is rejected before the add-ons folder is created. A failed replacement
 /// restores the old folder. A backup left by an interrupted process is not an installed add-on.
 pub fn install(package: impl AsRef<Path>, addons: impl AsRef<Path>) -> Result<PackageInfo> {
-    let mut archive = open_archive(package.as_ref())?;
+    require_extension(package.as_ref())?;
+    let file = File::open(package)?;
+    #[cfg(target_os = "macos")]
+    let quarantine = quarantine::Quarantine::read(&file)?;
+    let mut archive = ZipArchive::new(file).map_err(zip_error)?;
     let info = inspect_archive(&mut archive)?;
     let addons = addons.as_ref();
-    fs::create_dir_all(addons)?;
+    install_dir(addons, true)?;
     let addons = fs::canonicalize(addons)?;
     let _lock = OperationLock::acquire(&addons, &info.manifest.id)?;
     let target = addons.join(&info.manifest.id);
@@ -57,10 +64,10 @@ pub fn install(package: impl AsRef<Path>, addons: impl AsRef<Path>) -> Result<Pa
         let name = archive_name(&entry)?;
         let destination = stage.join(name.trim_end_matches('/'));
         if entry.is_dir() {
-            fs::create_dir_all(destination)?;
+            install_dir(&destination, true)?;
         } else {
             if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
+                install_dir(parent, true)?;
             }
             let mut output = OpenOptions::new()
                 .write(true)
@@ -71,6 +78,8 @@ pub fn install(package: impl AsRef<Path>, addons: impl AsRef<Path>) -> Result<Pa
             if copied != entry.size() || copied > MAX_UNPACKED_SIZE {
                 return Err(Error::new("Package changed while installing; its unpacked size does not match the inspected package."));
             }
+            #[cfg(target_os = "macos")]
+            quarantine.apply(&output)?;
             output.sync_all()?;
             #[cfg(unix)]
             {
@@ -81,6 +90,13 @@ pub fn install(package: impl AsRef<Path>, addons: impl AsRef<Path>) -> Result<Pa
                 }
             }
         }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let program = stage.join(&info.program);
+        let mode = fs::metadata(&program)?.permissions().mode() & 0o777;
+        fs::set_permissions(program, fs::Permissions::from_mode(mode | 0o500))?;
     }
     replace_install(&stage, &target, &addons, &info.manifest.id)?;
     cleanup.0 = PathBuf::new();
@@ -94,6 +110,12 @@ fn replace_install(stage: &Path, target: &Path, addons: &Path, id: &str) -> Resu
                 "Cannot replace {}: it is not a folder.",
                 target.display()
             )));
+        }
+        #[cfg(target_os = "macos")]
+        if swap_directories(stage, target)? {
+            // The previous version now occupies the private stage.
+            let _ = fs::remove_dir_all(stage);
+            return Ok(());
         }
         let backup = unused_path(addons, id, "backup");
         fs::rename(target, &backup)?;
@@ -115,6 +137,48 @@ fn replace_install(stage: &Path, target: &Path, addons: &Path, id: &str) -> Resu
         fs::rename(stage, target)?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn swap_directories(stage: &Path, target: &Path) -> std::io::Result<bool> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    extern "C" {
+        fn renamex_np(
+            from: *const std::ffi::c_char,
+            to: *const std::ffi::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+    let from = CString::new(stage.as_os_str().as_bytes())?;
+    let to = CString::new(target.as_os_str().as_bytes())?;
+    const RENAME_SWAP: u32 = 2;
+    if unsafe { renamex_np(from.as_ptr(), to.as_ptr(), RENAME_SWAP) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::Unsupported {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+/// Validate an installed or privately renamed program folder against its intended id.
+pub fn validate_installed_folder(path: &Path, id: &str) -> Result<Manifest> {
+    reject_link(path)?;
+    #[cfg(target_os = "macos")]
+    if !fs::symlink_metadata(path.join("addon.json"))?.is_file() {
+        return Err(Error::new("Expected addon.json to be a regular file."));
+    }
+    let manifest = read_folder_manifest(path)?;
+    if id != manifest.id {
+        return Err(Error::new(format!(
+            "Folder {} does not match manifest id {}. Reinstall the add-on.",
+            path.display(),
+            manifest.id
+        )));
+    }
+    validate_folder_programs(path, &manifest)?;
+    Ok(manifest)
 }
 
 /// Read each installed folder. Unreadable entries and invalid manifests are returned individually.
@@ -164,29 +228,63 @@ fn list_installed_entries(
             continue;
         }
         let path = entry.path();
-        let manifest = (|| {
-            reject_link(&path)?;
-            let manifest = read_folder_manifest(&path)?;
-            if entry.file_name().to_str() != Some(manifest.id.as_str()) {
-                return Err(Error::new(format!(
-                    "Folder {} does not match manifest id {}. Reinstall the add-on.",
-                    path.display(),
-                    manifest.id
-                )));
-            }
-            validate_folder_programs(&path, &manifest)?;
-            Ok(manifest)
-        })();
+        let manifest = validate_installed_folder(&path, entry.file_name().to_str().unwrap_or(""));
         installed.push(InstalledAddon { path, manifest });
     }
     installed.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(installed)
 }
 
+/// Parse a private transaction basename (without its leading dot) as generated by the installer.
+#[cfg(unix)]
+pub fn transaction_id<'a>(name: &'a str, separator: &str) -> Option<&'a str> {
+    let (id, suffix) = name.rsplit_once(separator)?;
+    validate_id(id).ok()?;
+    let (pid, sequence) = suffix.split_once('-')?;
+    if !suffix.bytes().all(|b| b == b'-' || b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse::<u32>().ok()?;
+    sequence.parse::<u64>().ok()?;
+    Some(id)
+}
+
+#[cfg(target_os = "macos")]
+fn removal_backup(addons: &Path, id: &str) -> Result<Option<PathBuf>> {
+    let mut backup = None;
+    for entry in fs::read_dir(addons)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let owner = name
+            .to_str()
+            .and_then(|name| name.strip_prefix('.'))
+            .and_then(|name| transaction_id(name, ".backup-"));
+        if owner != Some(id) {
+            continue;
+        }
+        // A reserved name alone does not authorize deleting unrelated contents.
+        let path = entry.path();
+        validate_installed_folder(&path, id).map_err(|error| {
+            Error::new(format!(
+                "Cannot remove {id}: unverified backup {}: {error}",
+                path.display()
+            ))
+        })?;
+        if backup.replace(path).is_some() {
+            return Err(Error::new(format!(
+                "Cannot remove {id}: multiple valid backups"
+            )));
+        }
+    }
+    Ok(backup)
+}
+
 /// Remove the program folder only. The caller handles the user's choice to delete add-on data.
 pub fn remove(addons: impl AsRef<Path>, id: &str) -> Result<()> {
     validate_id(id)?;
     let addons = addons.as_ref();
+    #[cfg(target_os = "macos")]
+    reject_link(addons)?;
     if !addons.exists() {
         return Ok(());
     }
@@ -194,12 +292,22 @@ pub fn remove(addons: impl AsRef<Path>, id: &str) -> Result<()> {
     let _lock = OperationLock::acquire(&addons, id)?;
     let target = addons.join(id);
     reject_link(&target)?;
+    #[cfg(target_os = "macos")]
+    let backup = removal_backup(&addons, id)?;
     if target.exists() {
         if fs::canonicalize(&target)?.parent() != Some(addons.as_path()) {
             return Err(Error::new(
                 "The installed add-on folder escapes the add-ons folder.",
             ));
         }
+        fs::remove_dir_all(&target)?;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(backup) = backup {
+        // Never recursively delete a recoverable backup in place. Keep it complete
+        // until the visible slot is empty, then move it there under the same lock.
+        // A failed final deletion leaves a visible package that remove can retry.
+        fs::rename(backup, &target)?;
         fs::remove_dir_all(target)?;
     }
     Ok(())
@@ -606,10 +714,20 @@ fn unused_path(parent: &Path, id: &str, purpose: &str) -> PathBuf {
     }
 }
 
+fn install_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.recursive(recursive).create(path)
+}
+
 fn create_stage(parent: &Path, id: &str) -> Result<PathBuf> {
     loop {
         let path = unused_path(parent, id, "install");
-        match fs::create_dir(&path) {
+        match install_dir(&path, false) {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -655,6 +773,21 @@ mod tests {
     use serde_json::json;
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rc1_directory_exchange_publishes_whole_stage() {
+        let dir = TestDir::new();
+        let old = dir.0.join("com.example.test");
+        let new = dir.0.join(".com.example.test.install-1-1");
+        for (folder, contents) in [(&old, "old"), (&new, "new")] {
+            fs::create_dir(folder).unwrap();
+            fs::write(folder.join(contents), contents).unwrap();
+        }
+        assert!(swap_directories(&new, &old).unwrap());
+        assert_eq!(fs::read(old.join("new")).unwrap(), b"new");
+        assert_eq!(fs::read(new.join("old")).unwrap(), b"old");
+    }
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -869,6 +1002,20 @@ mod tests {
         assert!(install(&path, &addons).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"existing destination");
         assert_eq!(fs::read_dir(&addons).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn an_unavailable_staged_update_restores_the_old_install() {
+        let root = TestDir::new();
+        let id = "com.example.restore";
+        let target = root.0.join(id);
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("version"), "original").unwrap();
+        assert!(replace_install(&root.0.join("missing-stage"), &target, &root.0, id).is_err());
+        assert_eq!(
+            fs::read_to_string(target.join("version")).unwrap(),
+            "original"
+        );
     }
 
     #[test]

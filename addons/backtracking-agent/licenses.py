@@ -9,6 +9,7 @@ crate ships (LICENSE*, LICENCE*, COPYING*, NOTICE*, UNLICENSE*), with identical 
 once. Crates that ship no licence file are listed at the end, so that they can be checked by
 hand. --list prints one line per crate (name, version, licence) instead.
 """
+import argparse
 import hashlib
 import json
 import os
@@ -19,9 +20,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PREFIXES = ("license", "licence", "copying", "notice", "unlicense")
 
 
-def crates():
+def crates(target):
     tree = subprocess.run(
-        ["cargo", "tree", "--locked", "-e", "normal", "--target", "x86_64-pc-windows-msvc",
+        ["cargo", "tree", "--locked", "-e", "normal", "--target", target,
          "--prefix", "none", "-f", "{p}"],
         cwd=HERE, check=True, capture_output=True, text=True).stdout
     built = set()
@@ -31,7 +32,7 @@ def crates():
             built.add((parts[0], parts[1][1:]))
     metadata = json.loads(subprocess.run(
         ["cargo", "metadata", "--locked", "--format-version", "1",
-         "--filter-platform", "x86_64-pc-windows-msvc"],
+         "--filter-platform", target],
         cwd=HERE, check=True, capture_output=True).stdout)
     packages = {package["id"]: package for package in metadata["packages"]}
     nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
@@ -62,9 +63,13 @@ def licence_files(package):
 
 
 def main():
-    output = sys.argv[1]
-    listing = "--list" in sys.argv[2:]
-    found = crates()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("output")
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--target", default="x86_64-pc-windows-msvc")
+    args = parser.parse_args()
+    output, listing = args.output, args.list
+    found = crates(args.target)
     if listing:
         for package in found:
             print(f"{package['name']} {package['version']}  {package.get('license') or package.get('license_file')}")

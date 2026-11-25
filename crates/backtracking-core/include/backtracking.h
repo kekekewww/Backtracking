@@ -6,6 +6,8 @@
 
 typedef struct BtCore BtCore;
 typedef struct BtTracks BtTracks;
+typedef struct BtFrozenCapture BtFrozenCapture;
+typedef struct BtPreviewSlot BtPreviewSlot;
 typedef struct BtSnapshot BtSnapshot;
 typedef struct BtSenders BtSenders;
 
@@ -141,8 +143,8 @@ int32_t bt_snapshots_export_pair_routed_faded_frames(const BtSnapshot *snapshot_
 // The faded exports, with each file named after its source and lane:
 // Backtracking_<source>_<lane>_<date>_<time>_<length>s.wav. A source name is UTF-8 and may be
 // NULL or empty to leave it out; the lane then follows the take, as in the unnamed exports:
-// Backtracking_<date>_<time>_<length>s-A.wav. lane is 0 for a single source, 1 for A and 2
-// for B, and is given whenever two sources record, even when only one of them is exported.
+// Backtracking_<date>_<time>_<length>s-A.wav. lane is 0 for a single source, 1 for A through
+// 64 for BL, and is given whenever multiple sources record.
 char *bt_snapshot_export_labelled_frames(const BtSnapshot *snapshot, uint64_t first_frame,
                                          uint64_t end_frame, const char *directory,
                                          uint32_t sample_rate, uint32_t bits_per_sample,
@@ -175,7 +177,7 @@ void bt_string_free(char *string);
 // rearming the handle. Set b_channels to zero for single-lane capture.
 BtTracks *bt_tracks_new(double sample_rate, uint32_t a_channels, uint32_t b_channels, uint32_t history_secs);
 void bt_tracks_free(BtTracks *core);
-// timestamp_ns is the first frame's monotonic host time, on the same clock for both lanes.
+// timestamp_ns is the first frame's monotonic host time, on the same clock for all lanes.
 uint32_t bt_tracks_push_interleaved(const BtTracks *core, uint32_t lane, const float *data,
                                     uint32_t frames, uint64_t timestamp_ns, double source_rate);
 uint32_t bt_tracks_push_planar_stereo(const BtTracks *core, uint32_t lane, const float *left,
@@ -188,6 +190,7 @@ void bt_tracks_clear(const BtTracks *core);
 uint32_t bt_tracks_state(const BtTracks *core);
 uint64_t bt_tracks_revision(const BtTracks *core);
 int32_t bt_tracks_set_history(const BtTracks *core, uint32_t seconds);
+uint64_t bt_tracks_retention_frames(const BtTracks *core);
 void bt_tracks_set_retain_silence(const BtTracks *core, uint32_t enabled);
 BtMeterReadings bt_tracks_meter_readings(const BtTracks *core, uint32_t lane);
 uint64_t bt_tracks_waveform(const BtTracks *core, uint32_t lane, uint32_t view,
@@ -195,10 +198,163 @@ uint64_t bt_tracks_waveform(const BtTracks *core, uint32_t lane, uint32_t view,
 uint64_t bt_tracks_first_frame(const BtTracks *core);
 uint64_t bt_tracks_end_frame(const BtTracks *core);
 uint32_t bt_tracks_channels(const BtTracks *core, uint32_t lane);
+// Create 1 to 64 lanes with at most 64 channels total.
+BtTracks *bt_tracks_new_lanes(double rate, const uint32_t *widths, size_t count,
+                             uint32_t history_secs, uint64_t physical_memory);
+char *bt_lane_letter(uint32_t index);
+
+// Share immutable pages with a renderer or exporter. Release with bt_frozen_free.
+// View 0/1/2 is merged/left/right, 3 + channel index is native, and 67/68 is the wide L/R pair.
+// labels is a tab-separated list of native channel names, or NULL for numbered names.
+BtFrozenCapture *bt_tracks_freeze(const BtTracks *core, uint64_t first, uint64_t end);
+void bt_frozen_free(BtFrozenCapture *frozen);
+void bt_frozen_waveform(const BtFrozenCapture *frozen, uint32_t lane, uint32_t view,
+                        uint64_t first, uint64_t end, float *minimum, float *maximum, uint32_t bins,
+                        const char *labels);
+// The output holds six consecutive energies per bin, low to high. Silence is all zeros.
+void bt_frozen_spectrum(const BtFrozenCapture *frozen, uint32_t lane, uint32_t view,
+                        uint64_t first, uint64_t end, float *energies, uint32_t bins, const char *labels);
+
+typedef struct BtFrozenLane {
+    uint32_t index;
+    uint32_t route;
+    const char *source_name;
+    const char *channel_labels; // Tab-separated, in channel order. NULL means numbered labels.
+    uint32_t view; // 0 for the whole lane, otherwise the chosen row.
+} BtFrozenLane;
+
+int32_t bt_frozen_play(const BtFrozenCapture *frozen, const BtPreviewSlot *slot,
+                       const BtFrozenLane *lanes, size_t count, uint64_t first, uint64_t end,
+                       uint32_t force_mono, uint32_t pair_binaural, BtFades fades);
+// Export formats for wide lanes: 0 binaural per channel, 1 mono per channel,
+// 2 one multichannel WAV, 3 one binaural mix. A whole lane also writes its L/R mix.
+typedef struct BtExportPaths BtExportPaths;
+BtExportPaths *bt_frozen_export(const BtFrozenCapture *frozen, const BtFrozenLane *lanes, size_t count,
+                                uint64_t first, uint64_t end, const char *directory, uint32_t sample_rate,
+                                uint32_t bits_per_sample, uint32_t force_mono, uint32_t wide_mode,
+                                uint32_t pair_binaural, BtFades fades);
+size_t bt_export_paths_count(const BtExportPaths *paths);
+// Each path is borrowed until bt_export_paths_free.
+const char *bt_export_path(const BtExportPaths *paths, size_t index);
+void bt_export_paths_free(BtExportPaths *paths);
+
+// Bitmask of channels (bit i = native channel i) that have non-silent audio (> -90 dBFS)
+// in the retained history or frozen capture. Returns 0 for narrow (<= 2ch) or unknown lanes.
+uint64_t bt_tracks_active_channels(const BtTracks *core, uint32_t lane);
+uint64_t bt_frozen_active_channels(const BtFrozenCapture *frozen, uint32_t lane);
+
+// Multi-row / channel-subset selection for preview and export.
+// When channel_mask_valid == 0, every channel of the lane is selected.
+// When channel_mask_valid != 0, bit i of channel_mask selects native channel i;
+// channel_mask == 0 with include_pair != 0 selects only the wide L/R pair.
+typedef struct BtFrozenSelectionLane {
+    uint32_t index;
+    uint32_t route;
+    const char *source_name;
+    const char *channel_labels; // Tab-separated, in channel order. NULL means numbered labels.
+    uint64_t channel_mask;
+    uint32_t channel_mask_valid;
+    uint32_t include_pair; // For wide lanes: nonzero includes the L/R pair WAV.
+} BtFrozenSelectionLane;
+
+// Like bt_frozen_play, supporting arbitrary channel subsets per lane and returning a UTF-8
+// error message via error_out on failure (free with bt_string_free).
+int32_t bt_frozen_play_selection(const BtFrozenCapture *frozen, const BtPreviewSlot *slot,
+                                 const BtFrozenSelectionLane *lanes, size_t count,
+                                 uint64_t first, uint64_t end,
+                                 uint32_t force_mono, uint32_t pair_binaural, BtFades fades,
+                                 char **error_out);
+
+// Like bt_frozen_export, supporting arbitrary channel subsets per lane (cross-row selection
+// and hide-silent-channels export) and returning a UTF-8 error message via error_out on failure
+// (free with bt_string_free).
+BtExportPaths *bt_frozen_export_selection(const BtFrozenCapture *frozen,
+                                          const BtFrozenSelectionLane *lanes, size_t count,
+                                          uint64_t first, uint64_t end, const char *directory,
+                                          uint32_t sample_rate, uint32_t bits_per_sample,
+                                          uint32_t force_mono, uint32_t wide_mode,
+                                          uint32_t pair_binaural, BtFades fades,
+                                          char **error_out);
+
+// Frame clock mapping for lanes carrying positioned objects (monotonic ns -> retained frame).
+// bt_tracks_enable_frame_clock returns 1 on success, 0 on invalid lane.
+int32_t bt_tracks_enable_frame_clock(const BtTracks *core, uint32_t lane);
+// Returns 1 and writes *first_out when an older clock entry was evicted; 0 otherwise.
+int32_t bt_tracks_take_frame_clock_eviction(const BtTracks *core, uint32_t lane, uint64_t *first_out);
+// Returns 1 for Poll::Ready(Some(frame)) (writes *frame_out), 0 for Poll::Ready(None), -1 for Poll::Pending.
+int32_t bt_tracks_retained_frame_at(const BtTracks *core, uint32_t lane, uint64_t time_ns,
+                                    uint64_t *frame_out);
+
+// Bed-aware waveform and spectrum queries for wide lanes with channel groups.
+// For views 67/68 (L/R pair), folds down bed_start..bed_start+bed_count using bed_labels
+// (tab-separated, bed_count entries, or NULL). When bed_count == 0, uses the full track.
+void bt_frozen_waveform_bed(const BtFrozenCapture *frozen, uint32_t lane, uint32_t view,
+                            uint32_t bed_start, uint32_t bed_count,
+                            uint64_t first, uint64_t end, float *minimum, float *maximum,
+                            uint32_t bins, const char *bed_labels);
+void bt_frozen_spectrum_bed(const BtFrozenCapture *frozen, uint32_t lane, uint32_t view,
+                            uint32_t bed_start, uint32_t bed_count,
+                            uint64_t first, uint64_t end, float *energies, uint32_t bins,
+                            const char *bed_labels);
+
+struct BtFrozenPositions;
+
+// Group- and position-aware lane selection for preview and export.
+// shown_count == 0 selects the full track as a single unpositioned group.
+// bed_count == 0 falls back to shown (when not positioned) or full track.
+typedef struct BtFrozenGroupSelectionLane {
+    uint32_t index;
+    uint32_t route;
+    const char *source_name;
+    const char *channel_labels; // Tab-separated labels for all track channels, or NULL.
+    uint64_t channel_mask;
+    uint32_t channel_mask_valid;
+    uint32_t include_pair;
+    uint32_t shown_start;
+    uint32_t shown_count;
+    uint32_t shown_positioned;
+    uint32_t bed_start;
+    uint32_t bed_count;
+    const struct BtFrozenPositions *positions; // Optional frozen positions for this lane, or NULL.
+} BtFrozenGroupSelectionLane;
+
+int32_t bt_frozen_play_group_selection(const BtFrozenCapture *frozen, const BtPreviewSlot *slot,
+                                       const BtFrozenGroupSelectionLane *lanes, size_t count,
+                                       uint64_t first, uint64_t end,
+                                       uint32_t force_mono, uint32_t pair_binaural, BtFades fades,
+                                       char **error_out);
+
+// Writes WAVs and any *-Positions.json sidecar into directory. Sets *objects_in_mono_out to 1
+// if any positioned object lacked position keys and fell back to mono.
+BtExportPaths *bt_frozen_export_group_selection(const BtFrozenCapture *frozen,
+                                                const BtFrozenGroupSelectionLane *lanes, size_t count,
+                                                uint64_t first, uint64_t end, const char *directory,
+                                                uint32_t sample_rate, uint32_t bits_per_sample,
+                                                uint32_t force_mono, uint32_t wide_mode,
+                                                uint32_t pair_binaural, BtFades fades,
+                                                uint32_t *objects_in_mono_out,
+                                                char **error_out);
+// As bt_frozen_export_group_selection; on success *lanes_out holds the capture lane of each
+// path, in path order. Free it with bt_export_lanes_free.
+typedef struct BtExportLanes BtExportLanes;
+BtExportPaths *bt_frozen_export_group_selection_lanes(const BtFrozenCapture *frozen,
+                                                      const BtFrozenGroupSelectionLane *lanes, size_t count,
+                                                      uint64_t first, uint64_t end, const char *directory,
+                                                      uint32_t sample_rate, uint32_t bits_per_sample,
+                                                      uint32_t force_mono, uint32_t wide_mode,
+                                                      uint32_t pair_binaural, BtFades fades,
+                                                      uint32_t *objects_in_mono_out,
+                                                      char **error_out, BtExportLanes **lanes_out);
+size_t bt_export_lanes_count(const BtExportLanes *lanes);
+// UINT32_MAX past the end.
+uint32_t bt_export_lane(const BtExportLanes *lanes, size_t index);
+void bt_export_lanes_free(BtExportLanes *lanes);
+
 BtSnapshot *bt_tracks_snapshot(const BtTracks *core, uint32_t lane);
 BtSnapshot *bt_tracks_snapshot_range(const BtTracks *core, uint32_t lane, uint64_t first, uint64_t end);
 
 uint32_t bt_tracks_sample_rate(const BtTracks *core);
+// Also accepts view 3 + native channel index.
 uint64_t bt_tracks_waveform_range(const BtTracks *core, uint32_t lane, uint32_t view,
                                   uint64_t first, uint64_t end, float *minimum, float *maximum, uint32_t bins);
 size_t bt_tracks_copy_bar_markers(const BtTracks *core, uint64_t first, uint64_t end,
@@ -213,8 +369,11 @@ void bt_tracks_set_preview_silence(const BtTracks *core, uint32_t lane, uint32_t
 // thread. bt_preview_slot_play reads the snapshots in place: keep them alive until the slot
 // has let the preview go (after the next play, bt_preview_slot_clear, bt_preview_slot_reap
 // returning 0, or bt_preview_slot_free). Stop rendering before freeing the slot.
-typedef struct BtPreviewSlot BtPreviewSlot;
 BtPreviewSlot *bt_preview_slot_new(void);
+// As bt_preview_slot_new, holding a gate of this process alone: rendering it never silences
+// another Backtracking's System capture. All such slots share one gate made once per process;
+// bt_preview_slot_free releases the slot itself.
+BtPreviewSlot *bt_preview_slot_new_local(void);
 void bt_preview_slot_free(BtPreviewSlot *slot);
 // One or two snapshots with their WAV routes, as exported. Returns 1 when it plays and 0,
 // leaving the slot as it was, when the snapshots do not all hold the selection at one rate.
@@ -253,6 +412,8 @@ void bt_senders_free(BtSenders *senders);
 size_t bt_senders_count(const BtSenders *senders);
 char *bt_senders_string(const BtSenders *senders, size_t index, int32_t name);
 uint32_t bt_senders_format(const BtSenders *senders, size_t index, uint32_t *channels);
+// Tab-separated channel names for a Sender, or NULL. Release with bt_string_free.
+char *bt_sender_channel_labels(const char *id);
 int32_t bt_sender_request_snapshot(const char *id);
 
 // Optional housekeeping for the drag-and-drop folder. days is 0 for Off, otherwise 10, 20, 30,

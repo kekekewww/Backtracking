@@ -8,6 +8,7 @@ description = "A Backtracking add-on that lets MCP clients (AI agents) control B
 publish = false
 
 [dependencies]
+reqwest = { version = "0.13", default-features = false }
 backtracking-addon = { path = "../../crates/backtracking-addon" }
 rmcp = { version = "3.11.0", default-features = false, features = [
     "base64",
@@ -39,7 +40,6 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 backtracking-addon = { path = "../../crates/backtracking-addon", features = ["install"] }
-reqwest = { version = "0.13", default-features = false }
 tokio = { version = "1", features = ["process"] }
 
 [[bin]]

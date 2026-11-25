@@ -43,9 +43,36 @@ impl Endpoint {
     }
 
     /// Whether the process that wrote this file is still running.
-    pub fn is_current(&self) -> bool {
-        platform::process_runs(self.pid, &self.program)
+    pub fn is_current(&self, file: &Path) -> bool {
+        let Ok(current) = std::env::current_exe() else {
+            return false;
+        };
+        trusted_program(&self.program, &current, file)
+            && platform::process_runs(self.pid, &self.program)
     }
+}
+
+// The caller can explicitly select another installation's endpoint. Derive its
+// installed program from that selected layout, never from fields in the JSON.
+fn trusted_program(claim: &Path, current: &Path, endpoint: &Path) -> bool {
+    let Ok(claim) = claim.canonicalize() else {
+        return false;
+    };
+    let matches = |path: &Path| path.canonicalize().is_ok_and(|p| p == claim);
+    if matches(current) {
+        return true;
+    }
+    let Some(data) = endpoint.parent() else {
+        return false;
+    };
+    if !data.ends_with(Path::new("addon-data").join(crate::ID)) {
+        return false;
+    }
+    let Some(root) = data.parent().and_then(Path::parent) else {
+        return false;
+    };
+    let bin = format!("backtracking-agent{}", std::env::consts::EXE_SUFFIX);
+    matches(&root.join("addons").join(crate::ID).join("bin").join(bin))
 }
 
 /// A new random token: 32 bytes as 64 hexadecimal digits.
@@ -90,6 +117,12 @@ pub fn locate(explicit: Option<PathBuf>, program: &Path) -> PathBuf {
     if let Some(path) = beside_install(program) {
         return path;
     }
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("Library/Application Support");
+    #[cfg(not(target_os = "macos"))]
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -125,6 +158,36 @@ fn beside_install(program: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rc1_stdio_program_is_local_or_belongs_to_selected_installation() {
+        let root = std::env::temp_dir().join(format!("rc1-program-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let current = root.join("current");
+        let unrelated = root.join("other");
+        let bin = root.join("addons").join(crate::ID).join("bin");
+        let installed = bin.join(format!(
+            "backtracking-agent{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let endpoint = root
+            .join("addon-data")
+            .join(crate::ID)
+            .join("endpoint.json");
+        std::fs::create_dir_all(bin).unwrap();
+        for file in [&current, &unrelated, &installed] {
+            std::fs::write(file, []).unwrap();
+        }
+        assert!(trusted_program(&current, &current, &endpoint));
+        assert!(trusted_program(&installed, &current, &endpoint));
+        assert!(!trusted_program(&unrelated, &current, &endpoint));
+        assert!(!trusted_program(
+            &installed,
+            &current,
+            &root.join("other.json")
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn the_connection_file_is_found_beside_the_install_folder() {
