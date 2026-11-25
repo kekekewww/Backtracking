@@ -1300,7 +1300,21 @@ final class SystemAudioTap {
     private(set) var cachedMeters: [BtMeterReadings]
     var core: OpaquePointer { timeline.core }
     var laneCount: Int { lanes.count }
-    var totalChannelCount: UInt32 { widths.reduce(0, +) }
+    /// The channels of the lanes that start; a lane past the limit holds none (Windows `track_channels`).
+    var totalChannelCount: UInt32 { Self.channelsInUse(widths: widths, capErrors: laneCapErrors) }
+
+    nonisolated static func channelsInUse(widths: [UInt32], capErrors: [String?]) -> UInt32 {
+        zip(widths, capErrors).reduce(0) { $0 + ($1.1 == nil ? $1.0 : 0) }
+    }
+
+    /// Why lane `lane` cannot start after lanes holding `total - width` channels, in English and
+    /// Traditional Chinese on one line, worded as Windows `controller::lane_fits`.
+    nonisolated static func overLimitMessage(lane: Int, total: UInt32) -> String {
+        let letter = captureLaneLetter(lane)
+        let english = lane <= 1 ? "lanes A and \(letter)" : "lanes A to \(letter)"
+        let chinese = lane <= 1 ? "來源 A 與 \(letter)" : "來源 A 到 \(letter)"
+        return "Lane \(letter) cannot start: \(english) would contain \(total) channels; the limit is 64 / 來源 \(letter) 無法開始：\(chinese) 合計會有 \(total) 個聲道，上限為 64。"
+    }
     var retainedSeconds: Double { Double(bt_tracks_retention_frames(core)) / Self.timelineRate }
     var captureRoutes: [CaptureRoute] { routes }
     var captureChannelNames: [[String]] {
@@ -1462,9 +1476,7 @@ final class SystemAudioTap {
                 acceptedWidths.append(width)
                 capErrors.append(nil)
             } else {
-                let letter = captureLaneLetter(index)
-                let wouldBe = total + width
-                capErrors.append("Lane \(letter) cannot start: lanes A to \(letter) would contain \(wouldBe) channels; the limit is 64 / 來源 \(letter) 無法開始：來源 A 到 \(letter) 合計會有 \(wouldBe) 個聲道，上限為 64。")
+                capErrors.append(Self.overLimitMessage(lane: index, total: total + width))
                 acceptedWidths.append(1)
             }
         }

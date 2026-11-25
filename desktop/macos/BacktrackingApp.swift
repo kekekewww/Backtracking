@@ -91,6 +91,12 @@ func verifyMacCrossSourceEdgeScroll() throws {
 }
 
 @MainActor
+func verifyMacChannelLimit() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyChannelLimit()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -2252,6 +2258,18 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let entered = lastShown >= 2 ? RowIdentity.channel(lane: 1, index: lastShown - 2) : nil
         guard first.count == 2, first[1] == 1, let entered, rows.last == entered, rows.first == .whole(lane: 0) else {
             throw CaptureError("Dragging past B's bottom scrolled lanes to \(first) and chose \(rows)")
+        }
+    }
+
+    /// A lane past 64 channels holds none of them, and says why it cannot start in Windows' words.
+    static func verifyChannelLimit() throws {
+        let used = SystemAudioTap.channelsInUse(widths: [32, 30, 1], capErrors: [nil, nil, "Lane C cannot start"])
+        let laneB = SystemAudioTap.overLimitMessage(lane: 1, total: 65)
+        let laneC = SystemAudioTap.overLimitMessage(lane: 2, total: 68)
+        guard used == 62,
+              laneB == "Lane B cannot start: lanes A and B would contain 65 channels; the limit is 64 / 來源 B 無法開始：來源 A 與 B 合計會有 65 個聲道，上限為 64。",
+              laneC == "Lane C cannot start: lanes A to C would contain 68 channels; the limit is 64 / 來源 C 無法開始：來源 A 到 C 合計會有 68 個聲道，上限為 64。" else {
+            throw CaptureError("Over the channel limit: \(used) in use; lane B says \(laneB); lane C says \(laneC)")
         }
     }
 
