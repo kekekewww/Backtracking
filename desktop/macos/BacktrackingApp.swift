@@ -2581,6 +2581,27 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             _ = controller.canConfigure(CaptureLane(source: .addon(addonID: "verify.kept", sourceID: "more"), route: .merged), at: 3)
             refusals.append(controller.notice ?? "")
         }
+        // The Sources page's two lines, worked out by updateCaptureCapacity, for 61 + 2 in use and
+        // one kept: the page is full.
+        SystemAudioTap.verifyRequestedWidths = [61, 8, 2]
+        controller.tap = try SystemAudioTap(history: 10, lanes: kept)
+        SystemAudioTap.verifyRequestedWidths = nil
+        _ = controller.makeSourceTab()
+        var lines: [[String]] = []
+        for language in [AppLanguage.english, .zhHant] {
+            AppLanguage.verifyLanguage = language
+            controller.updateCaptureCapacity()
+            // The count comes first; a memory note may follow it.
+            let count = (controller.sourcesCapacityNote?.stringValue ?? "").components(separatedBy: ". With ").first ?? ""
+            lines.append([count,
+                          controller.sourcesChannelsFullNote?.isHidden == false ? controller.sourcesChannelsFullNote?.stringValue ?? "" : "(hidden)"])
+        }
+        guard lines == [["63 of 64 channels in use, and 1 kept for sources that cannot start",
+                         "All 64 channels are in use, 1 of them kept for sources that cannot start. A source added now cannot start."],
+                        ["已使用 63 個聲道，另有 1 個保留給無法開始的來源，上限 64 個",
+                         "64 個聲道已全部使用，其中 1 個保留給無法開始的來源。現在新增的來源無法開始。"]] else {
+            throw CaptureError("Sources page lines: \(lines)")
+        }
         guard refusals == ["Source D would bring the total to 65 channels, with one channel kept for each source that cannot start. The limit is 64.",
                            "來源 D 會使總數變成 65 個聲道（每個無法開始的來源保留 1 個），上限為 64。"] else {
             throw CaptureError("Refusals with a source that cannot start: \(refusals)")
@@ -5653,7 +5674,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         sourcesFullNote = fullNote
         let capacity = optionNote("")
         sourcesCapacityNote = capacity
-        let channelsFull = optionNote("All 64 channels are in use. A source added now cannot start.")
+        let channelsFull = optionNote(localizedBilingual(SystemAudioTap.channelsFullNote(kept: 0)))
         channelsFull.textColor = WaveformTheme.statusUnavailable
         channelsFull.isHidden = true
         sourcesChannelsFullNote = channelsFull
@@ -5791,6 +5812,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         sourcesCapacityNote?.stringValue = [localizedBilingual(SystemAudioTap.channelsInUseNote(used: channels, kept: keptChannels)), shortNote]
             .compactMap { $0 }.joined(separator: ". ")
         sourcesChannelsFullNote?.isHidden = !(channels + keptChannels >= 64 && captureLanes.count < maximumCaptureLanes)
+        sourcesChannelsFullNote?.stringValue = localizedBilingual(SystemAudioTap.channelsFullNote(kept: keptChannels))
         captureCapacityNote?.isHidden = shortNote == nil
         captureCapacityNote?.stringValue = shortNote ?? ""
     }

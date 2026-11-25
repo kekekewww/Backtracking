@@ -1318,6 +1318,15 @@ final class SystemAudioTap {
         return "\(used) of 64 channels in use, and \(kept) kept for sources that cannot start / 已使用 \(used) 個聲道，另有 \(kept) 個保留給無法開始的來源，上限 64 個"
     }
 
+    /// The Sources page's line when the 64 channels are taken, in Windows' words, saying so when
+    /// some of them are kept for sources that cannot start.
+    nonisolated static func channelsFullNote(kept: UInt32) -> String {
+        guard kept > 0 else {
+            return "All 64 channels are in use. A source added now cannot start. / 64 個聲道已全部使用，現在新增的來源無法開始。"
+        }
+        return "All 64 channels are in use, \(kept) of them kept for sources that cannot start. A source added now cannot start. / 64 個聲道已全部使用，其中 \(kept) 個保留給無法開始的來源。現在新增的來源無法開始。"
+    }
+
     /// Why source `lane` cannot be added or changed: the sources would hold `total` channels,
     /// `kept` of them one for each source that cannot start.
     nonisolated static func addRefusal(lane: Int, total: UInt32, kept: UInt32) -> String {
