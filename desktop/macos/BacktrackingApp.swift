@@ -127,6 +127,12 @@ func verifyMacAddonSettingControls() throws {
 }
 
 @MainActor
+func verifyMacSelectWaitsForFreeze() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifySelectWaitsForFreeze()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -1814,6 +1820,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
     private var pendingSnapshotReads: [SnapshotRead] = []
     private var pendingLookControlsRebuild = false
+    private var selectFreezeWaits: [(AddonControlCall, TimeInterval)] = []
     private var pendingAddonsTabReload = false
     /// The window's editing freezes still in flight, oldest first; `pendingSnapshots` wait for them.
     private var editingFreezeReads: [EditingMaterialRead] = []
@@ -2500,6 +2507,54 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard steps == ["−", "+"], idle.allSatisfy(\.isEnabled), !waiting.isEmpty, waiting.allSatisfy({ !$0.isEnabled }),
               !link("https://example.com/\u{7}a"), !link("https://example.com/a\u{85}"), link("https://example.com/it's") else {
             throw CaptureError("Number steps \(steps), enabled while idle \(idle.map(\.isEnabled)), while waiting \(waiting.map(\.isEnabled)), control-character link refused \(!link("https://example.com/\u{7}a"))")
+        }
+    }
+
+    /// An add-on's `select` is answered once the selection's audio is frozen, not before.
+    /// It spins the main queue, so it runs with the other main-queue checks at the end.
+    static func verifySelectWaitsForFreeze() throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-select-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        let root = scratch.appendingPathComponent("addons-root", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        guard let host = AddonHostClient(dataRoot: root.path, appVersion: "0.2.1", primary: true) else {
+            throw CaptureError("AddonHostClient failed to start")
+        }
+        controller.attach(addonHost: host)
+        defer { host.shutdownAndFree(); controller.addonHost = nil }
+        let lanes = [CaptureLane(source: .addon(addonID: "verify.select", sourceID: "a"), route: .merged)]
+        let tap = try SystemAudioTap(history: 10, lanes: lanes)
+        controller.captureLanes = lanes
+        controller.tap = tap
+        defer { controller.tap = nil }
+        let samples = [Float](repeating: 0.25, count: 48_000 * 2)
+        _ = tap.withCaptureRead { core in
+            samples.withUnsafeBufferPointer { bt_tracks_push_interleaved(core, 0, $0.baseAddress, 48_000, 1_000_000_000, SystemAudioTap.timelineRate) }
+        }
+        let (first, end) = tap.withCaptureSnapshot { (bt_tracks_first_frame($0), bt_tracks_end_frame($0)) }
+        let view = WaveformView(frame: NSRect(x: 0, y: 0, width: 600, height: 200))
+        view.controller = controller
+        controller.waveform = view
+        defer { controller.waveform = nil }
+        view.verifyShow(rows: WaveformRow.layout(widths: [2], labels: [[]], stereo: false), laneWidths: [2], frames: first..<end)
+        // Something else holds the capture queue, so the freeze is still running when select returns.
+        tap.readCapture(poll: false, { _ in Thread.sleep(forTimeInterval: 0.3); return 0 }) { _ in }
+        let command = AddonControlCommand(command: "select", from_seconds_ago: 0.5, to_seconds_ago: 0.1,
+            start_frame: nil, end_frame: nil, lane: nil, first: nil, last: nil, seconds: nil, folder: nil, source: nil)
+        let call = AddonControlCall(addon_id: "verify.select", addon_name: "Verify", run: 1, request_id: "sel", command: command)
+        controller.executeSingleControlCall(host: host, call: call)
+        let early = host.verifyEvents.filter { $0.hasPrefix("control_reply") }
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        while !host.verifyEvents.contains(where: { $0.hasPrefix("control_reply") }) && ProcessInfo.processInfo.systemUptime < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+            controller.answerSelectFreezeWaits()
+        }
+        let replies = host.verifyEvents.filter { $0.hasPrefix("control_reply") }
+        guard early.isEmpty, replies == ["control_reply sel ok"], view.hasEditingMaterial, !view.isPreparingMaterial else {
+            throw CaptureError("select answered \(early) before its freeze and \(replies) after")
         }
     }
 
@@ -6827,6 +6882,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 }
             }
         }
+        answerSelectFreezeWaits()
         // Poll control commands on primary window only (Pkg 17).
         if !independentWindow {
             let calls = host.takeControl()
@@ -8107,6 +8163,26 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         syncAddonSnapshotUI()
     }
 
+    /// Answers each `select` whose freeze has finished or run out of time.
+    private func answerSelectFreezeWaits() {
+        guard !selectFreezeWaits.isEmpty, let host = addonHost else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let preparing = waveform?.isPreparingMaterial == true
+        var still: [(AddonControlCall, TimeInterval)] = []
+        for (call, until) in selectFreezeWaits {
+            if preparing && now < until {
+                still.append((call, until))
+            } else if !preparing, waveform?.hasEditingMaterial == true, waveform?.hasSelection == true {
+                host.controlReply(call: call, result: AddonControlResult(state: buildControlState()))
+            } else {
+                let message = preparing ? "the selection's audio was not ready in time"
+                    : (notice?.isEmpty == false ? notice! : "no audio is available for this selection")
+                host.controlReply(call: call, error: AddonControlError(code: "no_audio", message: message))
+            }
+        }
+        selectFreezeWaits = still
+    }
+
     private func executeSingleControlCall(host: AddonHostClient, call: AddonControlCall) {
         let cmd = call.command
         let by = call.addon_name
@@ -8160,7 +8236,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             case .success:
                 selectionByAddon = by
                 updateStatus()
-                host.controlReply(call: call, result: AddonControlResult(state: buildControlState()))
+                // The reply waits until the selection's audio is frozen, so a play_preview that
+                // follows plays it (Windows `Wait::Freeze`, at most 8 s).
+                selectFreezeWaits.append((call, ProcessInfo.processInfo.systemUptime + 8))
+                answerSelectFreezeWaits()
             case .failure(let ref):
                 host.controlReply(call: call, error: AddonControlError(code: ref.code, message: ref.message))
             }

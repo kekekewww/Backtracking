@@ -945,6 +945,9 @@ final class AddonHostClient {
     }
 
     func controlReply(call: AddonControlCall, result: AddonControlResult) {
+        #if BACKTRACKING_CAPTURE_VERIFY
+        verifyEvents.append("control_reply \(call.request_id) ok")
+        #endif
         let payload = ControlReplyPayload(
             addon_id: call.addon_id,
             run: call.run,
@@ -958,6 +961,9 @@ final class AddonHostClient {
     }
 
     func controlReply(call: AddonControlCall, error: AddonControlError) {
+        #if BACKTRACKING_CAPTURE_VERIFY
+        verifyEvents.append("control_reply \(call.request_id) \(error.code)")
+        #endif
         let payload = ControlReplyPayload(
             addon_id: call.addon_id,
             run: call.run,
