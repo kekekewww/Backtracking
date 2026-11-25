@@ -71,6 +71,7 @@ enum Verify {
         try verifyMacSavedFileLanes()
         try verifyMacRowsAcrossGroups()
         try verifyMacPreviewPlan()
+        try verifyMacEmptyGroupKeepsBed()
         try verifyMacTerminationSaves()
         try verifyFrequencyColors()
         try verifyRecorderHotkeys()

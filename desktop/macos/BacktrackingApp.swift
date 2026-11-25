@@ -193,6 +193,12 @@ func verifyMacChannelCountsAgree() throws {
 }
 
 @MainActor
+func verifyMacEmptyGroupKeepsBed() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyEmptyGroupKeepsBed()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -1293,23 +1299,19 @@ private final class WAVExport: @unchecked Sendable {
         }
         let groups = channelGroups[lane]
         var offset = 0
-        var shown: (Int, Int, Bool)?
-        var bed: (Int, Int)?
+        var spans: [(id: String, start: Int, count: Int, positioned: Bool)] = []
         for g in groups {
-            let end = offset + g.channels.count
-            if end <= width {
-                if !g.positioned && bed == nil {
-                    bed = (offset, g.channels.count)
-                }
-                if let preferredID, g.id == preferredID {
-                    shown = (offset, g.channels.count, g.positioned)
-                }
-            }
-            offset = end
+            spans.append((g.id, offset, g.channels.count, g.positioned))
+            offset += g.channels.count
         }
-        if shown == nil, let first = groups.first, first.channels.count <= width {
-            shown = (0, first.channels.count, first.positioned)
-        }
+        let fits = { (span: (id: String, start: Int, count: Int, positioned: Bool)) in span.count > 0 && span.start + span.count <= width }
+        // The group on show: the one asked for, else the first, when it has channels and fits;
+        // else every channel, numbered (Windows `group_on_show`).
+        let wanted = spans.first { $0.id == preferredID } ?? spans.first
+        let shown: (Int, Int, Bool)? = wanted.flatMap { fits($0) ? ($0.start, $0.count, $0.positioned) : nil }
+        // The pair's Channels group: the first group that is not objects, has channels and fits
+        // (Windows `channels_group`).
+        let bed: (Int, Int)? = spans.first { !$0.positioned && fits($0) }.map { ($0.start, $0.count) }
         let s = shown ?? (0, width, false)
         let b = bed ?? (0, 0)
         return (UInt32(s.0), UInt32(s.1), s.2 ? 1 : 0, UInt32(b.0), UInt32(b.1))
@@ -2629,6 +2631,35 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         guard files.count == 2, Set(files.compactMap(\.lane)) == ["A", "B"], !named.contains(false) else {
             throw CaptureError("Saved files carry lanes \(files.map { "\($0.lane ?? "-") \(URL(fileURLWithPath: $0.path).lastPathComponent)" })")
+        }
+    }
+
+    /// An add-on group with no channels never takes the Channels group's place: the pair is still
+    /// made from the bed (Windows `channels_group` takes the first non-empty group).
+    static func verifyEmptyGroupKeepsBed() throws {
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-empty-group-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let widths: [UInt32] = [5]
+        guard let core = widths.withUnsafeBufferPointer({
+            bt_tracks_new_lanes(SystemAudioTap.timelineRate, $0.baseAddress, $0.count, 10, ProcessInfo.processInfo.physicalMemory)
+        }) else { throw CaptureError("Empty group verification could not make a capture") }
+        defer { bt_tracks_free(core) }
+        bt_tracks_set_retain_silence(core, 1)
+        let samples = [Float](repeating: 0.25, count: 4_800 * 5)
+        _ = samples.withUnsafeBufferPointer { bt_tracks_push_interleaved(core, 0, $0.baseAddress, 4_800, 1_000_000_000, SystemAudioTap.timelineRate) }
+        bt_tracks_pause(core)
+        let empty = AddonChannelGroup(id: "none", label: "None", channels: [], positioned: false)
+        let bed = AddonChannelGroup(id: "bed", label: "Bed", channels: ["FL", "FR", "FC"], positioned: false)
+        let objects = AddonChannelGroup(id: "objects", label: "Objects", channels: ["Object 1", "Object 2"], positioned: true)
+        guard let frozen = WAVExport(core: core, routes: [.allChannels], channelNames: [["FL", "FR", "FC", "Object 1", "Object 2"]],
+                                     channelGroups: [[empty, bed, objects]]) else { throw CaptureError("Could not freeze") }
+        let written = frozen.write(range: frozen.span, directory: scratch.path, sampleRate: 48_000, bitsPerSample: 32,
+            forceMono: false, fades: noFades, names: ["Empty"], selectedRows: [.pair(lane: 0, side: 0), .pair(lane: 0, side: 1)],
+            hideSilentLanes: [], wideMode: .monoFiles, pairBinaural: false, shownGroupIDs: ["objects"])
+        let names = written.urls.map(\.lastPathComponent)
+        guard names.count == 1, names[0].hasSuffix("-Stereo.wav") else {
+            throw CaptureError("The pair with an empty group ahead of the bed wrote \(names) \(written.error ?? "")")
         }
     }
 
