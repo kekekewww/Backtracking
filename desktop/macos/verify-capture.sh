@@ -84,6 +84,7 @@ enum Verify {
         try verifyMacClipExportedAtExportRate()
         try verifyMacSelectWaitsForFreeze()
         try verifyMacControlSaveReply()
+        try verifyMacSavedFilesReadHeadersOnly()
         print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options, test-copy isolation, flag drags keeping rows, chip tooltips, cross-source edge scroll, 64-channel limit, look gradients, add-on pauses holding, look updates keeping controls, snapshot rebuilds, hidden pages catching up, frequency rows by identity, add-on setting controls, add-on capture status, saved file lanes, rows across groups, preview plan, exit saves, hotkeys, row layout, silent channel tracking, theme, add-on host, ticket completions, control grant checks, control batch window sync, clip_exported rates, select waiting for its freeze, control save reply, look readability and positions passed.")
     }
 

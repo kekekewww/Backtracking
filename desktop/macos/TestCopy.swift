@@ -523,6 +523,15 @@ struct WavHeaderInfo {
     let bitsPerSample: UInt16
     let frames: UInt64
 
+    /// The header of the WAV file at `url`, read from its first 64 KiB only: the chunks before
+    /// the audio, not the audio, which may be gigabytes.
+    static func read(_ url: URL) -> WavHeaderInfo? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: 65_536) else { return nil }
+        return parse(head)
+    }
+
     static func parse(_ data: Data) -> WavHeaderInfo? {
         guard data.count >= 44 else { return nil }
         func u16(_ offset: Int) -> UInt16? {

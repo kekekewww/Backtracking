@@ -199,6 +199,12 @@ func verifyMacEmptyGroupKeepsBed() throws {
 }
 
 @MainActor
+func verifyMacSavedFilesReadHeadersOnly() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifySavedFilesReadHeadersOnly()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -2749,6 +2755,33 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             problems.append(error.operation)
         }
         guard problems.isEmpty else { throw CaptureError("Preview plan: " + problems.joined(separator: "; ")) }
+    }
+
+    /// The files of a save are described from their headers alone: a 1 GB WAV is not read on the
+    /// main thread to answer an add-on's save.
+    static func verifySavedFilesReadHeadersOnly() throws {
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-header-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let url = scratch.appendingPathComponent("big.wav")
+        let dataBytes: UInt32 = 1_000_000_000
+        var header = Data("RIFF".utf8)
+        func le32(_ v: UInt32) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
+        func le16(_ v: UInt16) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
+        header += le32(36 + dataBytes) + Data("WAVE".utf8) + Data("fmt ".utf8) + le32(16)
+        header += le16(3) + le16(2) + le32(48_000) + le32(48_000 * 8) + le16(8) + le16(32)
+        header += Data("data".utf8) + le32(dataBytes)
+        FileManager.default.createFile(atPath: url.path, contents: header)
+        // A sparse gigabyte of audio after the header: nothing is written to disk for it.
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(header.count) + UInt64(dataBytes))
+        try handle.close()
+        let started = ProcessInfo.processInfo.systemUptime
+        let files = BacktrackingController.savedFiles(urls: [url], lanes: [0])
+        let took = ProcessInfo.processInfo.systemUptime - started
+        guard files.count == 1, files[0].frames == UInt64(dataBytes) / 8, files[0].channels == 2, took < 0.1 else {
+            throw CaptureError("Describing a 1 GB WAV took \(String(format: "%.2f", took)) s: \(files)")
+        }
     }
 
     /// An add-on's `save` of two sources answers with each file and the lane it came from.
@@ -9429,7 +9462,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             if url.pathExtension.lowercased() == "json" {
                 return AddonSavedFile(path: url.path, kind: "positions", lane: lane, channels: nil, sample_rate: nil, frames: nil)
             }
-            if let data = try? Data(contentsOf: url), let hdr = WavHeaderInfo.parse(data) {
+            if let hdr = WavHeaderInfo.read(url) {
                 return AddonSavedFile(
                     path: url.path, kind: "wav", lane: lane,
                     channels: UInt32(hdr.channels), sample_rate: hdr.sampleRate, frames: hdr.frames
