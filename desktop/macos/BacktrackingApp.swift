@@ -139,6 +139,12 @@ func verifyMacAddonCaptureStatus() throws {
 }
 
 @MainActor
+func verifyMacChannelLimitCaptureOpens() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyChannelLimitCaptureOpens()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -2365,6 +2371,18 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let opened = controller.openingWaveformGradient
         guard opened == offered else {
             throw CaptureError("A window opened with the look's gradient draws \(opened?.stops ?? [])")
+        }
+    }
+
+    /// More lanes than the 64 channels can hold, as when sources turn out wider than estimated:
+    /// the capture still opens, and only the lanes that do not fit say why.
+    static func verifyChannelLimitCaptureOpens() throws {
+        let lanes = (0..<33).map { CaptureLane(source: .addon(addonID: "verify.limit", sourceID: "s\($0)"), route: .merged) }
+        let tap = try SystemAudioTap(history: 10, lanes: lanes)
+        let refused = lanes.indices.filter { tap.sourceProblem(for: $0)?.contains("cannot start") == true }
+        guard refused == [31, 32], tap.totalChannelCount == 62,
+              tap.sourceProblem(for: 32)?.hasPrefix("Lane AG cannot start: lanes A to AG would contain 66 channels; the limit is 64") == true else {
+            throw CaptureError("33 stereo lanes: refused \(refused), \(tap.totalChannelCount) channels in use")
         }
     }
 

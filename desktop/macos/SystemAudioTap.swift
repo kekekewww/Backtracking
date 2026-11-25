@@ -1307,6 +1307,34 @@ final class SystemAudioTap {
         zip(widths, capErrors).reduce(0) { $0 + ($1.1 == nil ? $1.0 : 0) }
     }
 
+    /// CAP-16: lanes start in order up to 64 channels in all; one that would go past does not
+    /// start, and later ones that still fit do (Windows `controller::lane_fits`). Unlike Windows,
+    /// a lane that does not start still holds one channel in the capture core, which takes at
+    /// most 64 in all. When those placeholders would push the capture past 64, the latest lanes
+    /// that started give way too, so only lanes are refused and the capture itself still opens.
+    nonisolated static func acceptLanes(_ requested: [UInt32]) -> (widths: [UInt32], errors: [String?]) {
+        var widths: [UInt32] = []
+        var errors: [String?] = []
+        var total: UInt32 = 0
+        for (index, width) in requested.enumerated() {
+            if total + width <= 64 {
+                total += width
+                widths.append(width)
+                errors.append(nil)
+            } else {
+                errors.append(overLimitMessage(lane: index, total: total + width))
+                widths.append(1)
+            }
+        }
+        var held = widths.reduce(0, +)
+        while held > 64, let last = widths.indices.last(where: { errors[$0] == nil && widths[$0] > 1 }) {
+            errors[last] = overLimitMessage(lane: last, total: held)
+            held -= widths[last] - 1
+            widths[last] = 1
+        }
+        return (widths, errors)
+    }
+
     /// Why lane `lane` cannot start after lanes holding `total - width` channels, in English and
     /// Traditional Chinese on one line, worded as Windows `controller::lane_fits`.
     nonisolated static func overLimitMessage(lane: Int, total: UInt32) -> String {
@@ -1465,21 +1493,7 @@ final class SystemAudioTap {
             }
             return format.width(for: route)
         }
-        // CAP-16: Start lanes sequentially up to 64 total channels; overflowing lanes do not start
-        // while subsequent lanes that still fit can start.
-        var acceptedWidths: [UInt32] = []
-        var capErrors: [String?] = []
-        var total: UInt32 = 0
-        for (index, width) in requestedWidths.enumerated() {
-            if total + width <= 64 {
-                total += width
-                acceptedWidths.append(width)
-                capErrors.append(nil)
-            } else {
-                capErrors.append(Self.overLimitMessage(lane: index, total: total + width))
-                acceptedWidths.append(1)
-            }
-        }
+        let (acceptedWidths, capErrors) = Self.acceptLanes(requestedWidths)
         self.routes = routes
         self.widths = acceptedWidths
         self.laneCapErrors = capErrors
