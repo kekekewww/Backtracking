@@ -177,7 +177,7 @@ func verifyMacControlSaveReply() throws {
 @MainActor
 func verifyMacOptionsRebuild(step: String) throws {
     _ = NSApplication.shared
-    if ["typed-values", "deferred", "sources-name"].contains(step) {
+    if ["typed-values", "deferred", "sources-name", "open-list"].contains(step) {
         try BacktrackingController.verifyOptionsRebuildKeepsTyping(step: step)
         return
     }
@@ -514,7 +514,38 @@ private final class OptionsPopUpButton: NSPopUpButton, NSTableViewDataSource, NS
     private weak var choiceTable: OptionsChoiceTable?
     private var choiceItems: [NSMenuItem] = []
 
-    var isChoicePopoverShown: Bool { choicePopover?.isShown == true }
+    var isChoicePopoverShown: Bool {
+        #if BACKTRACKING_CAPTURE_VERIFY
+        if verifyOpen { return true }
+        #endif
+        return choicePopover?.isShown == true
+    }
+
+    func closeChoicePopover() {
+        #if BACKTRACKING_CAPTURE_VERIFY
+        verifyOpen = false
+        verifyClosedInWindow = window != nil
+        #endif
+        choicePopover?.close()
+    }
+
+    /// Closes every list still open whose button lies inside `view`, before `view` goes away.
+    static func closeChoices(inside view: NSView) {
+        for button in opened.allObjects where button.isChoicePopoverShown && button.isDescendant(of: view) {
+            button.closeChoicePopover()
+        }
+    }
+
+    #if BACKTRACKING_CAPTURE_VERIFY
+    /// A list a verification cannot put on screen, marked open.
+    private var verifyOpen = false
+    private(set) var verifyClosedInWindow: Bool?
+    func verifyMarkOpen() {
+        verifyOpen = true
+        Self.opened.add(self)
+    }
+    #endif
+
 
     /// Every list that has opened, so a window can ask whether any is open now, whichever it is.
     private static let opened = NSHashTable<OptionsPopUpButton>.weakObjects()
@@ -3734,6 +3765,29 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             guard whileHeld == 0, waiting, built == 1, shown == "/latest", addonsRegistered(), !controller.pendingAddonsTabReload else {
                 throw CaptureError("Held rebuild: built \(whileHeld) while held (pending \(waiting)), \(built) in all, shows \(shown ?? "-"), registered \(addonsRegistered())")
             }
+        case "open-list":
+            // A Choice setting's list is open when an add-on's answer rebuilds the page.
+            let choice = AddonSettingEntry(declaration: AddonSettingDeclaration(key: "mode", label: "Mode", help: nil, kind: "choice",
+                defaultValue: .string("a"), options: [AddonChoiceOption(value: "a", label: "A"), AddonChoiceOption(value: "b", label: "B")],
+                min: nil, max: nil, step: nil), value: .string("a"))
+            let withChoice = AddonRecord(id: "verify.typing", manifest: nil, enabled: true, state: "running", reason: nil, pid: 1,
+                message: nil, sources: [], settings: [choice], actions: [], control_allowed: false, control_asked: false)
+            host.verifyReceive(AddonSnapshot(schema: 1, generation: 9_100, ready: true, error: nil, addons: [withChoice], appearances: [:], completed: []))
+            controller.syncAddonSnapshotUI()
+            guard let addons = category("Add-ons") else { throw CaptureError("No Add-ons category") }
+            controller.selectOptionCategory(addons)
+            controller.reloadAddonsTab()
+            func popups(_ view: NSView) -> [OptionsPopUpButton] {
+                ((view as? OptionsPopUpButton).map { [$0] } ?? []) + view.subviews.flatMap(popups)
+            }
+            guard let list = page("Add-ons").map(popups)?.first(where: { $0.identifier?.rawValue.hasPrefix("addon-choice:") == true }) else {
+                throw CaptureError("No Choice list on the Add-ons page")
+            }
+            list.verifyMarkOpen()
+            controller.reloadAddonsTab()
+            guard !list.isChoicePopoverShown, list.verifyClosedInWindow == true else {
+                throw CaptureError("The open list was \(list.isChoicePopoverShown ? "left open" : "closed after its page went away")")
+            }
         default: // "sources-name"
             guard let sources = category("Sources") else { throw CaptureError("No Sources category") }
             controller.selectOptionCategory(sources)
@@ -5250,6 +5304,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         guard let index = tabs.tabViewItems.firstIndex(where: { $0.label == label }) else { return }
         let current = tabs.tabViewItem(at: index)
+        // A list still open on the old page closes before its button goes away (V10-L1).
+        if let view = current.view { OptionsPopUpButton.closeChoices(inside: view) }
         guard let page = makeOptionsPage(label) else { return }
         pendingOptionsPages.remove(label)
         current.initialFirstResponder = nil
