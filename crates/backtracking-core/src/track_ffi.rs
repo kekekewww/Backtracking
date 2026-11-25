@@ -2096,6 +2096,79 @@ unsafe extern "C" fn bt_frozen_export_group_selection(
     objects_in_mono_out: *mut u32,
     error_out: *mut *mut c_char,
 ) -> *mut Vec<CString> {
+    export_group_selection(
+        frozen, lanes, count, first, end, directory, sample_rate, bits_per_sample, force_mono,
+        wide_mode, pair_binaural, fades, objects_in_mono_out, error_out, ptr::null_mut(),
+    )
+}
+
+/// As [`bt_frozen_export_group_selection`], and when the export succeeds `*lanes_out` names the
+/// capture lane of each path, in the same order (Windows `ExportResult::tracks`). Free it with
+/// `bt_export_lanes_free`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn bt_frozen_export_group_selection_lanes(
+    frozen: *const FrozenCapture,
+    lanes: *const BtFrozenGroupSelectionLane,
+    count: usize,
+    first: u64,
+    end: u64,
+    directory: *const c_char,
+    sample_rate: u32,
+    bits_per_sample: u32,
+    force_mono: u32,
+    wide_mode: u32,
+    pair_binaural: u32,
+    fades: Fades,
+    objects_in_mono_out: *mut u32,
+    error_out: *mut *mut c_char,
+    lanes_out: *mut *mut Vec<u32>,
+) -> *mut Vec<CString> {
+    export_group_selection(
+        frozen, lanes, count, first, end, directory, sample_rate, bits_per_sample, force_mono,
+        wide_mode, pair_binaural, fades, objects_in_mono_out, error_out, lanes_out,
+    )
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_export_lanes_count(lanes: *const Vec<u32>) -> usize {
+    lanes.as_ref().map_or(0, Vec::len)
+}
+
+/// The capture lane of path `index`, or `u32::MAX` past the end.
+#[no_mangle]
+unsafe extern "C" fn bt_export_lane(lanes: *const Vec<u32>, index: usize) -> u32 {
+    lanes.as_ref().and_then(|lanes| lanes.get(index)).copied().unwrap_or(u32::MAX)
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_export_lanes_free(lanes: *mut Vec<u32>) {
+    if !lanes.is_null() {
+        drop(Box::from_raw(lanes));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn export_group_selection(
+    frozen: *const FrozenCapture,
+    lanes: *const BtFrozenGroupSelectionLane,
+    count: usize,
+    first: u64,
+    end: u64,
+    directory: *const c_char,
+    sample_rate: u32,
+    bits_per_sample: u32,
+    force_mono: u32,
+    wide_mode: u32,
+    pair_binaural: u32,
+    fades: Fades,
+    objects_in_mono_out: *mut u32,
+    error_out: *mut *mut c_char,
+    lanes_out: *mut *mut Vec<u32>,
+) -> *mut Vec<CString> {
+    if !lanes_out.is_null() {
+        *lanes_out = ptr::null_mut();
+    }
     if !error_out.is_null() {
         *error_out = ptr::null_mut();
     }
@@ -2185,6 +2258,7 @@ unsafe extern "C" fn bt_frozen_export_group_selection(
     let frames = (first - start) as usize..(end - start) as usize;
     let profile = WavExportProfile { sample_rate, sample_format };
     let mut paths = Vec::new();
+    let mut path_lanes: Vec<u32> = Vec::new();
     let mut any_objects_in_mono = false;
     let result: std::io::Result<()> = (|| {
         if tracks.iter().all(|track| track.channels() <= 2) && narrowed_stereo.iter().all(Option::is_none) {
@@ -2192,6 +2266,8 @@ unsafe extern "C" fn bt_frozen_export_group_selection(
             paths = export_routed_track_refs(
                 directory, &references, frames, profile, &routes, force_mono != 0, None, fades, &labels,
             )?;
+            // One file per lane, in lane order.
+            path_lanes = lanes.iter().take(paths.len()).map(|lane| lane.index).collect();
         } else {
             for (index, track) in tracks.iter().enumerate() {
                 let lane = &lanes[index];
@@ -2278,6 +2354,7 @@ unsafe extern "C" fn bt_frozen_export_group_selection(
                         &labels[index..=index],
                     )?
                 };
+                path_lanes.extend(std::iter::repeat_n(lane.index, written.len()));
                 paths.extend(written);
             }
         }
@@ -2292,7 +2369,12 @@ unsafe extern "C" fn bt_frozen_export_group_selection(
         *objects_in_mono_out = u32::from(any_objects_in_mono);
     }
     match encode_export_paths(paths) {
-        Some(encoded) => Box::into_raw(Box::new(encoded)),
+        Some(encoded) => {
+            if !lanes_out.is_null() {
+                *lanes_out = Box::into_raw(Box::new(path_lanes));
+            }
+            Box::into_raw(Box::new(encoded))
+        }
         None => {
             set_ffi_error(error_out, "Export path is not valid UTF-8");
             ptr::null_mut()
@@ -2653,6 +2735,63 @@ mod display_tests {
             let err_str = CString::from_raw(err).into_string().unwrap();
             assert_eq!(err_str, "The selected rows do not match this capture");
 
+            bt_frozen_free(frozen);
+            bt_tracks_free(core);
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Every exported file names the capture lane it came from, wide or narrow, as on Windows.
+    #[test]
+    fn group_selection_export_reports_each_files_lane() {
+        let directory = std::env::temp_dir().join(format!("bt-export-lanes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let folder = CString::new(directory.to_str().unwrap()).unwrap();
+        let labels = CString::new("FL\tFR\tFC\tLFE\tLs\tRs").unwrap();
+        let name = CString::new("Lanes").unwrap();
+        let widths = [6u32, 2u32];
+        unsafe {
+            let core = bt_tracks_new_lanes(48_000.0, widths.as_ptr(), widths.len(), 10, 1 << 30);
+            bt_tracks_set_retain_silence(core, 1);
+            let wide = vec![0.25f32; 960 * 6];
+            let stereo = vec![0.2f32; 960 * 2];
+            assert_eq!(bt_tracks_push_interleaved(core, 0, wide.as_ptr(), 960, 1_000_000_000, 48_000.0), 960);
+            assert_eq!(bt_tracks_push_interleaved(core, 1, stereo.as_ptr(), 960, 1_000_000_000, 48_000.0), 960);
+            bt_tracks_pause(core);
+            let (first, end) = (bt_tracks_first_frame(core), bt_tracks_end_frame(core));
+            let frozen = bt_tracks_freeze(core, first, end);
+            let lane = |index: u32, route: u32, labels: *const c_char, mask: u64, valid: u32, pair: u32| BtFrozenGroupSelectionLane {
+                index, route, source_name: name.as_ptr(), channel_labels: labels, channel_mask: mask,
+                channel_mask_valid: valid, include_pair: pair, shown_start: 0, shown_count: 0,
+                shown_positioned: 0, bed_start: 0, bed_count: 0, positions: ptr::null(),
+            };
+            let both = [lane(0, 7, labels.as_ptr(), (1 << 2) | (1 << 4), 1, 1), lane(1, 5, ptr::null(), 0, 0, 0)];
+            let narrow = [lane(1, 5, ptr::null(), 0, 0, 0)];
+            for (selection, expected) in [(&both[..], vec![0u32, 0, 0, 1]), (&narrow[..], vec![1u32])] {
+                let mut err: *mut c_char = ptr::null_mut();
+                let mut lanes_out: *mut Vec<u32> = ptr::null_mut();
+                let paths = bt_frozen_export_group_selection_lanes(
+                    frozen, selection.as_ptr(), selection.len(), first, end, folder.as_ptr(), 48_000, 32,
+                    0, 1, 0, Fades::NONE, ptr::null_mut(), &mut err, &mut lanes_out,
+                );
+                assert!(err.is_null(), "{}", CStr::from_ptr(err).to_string_lossy());
+                assert!(!paths.is_null() && !lanes_out.is_null());
+                let got: Vec<u32> = (0..bt_export_lanes_count(lanes_out)).map(|i| bt_export_lane(lanes_out, i)).collect();
+                assert_eq!(bt_export_paths_count(paths), got.len());
+                let mut sorted = got.clone();
+                sorted.sort();
+                assert_eq!(sorted, expected);
+                for (i, lane) in got.iter().enumerate() {
+                    let path = CStr::from_ptr(bt_export_path(paths, i)).to_str().unwrap().to_owned();
+                    if selection.len() > 1 {
+                        let letter = if *lane == 0 { "_A_" } else { "_B_" };
+                        assert!(path.contains(letter), "{path} is lane {lane}");
+                    }
+                }
+                assert_eq!(bt_export_lane(lanes_out, got.len()), u32::MAX);
+                bt_export_lanes_free(lanes_out);
+                bt_export_paths_free(paths);
+            }
             bt_frozen_free(frozen);
             bt_tracks_free(core);
         }

@@ -145,6 +145,12 @@ func verifyMacChannelLimitCaptureOpens() throws {
 }
 
 @MainActor
+func verifyMacSavedFileLanes() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifySavedFileLanes()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -1360,7 +1366,7 @@ private final class WAVExport: @unchecked Sendable {
         range: Range<UInt64>, directory: String, sampleRate: UInt32, bitsPerSample: UInt32, forceMono: Bool,
         fades: BtFades, names: [String], selectedRows: [RowIdentity]?, hideSilentLanes: Set<Int>,
         wideMode: WideExportMode, pairBinaural: Bool, shownGroupIDs: [String?] = []
-    ) -> (urls: [URL], objectsInMono: Bool, error: String?) {
+    ) -> (urls: [URL], objectsInMono: Bool, error: String?, lanes: [Int?]) {
         let built = buildGroupSelectionLanes(
             names: names, selectedRows: selectedRows, hideSilentLanes: hideSilentLanes, shownGroupIDs: shownGroupIDs
         )
@@ -1368,18 +1374,20 @@ private final class WAVExport: @unchecked Sendable {
             for s in built.sources { free(s) }
             for l in built.labels { free(l) }
         }
-        guard !built.lanes.isEmpty else { return ([], false, "Invalid capture lanes") }
+        guard !built.lanes.isEmpty else { return ([], false, "Invalid capture lanes", []) }
         var objectsInMonoRaw: UInt32 = 0
         var errorPtr: UnsafeMutablePointer<CChar>?
+        var lanesPtr: OpaquePointer?
         let paths = directory.withCString { destination in
             built.lanes.withUnsafeBufferPointer {
-                bt_frozen_export_group_selection(
+                bt_frozen_export_group_selection_lanes(
                     frozen, $0.baseAddress, $0.count, range.lowerBound, range.upperBound,
                     destination, sampleRate, bitsPerSample, forceMono ? 1 : 0, wideMode.rawValue,
-                    pairBinaural ? 1 : 0, fades, &objectsInMonoRaw, &errorPtr
+                    pairBinaural ? 1 : 0, fades, &objectsInMonoRaw, &errorPtr, &lanesPtr
                 )
             }
         }
+        defer { if let lanesPtr { bt_export_lanes_free(lanesPtr) } }
         let errorMessage: String?
         if let errorPtr {
             errorMessage = String(cString: errorPtr)
@@ -1387,12 +1395,17 @@ private final class WAVExport: @unchecked Sendable {
         } else {
             errorMessage = nil
         }
-        guard let paths else { return ([], false, errorMessage) }
+        guard let paths else { return ([], false, errorMessage, []) }
         defer { bt_export_paths_free(paths) }
-        let urls = (0..<bt_export_paths_count(paths)).compactMap { index in
-            bt_export_path(paths, index).map { URL(fileURLWithPath: String(cString: $0)) }
+        var urls: [URL] = []
+        var lanes: [Int?] = []
+        for index in 0..<bt_export_paths_count(paths) {
+            guard let path = bt_export_path(paths, index) else { continue }
+            urls.append(URL(fileURLWithPath: String(cString: path)))
+            let lane = lanesPtr.map { bt_export_lane($0, index) } ?? UInt32.max
+            lanes.append(lane == UInt32.max ? nil : Int(lane))
         }
-        return (urls, objectsInMonoRaw != 0, nil)
+        return (urls, objectsInMonoRaw != 0, nil, lanes)
     }
 }
 
@@ -2383,6 +2396,42 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard refused == [31, 32], tap.totalChannelCount == 62,
               tap.sourceProblem(for: 32)?.hasPrefix("Lane AG cannot start: lanes A to AG would contain 66 channels; the limit is 64") == true else {
             throw CaptureError("33 stereo lanes: refused \(refused), \(tap.totalChannelCount) channels in use")
+        }
+    }
+
+    /// The files of an add-on's save name the lane each came from, from the export itself.
+    static func verifySavedFileLanes() throws {
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-lanes-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let lanes = [
+            CaptureLane(source: .addon(addonID: "verify.lanes", sourceID: "a"), route: .merged),
+            CaptureLane(source: .addon(addonID: "verify.lanes", sourceID: "b"), route: .merged)
+        ]
+        let tap = try SystemAudioTap(history: 10, lanes: lanes)
+        let samples = [Float](repeating: 0.25, count: 4_800 * 2)
+        for lane in 0..<2 {
+            _ = tap.withCaptureRead { core in
+                samples.withUnsafeBufferPointer {
+                    bt_tracks_push_interleaved(core, UInt32(lane), $0.baseAddress, 4_800, 1_000_000_000, SystemAudioTap.timelineRate)
+                }
+            }
+        }
+        let routes = tap.captureRoutes
+        let labels = tap.captureChannelNames
+        guard let frozen = tap.withCaptureSnapshot({
+            WAVExport(core: $0, routes: routes, channelNames: labels, channelGroups: [[], []], positions: [:])
+        }) else { throw CaptureError("Lane verification could not freeze") }
+        let written = frozen.write(range: frozen.span, directory: scratch.path, sampleRate: 48_000, bitsPerSample: 32,
+            forceMono: false, fades: noFades, names: ["Lanes", "Lanes"], selectedRows: nil, hideSilentLanes: [],
+            wideMode: .monoFiles, pairBinaural: false)
+        let files = BacktrackingController.savedFiles(urls: written.urls, lanes: written.lanes)
+        let named = files.map { file -> Bool in
+            guard let lane = file.lane else { return false }
+            return URL(fileURLWithPath: file.path).lastPathComponent.contains("_\(lane)_")
+        }
+        guard files.count == 2, Set(files.compactMap(\.lane)) == ["A", "B"], !named.contains(false) else {
+            throw CaptureError("Saved files carry lanes \(files.map { "\($0.lane ?? "-") \(URL(fileURLWithPath: $0.path).lastPathComponent)" })")
         }
     }
 
@@ -6231,7 +6280,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                         }
                         if let controlCall {
                             status += " · by \(controlCall.addon_name)"
-                            self?.replyControlSave(call: controlCall, folder: directory, urls: urls)
+                            self?.replyControlSave(call: controlCall, folder: directory, urls: urls, lanes: written.lanes)
                         }
                         self?.setNotice(status)
                     }
@@ -8165,19 +8214,25 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         )
     }
 
-    private func replyControlSave(call: AddonControlCall, folder: String, urls: [URL]) {
-        let savedFiles: [AddonSavedFile] = urls.map { url in
-            if url.lastPathComponent.hasSuffix("-Positions.json") {
-                return AddonSavedFile(path: url.path, kind: "positions", lane: nil, channels: nil, sample_rate: nil, frames: nil)
+    /// Every file a save wrote, with the letter of the lane it came from (Windows `saved_files`).
+    static func savedFiles(urls: [URL], lanes: [Int?]) -> [AddonSavedFile] {
+        urls.enumerated().map { index, url in
+            let lane = lanes.indices.contains(index) ? lanes[index].map(captureLaneLetter) : nil
+            if url.pathExtension.lowercased() == "json" {
+                return AddonSavedFile(path: url.path, kind: "positions", lane: lane, channels: nil, sample_rate: nil, frames: nil)
             }
             if let data = try? Data(contentsOf: url), let hdr = WavHeaderInfo.parse(data) {
                 return AddonSavedFile(
-                    path: url.path, kind: "wav", lane: nil,
+                    path: url.path, kind: "wav", lane: lane,
                     channels: UInt32(hdr.channels), sample_rate: hdr.sampleRate, frames: hdr.frames
                 )
             }
-            return AddonSavedFile(path: url.path, kind: "wav", lane: nil, channels: nil, sample_rate: nil, frames: nil)
+            return AddonSavedFile(path: url.path, kind: "wav", lane: lane, channels: nil, sample_rate: nil, frames: nil)
         }
+    }
+
+    private func replyControlSave(call: AddonControlCall, folder: String, urls: [URL], lanes: [Int?]) {
+        let savedFiles = Self.savedFiles(urls: urls, lanes: lanes)
         let res = AddonControlResult(
             state: buildControlState(),
             sources: nil,

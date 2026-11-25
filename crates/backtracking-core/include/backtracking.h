@@ -334,6 +334,21 @@ BtExportPaths *bt_frozen_export_group_selection(const BtFrozenCapture *frozen,
                                                 uint32_t pair_binaural, BtFades fades,
                                                 uint32_t *objects_in_mono_out,
                                                 char **error_out);
+// As bt_frozen_export_group_selection; on success *lanes_out holds the capture lane of each
+// path, in path order. Free it with bt_export_lanes_free.
+typedef struct BtExportLanes BtExportLanes;
+BtExportPaths *bt_frozen_export_group_selection_lanes(const BtFrozenCapture *frozen,
+                                                      const BtFrozenGroupSelectionLane *lanes, size_t count,
+                                                      uint64_t first, uint64_t end, const char *directory,
+                                                      uint32_t sample_rate, uint32_t bits_per_sample,
+                                                      uint32_t force_mono, uint32_t wide_mode,
+                                                      uint32_t pair_binaural, BtFades fades,
+                                                      uint32_t *objects_in_mono_out,
+                                                      char **error_out, BtExportLanes **lanes_out);
+size_t bt_export_lanes_count(const BtExportLanes *lanes);
+// UINT32_MAX past the end.
+uint32_t bt_export_lane(const BtExportLanes *lanes, size_t index);
+void bt_export_lanes_free(BtExportLanes *lanes);
 
 BtSnapshot *bt_tracks_snapshot(const BtTracks *core, uint32_t lane);
 BtSnapshot *bt_tracks_snapshot_range(const BtTracks *core, uint32_t lane, uint64_t first, uint64_t end);
