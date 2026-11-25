@@ -59,7 +59,7 @@ enum Verify {
         try verifyMacCrossSourceEdgeScroll()
         try verifyMacChannelLimit()
         try verifyMacChannelCountsAgree()
-        try verifyMacChannelLimitCaptureOpens()
+        try verifyMacChannelLimitCaptureRefused()
         try verifyMacLookGradient()
         try verifyMacControlPauseHolds()
         try verifyMacLookUpdatesKeepControls()

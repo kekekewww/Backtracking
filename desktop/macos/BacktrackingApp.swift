@@ -139,9 +139,9 @@ func verifyMacAddonCaptureStatus() throws {
 }
 
 @MainActor
-func verifyMacChannelLimitCaptureOpens() throws {
+func verifyMacChannelLimitCaptureRefused() throws {
     _ = NSApplication.shared
-    try BacktrackingController.verifyChannelLimitCaptureOpens()
+    try BacktrackingController.verifyChannelLimitCaptureRefused()
 }
 
 @MainActor
@@ -2580,7 +2580,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     /// More lanes than the 64 channels can hold, as when sources turn out wider than estimated:
     /// the capture does not open, and its error says the channels pass 64. Lanes that fit beside
     /// the placeholders still open, with none refused.
-    static func verifyChannelLimitCaptureOpens() throws {
+    static func verifyChannelLimitCaptureRefused() throws {
         func lanes(_ count: Int) -> [CaptureLane] {
             (0..<count).map { CaptureLane(source: .addon(addonID: "verify.limit", sourceID: "s\($0)"), route: .merged) }
         }
@@ -2590,6 +2590,23 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             message = "opened"
         } catch let error as CaptureError {
             message = error.operation
+        }
+        // A source in the middle that cannot start takes the capture past 64 with its kept channel.
+        let middle = SystemAudioTap.acceptLanes([62, 4, 2])
+        let middleOver = SystemAudioTap.captureOverLimitMessage(middle.widths) ?? ""
+        // The error reaches the window when the sources are set up again.
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-over-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        controller.captureLanes = lanes(33)
+        controller.reconnectConfiguredSources()
+        let shown = controller.captureError ?? ""
+        controller.tap = nil
+        guard middle.widths == [62, 1, 2], middle.errors[1] != nil, middleOver.contains("65 channels"),
+              shown.hasPrefix("Capture cannot start: with one channel kept"), shown.contains(" / 無法開始擷取") else {
+            throw CaptureError("[62, 4, 2]: \(middle.widths) \(middleOver); after setting 33 sources up the window says \(shown)")
         }
         let fits = try SystemAudioTap(history: 10, lanes: lanes(32))
         guard message.hasPrefix("Capture cannot start: with one channel kept for each source that cannot start, the sources would hold 65 channels; the limit is 64."),
@@ -7199,7 +7216,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         // Package 6 & 17 / WIN-06, ADD-W27: status strip below waveform (26px, empty when no text, hidden in waveform-only).
         let line: String
         if let captureError {
-            line = captureError
+            line = localizedBilingual(captureError)
         } else if waveform?.isPreparingMaterial == true {
             line = "Preparing selection…"
         } else if waveform?.hasSelection == true && notice == nil {

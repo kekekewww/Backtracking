@@ -1330,8 +1330,8 @@ final class SystemAudioTap {
     /// CAP-16: lanes start in order up to 64 channels in all; one that would go past does not
     /// start, and later ones that still fit do (Windows `controller::lane_fits`). Unlike Windows,
     /// a lane that does not start still holds one channel in the capture core, which takes at
-    /// most 64 in all. When those placeholders would push the capture past 64, the latest lanes
-    /// that started give way too, so only lanes are refused and the capture itself still opens.
+    /// most 64 in all; when those placeholders push it past 64 the capture does not open
+    /// (`captureOverLimitMessage`).
     nonisolated static func acceptLanes(_ requested: [UInt32]) -> (widths: [UInt32], errors: [String?]) {
         var widths: [UInt32] = []
         var errors: [String?] = []
@@ -1355,7 +1355,7 @@ final class SystemAudioTap {
     nonisolated static func captureOverLimitMessage(_ held: [UInt32]) -> String? {
         let total = held.reduce(0, +)
         guard total > 64 else { return nil }
-        return "Capture cannot start: with one channel kept for each source that cannot start, the sources would hold \(total) channels; the limit is 64. Remove a source or choose a narrower route."
+        return "Capture cannot start: with one channel kept for each source that cannot start, the sources would hold \(total) channels; the limit is 64. Remove a source or choose a narrower route. / 無法開始擷取：每個無法開始的來源保留 1 個聲道後，這些來源合計會有 \(total) 個聲道，上限為 64。請移除一個來源，或選擇聲道較少的路由。"
     }
 
     /// Why lane `lane` cannot start after lanes holding `total - width` channels, in English and
