@@ -3743,12 +3743,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         // The Sources page, hidden: a play position that moves marks nothing; a new format does,
         // and the page is rebuilt once when it is shown.
-        func receiveSource(position: Double?, format: String, name: String = "Main", state: String = "running", reason: String? = nil) {
+        func receiveSource(position: Double?, format: String, name: String = "Main", state: String = "running", reason: String? = nil,
+                           duration: Double? = 10, says: String? = nil) {
             generation += 1
             let source = AddonSource(id: "main", name: name, sender: "s", formats: [], format: format, groups: nil,
-                                     transport: position.map { AddonTransport(state: "playing", position: $0, duration: 10) })
+                                     transport: position.map { AddonTransport(state: "playing", position: $0, duration: duration) })
             let addon = AddonRecord(id: "verify.hidden", manifest: nil, enabled: true, state: state, reason: reason,
-                pid: nil, message: nil, sources: [source], settings: [], actions: [], control_allowed: false, control_asked: false)
+                pid: nil, message: says.map { AddonNotice(level: "error", text: $0) }, sources: [source], settings: [], actions: [], control_allowed: false, control_asked: false)
             host.verifyReceive(AddonSnapshot(schema: 1, generation: generation, ready: true, error: nil,
                                              addons: [addon], appearances: [:], completed: []))
             controller.syncAddonSnapshotUI()
@@ -3779,10 +3780,30 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let playback = marks { receiveSource(position: 5, format: "b") }
         let moved = marks { receiveSource(position: 6, format: "b") }
         let renamed = marks { receiveSource(position: 6, format: "b", name: "Other") }
+        let noLength = marks { receiveSource(position: 6, format: "b", name: "Other", duration: nil) }
+        let length = marks { receiveSource(position: 6, format: "b", name: "Other") }
+        let said = marks { receiveSource(position: 6, format: "b", name: "Other", says: "That file could not be read.") }
         receiveSource(position: 6, format: "b", name: "Other", state: "failed", reason: "one")
         let reason = marks { receiveSource(position: 6, format: "b", name: "Other", state: "failed", reason: "two") }
-        guard noPlayback, playback, !moved, renamed, reason else {
-            throw CaptureError("Hidden Sources page: marked \(noPlayback) by playback controls going, \(playback) by them coming, \(moved) by a play position, \(renamed) by a name, \(reason) by a reason")
+        guard noPlayback, playback, !moved, renamed, noLength, length, said, reason else {
+            throw CaptureError("Hidden Sources page: marked \(noPlayback) by playback controls going, \(playback) by them coming, \(moved) by a play position, \(renamed) by a name, \(noLength) by a length going, \(length) by one coming, \(said) by a message, \(reason) by a reason")
+        }
+        // On show, the page is rebuilt at once for a reason or a message alone, and not for a
+        // play position.
+        if let sources = category("Sources") { controller.selectOptionCategory(sources) }
+        controller.verifyOptionsPage = "Sources" // the window is never put on screen
+        defer { controller.verifyOptionsPage = nil }
+        func rebuilds(_ change: () -> Void) -> Int {
+            let before = controller.verifySourcesTabRebuilds
+            change()
+            return controller.verifySourcesTabRebuilds - before
+        }
+        let shownReason = rebuilds { receiveSource(position: 6, format: "b", name: "Other", state: "failed", reason: "three") }
+        receiveSource(position: 6, format: "b", name: "Other")
+        let shownSaid = rebuilds { receiveSource(position: 6, format: "b", name: "Other", says: "That file could not be read.") }
+        let shownMoved = rebuilds { receiveSource(position: 7, format: "b", name: "Other", says: "That file could not be read.") }
+        guard shownReason == 1, shownSaid == 1, shownMoved == 0 else {
+            throw CaptureError("Sources page on show: rebuilt \(shownReason) times for a reason, \(shownSaid) for a message, \(shownMoved) for a play position")
         }
     }
 
@@ -8676,14 +8697,19 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if !optionsPageShown("Add-ons"), Self.addonsPageChanged(from: prev, to: snap), optionTabs != nil {
             pendingAddonsTabReload = true
         }
-        // What the Sources page shows of a source, its name, why it stopped and whether it has
-        // playback controls included: not its play position, which its chip refreshes.
+        // What the Sources page shows of a source, its name, why it stopped, what its add-on says
+        // and whether it has playback controls and a position slider included: not its play
+        // position, which its chip refreshes.
+        func hasSlider(_ source: AddonSource) -> Bool {
+            source.transport?.duration.map { $0.isFinite && $0 > 0 } ?? false
+        }
         let sourcesStructureChanged = !prev.addons.elementsEqual(snap.addons) { a, b in
-            a.id == b.id && a.state == b.state && a.reason == b.reason && a.sources.elementsEqual(b.sources) { s1, s2 in
-                s1.id == s2.id && s1.name == s2.name && s1.format == s2.format && s1.formats == s2.formats
-                    && s1.sender == s2.sender && s1.groups == s2.groups
-                    && (s1.transport == nil) == (s2.transport == nil)
-            }
+            a.id == b.id && a.state == b.state && a.enabled == b.enabled && a.reason == b.reason && a.message == b.message
+                && a.sources.elementsEqual(b.sources) { s1, s2 in
+                    s1.id == s2.id && s1.name == s2.name && s1.format == s2.format && s1.formats == s2.formats
+                        && s1.sender == s2.sender && s1.groups == s2.groups
+                        && (s1.transport == nil) == (s2.transport == nil) && hasSlider(s1) == hasSlider(s2)
+                }
         }
         if !optionsPageShown("Sources"), sourcesStructureChanged, optionTabs != nil {
             pendingSourcesTabRebuild = true
