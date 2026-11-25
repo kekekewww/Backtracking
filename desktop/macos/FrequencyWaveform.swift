@@ -179,10 +179,17 @@ final class FrequencyGradientPreview: NSView {
     var gradient = FrequencyGradient.standard {
         didSet { needsDisplay = true }
     }
+    /// The look the waveform is drawn with; the bar shows the gradient as it reads on that plot
+    /// (Windows `drawn_spectrum`).
+    var look: ResolvedLook = .default {
+        didSet { if look != oldValue { needsDisplay = true } }
+    }
+
+    var drawnGradient: FrequencyGradient { look.legibleSpectrum(for: gradient).gradient }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        let drawn = gradient.readableForDrawing()
+        let drawn = drawnGradient
         guard let context = NSGraphicsContext.current?.cgContext,
               let image = FrequencyWaveform.stripeImage(drawn.previewColors, fallback: 0, dimmed: false) else { return }
         context.interpolationQuality = .none

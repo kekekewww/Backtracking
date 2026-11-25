@@ -97,6 +97,12 @@ func verifyMacChannelLimit() throws {
 }
 
 @MainActor
+func verifyMacLookGradient() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyLookGradient()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -2273,6 +2279,40 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
+    /// The gradient bar on the Appearance page reads against the chosen look's plot, as the
+    /// waveform does; a window that opens with a look's gradient draws that gradient at once.
+    static func verifyLookGradient() throws {
+        // #474747 reads on black (2.3:1) but not on the window's own plot (1.9:1).
+        let light = AddonAppearance(colors: ["plot_background": "#000000", "panel_background": "#000000"],
+                                    numbers: [:], rows: [:], spectrum: [
+            AddonSpectrumStop(color: "#474747", position: 0.0),
+            AddonSpectrumStop(color: "#2c68ec", position: 1.0),
+        ])
+        let look = ResolvedLook.from(appearance: light, accentRGB: WaveformTheme.defaultAccentRGB)
+        let preview = FrequencyGradientPreview(frame: NSRect(x: 0, y: 0, width: 200, height: 16))
+        guard let offered = ResolvedLook.spectrum(from: light) else { throw CaptureError("The look's gradient did not parse") }
+        preview.gradient = offered
+        preview.look = look
+        let expected = look.legibleSpectrum(for: offered).gradient
+        guard expected == offered, offered.readableForDrawing() != offered, preview.drawnGradient == expected else {
+            throw CaptureError("The gradient bar draws \(preview.drawnGradient.stops) on the look's plot \(look.plotBackground), the waveform \(expected.stops)")
+        }
+        let saved = currentAddonSnapshot
+        defer { currentAddonSnapshot = saved }
+        currentAddonSnapshot = AddonSnapshot(schema: 1, generation: 1, ready: true, error: nil, addons: [],
+                                             appearances: ["verify.look": light], completed: [])
+        let controller = BacktrackingController()
+        controller.selectedLookAddonID = "verify.look"
+        controller.frequencyColoring = true
+        controller.frequencyGradient = .standard
+        controller.hasCustomFrequencyGradient = false
+        // What `configurePanel` gives a new window's waveform; no window is made here.
+        let opened = controller.openingWaveformGradient
+        guard opened == offered else {
+            throw CaptureError("A window opened with the look's gradient draws \(opened?.stops ?? [])")
+        }
+    }
+
     /// Hovering a group or transport chip shows what it does, and the compact transport keeps
     /// Windows' plot-width and lane-height limits.
     static func verifyChipToolTipsAndTransportLimits() throws {
@@ -2985,7 +3025,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         waveform.accentRGB = accentRGB
         waveform.stereo = stereoWaveform
         waveform.hideSilentChannels = hideSilentChannels
-        waveform.frequencyGradient = frequencyColoring ? frequencyGradient : nil
+        waveform.frequencyGradient = openingWaveformGradient
         let minimumWaveformHeight = waveform.heightAnchor.constraint(greaterThanOrEqualToConstant: fullWaveformMinimumHeight)
         minimumWaveformHeight.isActive = true
         waveformMinimumHeight = minimumWaveformHeight
@@ -4325,6 +4365,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let lookOfferer = lookSpectrumOffererName()
         let preview = FrequencyGradientPreview(frame: .zero)
         preview.gradient = activeGradient
+        preview.look = currentLook
         preview.heightAnchor.constraint(equalToConstant: 16).isActive = true
         preview.setAccessibilityElement(true)
         preview.setAccessibilityLabel("Waveform gradient from low to high frequency")
@@ -6680,6 +6721,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         return currentAddonSnapshot.addonName(for: id)
     }
 
+    /// The gradient a window's waveform starts with: the one in force, as every later change sets.
+    private var openingWaveformGradient: FrequencyGradient? {
+        frequencyColoring ? effectiveFrequencyGradient() : nil
+    }
+
     func effectiveFrequencyGradient() -> FrequencyGradient {
         if hasCustomFrequencyGradient { return frequencyGradient }
         if let fromLook = offeredLookSpectrum() { return fromLook }
@@ -6696,6 +6742,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         currentLook = nextLook
         background?.look = nextLook
         waveform?.look = nextLook
+        frequencyGradientPreview?.look = nextLook
         waveform?.frequencyGradient = frequencyColoring ? effectiveFrequencyGradient() : nil
         lookBorderWidthNote?.isHidden = nextLook.borderWidth == nil
         updateBackground()
