@@ -2452,8 +2452,25 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard expected == offered, offered.readableForDrawing() != offered, preview.drawnGradient == expected else {
             throw CaptureError("The gradient bar draws \(preview.drawnGradient.stops) on the look's plot \(look.plotBackground), the waveform \(expected.stops)")
         }
+        // A look whose plot makes a stop of the gradient in force hard to see shows the note at once.
+        let note = NSTextField(labelWithString: "")
+        let lookController = BacktrackingController()
+        lookController.frequencyIllegibleNote = note
+        lookController.hasCustomFrequencyGradient = true
+        lookController.frequencyGradient = offered
+        note.isHidden = true
         let saved = currentAddonSnapshot
         defer { currentAddonSnapshot = saved }
+        currentAddonSnapshot = AddonSnapshot(schema: 1, generation: 1, ready: true, error: nil, addons: [],
+                                             appearances: ["verify.look": light], completed: [])
+        lookController.selectedLookAddonID = "verify.look"
+        lookController.recomputeLook(refreshAppearanceTab: false)
+        let shownOnBlack = !note.isHidden
+        lookController.selectedLookAddonID = nil
+        lookController.recomputeLook(refreshAppearanceTab: false)
+        guard !shownOnBlack, !note.isHidden else {
+            throw CaptureError("The illegible-colour note shows \(shownOnBlack) on the black look and \(!note.isHidden) on the window's own plot")
+        }
         currentAddonSnapshot = AddonSnapshot(schema: 1, generation: 1, ready: true, error: nil, addons: [],
                                              appearances: ["verify.look": light], completed: [])
         let controller = BacktrackingController()
@@ -7531,6 +7548,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         background?.look = nextLook
         waveform?.look = nextLook
         frequencyGradientPreview?.look = nextLook
+        // The note under the bar follows the look the bar is drawn on.
+        frequencyIllegibleNote?.isHidden = !nextLook.legibleSpectrum(for: effectiveFrequencyGradient()).replacedAny
         waveform?.frequencyGradient = frequencyColoring ? effectiveFrequencyGradient() : nil
         lookBorderWidthNote?.isHidden = nextLook.borderWidth == nil
         updateBackground()
