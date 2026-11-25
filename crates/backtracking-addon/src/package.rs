@@ -1,5 +1,8 @@
 //! Inspect, install and build add-on packages without following package paths outside their root.
 
+#[cfg(target_os = "macos")]
+pub mod quarantine;
+
 use crate::manifest::{validate_id, validate_relative_path, Manifest};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,10 +45,14 @@ pub fn inspect(path: impl AsRef<Path>) -> Result<PackageInfo> {
 /// An invalid package is rejected before the add-ons folder is created. A failed replacement
 /// restores the old folder. A backup left by an interrupted process is not an installed add-on.
 pub fn install(package: impl AsRef<Path>, addons: impl AsRef<Path>) -> Result<PackageInfo> {
-    let mut archive = open_archive(package.as_ref())?;
+    require_extension(package.as_ref())?;
+    let file = File::open(package)?;
+    #[cfg(target_os = "macos")]
+    let quarantine = quarantine::Quarantine::read(&file)?;
+    let mut archive = ZipArchive::new(file).map_err(zip_error)?;
     let info = inspect_archive(&mut archive)?;
     let addons = addons.as_ref();
-    fs::create_dir_all(addons)?;
+    install_dir(addons, true)?;
     let addons = fs::canonicalize(addons)?;
     let _lock = OperationLock::acquire(&addons, &info.manifest.id)?;
     let target = addons.join(&info.manifest.id);
@@ -57,10 +64,10 @@ pub fn install(package: impl AsRef<Path>, addons: impl AsRef<Path>) -> Result<Pa
         let name = archive_name(&entry)?;
         let destination = stage.join(name.trim_end_matches('/'));
         if entry.is_dir() {
-            fs::create_dir_all(destination)?;
+            install_dir(&destination, true)?;
         } else {
             if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
+                install_dir(parent, true)?;
             }
             let mut output = OpenOptions::new()
                 .write(true)
@@ -71,6 +78,8 @@ pub fn install(package: impl AsRef<Path>, addons: impl AsRef<Path>) -> Result<Pa
             if copied != entry.size() || copied > MAX_UNPACKED_SIZE {
                 return Err(Error::new("Package changed while installing; its unpacked size does not match the inspected package."));
             }
+            #[cfg(target_os = "macos")]
+            quarantine.apply(&output)?;
             output.sync_all()?;
             #[cfg(unix)]
             {
@@ -81,6 +90,13 @@ pub fn install(package: impl AsRef<Path>, addons: impl AsRef<Path>) -> Result<Pa
                 }
             }
         }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let program = stage.join(&info.program);
+        let mode = fs::metadata(&program)?.permissions().mode() & 0o777;
+        fs::set_permissions(program, fs::Permissions::from_mode(mode | 0o500))?;
     }
     replace_install(&stage, &target, &addons, &info.manifest.id)?;
     cleanup.0 = PathBuf::new();
@@ -606,10 +622,20 @@ fn unused_path(parent: &Path, id: &str, purpose: &str) -> PathBuf {
     }
 }
 
+fn install_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.recursive(recursive).create(path)
+}
+
 fn create_stage(parent: &Path, id: &str) -> Result<PathBuf> {
     loop {
         let path = unused_path(parent, id, "install");
-        match fs::create_dir(&path) {
+        match install_dir(&path, false) {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -869,6 +895,20 @@ mod tests {
         assert!(install(&path, &addons).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"existing destination");
         assert_eq!(fs::read_dir(&addons).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn an_unavailable_staged_update_restores_the_old_install() {
+        let root = TestDir::new();
+        let id = "com.example.restore";
+        let target = root.0.join(id);
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("version"), "original").unwrap();
+        assert!(replace_install(&root.0.join("missing-stage"), &target, &root.0, id).is_err());
+        assert_eq!(
+            fs::read_to_string(target.join("version")).unwrap(),
+            "original"
+        );
     }
 
     #[test]

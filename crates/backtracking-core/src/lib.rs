@@ -5,6 +5,7 @@ mod fade;
 mod ffi;
 mod meter;
 mod positions;
+mod positions_ffi;
 mod preview;
 mod preview_ffi;
 mod queue;

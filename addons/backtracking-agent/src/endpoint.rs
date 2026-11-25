@@ -90,6 +90,12 @@ pub fn locate(explicit: Option<PathBuf>, program: &Path) -> PathBuf {
     if let Some(path) = beside_install(program) {
         return path;
     }
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("Library/Application Support");
+    #[cfg(not(target_os = "macos"))]
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
