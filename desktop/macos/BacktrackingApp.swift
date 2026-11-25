@@ -1965,6 +1965,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var addonEnabledChanging: [String: Bool] = [:]
     private var addonControlChanging: [String: Bool] = [:]
     private var addonNumberSteps: [NSButton: (field: NSTextField, up: Bool)] = [:]
+    /// The controls of each setting on the Add-ons page, by "addon:key".
+    private var addonSettingControls: [String: [NSControl]] = [:]
     private var addonSettingTextFields: [NSTextField: (addonID: String, key: String, label: String)] = [:]
     private var addonSettingNumberFields: [NSTextField: (addonID: String, key: String, label: String, min: Double, max: Double, step: Double)] = [:]
     private var addonTransportTimeLabels: [Int: NSTextField] = [:]
@@ -2804,13 +2806,26 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
-    /// A Number setting has − and + beside its field, a setting waiting for the add-on's answer
-    /// cannot be changed again, and a homepage holding a control character is not opened.
+    /// A Number setting has − and + beside its field. Each kind of setting, changed through its
+    /// own control, cannot be changed again until the add-on answers, and is changeable again
+    /// after. A homepage holding a control character is not opened. Ticking "Also delete its
+    /// saved data" drops the note about keeping it.
     static func verifyAddonSettingControls() throws {
         let controller = BacktrackingController()
-        let declaration = AddonSettingDeclaration(key: "gain", label: "Gain", help: nil, kind: "number",
-            defaultValue: .double(0.5), options: nil, min: 0, max: 1, step: 0.1)
-        let entry = AddonSettingEntry(declaration: declaration, value: .double(0.5))
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-settings-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        guard let host = AddonHostClient(dataRoot: scratch.path, appVersion: "0.2.1", primary: true) else {
+            throw CaptureError("AddonHostClient failed to start")
+        }
+        controller.attach(addonHost: host)
+        defer { host.shutdownAndFree(); controller.addonHost = nil }
+        let ready = ProcessInfo.processInfo.systemUptime + 3
+        while !host.snapshot.ready && ProcessInfo.processInfo.systemUptime < ready {
+            host.pollSnapshot()
+            Thread.sleep(forTimeInterval: 0.01)
+        }
         func controls(_ view: NSView) -> [NSControl] {
             // Labels are text fields too; only what the user can change counts.
             let own = (view as? NSControl).flatMap { control -> NSControl? in
@@ -2819,15 +2834,62 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             }
             return (own.map { [$0] } ?? []) + view.subviews.flatMap(controls)
         }
-        let idle = controls(controller.makeAddonSettingView(addonID: "verify.settings", entry: entry))
-        let steps = idle.compactMap { ($0 as? NSButton)?.title }.filter { $0 == "−" || $0 == "+" }
-        controller.addonSettingDrafts["verify.settings:gain"] = .double(0.6)
-        let waiting = controls(controller.makeAddonSettingView(addonID: "verify.settings", entry: entry))
-        let link = AddonFormatting.linkIsOpenable
-        guard steps == ["−", "+"], idle.allSatisfy(\.isEnabled), !waiting.isEmpty, waiting.allSatisfy({ !$0.isEnabled }),
-              !link("https://example.com/\u{7}a"), !link("https://example.com/a\u{85}"), link("https://example.com/it's") else {
-            throw CaptureError("Number steps \(steps), enabled while idle \(idle.map(\.isEnabled)), while waiting \(waiting.map(\.isEnabled)), control-character link refused \(!link("https://example.com/\u{7}a"))")
+        func declaration(_ kind: String, _ key: String) -> AddonSettingEntry {
+            switch kind {
+            case "number":
+                return AddonSettingEntry(declaration: AddonSettingDeclaration(key: key, label: "Gain", help: nil, kind: kind,
+                    defaultValue: .double(0.5), options: nil, min: 0, max: 1, step: 0.1), value: .double(0.5))
+            case "choice":
+                return AddonSettingEntry(declaration: AddonSettingDeclaration(key: key, label: "Mode", help: nil, kind: kind,
+                    defaultValue: .string("a"), options: [AddonChoiceOption(value: "a", label: "A"), AddonChoiceOption(value: "b", label: "B")],
+                    min: nil, max: nil, step: nil), value: .string("a"))
+            default:
+                return AddonSettingEntry(declaration: AddonSettingDeclaration(key: key, label: "Loud", help: nil, kind: kind,
+                    defaultValue: .bool(false), options: nil, min: nil, max: nil, step: nil), value: .bool(false))
+            }
         }
+        var problems: [String] = []
+        var steps: [String] = []
+        for kind in ["number", "toggle", "choice"] {
+            let entry = declaration(kind, "k-\(kind)")
+            let page = controls(controller.makeAddonSettingView(addonID: "verify.settings", entry: entry))
+            if kind == "number" { steps = page.compactMap { ($0 as? NSButton)?.title }.filter { $0 == "−" || $0 == "+" } }
+            let reloadsBefore = controller.verifyAddonsTabReloads
+            switch kind {
+            case "number":
+                guard let plus = page.compactMap({ $0 as? NSButton }).first(where: { $0.title == "+" }) else { continue }
+                controller.addonSettingNumberStep(plus)
+            case "toggle":
+                guard let check = page.compactMap({ $0 as? NSButton }).first else { continue }
+                check.state = .on
+                controller.addonSettingToggleChanged(check)
+            default:
+                guard let popup = page.compactMap({ $0 as? NSPopUpButton }).first else { continue }
+                popup.selectItem(at: 1)
+                controller.addonSettingChoiceChanged(popup)
+            }
+            let rebuilt = controls(controller.makeAddonSettingView(addonID: "verify.settings", entry: entry))
+            if page.isEmpty || page.contains(where: \.isEnabled) || rebuilt.contains(where: \.isEnabled)
+                || controller.verifyAddonsTabReloads == reloadsBefore {
+                problems.append("\(kind) stays changeable while waiting (page \(page.map(\.isEnabled)), rebuilt \(rebuilt.map(\.isEnabled)))")
+            }
+            // The add-on manager answers (here: there is no such add-on); the setting can be changed again.
+            let deadline = ProcessInfo.processInfo.systemUptime + 3
+            while controller.addonSettingDrafts["verify.settings:k-\(kind)"] != nil && ProcessInfo.processInfo.systemUptime < deadline {
+                host.pollSnapshot()
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            let answered = controls(controller.makeAddonSettingView(addonID: "verify.settings", entry: entry))
+            if answered.isEmpty || !answered.allSatisfy(\.isEnabled) {
+                problems.append("\(kind) is not changeable after the answer (\(answered.map(\.isEnabled)))")
+            }
+        }
+        if steps != ["−", "+"] { problems.append("Number steps \(steps)") }
+        let link = AddonFormatting.linkIsOpenable
+        if link("https://example.com/\u{7}a") || link("https://example.com/a\u{85}") || !link("https://example.com/it's") {
+            problems.append("link checks")
+        }
+        guard problems.isEmpty else { throw CaptureError("Add-on settings: " + problems.joined(separator: "; ")) }
     }
 
     /// An add-on's `select` is answered once the selection's audio is frozen, not before.
@@ -7559,6 +7621,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         addonSettingTextFields.removeAll()
         addonSettingNumberFields.removeAll()
         addonNumberSteps.removeAll()
+        addonSettingControls.removeAll()
         guard addonHost != nil else {
             return optionsTab("Add-ons", groups: [
                 optionGroup(nil, rows: [optionNote("Add-ons are not available in this window.")])
@@ -7855,6 +7918,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             let on = current.boolValue ?? decl.defaultValue.boolValue ?? false
             check.state = on ? .on : .off
             check.isEnabled = !pending
+            addonSettingControls[draftKey, default: []].append(check)
             check.identifier = NSUserInterfaceItemIdentifier("addon-toggle:\(addonID):\(decl.key):\(decl.label)")
             if below.isEmpty { return check }
             return optionsStack([check] + below, spacing: 4)
@@ -7876,6 +7940,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             }
             if !opts.isEmpty { popup.selectItem(at: selectedIdx) }
             popup.isEnabled = !pending
+            addonSettingControls[draftKey, default: []].append(popup)
             return optionField(decl.label, popup, below: below)
 
         case "number":
@@ -7900,6 +7965,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             up.isEnabled = !pending && val < maxV
             addonNumberSteps[down] = (field, false)
             addonNumberSteps[up] = (field, true)
+            addonSettingControls[draftKey, default: []] += [down, field, up]
             field.widthAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
             let row = NSStackView(views: [down, field, up])
             row.orientation = .horizontal
@@ -7912,6 +7978,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             field.target = self
             field.action = #selector(addonSettingTextChanged(_:))
             field.isEnabled = !pending
+            addonSettingControls[draftKey, default: []].append(field)
             addonSettingTextFields[field] = (addonID, decl.key, decl.label)
             return optionField(decl.label, field, below: below)
         }
@@ -8061,6 +8128,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let slot = "\(id):\(key)"
         addonProblems.removeValue(forKey: slot)
         addonSettingDrafts[slot] = value
+        // Until the add-on answers, the setting shows the value asked for and cannot be changed again.
+        for control in addonSettingControls[slot] ?? [] { control.isEnabled = false }
+        reloadAddonsTab()
         host.setSetting(id: id, key: key, value: value) { [weak self] result in
             guard let self else { return }
             self.addonSettingDrafts.removeValue(forKey: slot)
