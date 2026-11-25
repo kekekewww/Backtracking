@@ -168,6 +168,10 @@ enum BacktrackingApp {
             fputs("Backtracking test copy could not start: this window was opened by a test copy, but \(TestCopyConfig.instanceVariable) did not reach it.\n", stderr)
             exit(2)
         }
+        if config.isTestCopy, let refusal = TestCopyConfig.productionBundleRefusal(bundleID: Bundle.main.bundleIdentifier) {
+            fputs("Backtracking test copy could not start: \(refusal)\n", stderr)
+            exit(2)
+        }
         if config.isTestCopy || config.invalidInstanceName {
             guard config.validateAndAcquireLock(primary: primary) else { return }
             // A test copy neither restores nor keeps window state. Registered defaults live only in
@@ -2591,6 +2595,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
               child.isTestCopy, child.dataDirectory?.path == scratch.resolvingSymlinksInPath().path,
               child.language == .zhHant else {
             throw CaptureError("A test copy's new capture window would not be the same test copy: \(launch)")
+        }
+        // A test copy never runs from a bundle with the installed app's identifier; a copy made by
+        // make-test-copy.sh, and this unbundled verification, are not refused.
+        guard TestCopyConfig.productionBundleRefusal(bundleID: "com.backtracking.audio.capture") != nil,
+              TestCopyConfig.productionBundleRefusal(bundleID: "com.backtracking.audio.capture.testcopy.verify") == nil,
+              TestCopyConfig.productionBundleRefusal(bundleID: Bundle.main.bundleIdentifier) == nil else {
+            throw CaptureError("A test copy would run from the installed app's bundle identifier")
         }
         // A data folder inside the user's real settings or recordings is refused like the folders themselves.
         let fakeHome = scratch.appendingPathComponent("home", isDirectory: true)

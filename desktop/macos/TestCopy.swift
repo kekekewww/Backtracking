@@ -41,6 +41,18 @@ final class TestCopyConfig: @unchecked Sendable {
         environment.filter { key, _ in key.hasPrefix("BACKTRACKING_TEST_") || key == localAppDataVariable }
     }
 
+    static let productionBundleID = "com.backtracking.audio.capture"
+    static let testCopyBundlePrefix = "com.backtracking.audio.capture.testcopy."
+
+    /// Why a test copy cannot run from a bundle carrying the installed app's identifier, or nil.
+    /// AppKit keeps panel, window and restore state under the bundle identifier, outside what
+    /// `PreferencesStore` isolates, so a test copy runs only from a copy made by
+    /// `desktop/macos/make-test-copy.sh`, which gives it its own identifier.
+    static func productionBundleRefusal(bundleID: String?) -> String? {
+        guard bundleID == productionBundleID else { return nil }
+        return "it runs from the installed app's bundle (\(productionBundleID)), whose preferences it would share. Make a test copy with desktop/macos/make-test-copy.sh and start that instead."
+    }
+
     /// Whether a launch marked as opened by a test copy has to stop because it is not one.
     static func refusesUnisolatedLaunch(arguments: [String], isTestCopy: Bool) -> Bool {
         arguments.contains(testCopyLaunchArgument) && !isTestCopy

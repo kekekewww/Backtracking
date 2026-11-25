@@ -295,3 +295,4 @@ xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library -D BACKTRACKING_CAP
   -framework AppKit -framework AudioToolbox -framework CoreAudio -framework AVFoundation \
   -framework ServiceManagement -framework Carbon -framework CoreGraphics -o "$scratch/verify"
 "$scratch/verify"
+bash "$source_dir/tests/make-test-copy-tests.sh"
