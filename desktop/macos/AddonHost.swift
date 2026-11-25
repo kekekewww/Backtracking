@@ -1519,7 +1519,9 @@ enum AddonFormatting {
         link.hasPrefix("https://")
             && link.count > "https://".count
             && link.count <= 2048
-            && !link.contains(where: { $0.isWhitespace || $0.isNewline || $0 == "\"" })
+            && !link.unicodeScalars.contains(where: {
+                CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) || $0 == "\""
+            })
     }
 
     static func clock(_ seconds: Double) -> String {

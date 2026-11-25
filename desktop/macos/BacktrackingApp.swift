@@ -121,6 +121,12 @@ func verifyMacFrequencyRows() throws {
 }
 
 @MainActor
+func verifyMacAddonSettingControls() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyAddonSettingControls()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -1835,6 +1841,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var addonSourceProblems: [String: String] = [:]
     private var addonBusyRequests: Int = 0
     private var addonSettingDrafts: [String: AddonJSONValue] = [:]
+    /// Enabled and control switches whose change the manager has not answered yet, with the value asked for.
+    private var addonEnabledChanging: [String: Bool] = [:]
+    private var addonControlChanging: [String: Bool] = [:]
+    private var addonNumberSteps: [NSButton: (field: NSTextField, up: Bool)] = [:]
     private var addonSettingTextFields: [NSTextField: (addonID: String, key: String, label: String)] = [:]
     private var addonSettingNumberFields: [NSTextField: (addonID: String, key: String, label: String, min: Double, max: Double, step: Double)] = [:]
     private var addonTransportTimeLabels: [Int: NSTextField] = [:]
@@ -2459,6 +2469,32 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let expected = after.map { row in before.firstIndex(of: row) }
         guard before != after, mapped == expected, !mapped.contains(where: { $0 == nil }) else {
             throw CaptureError("Rows after a silent channel hid map to \(mapped), expected \(expected)")
+        }
+    }
+
+    /// A Number setting has − and + beside its field, a setting waiting for the add-on's answer
+    /// cannot be changed again, and a homepage holding a control character is not opened.
+    static func verifyAddonSettingControls() throws {
+        let controller = BacktrackingController()
+        let declaration = AddonSettingDeclaration(key: "gain", label: "Gain", help: nil, kind: "number",
+            defaultValue: .double(0.5), options: nil, min: 0, max: 1, step: 0.1)
+        let entry = AddonSettingEntry(declaration: declaration, value: .double(0.5))
+        func controls(_ view: NSView) -> [NSControl] {
+            // Labels are text fields too; only what the user can change counts.
+            let own = (view as? NSControl).flatMap { control -> NSControl? in
+                if let text = control as? NSTextField, !text.isEditable { return nil }
+                return control
+            }
+            return (own.map { [$0] } ?? []) + view.subviews.flatMap(controls)
+        }
+        let idle = controls(controller.makeAddonSettingView(addonID: "verify.settings", entry: entry))
+        let steps = idle.compactMap { ($0 as? NSButton)?.title }.filter { $0 == "−" || $0 == "+" }
+        controller.addonSettingDrafts["verify.settings:gain"] = .double(0.6)
+        let waiting = controls(controller.makeAddonSettingView(addonID: "verify.settings", entry: entry))
+        let link = AddonFormatting.linkIsOpenable
+        guard steps == ["−", "+"], idle.allSatisfy(\.isEnabled), !waiting.isEmpty, waiting.allSatisfy({ !$0.isEnabled }),
+              !link("https://example.com/\u{7}a"), !link("https://example.com/a\u{85}"), link("https://example.com/it's") else {
+            throw CaptureError("Number steps \(steps), enabled while idle \(idle.map(\.isEnabled)), while waiting \(waiting.map(\.isEnabled)), control-character link refused \(!link("https://example.com/\u{7}a"))")
         }
     }
 
@@ -7076,6 +7112,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private func makeAddonsTab() -> NSTabViewItem {
         addonSettingTextFields.removeAll()
         addonSettingNumberFields.removeAll()
+        addonNumberSteps.removeAll()
         guard addonHost != nil else {
             return optionsTab("Add-ons", groups: [
                 optionGroup(nil, rows: [optionNote("Add-ons are not available in this window.")])
@@ -7242,8 +7279,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
 
         let enabledCheck = NSButton(checkboxWithTitle: "Enabled", target: self, action: #selector(addonEnabledChanged(_:)))
-        enabledCheck.state = addon.enabled ? .on : .off
-        enabledCheck.isEnabled = !addon.isBroken
+        // While a change waits for its answer the switch shows it and cannot be changed again (Windows `addons_page`).
+        enabledCheck.state = (addonEnabledChanging[addon.id] ?? addon.enabled) ? .on : .off
+        enabledCheck.isEnabled = !addon.isBroken && addonEnabledChanging[addon.id] == nil
         enabledCheck.identifier = NSUserInterfaceItemIdentifier("addon-enabled:\(addon.id)")
         var headerButtons: [NSButton] = [enabledCheck]
         if addon.canStartAgain {
@@ -7265,7 +7303,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 checkboxWithTitle: "Let this add-on control Backtracking (start and pause recording, select, save files, change sources)",
                 target: self, action: #selector(addonControlAllowedChanged(_:))
             )
-            controlCheck.state = addon.control_allowed ? .on : .off
+            controlCheck.state = (addonControlChanging[addon.id] ?? addon.control_allowed) ? .on : .off
+            controlCheck.isEnabled = addonControlChanging[addon.id] == nil && addonRemoval?.id != addon.id
             controlCheck.identifier = NSUserInterfaceItemIdentifier("addon-control:\(addon.id)")
             rows.append(controlCheck)
             if addon.control_asked && !addon.control_allowed {
@@ -7325,7 +7364,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             delCheck.state = rem.deleteData ? .on : .off
             delCheck.isEnabled = !rem.busy
             rows.append(delCheck)
-            rows.append(optionNote("Unless you delete it, its saved data stays for a later install."))
+            if !rem.deleteData {
+                rows.append(optionNote("Unless you delete it, its saved data stays for a later install."))
+            }
             if let err = rem.error {
                 let eLbl = optionNote(err)
                 eLbl.textColor = WaveformTheme.statusUnavailable
@@ -7351,6 +7392,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let decl = entry.declaration
         let draftKey = "\(addonID):\(decl.key)"
         let current = addonSettingDrafts[draftKey] ?? entry.value
+        // A change the add-on has not answered yet cannot be changed again (Windows `add_enabled_ui(!pending)`).
+        let pending = addonSettingDrafts[draftKey] != nil
         var below: [NSView] = []
         if let help = decl.help, !help.isEmpty {
             below.append(optionNote(help))
@@ -7365,6 +7408,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             let check = NSButton(checkboxWithTitle: decl.label, target: self, action: #selector(addonSettingToggleChanged(_:)))
             let on = current.boolValue ?? decl.defaultValue.boolValue ?? false
             check.state = on ? .on : .off
+            check.isEnabled = !pending
             check.identifier = NSUserInterfaceItemIdentifier("addon-toggle:\(addonID):\(decl.key):\(decl.label)")
             if below.isEmpty { return check }
             return optionsStack([check] + below, spacing: 4)
@@ -7385,6 +7429,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 if opt.value == wanted { selectedIdx = idx }
             }
             if !opts.isEmpty { popup.selectItem(at: selectedIdx) }
+            popup.isEnabled = !pending
             return optionField(decl.label, popup, below: below)
 
         case "number":
@@ -7400,14 +7445,27 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             let field = NSTextField(string: formatted)
             field.target = self
             field.action = #selector(addonSettingNumberChanged(_:))
+            field.isEnabled = !pending
             addonSettingNumberFields[field] = (addonID, decl.key, decl.label, minV, maxV, stepV)
-            return optionField(decl.label, field, below: below)
+            // − and + move one step, as on Windows.
+            let down = NSButton(title: "−", target: self, action: #selector(addonSettingNumberStep(_:)))
+            let up = NSButton(title: "+", target: self, action: #selector(addonSettingNumberStep(_:)))
+            down.isEnabled = !pending && val > minV
+            up.isEnabled = !pending && val < maxV
+            addonNumberSteps[down] = (field, false)
+            addonNumberSteps[up] = (field, true)
+            field.widthAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
+            let row = NSStackView(views: [down, field, up])
+            row.orientation = .horizontal
+            row.spacing = 4
+            return optionField(decl.label, row, below: below)
 
         default: // "text"
             let val = current.stringValue ?? decl.defaultValue.stringValue ?? ""
             let field = NSTextField(string: val)
             field.target = self
             field.action = #selector(addonSettingTextChanged(_:))
+            field.isEnabled = !pending
             addonSettingTextFields[field] = (addonID, decl.key, decl.label)
             return optionField(decl.label, field, below: below)
         }
@@ -7476,11 +7534,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let id = String(raw.dropFirst("addon-enabled:".count))
         let on = sender.state == .on
         addonProblems.removeValue(forKey: "\(id):")
+        addonEnabledChanging[id] = on
+        sender.isEnabled = false
         host.setEnabled(id: id, enabled: on) { [weak self] result in
+            self?.addonEnabledChanging.removeValue(forKey: id)
             if case .failure(let reason) = result {
                 self?.addonProblems["\(id):"] = on ? "Could not turn it on: \(reason)" : "Could not turn it off: \(reason)"
-                self?.reloadAddonsTab()
             }
+            self?.reloadAddonsTab()
         }
     }
 
@@ -7489,11 +7550,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let id = String(raw.dropFirst("addon-control:".count))
         let on = sender.state == .on
         addonProblems.removeValue(forKey: "\(id):control:")
+        addonControlChanging[id] = on
+        sender.isEnabled = false
         host.setControlAllowed(id: id, allowed: on) { [weak self] result in
+            self?.addonControlChanging.removeValue(forKey: id)
             if case .failure(let reason) = result {
                 self?.addonProblems["\(id):control:"] = on ? "Could not turn it on: \(reason)" : "Could not turn it off: \(reason)"
-                self?.reloadAddonsTab()
             }
+            self?.reloadAddonsTab()
         }
     }
 
@@ -7530,6 +7594,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard let info = addonSettingNumberFields[sender], let host = addonHost else { return }
         let parsed = Double(sender.stringValue.trimmingCharacters(in: .whitespaces)) ?? info.min
         let json = AddonJSONValue.snappedNumber(parsed, min: info.min, max: info.max, step: info.step)
+        submitAddonSetting(host: host, id: info.addonID, key: info.key, label: info.label, value: json)
+    }
+
+    @objc private func addonSettingNumberStep(_ sender: NSButton) {
+        guard let (field, up) = addonNumberSteps[sender], let info = addonSettingNumberFields[field],
+              let host = addonHost else { return }
+        let shown = Double(field.stringValue.trimmingCharacters(in: .whitespaces)) ?? info.min
+        let json = AddonJSONValue.snappedNumber(shown + (up ? info.step : -info.step), min: info.min, max: info.max, step: info.step)
         submitAddonSetting(host: host, id: info.addonID, key: info.key, label: info.label, value: json)
     }
 
