@@ -181,6 +181,12 @@ func verifyMacOptionsRebuild(step: String) throws {
 }
 
 @MainActor
+func verifyMacHiddenPagesCatchUp() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyHiddenPagesCatchUp()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -3399,6 +3405,56 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
+    /// A change that arrives while the Add-ons page is not on show (another category, or Options
+    /// closed) rebuilds it exactly once when it is shown again. The window is made, never shown.
+    static func verifyHiddenPagesCatchUp() throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-catchup-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        guard let host = AddonHostClient(dataRoot: scratch.path, appVersion: "0.2.1", primary: true) else {
+            throw CaptureError("AddonHostClient failed to start")
+        }
+        controller.attach(addonHost: host)
+        defer { host.shutdownAndFree(); controller.addonHost = nil }
+        var generation: UInt64 = 7_000
+        func receive(_ enabled: Bool) {
+            generation += 1
+            let addon = AddonRecord(id: "verify.hidden", manifest: nil, enabled: enabled, state: "stopped", reason: nil,
+                pid: nil, message: nil, sources: [], settings: [], actions: [], control_allowed: false, control_asked: false)
+            host.verifyReceive(AddonSnapshot(schema: 1, generation: generation, ready: true, error: nil,
+                                             addons: [addon], appearances: [:], completed: []))
+            controller.syncAddonSnapshotUI()
+        }
+        receive(false)
+        let window = controller.makeOptionsPanel()
+        controller.optionsPanel = window
+        defer { controller.optionsPanel = nil; window.close() }
+        func category(_ label: String) -> NSButton? { controller.optionCategoryButtons.first { $0.title == label } }
+        guard let addons = category("Add-ons"), let export = category("Export") else { throw CaptureError("No Options categories") }
+        controller.selectOptionCategory(export)
+        controller.verifyAddonsTabReloads = 0
+        // Another category is on show while the change comes.
+        controller.verifyOptionsPage = "Export"
+        receive(true)
+        let hidden = controller.verifyAddonsTabReloads
+        controller.verifyOptionsPage = nil
+        controller.selectOptionCategory(addons)
+        let shown = controller.verifyAddonsTabReloads
+        controller.selectOptionCategory(export)
+        controller.selectOptionCategory(addons)
+        let again = controller.verifyAddonsTabReloads
+        // Options closed (the window is not on screen) while the change comes; opening shows it.
+        receive(false)
+        let closed = controller.verifyAddonsTabReloads
+        controller.catchUpOptionsPage()
+        let reopened = controller.verifyAddonsTabReloads
+        guard hidden == 0, shown == 1, again == 1, closed == 1, reopened == 2, !controller.pendingAddonsTabReload else {
+            throw CaptureError("Hidden Add-ons page reloads: hidden \(hidden), shown \(shown), again \(again), closed \(closed), reopened \(reopened)")
+        }
+    }
+
     /// N1: the Add-ons page holds a Text setting being typed into; the page is rebuilt, then the
     /// user picks another category. The Options window is made but never put on screen. Run in a
     /// child process that exits with status 11 on a crash instead of leaving a crash report.
@@ -4365,6 +4421,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         window.isFloatingPanel = alwaysOnTop
         window.level = alwaysOnTop ? .floating : .normal
+        catchUpOptionsPage()
         refreshSourceOptions()
         refreshSnapshotTargets()
         refreshShortcutPermission()
@@ -4505,6 +4562,20 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         optionCategory = sender.tag
         optionTabs?.selectTabViewItem(at: optionCategory)
         for button in optionCategoryButtons { button.state = button === sender ? .on : .off }
+        catchUpOptionsPage()
+    }
+
+    /// The page about to be seen shows the latest snapshot: a rebuild put off while it was hidden
+    /// is done now.
+    private func catchUpOptionsPage() {
+        guard let label = optionTabs?.selectedTabViewItem?.label else { return }
+        if label == "Add-ons", pendingAddonsTabReload {
+            pendingAddonsTabReload = false
+            reloadAddonsTab()
+        } else if label == "Sources", pendingSourcesTabRebuild {
+            pendingSourcesTabRebuild = false
+            rebuildSourcesTab()
+        }
     }
 
     private func makeActionTab() -> NSTabViewItem {
@@ -7892,21 +7963,18 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             }
         }
         if pendingSourcesTabRebuild {
-            // The Sources page's File name fields wait for typing to end too.
-            if !optionsPageShown("Sources") {
-                pendingSourcesTabRebuild = false
-            } else if !userIsHandlingControls && !editingOptionsText {
+            // The Sources page's File name fields wait for typing to end too. A page not on show
+            // keeps its flag and is rebuilt when it is shown (catchUpOptionsPage).
+            if optionsPageShown("Sources") && !userIsHandlingControls && !editingOptionsText {
                 pendingSourcesTabRebuild = false
                 rebuildSourcesTab()
                 sourcesRebuilt = true
             }
         }
         if pendingAddonsTabReload {
-            // A page no longer on show is built afresh when it next shows; one being typed into
-            // waits until the typing ends.
-            if !optionsPageShown("Add-ons") {
-                pendingAddonsTabReload = false
-            } else if !userIsHandlingControls && !editingOptionsText {
+            // One being typed into waits until the typing ends; one not on show keeps its flag
+            // and is rebuilt when it is shown (catchUpOptionsPage).
+            if optionsPageShown("Add-ons") && !userIsHandlingControls && !editingOptionsText {
                 pendingAddonsTabReload = false
                 reloadAddonsTab()
                 addonsRebuilt = true
@@ -7934,6 +8002,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 if tap?.refreshSources() == true { reconnectConfiguredSources() }
             }
             refreshWaveform()
+        }
+        // Pages not on show are rebuilt when they are next shown.
+        if !optionsPageShown("Add-ons"), Self.addonsPageChanged(from: prev, to: snap), optionTabs != nil {
+            pendingAddonsTabReload = true
+        }
+        if !optionsPageShown("Sources"), sourcesChanged, optionTabs != nil {
+            pendingSourcesTabRebuild = true
         }
         if optionsPageShown("Add-ons") || optionsPageShown("Sources") {
             if optionsPageShown("Add-ons") {
