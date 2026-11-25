@@ -818,6 +818,7 @@ struct Worker {
     root: PathBuf,
     primary_lease: startup::PrimaryLease,
     remove_package: fn(&Path, &str) -> backtracking_addon::Result<()>,
+    save_preferences: fn(&Path, &SavedState) -> Result<(), String>,
     host: Host,
     shared: Arc<Shared>,
     entries: BTreeMap<String, Entry>,
@@ -859,6 +860,7 @@ impl Worker {
             root,
             primary_lease,
             remove_package: |addons, id| package::remove(addons, id),
+            save_preferences: write_saved,
             host,
             shared,
             entries,
@@ -974,7 +976,8 @@ impl Worker {
             Command::Remove(id, delete_data, reply) => {
                 let result = self
                     .available(&id)
-                    .and_then(|()| validate_id(&id).map_err(|e| e.to_string()));
+                    .and_then(|()| validate_id(&id).map_err(|e| e.to_string()))
+                    .and_then(|()| self.forget_installation_grant(&id));
                 if let Err(reason) = result {
                     let _ = reply.send(Err(reason));
                 } else {
@@ -1232,9 +1235,30 @@ impl Worker {
     }
 
     fn store(&mut self, saved: SavedState) -> Result<(), String> {
-        write_saved(&self.root, &saved)?;
+        (self.save_preferences)(&self.root, &saved)?;
         self.saved = saved;
         Ok(())
+    }
+
+    /// The permission belongs to this installation. Finish revocation on disk before
+    /// the package worker can remove it or publish fresh code under an orphaned id.
+    fn forget_installation_grant(&mut self, id: &str) -> Result<(), String> {
+        // Startup can fall back to an empty in-memory snapshot on a read error.
+        // Check the persisted choice before treating an absent grant as revoked.
+        let mut persisted = read_saved(&self.root)?;
+        if let Some(addon) = persisted.addons.get_mut(id).filter(|a| a.control) {
+            addon.control = false;
+            self.store(persisted)?;
+        } else if let Some(addon) = self.saved.addons.get_mut(id) {
+            addon.control = false;
+        }
+        self.set_control_access(id, false);
+        // write_saved syncs the temporary file and renames it. Sync the directory
+        // entry as well, including on retry after a previous directory sync error.
+        self.primary_lease
+            .directory
+            .sync_all()
+            .map_err(|e| format!("Cannot sync add-on preferences: {e}"))
     }
 
     fn start(&mut self, id: &str) -> Result<(), String> {
@@ -1738,6 +1762,13 @@ impl Worker {
                         ));
                         continue;
                     }
+                    if !self.entries.contains_key(&id) {
+                        // Older hosts may have removed the package before saving revocation.
+                        if let Err(error) = self.forget_installation_grant(&id) {
+                            let _ = inspection.reply.send(Err(error));
+                            continue;
+                        }
+                    }
                     let restart = self
                         .entries
                         .get(&id)
@@ -1908,7 +1939,7 @@ impl Worker {
                     }
                     Ok(Err(reason)) => {
                         // A failed package transaction may leave only its private backup.
-                        // Keep this entry and its preferences so the handle can retry.
+                        // Keep its entry and settings for retry. Its grant stays revoked.
                         let _ = reply.send(Err(reason));
                     }
                     Err(mpsc::TryRecvError::Empty) => self.operations.push(Operation::Remove {
@@ -2558,6 +2589,7 @@ mod tests {
             std::io::Error::from_raw_os_error(libc::EIO).to_string()
         );
         assert!(handle.snapshot().addon(id).is_some());
+        saved.addons.get_mut(id).unwrap().control = false;
         assert_eq!(read_saved(&dir.0).unwrap(), saved);
         assert!(backup.is_dir() && data.join("keep").is_file() && !target.exists());
 
@@ -3599,63 +3631,234 @@ mod tests {
         assert!(handle.take_control_calls().is_empty());
     }
 
-    #[test]
-    fn the_control_choice_survives_a_restart_and_is_forgotten_on_removal() {
-        let dir = TestDir::new();
-        let folder = dir.0.join("package");
+    fn control_package(root: &Path, version: &str) -> PathBuf {
+        let folder = root.join(version);
         fs::create_dir(&folder).unwrap();
         let mut manifest = info(vec![Capability::Control]).manifest.unwrap();
         manifest.id = "com.example.control".into();
+        manifest.version = version.into();
         fs::write(
             folder.join("addon.json"),
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
-        fs::write(folder.join("test.exe"), b"package fixture").unwrap();
-        let path = dir.0.join("control.btaddon");
-        package::pack(&folder, &path).unwrap();
-        package::install(&path, dir.0.join("addons")).unwrap();
-        let id = "com.example.control";
-        let allowed = |manager: &AddonManager| {
-            manager
+        fs::write(folder.join("test.exe"), version).unwrap();
+        let path = root.join(format!("{version}.btaddon"));
+        package::pack(folder, &path).unwrap();
+        path
+    }
+
+    fn reviewed_install(handle: &AddonHandle, path: &Path) -> PackageInfo {
+        let review = handle
+            .inspect(path.to_owned())
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        handle
+            .install(path.to_owned(), review.identity)
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn wait_for_grant(manager: &AddonManager, wanted: Option<bool>) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let grant = manager
                 .handle()
                 .snapshot()
-                .addon(id)
-                .map(|addon| addon.control_allowed)
-        };
-        let wait_for = |manager: &AddonManager, wanted: Option<bool>| {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while allowed(manager) != wanted && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(10));
+                .addon("com.example.control")
+                .map(|a| a.control_allowed);
+            if grant == wanted {
+                return;
             }
-            assert_eq!(allowed(manager), wanted);
-        };
+            assert!(
+                Instant::now() < deadline,
+                "expected {wanted:?}, found {grant:?}"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
 
+    #[test]
+    fn the_control_choice_survives_a_restart_and_is_forgotten_on_removal() {
+        let dir = TestDir::new();
+        let id = "com.example.control";
+        let path = control_package(&dir.0, "1.0");
+        let addons = dir.0.join("addons");
+        package::install(&path, &addons).unwrap();
         let manager = AddonManager::new(dir.0.clone(), "test").unwrap();
-        wait_for(&manager, Some(false));
+        wait_for_grant(&manager, Some(false));
         manager
             .handle()
             .set_control_allowed(id, true)
             .recv_timeout(Duration::from_secs(3))
             .unwrap()
             .unwrap();
-        wait_for(&manager, Some(true));
         drop(manager);
-
         let manager = AddonManager::new(dir.0.clone(), "test").unwrap();
-        wait_for(&manager, Some(true));
+        wait_for_grant(&manager, Some(true));
         manager
             .handle()
             .remove(id, false)
             .recv_timeout(Duration::from_secs(3))
             .unwrap()
             .unwrap();
-        wait_for(&manager, None);
+        wait_for_grant(&manager, None);
         drop(manager);
+        // A direct SDK reinstall bypasses the host's fresh-install preflight.
+        package::install(path, addons).unwrap();
+        wait_for_grant(
+            &AddonManager::new(dir.0.clone(), "test").unwrap(),
+            Some(false),
+        );
+    }
 
-        package::install(&path, dir.0.join("addons")).unwrap();
+    #[test]
+    fn grant_v4_update_preserves_grant_and_removal_resets_it_across_restart() {
+        let dir = TestDir::new();
+        let original = control_package(&dir.0, "1.0");
+        let update = control_package(&dir.0, "2.0");
+        let id = "com.example.control";
         let manager = AddonManager::new(dir.0.clone(), "test").unwrap();
-        wait_for(&manager, Some(false));
+        let handle = manager.handle();
+        reviewed_install(&handle, &original);
+        wait_for_grant(&manager, Some(false));
+        handle
+            .set_control_allowed(id, true)
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reviewed_install(&handle, &update).manifest.version, "2.0");
+        wait_for_grant(&manager, Some(true));
+        drop(manager);
+        let manager = AddonManager::new(dir.0.clone(), "test").unwrap();
+        wait_for_grant(&manager, Some(true));
+        manager
+            .handle()
+            .remove(id, false)
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        wait_for_grant(&manager, None);
+        reviewed_install(&manager.handle(), &original);
+        wait_for_grant(&manager, Some(false));
+        drop(manager);
+        wait_for_grant(
+            &AddonManager::new(dir.0.clone(), "test").unwrap(),
+            Some(false),
+        );
+    }
+
+    #[test]
+    fn grant_v4_failed_preflight_keeps_package_and_retry_revokes_before_disk_removal() {
+        let dir = TestDir::new();
+        let id = "com.example.control";
+        let addons = dir.0.join("addons");
+        package::install(control_package(&dir.0, "1.0"), &addons).unwrap();
+        let mut actor = worker(&dir.0);
+        let (send, reply) = mpsc::channel();
+        actor.command(Command::ControlAllowed(id.into(), true, send));
+        reply.recv().unwrap().unwrap();
+        actor.save_preferences = |_, _| Err("injected write failure".into());
+        let (send, reply) = mpsc::channel();
+        actor.command(Command::Remove(id.into(), true, send));
+        assert_eq!(
+            reply.try_recv().unwrap().unwrap_err(),
+            "injected write failure"
+        );
+        assert!(actor.operations.is_empty());
+        assert!(
+            actor.entries[id].info.control_allowed
+                && read_saved(&dir.0).unwrap().addons[id].control
+        );
+        assert!(addons.join(id).is_dir());
+        drop(actor);
+
+        // Stop at the boundary between durable revocation and the filesystem job.
+        let mut actor = worker(&dir.0);
+        assert!(actor.entries[id].info.control_allowed);
+        let (send, _reply) = mpsc::channel();
+        actor.command(Command::Remove(id.into(), true, send));
+        assert_eq!(actor.operations.len(), 1);
+        assert!(
+            !actor.entries[id].info.control_allowed
+                && !read_saved(&dir.0).unwrap().addons[id].control
+        );
+        assert!(addons.join(id).is_dir());
+        drop(actor);
+
+        let manager = AddonManager::new(dir.0.clone(), "test").unwrap();
+        wait_for_grant(&manager, Some(false));
+        manager
+            .handle()
+            .remove(id, true)
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert!(!addons.join(id).exists());
+        assert!(!read_saved(&dir.0).unwrap().addons.contains_key(id));
+    }
+
+    #[test]
+    fn grant_v4_final_preferences_failure_cannot_restore_grant() {
+        let dir = TestDir::new();
+        let id = "com.example.control";
+        let path = control_package(&dir.0, "1.0");
+        package::install(&path, dir.0.join("addons")).unwrap();
+        let mut actor = worker(&dir.0);
+        let (send, reply) = mpsc::channel();
+        actor.command(Command::ControlAllowed(id.into(), true, send));
+        reply.recv().unwrap().unwrap();
+        // Allow the revocation write, then fail the preference record deletion.
+        actor.save_preferences = |root, state| {
+            if state.addons.contains_key("com.example.control") {
+                write_saved(root, state)
+            } else {
+                Err("injected final write failure".into())
+            }
+        };
+        let (commands, receive) = mpsc::channel();
+        let handle = AddonHandle {
+            commands,
+            shared: actor.shared.clone(),
+        };
+        let thread = thread::spawn(move || actor.run(receive));
+        let result = handle
+            .remove(id, true)
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(result.unwrap_err(), "injected final write failure");
+        assert!(!dir.0.join("addons").join(id).exists());
+        assert!(!read_saved(&dir.0).unwrap().addons[id].control);
+        drop(handle);
+        thread.join().unwrap();
+        let manager = AddonManager::new(dir.0.clone(), "test").unwrap();
+        reviewed_install(&manager.handle(), &path);
+        wait_for_grant(&manager, Some(false));
+    }
+
+    #[test]
+    fn grant_v4_fresh_install_discards_an_orphaned_grant() {
+        let dir = TestDir::new();
+        let id = "com.example.control";
+        let mut saved = SavedState::default();
+        saved.addons.insert(
+            id.into(),
+            SavedAddon {
+                control: true,
+                settings: BTreeMap::from([("keep".into(), json!(3))]),
+                ..Default::default()
+            },
+        );
+        write_saved(&dir.0, &saved).unwrap();
+        let path = control_package(&dir.0, "1.0");
+        let manager = AddonManager::new(dir.0.clone(), "test").unwrap();
+        reviewed_install(&manager.handle(), &path);
+        wait_for_grant(&manager, Some(false));
+        let actual = &read_saved(&dir.0).unwrap().addons[id];
+        assert!(!actual.control);
+        assert_eq!(actual.settings, saved.addons[id].settings);
     }
 
     #[test]
