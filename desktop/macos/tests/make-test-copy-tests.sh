@@ -43,6 +43,33 @@ for inside in "Library/Preferences" "Library/Application Support/Backtracking" "
   [[ ! -e "$target" ]] || fail "$target was created"
 done
 if "$script" "$source_app" "$work/copies" "---" >/dev/null 2>&1; then fail "a name without letters was taken"; fi
+
+# A .. in the part that does not exist yet would land in ~/Backtracking after mkdir.
+dotted="$real_home/bt-test-copy-missing-$$/../Backtracking"
+if "$script" "$source_app" "$dotted" dotted >/dev/null 2>&1; then fail "a destination with .. was taken"; fi
+[[ ! -e "$real_home/bt-test-copy-missing-$$" && ! -e "$real_home/Backtracking/Backtracking-dotted.app" ]] || fail "the .. destination made something"
+if "$script" "$source_app" "$work/./dot" dot >/dev/null 2>&1; then fail "a destination with . was taken"; fi
+[[ ! -e "$work/dot" ]] || fail "the . destination made a folder"
+
+# The copy may not be, hold or lie in the source; the source stays whole.
+same_dir="$work/same"
+mkdir -p "$same_dir"
+ditto "$source_app" "$same_dir/Backtracking-same.app"
+source_sum="$(find "$same_dir/Backtracking-same.app" -type f -exec shasum {} + | sort | shasum)"
+if "$script" "$same_dir/Backtracking-same.app" "$same_dir" same >/dev/null 2>&1; then fail "a copy over its own source was taken"; fi
+if "$script" "$same_dir/Backtracking-same.app" "$same_dir/Backtracking-same.app/Contents" inside >/dev/null 2>&1; then fail "a copy inside its source was taken"; fi
+[[ "$(find "$same_dir/Backtracking-same.app" -type f -exec shasum {} + | sort | shasum)" == "$source_sum" ]] || fail "the source changed"
+[[ ! -e "$same_dir/Backtracking-same.app/Contents/Backtracking-inside.app" ]] || fail "a copy was made inside the source"
+
+# Something at the copy's path that is not a test copy is left alone.
+mkdir -p "$work/taken"
+ditto "$source_app" "$work/taken/Backtracking-taken.app"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.backtracking.audio.capture" "$work/taken/Backtracking-taken.app/Contents/Info.plist"
+if "$script" "$source_app" "$work/taken" taken >/dev/null 2>&1; then fail "an app that is not a test copy was replaced"; fi
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$work/taken/Backtracking-taken.app/Contents/Info.plist")" == com.backtracking.audio.capture ]] \
+  || fail "the app at the copy's path changed"
+# A test copy made earlier is replaced.
+"$script" "$source_app" "$work/copies" "Verify copy/1" >/dev/null 2>&1 || fail "an earlier test copy was not replaced"
 for id in com.backtracking.audio.capture com.backtracking.audio.capture.testcopy. other.testcopy.x "com.backtracking.audio.capture.testcopy.a b"; do
   if "$script" --clean "$id" >/dev/null 2>&1; then fail "--clean accepted $id"; fi
 done

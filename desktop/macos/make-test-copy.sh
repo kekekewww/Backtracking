@@ -41,11 +41,19 @@ raw_name="$3"
 
 [[ -d "$source_app" && -f "$source_app/Contents/Info.plist" ]] || fail "$source_app is not an app bundle."
 [[ -f "$source_app/Contents/MacOS/bt-addon-guard" ]] || fail "$source_app has no Contents/MacOS/bt-addon-guard."
+source_app="$(cd -- "$source_app" && pwd -P)"
 
 # Letters, digits and - only, as a bundle identifier part and a folder name take them.
 name="$(printf '%s' "$raw_name" | LC_ALL=C tr -c 'A-Za-z0-9-' '-' | sed -e 's/--*/-/g' -e 's/^-//' -e 's/-$//' | cut -c1-40)"
 name="${name%-}"
 [[ -n "$name" ]] || fail "The name \"$raw_name\" leaves nothing for a bundle identifier."
+
+# A . or .. in the part of the path that does not exist yet would only be resolved by mkdir,
+# after the checks below, so such a destination is refused outright.
+IFS=/ read -r -a parts <<< "$destination"
+for part in "${parts[@]}"; do
+  [[ "$part" == . || "$part" == .. ]] && fail "Give the destination without . or .. in it: $destination"
+done
 
 # Resolve the destination before anything is made there: the nearest folder that exists,
 # with symlinks resolved, and the rest of the path as given.
@@ -56,15 +64,32 @@ while [[ ! -d "$existing" ]]; do
   existing="$(dirname -- "$existing")"
 done
 destination="$(cd -- "$existing" && pwd -P)$rest"
-for real in "$real_home/Library/Preferences" "$real_home/Library/Application Support/Backtracking" "$real_home/Backtracking"; do
-  if [[ "$destination" == "$real" || "$destination" == "$real/"* ]]; then
-    fail "A test copy cannot be made inside $real, which holds the user's real settings or recordings."
-  fi
-done
+refuse_real() {
+  for real in "$real_home/Library/Preferences" "$real_home/Library/Application Support/Backtracking" "$real_home/Backtracking"; do
+    if [[ "$1" == "$real" || "$1" == "$real/"* ]]; then
+      fail "A test copy cannot be made inside $real, which holds the user's real settings or recordings."
+    fi
+  done
+}
+refuse_real "$destination"
 
-mkdir -p -- "$destination"
 id="$prefix$name"
 copy="$destination/Backtracking-$name.app"
+# The copy may not be the source, hold it, or lie inside it.
+if [[ "$copy" == "$source_app" || "$copy" == "$source_app/"* || "$source_app" == "$copy/"* ]]; then
+  fail "The test copy $copy would overlap the source $source_app."
+fi
+# Only a test copy this script made is replaced.
+if [[ -e "$copy" || -L "$copy" ]]; then
+  existing_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$copy/Contents/Info.plist" 2>/dev/null || true)"
+  [[ "$existing_id" == "$prefix"* ]] || fail "$copy exists and is not a test copy; it is left alone."
+fi
+
+mkdir -p -- "$destination"
+# Check where the folder really is now that it exists.
+real_destination="$(cd -- "$destination" && pwd -P)"
+refuse_real "$real_destination"
+[[ "$real_destination" == "$destination" ]] || fail "The destination resolved to $real_destination; give that path instead."
 rm -rf -- "$copy"
 ditto "$source_app" "$copy"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $id" "$copy/Contents/Info.plist"
