@@ -74,7 +74,7 @@ xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library -D BACKTRACKING_CAP
   -target "$swift_target" -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
   -import-objc-header "$repo_dir/crates/backtracking-core/include/backtracking.h" \
   "$source_dir/BacktrackingApp.swift" "$source_dir/SystemAudioTap.swift" "$source_dir/StartupUpdater.swift" \
-  "$source_dir/FrequencyWaveform.swift" "$source_dir/RecorderHotkeys.swift" \
+  "$source_dir/FrequencyWaveform.swift" "$source_dir/RecorderHotkeys.swift" "$source_dir/TestCopy.swift" \
   "$scratch/Verify.swift" "$target_dir/$rust_target/release/libbacktracking_core.a" \
   -framework AppKit -framework AudioToolbox -framework CoreAudio -framework AVFoundation \
   -framework ServiceManagement -framework Carbon -framework CoreGraphics -o "$scratch/verify"

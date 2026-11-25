@@ -268,7 +268,8 @@ func requestSenderSnapshot(_ id: String) -> Bool {
 @MainActor
 func availableCaptureSources(excluding privateDevices: Set<AudioObjectID>) -> [(source: CaptureSource, title: String)] {
     var choices: [(CaptureSource, String)] = []
-    if defaultDevice(kAudioHardwarePropertyDefaultOutputDevice) != nil {
+    if TestCopyConfig.current.syntheticSystemFormat != nil
+        || defaultDevice(kAudioHardwarePropertyDefaultOutputDevice) != nil {
         choices.append((.system, CaptureSource.system.label))
     }
     let inputDevices = audioObjects(kAudioHardwarePropertyDevices).filter { device in
@@ -530,6 +531,7 @@ private func nominalRate(_ device: AudioObjectID) -> Double {
 
 private enum InputIdentity: Equatable {
     case system(AudioObjectID, Double)
+    case syntheticSystem(String)
     case microphone(AudioObjectID, Double)
     case application([AudioObjectID], AudioObjectID, Double)
     case sender(String, UInt32, UInt32)
@@ -542,6 +544,9 @@ private func identity(for source: CaptureSource) -> InputIdentity? {
         return senderDescriptors(audioOnly: true).first { $0.id == id }
             .map { .sender(id, $0.sampleRate, $0.channels) }
     case .system:
+        if let spec = TestCopyConfig.current.syntheticSystemFormat {
+            return .syntheticSystem(spec)
+        }
         return defaultDevice(kAudioHardwarePropertyDefaultOutputDevice).map { .system($0, nominalRate($0)) }
     case .application(let identifier):
         let processes = processObjects(for: identifier)
@@ -587,6 +592,37 @@ private struct InputFormat {
     let center: Int?
     let mix: [(channel: Int, left: Float, right: Float)]
     let channelNames: [String]
+
+    init(syntheticChannelNames: [String], sampleRate: Double = 48_000) {
+        channels = syntheticChannelNames.count
+        self.sampleRate = sampleRate
+        planar = false
+        channelNames = syntheticChannelNames
+        left = syntheticChannelNames.firstIndex(of: "FL") ?? 0
+        right = syntheticChannelNames.firstIndex(of: "FR") ?? (channels >= 2 ? 1 : nil)
+        center = syntheticChannelNames.firstIndex(of: "FC")
+        var weights: [(Int, Float, Float)] = []
+        if channels > 2 {
+            var leftSum: Float = 1.0
+            var rightSum: Float = 1.0
+            for (index, name) in syntheticChannelNames.enumerated() where index != left && index != right {
+                let (wl, wr): (Float, Float) = switch name {
+                case "FC": (0.70710677, 0.70710677)
+                case "LFE": (0.5, 0.5)
+                case "Ls", "Lb", "TFL", "TBL": (0.70710677, 0)
+                case "Rs", "Rb", "TFR", "TBR": (0, 0.70710677)
+                default: (0.70710677, 0.70710677)
+                }
+                leftSum += wl
+                rightSum += wr
+                weights.append((index, wl, wr))
+            }
+            let norm = max(1.0, max(leftSum, rightSum))
+            mix = weights.map { ($0.0, $0.1 / norm, $0.2 / norm) }
+        } else {
+            mix = []
+        }
+    }
 
     init(senderID: String, senderChannels: UInt32, sampleRate: UInt32) {
         channels = Int(senderChannels)
@@ -811,6 +847,108 @@ private protocol NativeInput: AnyObject {
     func bind(_ producers: [LaneProducer]) throws
     func start() throws
     func stop() throws
+}
+
+private final class SyntheticSystemInput: NativeInput {
+    let format: InputFormat
+    private let width: Int
+    private let stereoOnly: Bool
+    private var producers: [LaneProducer] = []
+    private let queue = DispatchQueue(label: "Backtracking.synthetic-system", qos: .userInitiated)
+    private var timer: DispatchSourceTimer?
+    private var frameIndex: UInt64 = 0
+    private var packetTimestampNs: UInt64 = 0
+    private var running = false
+
+    static func parse(_ spec: String) -> (labels: [String], stereoOnly: Bool)? {
+        let parts = spec.split(separator: ":", maxSplits: 1)
+        guard parts.count == 2 else { return nil }
+        let activity = String(parts[1])
+        guard activity == "all" || activity == "stereo" else { return nil }
+        let labels: [String]
+        switch parts[0] {
+        case "5.1": labels = ["FL", "FR", "FC", "LFE", "Ls", "Rs"]
+        case "7.1": labels = ["FL", "FR", "FC", "LFE", "Lb", "Rb", "Ls", "Rs"]
+        case "7.1.4": labels = ["FL", "FR", "FC", "LFE", "Lb", "Rb", "Ls", "Rs", "TFL", "TFR", "TBL", "TBR"]
+        default: return nil
+        }
+        return (labels, activity == "stereo")
+    }
+
+    init(spec: String) throws {
+        guard let parsed = Self.parse(spec) else {
+            throw CaptureError("Unknown synthetic format \(spec)")
+        }
+        width = parsed.labels.count
+        stereoOnly = parsed.stereoOnly
+        format = InputFormat(syntheticChannelNames: parsed.labels, sampleRate: 48_000)
+    }
+
+    deinit {
+        try? stop()
+    }
+
+    func bind(_ producers: [LaneProducer]) throws {
+        self.producers = producers
+    }
+
+    func start() throws {
+        guard !running else { return }
+        running = true
+        packetTimestampNs = AudioConvertHostTimeToNanos(AudioGetCurrentHostTime())
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        let width = self.width
+        let stereoOnly = self.stereoOnly
+        let format = self.format
+        let producers = self.producers
+        let framesPerPacket = 480
+        var interleaved = [Float](repeating: 0, count: framesPerPacket * width)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.running else { return }
+            let startFrame = self.frameIndex
+            for f in 0..<framesPerPacket {
+                let phaseFrame = Double((startFrame + UInt64(f)) % 48_000)
+                for ch in 0..<width {
+                    let sample: Float
+                    if !stereoOnly || ch < 2 {
+                        let freq = Double(220 + 30 * ch)
+                        sample = Float(sin(2.0 * Double.pi * phaseFrame * freq / 48_000.0)) * 0.25
+                    } else {
+                        sample = 0
+                    }
+                    interleaved[f * width + ch] = sample
+                }
+            }
+            let ts = self.packetTimestampNs
+            self.frameIndex += UInt64(framesPerPacket)
+            self.packetTimestampNs &+= 10_000_000
+            interleaved.withUnsafeMutableBytes { raw in
+                var list = AudioBufferList(
+                    mNumberBuffers: 1,
+                    mBuffers: AudioBuffer(
+                        mNumberChannels: UInt32(width),
+                        mDataByteSize: UInt32(raw.count),
+                        mData: raw.baseAddress
+                    )
+                )
+                withUnsafeMutablePointer(to: &list) { ptr in
+                    let buffers = UnsafeMutableAudioBufferListPointer(ptr)
+                    for producer in producers {
+                        producer.push(buffers, format: format, frameLimit: framesPerPacket, time: ts)
+                    }
+                }
+            }
+        }
+        self.timer = timer
+        timer.resume()
+    }
+
+    func stop() throws {
+        running = false
+        timer?.cancel()
+        timer = nil
+    }
 }
 
 private final class SenderInput: NativeInput {
@@ -1086,8 +1224,11 @@ final class SystemAudioTap {
         self.slots = slots
         // A selection preview from any Backtracking is heard in System playback. Those lanes
         // record silence while it plays, so the preview never enters the history.
-        for (index, lane) in lanes.enumerated() where lane.source == .system {
-            bt_tracks_set_preview_silence(timeline.core, UInt32(index), 1)
+        // A test copy neither plays previews nor joins the shared preview gate.
+        if !TestCopyConfig.current.isTestCopy {
+            for (index, lane) in lanes.enumerated() where lane.source == .system {
+                bt_tracks_set_preview_silence(timeline.core, UInt32(index), 1)
+            }
         }
         for index in self.slots.indices { bind(index) }
     }
@@ -1104,6 +1245,8 @@ final class SystemAudioTap {
         guard lane.route == .merged || lane.route == .allChannels else { return 1 }
         let channels: Int
         switch identity(for: lane.source) {
+        case .syntheticSystem(let spec):
+            channels = SyntheticSystemInput.parse(spec)?.labels.count ?? 2
         case .sender(_, _, let count): channels = Int(count)
         case .microphone(let device, _): channels = inputChannels(device)
         case .system(let device, _), .application(_, let device, _):
@@ -1116,6 +1259,7 @@ final class SystemAudioTap {
 
     private static func makeInput(_ identity: InputIdentity?, preferNative: Bool) throws -> NativeInput? {
         switch identity {
+        case .syntheticSystem(let spec): try SyntheticSystemInput(spec: spec)
         case .system(let device, _): try PlaybackTap(processes: nil, device: device, preferNativeLayout: preferNative)
         case .application(let processes, let device, _):
             try PlaybackTap(processes: processes, device: device, preferNativeLayout: preferNative)

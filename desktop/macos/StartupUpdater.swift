@@ -155,11 +155,17 @@ private struct UpdateTransaction: Codable {
 final class StartupUpdater: NSObject {
     private enum Preference: String { case ask, automatic, manual }
     private enum Choice { case update, later, never }
-    private let defaults = UserDefaults.standard
+    private let isTestCopy: Bool
+    private var defaults: UserDefaults? { isTestCopy ? nil : .standard }
     private var busy = false
     private weak var modePopup: NSPopUpButton?
     private weak var checkButton: NSButton?
     private weak var status: NSTextField?
+
+    init(isTestCopy: Bool = false) {
+        self.isTestCopy = isTestCopy
+        super.init()
+    }
 
     private var version: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
@@ -170,9 +176,9 @@ final class StartupUpdater: NSObject {
     }
 
     private var preference: Preference {
-        get { Preference(rawValue: defaults.string(forKey: "updatePreference") ?? "") ?? .ask }
+        get { Preference(rawValue: defaults?.string(forKey: "updatePreference") ?? "") ?? .ask }
         set {
-            defaults.set(newValue.rawValue, forKey: "updatePreference")
+            defaults?.set(newValue.rawValue, forKey: "updatePreference")
             modePopup?.selectItem(at: Self.modes.firstIndex(of: newValue) ?? 0)
         }
     }
@@ -230,8 +236,8 @@ final class StartupUpdater: NSObject {
                     )
                 } catch { ready(); return }
                 ready()
-                defaults.set(receipt.notes, forKey: "lastUpdateNotes")
-                defaults.set(receipt.nextVersion, forKey: "lastUpdateVersion")
+                defaults?.set(receipt.notes, forKey: "lastUpdateNotes")
+                defaults?.set(receipt.nextVersion, forKey: "lastUpdateVersion")
                 showNotes(title: "Updated to v\(receipt.nextVersion)", notes: receipt.notes, buttons: ["OK"])
             } else {
                 ready()
@@ -251,7 +257,7 @@ final class StartupUpdater: NSObject {
         guard Self.modes.indices.contains(popup.indexOfSelectedItem) else { return }
         preference = Self.modes[popup.indexOfSelectedItem]
         // A new choice forgets the version that was skipped, as on Windows.
-        defaults.removeObject(forKey: "skippedUpdateVersion")
+        defaults?.removeObject(forKey: "skippedUpdateVersion")
     }
 
     @objc private func checkManually() {
@@ -263,12 +269,12 @@ final class StartupUpdater: NSObject {
     }
 
     @objc private func showPreviousNotes() {
-        let version = defaults.string(forKey: "lastUpdateVersion") ?? self.version
-        showNotes(title: "Last update  v\(version)", notes: defaults.string(forKey: "lastUpdateNotes") ?? "", buttons: ["OK"])
+        let version = defaults?.string(forKey: "lastUpdateVersion") ?? self.version
+        showNotes(title: "Last update  v\(version)", notes: defaults?.string(forKey: "lastUpdateNotes") ?? "", buttons: ["OK"])
     }
 
     private func check(startup: Bool) async -> Bool {
-        guard !busy else { return false }
+        guard !busy, !isTestCopy else { return false }
         busy = true
         checkButton?.isEnabled = false
         status?.stringValue = "Checking GitHub Releases…"
@@ -279,7 +285,7 @@ final class StartupUpdater: NSObject {
             let release = try JSONDecoder().decode(GitHubUpdate.self, from: data)
             guard let newVersion = release.version, let candidate = UpdateVersion(newVersion),
                   let current = UpdateVersion(version), candidate > current,
-                  !(startup && defaults.string(forKey: "skippedUpdateVersion") == newVersion) else {
+                  !(startup && defaults?.string(forKey: "skippedUpdateVersion") == newVersion) else {
                 status?.stringValue = "There is no newer stable update."
                 return false
             }
@@ -304,7 +310,7 @@ final class StartupUpdater: NSObject {
                     status?.stringValue = ""
                     return false
                 default:
-                    if startup { defaults.set(newVersion, forKey: "skippedUpdateVersion") }
+                    if startup { defaults?.set(newVersion, forKey: "skippedUpdateVersion") }
                     status?.stringValue = ""
                     return false
                 }

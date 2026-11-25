@@ -64,7 +64,13 @@ func verifyMacOptions() throws {
 enum BacktrackingApp {
     @MainActor
     static func main() {
-        if StartupUpdater.runHelperIfRequested() { return }
+        let config = TestCopyConfig.current
+        let primary = !CommandLine.arguments.contains(receiverWindowArgument)
+        if config.isTestCopy || config.invalidInstanceName {
+            guard config.validateAndAcquireLock(primary: primary) else { return }
+        } else {
+            if StartupUpdater.runHelperIfRequested() { return }
+        }
         let app = NSApplication.shared
         let delegate = BacktrackingController()
         app.delegate = delegate
@@ -1151,16 +1157,14 @@ private enum ExportFolder: Int {
 private final class BacktrackingController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate,
     NSTextFieldDelegate {
     private let independentWindow = CommandLine.arguments.contains(receiverWindowArgument)
-    private lazy var defaults: UserDefaults = {
-        guard independentWindow else { return .standard }
-        let name = "com.backtracking.audio.capture.receiver.\(UUID().uuidString)"
-        guard let preferences = UserDefaults(suiteName: name) else { return .standard }
-        receiverPreferencesName = name
-        preferences.register(defaults: UserDefaults.standard.dictionaryRepresentation())
-        return preferences
-    }()
-    private var receiverPreferencesName: String?
-    private let startupUpdater = StartupUpdater()
+    private let testCopy = TestCopyConfig.current.isTestCopy
+    private lazy var defaults: PreferencesStore = .forCurrentProcess(independentWindow: independentWindow)
+    private lazy var startupUpdater = StartupUpdater(isTestCopy: testCopy)
+    private var harness: TestHarness? = TestHarness()
+    private var harnessTimer: Timer?
+    private var activeSnapshotSaves = 0
+    private var lastHarnessDragFiles: [URL] = []
+    private var lastHarnessDragStatus: String = ""
     private lazy var snapshotShortcut = SnapshotShortcut { [weak self] in self?.dispatchSnapshotShortcut() }
     private var hotkeys = RecorderHotkeys()
     private var recordingShortcut: (action: RecorderAction, index: Int)?
@@ -1340,16 +1344,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if let raw = unsignedSetting("wideExportMode"), let mode = WideExportMode(rawValue: raw) { wideExportMode = mode }
         alwaysOnTop = (defaults.object(forKey: "alwaysOnTop") as? Bool) ?? true
         waveformOnly = (defaults.object(forKey: "waveformOnly") as? Bool) ?? false
-        if independentWindow { beginCaptureAfterUpdate() }
+        if independentWindow || testCopy { beginCaptureAfterUpdate() }
         else { startupUpdater.checkAtLaunch { [weak self] in self?.beginCaptureAfterUpdate() } }
     }
 
     #if BACKTRACKING_CAPTURE_VERIFY
     static func verifyOptions() throws {
         let controller = BacktrackingController()
-        let suite = "com.backtracking.verify.\(UUID())"
-        guard let fixture = UserDefaults(suiteName: suite) else { throw CaptureError("Missing settings fixture") }
-        defer { fixture.removePersistentDomain(forName: suite) }
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-opts-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let fixture = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
         controller.defaults = fixture
         fixture.set("system", forKey: "captureSourceA")
         fixture.set("mic:fixture", forKey: "captureSourceB")
@@ -1391,14 +1396,24 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         loadCapturePreferences()
         configureMenu()
         configurePanel()
-        if !independentWindow {
+        if !independentWindow && !testCopy && !TestCopyConfig.current.showOptionsOnStart {
             configureStatusItem()
+        }
+        if !independentWindow && !testCopy {
             snapshotShortcut.start()
         }
         resume()
+        if TestCopyConfig.current.showOptionsOnStart {
+            showOptions()
+        }
         let timer = Timer(timeInterval: 1.0 / 15.0, target: self, selector: #selector(tick(_:)), userInfo: nil, repeats: true)
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
+        if harness != nil {
+            let hTimer = Timer(timeInterval: 0.05, target: self, selector: #selector(driveHarnessTick(_:)), userInfo: nil, repeats: true)
+            self.harnessTimer = hTimer
+            RunLoop.main.add(hTimer, forMode: .common)
+        }
     }
 
     private func loadCapturePreferences() {
@@ -1418,8 +1433,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 return MeterMode(rawValue: raw) ?? .dbfs
             }
         } else {
+            let defaultRoute: CaptureRoute = (testCopy && TestCopyConfig.current.syntheticSystemFormat != nil
+                && defaults.object(forKey: "captureRouteA") == nil) ? .allChannels : .merged
             let first = defaults.string(forKey: "captureSourceA").flatMap(CaptureSource.init(key:)) ?? .system
-            let routeA = unsignedSetting("captureRouteA").flatMap(CaptureRoute.init(rawValue:)) ?? .merged
+            let routeA = unsignedSetting("captureRouteA").flatMap(CaptureRoute.init(rawValue:)) ?? defaultRoute
             captureLanes = [CaptureLane(source: first, route: routeA)]
             meterModes = [unsignedSetting("meterMode").flatMap(MeterMode.init(rawValue:)) ?? .dbfs]
             if defaults.bool(forKey: "dualCaptureSource") {
@@ -1470,16 +1487,18 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if let saved = defaults.string(forKey: folder.key), saved.hasPrefix("/"), !saved.utf8.contains(0) {
             return saved
         }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Backtracking/\(folder.component)", isDirectory: true).path
+        return TestCopyConfig.current.defaultExportDirectory(component: folder.component)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if !independentWindow { panel?.saveFrame(usingName: frameAutosaveName) }
+        if !independentWindow && !testCopy { panel?.saveFrame(usingName: frameAutosaveName) }
         timer?.invalidate()
         timer = nil
-        if !independentWindow { snapshotShortcut.stop() }
-        if let receiverPreferencesName { defaults.removePersistentDomain(forName: receiverPreferencesName) }
+        harnessTimer?.invalidate()
+        harnessTimer = nil
+        if !independentWindow && !testCopy { snapshotShortcut.stop() }
+        defaults.cleanup()
+        TestCopyConfig.current.releaseLock()
         if let cleanup {
             // Waits for a pass that is still running; a pass only lists one folder.
             bt_cleanup_free(cleanup)
@@ -1573,7 +1592,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private func hidePanel(_ panel: NSWindow) {
         // Nothing would show the preview or stop it.
         waveform?.stopPreview()
-        if !independentWindow { panel.saveFrame(usingName: frameAutosaveName) }
+        if !independentWindow && !testCopy { panel.saveFrame(usingName: frameAutosaveName) }
         panel.orderOut(nil)
         updateOptionsVisibility()
     }
@@ -1592,7 +1611,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
-        window.title = independentWindow ? "Backtracking Capture" : "Backtracking"
+        window.title = TestCopyConfig.current.windowTitle(independentWindow ? "Backtracking Capture" : "Backtracking")
         window.contentMinSize = fullPanelMinimum
         // CapturePanel handles dragging and resizing without AppKit's native window gestures.
         window.isMovable = false
@@ -1694,16 +1713,32 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         panel = window
         applyPin()
         if waveformOnly { window.contentMinSize = waveformOnlyPanelMinimum }
-        let restoredFrame = !independentWindow && window.setFrameUsingName(frameAutosaveName, force: true)
-        if !independentWindow { _ = window.setFrameAutosaveName(frameAutosaveName) }
+        let restoredFrame = !independentWindow && !testCopy && window.setFrameUsingName(frameAutosaveName, force: true)
+        if !independentWindow && !testCopy { _ = window.setFrameAutosaveName(frameAutosaveName) }
         applyWaveformOnly(initial: true, restoredFrame: restoredFrame)
-        if !restoredFrame {
+        if let sizeOverride = TestCopyConfig.current.windowSizeOverride {
+            let minSize = window.contentMinSize
+            let clamped = NSSize(width: max(minSize.width, sizeOverride.width), height: max(minSize.height, sizeOverride.height))
+            window.setContentSize(clamped)
+        }
+        if let posOverride = TestCopyConfig.current.windowPositionOverride {
+            let screenHeight = NSScreen.screens.first?.frame.height ?? 1080
+            let appKitY = screenHeight - posOverride.y - window.frame.height
+            window.setFrameOrigin(NSPoint(x: posOverride.x, y: appKitY))
+        } else if !restoredFrame {
             window.center()
             if independentWindow {
                 window.setFrameOrigin(NSPoint(x: window.frame.minX + 34, y: window.frame.minY - 34))
             }
         }
-        showPanel(window)
+        if testCopy && TestCopyConfig.current.windowPositionOverride != nil {
+            refreshWaveform()
+            updateStatus()
+            window.orderFrontRegardless()
+            updateOptionsVisibility()
+        } else {
+            showPanel(window)
+        }
     }
 
     private func keepPanelVisible(_ window: NSWindow) {
@@ -1735,17 +1770,25 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         updateOptionsVisibility()
         updateLoginOption()
         updateStatus()
-        keepPanelVisible(window)
-        NSApp.activate()
-        window.makeKeyAndOrderFront(nil)
+        if testCopy {
+            if let size = harness?.optionsSize {
+                window.setContentSize(size)
+            }
+            window.orderFrontRegardless()
+        } else {
+            keepPanelVisible(window)
+            NSApp.activate()
+            window.makeKeyAndOrderFront(nil)
+        }
     }
 
     private func makeOptionsPanel() -> KeyPanel {
+        let initialSize = harness?.optionsSize ?? NSSize(width: 760, height: 560)
         let window = HotkeyOptionsPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 560),
+            contentRect: NSRect(origin: .zero, size: initialSize),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false
         )
-        window.title = independentWindow ? "Backtracking Capture Options" : "Backtracking Options"
+        window.title = TestCopyConfig.current.windowTitle(independentWindow ? "Backtracking Capture Options" : "Backtracking Options")
         window.recordKey = { [weak self] event in self?.recordHotkey(event) ?? false }
         window.cancelRecording = { [weak self] in self?.cancelHotkeyRecording() }
         window.contentMinSize = NSSize(width: 680, height: 460)
@@ -2041,7 +2084,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         snapshotShortcut.recording = false
         defaults.set(hotkeys.data, forKey: "recorderHotkeys")
         snapshotShortcut.bindings = hotkeys[.globalSnapshot]
-        if !independentWindow {
+        if !independentWindow && !testCopy {
             if snapshotShortcut.bindings.isEmpty { snapshotShortcut.stop() }
             else { snapshotShortcut.start() }
         }
@@ -3036,6 +3079,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func loginItem() -> NSMenuItem {
+        if testCopy {
+            let item = NSMenuItem(title: "Start at login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+            item.target = self
+            item.state = .off
+            return item
+        }
         let status = SMAppService.mainApp.status
         let title = status == .requiresApproval ? "Start at login (needs approval)" : "Start at login"
         let item = NSMenuItem(title: title, action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
@@ -3045,6 +3094,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     @objc private func toggleLaunchAtLogin() {
+        if testCopy {
+            setNotice("A test copy does not change the macOS login item.")
+            updateLoginOption()
+            return
+        }
         defer { updateLoginOption() }
         let service = SMAppService.mainApp
         do {
@@ -3067,6 +3121,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func updateLoginOption() {
+        if testCopy {
+            optionsLoginButton?.allowsMixedState = false
+            optionsLoginButton?.title = "Start at login"
+            optionsLoginButton?.state = .off
+            return
+        }
         let status = SMAppService.mainApp.status
         optionsLoginButton?.allowsMixedState = status == .requiresApproval
         optionsLoginButton?.title = status == .requiresApproval ? "Start at login (needs approval)" : "Start at login"
@@ -3653,6 +3713,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     @objc private func tick(_: Timer) {
+        let tickStart = ProcessInfo.processInfo.systemUptime
         let panelVisible = panel?.isVisible == true
         if panelVisible { waveform?.refreshHintModifiers() }
         let now = ProcessInfo.processInfo.systemUptime
@@ -3660,7 +3721,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             lastSourceCheck = now
             if tap?.refreshSources() == true { reconnectConfiguredSources() }
         }
-        if !independentWindow && now - lastShortcutCheck >= 1 {
+        if !independentWindow && !testCopy && now - lastShortcutCheck >= 1 {
             lastShortcutCheck = now
             snapshotShortcut.start()
             if optionsPanel?.isVisible == true { refreshShortcutPermission() }
@@ -3676,6 +3737,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             resume()
         }
         if panelVisible || optionsPanel?.isVisible == true { updateStatus() }
+        if let harness, !harness.finished {
+            harness.recordFrameWork(ProcessInfo.processInfo.systemUptime - tickStart, now: tickStart)
+        }
     }
 
     func refreshWaveform() {
@@ -3836,6 +3900,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let wideMode = wideExportMode
         let pairBinaural = self.pairBinaural
         let names = laneFileNames
+        if !provisional { activeSnapshotSaves += 1 }
         setNotice(provisional ? "Preparing WAV…" : "Saving snapshot…")
         let write = DispatchWorkItem { @Sendable [weak self, worker, pendingProvisionalWAVs] in
             let urls = job.write(
@@ -3844,6 +3909,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             )
             if provisional { pendingProvisionalWAVs.urls.formUnion(urls) }
             DispatchQueue.main.async {
+                if !provisional, let self { self.activeSnapshotSaves = max(0, self.activeSnapshotSaves - 1) }
                 if provisional {
                     worker.async { pendingProvisionalWAVs.urls.subtract(urls) }
                 }
@@ -3859,12 +3925,410 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                             + " Check that there is audio and that the folder can be written to."
                     )
                 } else {
+                    if !provisional { self?.harness?.noteSaved(urls) }
                     self?.setNotice(provisional ? nil : "Saved snapshot \(exportDescription(urls))")
                 }
             }
         }
         worker.async(execute: write)
         return write
+    }
+
+    // MARK: - Unified Action Layer & Test Harness (Package 22 / TEST-07..18)
+
+    @objc private func driveHarnessTick(_: Timer) {
+        guard let harness, !harness.finished else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - harness.started < harness.delaySeconds { return }
+        if harness.appliedAt == nil {
+            harness.appliedAt = now
+            applyTestSteps()
+            return
+        }
+        if let folder = harness.dragCopyFolder,
+           waveform?.hasPendingDragWrite != true,
+           waveform?.isPreparingMaterial != true {
+            harness.dragCopyFolder = nil
+            copyHarnessDragFiles(to: folder)
+            return
+        }
+        let settled = (now - (harness.appliedAt ?? now)) >= TestHarness.settleSeconds + harness.holdSeconds
+            && waveform?.isPreparingMaterial != true
+            && (!harness.colorWait || waveform?.isFrequencyBusy != true)
+            && activeSnapshotSaves == 0
+            && waveform?.hasPendingDragWrite != true
+        guard settled else { return }
+        if !harness.steps.isEmpty {
+            harness.appliedAt = now
+            applyTestSteps()
+            return
+        }
+        harness.finished = true
+        updateStatus()
+        harness.note("status: \(statusLabel.stringValue)")
+        let targetView: NSView?
+        if harness.optionsPicture {
+            if let optionsPanel, optionsPanel.isVisible {
+                targetView = optionsPanel.contentView
+            } else {
+                harness.writeLog(picture: .failure("the Options window is not open"))
+                NSApp.terminate(nil)
+                return
+            }
+        } else {
+            targetView = panel?.contentView
+        }
+        let result: Result<(Int, Int), MessageError>
+        if let targetView {
+            result = TestHarness.captureRGBPNG(of: targetView, to: harness.output)
+        } else {
+            result = .failure("window view is unavailable")
+        }
+        harness.writeLog(picture: result)
+        NSApp.terminate(nil)
+    }
+
+    private func applyTestSteps() {
+        guard let harness else { return }
+        let splitIndex = harness.steps.dropFirst().firstIndex(where: \.waits) ?? harness.steps.endIndex
+        let batch = Array(harness.steps[..<splitIndex])
+        harness.steps.removeFirst(batch.count)
+        harness.holdSeconds = 0
+        for step in batch {
+            if case .failure(let error) = applyTestStep(step) {
+                harness.note("\(step): \(error.message)")
+            }
+        }
+        refreshWaveform()
+        updateStatus()
+    }
+
+    private func applyTestStep(_ step: TestStep) -> Result<Void, MessageError> {
+        switch step {
+        case .zoom(let seconds):
+            return runWindowAction(.zoomNewest(seconds)).map { _ in () }.mapError { MessageError($0.message) }
+        case .select(let from, let to):
+            return runWindowAction(.selectBack(from: from, to: to)).map { _ in () }.mapError { MessageError($0.message) }
+        case .selectLane(let lane):
+            return runWindowAction(.chooseLane(lane)).map { _ in () }.mapError { MessageError($0.message) }
+        case .rows(let fl, let fr, let ll, let lr):
+            return runWindowAction(.chooseRows(firstLane: fl, firstRow: fr, lastLane: ll, lastRow: lr)).map { _ in () }.mapError { MessageError($0.message) }
+        case .separate(let on):
+            return runWindowAction(.separate(on)).map { _ in () }.mapError { MessageError($0.message) }
+        case .save(let folder):
+            let res = runWindowAction(.save(folder: folder))
+            if case .failure(let refusal) = res {
+                var isDir: ObjCBool = false
+                if !FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDir) || !isDir.boolValue {
+                    return .failure(MessageError(refusal.message))
+                }
+            }
+            return .success(())
+        case .dragPrepare(let folder):
+            do {
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            } catch {
+                return .failure("\(folder.path): \(error.localizedDescription)")
+            }
+            let res = runWindowAction(.dragPrepare)
+            if case .failure(let refusal) = res { return .failure(MessageError(refusal.message)) }
+            harness?.dragCopyFolder = folder
+            return .success(())
+        case .exportMode(let raw):
+            guard let mode = WideExportMode(rawValue: raw) else { return .failure("invalid export mode") }
+            wideExportMode = mode
+            invalidateExportFormat()
+            return .success(())
+        case .openExportMode:
+            return .success(())
+        case .previewPlan:
+            switch runWindowAction(.previewPlan) {
+            case .success(let note):
+                if let note { harness?.note(note) }
+                return .success(())
+            case .failure(let refusal):
+                return .failure(MessageError(refusal.message))
+            }
+        case .scroll(let lane, let row):
+            waveform?.scrollToRow(lane: lane, row: row)
+            return .success(())
+        case .group:
+            return .failure("channel groups require add-on sources (not available in A stage)")
+        case .hideSilent:
+            return .success(())
+        case .pair(let binaural):
+            pairBinaural = binaural
+            waveform?.stopPreview()
+            invalidateExportFormat()
+            return .success(())
+        case .options(let page, let size):
+            if let size { harness?.optionsSize = size }
+            if optionsPanel == nil || optionsPanel?.isVisible != true { showOptions() }
+            if let size { optionsPanel?.setContentSize(size) }
+            let targetIndex = optionCategoryButtons.firstIndex {
+                $0.title.lowercased().replacingOccurrences(of: "-", with: "") == page
+            }
+            if let idx = targetIndex {
+                selectOptionCategory(optionCategoryButtons[idx])
+            } else {
+                return .failure("Options page \(page) is not available")
+            }
+            return .success(())
+        case .optionsScroll(let points):
+            guard let tabs = optionTabs, let scroll = tabs.selectedTabViewItem?.view as? NSScrollView else {
+                return .failure("the Options window is not open")
+            }
+            scroll.layoutSubtreeIfNeeded()
+            scroll.contentView.scroll(to: NSPoint(x: 0, y: points))
+            scroll.reflectScrolledClipView(scroll.contentView)
+            return .success(())
+        case .bind(let action, let bindings):
+            if let reason = hotkeys.set(bindings, for: action) { return .failure(MessageError(reason)) }
+            finishHotkeyEdit()
+            return .success(())
+        case .key(let shortcut):
+            if let action = hotkeys.windowAction(for: shortcut) {
+                _ = run(action)
+            }
+            return .success(())
+        case .openMeters:
+            guard captureLanes.count > 2 else {
+                return .failure("the meters all show with one or two sources")
+            }
+            showMoreMeters(moreMetersButton)
+            return .success(())
+        case .wait(let ms):
+            harness?.holdSeconds = Double(ms) / 1000.0
+            return .success(())
+        case .look:
+            return .failure("add-on looks are not available in A stage")
+        case .waveformColor(let byFrequency):
+            frequencyColoring = byFrequency
+            defaults.set(frequencyColoring, forKey: "waveformColorByFrequency")
+            waveform?.frequencyGradient = frequencyColoring ? frequencyGradient : nil
+            refreshFrequencyGradientControls()
+            refreshWaveform()
+            return .success(())
+        case .gradient(let custom):
+            frequencyGradient = custom ?? .standard
+            storeFrequencyGradient(refreshControls: true)
+            return .success(())
+        case .colorWait(let wait):
+            harness?.colorWait = wait
+            return .success(())
+        case .addSource(let name):
+            let choices = availableCaptureSources(excluding: tap?.privatePlaybackDevices ?? [])
+            let wanted = name.trimmingCharacters(in: .whitespaces).lowercased()
+            let found = choices.first { $0.title.lowercased() == wanted }
+                ?? choices.first { $0.title.lowercased().contains(wanted) }
+            guard let source = found?.source else { return .failure("no source is called \(name)") }
+            return runWindowAction(.addSource(source)).map { _ in () }.mapError { MessageError($0.message) }
+        case .removeSource(let lane):
+            return runWindowAction(.removeSource(lane)).map { _ in () }.mapError { MessageError($0.message) }
+        case .unsupportedAddon(let step):
+            return .failure("add-on step '\(step)' is not available in A stage")
+        }
+    }
+
+    private func copyHarnessDragFiles(to folder: URL) {
+        guard !lastHarnessDragFiles.isEmpty else {
+            harness?.note("drag-prepare: nothing was prepared (\(notice ?? ""))")
+            return
+        }
+        var copied: [URL] = []
+        var errors: [String] = []
+        for url in lastHarnessDragFiles {
+            let dest = folder.appendingPathComponent(url.lastPathComponent)
+            do {
+                try? FileManager.default.removeItem(at: dest)
+                try FileManager.default.copyItem(at: url, to: dest)
+                copied.append(dest)
+            } catch {
+                errors.append("drag-prepare: \(url.path): \(error.localizedDescription)")
+            }
+        }
+        harness?.note("drag-prepare: \(lastHarnessDragFiles.count) files")
+        harness?.noteSaved(copied)
+        for err in errors { harness?.note(err) }
+        harness?.note("drag status would be: \(lastHarnessDragStatus)")
+        for url in lastHarnessDragFiles { try? FileManager.default.removeItem(at: url) }
+        lastHarnessDragFiles.removeAll()
+    }
+
+    func runWindowAction(_ action: TestWindowAction) -> Result<String?, TestActionRefusal> {
+        let rate = Double(max(1, waveform?.currentSampleRate ?? UInt32(SystemAudioTap.timelineRate)))
+        let history = waveform?.currentRetainedFrames ?? (0..<0)
+        func toFrames(_ seconds: Double) -> UInt64 { UInt64((seconds * rate).rounded()) }
+        switch action {
+        case .selectBack, .selectFrames, .zoomNewest, .view:
+            if history.isEmpty {
+                return .failure(TestActionRefusal(code: "no_audio", message: "no audio yet"))
+            }
+        default: break
+        }
+        switch action {
+        case .startCapture:
+            if paused || captureError != nil { resume(clearingSelection: false) }
+            return .success(nil)
+        case .pauseCapture:
+            if !paused { pauseCapture() }
+            return .success(nil)
+        case .clearHistory:
+            clearCapture()
+            return .success(nil)
+        case .selectBack(let from, let to):
+            let hi = max(from, to), lo = min(from, to)
+            let start = max(history.lowerBound, history.upperBound - min(history.upperBound, toFrames(hi)))
+            let end = max(start + 1, history.upperBound - min(history.upperBound, toFrames(lo)))
+            let clampedEnd = min(history.upperBound, end)
+            guard start < clampedEnd else {
+                return .failure(TestActionRefusal(code: "no_audio", message: "no audio yet"))
+            }
+            beginEditing(retainMaterial: true)
+            waveform?.applyProgrammaticSelection(start..<clampedEnd)
+            endEditing(allowImmediateResume: false)
+            return .success(nil)
+        case .selectFrames(let range):
+            guard range.lowerBound >= history.lowerBound, range.upperBound <= history.upperBound, !range.isEmpty else {
+                return .failure(TestActionRefusal(code: "not_found", message: "frames \(range.lowerBound)..\(range.upperBound) are not all in the audio held, \(history.lowerBound)..\(history.upperBound)"))
+            }
+            beginEditing(retainMaterial: true)
+            waveform?.applyProgrammaticSelection(range)
+            endEditing(allowImmediateResume: false)
+            return .success(nil)
+        case .clearSelection:
+            _ = waveform?.cancelSelection()
+            return .success(nil)
+        case .separate(let on):
+            guard multipleRows else {
+                return .failure(TestActionRefusal(code: "failed", message: "editing separately needs more than one row"))
+            }
+            if separateLanes != on { toggleSeparateLanes() }
+            return .success(nil)
+        case .chooseLane(let lane):
+            guard let waveform, waveform.selectProgrammaticLane(lane) else {
+                return .failure(TestActionRefusal(code: "not_found", message: "the window does not show that lane"))
+            }
+            updateStatus()
+            return .success(nil)
+        case .chooseRows(let fl, let fr, let ll, let lr):
+            guard let waveform, waveform.selectProgrammaticRows(firstLane: fl, firstRow: fr, lastLane: ll, lastRow: lr) else {
+                return .failure(TestActionRefusal(code: "not_found", message: "the window has no matching row range"))
+            }
+            updateStatus()
+            return .success(nil)
+        case .zoomNewest(let seconds):
+            let count = max(UInt64(1), toFrames(seconds))
+            let start = history.upperBound > count ? max(history.lowerBound, history.upperBound - count) : history.lowerBound
+            waveform?.applyProgrammaticView(start..<history.upperBound)
+            return .success(nil)
+        case .view(let range):
+            let start = max(history.lowerBound, range.lowerBound)
+            let end = min(history.upperBound, max(start + 1, range.upperBound))
+            waveform?.applyProgrammaticView(start..<end)
+            return .success(nil)
+        case .viewAll:
+            if !history.isEmpty { waveform?.applyProgrammaticView(history) }
+            return .success(nil)
+        case .save(let folder):
+            do {
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            } catch {
+                return .failure(TestActionRefusal(code: "failed", message: "\(folder.path): \(error.localizedDescription)"))
+            }
+            saveSnapshot(into: folder.path)
+            return .success(nil)
+        case .dragPrepare:
+            guard let waveform else { return .failure(TestActionRefusal(code: "failed", message: "no waveform")) }
+            let selected = waveform.selectionForSaving()
+            let fades = waveform.fadesForSaving()
+            let row = selected == nil ? nil : waveform.selectedRow
+            let runPrepare: (WAVExport?) -> Void = { [weak self] job in
+                guard let self, let job else {
+                    self?.lastHarnessDragFiles = []
+                    return
+                }
+                let range = selected ?? job.span
+                _ = self.writeExport(job, range: range, fades: fades, row: row, directory: self.directory(for: .output),
+                                     provisional: true) { [weak self] urls in
+                    self?.lastHarnessDragFiles = urls
+                    self?.lastHarnessDragStatus = urls.isEmpty ? "" : "Saved \(exportDescription(urls))"
+                    return true
+                }
+            }
+            if let material = waveform.materialForExport(range: selected) {
+                runPrepare(material)
+            } else {
+                requestEditingMaterial(runPrepare)
+            }
+            return .success(nil)
+        case .previewPlan:
+            return .success(describePreviewPlan())
+        case .playPreview:
+            if testCopy {
+                return .failure(TestActionRefusal(code: "failed", message: "a test copy of Backtracking does not play audio"))
+            }
+            _ = waveform?.togglePreview()
+            return .success(nil)
+        case .stopPreview:
+            waveform?.stopPreview()
+            return .success(nil)
+        case .addSource(let source):
+            guard captureLanes.count < maximumCaptureLanes else {
+                return .failure(TestActionRefusal(code: "failed", message: "The recorder has reached the 64-source limit."))
+            }
+            let lane = CaptureLane(source: source)
+            guard canConfigure(lane, at: captureLanes.count) else {
+                return .failure(TestActionRefusal(code: "failed", message: notice ?? "Cannot add source"))
+            }
+            captureLanes.append(lane)
+            meterModes.append(.dbfs)
+            storeLanes(rebuildOptions: true)
+            return .success(nil)
+        case .removeSource(let lane):
+            guard dualSource, captureLanes.indices.contains(lane) else {
+                return .failure(TestActionRefusal(code: "not_found", message: "cannot remove lane \(lane)"))
+            }
+            removeLane(at: lane)
+            return .success(nil)
+        }
+    }
+
+    private func describePreviewPlan() -> String {
+        guard let selection = waveform?.selectionForSaving() else { return "preview: no selection" }
+        guard let material = waveform?.materialForExport(range: selection) else { return "preview: the selection is not frozen" }
+        let pairMode = pairBinaural ? "Binaural" : "Stereo"
+        let desc = "preview of \(selection.lowerBound)..\(selection.upperBound) (\(pairMode)): lanes \(captureLanes.count), rate \(material.sampleRate); prepared, not played"
+        return desc
+    }
+
+    private func saveSnapshot(into directoryPath: String) {
+        guard !editing else { return }
+        guard waveform?.isPreparingMaterial != true else { setNotice("Preparing selection…"); return }
+        let selected = waveform?.selectionForSaving()
+        let fades = waveform?.fadesForSaving() ?? noFades
+        let row = selected == nil ? nil : waveform?.selectedRow
+        let save: (WAVExport?) -> Void = { [weak self] job in
+            guard let self else { return }
+            guard let job else { self.setNotice("No audio captured yet."); return }
+            let range = selected ?? job.span
+            guard range.lowerBound >= job.span.lowerBound, range.upperBound <= job.span.upperBound, !range.isEmpty else {
+                self.setNotice("The selected audio is unavailable.")
+                return
+            }
+            let ticket = self.waveform?.reserveMarker()
+            if selected != nil { self.waveform?.clearSelection() }
+            self.writeExport(job, range: range, fades: fades, row: row, directory: directoryPath,
+                             provisional: false) { [weak self] urls in
+                if !urls.isEmpty, let ticket { self?.waveform?.commitMarker(range, row: row, ticket: ticket) }
+                return true
+            }
+        }
+        if let material = waveform?.materialForExport(range: selected) {
+            save(material)
+        } else {
+            requestEditingMaterial(save)
+        }
     }
 
 }
@@ -4011,6 +4475,43 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
     var hasEditingMaterial: Bool { editMaterial != nil || materialPending }
     var isPreparingMaterial: Bool { materialPending }
+    var isFrequencyBusy: Bool { frequencyReading }
+    var hasPendingDragWrite: Bool { pendingDragWrite != nil }
+    var currentSampleRate: UInt32 { sampleRate }
+    var currentRetainedFrames: Range<UInt64> { retainedFrames }
+
+    func applyProgrammaticView(_ range: Range<UInt64>) {
+        changeView(to: range)
+    }
+
+    func applyProgrammaticSelection(_ range: Range<UInt64>) {
+        selection = range
+        fades = noFades
+        needsDisplay = true
+    }
+
+    func scrollToRow(lane: Int, row: Int) {
+        if let idx = displayedRows.firstIndex(where: { $0.lane == lane }) {
+            let target = min(displayedRows.count - 1, idx + row)
+            rowOffset = min(maxRowOffset, max(0, CGFloat(target) * rowHeight))
+            needsDisplay = true
+        }
+    }
+
+    func selectProgrammaticLane(_ lane: Int) -> Bool {
+        guard let row = displayedRows.first(where: { $0.lane == lane }) else { return false }
+        selectionReference = row
+        needsDisplay = true
+        return true
+    }
+
+    func selectProgrammaticRows(firstLane: Int, firstRow: Int, lastLane: Int, lastRow: Int) -> Bool {
+        let laneRows = displayedRows.filter { $0.lane == firstLane }
+        guard laneRows.indices.contains(firstRow) else { return false }
+        selectionReference = laneRows[firstRow]
+        needsDisplay = true
+        return true
+    }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -4398,6 +4899,10 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         guard let selection = selectionForSaving() else { return false }
         // A gesture in progress keeps the key to itself.
         guard anchor == nil, fadeGesture == nil, mouseDownEvent == nil, !dragging else { return true }
+        if TestCopyConfig.current.isTestCopy {
+            controller?.setNotice("a test copy of Backtracking does not play audio")
+            return true
+        }
         if player?.range != nil {
             player?.stop()
             return true
