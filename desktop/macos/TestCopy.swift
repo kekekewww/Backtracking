@@ -63,6 +63,13 @@ final class TestCopyConfig: @unchecked Sendable {
         return "it runs from the installed app's bundle (\(productionBundleID)), whose preferences it would share. Make a test copy with desktop/macos/make-test-copy.sh and start that instead."
     }
 
+    /// Why a bundle made by make-test-copy.sh cannot run as the installed app, or nil. Started
+    /// without the test variables (from the Finder, say) it would use the user's real data.
+    static func unisolatedTestBundleRefusal(bundleID: String?, isTestCopy: Bool) -> String? {
+        guard !isTestCopy, let bundleID, bundleID.hasPrefix(testCopyBundlePrefix) else { return nil }
+        return "\(bundleID) is a test copy. Start it with \(instanceVariable) and \(dataDirVariable) set; it does not run on the user's own data."
+    }
+
     /// Whether a launch marked as opened by a test copy has to stop because it is not one.
     static func refusesUnisolatedLaunch(arguments: [String], isTestCopy: Bool) -> Bool {
         arguments.contains(testCopyLaunchArgument) && !isTestCopy

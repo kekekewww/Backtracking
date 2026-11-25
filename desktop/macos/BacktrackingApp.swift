@@ -192,6 +192,11 @@ enum BacktrackingApp {
             fputs("Backtracking test copy could not start: this window was opened by a test copy, but \(TestCopyConfig.instanceVariable) did not reach it.\n", stderr)
             exit(2)
         }
+        if let refusal = TestCopyConfig.unisolatedTestBundleRefusal(bundleID: Bundle.main.bundleIdentifier,
+                                                                    isTestCopy: config.isTestCopy || config.invalidInstanceName) {
+            fputs("Backtracking could not start: \(refusal)\n", stderr)
+            exit(2)
+        }
         if config.isTestCopy, let refusal = TestCopyConfig.productionBundleRefusal(bundleID: Bundle.main.bundleIdentifier) {
             fputs("Backtracking test copy could not start: \(refusal)\n", stderr)
             exit(2)
@@ -3119,8 +3124,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         // make-test-copy.sh, and this unbundled verification, are not refused.
         guard TestCopyConfig.productionBundleRefusal(bundleID: "com.backtracking.audio.capture") != nil,
               TestCopyConfig.productionBundleRefusal(bundleID: "com.backtracking.audio.capture.testcopy.verify") == nil,
-              TestCopyConfig.productionBundleRefusal(bundleID: Bundle.main.bundleIdentifier) == nil else {
-            throw CaptureError("A test copy would run from the installed app's bundle identifier")
+              TestCopyConfig.productionBundleRefusal(bundleID: Bundle.main.bundleIdentifier) == nil,
+              // A copy started without the test variables refuses, as a copy started with them runs.
+              TestCopyConfig.unisolatedTestBundleRefusal(bundleID: "com.backtracking.audio.capture.testcopy.verify", isTestCopy: false) != nil,
+              TestCopyConfig.unisolatedTestBundleRefusal(bundleID: "com.backtracking.audio.capture.testcopy.verify", isTestCopy: true) == nil,
+              TestCopyConfig.unisolatedTestBundleRefusal(bundleID: "com.backtracking.audio.capture", isTestCopy: false) == nil,
+              TestCopyConfig.unisolatedTestBundleRefusal(bundleID: Bundle.main.bundleIdentifier, isTestCopy: false) == nil else {
+            throw CaptureError("A test copy would run from the installed app's bundle identifier, or a copy on the user's own data")
         }
         // State restoration stays off whatever a lower domain says, and no window is restorable.
         // Launched with `-ApplePersistenceIgnoreState NO -NSQuitAlwaysKeepsWindows YES`, as a

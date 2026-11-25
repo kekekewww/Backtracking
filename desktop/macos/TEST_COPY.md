@@ -25,7 +25,11 @@ Start the copy's executable with the usual test variables:
   System format, screenshot and view script.
 
 A test copy started from a bundle whose identifier is still `com.backtracking.audio.capture` stops
-with exit code 2 and says to make a test copy.
+with exit code 2 and says to make a test copy. A copy started without `BACKTRACKING_TEST_INSTANCE`
+(from the Finder, say) also stops with exit code 2, so it never runs on the user's own data.
+
+The copy is signed ad hoc without the hardened runtime or the app's entitlements. That is enough
+to run it on this Mac, not to distribute it.
 
 To remove what a test copy left in the system:
 
