@@ -3400,9 +3400,22 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         old.readCapture(poll: false, { _ in Thread.sleep(forTimeInterval: 0.3); return 0 }) { _ in }
         let folder = scratch.appendingPathComponent("saved", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        guard let host = AddonHostClient(dataRoot: scratch.path, appVersion: "0.2.1", primary: true) else {
+            throw CaptureError("AddonHostClient failed to start")
+        }
+        controller.attach(addonHost: host)
+        defer { host.shutdownAndFree(); controller.addonHost = nil }
+        let saveCommand = AddonControlCommand(command: "save", from_seconds_ago: nil, to_seconds_ago: nil, start_frame: nil,
+            end_frame: nil, lane: nil, first: nil, last: nil, seconds: nil, folder: folder.path, source: nil)
         controller.saveSnapshot(into: folder.path)
+        controller.executeSingleControlCall(host: host, call: AddonControlCall(addon_id: "verify.change", addon_name: "Verify",
+                                                                           run: 1, request_id: "s", command: saveCommand))
         // The user picks other sources: a new capture, which records something else.
         controller.reconnectConfiguredSources()
+        let reason = "The capture source changed before this snapshot was ready."
+        guard host.verifyEvents.contains("control_reply s failed"), controller.notice == reason else {
+            throw CaptureError("A dropped save told the add-on \(host.verifyEvents) and the window \(controller.notice ?? "nothing")")
+        }
         guard let new = controller.tap, new !== old else { throw CaptureError("Changing sources did not make a new capture") }
         defer { controller.tap = nil }
         let other = [Float](repeating: -0.75, count: 4_800 * 2)
@@ -5054,7 +5067,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             failPendingSnapshots("The capture source changed before this selection was ready.")
         }
         // Freezes of the capture being replaced no longer serve a save (Windows drops them with it).
-        abandonSnapshotReads("The capture source changed before this selection was ready.")
+        abandonSnapshotReads()
         let wasRunning = !paused
         if wasRunning { pauseCapture() }
         editing = false
@@ -7338,16 +7351,24 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         failPendingSnapshots("No audio available for this selection.")
     }
 
-    private func abandonSnapshotReads(_ reason: String) {
+    /// Windows has no such case: its reads survive a source change. A save of a selection and a
+    /// save of the whole capture are named for what they were.
+    static func sourceChangedReason(selection: Bool) -> String {
+        selection ? "The capture source changed before this selection was ready."
+            : "The capture source changed before this snapshot was ready."
+    }
+
+    private func abandonSnapshotReads() {
         let abandoned = pendingSnapshotReads
         pendingSnapshotReads.removeAll()
         editingFreezeReads.removeAll()
         for entry in abandoned {
             if let call = entry.save.controlCall {
+                let reason = Self.sourceChangedReason(selection: entry.save.range != nil)
                 addonHost?.controlReply(call: call, error: AddonControlError(code: "failed", message: reason))
             }
         }
-        if !abandoned.isEmpty { setNotice(reason) }
+        if let last = abandoned.last { setNotice(Self.sourceChangedReason(selection: last.save.range != nil)) }
     }
 
     private func failPendingSnapshots(_ reason: String) {
