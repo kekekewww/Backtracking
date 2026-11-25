@@ -646,6 +646,8 @@ final class AddonHostClient {
     #if BACKTRACKING_CAPTURE_VERIFY
     /// Runs once the polled snapshot's completed tickets have been consumed.
     var verifyAfterTakingResults: (() -> Void)?
+    /// What the app sent the host, in order, for verification.
+    var verifyEvents: [String] = []
     #endif
 
     init?(dataRoot: String, appVersion: String, primary: Bool) {
@@ -672,6 +674,9 @@ final class AddonHostClient {
 
     func shutdownAndFree(timeoutMs: UInt32 = 2500) {
         guard let ptr = handle else { return }
+        #if BACKTRACKING_CAPTURE_VERIFY
+        verifyEvents.append("shutdown")
+        #endif
         handle = nil
         _ = bt_addon_host_shutdown(ptr, timeoutMs)
         bt_addon_host_free(ptr)
@@ -876,15 +881,37 @@ final class AddonHostClient {
         submitVoid(payload, completion: completion)
     }
 
-    func clipExported(files: [String], sampleRate: UInt32, frames: UInt64) {
-        guard !files.isEmpty, frames > 0, sampleRate > 0 else { return }
+    func clipExported(files: [String], sampleRate: UInt32, frames: UInt64,
+                      completion: @escaping (Result<Void, MessageError>) -> Void = { _ in }) {
+        guard !files.isEmpty, frames > 0, sampleRate > 0 else {
+            completion(.failure("Nothing was exported."))
+            return
+        }
+        #if BACKTRACKING_CAPTURE_VERIFY
+        verifyEvents.append("clip_exported \(sampleRate) \(frames) \(files.count)")
+        let answered: (Result<Void, MessageError>) -> Void = { [weak self] result in
+            self?.verifyEvents.append("clip_exported answered")
+            completion(result)
+        }
+        #else
+        let answered = completion
+        #endif
         submitVoid([
             "schema": 1,
             "op": "clip_exported",
             "files": files,
             "sample_rate": sampleRate,
             "frames": frames,
-        ]) { _ in }
+        ], completion: answered)
+    }
+
+    /// Polls the host until `done` or `deadline` (system uptime); only for quitting, which may block.
+    func poll(until deadline: TimeInterval, _ done: () -> Bool) {
+        while !done() && handle != nil && ProcessInfo.processInfo.systemUptime < deadline {
+            pollSnapshot()
+            if done() { break }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
     }
 
     func setControlAllowed(id: String, allowed: Bool, completion: @escaping (Result<Void, MessageError>) -> Void) {

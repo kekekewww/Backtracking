@@ -932,6 +932,47 @@ private final class EditingMaterialRead: @unchecked Sendable {
     }
 }
 
+/// Saved clips whose `clip_exported` has not gone to the add-ons yet. The export worker adds each
+/// one as soon as its files are written, so quitting can still announce saves the main queue never saw.
+private final class ClipExportLedger: @unchecked Sendable {
+    struct Clip {
+        let urls: [URL]
+        let sampleRate: UInt32
+        let frames: UInt64
+    }
+    private let lock = NSLock()
+    private var next: UInt64 = 0
+    private var clips: [UInt64: Clip] = [:]
+
+    func reserve() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        next &+= 1
+        return next
+    }
+
+    func add(_ clip: Clip, as token: UInt64) {
+        lock.lock()
+        clips[token] = clip
+        lock.unlock()
+    }
+
+    func take(_ token: UInt64) -> Clip? {
+        lock.lock()
+        defer { lock.unlock() }
+        return clips.removeValue(forKey: token)
+    }
+
+    /// Every clip not announced yet, in the order they were reserved.
+    func takeAll() -> [Clip] {
+        lock.lock()
+        defer { lock.unlock() }
+        let all = clips.sorted { $0.key < $1.key }.map(\.value)
+        clips.removeAll()
+        return all
+    }
+}
+
 private final class WAVExport: @unchecked Sendable {
     private static let releaseQueue = DispatchQueue(label: "Backtracking.material-release", qos: .utility)
     private let frozen: OpaquePointer
@@ -1691,6 +1732,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let save: PendingSnapshotSave
     }
     private var pendingSnapshotReads: [SnapshotRead] = []
+    /// The window's editing freezes still in flight, oldest first; `pendingSnapshots` wait for them.
+    private var editingFreezeReads: [EditingMaterialRead] = []
+    private let clipLedger = ClipExportLedger()
     private var addonHost: AddonHostClient?
     private var addonPositionsCursor: UInt64 = 0
     private var lastAddonSnapshotForUI: AddonSnapshot = .empty
@@ -2243,6 +2287,113 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             }
         }
         guard controller.pendingSnapshotReads.isEmpty else { throw CaptureError("Exit left a save waiting for its freeze") }
+        try verifyTerminationAnnouncesClips()
+    }
+
+    /// Quitting while two saves wait for the window's freeze, after the oldest audio they asked for
+    /// has aged out of the live history. Both are written from that freeze, and each clip is
+    /// announced to the add-ons before their manager closes.
+    static func verifyTerminationAnnouncesClips() throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-exit-clips-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        let root = scratch.appendingPathComponent("addons-root", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        guard let host = AddonHostClient(dataRoot: root.path, appVersion: "0.2.1", primary: true) else {
+            throw CaptureError("AddonHostClient failed to start")
+        }
+        controller.attach(addonHost: host)
+        defer { host.shutdownAndFree() }
+        let ready = ProcessInfo.processInfo.systemUptime + 3
+        while !host.snapshot.ready && ProcessInfo.processInfo.systemUptime < ready {
+            host.pollSnapshot()
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        guard host.snapshot.ready else { throw CaptureError("Add-on host did not become ready") }
+        let lanes = [
+            CaptureLane(source: .addon(addonID: "verify.exit", sourceID: "a"), route: .merged),
+            CaptureLane(source: .addon(addonID: "verify.exit", sourceID: "b"), route: .merged)
+        ]
+        let history: UInt32 = 10
+        let tap = try SystemAudioTap(history: history, lanes: lanes)
+        controller.captureLanes = lanes
+        controller.tap = tap
+        let levels: [[Float]] = [[0.25, -0.5], [0.125, 0.375]]
+        let chunk = 4_800
+        var pushed: UInt64 = 0
+        func push(seconds: Int) throws {
+            for _ in 0..<(seconds * Int(SystemAudioTap.timelineRate) / chunk) {
+                let timestamp = 1_000_000_000 + pushed * 1_000_000_000 / UInt64(SystemAudioTap.timelineRate)
+                pushed += UInt64(chunk)
+                for (lane, level) in levels.enumerated() {
+                    let samples = [Float]((0..<chunk).flatMap { _ in level })
+                    let accepted = tap.withCaptureSnapshot { core in
+                        samples.withUnsafeBufferPointer {
+                            bt_tracks_push_interleaved(core, UInt32(lane), $0.baseAddress, UInt32(chunk),
+                                                       timestamp, SystemAudioTap.timelineRate)
+                        }
+                    }
+                    guard accepted == UInt32(chunk) else { throw CaptureError("Exit clip verification lane \(lane) lost input") }
+                }
+            }
+        }
+        try push(seconds: Int(history))
+        let (first, end) = tap.withCaptureSnapshot { (bt_tracks_first_frame($0), bt_tracks_end_frame($0)) }
+        // The window starts its editing freeze; two saves wait for it.
+        controller.requestEditingFreeze { _ in }
+        let selected = scratch.appendingPathComponent("selected", isDirectory: true)
+        let whole = scratch.appendingPathComponent("whole", isDirectory: true)
+        try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: whole, withIntermediateDirectories: true)
+        let noFades = BtFades(fade_in: 0, fade_out: 0)
+        controller.pendingSnapshots = [
+            PendingSnapshotSave(range: (first + 100)..<(first + 1_100), fades: noFades, rows: nil,
+                                directory: selected.path, ticket: nil, controlCall: nil),
+            PendingSnapshotSave(range: nil, fades: noFades, rows: nil,
+                                directory: whole.path, ticket: nil, controlCall: nil)
+        ]
+        // Capture goes on behind the freeze until the selected audio has left the live history.
+        var liveFirst = first
+        for _ in 0..<60 where liveFirst <= first + 1_100 {
+            try push(seconds: 1)
+            liveFirst = tap.withCaptureSnapshot { bt_tracks_first_frame($0) }
+        }
+        guard liveFirst > first + 1_100 else {
+            throw CaptureError("Exit clip verification setup: live history still starts at \(liveFirst), selection ends at \(first + 1_100)")
+        }
+        controller.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+
+        var problems: [String] = []
+        func wavs(_ folder: URL) throws -> [URL] {
+            try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil).filter { $0.pathExtension == "wav" }
+        }
+        for (folder, expected) in [(selected, Int64(1_000)), (whole, Int64(end - first))] {
+            let files = try wavs(folder)
+            if files.count != levels.count {
+                problems.append("\(folder.lastPathComponent) has \(files.count) WAV files, expected \(levels.count)")
+                continue
+            }
+            for url in files {
+                let file = try AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: false)
+                if file.length != expected {
+                    problems.append("\(url.lastPathComponent) has \(file.length) frames, expected \(expected)")
+                }
+            }
+        }
+        let expectedEvents = ["clip_exported 48000 1000 2", "clip_exported 48000 \(end - first) 2"]
+        let events = host.verifyEvents
+        let sent = events.filter { $0.hasPrefix("clip_exported ") && $0 != "clip_exported answered" }
+        let answeredBeforeShutdown = events.firstIndex(of: "shutdown").map { shutdown in
+            events[..<shutdown].filter { $0 == "clip_exported answered" }.count
+        } ?? 0
+        if sent != expectedEvents || answeredBeforeShutdown != expectedEvents.count || events.last != "shutdown" {
+            problems.append("host saw \(events), expected \(expectedEvents), each answered, then shutdown")
+        }
+        guard problems.isEmpty else {
+            throw CaptureError("Quitting with saves waiting: " + problems.joined(separator: "; "))
+        }
     }
     #endif
 
@@ -2363,7 +2514,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             bt_cleanup_free(cleanup)
             self.cleanup = nil
         }
-        queuePendingSnapshotsForTermination()
+        finishSavesForTermination()
         addonHost?.shutdownAndFree(timeoutMs: 2500)
         addonHost = nil
         waveform?.endPreview()
@@ -2405,7 +2556,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             let own = entry.read.tap == current ? entry.read.material : nil
             return (own ?? freezeNow()).map { ($0, entry.save) }
         }
-        jobs += queued.compactMap { req in freezeNow().map { ($0, req) } }
+        // A save waiting for the window's freeze writes the first one that holds it, as it would have
+        // when that freeze arrived; freezing again now could miss audio that has aged out since.
+        let editing = editingFreezeReads.filter { $0.tap == current }.compactMap(\.material)
+        editingFreezeReads.removeAll()
+        jobs += queued.compactMap { req in
+            let held = editing.first { material in
+                req.range.map { $0.lowerBound >= material.span.lowerBound && $0.upperBound <= material.span.upperBound } ?? true
+            }
+            return (held ?? freezeNow()).map { ($0, req) }
+        }
         let sampleRate = exportSampleRate
         let bits = exportBitsPerSample
         let mono = forceMonoExport
@@ -2418,13 +2578,36 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             let range = req.range ?? frozen.span
             guard range.lowerBound >= frozen.span.lowerBound, range.upperBound <= frozen.span.upperBound,
                   !range.isEmpty else { continue }
+            let ledger = clipLedger
+            let token = ledger.reserve()
             worker.async {
-                _ = frozen.write(range: range, directory: req.directory, sampleRate: sampleRate,
-                                 bitsPerSample: bits, forceMono: mono, fades: req.fades, names: names,
-                                 selectedRows: req.rows, hideSilentLanes: hide, wideMode: wide,
-                                 pairBinaural: binaural, shownGroupIDs: shownIDs)
+                let written = frozen.write(range: range, directory: req.directory, sampleRate: sampleRate,
+                                           bitsPerSample: bits, forceMono: mono, fades: req.fades, names: names,
+                                           selectedRows: req.rows, hideSilentLanes: hide, wideMode: wide,
+                                           pairBinaural: binaural, shownGroupIDs: shownIDs)
+                if !written.urls.isEmpty {
+                    ledger.add(ClipExportLedger.Clip(urls: written.urls, sampleRate: sampleRate,
+                                                     frames: range.upperBound - range.lowerBound), as: token)
+                }
             }
         }
+    }
+
+    /// Writes every save still on its way, then tells the add-ons about each clip before their
+    /// manager closes (Windows `Recorder::drop`). An add-on's own `save` gets no `control_reply` here,
+    /// as on Windows.
+    private func finishSavesForTermination() {
+        queuePendingSnapshotsForTermination()
+        // Write jobs hand their completion to the main queue and never wait for it.
+        worker.sync {}
+        let clips = clipLedger.takeAll()
+        guard let host = addonHost, !clips.isEmpty else { return }
+        var unanswered = clips.count
+        for clip in clips {
+            notifyClipExported(clip) { _ in unanswered -= 1 }
+        }
+        // The manager takes requests on its own thread; wait briefly so they are handed on before it closes.
+        host.poll(until: ProcessInfo.processInfo.systemUptime + 1.0) { unanswered == 0 }
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -5427,6 +5610,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
+    /// The window's freeze for editing, which saves made meanwhile wait for (`pendingSnapshots`).
+    func requestEditingFreeze(_ completion: @escaping (WAVExport?) -> Void) {
+        guard let tap else { completion(nil); return }
+        let read = EditingMaterialRead(tap: ObjectIdentifier(tap))
+        editingFreezeReads.append(read)
+        requestEditingMaterial(read: read) { [weak self] material in
+            self?.editingFreezeReads.removeAll { $0 === read }
+            completion(material)
+        }
+    }
+
     func retireEditingMaterial(_ material: WAVExport?) {
         guard let material else { return }
         worker.async { withExtendedLifetime(material) {} }
@@ -5470,6 +5664,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let frameCount = range.upperBound > range.lowerBound ? (range.upperBound - range.lowerBound) : 0
         if !provisional { activeSnapshotSaves += 1 }
         setNotice(provisional ? "Preparing WAV…" : "Saving snapshot…")
+        let ledger = clipLedger
+        let token = ledger.reserve()
         let write = DispatchWorkItem { @Sendable [weak self, worker, pendingProvisionalWAVs] in
             let written = job.write(
                 range: range, directory: directory, sampleRate: sampleRate, bitsPerSample: bitsPerSample,
@@ -5478,7 +5674,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             )
             let urls = written.urls
             if provisional { pendingProvisionalWAVs.urls.formUnion(urls) }
+            // Windows announces a save from the thread that wrote it; listing it here lets quitting do the same.
+            if !provisional, !urls.isEmpty {
+                ledger.add(ClipExportLedger.Clip(urls: urls, sampleRate: sampleRate, frames: frameCount), as: token)
+            }
             DispatchQueue.main.async {
+                let clip = ledger.take(token)
                 if !provisional, let self { self.activeSnapshotSaves = max(0, self.activeSnapshotSaves - 1) }
                 if provisional {
                     worker.async { pendingProvisionalWAVs.urls.subtract(urls) }
@@ -5501,7 +5702,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 } else {
                     if !provisional {
                         self?.harness?.noteSaved(urls)
-                        self?.notifyClipExported(urls: urls, sampleRate: sampleRate, frames: frameCount)
+                        if let clip { self?.notifyClipExported(clip) }
                     }
                     if provisional {
                         self?.setNotice(written.objectsInMono ? "Objects without positions were written in mono." : nil)
@@ -6157,9 +6358,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
-    func notifyClipExported(urls: [URL], sampleRate: UInt32, frames: UInt64) {
-        guard !urls.isEmpty, frames > 0, sampleRate > 0 else { return }
-        addonHost?.clipExported(files: urls.map(\.path), sampleRate: sampleRate, frames: frames)
+    func notifyClipExported(_ clip: ClipExportLedger.Clip,
+                            completion: @escaping (Result<Void, MessageError>) -> Void = { _ in }) {
+        guard let addonHost else { completion(.failure("The add-on manager is not running.")); return }
+        addonHost.clipExported(files: clip.urls.map(\.path), sampleRate: clip.sampleRate, frames: clip.frames,
+                               completion: completion)
     }
 
     // MARK: Pkg 3 — Channel Groups
@@ -8204,7 +8407,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         materialPending = true
         materialVersion &+= 1
         let version = materialVersion
-        controller?.requestEditingMaterial { [weak self] material in
+        controller?.requestEditingFreeze { [weak self] material in
             guard let self else { return }
             guard self.materialVersion == version else {
                 if let material {
@@ -9011,7 +9214,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             let frames = pendingDragMarker.map { $0.range.upperBound - $0.range.lowerBound }
                 ?? (retainedFrames.upperBound - retainedFrames.lowerBound)
             if !exportedURLs.isEmpty {
-                controller?.notifyClipExported(urls: exportedURLs, sampleRate: sampleRate, frames: frames)
+                controller?.notifyClipExported(ClipExportLedger.Clip(urls: exportedURLs, sampleRate: sampleRate, frames: frames))
             }
             readyFiles.removeAll()
             if let pendingDragMarker {
