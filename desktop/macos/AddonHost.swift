@@ -1605,6 +1605,12 @@ enum AddonFormatting {
 extension AddonHostClient {
     /// The host's own generation counter, read without polling.
     var verifyHostGeneration: UInt64? { handle.map { bt_addon_host_generation($0) } }
+    /// Puts `snapshot` in place as if a poll had just read it.
+    func verifyReceive(_ snapshot: AddonSnapshot) {
+        self.snapshot = snapshot
+        lastGeneration = snapshot.generation
+        onSnapshot?(snapshot)
+    }
 
     /// Ticket B completes after the poll read its snapshot but before the poll finished.
     /// The host then stays quiet; B's completion must still run, exactly once, like A's.

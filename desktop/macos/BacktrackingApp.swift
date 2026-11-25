@@ -157,6 +157,12 @@ func verifyMacRowsAcrossGroups() throws {
 }
 
 @MainActor
+func verifyMacSnapshotRebuilds() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifySnapshotRebuilds()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -1906,6 +1912,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var pendingLookControlsRebuild = false
     private var selectFreezeWaits: [(AddonControlCall, TimeInterval)] = []
     private var pendingAddonsTabReload = false
+    #if BACKTRACKING_CAPTURE_VERIFY
+    /// Stand-ins for the Options window, which a verification does not open.
+    private var verifyOptionsPage: String?
+    private var verifyEditingText: Bool?
+    private var verifyAddonsTabReloads = 0
+    #endif
     /// The window's editing freezes still in flight, oldest first; `pendingSnapshots` wait for them.
     private var editingFreezeReads: [EditingMaterialRead] = []
     private let clipLedger = ClipExportLedger()
@@ -2670,6 +2682,44 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard controller.paused, !controller.shouldAutoResume(now: soon),
               controller.shouldAutoResume(now: soon + 5) else {
             throw CaptureError("An add-on's pause resumes on its own after 0.4 s (paused \(controller.paused))")
+        }
+    }
+
+    /// Snapshots reach the Options pages through `syncAddonSnapshotUI`. A change that arrives while
+    /// the Add-ons page is being typed into reloads it exactly once, after the typing ends.
+    static func verifySnapshotRebuilds() throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-rebuilds-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        guard let host = AddonHostClient(dataRoot: scratch.path, appVersion: "0.2.1", primary: true) else {
+            throw CaptureError("AddonHostClient failed to start")
+        }
+        controller.attach(addonHost: host)
+        defer { host.shutdownAndFree(); controller.addonHost = nil }
+        var generation: UInt64 = 1_000
+        func receive(enabled: Bool) {
+            generation += 1
+            let addon = AddonRecord(id: "verify.page", manifest: nil, enabled: enabled, state: "stopped", reason: nil,
+                pid: nil, message: nil, sources: [], settings: [], actions: [], control_allowed: false, control_asked: false)
+            host.verifyReceive(AddonSnapshot(schema: 1, generation: generation, ready: true, error: nil,
+                                             addons: [addon], appearances: [:], completed: []))
+            controller.syncAddonSnapshotUI()
+        }
+        controller.verifyOptionsPage = "Add-ons"
+        receive(enabled: false)
+        controller.verifyAddonsTabReloads = 0
+        controller.verifyEditingText = true
+        receive(enabled: true)
+        receive(enabled: false)
+        controller.syncAddonSnapshotUI() // the next tick, still typing
+        let whileTyping = controller.verifyAddonsTabReloads
+        controller.verifyEditingText = false
+        controller.syncAddonSnapshotUI()
+        controller.syncAddonSnapshotUI()
+        guard whileTyping == 0, controller.verifyAddonsTabReloads == 1, !controller.pendingAddonsTabReload else {
+            throw CaptureError("Add-ons page reloaded \(whileTyping) times while typing and \(controller.verifyAddonsTabReloads) after")
         }
     }
 
@@ -7046,6 +7096,22 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         RunLoop.current.currentMode == .eventTracking || NSEvent.pressedMouseButtons != 0
     }
 
+    /// Whether the Options window is on show at page `label`.
+    private func optionsPageShown(_ label: String) -> Bool {
+        #if BACKTRACKING_CAPTURE_VERIFY
+        if let verifyOptionsPage { return verifyOptionsPage == label }
+        #endif
+        return optionsPanel?.isVisible == true && optionTabs?.selectedTabViewItem?.label == label
+    }
+
+    /// Whether a text field of the Options window is being typed into.
+    private var editingOptionsText: Bool {
+        #if BACKTRACKING_CAPTURE_VERIFY
+        if let verifyEditingText { return verifyEditingText }
+        #endif
+        return optionsPanel?.firstResponder is NSTextView
+    }
+
     private func syncAddonSnapshotUI() {
         guard let host = addonHost else { return }
         let snap = host.snapshot
@@ -7056,12 +7122,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 pendingLookControlsRebuild = false
                 recomputeLook(refreshAppearanceTab: true)
             }
-            if pendingAddonsTabReload {
+        }
+        if pendingAddonsTabReload {
+            // A page no longer on show is built afresh when it next shows; one being typed into
+            // waits until the typing ends.
+            if !optionsPageShown("Add-ons") {
                 pendingAddonsTabReload = false
-                if optionsPanel?.isVisible == true, optionTabs?.selectedTabViewItem?.label == "Add-ons",
-                   !(optionsPanel?.firstResponder is NSTextView) {
-                    reloadAddonsTab()
-                }
+            } else if !userIsHandlingControls && !editingOptionsText {
+                pendingAddonsTabReload = false
+                reloadAddonsTab()
             }
         }
         guard snap.generation != lastAddonSnapshotForUI.generation else { return }
@@ -7087,18 +7156,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             }
             refreshWaveform()
         }
-        let optionsVisible = optionsPanel?.isVisible == true
-        if optionsVisible, let tabs = optionTabs {
-            let selectedLabel = tabs.selectedTabViewItem?.label
-            if selectedLabel == "Add-ons" {
+        if optionsPageShown("Add-ons") || optionsPageShown("Sources") {
+            if optionsPageShown("Add-ons") {
                 if Self.addonsPageChanged(from: prev, to: snap) {
-                    if userIsHandlingControls || optionsPanel?.firstResponder is NSTextView {
+                    if userIsHandlingControls || editingOptionsText {
                         pendingAddonsTabReload = true
                     } else {
                         reloadAddonsTab()
                     }
                 }
-            } else if selectedLabel == "Sources" && sourcesChanged {
+            } else if sourcesChanged {
                 let sourcesStructureChanged = !prev.addons.elementsEqual(snap.addons) { a, b in
                     a.id == b.id && a.state == b.state && a.sources.elementsEqual(b.sources) { s1, s2 in
                         s1.id == s2.id && s1.format == s2.format && s1.formats == s2.formats
@@ -7314,6 +7381,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     // MARK: Pkg 16 & 21 — Add-ons Page, Install Review, Settings, Actions, Remove
 
     private func reloadAddonsTab() {
+        #if BACKTRACKING_CAPTURE_VERIFY
+        verifyAddonsTabReloads += 1
+        #endif
         guard optionTabs != nil else { return }
         replaceOptionsTab(with: makeAddonsTab())
     }
