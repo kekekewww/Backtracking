@@ -553,6 +553,28 @@ struct AddonControlError: Codable, Equatable {
     let message: String
 }
 
+/// I6 step 5: every control request is checked against its add-on's current grant just before
+/// it runs. `currentGrant` answers nil when the grant cannot be confirmed; nothing runs then.
+enum AddonControlGate {
+    static func run(
+        _ calls: [AddonControlCall],
+        currentGrant: (AddonControlCall) -> Bool?,
+        refuse: (AddonControlCall, AddonControlError) -> Void,
+        execute: (AddonControlCall) -> Void
+    ) {
+        for call in calls {
+            switch currentGrant(call) {
+            case true?:
+                execute(call)
+            case false?:
+                refuse(call, AddonControlError(code: "not_allowed", message: "The user has not let this add-on control Backtracking"))
+            case nil:
+                refuse(call, AddonControlError(code: "failed", message: "The add-on manager did not respond."))
+            }
+        }
+    }
+}
+
 // MARK: - Position Events (Pkg 19)
 
 struct AddonChannelPosition: Codable, Equatable {
@@ -683,6 +705,13 @@ final class AddonHostClient {
             // snapshot again and collects any ticket that finished after this one was taken.
         }
         return true
+    }
+
+    /// The host's snapshot as of now, or nil when it cannot be read; never an older copy.
+    func confirmedSnapshot() -> AddonSnapshot? {
+        guard let ptr = handle else { return nil }
+        if bt_addon_host_generation(ptr) == lastGeneration { return snapshot }
+        return pollSnapshot(force: true) ? snapshot : nil
     }
 
     private func rawCommand(_ payload: [String: Any]) -> Data? {
@@ -1582,6 +1611,57 @@ extension AddonHostClient {
             throw MessageError("Completion callbacks ran A \(calls["A"] ?? 0) and B \(calls["B"] ?? 0) times; each must run exactly once")
         }
         guard client.callbacks.isEmpty else { throw MessageError("A completed ticket kept its callback") }
+    }
+
+    /// Each control request in a batch is checked against the grant at that moment: a grant
+    /// revoked mid-batch, or one that cannot be read, stops the requests that follow.
+    static func verifyControlGate() throws {
+        let command = AddonControlCommand(command: "start_capture", from_seconds_ago: nil, to_seconds_ago: nil,
+            start_frame: nil, end_frame: nil, lane: nil, first: nil, last: nil, seconds: nil, folder: nil, source: nil)
+        func calls(_ ids: [String]) -> [AddonControlCall] {
+            ids.map { AddonControlCall(addon_id: "verify.control", addon_name: "Verify", run: 1, request_id: $0, command: command) }
+        }
+        var executed: [String] = []
+        var refused: [String: String] = [:]
+        var checks = 0
+        var allowed = true
+        AddonControlGate.run(calls(["1", "2", "3"]), currentGrant: { _ in checks += 1; return allowed },
+                             refuse: { refused[$0.request_id] = $1.code }) { call in
+            executed.append(call.request_id)
+            allowed = false // The user's revocation lands while the first request runs.
+        }
+        guard executed == ["1"], refused == ["2": "not_allowed", "3": "not_allowed"], checks == 3 else {
+            throw MessageError("Revoked grant: executed \(executed), refused \(refused), checks \(checks)")
+        }
+        executed = []
+        refused = [:]
+        let grants: [String: Bool?] = ["1": true, "2": nil, "3": true]
+        AddonControlGate.run(calls(["1", "2", "3"]), currentGrant: { grants[$0.request_id] ?? nil },
+                             refuse: { refused[$0.request_id] = $1.code }) { executed.append($0.request_id) }
+        guard executed == ["1", "3"], refused == ["2": "failed"] else {
+            throw MessageError("Unreadable grant: executed \(executed), refused \(refused)")
+        }
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-grant-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        guard let client = AddonHostClient(dataRoot: root.path, appVersion: "0.2.1", primary: true) else {
+            throw MessageError("AddonHostClient failed to start")
+        }
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        while !client.snapshot.ready && ProcessInfo.processInfo.systemUptime < deadline {
+            client.pollSnapshot()
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        guard client.snapshot.ready, let confirmed = client.confirmedSnapshot(), confirmed.ready,
+              let handle = client.handle, confirmed.generation <= bt_addon_host_generation(handle) else {
+            client.shutdownAndFree()
+            throw MessageError("confirmedSnapshot did not return the host's current snapshot")
+        }
+        client.shutdownAndFree()
+        guard client.confirmedSnapshot() == nil else {
+            throw MessageError("confirmedSnapshot returned an old snapshot after the host went away")
+        }
     }
 }
 #endif

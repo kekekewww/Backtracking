@@ -7072,23 +7072,19 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private func executeControlCalls(_ calls: [AddonControlCall]) {
         guard let host = addonHost else { return }
         // I6 step 5: re-check current snapshot's control_allowed immediately before executing each request.
-        _ = host.pollSnapshot(force: true)
-        currentAddonSnapshot = host.snapshot
-        for call in calls {
-            let allowed = currentAddonSnapshot.addon(call.addon_id)?.control_allowed ?? false
-            if !allowed {
-                host.controlReply(
-                    call: call,
-                    error: AddonControlError(code: "not_allowed", message: "The user has not let this add-on control Backtracking")
-                )
-                continue
-            }
+        AddonControlGate.run(calls, currentGrant: { call in
+            guard let snapshot = host.confirmedSnapshot() else { return nil }
+            currentAddonSnapshot = snapshot
+            return snapshot.addon(call.addon_id)?.control_allowed ?? false
+        }, refuse: { call, error in
+            host.controlReply(call: call, error: error)
+        }) { call in
             if !call.command.isQuiet, let busy = controlBusyReason() {
                 host.controlReply(
                     call: call,
                     error: AddonControlError(code: "busy", message: "Backtracking is busy with \(busy); try again shortly")
                 )
-                continue
+                return
             }
             executeSingleControlCall(host: host, call: call)
         }

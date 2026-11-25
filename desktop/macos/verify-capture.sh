@@ -35,7 +35,8 @@ enum Verify {
         try verifyThemeAndReadability()
         try verifyStageBAddonsAndLook()
         try AddonHostClient.verifyTicketCompletions()
-        print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options, exit saves, hotkeys, row layout, silent channel tracking, theme, add-on host, ticket completions, look readability and positions passed.")
+        try AddonHostClient.verifyControlGate()
+        print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options, exit saves, hotkeys, row layout, silent channel tracking, theme, add-on host, ticket completions, control grant checks, look readability and positions passed.")
     }
 
     static func verifyFrequencyColors() throws {
