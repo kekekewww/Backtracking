@@ -1684,9 +1684,13 @@ final class SystemAudioTap {
         if lanes.count == 1 {
             return first.1
         }
-        let head = "Source \(captureLaneLetter(first.0)): \(first.1)"
+        let letter = captureLaneLetter(first.0)
+        let head = AppLanguage.current == .zhHant ? "來源 \(letter)：\(first.1)" : "Source \(letter): \(first.1)"
         let extra = problems.count - 1
         if extra == 0 { return head }
+        if AppLanguage.current == .zhHant {
+            return "\(head) · 另有 \(extra) 個來源有問題"
+        }
         if extra == 1 { return "\(head) · 1 more source has a problem" }
         return "\(head) · \(extra) more sources have a problem"
     }

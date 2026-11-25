@@ -177,7 +177,7 @@ func verifyMacControlSaveReply() throws {
 @MainActor
 func verifyMacOptionsRebuild(step: String) throws {
     _ = NSApplication.shared
-    if ["typed-values", "deferred", "sources-name", "open-list", "key-loop"].contains(step) {
+    if ["typed-values", "deferred", "sources-name", "open-list", "key-loop", "switch-while-typing", "switch-unchanged"].contains(step) {
         try BacktrackingController.verifyOptionsRebuildKeepsTyping(step: step)
         return
     }
@@ -2588,6 +2588,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         SystemAudioTap.verifyRequestedWidths = nil
         _ = controller.makeSourceTab()
         var lines: [[String]] = []
+        var statusMessages: [String] = []
         for language in [AppLanguage.english, .zhHant] {
             AppLanguage.verifyLanguage = language
             controller.updateCaptureCapacity()
@@ -2595,12 +2596,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             let count = (controller.sourcesCapacityNote?.stringValue ?? "").components(separatedBy: ". With ").first ?? ""
             lines.append([count,
                           controller.sourcesChannelsFullNote?.isHidden == false ? controller.sourcesChannelsFullNote?.stringValue ?? "" : "(hidden)"])
+            statusMessages.append(controller.tap?.sourceMessage ?? "")
         }
         guard lines == [["63 of 64 channels in use, and 1 kept for sources that cannot start",
                          "All 64 channels are in use, 1 of them kept for sources that cannot start. A source added now cannot start."],
                         ["已使用 63 個聲道，另有 1 個保留給無法開始的來源，上限 64 個",
                          "64 個聲道已全部使用，其中 1 個保留給無法開始的來源。現在新增的來源無法開始。"]] else {
             throw CaptureError("Sources page lines: \(lines)")
+        }
+        guard statusMessages[0].hasPrefix("Source A:") && statusMessages[0].contains("· 2 more sources have a problem"),
+              statusMessages[1].hasPrefix("來源 A：") && statusMessages[1].contains("· 另有 2 個來源有問題") else {
+            throw CaptureError("Status bar sourceMessage prefixes: \(statusMessages)")
         }
         guard refusals == ["Source D would bring the total to 65 channels, with one channel kept for each source that cannot start. The limit is 64.",
                            "來源 D 會使總數變成 65 個聲道（每個無法開始的來源保留 1 個），上限為 64。"] else {
@@ -3861,16 +3867,18 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             }
         case "key-loop":
             // The window's key view loop and initial first responder lead into the page; after
-            // the page is rebuilt neither points into the old page, which is still alive.
+            // the page is rebuilt neither points into the old page, which is freed cleanly.
             guard let addons = category("Add-ons"), let export = category("Export") else { throw CaptureError("No categories") }
             controller.selectOptionCategory(addons)
             window.recalculateKeyViewLoop()
-            guard let oldPage = page("Add-ons"), let firstField = editable(oldPage).first else { throw CaptureError("No Add-ons fields") }
-            window.initialFirstResponder = firstField
-            weak let oldView = oldPage
-            controller.reloadAddonsTab()
+            weak var oldView: NSView?
+            autoreleasepool {
+                guard let oldPage = page("Add-ons"), let firstField = editable(oldPage).first else { return }
+                oldView = oldPage
+                window.initialFirstResponder = firstField
+                controller.reloadAddonsTab()
+            }
             RunLoop.main.run(until: Date().addingTimeInterval(0.05))
-            guard let old = oldView else { throw CaptureError("The old page was let go at once") }
             var loop: [NSView] = []
             var node: NSView? = window.contentView
             for _ in 0..<200 {
@@ -3878,11 +3886,55 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 loop.append(current)
                 node = current
             }
-            let intoOld = loop.contains { $0 === old || $0.isDescendant(of: old) }
-            let initialIntoOld = window.initialFirstResponder.map { $0 === old || $0.isDescendant(of: old) } ?? false
+            let intoOld = oldView.map { old in loop.contains { $0 === old || $0.isDescendant(of: old) } } ?? false
+            let initialIntoOld = oldView.flatMap { old in window.initialFirstResponder.map { $0 === old || $0.isDescendant(of: old) } } ?? false
             controller.selectOptionCategory(export)
             guard !intoOld, !initialIntoOld else {
                 throw CaptureError("After the rebuild the key view loop leads into the old page: \(intoOld), the initial first responder: \(initialIntoOld)")
+            }
+        case "switch-while-typing":
+            // R1/N1: typing into an Add-ons Text or Number setting and clicking another category
+            // directly ends editing before NSTabView.selectTabViewItem: runs so AppKit never sends
+            // _setTabState: to a tab item freed re-entrantly during category switching.
+            guard let addons = category("Add-ons"), let export = category("Export") else { throw CaptureError("No categories") }
+            for (index, value) in ["/typed-before-switch", "0.8"].enumerated() {
+                controller.selectOptionCategory(addons)
+                try autoreleasepool {
+                    guard let view = page("Add-ons") else { throw CaptureError("No Add-ons page") }
+                    let fields = editable(view)
+                    guard fields.count == 2 else { throw CaptureError("The Add-ons page has \(fields.count) fields") }
+                    try type(value, into: fields[index])
+                }
+                controller.selectOptionCategory(export)
+                guard controller.optionTabs?.selectedTabViewItem?.label == "Export",
+                      controller.optionTabs?.subviews.count == 1 else {
+                    throw CaptureError("Switching to Export while editing left tab \(controller.optionTabs?.selectedTabViewItem?.label ?? "-") with \(controller.optionTabs?.subviews.count ?? -1) subviews")
+                }
+            }
+            controller.selectOptionCategory(addons)
+            let sent = (controller.addonSettingDrafts["verify.typing:folder"], controller.addonSettingDrafts["verify.typing:gain"])
+            guard sent.0 == .string("/typed-before-switch"), sent.1 == .double(0.8), addonsRegistered() else {
+                throw CaptureError("Switch while typing: drafts \(sent), registered \(addonsRegistered())")
+            }
+        case "switch-unchanged":
+            // R1/N1 scenario 1.1: reopening Options on Add-ons focuses the first editable field
+            // without typing; switching categories must neither crash nor send a spurious change.
+            guard let addons = category("Add-ons"), let export = category("Export") else { throw CaptureError("No categories") }
+            controller.selectOptionCategory(addons)
+            autoreleasepool {
+                guard let view = page("Add-ons"), let field = editable(view).first else { return }
+                _ = window.makeFirstResponder(field)
+            }
+            window.close()
+            _ = controller.prepareOptionsForShowing()
+            autoreleasepool {
+                guard let view = page("Add-ons"), let field = editable(view).last else { return }
+                _ = window.makeFirstResponder(field)
+            }
+            controller.selectOptionCategory(export)
+            guard controller.optionTabs?.selectedTabViewItem?.label == "Export",
+                  controller.addonSettingDrafts.isEmpty else {
+                throw CaptureError("Switching after focus without typing sent drafts \(controller.addonSettingDrafts) or landed on \(controller.optionTabs?.selectedTabViewItem?.label ?? "-")")
             }
         case "open-list":
             // A Choice setting's list is open when an add-on's answer rebuilds the page.
@@ -5069,7 +5121,21 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     @objc private func selectOptionCategory(_ sender: NSButton) {
         cancelHotkeyRecording()
         optionCategory = sender.tag
-        optionTabs?.selectTabViewItem(at: optionCategory)
+        if let tabs = optionTabs {
+            // Finish any edit on the outgoing page before entering NSTabView.selectTabViewItem:,
+            // so a field's end-of-editing action never removes the outgoing NSTabViewItem while
+            // AppKit still holds an unretained pointer to it for _setTabState: (R1/N1).
+            if let window = tabs.window,
+               let currentView = tabs.selectedTabViewItem?.view,
+               Self.responder(window.firstResponder, isInside: currentView) {
+                endingEditingForOptionsRebuild = true
+                _ = window.makeFirstResponder(nil)
+                endingEditingForOptionsRebuild = false
+            }
+            switchingOptionsTab = true
+            tabs.selectTabViewItem(at: optionCategory)
+            switchingOptionsTab = false
+        }
         for button in optionCategoryButtons { button.state = button === sender ? .on : .off }
         catchUpOptionsPage()
     }
@@ -5389,8 +5455,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private var endingEditingForOptionsRebuild = false
-    /// Pages taken out of the Options window, kept alive for a while (see rebuildOptionsPage).
-    private var retiredOptionsPages: [NSTabViewItem] = []
+    private var switchingOptionsTab = false
 
     /// A fresh page for `label`, built from the state now.
     private func makeOptionsPage(_ label: String) -> NSTabViewItem? {
@@ -5411,22 +5476,21 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     /// Builds the Options page `label` again from the latest state. AppKit keeps unretained
-    /// pointers to the view being edited (the field editor's client, the tab item's remembered
-    /// first responder), so a field of the old page that is being edited finishes first, while
-    /// the old page's controls are still registered, so what was typed is sent as usual (N1,
-    /// V10-M1). Only then is the new page built. When the edit cannot finish now (inside that
-    /// field's own end of editing, or a responder that will not let go) the page is only marked
-    /// to be built again; the poll, a category switch or reopening Options does it later. Every
-    /// request for one page in the meantime comes to one rebuild, from the state then.
+    /// pointers to the view being edited and to the outgoing NSTabViewItem during
+    /// `selectTabViewItem:` (sending `_setTabState:` after subview teardown). Never mutate the
+    /// tab view while a category switch or an edit finish is on the stack; otherwise finish any
+    /// active edit on the old page first while its controls are still registered (R1/N1, V10-M1),
+    /// then build and swap in the replacement. Deferred requests coalesce to one rebuild from the
+    /// latest state.
     private func rebuildOptionsPage(_ label: String) {
         guard !quitting, let tabs = optionTabs,
               tabs.tabViewItems.contains(where: { $0.label == label }) else { return }
+        if switchingOptionsTab || endingEditingForOptionsRebuild {
+            pendingOptionsPages.insert(label)
+            return
+        }
         if let window = tabs.window, let previous = tabs.tabViewItems.first(where: { $0.label == label }),
            Self.responder(window.firstResponder, isInside: previous.view) {
-            if endingEditingForOptionsRebuild {
-                pendingOptionsPages.insert(label)
-                return
-            }
             endingEditingForOptionsRebuild = true
             let ended = window.makeFirstResponder(nil)
             endingEditingForOptionsRebuild = false
@@ -5442,21 +5506,19 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard let page = makeOptionsPage(label) else { return }
         pendingOptionsPages.remove(label)
         current.initialFirstResponder = nil
-        // Nothing of the window may keep pointing into the old page: the window's initial first
-        // responder and the key view loop are set again, and the old page stays alive for a while
-        // so a pointer AppKit kept regardless finds a live, detached view (rc-v10 still crashed
-        // in -[NSTabView selectTabViewItem:] on a real desktop after N1's first fix).
         let window = tabs.window
         if let oldView = current.view, let initial = window?.initialFirstResponder,
            initial === oldView || initial.isDescendant(of: oldView) {
             window?.initialFirstResponder = nil
         }
-        retiredOptionsPages.append(current)
-        if retiredOptionsPages.count > 32 { retiredOptionsPages.removeFirst(retiredOptionsPages.count - 32) }
         let selected = tabs.selectedTabViewItem === current
         let offset = (current.view as? NSScrollView)?.contentView.bounds.origin ?? .zero
         tabs.insertTabViewItem(page, at: index)
-        if selected { tabs.selectTabViewItem(page) }
+        if selected {
+            switchingOptionsTab = true
+            tabs.selectTabViewItem(page)
+            switchingOptionsTab = false
+        }
         tabs.removeTabViewItem(current)
         window?.recalculateKeyViewLoop()
         if selected, let scroll = page.view as? NSScrollView {
@@ -9404,7 +9466,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     @objc private func addonSettingNumberChanged(_ sender: NSTextField) {
         guard let info = addonSettingNumberFields[sender], let host = addonHost else { return }
         let parsed = Double(sender.stringValue.trimmingCharacters(in: .whitespaces)) ?? info.min
-        let json = AddonJSONValue.snappedNumber(parsed, min: info.min, max: info.max, step: info.step)
+        let snapped = AddonJSONValue.snapNumber(parsed, min: info.min, max: info.max, step: info.step)
+        let json = AddonJSONValue.snappedNumber(snapped, min: info.min, max: info.max, step: info.step)
+        let slot = "\(info.addonID):\(info.key)"
+        if addonSettingDrafts[slot] == nil, addonProblems[slot] == nil,
+           let entry = currentAddonSnapshot.addon(info.addonID)?.settings.first(where: { $0.declaration.key == info.key }),
+           let currentVal = entry.value.doubleValue ?? entry.declaration.defaultValue.doubleValue,
+           AddonJSONValue.snappedNumber(currentVal, min: info.min, max: info.max, step: info.step) == json {
+            let decimals = AddonJSONValue.stepDecimals(info.step)
+            sender.stringValue = decimals == 0 ? String(format: "%.0f", snapped) : String(format: "%.\(decimals)f", snapped)
+            return
+        }
         submitAddonSetting(host: host, id: info.addonID, key: info.key, label: info.label, value: json)
     }
 
@@ -9419,6 +9491,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     @objc private func addonSettingTextChanged(_ sender: NSTextField) {
         guard let info = addonSettingTextFields[sender], let host = addonHost else { return }
         let clipped = String(sender.stringValue.prefix(200))
+        let slot = "\(info.addonID):\(info.key)"
+        if addonSettingDrafts[slot] == nil, addonProblems[slot] == nil,
+           let entry = currentAddonSnapshot.addon(info.addonID)?.settings.first(where: { $0.declaration.key == info.key }),
+           let current = entry.value.stringValue ?? entry.declaration.defaultValue.stringValue,
+           clipped == current {
+            sender.stringValue = clipped
+            return
+        }
         submitAddonSetting(host: host, id: info.addonID, key: info.key, label: info.label, value: .string(clipped))
     }
 
