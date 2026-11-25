@@ -2806,7 +2806,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if written.error != nil || names.filter({ $0.hasSuffix(".wav") }).count != 1 || !names.contains(where: { $0.contains("Object 1") }) {
             problems.append("export of Object 1 with Bed on show wrote \(names) \(written.error ?? "")")
         }
-        let slot = bt_preview_slot_new()
+        let slot = bt_preview_slot_new_local()
         defer { if let slot { bt_preview_slot_clear(slot); bt_preview_slot_free(slot) } }
         if let slot, let failure = frozen.play(in: slot, range: frozen.span, forceMono: false, fades: noFades,
                                                selectedRows: afterSwitch, hideSilentLanes: [], pairBinaural: false,

@@ -2118,7 +2118,7 @@ private func verifyMacMultiSourceCapture() throws {
     }
     bt_frozen_waveform(frozen, 2, 67, selectionStart, selectionEnd, &low, &high, 1, nil)
     guard high > 0, low == high else { throw CaptureError("The L/R row is missing its fold-down") }
-    guard let slot = bt_preview_slot_new() else { throw CaptureError("Could not create a preview slot") }
+    guard let slot = bt_preview_slot_new_local() else { throw CaptureError("Could not create a preview slot") }
     defer { bt_preview_slot_free(slot) }
     let playing = lanes.withUnsafeBufferPointer {
         bt_frozen_play(frozen, slot, $0.baseAddress, $0.count, selectionStart, selectionEnd, 0, 0, fades)

@@ -2706,7 +2706,8 @@ mod display_tests {
             bt_export_paths_free(paths);
 
             // Play selection subset succeeds.
-            let slot = PreviewSlot::new();
+            // Checks render on this process's own gate, never the one shared with other apps.
+            let slot = PreviewSlot::with_gate(crate::preview_ffi::local_gate());
             assert_eq!(
                 bt_frozen_play_selection(
                     frozen, &slot, sel.as_ptr(), sel.len(), first, end, 0, 0, Fades::NONE, &mut err,
@@ -2863,7 +2864,7 @@ mod display_tests {
                     positions,
                 }];
                 // A gate of this test alone: rendering must not silence another Backtracking.
-                let slot = PreviewSlot::with_gate(Box::leak(Box::new(crate::preview::PreviewGate::local())));
+                let slot = PreviewSlot::with_gate(crate::preview_ffi::local_gate());
                 let mut err: *mut c_char = ptr::null_mut();
                 assert_eq!(
                     bt_frozen_play_group_selection(
@@ -3005,7 +3006,8 @@ mod display_tests {
             bt_export_paths_free(paths);
 
             // Preview positioned group + bed pair succeeds.
-            let slot = PreviewSlot::new();
+            // Checks render on this process's own gate, never the one shared with other apps.
+            let slot = PreviewSlot::with_gate(crate::preview_ffi::local_gate());
             assert_eq!(
                 bt_frozen_play_group_selection(
                     frozen, &slot, group_lane.as_ptr(), 1, first, end, 0, 0, Fades::NONE, &mut err,

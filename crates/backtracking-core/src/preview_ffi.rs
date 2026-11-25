@@ -12,7 +12,7 @@ extern "C" fn bt_preview_slot_new() -> *mut PreviewSlot {
 }
 
 /// The gate of this process alone, made once and shared by every local slot.
-fn local_gate() -> &'static crate::preview::PreviewGate {
+pub(crate) fn local_gate() -> &'static crate::preview::PreviewGate {
     static LOCAL: std::sync::OnceLock<crate::preview::PreviewGate> = std::sync::OnceLock::new();
     LOCAL.get_or_init(crate::preview::PreviewGate::local)
 }
