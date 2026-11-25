@@ -2889,6 +2889,26 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if link("https://example.com/\u{7}a") || link("https://example.com/a\u{85}") || !link("https://example.com/it's") {
             problems.append("link checks")
         }
+        // Removing: ticking "Also delete its saved data" rebuilds the page without the keep-data note.
+        let addon = AddonRecord(id: "verify.remove", manifest: nil, enabled: false, state: "stopped", reason: nil,
+            pid: nil, message: nil, sources: [], settings: [], actions: [], control_allowed: false, control_asked: false)
+        controller.addonRemoval = (id: addon.id, name: "Verify", deleteData: false, busy: false, error: nil)
+        func texts(_ view: NSView) -> [String] {
+            ((view as? NSTextField).map { [$0.stringValue] } ?? []) + view.subviews.flatMap(texts)
+        }
+        let keepNote = "Unless you delete it, its saved data stays for a later install."
+        let card = controller.makeAddonCardGroup(addon)
+        let reloads = controller.verifyAddonsTabReloads
+        if let delete = controls(card).compactMap({ $0 as? NSButton }).first(where: { $0.title == "Also delete its saved data" }),
+           texts(card).contains(keepNote) {
+            delete.state = .on
+            controller.addonRemoveDeleteDataChanged(delete)
+            if controller.verifyAddonsTabReloads == reloads || texts(controller.makeAddonCardGroup(addon)).contains(keepNote) {
+                problems.append("ticking delete data left the keep-data note")
+            }
+        } else {
+            problems.append("the removal card has no delete-data box or note")
+        }
         guard problems.isEmpty else { throw CaptureError("Add-on settings: " + problems.joined(separator: "; ")) }
     }
 
@@ -8168,6 +8188,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard var rem = addonRemoval else { return }
         rem.deleteData = sender.state == .on
         addonRemoval = rem
+        reloadAddonsTab()
     }
 
     @objc private func addonConfirmRemove() {
