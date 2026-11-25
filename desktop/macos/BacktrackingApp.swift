@@ -134,6 +134,9 @@ enum BacktrackingApp {
         }
         if config.isTestCopy || config.invalidInstanceName {
             guard config.validateAndAcquireLock(primary: primary) else { return }
+            // A test copy neither restores nor keeps window state. Registered defaults live only in
+            // memory, so this writes nothing to the app's real preferences domain.
+            UserDefaults.standard.register(defaults: ["ApplePersistenceIgnoreState": true, "NSQuitAlwaysKeepsWindows": false])
         } else {
             if StartupUpdater.runHelperIfRequested() { return }
             if StartupUpdater.otherLaunchDuringUpdate() { return }
