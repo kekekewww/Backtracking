@@ -88,6 +88,10 @@ struct RecorderShortcut: Equatable, Codable {
         self == Self(code: code, modifiers: modifiers, key: "")
     }
 
+    func bareKeyMatches(_ other: RecorderShortcut) -> Bool {
+        modifiers.isEmpty && code == other.code
+    }
+
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.code == rhs.code && lhs.flags == rhs.flags }
 
     var title: String {
@@ -99,7 +103,8 @@ struct RecorderShortcut: Equatable, Codable {
 
     func error(for action: RecorderAction) -> String? {
         if code == Self.rightCommand.code {
-            return action == .separateLanes && self == Self.rightCommand ? nil : "Right Command is reserved for Edit separately."
+            return action == .separateLanes && self == Self.rightCommand
+                ? nil : "A tap of Right Command works only for Edit separately."
         }
         if code == UInt16(kVK_Escape) {
             return action == .cancelSelection && modifiers.isEmpty ? nil : "Escape is reserved for cancelling."
@@ -126,14 +131,57 @@ struct RecorderHotkeys {
 
     init(data: Data? = nil) {
         bindings = Dictionary(uniqueKeysWithValues: RecorderAction.allCases.map { ($0, $0.presets) })
-        if let data, let saved = try? JSONDecoder().decode([String: [RecorderShortcut]].self, from: data) {
-            var restored = Self()
-            restored.bindings = [:]
-            for action in RecorderAction.allCases {
-                guard restored.set(saved[action.rawValue] ?? action.presets, for: action) == nil else { return }
+        guard let data,
+              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+
+        // Package 11 / HK-22: decode per-action so a single malformed entry or conflict only resets
+        // that action to its default; explicit [] remains cleared.
+        var overrides: [RecorderAction: [RecorderShortcut]] = [:]
+        let decoder = JSONDecoder()
+        for (key, value) in raw {
+            guard let action = RecorderAction(rawValue: key),
+                  let array = value as? [Any] else { continue }
+            if array.isEmpty {
+                overrides[action] = []
+                continue
             }
-            self = restored
+            var parsed: [RecorderShortcut] = []
+            for item in array {
+                if let itemData = try? JSONSerialization.data(withJSONObject: item),
+                   let shortcut = try? decoder.decode(RecorderShortcut.self, from: itemData) {
+                    parsed.append(shortcut)
+                }
+            }
+            // Only an explicit empty array clears the action; if every entry was invalid, fall back to default.
+            if !parsed.isEmpty {
+                overrides[action] = parsed
+            }
         }
+
+        while true {
+            var restored = RecorderHotkeys(defaultsOnly: true)
+            for action in overrides.keys {
+                restored.bindings[action] = []
+            }
+            var rejected: RecorderAction?
+            for action in RecorderAction.allCases {
+                guard let candidate = overrides[action] else { continue }
+                if restored.set(candidate, for: action) != nil {
+                    rejected = action
+                    break
+                }
+            }
+            if let rejected {
+                overrides.removeValue(forKey: rejected)
+            } else {
+                self = restored
+                return
+            }
+        }
+    }
+
+    private init(defaultsOnly: Bool) {
+        bindings = Dictionary(uniqueKeysWithValues: RecorderAction.allCases.map { ($0, $0.presets) })
     }
 
     subscript(action: RecorderAction) -> [RecorderShortcut] { bindings[action] ?? [] }
@@ -146,14 +194,38 @@ struct RecorderHotkeys {
         RecorderAction.allCases.first { $0 != .globalSnapshot && self[$0].contains(shortcut) }
     }
 
+    /// Package 5 / HK-05: a bare cancel binding also matches when any modifiers are held or on key repeat,
+    /// provided a selection/gesture can be cancelled. Right Command tap never cancels.
+    func windowAction(for shortcut: RecorderShortcut, isRepeat: Bool, canCancel: Bool) -> RecorderAction? {
+        if canCancel && shortcut.code != RecorderShortcut.rightCommand.code {
+            if self[.cancelSelection].contains(where: { $0.bareKeyMatches(shortcut) }) {
+                return .cancelSelection
+            }
+        }
+        guard !isRepeat else { return nil }
+        return windowAction(for: shortcut)
+    }
+
+    private func conflicts(_ a: RecorderShortcut, for actionA: RecorderAction,
+                           with b: RecorderShortcut, for actionB: RecorderAction) -> Bool {
+        if a == b { return true }
+        let sameWindowScope = actionA != .globalSnapshot && actionB != .globalSnapshot
+        guard sameWindowScope else { return false }
+        if actionA == .cancelSelection && a.bareKeyMatches(b) { return true }
+        if actionB == .cancelSelection && b.bareKeyMatches(a) { return true }
+        return false
+    }
+
     @discardableResult
     mutating func set(_ shortcuts: [RecorderShortcut], for action: RecorderAction) -> String? {
-        guard shortcuts.count <= 2 else { return "Each action can have up to two shortcuts." }
-        if shortcuts.count == 2, shortcuts[0] == shortcuts[1] { return "This action already uses that shortcut." }
+        guard shortcuts.count <= 2 else { return "An action can have two shortcuts at most." }
+        if shortcuts.count == 2, shortcuts[0] == shortcuts[1] { return "This action already has this shortcut." }
         for shortcut in shortcuts {
             if let error = shortcut.error(for: action) { return error }
-            if let other = RecorderAction.allCases.first(where: { $0 != action && self[$0].contains(shortcut) }) {
-                return "This shortcut is already used by \(other.title)."
+            if let other = RecorderAction.allCases.first(where: { other in
+                other != action && self[other].contains(where: { conflicts(shortcut, for: action, with: $0, for: other) })
+            }) {
+                return "Already used by \(other.title)."
             }
         }
         bindings[action] = shortcuts

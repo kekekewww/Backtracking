@@ -28,7 +28,9 @@ enum Verify {
         try verifyMacOptions()
         try verifyFrequencyColors()
         try verifyRecorderHotkeys()
-        print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options and hotkeys passed.")
+        try verifyRowStackAndActivity()
+        try verifyThemeAndReadability()
+        print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options, hotkeys, row layout, silent channel tracking and theme passed.")
     }
 
     static func verifyFrequencyColors() throws {
@@ -44,15 +46,36 @@ enum Verify {
                   == [0xE8302C, 0x2C68EC, 0x2C68EC, 0x2C68EC] else {
             throw VerificationError("The gradient or live-edge colors changed")
         }
+        // Package 9: dark stop fails readability (< 2.0 contrast vs plot bg) and falls back to default at that stop position.
+        let dark = FrequencyGradient(stops: [
+            FrequencyGradient.Stop(position: 0, rgb: 0x161A1D),
+            FrequencyGradient.Stop(position: 1, rgb: 0x2C68EC)
+        ])
+        let readable = dark.readableForDrawing()
+        guard dark.hasUnreadableStops, !readable.hasUnreadableStops,
+              readable.stops[0].rgb == FrequencyGradient.standard.rgbAt(position: 0),
+              readable.stops[1].rgb == 0x2C68EC else {
+            throw VerificationError("Gradient readability fallback did not replace unreadable stop")
+        }
     }
 
     static func verifyRecorderHotkeys() throws {
         var hotkeys = RecorderHotkeys()
         let key = RecorderAction.toggleCapture.presets[0]
         let second = RecorderShortcut(code: 0, modifiers: [.control, .shift], key: "A")
+        let shiftBackspace = RecorderShortcut(code: 51, modifiers: [.shift], key: "Backspace")
+        let bareBackspace = RecorderShortcut(code: 51, modifiers: [], key: "Backspace")
         guard hotkeys.windowAction(for: key) == .toggleCapture,
               hotkeys.set([key], for: .saveSnapshot) != nil,
               hotkeys.set([key], for: .globalSnapshot) != nil,
+              // Package 11: bare cancel key (Backspace) conflicts with Shift+Backspace in window actions.
+              hotkeys.set([shiftBackspace], for: .saveSnapshot) != nil,
+              // Package 5 / HK-05: bare cancel binding matches with modifiers and on key repeat when canCancel is true.
+              hotkeys.windowAction(for: shiftBackspace, isRepeat: true, canCancel: true) == .cancelSelection,
+              hotkeys.windowAction(for: shiftBackspace, isRepeat: true, canCancel: false) == nil,
+              hotkeys.windowAction(for: bareBackspace, isRepeat: false, canCancel: true) == .cancelSelection,
+              // Package 11: Right Command tap rejected for non-separateLanes.
+              hotkeys.set([.rightCommand], for: .saveSnapshot) == "A tap of Right Command works only for Edit separately.",
               hotkeys.set([], for: .toggleCapture) == nil,
               hotkeys.set([key, second], for: .saveSnapshot) == nil,
               hotkeys.set([key, key], for: .saveSnapshot) != nil,
@@ -61,6 +84,89 @@ enum Verify {
         guard restored.windowAction(for: second) == .saveSnapshot, restored[.toggleCapture].isEmpty,
               restored.windowAction(for: .rightCommand) == .separateLanes else {
             throw VerificationError("Shortcut settings did not survive a reload")
+        }
+        // Package 11 / HK-22: partial-bad JSON keeps valid actions and explicit [] while resetting only the bad action.
+        let partialJSON = """
+        {"toggleCapture":[],"saveSnapshot":[{"code":0,"flags":131072,"key":"A"}],"keepOnTop":[{"code":9999,"flags":0,"key":""}]}
+        """.data(using: .utf8)!
+        let partial = RecorderHotkeys(data: partialJSON)
+        guard partial[.toggleCapture].isEmpty,
+              partial[.saveSnapshot].count == 1,
+              partial[.keepOnTop] == RecorderAction.keepOnTop.presets else {
+            throw VerificationError("Partial-bad hotkeys JSON did not preserve valid overrides")
+        }
+    }
+
+    static func verifyRowStackAndActivity() throws {
+        // Package 2: ChannelActivityTracker hysteresis (immediate appear, 2 quiet polls to hide, FL/FR-only -> empty).
+        var tracker = ChannelActivityTracker()
+        guard tracker.shown == nil else { throw VerificationError("Initial mask should be nil") }
+        let labels51 = ["FL", "FR", "FC", "LFE", "Ls", "Rs"]
+        guard ChannelActivityTracker.shownChannels(width: 6, labels: labels51, activeMask: 0b000011).isEmpty else {
+            throw VerificationError("FL/FR-only activity should hide channel rows below L/R pair")
+        }
+        tracker.recordAnswer(0b000111) // FL, FR, FC active
+        guard tracker.shown == 0b000111,
+              ChannelActivityTracker.shownChannels(width: 6, labels: labels51, activeMask: tracker.shown) == [0, 1, 2] else {
+            throw VerificationError("Active FC channel did not appear immediately")
+        }
+        tracker.recordAnswer(0b000011) // 1st quiet poll for FC: stays visible
+        guard ((tracker.shown ?? 0) & 0b000100) != 0 else {
+            throw VerificationError("Channel hid after only 1 quiet poll")
+        }
+        tracker.recordAnswer(0b000011) // 2nd quiet poll for FC: hides
+        guard ((tracker.shown ?? 0) & 0b000100) == 0 else {
+            throw VerificationError("Channel did not hide after 2 quiet polls")
+        }
+
+        // Package 4: RowStackLayout 1-2 lanes & >2 lanes single-column scroll + shortLabel + labelGutterWidth.
+        guard RowStackLayout.shortLabel("Object 12") == "12",
+              RowStackLayout.shortLabel("TpFC") == "TpFC",
+              RowStackLayout.shortLabel("Center") == "Cent",
+              RowStackLayout.labelGutterWidth(laneCount: 1, hasStacked: false) == 0,
+              RowStackLayout.labelGutterWidth(laneCount: 1, hasStacked: true) == 28,
+              RowStackLayout.labelGutterWidth(laneCount: 3, hasStacked: false) == 16,
+              RowStackLayout.labelGutterWidth(laneCount: 3, hasStacked: true) == 36 else {
+            throw VerificationError("RowStackLayout label/gutter rules mismatch")
+        }
+        let twoBoxes = RowStackLayout.layOut(height: 100, lanes: [LaneLayoutInput(rows: 1, stacked: false), LaneLayoutInput(rows: 14, stacked: true)], first: [0, 0])
+        guard twoBoxes.count == 2, twoBoxes[0].shown == 1, !twoBoxes[0].scrolls, twoBoxes[1].scrolls,
+              twoBoxes[1].rowHeight >= RowStackLayout.minRowHeight else {
+            throw VerificationError("Two-lane stacked layout failed")
+        }
+        let (colBoxes, col) = RowStackLayout.layOutColumn(height: 100, lanes: [
+            LaneLayoutInput(rows: 1, stacked: false),
+            LaneLayoutInput(rows: 1, stacked: false),
+            LaneLayoutInput(rows: 14, stacked: true)
+        ], first: 3)
+        guard colBoxes.count == 3, col.scrolls, col.first == 3, col.rowHeight >= RowStackLayout.minRowHeight else {
+            throw VerificationError("Multi-lane column scroll layout failed")
+        }
+
+        // Package 1: L/R pair atomic selection & rowsLabel formatting.
+        let specs: [WaveformRowSpec] = [
+            WaveformRowSpec(identity: .pair(lane: 0, side: 0), lane: 0, view: 67, shortLabel: "L", fullLabel: "L", laneChannelCount: 6, channelNumberOneBased: nil),
+            WaveformRowSpec(identity: .pair(lane: 0, side: 1), lane: 0, view: 68, shortLabel: "R", fullLabel: "R", laneChannelCount: 6, channelNumberOneBased: nil),
+            WaveformRowSpec(identity: .channel(lane: 0, index: 0), lane: 0, view: 3, shortLabel: "FL", fullLabel: "FL", laneChannelCount: 6, channelNumberOneBased: 1),
+            WaveformRowSpec(identity: .channel(lane: 0, index: 1), lane: 0, view: 4, shortLabel: "FR", fullLabel: "FR", laneChannelCount: 6, channelNumberOneBased: 2),
+        ]
+        let span = RowStackLayout.rowsBetween(allRows: specs, anchor: .pair(lane: 0, side: 1), cursor: .channel(lane: 0, index: 0))
+        guard span == [.pair(lane: 0, side: 0), .pair(lane: 0, side: 1), .channel(lane: 0, index: 0)],
+              RowStackLayout.rowsLabel(span, dual: false, channelLabels: [labels51]) == "L/R–FL",
+              RowStackLayout.rowsLabel(span, dual: true, channelLabels: [labels51]) == "A L/R–FL",
+              RowStackLayout.rowsLabel([.pair(lane: 0, side: 0), .whole(lane: 1)], dual: true, channelLabels: [labels51]) == "A L/R–B" else {
+            throw VerificationError("Cross-row span or label mismatch")
+        }
+    }
+
+    static func verifyThemeAndReadability() throws {
+        // Package 8: complement selection color vs 80-delta white fallback.
+        guard WaveformTheme.defaultAccentRGB == 0x67E7B5,
+              WaveformTheme.selectionRGB(for: 0x67E7B5) == (0x67E7B5 ^ 0xFFFFFF),
+              WaveformTheme.selectionRGB(for: 0x808080) == 0xFFFFFF,
+              WaveformTheme.isReadableGradientStop(0xE8302C),
+              !WaveformTheme.isReadableGradientStop(0x161A1D) else {
+            throw VerificationError("WaveformTheme color/contrast checks failed")
         }
     }
 

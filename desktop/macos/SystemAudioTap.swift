@@ -265,8 +265,33 @@ func requestSenderSnapshot(_ id: String) -> Bool {
     id.withCString { bt_sender_request_snapshot($0) != 0 }
 }
 
+struct RunningAppSnapshot: Sendable {
+    let pid: pid_t
+    let bundleIdentifier: String
+    let localizedName: String?
+    let isRegular: Bool
+}
+
+@MainActor
+func snapshotRunningApps() -> [RunningAppSnapshot] {
+    NSWorkspace.shared.runningApplications.compactMap { app in
+        guard app.activationPolicy != .prohibited, let bundle = app.bundleIdentifier else { return nil }
+        return RunningAppSnapshot(
+            pid: app.processIdentifier, bundleIdentifier: bundle,
+            localizedName: app.localizedName, isRegular: app.activationPolicy == .regular
+        )
+    }
+}
+
 @MainActor
 func availableCaptureSources(excluding privateDevices: Set<AudioObjectID>) -> [(source: CaptureSource, title: String)] {
+    scanCaptureSources(excluding: privateDevices, runningApps: snapshotRunningApps())
+}
+
+func scanCaptureSources(
+    excluding privateDevices: Set<AudioObjectID>,
+    runningApps apps: [RunningAppSnapshot]
+) -> [(source: CaptureSource, title: String)] {
     var choices: [(CaptureSource, String)] = []
     if TestCopyConfig.current.syntheticSystemFormat != nil
         || defaultDevice(kAudioHardwarePropertyDefaultOutputDevice) != nil {
@@ -289,11 +314,7 @@ func availableCaptureSources(excluding privateDevices: Set<AudioObjectID>) -> [(
         choices.append((.microphone(uid), name))
     }
 
-    // Workspace metadata names HAL playback clients and associates helper processes with their app.
-    let apps = NSWorkspace.shared.runningApplications.filter {
-        $0.activationPolicy != .prohibited && $0.bundleIdentifier != nil
-    }
-    let appsByPID = Dictionary(apps.map { ($0.processIdentifier, $0) }, uniquingKeysWith: { first, _ in first })
+    let appsByPID = Dictionary(apps.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
     let ownPID = ProcessInfo.processInfo.processIdentifier
     let ownBundle = Bundle.main.bundleIdentifier
     var namesByBundle: [String: String] = [:]
@@ -301,19 +322,17 @@ func availableCaptureSources(excluding privateDevices: Set<AudioObjectID>) -> [(
         guard hasPlaybackStream(object), let pid = processID(object), pid != ownPID else { continue }
         let bundle = audioString(object, kAudioProcessPropertyBundleID)
         var owner = appsByPID[pid]
-        if owner?.activationPolicy != .regular {
+        if owner?.isRegular != true {
             let helperOwner = apps.first { app in
-                guard let identifier = app.bundleIdentifier else { return false }
-                return bundle?.hasPrefix(identifier + ".helper") == true
+                bundle?.hasPrefix(app.bundleIdentifier + ".helper") == true
             }
             let ancestor = helperOwner ?? processLineage(pid).dropFirst()
-                .first(where: { appsByPID[$0]?.activationPolicy == .regular }).flatMap { appsByPID[$0] }
+                .first(where: { appsByPID[$0]?.isRegular == true }).flatMap { appsByPID[$0] }
             owner = ancestor ?? owner ?? apps.first { $0.bundleIdentifier == bundle }
         }
         guard let identifier = owner?.bundleIdentifier ?? bundle, !identifier.isEmpty,
               identifier != ownBundle else { continue }
-        namesByBundle[identifier] = owner?.localizedName ?? NSRunningApplication(processIdentifier: pid)?.localizedName
-            ?? namesByBundle[identifier] ?? identifier
+        namesByBundle[identifier] = owner?.localizedName ?? namesByBundle[identifier] ?? identifier
     }
     let sortedApps = namesByBundle.sorted {
         let order = $0.value.localizedStandardCompare($1.value)

@@ -406,7 +406,7 @@ When you switch modes, the desktop window fits the waveform panel's existing hei
 | Desktop app | Waveform-only minimum size | Full interface minimum size |
 | --- | --- | --- |
 | Windows | 240 × 48 logical pixels | 510 × 132 logical pixels |
-| macOS | 240 × 48 points | 560 × 100 points |
+| macOS | 240 × 48 points | 510 × 132 points |
 
 To restore the full interface, right-click the waveform and turn off **Show waveform only**. Windows/macOS native shadows are disabled in this mode; the optional thin border is controlled separately in Appearance Options. The desktop apps and the plug-in also let you set the border width (1 to 4 px) on the Appearance page of Options, and choose what is shown under **Show**: the app name in the toolbar, the level meters, and the capture status mark (**Always**, **Only when paused or failing** (**Only when paused** in the plug-in), or **Never**). With **Never**, nothing on the window marks a capture failure either.
 
@@ -467,11 +467,11 @@ The Windows desktop app can capture more sources than A and B at once, up to 64.
 
 ### macOS desktop from source
 
-The macOS app built from the current source has **Add source** and **Remove** in Options → **Sources**. It accepts up to 64 sources and 64 channels in total, with lanes lettered A through BL. **All channels** preserves a multichannel source. Its waveform has a stereo L/R pair and one row per channel. Scroll over either edge to see rows that do not fit. **Edit separately** selects an individual row and treats the L/R pair as one target.
+The macOS app built from the current source has **Add source** and **Remove** in Options → **Sources**. It accepts up to 64 sources and 64 channels in total, with lanes lettered A through BL. **All channels** preserves a multichannel source. Its waveform has a stereo L/R pair and one row per channel, with **Hide silent channels** on by default in Options → **Capture**. A left label gutter and a right scrollbar let you scroll rows that do not fit, and the window grows automatically up to 560 points for stacked channels or more than two sources. **Edit separately** supports cross-row selection across channels and sources (with edge auto-scroll) and treats the L/R pair as one target.
 
-Options → **Capture** sets whether the wide L/R pair sounds stereo or binaural. Options → **Export** offers one binaural or mono file per channel, one multichannel WAV, or one binaural mix. In Options → **Appearance**, choose **By frequency** under **Waveform color** to enable and edit the gradient.
+Options → **Capture** sets whether the wide L/R pair sounds stereo or binaural and whether silent channels are hidden. Options → **Export** offers one binaural or mono file per channel, one multichannel WAV, or one binaural mix. In Options → **Appearance**, choose **By frequency** under **Waveform color** to enable and edit the gradient (with readability checks against the dark plot background).
 
-Options → **Hotkeys** lets you set up to two shortcuts per action. The default system-wide snapshot shortcut uses Fn/Globe and the physical key left of 1 and requires Input Monitoring permission. **Reset** restores the Right Command tap for **Edit separately**.
+Options → **Hotkeys** lets you set up to two shortcuts per action. The default system-wide snapshot shortcut uses Fn/Globe and the physical key left of 1 and requires Input Monitoring permission. While recording **Edit separately**, a **Use a tap of Right Command** button restores or adds the Right Command tap.
 
 ### Live audio meter
 

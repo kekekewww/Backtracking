@@ -182,15 +182,21 @@ final class FrequencyGradientPreview: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        let drawn = gradient.readableForDrawing()
         guard let context = NSGraphicsContext.current?.cgContext,
-              let image = FrequencyWaveform.stripeImage(gradient.previewColors, fallback: 0, dimmed: false) else { return }
+              let image = FrequencyWaveform.stripeImage(drawn.previewColors, fallback: 0, dimmed: false) else { return }
         context.interpolationQuality = .none
         context.draw(image, in: bounds)
-        NSColor.white.withAlphaComponent(0.8).setStroke()
-        for stop in gradient.stops {
+        NSColor.white.withAlphaComponent(0.85).setStroke()
+        for stop in drawn.stops {
             let x = min(bounds.maxX - 0.5, max(bounds.minX + 0.5, bounds.width * stop.position))
-            NSBezierPath.strokeLine(from: NSPoint(x: x, y: bounds.minY),
-                to: NSPoint(x: x, y: bounds.minY + 4))
+            let tick = NSBezierPath()
+            tick.lineWidth = 2
+            tick.move(to: NSPoint(x: x, y: bounds.minY))
+            tick.line(to: NSPoint(x: x, y: bounds.minY + 4))
+            tick.stroke()
         }
+        NSColor(white: 1, alpha: 0.2).setStroke()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 2, yRadius: 2).stroke()
     }
 }

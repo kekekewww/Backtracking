@@ -12,16 +12,19 @@ private let exportSampleRates: [UInt32] = [44_100, 48_000, 96_000]
 private let exportBitDepths: [UInt32] = [16, 24, 32]
 private let frameAutosaveName: NSWindow.FrameAutosaveName = "Backtracking.Panel"
 private let receiverWindowArgument = "--new-capture-window"
-private let fullPanelMinimum = NSSize(width: 560, height: 100)
+private let fullPanelMinimum = NSSize(width: 510, height: 132)
+private let fullPanelDefault = NSSize(width: 610, height: 144)
 private let waveformOnlyPanelMinimum = NSSize(width: 240, height: 48)
+private let waveformOnlyPanelDefault = NSSize(width: 610, height: 59)
 private let panelVerticalInset: CGFloat = 8
+private let statusStripHeight: CGFloat = 26
 private let waveformFrameInset: CGFloat = 1
 private let secondsLineChoices: [UInt32] = [1, 5, 10]
 private let borderWidthChoices: [UInt32] = [1, 2, 3, 4]
 // Days before an old drag-and-drop file is deleted. 0 is Off, as in the Windows app.
 private let cleanupAgeChoices: [UInt32] = [0, 10, 20, 30, 60, 90]
 private let optionLabelWidth: CGFloat = 232
-private let problemColor = NSColor(srgbRed: 246 / 255, green: 196 / 255, blue: 118 / 255, alpha: 1)
+private let problemColor = WaveformTheme.statusUnavailable
 
 /// The default toggle for editing sources separately.
 private let rightCommandKeyCode: UInt16 = 54
@@ -32,9 +35,11 @@ private let rightCommandDeviceMask: UInt = 0x10
 private let tapLimit: TimeInterval = 0.5
 /// As long as a source's name in a file name may be, as in the core.
 private let sourceNameLimit = 48
+private let sourceFileNameMaxEntries = 64
 private let sourceFileNamesKey = "sourceFileNames"
-private let fullWaveformMinimumHeight: CGFloat = 51
-private let defaultAccentRGB: UInt32 = 0x52E3D1
+private let sourceFileNameOrderKey = "sourceFileNameOrder"
+private let fullWaveformMinimumHeight: CGFloat = 46
+private let defaultAccentRGB: UInt32 = WaveformTheme.defaultAccentRGB
 
 private func accentColor(_ rgb: UInt32) -> NSColor {
     NSColor(
@@ -70,6 +75,7 @@ enum BacktrackingApp {
             guard config.validateAndAcquireLock(primary: primary) else { return }
         } else {
             if StartupUpdater.runHelperIfRequested() { return }
+            if StartupUpdater.otherLaunchDuringUpdate() { return }
         }
         let app = NSApplication.shared
         let delegate = BacktrackingController()
@@ -148,14 +154,32 @@ private class KeyPanel: NSPanel {
 private final class HotkeyOptionsPanel: KeyPanel {
     var recordKey: ((NSEvent) -> Bool)?
     var cancelRecording: (() -> Void)?
+    var canCloseWithEscape: (() -> Bool)?
 
     override func sendEvent(_ event: NSEvent) {
-        if event.type == .keyDown, recordKey?(event) == true { return }
+        if event.type == .keyDown {
+            if recordKey?(event) == true { return }
+            if event.keyCode == UInt16(kVK_Escape), !event.isARepeat {
+                if canCloseWithEscape?() == true {
+                    performClose(nil)
+                }
+                return
+            }
+        }
         super.sendEvent(event)
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.type == .keyDown, recordKey?(event) == true { return true }
+        if event.type == .keyDown {
+            if recordKey?(event) == true { return true }
+            if event.keyCode == UInt16(kVK_Escape), !event.isARepeat {
+                if canCloseWithEscape?() == true {
+                    performClose(nil)
+                    return true
+                }
+                return false
+            }
+        }
         return super.performKeyEquivalent(with: event)
     }
 
@@ -212,7 +236,20 @@ private final class OptionsChoiceTable: NSTableView {
 // A bounded, native table supplies the ten-row limit that NSMenu does not expose.
 private final class OptionsPopUpButton: NSPopUpButton, NSTableViewDataSource, NSTableViewDelegate {
     private var choicePopover: NSPopover?
+    private weak var choiceTable: OptionsChoiceTable?
     private var choiceItems: [NSMenuItem] = []
+
+    var isChoicePopoverShown: Bool { choicePopover?.isShown == true }
+
+    func reloadChoicesIfOpen() {
+        guard choicePopover?.isShown == true, let table = choiceTable else { return }
+        choiceItems = itemArray
+        table.reloadData()
+        let selected = indexOfSelectedItem
+        if choiceItems.indices.contains(selected) {
+            table.selectRowIndexes(IndexSet(integer: selected), byExtendingSelection: false)
+        }
+    }
 
     override func mouseDown(with event: NSEvent) { showChoices() }
     override func performClick(_ sender: Any?) { showChoices() }
@@ -283,6 +320,7 @@ private final class OptionsPopUpButton: NSPopUpButton, NSTableViewDataSource, NS
         popover.behavior = .transient
         popover.animates = false
         choicePopover = popover
+        choiceTable = table
         popover.show(relativeTo: bounds, of: self, preferredEdge: .minY)
         let selected = indexOfSelectedItem
         if choiceItems.indices.contains(selected) {
@@ -336,7 +374,8 @@ private final class CapturePanel: KeyPanel {
     var onManualResize: (() -> Void)?
     /// Runs one of the recorder's own keys. False lets the key go on to the focused control.
     var onCommand: ((RecorderAction) -> Bool)?
-    var actionForShortcut: ((RecorderShortcut) -> RecorderAction?)?
+    var actionForShortcut: ((RecorderShortcut, Bool, Bool) -> RecorderAction?)?
+    var hasPopupOpen: (() -> Bool)?
     weak var waveform: WaveformView?
     private var move: MoveGesture?
     private var resize: ResizeGesture?
@@ -397,7 +436,7 @@ private final class CapturePanel: KeyPanel {
             rightCommandPress = alone ? event.timestamp : nil
         } else if let press = rightCommandPress {
             rightCommandPress = nil
-            if event.timestamp - press <= tapLimit, let action = actionForShortcut?(.rightCommand) {
+            if event.timestamp - press <= tapLimit, let action = actionForShortcut?(.rightCommand, false, false) {
                 _ = onCommand?(action)
             }
         }
@@ -478,10 +517,19 @@ private final class CapturePanel: KeyPanel {
     }
 
     private func handleShortcut(_ event: NSEvent) -> Bool {
-        guard !event.isARepeat, !(firstResponder is NSTextView) else { return false }
+        guard !(firstResponder is NSTextView) else { return false }
         let shortcut = RecorderShortcut(event: event)
-        guard let action = actionForShortcut?(shortcut) else { return false }
-        if firstResponder is NSControl, shortcut.modifiers.isEmpty, action != .cancelSelection { return false }
+        let popupOpen = hasPopupOpen?() == true
+        let canCancel = !popupOpen && (waveform?.canCancelSelection == true || waveform?.hasPendingDragWrite == true)
+        guard let action = actionForShortcut?(shortcut, event.isARepeat, canCancel) else { return false }
+        if action == .cancelSelection {
+            // HK-05: consume cancel key when selection or drag gesture is active and no popup is open.
+            guard canCancel else { return false }
+            _ = onCommand?(action)
+            return true
+        }
+        guard !event.isARepeat else { return false }
+        if firstResponder is NSControl, shortcut.modifiers.isEmpty { return false }
         return onCommand?(action) == true
     }
 
@@ -1198,10 +1246,10 @@ private final class CaptureLamp: NSView {
         super.draw(dirtyRect)
         guard shown, let state else { return }
         let color: NSColor = switch state {
-        case .unavailable: .systemOrange
-        case .paused: .quaternaryLabelColor
-        case .waiting: .tertiaryLabelColor
-        case .recording: .systemRed.withAlphaComponent(bright ? 1 : 0.27)
+        case .unavailable: WaveformTheme.statusUnavailable
+        case .paused: WaveformTheme.statusPaused
+        case .waiting: WaveformTheme.statusWaiting
+        case .recording: bright ? WaveformTheme.statusRecordingBright : WaveformTheme.statusRecordingDim
         }
         color.setFill()
         NSBezierPath(ovalIn: NSRect(x: bounds.midX - 4, y: bounds.midY - 4, width: 8, height: 8)).fill()
@@ -1241,6 +1289,7 @@ private struct CompactStatus: Equatable {
 private final class CaptureBackground: NSView {
     weak var waveform: NSView?
     var backgroundOpacity: CGFloat = 1 { didSet { needsDisplay = true } }
+    var waveformOnly = false { didSet { needsDisplay = true } }
     var showsOutline = false { didSet { needsDisplay = true } }
     var outlineWidth: CGFloat = 1 { didSet { needsDisplay = true } }
     var outlineColor = NSColor.white { didSet { needsDisplay = true } }
@@ -1254,28 +1303,32 @@ private final class CaptureBackground: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         NSGraphicsContext.current?.cgContext.clear(dirtyRect)
+        let radius: CGFloat = waveformOnly ? 0 : WaveformTheme.cornerRadius
         let waveRect = waveform.map { convert($0.bounds, from: $0) }
-        let waveShape = waveRect.map { NSBezierPath(roundedRect: $0, xRadius: 6, yRadius: 6) }
+        let waveShape = waveRect.map { NSBezierPath(roundedRect: $0, xRadius: radius, yRadius: radius) }
         if backgroundOpacity > 0 {
             let fill = NSBezierPath(rect: bounds)
             if let waveShape {
                 fill.append(waveShape)
                 fill.windingRule = .evenOdd
             }
-            NSColor.windowBackgroundColor.withAlphaComponent(backgroundOpacity).setFill()
+            WaveformTheme.panelBackground.withAlphaComponent(backgroundOpacity).setFill()
             fill.fill()
             if let waveShape {
-                NSColor(calibratedRed: 0.07, green: 0.09, blue: 0.12, alpha: backgroundOpacity).setFill()
+                WaveformTheme.plotBackground.withAlphaComponent(backgroundOpacity).setFill()
                 waveShape.fill()
             }
         }
         if showsOutline, let waveRect, let waveShape {
-            let outline = NSBezierPath(
-                roundedRect: waveRect.insetBy(dx: -outlineWidth, dy: -outlineWidth),
-                xRadius: 6 + outlineWidth, yRadius: 6 + outlineWidth
-            )
+            // Package 8 / LOOK-08: draw border inside the waveform rect.
+            let innerRect = waveRect.insetBy(dx: outlineWidth, dy: outlineWidth)
+            let innerRadius = max(0, radius - outlineWidth)
+            let outline = NSBezierPath()
             outline.append(waveShape)
-            outline.windingRule = .evenOdd
+            if innerRect.width > 0 && innerRect.height > 0 {
+                outline.append(NSBezierPath(roundedRect: innerRect, xRadius: innerRadius, yRadius: innerRadius))
+                outline.windingRule = .evenOdd
+            }
             outlineColor.withAlphaComponent(outlineFollowsOpacity ? backgroundOpacity : 1).setFill()
             outline.fill()
         }
@@ -1359,20 +1412,28 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private lazy var snapshotShortcut = SnapshotShortcut { [weak self] in self?.dispatchSnapshotShortcut() }
     private var hotkeys = RecorderHotkeys()
     private var recordingShortcut: (action: RecorderAction, index: Int)?
-    private var hotkeyNote: String?
+    private var hotkeyErrorAction: RecorderAction?
+    private var hotkeyErrorText: String?
     private weak var snapshotShortcutLabel: NSTextField?
     private var lastShortcutCheck = 0.0
+    private var lastSnapshotTargetCheck = 0.0
     private var snapshotTargetID: String?
     private weak var snapshotTargetPopup: NSPopUpButton?
     private weak var shortcutPermissionButton: NSButton?
     private var optionTabs: NSTabView?
     private var optionCategoryButtons: [NSButton] = []
     private var optionCategory = 0
+    private var optionsOpenedOnce = false
     private let worker = DispatchQueue(label: "backtracking.wav-export", qos: .userInitiated)
+    private let sourceScanQueue = DispatchQueue(label: "Backtracking.source-scan", qos: .userInitiated)
+    private var sourceScanInFlight = false
+    private var sourceScanQueued = false
+    private var cachedSourceChoices: [(source: CaptureSource, title: String)]?
+    private var sourceScanError: String?
     private let pendingProvisionalWAVs = PendingProvisionalWAVs()
     private var tap: SystemAudioTap?
     private var panel: CapturePanel?
-    private var optionsPanel: KeyPanel?
+    private var optionsPanel: HotkeyOptionsPanel?
     private var statusItem: NSStatusItem?
     private var background: CaptureBackground?
     private var waveform: WaveformView?
@@ -1382,14 +1443,20 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private let titleLabel = NSTextField(labelWithString: "Backtracking")
     private let clearButton = NSButton(title: "Clear capture", target: nil, action: nil)
     private let pinButton = NSButton(title: "Keep on top", target: nil, action: nil)
-    private let meterButton = NSButton(title: "— dBFS", target: nil, action: nil)
-    private let meterBButton = NSButton(title: "B — dBFS", target: nil, action: nil)
-    private var sourcePopups: [NSPopUpButton] = []
+    private let metersStack = NSStackView(views: [])
+    private var meterButtons: [NSButton] = []
+    private var meterWidthConstraints: [NSLayoutConstraint] = []
+    private var meterPopover: NSPopover?
+    private var meterPopoverButtons: [NSButton] = []
+    private var sourcePopups: [OptionsPopUpButton] = []
     private var routePopups: [NSPopUpButton] = []
+    private var sourceProblemNotes: [NSTextField] = []
     private var waveformModePopup: NSPopUpButton?
     private let moreMetersButton = NSButton(title: "", target: nil, action: nil)
-    private var addSourcePopup: NSPopUpButton?
+    private var addSourcePopup: OptionsPopUpButton?
     private weak var sourcesCapacityNote: NSTextField?
+    private weak var sourcesFullNote: NSTextField?
+    private weak var sourcesChannelsFullNote: NSTextField?
     private weak var captureCapacityNote: NSTextField?
     private var secondsIntervalPopup: NSPopUpButton?
     private var borderDependents: [NSControl] = []
@@ -1415,7 +1482,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var waveformTopWithoutToolbar: NSLayoutConstraint?
     private var waveformLeading: NSLayoutConstraint?
     private var waveformTrailing: NSLayoutConstraint?
-    private var waveformBottom: NSLayoutConstraint?
+    private var waveformBottomWithStatus: NSLayoutConstraint?
+    private var waveformBottomWithoutStatus: NSLayoutConstraint?
+    private var statusHeightConstraint: NSLayoutConstraint?
     private var fullPanelSize: NSSize?
     private var history: UInt32 = 20
     private var historyChangePending = false
@@ -1425,8 +1494,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var accentRGB = defaultAccentRGB
     private var frequencyColoring = false
     private var frequencyGradient = FrequencyGradient.standard
+    private var hasCustomFrequencyGradient = false
     private var frequencyGradientControls: NSStackView?
     private weak var frequencyGradientPreview: FrequencyGradientPreview?
+    private var frequencyStopPercentLabels: [Int: NSTextField] = [:]
+    private weak var frequencyIllegibleNote: NSTextField?
     private var showsBars = false
     private var showsSeconds = false
     private var secondsInterval: UInt32 = 5
@@ -1448,8 +1520,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         return dualSource || width > 2 || (stereoWaveform && width == 2)
     }
     /// The names the user gave sources for their files, by source key. A name belongs to the
-    /// device, so it follows it to either lane.
+    /// device, so it follows it to either lane. Capped at 64 most-recently-named entries (OPT-22).
     private var sourceFileNames: [String: String] = [:]
+    private var sourceFileNameOrder: [String] = []
     private var fileNameFields: [NSTextField] = []
     /// The source each File name field shows the name of, so typing never names another one.
     private var fileNameSourceKeys: [String] = []
@@ -1496,6 +1569,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if let settings = defaults.array(forKey: "waveformFrequencyGradient") as? [[String: Any]],
            let saved = FrequencyGradient(settings: settings) {
             frequencyGradient = saved
+            hasCustomFrequencyGradient = true
         }
         showsBars = defaults.bool(forKey: "showsBars")
         showsSeconds = defaults.bool(forKey: "showsSeconds")
@@ -1644,6 +1718,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         stereoWaveform = defaults.bool(forKey: "stereoWaveform")
         if let names = defaults.dictionary(forKey: sourceFileNamesKey) as? [String: String] {
             sourceFileNames = names.filter { !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            let savedOrder = (defaults.array(forKey: sourceFileNameOrderKey) as? [String] ?? [])
+                .filter { sourceFileNames[$0] != nil }
+            let extras = sourceFileNames.keys.filter { !savedOrder.contains($0) }.sorted()
+            sourceFileNameOrder = savedOrder + extras
+            trimSourceFileNamesIfNeeded()
         }
     }
 
@@ -1789,7 +1868,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         if let source = sourcePopups.first(where: { $0.menu === menu })
             ?? (addSourcePopup?.menu === menu ? addSourcePopup : nil) {
-            refreshSourcePopup(source, choices: availableCaptureSources(excluding: tap?.privatePlaybackDevices ?? []))
+            // Package 10 / CAP-06: trigger async background source scan when opening Audio source or Add source.
+            startBackgroundSourceScan()
+            refreshSourcePopup(source, choices: cachedSourceChoices ?? [], scanning: sourceScanInFlight)
             return
         }
         guard menu === statusItem?.menu else { return }
@@ -1816,9 +1897,19 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
+    private func trimSourceFileNamesIfNeeded() {
+        while sourceFileNameOrder.count > sourceFileNameMaxEntries {
+            let evicted = sourceFileNameOrder.removeFirst()
+            sourceFileNames.removeValue(forKey: evicted)
+        }
+    }
+
     private func hidePanel(_ panel: NSWindow) {
-        // Nothing would show the preview or stop it.
+        // Package 12 / WIN-18: stop preview, close Options and meter popover, abort active gestures.
         waveform?.stopPreview()
+        waveform?.abortGestures()
+        closeMeterPopover()
+        optionsPanel?.orderOut(nil)
         if !independentWindow && !testCopy { panel.saveFrame(usingName: frameAutosaveName) }
         panel.orderOut(nil)
         updateOptionsVisibility()
@@ -1833,11 +1924,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func configurePanel() {
+        let initialSize = waveformOnly ? waveformOnlyPanelDefault : fullPanelDefault
         let window = CapturePanel(
-            contentRect: NSRect(x: 0, y: 0, width: 590, height: 116),
+            contentRect: NSRect(origin: .zero, size: initialSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
+        // Package 8 / LOOK-01: window is always dark.
+        window.appearance = NSAppearance(named: .darkAqua)
         window.title = TestCopyConfig.current.windowTitle(independentWindow ? "Backtracking Capture" : "Backtracking")
         window.contentMinSize = fullPanelMinimum
         // CapturePanel handles dragging and resizing without AppKit's native window gestures.
@@ -1852,9 +1946,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             self?.lastManualResize = ProcessInfo.processInfo.systemUptime
             self?.autoGrownBaseHeight = nil
             self?.autoGrownTargetHeight = nil
+            self?.updateMeter()
         }
         window.onCommand = { [weak self] command in self?.run(command) ?? false }
-        window.actionForShortcut = { [weak self] shortcut in self?.hotkeys.windowAction(for: shortcut) }
+        window.actionForShortcut = { [weak self] shortcut, isRepeat, canCancel in
+            self?.hotkeys.windowAction(for: shortcut, isRepeat: isRepeat, canCancel: canCancel)
+        }
+        window.hasPopupOpen = { [weak self] in
+            self?.meterPopover?.isShown == true
+        }
 
         let waveform = WaveformView(frame: .zero)
         waveform.controller = self
@@ -1880,18 +1980,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         titleLabel.font = .systemFont(ofSize: 14, weight: .bold)
         titleLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
         titleLabel.isHidden = !showsTitle
-        for (lane, button) in [meterButton, meterBButton].enumerated() {
-            button.tag = lane
-            button.target = self
-            button.action = #selector(showMeterOptions(_:))
-            button.bezelStyle = .rounded
-            button.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-            button.widthAnchor.constraint(equalToConstant: 100).isActive = true
-        }
+
+        metersStack.orientation = .horizontal
+        metersStack.spacing = 4
+        metersStack.alignment = .centerY
         moreMetersButton.target = self
         moreMetersButton.action = #selector(showMoreMeters(_:))
         moreMetersButton.bezelStyle = .rounded
-        updateMeter()
+        moreMetersButton.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
+        moreMetersButton.widthAnchor.constraint(equalToConstant: 34).isActive = true
 
         pinButton.target = self
         pinButton.action = #selector(pinChanged(_:))
@@ -1902,20 +1999,22 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         setIcon("gearshape", label: "Options", on: settingsButton)
         let spacer = NSView(frame: .zero)
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        // The same order as the Windows toolbar: name, transport, status mark, clear and pin on
-        // the left, the meters and Options on the right.
+        // Package 6 / WIN-08: name, transport, status lamp, clear, pin on left; meters, +N, gear on right.
         let controls = NSStackView(views: [
-            titleLabel, captureButton, captureLamp, clearButton, pinButton, statusLabel, spacer,
-            meterButton, meterBButton, moreMetersButton, settingsButton
+            titleLabel, captureButton, captureLamp, clearButton, pinButton, spacer,
+            metersStack, moreMetersButton, settingsButton
         ])
         controls.orientation = .horizontal
         controls.spacing = 6
         controls.alignment = .centerY
 
-        statusLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        // Package 6 / TL-02 / WIN-06: 26px status strip below the waveform.
+        statusLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.maximumNumberOfLines = 1
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        statusLabel.isHidden = true
+        statusLabel.isHidden = false
         let content = CaptureBackground(frame: window.contentView?.bounds ?? .zero)
         content.waveform = waveform
         window.contentView = content
@@ -1923,27 +2022,38 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         window.trackChrome(in: content)
         content.addSubview(waveform)
         content.addSubview(controls)
+        content.addSubview(statusLabel)
         waveform.translatesAutoresizingMaskIntoConstraints = false
         controls.translatesAutoresizingMaskIntoConstraints = false
-        let toolbarTrailing = controls.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10)
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        let toolbarTrailing = controls.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -panelVerticalInset)
         self.toolbarTrailing = toolbarTrailing
-        let waveformLeading = waveform.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10)
-        let waveformTrailing = waveform.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10)
-        let waveformBottom = waveform.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -panelVerticalInset)
+        let waveformLeading = waveform.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: panelVerticalInset)
+        let waveformTrailing = waveform.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -panelVerticalInset)
+        let statusHeight = statusLabel.heightAnchor.constraint(equalToConstant: statusStripHeight)
+        self.statusHeightConstraint = statusHeight
+        let waveformBottomWithStatus = waveform.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -2)
+        let waveformBottomWithoutStatus = waveform.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -frameInset)
         self.waveformLeading = waveformLeading
         self.waveformTrailing = waveformTrailing
-        self.waveformBottom = waveformBottom
+        self.waveformBottomWithStatus = waveformBottomWithStatus
+        self.waveformBottomWithoutStatus = waveformBottomWithoutStatus
         NSLayoutConstraint.activate([
-            controls.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            controls.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: panelVerticalInset),
             toolbarTrailing,
             controls.topAnchor.constraint(equalTo: content.topAnchor, constant: panelVerticalInset),
-            waveformLeading, waveformTrailing, waveformBottom
+            waveformLeading, waveformTrailing, waveformBottomWithStatus,
+            statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: panelVerticalInset),
+            statusLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -panelVerticalInset),
+            statusLabel.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: 0),
+            statusHeight
         ])
         toolbar = controls
         waveformTopBelowToolbar = waveform.topAnchor.constraint(equalTo: controls.bottomAnchor, constant: 6)
         waveformTopBelowToolbar?.isActive = true
         waveformTopWithoutToolbar = waveform.topAnchor.constraint(equalTo: content.topAnchor, constant: frameInset)
         panel = window
+        updateMeter()
         applyPin()
         if waveformOnly { window.contentMinSize = waveformOnlyPanelMinimum }
         let restoredFrame = !independentWindow && !testCopy && window.setFrameUsingName(frameAutosaveName, force: true)
@@ -1997,6 +2107,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         registerClick()
         let window = optionsPanel ?? makeOptionsPanel()
         optionsPanel = window
+        if !optionsOpenedOnce {
+            optionsOpenedOnce = true
+            optionCategory = 0
+            if let first = optionCategoryButtons.first { selectOptionCategory(first) }
+        }
+        window.isFloatingPanel = alwaysOnTop
+        window.level = alwaysOnTop ? .floating : .normal
         refreshSourceOptions()
         refreshSnapshotTargets()
         refreshShortcutPermission()
@@ -2015,25 +2132,36 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
-    private func makeOptionsPanel() -> KeyPanel {
-        let initialSize = harness?.optionsSize ?? NSSize(width: 760, height: 560)
+    private func makeOptionsPanel() -> HotkeyOptionsPanel {
+        let initialSize = harness?.optionsSize ?? NSSize(width: 820, height: 640)
         let window = HotkeyOptionsPanel(
             contentRect: NSRect(origin: .zero, size: initialSize),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false
         )
+        // Package 8 / LOOK-01 & Package 12 / OPT-01: dark appearance, 820x640, tracks pin level.
+        window.appearance = NSAppearance(named: .darkAqua)
         window.title = TestCopyConfig.current.windowTitle(independentWindow ? "Backtracking Capture Options" : "Backtracking Options")
         window.recordKey = { [weak self] event in self?.recordHotkey(event) ?? false }
         window.cancelRecording = { [weak self] in self?.cancelHotkeyRecording() }
+        window.canCloseWithEscape = { [weak self] in
+            guard let self else { return true }
+            if self.recordingShortcut != nil { return false }
+            if NSColorPanel.shared.isVisible { return false }
+            if self.optionsPanel?.firstResponder is NSTextView { return false }
+            if self.hasOpenOptionsPopover() { return false }
+            return true
+        }
         window.contentMinSize = NSSize(width: 680, height: 460)
         window.isReleasedWhenClosed = false
-        window.isFloatingPanel = true
-        window.level = .floating
+        window.isFloatingPanel = alwaysOnTop
+        window.level = alwaysOnTop ? .floating : .normal
         window.hidesOnDeactivate = false
 
         let content = NSView(frame: .zero)
         let tabs = NSTabView(frame: .zero)
         tabs.tabViewType = .noTabsNoBorder
-        var pages = [makeActionTab(), makeCaptureTab(), makeSourceTab(), makeAppearanceTab(), makeExportTab(), makeHotkeysTab()]
+        // Package 11 & 12 / OPT-03: exact order Actions, Hotkeys, Capture, Sources, Appearance, Export, (Updates).
+        var pages = [makeActionTab(), makeHotkeysTab(), makeCaptureTab(), makeSourceTab(), makeAppearanceTab(), makeExportTab()]
         if !independentWindow { pages.append(makeUpdateTab()) }
         for page in pages { tabs.addTabViewItem(page) }
         optionTabs = tabs
@@ -2045,13 +2173,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             button.font = .systemFont(ofSize: 15, weight: .semibold)
             button.tag = index
             button.state = index == optionCategory ? .on : .off
+            button.heightAnchor.constraint(equalToConstant: 36).isActive = true
             return button
         }
         tabs.selectTabViewItem(at: optionCategory)
         let sidebar = NSStackView(views: optionCategoryButtons)
         sidebar.orientation = .vertical
         sidebar.alignment = .leading
-        sidebar.spacing = 6
+        sidebar.spacing = 4
         for button in optionCategoryButtons {
             button.widthAnchor.constraint(equalTo: sidebar.widthAnchor).isActive = true
         }
@@ -2069,15 +2198,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let close = NSButton(title: "Close", target: window, action: #selector(NSWindow.performClose(_:)))
         close.bezelStyle = .rounded
         close.font = .systemFont(ofSize: 15)
-        close.keyEquivalent = "\u{1b}"
+        close.setContentHuggingPriority(.required, for: .horizontal)
+        close.setContentCompressionResistancePriority(.required, for: .horizontal)
         for view in [sidebar as NSView, separator, tabs, footerSeparator, notice, close] {
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(view)
         }
         NSLayoutConstraint.activate([
-            sidebar.topAnchor.constraint(equalTo: content.topAnchor, constant: 22),
-            sidebar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
-            sidebar.widthAnchor.constraint(equalToConstant: 136),
+            sidebar.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+            sidebar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            sidebar.widthAnchor.constraint(equalToConstant: 172),
             sidebar.bottomAnchor.constraint(lessThanOrEqualTo: footerSeparator.topAnchor, constant: -12),
             separator.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: 10),
             separator.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
@@ -2102,6 +2232,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         window.contentView = content
         window.center()
         return window
+    }
+
+    private func hasOpenOptionsPopover() -> Bool {
+        if sourcePopups.contains(where: \.isChoicePopoverShown) { return true }
+        if addSourcePopup?.isChoicePopoverShown == true { return true }
+        if (snapshotTargetPopup as? OptionsPopUpButton)?.isChoicePopoverShown == true { return true }
+        if routePopups.contains(where: { ($0 as? OptionsPopUpButton)?.isChoicePopoverShown == true }) { return true }
+        if (waveformModePopup as? OptionsPopUpButton)?.isChoicePopoverShown == true { return true }
+        if (secondsIntervalPopup as? OptionsPopUpButton)?.isChoicePopoverShown == true { return true }
+        if optionsMeterPopups.contains(where: { ($0 as? OptionsPopUpButton)?.isChoicePopoverShown == true }) { return true }
+        return false
     }
 
     @objc private func selectOptionCategory(_ sender: NSButton) {
@@ -2194,7 +2335,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     private func dispatchSnapshotShortcut() {
         if let id = snapshotTargetID {
-            if !requestSenderSnapshot(id) { setNotice("Could not request plugin snapshot") }
+            if requestSenderSnapshot(id) {
+                setNotice("Snapshot requested from the selected plugin.")
+            } else {
+                setNotice("Could not request plugin snapshot: the plugin did not accept the request.")
+            }
         } else {
             saveCurrentSnapshot()
         }
@@ -2217,42 +2362,89 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         return shortcuts.isEmpty ? "Off" : shortcuts.joined(separator: " / ")
     }
 
+    private func makeHotkeyRow(action: RecorderAction, index: Int) -> NSView {
+        let shortcuts = hotkeys[action]
+        let isRecordingThis = recordingShortcut?.action == action
+        var buttons = shortcuts.enumerated().map { position, shortcut -> NSButton in
+            let button = NSButton(title: shortcut.title, target: self, action: #selector(startHotkeyRecording(_:)))
+            if isRecordingThis, recordingShortcut?.index == position { button.title = "Press keys…" }
+            button.tag = index * 2 + position
+            return button
+        }
+        if shortcuts.count < 2 {
+            let title = shortcuts.isEmpty ? "Not set" : "Add another"
+            let add = NSButton(title: title, target: self, action: #selector(startHotkeyRecording(_:)))
+            if isRecordingThis, recordingShortcut?.index == shortcuts.count { add.title = "Press keys…" }
+            add.tag = index * 2 + shortcuts.count
+            buttons.append(add)
+        }
+        let clear = NSButton(title: "Clear", target: self, action: #selector(clearHotkey(_:)))
+        clear.tag = index
+        clear.isEnabled = !shortcuts.isEmpty
+        let reset = NSButton(title: "Reset", target: self, action: #selector(resetHotkey(_:)))
+        reset.tag = index
+        reset.isEnabled = shortcuts != action.presets
+
+        var below: [NSView] = []
+        var extraButtons = [clear, reset]
+        // Package 11 / HK-19: offer "Use a tap of Right Command" while recording Edit separately.
+        if isRecordingThis && action == .separateLanes {
+            let rightCmd = NSButton(title: "Use a tap of Right Command", target: self, action: #selector(useRightCommandTap))
+            extraButtons.insert(rightCmd, at: 0)
+        }
+        below.append(optionControlRow(buttonRow(extraButtons)))
+        if isRecordingThis {
+            below.append(optionNote("Press the new keys. Escape stops without a change, so Escape itself comes back only with Reset."))
+        }
+        if hotkeyErrorAction == action, let err = hotkeyErrorText {
+            let errNote = optionNote(err)
+            errNote.textColor = WaveformTheme.statusUnavailable
+            below.append(errNote)
+        }
+        return optionField(action.title, buttonRow(buttons), below: below)
+    }
+
     private func makeHotkeysTab() -> NSTabViewItem {
         var groups: [NSView] = []
-        for (index, action) in RecorderAction.allCases.enumerated() {
-            guard action != .globalSnapshot || !independentWindow else { continue }
-            let shortcuts = hotkeys[action]
-            var buttons = shortcuts.enumerated().map { position, shortcut -> NSButton in
-                let button = NSButton(title: shortcut.title, target: self, action: #selector(startHotkeyRecording(_:)))
-                if recordingShortcut?.action == action, recordingShortcut?.index == position { button.title = "Press keys…" }
-                button.tag = index * 2 + position
-                return button
-            }
-            if shortcuts.count < 2 {
-                let title = shortcuts.isEmpty ? "Set shortcut…" : "Add another"
-                let add = NSButton(title: title, target: self, action: #selector(startHotkeyRecording(_:)))
-                if recordingShortcut?.action == action, recordingShortcut?.index == shortcuts.count { add.title = "Press keys…" }
-                add.tag = index * 2 + shortcuts.count
-                buttons.append(add)
-            }
-            let clear = NSButton(title: "Clear", target: self, action: #selector(clearHotkey(_:)))
-            clear.tag = index
-            clear.isEnabled = !shortcuts.isEmpty
-            let reset = NSButton(title: "Reset", target: self, action: #selector(resetHotkey(_:)))
-            reset.tag = index
-            reset.isEnabled = shortcuts != action.presets
-            var rows: [NSView] = [optionField(action.title, buttonRow(buttons)), buttonRow([clear, reset])]
-            if action == .globalSnapshot {
-                rows.append(optionNote("Works when another app is focused. Requires Input Monitoring."))
-            }
-            groups.append(optionGroup(nil, rows: rows))
+        var introRows: [NSView] = [optionNote("Click a shortcut, then press the keys you want. Changes apply at once.")]
+        if independentWindow {
+            introRows.append(optionNote("Changes made here apply to this window only and are not kept."))
         }
-        let reset = NSButton(title: "Reset all", target: self, action: #selector(resetAllHotkeys))
-        groups.append(optionGroup(nil, rows: [
-            buttonRow([reset]),
-            optionNote("Option-drag selects, Shift-drag snaps, and Option-drag on a flag fades. Scroll to zoom, and middle-drag to pan.")
-        ]))
-        if let hotkeyNote { groups.insert(optionGroup(nil, rows: [optionNote(hotkeyNote)]), at: 0) }
+        groups.append(optionGroup(nil, rows: introRows))
+
+        if !independentWindow {
+            let idx = RecorderAction.allCases.firstIndex(of: .globalSnapshot) ?? 0
+            groups.append(optionGroup("System-wide", rows: [
+                optionNote("Works while another app is in front. Requires Input Monitoring."),
+                makeHotkeyRow(action: .globalSnapshot, index: idx)
+            ]))
+        }
+
+        var windowRows: [NSView] = [
+            optionNote("These work while the Backtracking window is in front. With a selection, the key that pauses plays the selection and the key that clears cancels it.")
+        ]
+        for (index, action) in RecorderAction.allCases.enumerated() where action != .globalSnapshot {
+            windowRows.append(makeHotkeyRow(action: action, index: index))
+        }
+        let resetAll = NSButton(title: "Reset all", target: self, action: #selector(resetAllHotkeys))
+        windowRows.append(buttonRow([resetAll]))
+        groups.append(optionGroup("In the Backtracking window", rows: windowRows))
+
+        // Package 11 / HK-23: 6 fixed mouse gesture lines (Mac-adapted modifiers).
+        let mouseGestures: [(String, String)] = [
+            ("Option / Control + drag", "Free selection"),
+            ("Shift + drag", "Selection that snaps to flags, bar lines or seconds lines"),
+            ("Option + drag", "Move the window (outside waveform, or ⌘⌥ anywhere); on a selection's flag, fade that end"),
+            ("Mouse wheel", "Zoom; over the side margins of a track whose rows do not fit, scroll its rows"),
+            ("Middle-drag", "Pan while zoomed in"),
+            ("Right-click", "Open the menu")
+        ]
+        let mouseRows: [NSView] = mouseGestures.map { gesture, desc in
+            let descLabel = optionNote(desc)
+            descLabel.textColor = .labelColor
+            return optionField(gesture, descLabel)
+        }
+        groups.append(optionGroup("Mouse (fixed)", rows: mouseRows))
         return optionsTab("Hotkeys", groups: groups)
     }
 
@@ -2260,8 +2452,23 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let action = RecorderAction.allCases[sender.tag / 2]
         recordingShortcut = (action, sender.tag % 2)
         snapshotShortcut.recording = true
-        hotkeyNote = "Press keys for \(action.title). Escape cancels."
+        hotkeyErrorAction = nil
+        hotkeyErrorText = nil
         reloadHotkeysTab()
+    }
+
+    @objc private func useRightCommandTap() {
+        guard let editing = recordingShortcut, editing.action == .separateLanes else { return }
+        var modified = hotkeys[.separateLanes]
+        if modified.indices.contains(editing.index) { modified[editing.index] = .rightCommand }
+        else { modified.append(.rightCommand) }
+        if let reason = hotkeys.set(modified, for: .separateLanes) {
+            hotkeyErrorAction = .separateLanes
+            hotkeyErrorText = reason
+            reloadHotkeysTab()
+            return
+        }
+        finishHotkeyEdit()
     }
 
     private func recordHotkey(_ event: NSEvent) -> Bool {
@@ -2276,7 +2483,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if modified.indices.contains(editing.index) { modified[editing.index] = shortcut }
         else { modified.append(shortcut) }
         if let reason = hotkeys.set(modified, for: editing.action) {
-            hotkeyNote = reason
+            hotkeyErrorAction = editing.action
+            hotkeyErrorText = reason
             reloadHotkeysTab()
             return true
         }
@@ -2288,7 +2496,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard recordingShortcut != nil else { return }
         recordingShortcut = nil
         snapshotShortcut.recording = false
-        hotkeyNote = nil
+        hotkeyErrorAction = nil
+        hotkeyErrorText = nil
         reloadHotkeysTab()
     }
 
@@ -2299,7 +2508,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private func changeHotkey(_ index: Int, reset: Bool) {
         let action = RecorderAction.allCases[index]
         if let reason = hotkeys.set(reset ? action.presets : [], for: action) {
-            hotkeyNote = reason
+            hotkeyErrorAction = action
+            hotkeyErrorText = reason
             reloadHotkeysTab()
             return
         }
@@ -2313,7 +2523,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     private func finishHotkeyEdit() {
         recordingShortcut = nil
-        hotkeyNote = nil
+        hotkeyErrorAction = nil
+        hotkeyErrorText = nil
         snapshotShortcut.recording = false
         defaults.set(hotkeys.data, forKey: "recorderHotkeys")
         snapshotShortcut.bindings = hotkeys[.globalSnapshot]
@@ -2379,8 +2590,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             optionGroup("Multichannel sources", rows: [
                 hideSilent,
                 hideSilentNote,
-                optionChoice("L/R of multichannel sources", choices: [0, 1], selected: pairBinaural ? 1 : 0,
-                    action: #selector(pairBinauralChanged(_:))) { $0 == 0 ? "Stereo" : "Binaural" }
+                optionField("L/R of multichannel sources",
+                    choiceControl([0, 1], selected: pairBinaural ? 1 : 0, action: #selector(pairBinauralChanged(_:))) {
+                        $0 == 0 ? "Stereo" : "Binaural"
+                    },
+                    below: [optionNote("How L and R sound in preview and on export. Binaural places each channel around your head, for headphones. The waveform is the same either way.")])
             ])
         ])
     }
@@ -2402,10 +2616,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             checkboxWithTitle: "Export every file as mono", target: self, action: #selector(exportMonoChanged(_:))
         )
         mono.state = forceMonoExport ? .on : .off
-        let wide = optionChoice("Multichannel sources", choices: WideExportMode.allCases.map(\.rawValue),
-            selected: wideExportMode.rawValue, action: #selector(wideExportModeChanged(_:))) {
+        let wide = optionField("Multichannel sources",
+            choiceControl(WideExportMode.allCases.map(\.rawValue), selected: wideExportMode.rawValue,
+                          action: #selector(wideExportModeChanged(_:))) {
                 WideExportMode(rawValue: $0)?.label ?? ""
-            }
+            },
+            below: [optionNote("Binaural files let you hear on headphones where each channel sits.")])
         var folders: [NSView] = [folderOptions(.output)]
         // Other capture windows share the folder but leave its housekeeping to the main one.
         if !independentWindow { folders.append(cleanupOptions()) }
@@ -2492,12 +2708,49 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
+    private func startBackgroundSourceScan() {
+        if sourceScanInFlight {
+            sourceScanQueued = true
+            return
+        }
+        sourceScanInFlight = true
+        sourceScanQueued = false
+        let excluded = tap?.privatePlaybackDevices ?? []
+        let apps = snapshotRunningApps()
+        sourceScanQueue.async { [weak self] in
+            let choices = scanCaptureSources(excluding: excluded, runningApps: apps)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.sourceScanInFlight = false
+                self.cachedSourceChoices = choices
+                self.sourceScanError = nil
+                self.reloadOpenSourcePopups(choices: choices)
+                if self.sourceScanQueued {
+                    self.sourceScanQueued = false
+                    self.startBackgroundSourceScan()
+                }
+            }
+        }
+    }
+
+    private func reloadOpenSourcePopups(choices: [(source: CaptureSource, title: String)]) {
+        for popup in sourcePopups {
+            refreshSourcePopup(popup, choices: choices, scanning: false)
+            popup.reloadChoicesIfOpen()
+        }
+        if let add = addSourcePopup {
+            refreshSourcePopup(add, choices: choices, scanning: false)
+            add.reloadChoicesIfOpen()
+        }
+    }
+
     private func makeSourceTab() -> NSTabViewItem {
         sourcePopups.removeAll()
         routePopups.removeAll()
         fileNameFields.removeAll()
         fileNameNotes.removeAll()
         fileNameSourceKeys.removeAll()
+        sourceProblemNotes.removeAll()
         var groups: [NSView] = []
         for (index, configuration) in captureLanes.enumerated() {
             let label = captureLaneLetter(index)
@@ -2525,16 +2778,21 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             fileNameSourceKeys.append(configuration.source.key)
             let note = optionNote("")
             fileNameNotes.append(note)
+            let problemNote = optionNote("")
+            problemNote.textColor = WaveformTheme.statusUnavailable
+            problemNote.isHidden = true
+            sourceProblemNotes.append(problemNote)
             let sourceField = optionField("Audio source", source)
             let routeField = optionField("Channel route", route)
             let nameField = optionField("File name", name, below: [note])
             source.setAccessibilityLabel("Source \(label) audio source")
             route.setAccessibilityLabel("Source \(label) channel route")
             name.setAccessibilityLabel("Source \(label) file name")
-            var rows: [NSView] = [sourceField, routeField, nameField]
+            var rows: [NSView] = [sourceField, routeField, nameField, problemNote]
             if dualSource {
                 let remove = NSButton(title: "Remove", target: self, action: #selector(removeSource(_:)))
                 remove.tag = index
+                remove.toolTip = "Remove source \(label). The sources after it move up."
                 remove.setAccessibilityLabel("Remove source \(label)")
                 rows.append(buttonRow([remove]))
             }
@@ -2548,18 +2806,28 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         add.tag = -1
         prepareOptionPopup(add)
         addSourcePopup = add
+        let fullNote = optionNote("64 sources is the most the app can hold.")
+        fullNote.isHidden = captureLanes.count < maximumCaptureLanes
+        sourcesFullNote = fullNote
         let capacity = optionNote("")
         sourcesCapacityNote = capacity
+        let channelsFull = optionNote("All 64 channels are in use. A source added now cannot start.")
+        channelsFull.textColor = WaveformTheme.statusUnavailable
+        channelsFull.isHidden = true
+        sourcesChannelsFullNote = channelsFull
         updateCaptureCapacity()
+        let restartNote = dualSource
+            ? "Adding, removing or changing a source starts a new history. Removing a source moves the ones after it up a letter."
+            : "Adding, removing or changing a source starts a new history."
         groups.append(optionGroup(nil, rows: [
-            optionField("Add source", add), capacity,
-            optionNote("Adding, removing or changing a source starts a new capture history.")
+            optionField("Add source", add), fullNote, capacity, channelsFull,
+            optionNote(restartNote)
         ]))
         return optionsTab("Sources", groups: groups)
     }
 
     /// Typing in a File name field names that lane's source, or gives it back its own name when
-    /// the field is empty.
+    /// the field is empty. Capped at 64 most-recently-named sources (OPT-22).
     func controlTextDidChange(_ notification: Notification) {
         guard let field = notification.object as? NSTextField, let index = fileNameFields.firstIndex(of: field),
               index < fileNameSourceKeys.count else { return }
@@ -2568,12 +2836,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         let key = fileNameSourceKeys[index]
         let name = String(field.stringValue.map { $0.isNewline ? " " : $0 })
+        sourceFileNameOrder.removeAll { $0 == key }
         if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             sourceFileNames[key] = nil
         } else {
             sourceFileNames[key] = name
+            sourceFileNameOrder.append(key)
+            trimSourceFileNamesIfNeeded()
         }
         defaults.set(sourceFileNames, forKey: sourceFileNamesKey)
+        defaults.set(sourceFileNameOrder, forKey: sourceFileNameOrderKey)
         refreshFileNameNotes()
     }
 
@@ -2603,16 +2875,27 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private func refreshSourceOptions() {
         updateCaptureCapacity()
         guard sourcePopups.count == captureLanes.count, routePopups.count == captureLanes.count else { return }
-        let choices = availableCaptureSources(excluding: tap?.privatePlaybackDevices ?? [])
+        let choices = cachedSourceChoices ?? availableCaptureSources(excluding: tap?.privatePlaybackDevices ?? [])
+        cachedSourceChoices = choices
         for (index, lane) in captureLanes.enumerated() {
-            refreshSourcePopup(sourcePopups[index], choices: choices)
+            refreshSourcePopup(sourcePopups[index], choices: choices, scanning: false)
             let route = routePopups[index]
-            route.isEnabled = !editing
-            route.selectItem(withTag: Int(lane.route.rawValue))
+            let wideSender = lane.source.isSender && (tap?.channelCount(for: index) ?? 0) > 2
+            route.isEnabled = !editing && !wideSender
+            route.selectItem(withTag: Int((wideSender ? CaptureRoute.merged : lane.route).rawValue))
             for item in route.itemArray {
                 guard let raw = UInt32(exactly: item.tag), let selection = CaptureRoute(rawValue: raw) else { continue }
-                item.isEnabled = selection == lane.route || tap?.supports(selection, lane: index) == true
-                    || (tap == nil && selection != .center && selection != .allChannels)
+                if wideSender {
+                    item.isEnabled = selection == .merged
+                } else {
+                    item.isEnabled = selection == lane.route || tap?.supports(selection, lane: index) == true
+                        || (tap == nil && selection != .center && selection != .allChannels)
+                }
+            }
+            if index < sourceProblemNotes.count {
+                let problem = tap?.sourceProblem(for: index)
+                sourceProblemNotes[index].stringValue = problem ?? ""
+                sourceProblemNotes[index].isHidden = problem == nil
             }
         }
         for (index, lane) in captureLanes.enumerated() where index < fileNameFields.count && index < fileNameSourceKeys.count {
@@ -2628,17 +2911,21 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         refreshFileNameNotes()
         waveformModePopup?.isEnabled = !dualSource
+        let full = captureLanes.count >= maximumCaptureLanes
+        sourcesFullNote?.isHidden = !full
         if let addSourcePopup {
-            refreshSourcePopup(addSourcePopup, choices: choices)
-            addSourcePopup.isEnabled = captureLanes.count < maximumCaptureLanes && !editing
-            addSourcePopup.toolTip = captureLanes.count >= maximumCaptureLanes
-                ? "The recorder has reached the 64-source limit." : addSourcePopup.titleOfSelectedItem
+            refreshSourcePopup(addSourcePopup, choices: choices, scanning: false)
+            addSourcePopup.isEnabled = !full && !editing
+            addSourcePopup.toolTip = full
+                ? "64 sources is the most the app can hold."
+                : "The source you choose is added at the end of the list and recorded with the others."
         }
     }
 
     private func updateCaptureCapacity() {
         guard let tap else {
             sourcesCapacityNote?.isHidden = true
+            sourcesChannelsFullNote?.isHidden = true
             captureCapacityNote?.isHidden = true
             return
         }
@@ -2647,22 +2934,32 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let shortNote = kept < history ? "With \(channels) channels, memory holds the latest \(kept) seconds." : nil
         sourcesCapacityNote?.isHidden = false
         sourcesCapacityNote?.stringValue = ["\(channels) of 64 channels in use", shortNote].compactMap { $0 }.joined(separator: ". ")
+        sourcesChannelsFullNote?.isHidden = !(channels >= 64 && captureLanes.count < maximumCaptureLanes)
         captureCapacityNote?.isHidden = shortNote == nil
         captureCapacityNote?.stringValue = shortNote ?? ""
     }
 
-    private func refreshSourcePopup(_ popup: NSPopUpButton, choices: [(source: CaptureSource, title: String)]) {
+    private func refreshSourcePopup(_ popup: NSPopUpButton, choices: [(source: CaptureSource, title: String)], scanning: Bool = false) {
         let adding = popup.tag == -1
+        let full = captureLanes.count >= maximumCaptureLanes
         let configured = captureLanes.indices.contains(popup.tag) ? captureLanes[popup.tag].source : nil
         popup.removeAllItems()
         var selectedIndex: Int?
         if adding {
-            popup.addItem(withTitle: "Choose audio source…")
+            popup.addItem(withTitle: full ? "No more sources" : "Choose a source")
             popup.lastItem?.isEnabled = false
             selectedIndex = 0
         } else if popup.tag > 0 {
             popup.addItem(withTitle: "Off")
             popup.lastItem?.representedObject = offSourceKey
+        }
+        if scanning {
+            popup.addItem(withTitle: "⟳ Scanning audio sources…")
+            popup.lastItem?.isEnabled = false
+        }
+        if let err = sourceScanError {
+            popup.addItem(withTitle: "Could not list audio sources: \(err)")
+            popup.lastItem?.isEnabled = false
         }
         if !adding { popup.isEnabled = !editing }
         var uses: [String: Int] = [:]
@@ -2691,8 +2988,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             popup.addItem(withTitle: "\(configured.label) (unavailable)")
             popup.lastItem?.isEnabled = false
         }
-        popup.selectItem(at: selectedIndex ?? popup.numberOfItems - 1)
-        popup.toolTip = popup.titleOfSelectedItem
+        popup.selectItem(at: selectedIndex ?? max(0, popup.numberOfItems - 1))
+        if !adding { popup.toolTip = popup.titleOfSelectedItem }
     }
 
     @objc private func captureSourceChanged(_ sender: NSPopUpButton) {
@@ -2852,19 +3149,24 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         ) { $0 == 0 ? "Merged" : "Left / Right" }
         waveformModePopup = stereo
         optionsMeterPopups = []
-        let meterFields = meterModes.enumerated().map { lane, mode -> NSView in
+        let meterFields: [NSView] = meterModes.enumerated().map { lane, mode -> NSView in
             let meter = choiceControl(
                 MeterMode.allCases.map(\.rawValue), selected: mode.rawValue, action: #selector(meterChanged(_:))
             ) { MeterMode(rawValue: $0)?.label ?? "" }
             meter.tag = lane
             optionsMeterPopups.append(meter)
-            return optionField(dualSource ? "Meter \(captureLaneLetter(lane))" : "Meter", meter)
+            var below: [NSView] = []
+            if mode == .lufs && (tap?.channelCount(for: lane) ?? 0) > 2 {
+                below.append(optionNote("Loudness is measured for mono and stereo sources only."))
+            }
+            return optionField(dualSource ? "Meter \(captureLaneLetter(lane))" : "Meter", meter, below: below)
         }
         let coloring = choiceControl([0, 1], selected: frequencyColoring ? 1 : 0,
             action: #selector(frequencyColoringChanged(_:))) { $0 == 0 ? "Single color" : "By frequency" }
         let frequencyControls = optionsStack([], spacing: 8)
         frequencyGradientControls = frequencyControls
         refreshFrequencyGradientControls()
+        // Package 8 / OPT-16: Window group includes Waveform color & Frequency colors; Display holds Single-source & Meter.
         let tab = optionsTab("Appearance", groups: [
             optionGroup("Window", rows: [
                 waveform,
@@ -2873,7 +3175,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                     "Background transparency", choices: transparencyChoices, selected: transparency,
                     action: #selector(transparencyChanged(_:))
                 ) { "\($0)%" },
-                optionField("Theme color", buttonRow([accent, resetAccent]))
+                optionField("Theme color", buttonRow([accent, resetAccent])),
+                optionField("Waveform color", coloring),
+                frequencyControls
             ]),
             optionGroup("Show", rows: [
                 checkbox("App name in the toolbar", showsTitle, #selector(showTitleChanged(_:))),
@@ -2893,56 +3197,102 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 follows
             ]),
             optionGroup("Display", rows: [
-                optionField("Single-source waveform", stereo),
-                optionField("Waveform color", coloring),
-                frequencyControls
+                optionField("Single-source waveform", stereo)
             ] + meterFields)
         ])
         updateAppearanceDependencies()
         return tab
     }
 
+    /// Package 9 / TL-41..43: Frequency colors editor matching Windows spectrum.rs.
     private func refreshFrequencyGradientControls() {
         guard let controls = frequencyGradientControls else { return }
         for view in controls.arrangedSubviews {
             controls.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
+        frequencyStopPercentLabels.removeAll()
+        frequencyIllegibleNote = nil
         controls.isHidden = !frequencyColoring
         guard frequencyColoring else { return }
+
         let preview = FrequencyGradientPreview(frame: .zero)
         preview.gradient = frequencyGradient
         preview.heightAnchor.constraint(equalToConstant: 16).isActive = true
         preview.setAccessibilityElement(true)
         preview.setAccessibilityLabel("Waveform gradient from low to high frequency")
         frequencyGradientPreview = preview
-        var rows: [NSView] = [optionField("Low to high frequencies", preview)]
-        for (index, stop) in frequencyGradient.stops.enumerated() {
+
+        let lowLabel = optionNote("Low")
+        let highLabel = optionNote("High")
+        highLabel.alignment = .right
+        let endSpacer = NSView(frame: .zero)
+        endSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let endsRow = NSStackView(views: [lowLabel, endSpacer, highLabel])
+        endsRow.orientation = .horizontal
+        endsRow.alignment = .centerY
+
+        var editorRows: [NSView] = [preview, endsRow]
+        let stops = frequencyGradient.stops
+        let count = stops.count
+        for (index, stop) in stops.enumerated() {
             let color = NSColorWell(frame: .zero)
             color.color = accentColor(stop.rgb)
             color.tag = index
             color.target = self
             color.action = #selector(frequencyStopColorChanged(_:))
+            color.widthAnchor.constraint(equalToConstant: 44).isActive = true
+            color.heightAnchor.constraint(equalToConstant: 24).isActive = true
             color.setAccessibilityLabel("Frequency color \(index + 1)")
-            let position = NSSlider(value: stop.position, minValue: 0, maxValue: 1,
-                target: self, action: #selector(frequencyStopPositionChanged(_:)))
-            position.tag = index
-            position.setAccessibilityLabel("Frequency stop \(index + 1) position")
-            let remove = NSButton(title: "Remove", target: self, action: #selector(removeFrequencyStop(_:)))
-            remove.tag = index
-            remove.isEnabled = frequencyGradient.stops.count > 2
-            let row = NSStackView(views: [color, position, remove])
-            row.spacing = 8
-            rows.append(optionField("Stop \(index + 1)", row))
+            if index == 0 || index == count - 1 {
+                let endName = NSTextField(labelWithString: index == 0 ? "Low" : "High")
+                endName.font = .systemFont(ofSize: 14)
+                let row = NSStackView(views: [color, endName])
+                row.orientation = .horizontal
+                row.alignment = .centerY
+                row.spacing = 8
+                editorRows.append(row)
+            } else {
+                let minPct = stops[index - 1].position * 100.0
+                let maxPct = stops[index + 1].position * 100.0
+                let slider = NSSlider(
+                    value: min(maxPct, max(minPct, stop.position * 100.0)),
+                    minValue: minPct, maxValue: max(minPct + 0.001, maxPct),
+                    target: self, action: #selector(frequencyStopPositionChanged(_:))
+                )
+                slider.tag = index
+                slider.isContinuous = true
+                slider.toolTip = "Where this color sits between the lowest and the highest frequencies"
+                slider.setAccessibilityLabel("Frequency stop \(index + 1) position")
+                let pctLabel = NSTextField(labelWithString: "\(Int((stop.position * 100.0).rounded())) %")
+                pctLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+                pctLabel.widthAnchor.constraint(equalToConstant: 42).isActive = true
+                frequencyStopPercentLabels[index] = pctLabel
+                let remove = NSButton(title: "Remove", target: self, action: #selector(removeFrequencyStop(_:)))
+                remove.tag = index
+                let row = NSStackView(views: [color, slider, pctLabel, remove])
+                row.orientation = .horizontal
+                row.alignment = .centerY
+                row.spacing = 8
+                editorRows.append(row)
+            }
         }
-        let add = NSButton(title: "Add stop", target: self, action: #selector(addFrequencyStop))
-        add.isEnabled = frequencyGradient.stops.count < 8
-        let reset = NSButton(title: "Reset gradient", target: self, action: #selector(resetFrequencyGradient))
-        rows.append(optionControlRow(buttonRow([add, reset])))
-        for row in rows {
-            controls.addArrangedSubview(row)
-            row.widthAnchor.constraint(equalTo: controls.widthAnchor).isActive = true
-        }
+        let add = NSButton(title: "Add color", target: self, action: #selector(addFrequencyStop))
+        add.isEnabled = count < 8
+        let reset = NSButton(title: "Reset", target: self, action: #selector(resetFrequencyGradient))
+        reset.isEnabled = hasCustomFrequencyGradient
+        editorRows.append(buttonRow([add, reset]))
+        editorRows.append(optionNote("Each moment of the waveform mixes these colors by how much of its sound is low or high."))
+        let illegible = optionNote("A color too hard to see on the waveform's background is drawn in the default color instead.")
+        illegible.textColor = WaveformTheme.statusUnavailable
+        illegible.isHidden = !frequencyGradient.hasUnreadableStops
+        frequencyIllegibleNote = illegible
+        editorRows.append(illegible)
+
+        let stack = optionsStack(editorRows, spacing: 6)
+        let field = optionField("Frequency colors", stack)
+        controls.addArrangedSubview(field)
+        field.widthAnchor.constraint(equalTo: controls.widthAnchor).isActive = true
     }
 
     @objc private func frequencyColoringChanged(_ sender: NSPopUpButton) {
@@ -2953,9 +3303,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         refreshWaveform()
     }
 
-    private func storeFrequencyGradient(refreshControls: Bool = false) {
-        defaults.set(frequencyGradient.settings, forKey: "waveformFrequencyGradient")
+    private func storeFrequencyGradient(persist: Bool = true, custom: Bool = true, refreshControls: Bool = false) {
+        hasCustomFrequencyGradient = custom
+        if persist {
+            if custom {
+                defaults.set(frequencyGradient.settings, forKey: "waveformFrequencyGradient")
+            } else {
+                defaults.removeObject(forKey: "waveformFrequencyGradient")
+            }
+        }
         frequencyGradientPreview?.gradient = frequencyGradient
+        frequencyIllegibleNote?.isHidden = !frequencyGradient.hasUnreadableStops
         waveform?.frequencyGradient = frequencyColoring ? frequencyGradient : nil
         if refreshControls { refreshFrequencyGradientControls() }
     }
@@ -2966,31 +3324,48 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         func component(_ value: CGFloat) -> UInt32 {
             UInt32((min(1, max(0, value)) * 255).rounded())
         }
+        let wasCustom = hasCustomFrequencyGradient
         frequencyGradient.stops[sender.tag].rgb = (component(color.redComponent) << 16)
             | (component(color.greenComponent) << 8) | component(color.blueComponent)
-        storeFrequencyGradient()
+        let mouseUp = NSApp.currentEvent?.type != .leftMouseDragged
+        storeFrequencyGradient(persist: mouseUp, custom: true, refreshControls: !wasCustom)
     }
 
     @objc private func frequencyStopPositionChanged(_ sender: NSSlider) {
-        guard frequencyGradient.stops.indices.contains(sender.tag) else { return }
-        frequencyGradient.stops[sender.tag].position = sender.doubleValue
-        storeFrequencyGradient()
+        let index = sender.tag
+        let stops = frequencyGradient.stops
+        guard index > 0 && index < stops.count - 1 else { return }
+        let lo = stops[index - 1].position
+        let hi = stops[index + 1].position
+        let pos = min(hi, max(lo, sender.doubleValue / 100.0))
+        let wasCustom = hasCustomFrequencyGradient
+        frequencyGradient.stops[index].position = pos
+        frequencyStopPercentLabels[index]?.stringValue = "\(Int((pos * 100.0).rounded())) %"
+        let isDragging = NSApp.currentEvent?.type == .leftMouseDragged
+        storeFrequencyGradient(persist: !isDragging, custom: true, refreshControls: !isDragging && !wasCustom)
+        if !isDragging {
+            // Update neighbor slider bounds once the user releases the drag.
+            refreshFrequencyGradientControls()
+        }
     }
 
     @objc private func removeFrequencyStop(_ sender: NSButton) {
-        guard frequencyGradient.stops.count > 2, frequencyGradient.stops.indices.contains(sender.tag) else { return }
-        frequencyGradient.stops.remove(at: sender.tag)
-        storeFrequencyGradient(refreshControls: true)
+        let index = sender.tag
+        guard frequencyGradient.stops.count > 2, index > 0 && index < frequencyGradient.stops.count - 1 else { return }
+        frequencyGradient.stops.remove(at: index)
+        storeFrequencyGradient(persist: true, custom: true, refreshControls: true)
     }
 
     @objc private func addFrequencyStop() {
-        frequencyGradient = frequencyGradient.addingStop()
-        storeFrequencyGradient(refreshControls: true)
+        var added = frequencyGradient.addingStop()
+        added.stops.sort { $0.position < $1.position }
+        frequencyGradient = added
+        storeFrequencyGradient(persist: true, custom: true, refreshControls: true)
     }
 
     @objc private func resetFrequencyGradient() {
         frequencyGradient = .standard
-        storeFrequencyGradient(refreshControls: true)
+        storeFrequencyGradient(persist: true, custom: false, refreshControls: true)
     }
 
     /// Greys out the settings that do nothing while the one above them is off.
@@ -3156,9 +3531,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         row.distribution = .fill
         row.alignment = .top
         row.spacing = 12
+        let isVerticalBlock = (control is NSStackView) && !(control is OptionButtonRow)
         NSLayoutConstraint.activate([
             name.widthAnchor.constraint(equalToConstant: optionLabelWidth),
-            name.heightAnchor.constraint(equalTo: control.heightAnchor),
+            isVerticalBlock
+                ? name.heightAnchor.constraint(equalToConstant: 20)
+                : name.heightAnchor.constraint(equalTo: control.heightAnchor),
             label.leadingAnchor.constraint(equalTo: name.leadingAnchor),
             label.trailingAnchor.constraint(lessThanOrEqualTo: name.trailingAnchor),
             label.centerYAnchor.constraint(equalTo: name.centerYAnchor)
@@ -3485,16 +3863,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         updateBackground()
     }
 
-    /// Room around the bare waveform in waveform-only mode: the border's width, or one point.
-    private var frameInset: CGFloat { showsOutline ? CGFloat(outlineWidth) : waveformFrameInset }
+    /// Room around the bare waveform in waveform-only mode: one point inset.
+    private var frameInset: CGFloat { waveformFrameInset }
 
-    /// Keeps room for the border around the bare waveform. The window keeps its size.
+    /// Keeps room around the bare waveform in waveform-only mode. The window keeps its size.
     private func applyFrameInset() {
         guard waveformOnly else { return }
         waveformTopWithoutToolbar?.constant = frameInset
         waveformLeading?.constant = frameInset
         waveformTrailing?.constant = -frameInset
-        waveformBottom?.constant = -frameInset
+        waveformBottomWithoutStatus?.constant = -frameInset
         waveformMinimumHeight?.constant = waveformOnlyPanelMinimum.height - 2 * frameInset
     }
 
@@ -3595,10 +3973,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         panel?.ignoresMouseEvents = false
         panel?.hasShadow = !waveformOnly && opacity > 0
         background?.backgroundOpacity = opacity
-        background?.showsOutline = showsOutline
-        background?.outlineWidth = CGFloat(outlineWidth)
-        background?.outlineColor = accentColor(customOutline ? outlineRGB : accentRGB)
-        background?.outlineFollowsOpacity = outlineFollowsOpacity
+        background?.waveformOnly = waveformOnly
+        background?.showsOutline = false
+        let borderColor = accentColor(customOutline ? outlineRGB : accentRGB)
+            .withAlphaComponent(outlineFollowsOpacity ? opacity : 1)
+        waveform?.showsOutline = showsOutline
+        waveform?.outlineWidth = CGFloat(outlineWidth)
+        waveform?.outlineColor = borderColor
         waveform?.gridOpacity = opacity
         waveform?.showsBars = showsBars
         waveform?.secondsInterval = showsSeconds ? secondsInterval : nil
@@ -3666,49 +4047,212 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         setNotice(nil)
     }
 
-    private func meterTitle(for lane: Int) -> String {
+    private func meterTitle(for lane: Int) -> (text: String, unmeasuredLufs: Bool) {
         let mode = meterModes[lane]
+        let wideLufs = mode == .lufs && (tap?.channelCount(for: lane) ?? 0) > 2
         let reading: Float
-        if let tap, tap.cachedMeters.indices.contains(lane), mode != .lufs || (tap.channelCount(for: lane) ?? 0) <= 2 {
+        if let tap, tap.cachedMeters.indices.contains(lane), !wideLufs {
             reading = mode.value(from: tap.cachedMeters[lane])
         } else {
             reading = -.infinity
         }
-        let value = reading.isFinite ? String(format: "%.1f", Double(reading)) : "—"
+        let value: String
+        if reading.isFinite {
+            if mode == .vu {
+                value = String(format: "%+.1f", Double(reading))
+            } else {
+                value = String(format: "%.1f", Double(reading))
+            }
+        } else {
+            value = "—"
+        }
         let prefix = dualSource ? "\(captureLaneLetter(lane)) " : ""
-        return "\(prefix)\(value) \(mode.label)"
+        return ("\(prefix)\(value) \(mode.label)", wideLufs)
     }
 
+    private func meterTooltip(for lane: Int, unmeasuredLufs: Bool) -> String {
+        let base = meterModes[lane].detail
+        return unmeasuredLufs ? "\(base)\nLoudness is measured for mono and stereo sources only." : base
+    }
+
+    private func ensureMeterButtons(count: Int) {
+        while meterButtons.count < count {
+            let lane = meterButtons.count
+            let button = NSButton(title: "— dBFS", target: self, action: #selector(showMeterOptions(_:)))
+            button.tag = lane
+            button.bezelStyle = .rounded
+            button.alignment = .right
+            let widthConstraint = button.widthAnchor.constraint(equalToConstant: 91)
+            widthConstraint.isActive = true
+            meterButtons.append(button)
+            meterWidthConstraints.append(widthConstraint)
+            metersStack.addArrangedSubview(button)
+        }
+    }
+
+    /// Package 7 / TL-33 & TL-36: 1-2 sources show all meters; >2 sources show as many as fit (min 1) + "+N" live grid popover.
     private func updateMeter() {
-        let shown = captureLanes.count > 2 && (panel?.frame.width ?? 0) < 680 ? 1 : 2
-        for (lane, button) in [meterButton, meterBButton].enumerated() {
+        let total = meterModes.count
+        let single = !dualSource
+        let meterWidth: CGFloat = single ? 102 : 91
+        let font = NSFont.monospacedSystemFont(ofSize: single ? 12 : 10, weight: .medium)
+        let shown: Int
+        if !showsMeters {
+            shown = 0
+            closeMeterPopover()
+        } else if total <= 2 {
+            shown = total
+            closeMeterPopover()
+        } else {
+            let winWidth = panel?.frame.width ?? fullPanelDefault.width
+            // Reserve space for title (optional), transport/lamp/clear/pin (~156), gear (38), "+N" (38), padding (32).
+            let reserved: CGFloat = (showsTitle ? 110 : 0) + 264
+            let available = max(meterWidth, winWidth - reserved)
+            let fit = max(1, Int(floor((available + 4) / (meterWidth + 4))))
+            shown = min(total, fit)
+        }
+
+        ensureMeterButtons(count: shown)
+        for (lane, button) in meterButtons.enumerated() {
             let hide = !showsMeters || lane >= shown || !meterModes.indices.contains(lane)
             if button.isHidden != hide { button.isHidden = hide }
             guard !hide else { continue }
-            let title = meterTitle(for: lane)
-            if button.title != title {
-                button.title = title
-                button.setAccessibilityLabel(title)
+            if meterWidthConstraints[lane].constant != meterWidth {
+                meterWidthConstraints[lane].constant = meterWidth
             }
-            button.toolTip = meterModes[lane].detail
+            if button.font != font { button.font = font }
+            let info = meterTitle(for: lane)
+            if button.title != info.text {
+                button.title = info.text
+                button.setAccessibilityLabel(info.text)
+            }
+            let tip = meterTooltip(for: lane, unmeasuredLufs: info.unmeasuredLufs)
+            if button.toolTip != tip { button.toolTip = tip }
         }
-        let extra = max(0, meterModes.count - shown)
+
+        let extra = max(0, total - shown)
         moreMetersButton.isHidden = !showsMeters || extra == 0
         if extra > 0 {
             let title = "+\(extra)"
             if moreMetersButton.title != title { moreMetersButton.title = title }
-            moreMetersButton.setAccessibilityLabel("Show \(extra) more meters")
+            let tip = extra == 1
+                ? "1 more meter. Click to see every source's meter."
+                : "\(extra) more meters. Click to see every source's meter."
+            if moreMetersButton.toolTip != tip { moreMetersButton.toolTip = tip }
+            moreMetersButton.setAccessibilityLabel(tip)
+        } else {
+            closeMeterPopover()
+        }
+        refreshMeterPopover()
+    }
+
+    private func closeMeterPopover() {
+        if meterPopover?.isShown == true {
+            meterPopover?.performClose(nil)
+        }
+        meterPopover = nil
+        meterPopoverButtons.removeAll()
+    }
+
+    private func refreshMeterPopover() {
+        guard meterPopover?.isShown == true else { return }
+        guard meterPopoverButtons.count == meterModes.count else {
+            closeMeterPopover()
+            return
+        }
+        for (lane, button) in meterPopoverButtons.enumerated() {
+            let info = meterTitle(for: lane)
+            if button.title != info.text {
+                button.title = info.text
+                button.setAccessibilityLabel(info.text)
+            }
+            let tip = meterTooltip(for: lane, unmeasuredLufs: info.unmeasuredLufs)
+            if button.toolTip != tip { button.toolTip = tip }
         }
     }
 
+    /// Package 7 / TL-36: live-updating 1-6 column scrollable grid popover of all source meters.
     @objc private func showMoreMeters(_ sender: NSButton) {
-        let menu = NSMenu(title: "Level meters")
-        for lane in meterModes.indices {
-            let item = NSMenuItem(title: meterTitle(for: lane), action: nil, keyEquivalent: "")
-            item.submenu = meterMenu(lane: lane)
-            menu.addItem(item)
+        registerClick()
+        if meterPopover?.isShown == true {
+            closeMeterPopover()
+            return
         }
-        showMenu(menu, below: sender)
+        let count = meterModes.count
+        guard count > 0 else { return }
+        let eachWidth: CGFloat = 95 // 91 + 4 spacing
+        let winWidth = panel?.frame.width ?? fullPanelDefault.width
+        let columns = max(1, min(6, Int(floor((winWidth - 24) / eachWidth))))
+        let rows = (count + columns - 1) / columns
+        let gridWidth = CGFloat(columns) * 91 + CGFloat(max(0, columns - 1)) * 4
+        let rowHeight: CGFloat = 24
+        let contentHeight = CGFloat(rows) * rowHeight + CGFloat(max(0, rows - 1)) * 4
+        let maxHeight = min(contentHeight, 260)
+
+        meterPopoverButtons.removeAll()
+        let font = NSFont.monospacedSystemFont(ofSize: 10, weight: .medium)
+        var rowViews: [NSView] = []
+        for r in 0..<rows {
+            var cells: [NSView] = []
+            for c in 0..<columns {
+                let lane = r * columns + c
+                guard lane < count else { break }
+                let info = meterTitle(for: lane)
+                let btn = NSButton(title: info.text, target: self, action: #selector(showMeterOptions(_:)))
+                btn.tag = lane
+                btn.bezelStyle = .rounded
+                btn.alignment = .right
+                btn.font = font
+                btn.toolTip = meterTooltip(for: lane, unmeasuredLufs: info.unmeasuredLufs)
+                btn.setAccessibilityLabel(info.text)
+                btn.widthAnchor.constraint(equalToConstant: 91).isActive = true
+                btn.heightAnchor.constraint(equalToConstant: rowHeight).isActive = true
+                meterPopoverButtons.append(btn)
+                cells.append(btn)
+            }
+            let rowStack = NSStackView(views: cells)
+            rowStack.orientation = .horizontal
+            rowStack.spacing = 4
+            rowStack.alignment = .centerY
+            rowViews.append(rowStack)
+        }
+
+        let gridStack = NSStackView(views: rowViews)
+        gridStack.orientation = .vertical
+        gridStack.alignment = .leading
+        gridStack.spacing = 4
+        gridStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let doc = OptionsDocumentView(frame: NSRect(x: 0, y: 0, width: gridWidth, height: contentHeight))
+        doc.addSubview(gridStack)
+        NSLayoutConstraint.activate([
+            gridStack.topAnchor.constraint(equalTo: doc.topAnchor),
+            gridStack.leadingAnchor.constraint(equalTo: doc.leadingAnchor)
+        ])
+
+        let popSize = NSSize(width: gridWidth + 16, height: maxHeight + 16)
+        let root = NSView(frame: NSRect(origin: .zero, size: popSize))
+        root.appearance = NSAppearance(named: .darkAqua)
+        let scroll = NSScrollView(frame: root.bounds.insetBy(dx: 8, dy: 8))
+        scroll.autoresizingMask = [.width, .height]
+        scroll.borderType = .noBorder
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = contentHeight > maxHeight
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.documentView = doc
+        root.addSubview(scroll)
+
+        let vc = NSViewController()
+        vc.view = root
+        let popover = NSPopover()
+        popover.contentViewController = vc
+        popover.contentSize = popSize
+        popover.behavior = .transient
+        popover.animates = false
+        popover.appearance = NSAppearance(named: .darkAqua)
+        meterPopover = popover
+        popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
     }
 
     @objc private func togglePin() {
@@ -3729,6 +4273,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         panel?.isFloatingPanel = alwaysOnTop
         panel?.hidesOnDeactivate = false
         panel?.level = alwaysOnTop ? .floating : .normal
+        // Package 12 / OPT-01: Options window follows main window's pin state.
+        optionsPanel?.isFloatingPanel = alwaysOnTop
+        optionsPanel?.level = alwaysOnTop ? .floating : .normal
         setIcon(
             alwaysOnTop ? "pin.fill" : "pin", label: alwaysOnTop ? "Disable keep on top" : "Keep on top",
             on: pinButton
@@ -3750,6 +4297,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let waveformHeight = waveform?.bounds.height ?? fullWaveformMinimumHeight
         var desiredSize: NSSize?
         if waveformOnly {
+            closeMeterPopover()
             let restoredCompact = initial && restoredFrame && fullPanelSize != nil
             if !restoredCompact {
                 fullPanelSize = NSSize(
@@ -3760,7 +4308,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                     defaults.set(Double(fullPanelSize.width), forKey: "fullPanelWidth")
                     defaults.set(Double(fullPanelSize.height), forKey: "fullPanelHeight")
                 }
-                desiredSize = NSSize(width: previous.width, height: waveformHeight + 2 * frameInset)
+                desiredSize = initial
+                    ? waveformOnlyPanelDefault
+                    : NSSize(width: previous.width, height: waveformHeight + 2 * frameInset)
             }
         } else if !initial {
             desiredSize = fullPanelSize
@@ -3768,18 +4318,24 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
         toolbarTrailing?.isActive = !waveformOnly
         toolbar?.isHidden = waveformOnly
-        waveformLeading?.constant = waveformOnly ? frameInset : 10
-        waveformTrailing?.constant = waveformOnly ? -frameInset : -10
-        waveformBottom?.constant = waveformOnly ? -frameInset : -panelVerticalInset
+        statusLabel.isHidden = waveformOnly
+        statusHeightConstraint?.constant = waveformOnly ? 0 : statusStripHeight
+        waveformLeading?.constant = waveformOnly ? frameInset : panelVerticalInset
+        waveformTrailing?.constant = waveformOnly ? -frameInset : -panelVerticalInset
         if waveformOnly {
             waveformTopBelowToolbar?.isActive = false
+            waveformBottomWithStatus?.isActive = false
             waveformMinimumHeight?.constant = waveformOnlyPanelMinimum.height - 2 * frameInset
             waveformTopWithoutToolbar?.constant = frameInset
             waveformTopWithoutToolbar?.isActive = true
+            waveformBottomWithoutStatus?.constant = -frameInset
+            waveformBottomWithoutStatus?.isActive = true
         } else {
             waveformTopWithoutToolbar?.isActive = false
+            waveformBottomWithoutStatus?.isActive = false
             waveformMinimumHeight?.constant = fullWaveformMinimumHeight
             waveformTopBelowToolbar?.isActive = true
+            waveformBottomWithStatus?.isActive = true
         }
         panel.contentMinSize = waveformOnly ? waveformOnlyPanelMinimum : fullPanelMinimum
         resizePanel(to: desiredSize ?? previous)
@@ -3864,6 +4420,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     func beginEditing(retainMaterial: Bool = true) {
         editing = true
+        notice = nil
         registerClick()
         if retainMaterial { waveform?.retainEditingMaterial() }
         updateStatus()
@@ -3975,29 +4532,41 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     @objc private func tick(_: Timer) {
         let tickStart = ProcessInfo.processInfo.systemUptime
-        let panelVisible = panel?.isVisible == true
+        // Package 12 / WIN-23: hidden or minimized main window skips waveform/meter drawing.
+        let panelVisible = panel?.isVisible == true && panel?.isMiniaturized != true
+        let optionsVisible = optionsPanel?.isVisible == true && optionsPanel?.isMiniaturized != true
         if panelVisible { waveform?.refreshHintModifiers() }
         let now = ProcessInfo.processInfo.systemUptime
         if !paused, now - lastSourceCheck >= 1 {
             lastSourceCheck = now
             if tap?.refreshSources() == true { reconnectConfiguredSources() }
         }
+        if optionsVisible, now - lastSnapshotTargetCheck >= 1 {
+            lastSnapshotTargetCheck = now
+            if !independentWindow, (snapshotTargetPopup as? OptionsPopUpButton)?.isChoicePopoverShown != true {
+                refreshSnapshotTargets()
+            }
+        }
         if !independentWindow && !testCopy && now - lastShortcutCheck >= 1 {
             lastShortcutCheck = now
             snapshotShortcut.start()
-            if optionsPanel?.isVisible == true { refreshShortcutPermission() }
+            if optionsVisible { refreshShortcutPermission() }
             cleanOutputFolder()
         }
         if let tap, !paused {
-            if panelVisible { refreshWaveform() }
-            tap.pollCapture()
+            if panelVisible {
+                refreshWaveform()
+                tap.pollCapture()
+            } else if optionsVisible {
+                tap.pollCapture()
+            }
         }
         if paused && !editing && waveform?.hasSelection != true && tap != nil && idleSeconds > 0 &&
             ProcessInfo.processInfo.systemUptime - lastClick >= Double(idleSeconds) {
             registerClick()
             resume()
         }
-        if panelVisible || optionsPanel?.isVisible == true { updateStatus() }
+        if panelVisible || optionsVisible { updateStatus() }
         if let harness, !harness.finished {
             harness.recordFrameWork(ProcessInfo.processInfo.systemUptime - tickStart, now: tickStart)
         }
@@ -4048,6 +4617,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             if let tap {
                 for idx in 0..<tap.laneCount {
                     if let p = tap.sourceProblem(for: idx) { laneProbs[idx] = p }
+                    if idx < sourceProblemNotes.count {
+                        let text = laneProbs[idx] ?? ""
+                        if sourceProblemNotes[idx].stringValue != text {
+                            sourceProblemNotes[idx].stringValue = text
+                        }
+                        let hide = text.isEmpty
+                        if sourceProblemNotes[idx].isHidden != hide {
+                            sourceProblemNotes[idx].isHidden = hide
+                        }
+                    }
                 }
             }
             waveform.laneProblems = laneProbs
@@ -4063,7 +4642,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             optionsNotice.stringValue = message
             optionsNotice.toolTip = message.isEmpty ? nil : message
         }
-        // The toolbar's status line says what the Windows one under the waveform says.
+        // Package 6 / WIN-06: status strip below waveform (26px, empty when no text, hidden in waveform-only).
         let line: String
         if let captureError {
             line = captureError
@@ -4081,8 +4660,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             statusLabel.stringValue = line
             statusLabel.toolTip = line.isEmpty ? nil : line
         }
-        let hideStatus = waveformOnly || line.isEmpty
-        if statusLabel.isHidden != hideStatus { statusLabel.isHidden = hideStatus }
+        if statusLabel.isHidden != waveformOnly { statusLabel.isHidden = waveformOnly }
 
         // Waveform-only mode has no toolbar, so the plot carries the mark and any problem.
         if waveformOnly && markShown {
@@ -4370,7 +4948,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             return .success(())
         case .gradient(let custom):
             frequencyGradient = custom ?? .standard
-            storeFrequencyGradient(refreshControls: true)
+            storeFrequencyGradient(persist: true, custom: custom != nil, refreshControls: true)
             return .success(())
         case .colorWait(let wait):
             harness?.colorWait = wait
@@ -4671,6 +5249,9 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     }
     private var statusToolTip: NSView.ToolTipTag?
     var gridOpacity: CGFloat = 1 { didSet { needsDisplay = true } }
+    var showsOutline = false { didSet { needsDisplay = true } }
+    var outlineWidth: CGFloat = 1 { didSet { needsDisplay = true } }
+    var outlineColor = NSColor.white { didSet { needsDisplay = true } }
     var showsBars = false {
         didSet {
             if showsBars != oldValue {
@@ -6578,6 +7159,18 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         drawLengthLabel(flagRects: drawnFlagRects, hoverRows: hoverRows)
         drawEmptyHint()
         drawCompactStatus()
+        if showsOutline && outlineWidth > 0 {
+            let innerRect = bounds.insetBy(dx: outlineWidth, dy: outlineWidth)
+            let innerRadius = max(0, cornerRadius - outlineWidth)
+            let border = NSBezierPath()
+            border.append(panel)
+            if innerRect.width > 0 && innerRect.height > 0 {
+                border.append(NSBezierPath(roundedRect: innerRect, xRadius: innerRadius, yRadius: innerRadius))
+                border.windingRule = .evenOdd
+            }
+            outlineColor.setFill()
+            border.fill()
+        }
         NSGraphicsContext.restoreGraphicsState()
     }
 }
