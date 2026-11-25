@@ -177,7 +177,7 @@ func verifyMacControlSaveReply() throws {
 @MainActor
 func verifyMacOptionsRebuild(step: String) throws {
     _ = NSApplication.shared
-    if ["typed-values", "deferred", "sources-name", "open-list", "key-loop", "switch-while-typing", "switch-unchanged", "not-a-number"].contains(step) {
+    if ["typed-values", "deferred", "sources-name", "open-list", "key-loop", "switch-while-typing", "switch-unchanged", "not-a-number", "resting-keyboard"].contains(step) {
         try BacktrackingController.verifyOptionsRebuildKeepsTyping(step: step)
         return
     }
@@ -4004,6 +4004,57 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             guard controller.addonSettingDrafts["verify.typing:gain"] == .double(0.6) else {
                 throw CaptureError("+ on a Number setting holding \"abc\" sent \(String(describing: controller.addonSettingDrafts["verify.typing:gain"]))")
             }
+        case "resting-keyboard":
+            // The keyboard resting in a field, as it does when Options opens or a list closes, is
+            // not typing: a change from an add-on rebuilds the page at once and the keyboard stays
+            // in the same field. Once something is typed the page waits until the typing ends.
+            guard let addons = category("Add-ons") else { throw CaptureError("No Add-ons category") }
+            controller.selectOptionCategory(addons)
+            controller.verifyOptionsPage = "Add-ons"
+            var generation: UInt64 = 9_200
+            func receive(_ says: String) {
+                generation += 1
+                let record = AddonRecord(id: "verify.typing", manifest: nil, enabled: true, state: "running", reason: nil, pid: 1,
+                    message: AddonNotice(level: "info", text: says), sources: [], settings: [text, number], actions: [],
+                    control_allowed: false, control_asked: false)
+                host.verifyReceive(AddonSnapshot(schema: 1, generation: generation, ready: true, error: nil, addons: [record], appearances: [:], completed: []))
+                controller.syncAddonSnapshotUI()
+            }
+            func keyboardField() -> Int? {
+                guard let view = page("Add-ons"), let editor = window.firstResponder as? NSTextView,
+                      let field = editor.delegate as? NSTextField else { return nil }
+                return editable(view).firstIndex { $0 === field }
+            }
+            autoreleasepool {
+                if let field = page("Add-ons").map(editable)?.last { _ = window.makeFirstResponder(field) }
+            }
+            (window.firstResponder as? NSTextView)?.setSelectedRange(NSRange(location: 1, length: 0))
+            let start = controller.verifyPagesBuilt
+            receive("one")
+            let resting = controller.verifyPagesBuilt - start
+            let caret = (window.firstResponder as? NSTextView)?.selectedRange()
+            guard resting == 1, keyboardField() == 1, caret == NSRange(location: 1, length: 0), controller.addonSettingDrafts.isEmpty,
+                  addonsRegistered(), !controller.pendingAddonsTabReload else {
+                throw CaptureError("Keyboard resting in a field: rebuilt \(resting) times, keyboard in field \(String(describing: keyboardField())), caret \(String(describing: caret)), drafts \(controller.addonSettingDrafts), pending \(controller.pendingAddonsTabReload)")
+            }
+            try autoreleasepool {
+                guard let field = page("Add-ons").map(editable)?.last else { throw CaptureError("No Number field") }
+                try type("0.8", into: field)
+            }
+            receive("two")
+            receive("three")
+            let typing = controller.verifyPagesBuilt - start - resting
+            let typed = (window.firstResponder as? NSTextView)?.string
+            guard typing == 0, controller.pendingAddonsTabReload, typed == "0.8", controller.addonSettingDrafts.isEmpty else {
+                throw CaptureError("While typing: rebuilt \(typing) times, pending \(controller.pendingAddonsTabReload), field holds \(typed ?? "-"), drafts \(controller.addonSettingDrafts)")
+            }
+            _ = window.makeFirstResponder(nil) // the typing ends
+            controller.syncAddonSnapshotUI()
+            let ended = controller.verifyPagesBuilt - start - resting
+            guard ended >= 1, !controller.pendingAddonsTabReload, controller.addonSettingDrafts["verify.typing:gain"] == .double(0.8),
+                  addonsRegistered() else {
+                throw CaptureError("After typing ended: rebuilt \(ended) times, pending \(controller.pendingAddonsTabReload), drafts \(controller.addonSettingDrafts)")
+            }
         case "open-list":
             // A Choice setting's list is open when an add-on's answer rebuilds the page.
             let choice = AddonSettingEntry(declaration: AddonSettingDeclaration(key: "mode", label: "Mode", help: nil, kind: "choice",
@@ -5075,6 +5126,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             contentRect: NSRect(origin: .zero, size: initialSize),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false
         )
+        watchOptionsTyping()
         // Package 8 / LOOK-01 & Package 12 / OPT-01: dark appearance, 820x640, tracks pin level.
         window.appearance = NSAppearance(named: .darkAqua)
         window.title = TestCopyConfig.current.windowTitle(independentWindow ? "Backtracking Capture Options" : "Backtracking Options")
@@ -5525,6 +5577,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var endingEditingForOptionsRebuild = false
     private var switchingOptionsTab = false
 
+    /// The text fields of a page that can be typed into, in the order they are laid out.
+    private static func editableFields(in view: NSView) -> [NSTextField] {
+        ((view as? NSTextField).flatMap { $0.isEditable ? [$0] : nil } ?? []) + view.subviews.flatMap(editableFields)
+    }
+
     /// A fresh page for `label`, built from the state now.
     private func makeOptionsPage(_ label: String) -> NSTabViewItem? {
         #if BACKTRACKING_CAPTURE_VERIFY
@@ -5557,8 +5614,18 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             pendingOptionsPages.insert(label)
             return
         }
+        // The field the keyboard is in, by its place among the page's fields: the rebuilt page
+        // gets the keyboard back in the same place, with the same selection if the text is the same.
+        var keyboardField: (index: Int, of: Int, text: String, selection: NSRange)?
         if let window = tabs.window, let previous = tabs.tabViewItems.first(where: { $0.label == label }),
            Self.responder(window.firstResponder, isInside: previous.view) {
+            if let editor = window.firstResponder as? NSTextView, editor.isFieldEditor,
+               let field = editor.delegate as? NSTextField, let view = previous.view {
+                let fields = Self.editableFields(in: view)
+                if let index = fields.firstIndex(where: { $0 === field }) {
+                    keyboardField = (index, fields.count, editor.string, editor.selectedRange())
+                }
+            }
             endingEditingForOptionsRebuild = true
             let ended = window.makeFirstResponder(nil)
             endingEditingForOptionsRebuild = false
@@ -5589,6 +5656,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         tabs.removeTabViewItem(current)
         window?.recalculateKeyViewLoop()
+        if selected, let keyboardField, let view = page.view {
+            let fields = Self.editableFields(in: view)
+            if fields.count == keyboardField.of, fields[keyboardField.index].isEnabled,
+               window?.makeFirstResponder(fields[keyboardField.index]) == true,
+               let editor = window?.firstResponder as? NSTextView, editor.string == keyboardField.text {
+                editor.setSelectedRange(keyboardField.selection)
+            }
+        }
         if selected, let scroll = page.view as? NSScrollView {
             scroll.layoutSubtreeIfNeeded()
             scroll.contentView.scroll(to: offset)
@@ -8628,7 +8703,33 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         #if BACKTRACKING_CAPTURE_VERIFY
         if let verifyEditingText { return verifyEditingText }
         #endif
-        return optionsPanel?.firstResponder is NSTextView
+        // The keyboard resting in a field is not typing: a field has it whenever Options opens or
+        // a list closes, and a page that waited for it to leave would stay as it was.
+        guard let editor = optionsPanel?.firstResponder as? NSTextView, let typed = optionsFieldBeingTyped else { return false }
+        return editor.delegate === typed
+    }
+
+    /// The field whose text the user has changed and not yet finished with.
+    private weak var optionsFieldBeingTyped: NSTextField?
+    private var watchingOptionsTyping = false
+
+    /// Follows typing in the Options window's text fields: from the first change to the end of that edit.
+    private func watchOptionsTyping() {
+        guard !watchingOptionsTyping else { return }
+        watchingOptionsTyping = true
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(optionsTextChanged(_:)), name: NSControl.textDidChangeNotification, object: nil)
+        center.addObserver(self, selector: #selector(optionsTextEnded(_:)), name: NSControl.textDidEndEditingNotification, object: nil)
+    }
+
+    @objc private func optionsTextChanged(_ note: Notification) {
+        guard let field = note.object as? NSTextField, field.window === optionsPanel else { return }
+        optionsFieldBeingTyped = field
+    }
+
+    @objc private func optionsTextEnded(_ note: Notification) {
+        guard let field = note.object as? NSTextField, field === optionsFieldBeingTyped else { return }
+        optionsFieldBeingTyped = nil
     }
 
     private func syncAddonSnapshotUI() {
