@@ -901,6 +901,31 @@ private struct WaveformFrame: Sendable {
 }
 
 // Immutable recording material shared by the edit renderer and WAV worker.
+/// One freeze of the capture that is on its way to the main queue. The capture queue fills it in,
+/// so quitting can still use the audio after the main-queue completion can no longer run.
+private final class EditingMaterialRead: @unchecked Sendable {
+    let tap: ObjectIdentifier
+    private let lock = NSLock()
+    private var done = false
+    private var frozen: WAVExport?
+
+    init(tap: ObjectIdentifier) { self.tap = tap }
+
+    func finish(_ material: WAVExport?) {
+        lock.lock()
+        done = true
+        frozen = material
+        lock.unlock()
+    }
+
+    /// The frozen audio once the read has run; nil before that or when there was none.
+    var material: WAVExport? {
+        lock.lock()
+        defer { lock.unlock() }
+        return done ? frozen : nil
+    }
+}
+
 private final class WAVExport: @unchecked Sendable {
     private static let releaseQueue = DispatchQueue(label: "Backtracking.material-release", qos: .utility)
     private let frozen: OpaquePointer
@@ -1654,6 +1679,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let controlCall: AddonControlCall?
     }
     private var pendingSnapshots: [PendingSnapshotSave] = []
+    /// Saves that asked for their own freeze of the capture (Windows `pending_snapshot_reads`).
+    private struct SnapshotRead {
+        let read: EditingMaterialRead
+        let save: PendingSnapshotSave
+    }
+    private var pendingSnapshotReads: [SnapshotRead] = []
     private var addonHost: AddonHostClient?
     private var addonPositionsCursor: UInt64 = 0
     private var lastAddonSnapshotForUI: AddonSnapshot = .empty
@@ -2086,6 +2117,57 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         try check(selected, frames: 1_000)
         try check(whole, frames: Int(end - first))
+        try verifyTerminationSnapshotRead()
+    }
+
+    /// A save without a selection asks for its own freeze through `saveSnapshot`; the app quits
+    /// before that freeze reaches the main queue. Its WAVs must still be written.
+    static func verifyTerminationSnapshotRead() throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-exit-read-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        let lanes = [
+            CaptureLane(source: .addon(addonID: "verify.exit", sourceID: "a"), route: .merged),
+            CaptureLane(source: .addon(addonID: "verify.exit", sourceID: "b"), route: .merged)
+        ]
+        let tap = try SystemAudioTap(history: 10, lanes: lanes)
+        controller.captureLanes = lanes
+        controller.tap = tap
+        defer { controller.tap = nil }
+        let frames = 4_800
+        let levels: [[Float]] = [[0.25, -0.5], [0.125, 0.375]]
+        for (lane, level) in levels.enumerated() {
+            let samples = (0..<frames).flatMap { _ in level }
+            let accepted = tap.withCaptureRead { core in
+                samples.withUnsafeBufferPointer {
+                    bt_tracks_push_interleaved(core, UInt32(lane), $0.baseAddress, UInt32(frames),
+                                               1_000_000_000, SystemAudioTap.timelineRate)
+                }
+            }
+            guard accepted == UInt32(frames) else { throw CaptureError("Exit read verification lane \(lane) lost input") }
+        }
+        let (first, end) = tap.withCaptureSnapshot { (bt_tracks_first_frame($0), bt_tracks_end_frame($0)) }
+        // Something else is still running on the capture queue, so the save's freeze waits behind it.
+        tap.readCapture(poll: false, { _ in Thread.sleep(forTimeInterval: 0.3); return 0 }) { _ in }
+        let folder = scratch.appendingPathComponent("whole", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        controller.saveSnapshot(into: folder.path)
+        controller.queuePendingSnapshotsForTermination()
+        controller.worker.sync {}
+        let files = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "wav" }
+        guard files.count == levels.count else {
+            throw CaptureError("A whole-capture save made just before quitting wrote \(files.count) WAV files, expected \(levels.count)")
+        }
+        for url in files {
+            let file = try AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: false)
+            guard file.length == Int64(end - first), file.processingFormat.channelCount == 2 else {
+                throw CaptureError("Exit read save \(url.lastPathComponent) has \(file.length) frames, expected \(end - first)")
+            }
+        }
+        guard controller.pendingSnapshotReads.isEmpty else { throw CaptureError("Exit left a save waiting for its freeze") }
     }
     #endif
 
@@ -2221,38 +2303,51 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     /// Explicit saves that are still waiting for frozen audio are written before the app exits.
     private func queuePendingSnapshotsForTermination() {
-        if !pendingSnapshots.isEmpty, let tap {
-            let queued = pendingSnapshots
-            pendingSnapshots.removeAll()
+        let queued = pendingSnapshots
+        let ownReads = pendingSnapshotReads
+        pendingSnapshots.removeAll()
+        pendingSnapshotReads.removeAll()
+        guard !queued.isEmpty || !ownReads.isEmpty, let tap else { return }
+        // readCapture delivers on the main queue, which this thread is blocking. The capture queue is
+        // serial and never waits for the main queue, so this waits for every freeze still in flight.
+        tap.withCaptureRead { _ in }
+        var refrozen: WAVExport??
+        func freezeNow() -> WAVExport? {
+            if let refrozen { return refrozen }
             let routes = tap.captureRoutes
             let labels = tap.captureChannelNames
             let groups = (0..<tap.laneCount).map { tap.channelGroups(for: $0) }
             let frozenPos = tap.freezePositions()
-            let shownIDs = currentShownGroupIDs()
-            // readCapture delivers on the main queue, which this thread is blocking; freeze inline instead.
-            // The capture queue is serial, so this runs after any freeze still in flight.
             let frozen = tap.withCaptureSnapshot {
                 WAVExport(core: $0, routes: routes, channelNames: labels, channelGroups: groups, positions: frozenPos)
             }
-            if let frozen {
-                for req in queued {
-                    let range = req.range ?? frozen.span
-                    if range.lowerBound >= frozen.span.lowerBound, range.upperBound <= frozen.span.upperBound, !range.isEmpty {
-                        let sampleRate = exportSampleRate
-                        let bits = exportBitsPerSample
-                        let mono = forceMonoExport
-                        let wide = wideExportMode
-                        let binaural = pairBinaural
-                        let names = laneFileNames
-                        let hide = hideSilentLaneIndices
-                        worker.async {
-                            _ = frozen.write(range: range, directory: req.directory, sampleRate: sampleRate,
-                                             bitsPerSample: bits, forceMono: mono, fades: req.fades, names: names,
-                                             selectedRows: req.rows, hideSilentLanes: hide, wideMode: wide,
-                                             pairBinaural: binaural, shownGroupIDs: shownIDs)
-                        }
-                    }
-                }
+            refrozen = .some(frozen)
+            return frozen
+        }
+        let current = ObjectIdentifier(tap)
+        // A save that asked for its own freeze writes that freeze, as Windows does with the read it requested.
+        var jobs: [(WAVExport, PendingSnapshotSave)] = ownReads.compactMap { entry in
+            let own = entry.read.tap == current ? entry.read.material : nil
+            return (own ?? freezeNow()).map { ($0, entry.save) }
+        }
+        jobs += queued.compactMap { req in freezeNow().map { ($0, req) } }
+        let sampleRate = exportSampleRate
+        let bits = exportBitsPerSample
+        let mono = forceMonoExport
+        let wide = wideExportMode
+        let binaural = pairBinaural
+        let names = laneFileNames
+        let hide = hideSilentLaneIndices
+        let shownIDs = currentShownGroupIDs()
+        for (frozen, req) in jobs {
+            let range = req.range ?? frozen.span
+            guard range.lowerBound >= frozen.span.lowerBound, range.upperBound <= frozen.span.upperBound,
+                  !range.isEmpty else { continue }
+            worker.async {
+                _ = frozen.write(range: range, directory: req.directory, sampleRate: sampleRate,
+                                 bitsPerSample: bits, forceMono: mono, fades: req.fades, names: names,
+                                 selectedRows: req.rows, hideSilentLanes: hide, wideMode: wide,
+                                 pairBinaural: binaural, shownGroupIDs: shownIDs)
             }
         }
     }
@@ -5240,13 +5335,18 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         waveform?.materialForExport(range: range)
     }
 
-    func requestEditingMaterial(_ completion: @escaping (WAVExport?) -> Void) {
+    /// Freezes the capture. `read` receives the result on the capture queue, before the main queue does.
+    func requestEditingMaterial(read: EditingMaterialRead? = nil, _ completion: @escaping (WAVExport?) -> Void) {
         guard let tap else { completion(nil); return }
         let routes = tap.captureRoutes
         let labels = tap.captureChannelNames
         let groups = (0..<tap.laneCount).map { tap.channelGroups(for: $0) }
         let frozenPos = tap.freezePositions()
-        tap.readCapture({ WAVExport(core: $0, routes: routes, channelNames: labels, channelGroups: groups, positions: frozenPos) }) { [weak self, weak tap] material in
+        tap.readCapture({
+            let material = WAVExport(core: $0, routes: routes, channelNames: labels, channelGroups: groups, positions: frozenPos)
+            read?.finish(material)
+            return material
+        }) { [weak self, weak tap] material in
             guard let self, let tap, self.tap === tap else { completion(nil); return }
             completion(material)
         }
@@ -5879,9 +5979,18 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         if let material = waveform?.materialForExport(range: selected) {
             save(material)
-        } else {
+        } else if let tap {
             setNotice("Preparing snapshot…")
-            requestEditingMaterial(save)
+            // Listed until its freeze arrives, so quitting first still writes it (Windows `pending_snapshot_reads`).
+            let read = EditingMaterialRead(tap: ObjectIdentifier(tap))
+            pendingSnapshotReads.append(SnapshotRead(read: read, save: req))
+            requestEditingMaterial(read: read) { [weak self] job in
+                guard let self, let index = self.pendingSnapshotReads.firstIndex(where: { $0.read === read }) else { return }
+                self.pendingSnapshotReads.remove(at: index)
+                save(job)
+            }
+        } else {
+            save(nil)
         }
     }
 
