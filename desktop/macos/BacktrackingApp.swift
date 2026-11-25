@@ -109,6 +109,12 @@ func verifyMacControlPauseHolds() throws {
 }
 
 @MainActor
+func verifyMacLookUpdatesKeepControls() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyLookUpdatesKeepControls()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -1790,6 +1796,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let save: PendingSnapshotSave
     }
     private var pendingSnapshotReads: [SnapshotRead] = []
+    private var pendingLookControlsRebuild = false
+    private var pendingAddonsTabReload = false
     /// The window's editing freezes still in flight, oldest first; `pendingSnapshots` wait for them.
     private var editingFreezeReads: [EditingMaterialRead] = []
     private let clipLedger = ClipExportLedger()
@@ -2411,6 +2419,27 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard controller.paused, !controller.shouldAutoResume(now: soon),
               controller.shouldAutoResume(now: soon + 5) else {
             throw CaptureError("An add-on's pause resumes on its own after 0.4 s (paused \(controller.paused))")
+        }
+    }
+
+    /// A look that repaints its colours every 250 ms neither rebuilds the Appearance page's look
+    /// controls nor reloads the Add-ons page; a new offer or gradient does.
+    static func verifyLookUpdatesKeepControls() throws {
+        func look(_ waveform: String, spectrum: [AddonSpectrumStop] = []) -> AddonAppearance {
+            AddonAppearance(colors: ["waveform": waveform], numbers: [:], rows: [:], spectrum: spectrum)
+        }
+        func snapshot(_ generation: UInt64, _ looks: [String: AddonAppearance]) -> AddonSnapshot {
+            AddonSnapshot(schema: 1, generation: generation, ready: true, error: nil, addons: [], appearances: looks, completed: [])
+        }
+        let warm = [AddonSpectrumStop(color: "#ff8800", position: 0), AddonSpectrumStop(color: "#2c68ec", position: 1)]
+        let a = snapshot(1, ["theme": look("#88ccff", spectrum: warm)])
+        let b = snapshot(2, ["theme": look("#99ddff", spectrum: warm)])
+        let c = snapshot(3, ["theme": look("#99ddff", spectrum: warm.reversed().map { AddonSpectrumStop(color: $0.color, position: 1 - $0.position) })])
+        let d = snapshot(4, ["theme": look("#99ddff"), "other": look("#ffffff")])
+        let repaint = lookControlsChanged(from: a, to: b, chosen: "theme") || addonsPageChanged(from: a, to: b)
+        guard !repaint, lookControlsChanged(from: b, to: c, chosen: "theme"), lookControlsChanged(from: c, to: d, chosen: "theme"),
+              !lookControlsChanged(from: a, to: b, chosen: nil) else {
+            throw CaptureError("A look's colour update rebuilds controls (\(repaint)) or a new gradient or offer does not")
         }
     }
 
@@ -6622,15 +6651,68 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     /// Brings the window up to the host's latest snapshot. Any read of the snapshot (a poll, or the
     /// grant check before each control request) can advance it, so this compares generations
     /// with what the window last showed instead of trusting one poll's answer.
+    /// Whether the Appearance page's "Look from add-on" list and gradient rows show something new:
+    /// another set of offering add-ons or names, or another gradient from the chosen look. A look
+    /// that only changes its colours is applied without rebuilding them (Windows `OfferWatch`).
+    static func lookControlsChanged(from prev: AddonSnapshot, to snap: AddonSnapshot, chosen: String?) -> Bool {
+        let offering = { (s: AddonSnapshot) in s.appearances.keys.sorted().map { "\($0)\u{0}\(s.addonName(for: $0))" } }
+        if offering(prev) != offering(snap) { return true }
+        guard let chosen else { return false }
+        return prev.appearances[chosen]?.spectrum != snap.appearances[chosen]?.spectrum
+            || prev.addonName(for: chosen) != snap.addonName(for: chosen)
+    }
+
+    /// Whether the Add-ons page shows something new; looks alone do not appear there.
+    /// A source's play position moves many times a second and is shown on the Sources page and
+    /// the waveform's chip, not here.
+    static func addonsPageChanged(from prev: AddonSnapshot, to snap: AddonSnapshot) -> Bool {
+        func shown(_ addon: AddonRecord) -> AddonRecord {
+            AddonRecord(id: addon.id, manifest: addon.manifest, enabled: addon.enabled, state: addon.state,
+                        reason: addon.reason, pid: addon.pid, message: addon.message,
+                        sources: addon.sources.map {
+                            AddonSource(id: $0.id, name: $0.name, sender: $0.sender, formats: $0.formats,
+                                        format: $0.format, groups: $0.groups, transport: nil)
+                        },
+                        settings: addon.settings, actions: addon.actions,
+                        control_allowed: addon.control_allowed, control_asked: addon.control_asked)
+        }
+        return prev.addons.map(shown) != snap.addons.map(shown) || prev.ready != snap.ready || prev.error != snap.error
+    }
+
+    /// A menu is open or a mouse button is down in this app; controls are not swapped under it.
+    private var userIsHandlingControls: Bool {
+        RunLoop.current.currentMode == .eventTracking || NSEvent.pressedMouseButtons != 0
+    }
+
     private func syncAddonSnapshotUI() {
         guard let host = addonHost else { return }
         let snap = host.snapshot
         currentAddonSnapshot = snap
+        // Rebuilds put off while the user held a menu or a control are done once they let go.
+        if !userIsHandlingControls {
+            if pendingLookControlsRebuild {
+                pendingLookControlsRebuild = false
+                recomputeLook(refreshAppearanceTab: true)
+            }
+            if pendingAddonsTabReload {
+                pendingAddonsTabReload = false
+                if optionsPanel?.isVisible == true, optionTabs?.selectedTabViewItem?.label == "Add-ons",
+                   !(optionsPanel?.firstResponder is NSTextView) {
+                    reloadAddonsTab()
+                }
+            }
+        }
         guard snap.generation != lastAddonSnapshotForUI.generation else { return }
         let prev = lastAddonSnapshotForUI
         lastAddonSnapshotForUI = snap
         if prev.appearances != snap.appearances || prev.addons.map(\.id) != snap.addons.map(\.id) {
-            recomputeLook(refreshAppearanceTab: true)
+            let rebuild = Self.lookControlsChanged(from: prev, to: snap, chosen: selectedLookAddonID)
+            if rebuild && userIsHandlingControls {
+                pendingLookControlsRebuild = true
+                recomputeLook(refreshAppearanceTab: false)
+            } else {
+                recomputeLook(refreshAppearanceTab: rebuild)
+            }
         }
         // Refresh cached source choices if any running add-on sources changed.
         let sourcesChanged = !prev.addons.elementsEqual(snap.addons) { a, b in
@@ -6646,8 +6728,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let optionsVisible = optionsPanel?.isVisible == true
         if optionsVisible, let tabs = optionTabs {
             let selectedLabel = tabs.selectedTabViewItem?.label
-            if selectedLabel == "Add-ons" && !(optionsPanel?.firstResponder is NSTextView) {
-                reloadAddonsTab()
+            if selectedLabel == "Add-ons" {
+                if Self.addonsPageChanged(from: prev, to: snap) {
+                    if userIsHandlingControls || optionsPanel?.firstResponder is NSTextView {
+                        pendingAddonsTabReload = true
+                    } else {
+                        reloadAddonsTab()
+                    }
+                }
             } else if selectedLabel == "Sources" && sourcesChanged {
                 let sourcesStructureChanged = !prev.addons.elementsEqual(snap.addons) { a, b in
                     a.id == b.id && a.state == b.state && a.sources.elementsEqual(b.sources) { s1, s2 in
