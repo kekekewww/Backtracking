@@ -2692,6 +2692,23 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard file.fileFormat.sampleRate == 44_100, sent == [expected] else {
             throw CaptureError("A \(file.fileFormat.sampleRate) Hz WAV of \(file.length) frames was announced as \(sent), expected [\(expected)]")
         }
+        // A drag prepared at 44.1 kHz and dropped after the setting went to 96 kHz is announced
+        // at the rate its files were written at. Preparing a drag and dropping it need the pointer,
+        // so the marker the preparation leaves is set here.
+        let view = WaveformView(frame: NSRect(x: 0, y: 0, width: 400, height: 100))
+        view.controller = controller
+        view.verifyPrepareDragMarker(range: 0..<48_000, exportRate: 44_100, sourceRate: 48_000)
+        controller.exportSampleRate = 96_000
+        view.announceDraggedFiles([url])
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        while host.verifyEvents.filter({ $0 == "clip_exported answered" }).count < 2 && ProcessInfo.processInfo.systemUptime < deadline {
+            host.pollSnapshot()
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        let dragged = host.verifyEvents.filter { $0.hasPrefix("clip_exported ") && $0 != "clip_exported answered" }.dropFirst()
+        guard Array(dragged) == ["clip_exported 44100 44100 1"] else {
+            throw CaptureError("A drag prepared at 44.1 kHz was announced as \(Array(dragged))")
+        }
     }
 
     /// An add-on's pause_capture holds for the auto-resume delay, as a pause by hand does.
@@ -7447,10 +7464,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     /// Files dragged out were written at the export rate in force when they were prepared.
-    func notifyDraggedClip(urls: [URL], sourceFrames: UInt64, sourceRate: UInt32) {
-        notifyClipExported(ClipExportLedger.Clip(urls: urls, sampleRate: exportSampleRate,
+    func notifyDraggedClip(urls: [URL], sourceFrames: UInt64, sourceRate: UInt32, exportRate: UInt32) {
+        notifyClipExported(ClipExportLedger.Clip(urls: urls, sampleRate: exportRate,
                                                  sourceFrames: sourceFrames, sourceRate: sourceRate))
     }
+
+    var currentExportSampleRate: UInt32 { exportSampleRate }
 
     func notifyClipExported(_ clip: ClipExportLedger.Clip,
                             completion: @escaping (Result<Void, MessageError>) -> Void = { _ in }) {
@@ -9101,7 +9120,9 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     private var markerRows: [RowIdentity] = []
     private var markerRevision: UInt64 = 0
     private var committedMarkerRevision: UInt64 = 0
-    private var pendingDragMarker: (range: Range<UInt64>, rows: [RowIdentity]?, ticket: UInt64)?
+    /// The prepared drag's flags, and the rates its files were written at and from.
+    private var pendingDragMarker: (range: Range<UInt64>, rows: [RowIdentity]?, ticket: UInt64,
+                                    exportRate: UInt32, sourceRate: UInt32)?
     private var anchor: UInt64?
     private var selectionPressX: CGFloat?
     private var selectionMoved = false
@@ -10501,6 +10522,23 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         if anchor != nil { mouseUp(with: event) }
     }
 
+    /// Tells the add-ons about files dropped outside, at the rates they were written at when the
+    /// drag was prepared, whatever the settings say now.
+    func announceDraggedFiles(_ urls: [URL]) {
+        guard !urls.isEmpty, let controller else { return }
+        let frames = pendingDragMarker.map { $0.range.upperBound - $0.range.lowerBound }
+            ?? (retainedFrames.upperBound - retainedFrames.lowerBound)
+        controller.notifyDraggedClip(urls: urls, sourceFrames: frames,
+                                     sourceRate: pendingDragMarker?.sourceRate ?? sampleRate,
+                                     exportRate: pendingDragMarker?.exportRate ?? controller.currentExportSampleRate)
+    }
+
+    #if BACKTRACKING_CAPTURE_VERIFY
+    func verifyPrepareDragMarker(range: Range<UInt64>, exportRate: UInt32, sourceRate: UInt32) {
+        pendingDragMarker = (range, nil, 0, exportRate, sourceRate)
+    }
+    #endif
+
     private func pointerIsInApp(at point: NSPoint) -> Bool {
         NSApp.windows.contains { $0.isVisible && $0.frame.contains(point) }
     }
@@ -10527,6 +10565,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         } else {
             rows = nil
         }
+        let exportRate = controller.currentExportSampleRate
+        let sourceRate = job.sampleRate
         pendingDragWrite = controller.prepareDrag(job, range: range, fades: fadesForSaving(), rows: rows) {
             [weak self] urls in
             guard let self, self.exportVersion == version else { return false }
@@ -10538,7 +10578,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 return false
             }
             if !urls.isEmpty {
-                self.pendingDragMarker = (range, rows, ticket)
+                self.pendingDragMarker = (range, rows, ticket, exportRate, sourceRate)
                 self.beginFileDrag(urls, event: event)
             }
             return true
@@ -10581,11 +10621,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         let exportedURLs = accepted ? readyFiles : []
         let saved = accepted ? exportDescription(exportedURLs) : nil
         if accepted {
-            let frames = pendingDragMarker.map { $0.range.upperBound - $0.range.lowerBound }
-                ?? (retainedFrames.upperBound - retainedFrames.lowerBound)
-            if !exportedURLs.isEmpty {
-                controller?.notifyDraggedClip(urls: exportedURLs, sourceFrames: frames, sourceRate: sampleRate)
-            }
+            announceDraggedFiles(exportedURLs)
             readyFiles.removeAll()
             if let pendingDragMarker {
                 commitMarker(pendingDragMarker.range, rows: pendingDragMarker.rows, ticket: pendingDragMarker.ticket)
