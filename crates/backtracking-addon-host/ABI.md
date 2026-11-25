@@ -117,3 +117,8 @@ bt-test-sender takes stereo, 7.1.4 or spectrum. Set BACKTRACKING_TEST_SENDER_SEC
 stream, BACKTRACKING_TEST_WIDE_TONES=spread or BACKTRACKING_TEST_SPECTRUM_SIDES=split
 for the respective variants. bt-check-audio takes a Sender id and checks a non-silent
 packet. On macOS use the same isolated HOME for the test app and both tools.
+
+For TEST-06, run bt-test-sender system with BACKTRACKING_TEST_SYSTEM_FORMAT set to
+5.1, 7.1 or 7.1.4 followed by :all or :stereo. Sender id c1c1-5e7d-0006 publishes
+480-frame packets at 48 kHz, with the matching speaker labels. The test app provides
+capture pause/resume and quiet-section retention.

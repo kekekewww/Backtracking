@@ -8,8 +8,16 @@ fn main() {
         Some("stereo") => serve_stereo_sender(),
         Some("7.1.4") => serve_wide_sender(),
         Some("spectrum") => serve_spectrum_sender(),
+        Some("system") => {
+            if let Err(e) = serve_system_sender(
+                &std::env::var("BACKTRACKING_TEST_SYSTEM_FORMAT").unwrap_or_default(),
+            ) {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
         _ => {
-            eprintln!("usage: bt-test-sender stereo|7.1.4|spectrum");
+            eprintln!("usage: bt-test-sender stereo|7.1.4|spectrum|system");
             std::process::exit(2)
         }
     }
@@ -23,6 +31,39 @@ const WIDE_SENDER_NAME: &str = "7.1.4 test tone";
 const WIDE_SENDER_LABELS: [&str; 12] = [
     "FL", "FR", "FC", "LFE", "Lb", "Rb", "Ls", "Rs", "TFL", "TFR", "TBL", "TBR",
 ];
+
+// Frequency, frame phase and activity pattern from desktop/windows/src/loopback/synthetic.rs
+// at e9a4efc0d2918bccadeecf2c7e586b84ddd5a4f4. Labels carry the layout over Sender.
+fn serve_system_sender(spec: &str) -> Result<(), String> {
+    let Some((layout, activity @ ("all" | "stereo"))) = spec.split_once(':') else {
+        return Err(format!("Unknown synthetic format {spec}"));
+    };
+    let labels: &[&str] = match layout {
+        "5.1" => &["FL", "FR", "FC", "LFE", "Ls", "Rs"],
+        "7.1" => &WIDE_SENDER_LABELS[..8],
+        "7.1.4" => &WIDE_SENDER_LABELS,
+        _ => return Err(format!("Unknown synthetic format {spec}")),
+    };
+    serve_sender(
+        "c1c1-5e7d-0006",
+        "Synthetic system audio",
+        labels.len(),
+        labels,
+        |time, frame| {
+            let index = (time * 48_000.).round() as u64 % 48_000;
+            for (channel, sample) in frame.iter_mut().enumerate() {
+                *sample = if activity == "all" || channel < 2 {
+                    (std::f64::consts::TAU * index as f64 * (220 + 30 * channel) as f64 / 48_000.)
+                        .sin() as f32
+                        * 0.25
+                } else {
+                    0.
+                }
+            }
+        },
+    );
+    Ok(())
+}
 
 fn serve_stereo_sender() {
     serve_sender(
