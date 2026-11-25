@@ -4090,6 +4090,19 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                   addonsRegistered() else {
                 throw CaptureError("After typing ended: rebuilt \(ended) times, pending \(controller.pendingAddonsTabReload), drafts \(controller.addonSettingDrafts)")
             }
+            // Text an input method is still composing is typing, though no change is reported for
+            // it: the page waits, and what is being composed is neither written nor sent (N2).
+            guard let folder = page("Add-ons").map(editable)?.first, window.makeFirstResponder(folder),
+                  let composer = window.firstResponder as? NSTextView else { throw CaptureError("No Text field to compose in") }
+            composer.setMarkedText("ㄋㄧ", selectedRange: NSRange(location: 2, length: 0),
+                                   replacementRange: NSRange(location: NSNotFound, length: 0))
+            let beforeComposing = (built: controller.verifyPagesBuilt, drafts: controller.addonSettingDrafts)
+            receive("composing")
+            let interrupted = controller.verifyPagesBuilt - beforeComposing.built
+            guard composer.hasMarkedText(), interrupted == 0, controller.pendingAddonsTabReload,
+                  controller.addonSettingDrafts == beforeComposing.drafts else {
+                throw CaptureError("While an input method composed: still composing \(composer.hasMarkedText()), rebuilt \(interrupted) times, pending \(controller.pendingAddonsTabReload), drafts \(controller.addonSettingDrafts)")
+            }
         case "open-list":
             // A Choice setting's list is open when an add-on's answer rebuilds the page.
             let choice = AddonSettingEntry(declaration: AddonSettingDeclaration(key: "mode", label: "Mode", help: nil, kind: "choice",
