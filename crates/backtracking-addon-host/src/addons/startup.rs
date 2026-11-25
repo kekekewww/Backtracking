@@ -6,7 +6,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use backtracking_addon::manifest::validate_id;
+use backtracking_addon::{manifest::validate_id, package::transaction_id};
 
 #[derive(Clone)]
 pub(super) struct PrimaryLease {
@@ -72,18 +72,6 @@ fn stale_addon_entry(name: &str) -> Option<bool> {
         return validate_id(id).is_ok().then_some(false);
     }
     transaction_id(name, ".install-").map(|_| true)
-}
-
-fn transaction_id<'a>(name: &'a str, separator: &str) -> Option<&'a str> {
-    let (id, suffix) = name.rsplit_once(separator)?;
-    validate_id(id).ok()?;
-    let (pid, sequence) = suffix.split_once('-')?;
-    if !suffix.bytes().all(|b| b == b'-' || b.is_ascii_digit()) {
-        return None;
-    }
-    pid.parse::<u32>().ok()?;
-    sequence.parse::<u64>().ok()?;
-    Some(id)
 }
 
 fn recover_backups(addons: &Path) -> Result<(), String> {

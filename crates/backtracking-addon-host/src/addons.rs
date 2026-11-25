@@ -2447,6 +2447,146 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn write_backup_fixture(folder: &Path, id: &str) {
+        let mut manifest = info(Vec::new()).manifest.unwrap();
+        manifest.id = id.into();
+        let program = folder.join(&manifest.run.values().next().unwrap().program);
+        fs::create_dir_all(program.parent().unwrap()).unwrap();
+        fs::write(
+            folder.join("addon.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(program, "previous complete version").unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remove_v2_broken_package_stays_removed_through_two_starts() {
+        let dir = TestDir::new();
+        let id = "com.example.test";
+        let addons = dir.0.join("addons");
+        let target = addons.join(id);
+        let backup = addons.join(format!(".{id}.backup-1-2"));
+        write_backup_fixture(&backup, id);
+        fs::create_dir(&target).unwrap();
+        let data = dir.0.join("addon-data").join(id);
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("keep"), "private").unwrap();
+        std::os::unix::fs::symlink(&data, backup.join("extra")).unwrap();
+        let other = "com.example.test.backup-1-2";
+        fs::create_dir(addons.join(other)).unwrap();
+        let other_backup = addons.join(format!(".{other}.backup-3-4"));
+        write_backup_fixture(&other_backup, other);
+        let unrelated = addons.join(format!(".{id}.backup-1-2.extra"));
+        fs::create_dir(&unrelated).unwrap();
+        {
+            let manager = AddonManager::new(dir.0.clone(), "test").unwrap();
+            assert!(target.is_dir() && backup.is_dir());
+            manager
+                .handle()
+                .remove(id, false)
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+        }
+        for _ in 0..2 {
+            let manager = AddonManager::new(dir.0.clone(), "test").unwrap();
+            assert!(!target.exists() && !backup.exists());
+            assert!(addons.join(other).is_dir());
+            package::validate_installed_folder(&other_backup, other).unwrap();
+            assert!(unrelated.is_dir());
+            assert_eq!(fs::read_to_string(data.join("keep")).unwrap(), "private");
+            drop(manager);
+            package::remove(&addons, id).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remove_v2_refuses_ambiguous_foreign_and_linked_backups_under_lock() {
+        let dir = TestDir::new();
+        let id = "com.example.test";
+        let addons = dir.0.join("addons");
+        let target = addons.join(id);
+        let backup = addons.join(format!(".{id}.backup-1-2"));
+        let extra = addons.join(format!(".{id}.backup-1-3"));
+        fs::create_dir_all(&target).unwrap();
+        write_backup_fixture(&backup, id);
+        let lock = addons.join(format!(".{id}.lock"));
+        fs::write(&lock, "").unwrap();
+        assert!(
+            package::remove(&addons, id)
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot change")
+        );
+        assert!(target.is_dir() && backup.is_dir());
+        fs::remove_file(lock).unwrap();
+        write_backup_fixture(&extra, id);
+        for _ in 0..2 {
+            assert!(
+                package::remove(&addons, id)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("multiple valid backups")
+            );
+            assert!(target.is_dir());
+            for path in [&backup, &extra] {
+                package::validate_installed_folder(path, id).unwrap();
+            }
+        }
+        let private = dir.0.join("data");
+        fs::rename(&extra, &private).unwrap();
+        std::os::unix::fs::symlink(&private, &extra).unwrap();
+        assert!(package::remove(&addons, id).is_err());
+        package::validate_installed_folder(&private, id).unwrap();
+        fs::remove_file(&extra).unwrap();
+        write_backup_fixture(&extra, "com.example.other");
+        assert!(package::remove(&addons, id).is_err());
+        package::validate_installed_folder(&extra, "com.example.other").unwrap();
+        assert!(target.is_dir() && backup.is_dir());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remove_v2_retries_after_partial_deletion_without_restoring_backup() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new();
+        let id = "com.example.test";
+        let addons = dir.0.join("addons");
+        let target = addons.join(id);
+        let backup = addons.join(format!(".{id}.backup-1-2"));
+        fs::create_dir_all(&target).unwrap();
+        write_backup_fixture(&backup, id);
+        // Exercise a real failure while deleting the former backup in the visible slot.
+        let readonly = backup.join("readonly");
+        fs::create_dir(&readonly).unwrap();
+        fs::write(readonly.join("keep"), "in use").unwrap();
+        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = package::remove(&addons, id);
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(result.is_err());
+            assert!(!backup.exists());
+            assert!(target.join("readonly/keep").is_file());
+            startup::PrimaryLease::acquire(&dir.0)
+                .unwrap()
+                .cleanup()
+                .unwrap();
+            fs::set_permissions(target.join("readonly"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        package::remove(&addons, id).unwrap();
+        for _ in 0..2 {
+            startup::PrimaryLease::acquire(&dir.0)
+                .unwrap()
+                .cleanup()
+                .unwrap();
+            assert!(!target.exists() && !backup.exists());
+        }
+    }
+
     #[test]
     fn rc1_ambiguous_backups_remain_available_on_retry() {
         let dir = TestDir::new();
