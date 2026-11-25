@@ -1835,6 +1835,19 @@ fn valid_group_range(start: u32, count: u32, width: usize) -> Option<Range<usize
     (e <= width).then_some(s..e)
 }
 
+/// The head model for binaural preview at `rate`, made the first time it is needed and kept
+/// for later previews at that rate (Windows `Recorder::head_model`).
+fn cached_head_model(rate: u32) -> Option<Arc<crate::spatial::HeadModel>> {
+    static MODELS: Mutex<Vec<Arc<crate::spatial::HeadModel>>> = Mutex::new(Vec::new());
+    let mut models = MODELS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(model) = models.iter().find(|model| model.sample_rate() == rate) {
+        return Some(Arc::clone(model));
+    }
+    let model = Arc::new(crate::spatial::HeadModel::new(rate).ok()?);
+    models.push(Arc::clone(&model));
+    Some(model)
+}
+
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C" fn bt_frozen_play_group_selection(
@@ -1870,6 +1883,8 @@ unsafe extern "C" fn bt_frozen_play_group_selection(
         track: crate::FrozenTrack,
         route: ChannelRoute,
         group: Option<PairGroup>,
+        /// The lane-native channels of `group`; empty for a mono or stereo lane.
+        channels: Range<usize>,
         selected: Option<Vec<usize>>,
         positions: Option<&'a crate::FrozenPositionTrack>,
     }
@@ -1912,6 +1927,7 @@ unsafe extern "C" fn bt_frozen_play_group_selection(
                 track,
                 route,
                 group: None,
+                channels: 0..0,
                 selected: sel,
                 positions: None,
             });
@@ -1961,6 +1977,7 @@ unsafe extern "C" fn bt_frozen_play_group_selection(
                 track,
                 route,
                 group,
+                channels: shown_range.clone(),
                 selected: None,
                 positions: None,
             });
@@ -1972,6 +1989,7 @@ unsafe extern "C" fn bt_frozen_play_group_selection(
                         track: track.clone(),
                         route,
                         group,
+                        channels: bed.clone(),
                         selected: None,
                         positions: None,
                     });
@@ -2000,6 +2018,7 @@ unsafe extern "C" fn bt_frozen_play_group_selection(
                     track,
                     route,
                     group,
+                    channels: shown_range.clone(),
                     selected: sel,
                     positions,
                 });
@@ -2011,12 +2030,25 @@ unsafe extern "C" fn bt_frozen_play_group_selection(
         return 0;
     }
     let has_wide = entries.iter().any(|e| e.group.is_some());
-    let model = if pair_binaural != 0 && has_wide {
-        let Ok(model) = crate::spatial::HeadModel::new(frozen.sample_rate()) else {
+    // A binaural pair, or objects that move in the selection, need the head model of the
+    // capture's rate (Windows `Recorder::preview_selection`).
+    let moving = entries.iter().any(|entry| {
+        entry.positions.is_some_and(|positions| {
+            let heard: Vec<usize> = match &entry.selected {
+                Some(selected) => selected.clone(),
+                None => entry.channels.clone().collect(),
+            };
+            heard
+                .into_iter()
+                .any(|channel| !positions.render_keys(channel, first..end).is_empty())
+        })
+    });
+    let model = if has_wide && (pair_binaural != 0 || moving) {
+        let Some(model) = cached_head_model(frozen.sample_rate()) else {
             set_ffi_error(error_out, "Could not prepare binaural head model");
             return 0;
         };
-        Some(Arc::new(model))
+        Some(model)
     } else {
         None
     };
@@ -2625,6 +2657,98 @@ mod display_tests {
             bt_tracks_free(core);
         }
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn group_preview_head_models_are_made_once_per_sample_rate() {
+        let first = cached_head_model(48_000).unwrap();
+        let again = cached_head_model(48_000).unwrap();
+        let other = cached_head_model(44_100).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!((first.sample_rate(), other.sample_rate()), (48_000, 44_100));
+    }
+
+    /// Objects whose positions move in the selection make the whole preview binaural even when
+    /// the pair is set to Stereo, as on Windows; without positions the setting still decides.
+    #[test]
+    fn group_preview_with_moving_objects_is_binaural_in_stereo_mode() {
+        let all_labels = CString::new("FL\tFR\tFC\tObject 1\tObject 2").unwrap();
+        let name = CString::new("Atmos").unwrap();
+        let widths = [5u32];
+        let frames = 4_800usize;
+        unsafe {
+            let core = bt_tracks_new_lanes(48_000.0, widths.as_ptr(), widths.len(), 10, 1 << 30);
+            assert!(!core.is_null());
+            bt_tracks_set_retain_silence(core, 1);
+            let mut wide = vec![0.0f32; frames * 5];
+            for f in 0..frames {
+                let t = f as f32 / 48_000.0;
+                wide[f * 5] = 0.3 * (t * 440.0 * std::f32::consts::TAU).sin();
+                wide[f * 5 + 1] = 0.2 * (t * 660.0 * std::f32::consts::TAU).sin();
+                wide[f * 5 + 2] = 0.1 * (t * 880.0 * std::f32::consts::TAU).sin();
+                wide[f * 5 + 3] = 0.4 * (t * 330.0 * std::f32::consts::TAU).sin();
+            }
+            assert_eq!(
+                bt_tracks_push_interleaved(core, 0, wide.as_ptr(), frames as u32, 1_000_000_000, 48_000.0),
+                frames as u32
+            );
+            bt_tracks_pause(core);
+            let first = bt_tracks_first_frame(core);
+            let end = bt_tracks_end_frame(core);
+            let frozen = bt_tracks_freeze(core, first, end);
+            assert!(!frozen.is_null());
+            let mut track = crate::PositionTrack::with_memory_limit(1024 * 1024);
+            for (frame, x) in [(first, -0.8), (first + 2_400, 0.8)] {
+                track.insert(3, crate::PositionKey {
+                    frame,
+                    position: crate::Position { x, y: 0.5, z: 0.0, size: 0.0, gain: 1.0 },
+                });
+            }
+            let moving = track.freeze();
+            let still = crate::PositionTrack::with_memory_limit(1024 * 1024).freeze();
+            let render = |positions: &crate::FrozenPositionTrack, pair_binaural: u32| {
+                let lane = [BtFrozenGroupSelectionLane {
+                    index: 0,
+                    route: 7,
+                    source_name: name.as_ptr(),
+                    channel_labels: all_labels.as_ptr(),
+                    channel_mask: 1 << 3,
+                    channel_mask_valid: 1,
+                    include_pair: 1,
+                    shown_start: 3,
+                    shown_count: 2,
+                    shown_positioned: 1,
+                    bed_start: 0,
+                    bed_count: 3,
+                    positions,
+                }];
+                let slot = PreviewSlot::new();
+                let mut err: *mut c_char = ptr::null_mut();
+                assert_eq!(
+                    bt_frozen_play_group_selection(
+                        frozen, &slot, lane.as_ptr(), 1, first, end, 0, pair_binaural, Fades::NONE, &mut err,
+                    ),
+                    1
+                );
+                assert!(err.is_null());
+                let mut out = vec![[0.0f32; 2]; frames];
+                let rendered = slot.render_with(frames, 48_000, |i, frame| out[i] = frame);
+                assert!(rendered.frames > 1_000, "rendered {}", rendered.frames);
+                slot.clear();
+                out
+            };
+            let differs = |a: &[[f32; 2]], b: &[[f32; 2]]| {
+                a.iter().zip(b).any(|(x, y)| (x[0] - y[0]).abs() > 1e-4 || (x[1] - y[1]).abs() > 1e-4)
+            };
+            // Without positions the pair setting decides between a stereo and a binaural render.
+            assert!(differs(&render(&still, 0), &render(&still, 1)));
+            // With moving objects the Stereo setting renders exactly as Binaural does.
+            assert!(!differs(&render(&moving, 0), &render(&moving, 1)),
+                "moving objects in Stereo mode were not rendered binaurally");
+            bt_frozen_free(frozen);
+            bt_tracks_free(core);
+        }
     }
 
     #[test]
