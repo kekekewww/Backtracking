@@ -11,6 +11,14 @@ extern "C" fn bt_preview_slot_new() -> *mut PreviewSlot {
     Box::into_raw(Box::new(PreviewSlot::new()))
 }
 
+/// A slot whose renders hold a gate of this process alone, so other Backtracking processes
+/// keep recording System playback while it renders (for checks that render offline).
+#[no_mangle]
+extern "C" fn bt_preview_slot_new_local() -> *mut PreviewSlot {
+    let gate: &'static crate::preview::PreviewGate = Box::leak(Box::new(crate::preview::PreviewGate::local()));
+    Box::into_raw(Box::new(PreviewSlot::with_gate(gate)))
+}
+
 /// Frees the slot and any preview in it. Nothing may render the slot any more.
 #[no_mangle]
 unsafe extern "C" fn bt_preview_slot_free(slot: *mut PreviewSlot) {

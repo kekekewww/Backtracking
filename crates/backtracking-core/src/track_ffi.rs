@@ -2862,7 +2862,8 @@ mod display_tests {
                     bed_count: 3,
                     positions,
                 }];
-                let slot = PreviewSlot::new();
+                // A gate of this test alone: rendering must not silence another Backtracking.
+                let slot = PreviewSlot::with_gate(Box::leak(Box::new(crate::preview::PreviewGate::local())));
                 let mut err: *mut c_char = ptr::null_mut();
                 assert_eq!(
                     bt_frozen_play_group_selection(

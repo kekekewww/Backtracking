@@ -163,6 +163,12 @@ func verifyMacSnapshotRebuilds() throws {
 }
 
 @MainActor
+func verifyMacPreviewPlan() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyPreviewPlan()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -1296,16 +1302,11 @@ private final class WAVExport: @unchecked Sendable {
         }
     }
 
-    /// The group chosen channel rows are written or played with, whatever group is on show now
-    /// (Windows `lane_write`, `preview_plan`). Export names them by the objects when any row is an
-    /// object, else by the group that holds them; preview plays the group that holds every one.
-    /// nil when no group fits (preview then plays the pair).
-    private func groupHolding(_ channels: [Int], lane: Int, width: Int, forPreview: Bool) -> (range: Range<Int>, positioned: Bool)? {
+    /// The group chosen channel rows are written with, whatever group is on show now (Windows
+    /// `lane_write`): the objects when any row is an object, else the group that holds them.
+    private func groupHolding(_ channels: [Int], lane: Int, width: Int) -> (range: Range<Int>, positioned: Bool)? {
         let spans = groupSpans(for: lane, width: width)
         guard !spans.isEmpty, !channels.isEmpty else { return nil }
-        if forPreview {
-            return spans.first { span in channels.allSatisfy { span.range.contains($0) } }
-        }
         let holding = { (objects: Bool) in
             spans.first { $0.positioned == objects && channels.contains(where: $0.range.contains) }
         }
@@ -1336,7 +1337,47 @@ private final class WAVExport: @unchecked Sendable {
             // A wide lane chosen whole is written as it is shown, with rows that came or went since.
             let laneWhole = selectedRows?.isEmpty != false || (width > 2 && forLane.contains(.whole(lane: index)))
 
-            if !laneWhole {
+            if forPreview && width > 2 {
+                // One part per lane, as Windows `preview_plan` plays: the lane chosen whole plays
+                // the group on show; channels of one group play from it; the pair, or channels of
+                // two groups at once, play the pair render of the lane's Channels group.
+                if !laneWhole && forLane.isEmpty { continue }
+                let numbered: (range: Range<Int>, positioned: Bool) = (0..<width, false)
+                let onShow: (range: Range<Int>, positioned: Bool) = gb.shownCount == 0 ? numbered
+                    : (Int(gb.shownStart)..<Int(gb.shownStart + gb.shownCount), gb.shownPositioned != 0)
+                let channelsGroup: (range: Range<Int>, positioned: Bool) = gb.bedCount == 0 ? numbered
+                    : (Int(gb.bedStart)..<Int(gb.bedStart + gb.bedCount), false)
+                var play = onShow
+                var selected: [Int]?
+                if !laneWhole {
+                    let native = forLane.compactMap { row -> Int? in
+                        if case .channel(_, let ch) = row, ch < width, ch < 64 { return ch }
+                        return nil
+                    }
+                    if !forLane.contains(where: \.isPair), !native.isEmpty {
+                        let spans = groupSpans(for: index, width: width)
+                        if let group = spans.first(where: { span in native.allSatisfy { span.range.contains($0) } })
+                            ?? (spans.isEmpty ? numbered : nil) {
+                            play = group
+                            selected = native
+                        } else {
+                            play = channelsGroup
+                        }
+                    } else {
+                        play = channelsGroup
+                    }
+                }
+                gb.shownStart = UInt32(play.range.lowerBound)
+                gb.shownCount = UInt32(play.range.count)
+                gb.shownPositioned = play.positioned ? 1 : 0
+                gb.bedStart = 0
+                gb.bedCount = 0
+                includePair = 0
+                if let selected {
+                    maskValid = 1
+                    mask = selected.reduce(UInt64(0)) { $0 | (1 << UInt64($1)) }
+                }
+            } else if !laneWhole {
                 if forLane.isEmpty { continue }
                 if width > 2 {
                     let hasPair = forLane.contains(where: \.isPair)
@@ -1350,14 +1391,10 @@ private final class WAVExport: @unchecked Sendable {
                     maskValid = 1
                     mask = channelMask
                     if !channels.isEmpty {
-                        if let holding = groupHolding(channels, lane: index, width: width, forPreview: forPreview) {
+                        if let holding = groupHolding(channels, lane: index, width: width) {
                             gb.shownStart = UInt32(holding.range.lowerBound)
                             gb.shownCount = UInt32(holding.range.count)
                             gb.shownPositioned = holding.positioned ? 1 : 0
-                        } else if forPreview, hasBed {
-                            // Rows of two groups at once play the pair.
-                            mask = 0
-                            includePair = 1
                         }
                     }
                 } else if width == 2 {
@@ -2536,6 +2573,77 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard files.count == 2, Set(files.compactMap(\.lane)) == ["A", "B"], !named.contains(false) else {
             throw CaptureError("Saved files carry lanes \(files.map { "\($0.lane ?? "-") \(URL(fileURLWithPath: $0.path).lastPathComponent)" })")
         }
+    }
+
+    /// Previews play one part per lane, as Windows `preview_plan` does: the pair with an object
+    /// plays only the pair; a lane chosen whole with Objects on show plays only the objects;
+    /// objects of two groups of a lane without a Channels group play every channel's pair render.
+    /// Renders offline into a slot with a gate of this process alone.
+    static func verifyPreviewPlan() throws {
+        func capture(_ widths: [UInt32], _ fill: (Int, Int) -> Float) throws -> OpaquePointer {
+            guard let core = widths.withUnsafeBufferPointer({
+                bt_tracks_new_lanes(SystemAudioTap.timelineRate, $0.baseAddress, $0.count, 10, ProcessInfo.processInfo.physicalMemory)
+            }) else { throw CaptureError("Preview plan verification could not make a capture") }
+            bt_tracks_set_retain_silence(core, 1)
+            let frames = 9_600
+            for (lane, width) in widths.enumerated() {
+                let samples = (0..<frames).flatMap { f in (0..<Int(width)).map { c in lane == 0 ? fill(f, c) : 0 } }
+                _ = samples.withUnsafeBufferPointer {
+                    bt_tracks_push_interleaved(core, UInt32(lane), $0.baseAddress, UInt32(frames), 1_000_000_000, SystemAudioTap.timelineRate)
+                }
+            }
+            bt_tracks_pause(core)
+            return core
+        }
+        func render(_ frozen: WAVExport, _ rows: [RowIdentity]?, shown: String?) throws -> [Float] {
+            guard let slot = bt_preview_slot_new_local() else { throw CaptureError("No preview slot") }
+            defer { bt_preview_slot_clear(slot); bt_preview_slot_free(slot) }
+            if let failure = frozen.play(in: slot, range: frozen.span, forceMono: false, fades: noFades, selectedRows: rows,
+                                         hideSilentLanes: [], pairBinaural: false, shownGroupIDs: [shown]) {
+                throw CaptureError("Preview of \(rows ?? []) failed: \(failure)")
+            }
+            var left = [Float](repeating: 0, count: 4_096), right = left
+            _ = bt_preview_slot_render(slot, &left, &right, 4_096, 48_000)
+            return zip(left, right).flatMap { [$0, $1] }
+        }
+        func same(_ a: [Float], _ b: [Float]) -> Bool { zip(a, b).allSatisfy { abs($0 - $1) < 1e-5 } }
+        func loudness(_ a: [Float]) -> Float { a.map(abs).max() ?? 0 }
+        var problems: [String] = []
+
+        // Bed FL FR FC, then two objects; the bed sounds, the objects are silent.
+        let bed = AddonChannelGroup(id: "bed", label: "Bed", channels: ["FL", "FR", "FC"], positioned: false)
+        let objects = AddonChannelGroup(id: "objects", label: "Objects", channels: ["Object 1", "Object 2"], positioned: true)
+        let core = try capture([5], { f, c in c < 3 ? 0.3 * sinf(Float(f) * Float(c + 1) * 0.05) : (c == 3 ? 0.2 : 0) })
+        defer { bt_tracks_free(core) }
+        guard let frozen = WAVExport(core: core, routes: [.allChannels], channelNames: [["FL", "FR", "FC", "Object 1", "Object 2"]],
+                                     channelGroups: [[bed, objects]]) else { throw CaptureError("Could not freeze") }
+        let pair: [RowIdentity] = [.pair(lane: 0, side: 0), .pair(lane: 0, side: 1)]
+        let pairOnly = try render(frozen, pair, shown: "objects")
+        let pairAndObject = try render(frozen, pair + [.channel(lane: 0, index: 3)], shown: "objects")
+        if !same(pairOnly, pairAndObject) { problems.append("the pair with Object 1 does not play as the pair alone") }
+        let wholeObjects = try render(frozen, nil, shown: "objects")
+        let objectOne = try render(frozen, [.channel(lane: 0, index: 3), .channel(lane: 0, index: 4)], shown: "objects")
+        if !same(wholeObjects, objectOne) || same(wholeObjects, pairOnly) {
+            problems.append("the lane whole with Objects on show plays the bed too (loudest \(loudness(wholeObjects)))")
+        }
+
+        // No Channels group, two groups of objects: channels of both play the pair of every channel.
+        let first = AddonChannelGroup(id: "a", label: "A", channels: ["A1", "A2"], positioned: true)
+        let second = AddonChannelGroup(id: "b", label: "B", channels: ["B1", "B2"], positioned: true)
+        let objectsOnly = try capture([4], { f, c in 0.2 * sinf(Float(f) * Float(c + 2) * 0.03) })
+        defer { bt_tracks_free(objectsOnly) }
+        guard let groupsOnly = WAVExport(core: objectsOnly, routes: [.allChannels], channelNames: [["A1", "A2", "B1", "B2"]],
+                                         channelGroups: [[first, second]]) else { throw CaptureError("Could not freeze") }
+        do {
+            let across = try render(groupsOnly, [.channel(lane: 0, index: 1), .channel(lane: 0, index: 2)], shown: "a")
+            let otherPair = try render(groupsOnly, [.channel(lane: 0, index: 0), .channel(lane: 0, index: 3)], shown: "b")
+            if !same(across, otherPair) || loudness(across) < 0.01 {
+                problems.append("objects of two groups do not play every channel's pair render")
+            }
+        } catch let error as CaptureError {
+            problems.append(error.operation)
+        }
+        guard problems.isEmpty else { throw CaptureError("Preview plan: " + problems.joined(separator: "; ")) }
     }
 
     /// Rows chosen in one channel group keep their identity when another group is shown, and are

@@ -370,6 +370,9 @@ void bt_tracks_set_preview_silence(const BtTracks *core, uint32_t lane, uint32_t
 // has let the preview go (after the next play, bt_preview_slot_clear, bt_preview_slot_reap
 // returning 0, or bt_preview_slot_free). Stop rendering before freeing the slot.
 BtPreviewSlot *bt_preview_slot_new(void);
+// As bt_preview_slot_new, holding a gate of this process alone: rendering it never silences
+// another Backtracking's System capture.
+BtPreviewSlot *bt_preview_slot_new_local(void);
 void bt_preview_slot_free(BtPreviewSlot *slot);
 // One or two snapshots with their WAV routes, as exported. Returns 1 when it plays and 0,
 // leaving the slot as it was, when the snapshots do not all hold the selection at one rate.
