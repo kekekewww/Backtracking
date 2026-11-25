@@ -619,6 +619,10 @@ final class AddonHostClient {
     private let encoder = JSONEncoder()
     let dataRoot: String
     let isPrimary: Bool
+    #if BACKTRACKING_CAPTURE_VERIFY
+    /// Runs once the polled snapshot's completed tickets have been consumed.
+    var verifyAfterTakingResults: (() -> Void)?
+    #endif
 
     init?(dataRoot: String, appVersion: String, primary: Bool) {
         self.dataRoot = dataRoot
@@ -672,8 +676,11 @@ final class AddonHostClient {
                     cb(resultData)
                 }
             }
-            // Refresh lastGeneration after take_result bumps generation.
-            lastGeneration = bt_addon_host_generation(ptr)
+            #if BACKTRACKING_CAPTURE_VERIFY
+            verifyAfterTakingResults?()
+            #endif
+            // Keep the snapshot's generation: take_result advances it, so the next poll reads the
+            // snapshot again and collects any ticket that finished after this one was taken.
         }
         return true
     }
@@ -1526,3 +1533,55 @@ enum AddonFormatting {
         return "\(prefix): \(notice.text)"
     }
 }
+
+#if BACKTRACKING_CAPTURE_VERIFY
+extension AddonHostClient {
+    /// Ticket B completes after the poll read its snapshot but before the poll finished.
+    /// The host then stays quiet; B's completion must still run, exactly once, like A's.
+    static func verifyTicketCompletions() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-tickets-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        guard let client = AddonHostClient(dataRoot: root.path, appVersion: "0.2.1", primary: true) else {
+            throw MessageError("AddonHostClient failed to start")
+        }
+        defer { client.shutdownAndFree() }
+        func pump(for seconds: Double, until done: () -> Bool = { false }) {
+            let deadline = ProcessInfo.processInfo.systemUptime + seconds
+            while !done() && ProcessInfo.processInfo.systemUptime < deadline {
+                client.pollSnapshot()
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+        }
+        pump(for: 3) { client.snapshot.ready }
+        guard client.snapshot.ready, let handle = client.handle else { throw MessageError("Add-on host did not become ready") }
+        pump(for: 0.3)
+        let quiet = bt_addon_host_generation(handle)
+        Thread.sleep(forTimeInterval: 0.2)
+        guard bt_addon_host_generation(handle) == quiet else { throw MessageError("Add-on host never went quiet") }
+
+        var calls: [String: Int] = [:]
+        var lateCompleted = false
+        client.verifyAfterTakingResults = { [unowned client] in
+            client.verifyAfterTakingResults = nil
+            let before = bt_addon_host_generation(handle)
+            client.inspect(path: root.appendingPathComponent("missing-b.btaddon").path) { _ in calls["B", default: 0] += 1 }
+            let deadline = ProcessInfo.processInfo.systemUptime + 2
+            while bt_addon_host_generation(handle) == before && ProcessInfo.processInfo.systemUptime < deadline {
+                Thread.sleep(forTimeInterval: 0.002)
+            }
+            lateCompleted = bt_addon_host_generation(handle) != before
+        }
+        client.inspect(path: root.appendingPathComponent("missing-a.btaddon").path) { _ in calls["A", default: 0] += 1 }
+        pump(for: 2) { calls["A"] != nil }
+        guard calls["A"] == 1, lateCompleted, client.verifyAfterTakingResults == nil else {
+            throw MessageError("Ticket A did not complete or ticket B did not finish inside the poll (A \(calls["A"] ?? 0), B finished \(lateCompleted))")
+        }
+        pump(for: 1)
+        guard calls["B"] == 1, calls["A"] == 1 else {
+            throw MessageError("Completion callbacks ran A \(calls["A"] ?? 0) and B \(calls["B"] ?? 0) times; each must run exactly once")
+        }
+        guard client.callbacks.isEmpty else { throw MessageError("A completed ticket kept its callback") }
+    }
+}
+#endif
