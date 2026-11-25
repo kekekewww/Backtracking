@@ -25,7 +25,21 @@ import Foundation
 @main
 enum Verify {
     @MainActor
-    static func main() throws {
+    static func main() {
+        // A failed check exits with status 1 and its message, never a crash report.
+        do {
+            try checks()
+        } catch let error as VerificationError {
+            fputs("Verification failed: \(error.message)\n", stderr)
+            exit(1)
+        } catch {
+            fputs("Verification failed: \(error)\n", stderr)
+            exit(1)
+        }
+    }
+
+    @MainActor
+    static func checks() throws {
         try verifyMacCaptureRouting()
         try verifyMacOptions()
         try verifyMacTestCopyIsolation()
