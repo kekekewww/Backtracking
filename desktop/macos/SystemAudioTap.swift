@@ -1303,6 +1303,11 @@ final class SystemAudioTap {
     /// The channels of the lanes that start; a lane past the limit holds none (Windows `track_channels`).
     var totalChannelCount: UInt32 { Self.channelsInUse(widths: widths, capErrors: laneCapErrors) }
 
+    /// Whether source `lane` was refused for the 64-channel limit, whatever language the window shows.
+    func laneCannotStart(_ lane: Int) -> Bool {
+        laneCapErrors.indices.contains(lane) && laneCapErrors[lane] != nil
+    }
+
     /// Channels the capture core holds for sources that cannot start: one each (Windows holds none).
     var channelsKeptForRefusedLanes: UInt32 { UInt32(laneCapErrors.filter { $0 != nil }.count) }
 
@@ -1332,6 +1337,10 @@ final class SystemAudioTap {
     /// a lane that does not start still holds one channel in the capture core, which takes at
     /// most 64 in all; when those placeholders push it past 64 the capture does not open
     /// (`captureOverLimitMessage`).
+    #if BACKTRACKING_CAPTURE_VERIFY
+    static var verifyRequestedWidths: [UInt32]?
+    #endif
+
     nonisolated static func acceptLanes(_ requested: [UInt32]) -> (widths: [UInt32], errors: [String?]) {
         var widths: [UInt32] = []
         var errors: [String?] = []
@@ -1509,13 +1518,17 @@ final class SystemAudioTap {
             }
             return lane.route == .allChannels && formats[index]?.supports(.allChannels) == false ? .merged : lane.route
         }
-        let requestedWidths = lanes.enumerated().map { index, lane -> UInt32 in
+        var requestedWidths = lanes.enumerated().map { index, lane -> UInt32 in
             let route = routes[index]
             guard let format = formats[index], format.supports(route) else {
                 return route == .merged && !lane.source.isMicrophone ? 2 : 1
             }
             return format.width(for: route)
         }
+        #if BACKTRACKING_CAPTURE_VERIFY
+        // Stands in for sources whose formats a verification cannot open.
+        if let widths = Self.verifyRequestedWidths, widths.count == requestedWidths.count { requestedWidths = widths }
+        #endif
         let (acceptedWidths, capErrors) = Self.acceptLanes(requestedWidths)
         if let overLimit = Self.captureOverLimitMessage(acceptedWidths) { throw CaptureError(overLimit) }
         self.routes = routes

@@ -2566,6 +2566,25 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
               refused, controller.notice == "Source AG would bring the total to 66 channels. The limit is 64." else {
             throw CaptureError("Channel counts: note \(note), refusal \(refusal), refused \(refused), notice \(controller.notice ?? "-")")
         }
+        // A real capture with a source that cannot start ([60, 8, 2]: B is refused and keeps one
+        // channel), checked in English and Traditional Chinese.
+        SystemAudioTap.verifyRequestedWidths = [60, 8, 2]
+        defer { SystemAudioTap.verifyRequestedWidths = nil; AppLanguage.verifyLanguage = nil }
+        let kept = (0..<3).map { CaptureLane(source: .addon(addonID: "verify.kept", sourceID: "s\($0)"), route: .merged) }
+        controller.captureLanes = kept
+        controller.tap = try SystemAudioTap(history: 10, lanes: kept)
+        SystemAudioTap.verifyRequestedWidths = nil
+        var refusals: [String] = []
+        for language in [AppLanguage.english, .zhHant] {
+            AppLanguage.verifyLanguage = language
+            controller.notice = nil
+            _ = controller.canConfigure(CaptureLane(source: .addon(addonID: "verify.kept", sourceID: "more"), route: .merged), at: 3)
+            refusals.append(controller.notice ?? "")
+        }
+        guard refusals == ["Source D would bring the total to 65 channels, with one channel kept for each source that cannot start. The limit is 64.",
+                           "來源 D 會使總數變成 65 個聲道（每個無法開始的來源保留 1 個），上限為 64。"] else {
+            throw CaptureError("Refusals with a source that cannot start: \(refusals)")
+        }
     }
 
     /// A lane past 64 channels holds none of them, and says why it cannot start in Windows' words.
@@ -5855,7 +5874,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let count = widths.reduce(0, +)
         // A source that cannot start keeps one channel (its width here is 1), so the count and the
         // Sources page's note agree.
-        let kept = (0..<captureLanes.count).filter { $0 != index && tap?.sourceProblem(for: $0)?.contains("cannot start") == true }.count
+        let kept = (0..<captureLanes.count).filter { $0 != index && tap?.laneCannotStart($0) == true }.count
         guard count <= 64 else {
             setNotice(localizedBilingual(SystemAudioTap.addRefusal(lane: index, total: count, kept: UInt32(kept))))
             refreshSourceOptions()

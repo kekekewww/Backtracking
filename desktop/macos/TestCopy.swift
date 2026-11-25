@@ -14,7 +14,15 @@ enum AppLanguage: Equatable {
     case english
     case zhHant
 
-    static var current: AppLanguage { TestCopyConfig.current.language }
+    static var current: AppLanguage {
+        #if BACKTRACKING_CAPTURE_VERIFY
+        if let verifyLanguage { return verifyLanguage }
+        #endif
+        return TestCopyConfig.current.language
+    }
+    #if BACKTRACKING_CAPTURE_VERIFY
+    nonisolated(unsafe) static var verifyLanguage: AppLanguage?
+    #endif
 }
 
 final class TestCopyConfig: @unchecked Sendable {
