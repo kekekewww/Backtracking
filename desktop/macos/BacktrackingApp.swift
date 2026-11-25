@@ -2896,11 +2896,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         defer { try? FileManager.default.removeItem(at: scratch) }
         let url = scratch.appendingPathComponent("big.wav")
         let dataBytes: UInt32 = 1_000_000_000
-        var header = Data("RIFF".utf8)
         func le32(_ v: UInt32) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
         func le16(_ v: UInt16) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
-        header += le32(36 + dataBytes) + Data("WAVE".utf8) + Data("fmt ".utf8) + le32(16)
-        header += le16(3) + le16(2) + le32(48_000) + le32(48_000 * 8) + le16(8) + le16(32)
+        var formatChunk = Data("fmt ".utf8)
+        formatChunk += le32(16)
+        formatChunk += le16(3) + le16(2)
+        formatChunk += le32(48_000) + le32(48_000 * 8)
+        formatChunk += le16(8) + le16(32)
+        var header = Data("RIFF".utf8) + le32(36 + dataBytes) + Data("WAVE".utf8)
+        header += formatChunk
         header += Data("data".utf8) + le32(dataBytes)
         FileManager.default.createFile(atPath: url.path, contents: header)
         // A sparse gigabyte of audio after the header: nothing is written to disk for it.
@@ -2918,8 +2922,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let bigBytes: UInt64 = 6_000_000_000
         func le64(_ v: UInt64) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
         var head = Data("RF64".utf8) + le32(UInt32.max) + Data("WAVE".utf8)
-        head += Data("ds64".utf8) + le32(28) + le64(bigBytes + 72) + le64(bigBytes) + le64(bigBytes / 8) + le32(0)
-        head += Data("fmt ".utf8) + le32(16) + le16(3) + le16(2) + le32(48_000) + le32(48_000 * 8) + le16(8) + le16(32)
+        head += Data("ds64".utf8) + le32(28)
+        head += le64(bigBytes + 72) + le64(bigBytes) + le64(bigBytes / 8)
+        head += le32(0)
+        head += formatChunk
         head += Data("data".utf8) + le32(UInt32.max)
         FileManager.default.createFile(atPath: rf64.path, contents: head)
         let notWav = scratch.appendingPathComponent("note.wav")
