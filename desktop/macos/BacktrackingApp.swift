@@ -2633,6 +2633,29 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard view.verifyChipToolTipTags.count == expected.count, shown == expected.map(\.1) else {
             throw CaptureError("Chip tooltips: \(view.verifyChipToolTipTags.count) registered, hover shows \(shown)")
         }
+        // The window's own layout: an add-on source with a transport gets its chip and tooltip
+        // in a plot 600 px wide, and none in one narrower than 240 px or a lane under 22 px.
+        let controller = BacktrackingController()
+        let saved = currentAddonSnapshot
+        defer { currentAddonSnapshot = saved }
+        let main = AddonSource(id: "main", name: "Main", sender: "s", formats: [], format: "", groups: nil,
+                               transport: AddonTransport(state: "playing", position: 1, duration: 10))
+        let addon = AddonRecord(id: "verify.chip", manifest: nil, enabled: true, state: "running", reason: nil, pid: nil,
+            message: nil, sources: [main], settings: [], actions: [], control_allowed: false, control_asked: false)
+        currentAddonSnapshot = AddonSnapshot(schema: 1, generation: 1, ready: true, error: nil, addons: [addon], appearances: [:], completed: [])
+        controller.captureLanes = [CaptureLane(source: .addon(addonID: "verify.chip", sourceID: "main"), route: .merged)]
+        func laidOut(_ size: NSSize) -> [String] {
+            let plot = WaveformView(frame: NSRect(origin: .zero, size: size))
+            plot.controller = controller
+            plot.verifyShow(rows: WaveformRow.layout(widths: [2], labels: [[]], stereo: false), laneWidths: [2], frames: 0..<48_000)
+            return plot.verifyLaidOutChipToolTips()
+        }
+        let wide = laidOut(NSSize(width: 600, height: 100))
+        let narrow = laidOut(NSSize(width: 230, height: 100))
+        let short = laidOut(NSSize(width: 600, height: 20))
+        guard wide == ["Pause Main"], narrow.isEmpty, short.isEmpty else {
+            throw CaptureError("Laid-out transport chip tooltips: wide \(wide), narrow \(narrow), short \(short)")
+        }
         let fits = WaveformView.transportChipFits
         guard fits(240, 22, 300, 304), !fits(239, 22, 100, 304), !fits(400, 21.5, 100, 404),
               !fits(400, 40, 301, 304), fits(400, 40, 300, 304) else {
@@ -2725,11 +2748,25 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         controller.paused = false
         controller.idleSeconds = 5
         controller.lastClick = ProcessInfo.processInfo.systemUptime - 60 // nobody has touched the window for a minute
-        guard case .success = controller.runWindowAction(.pauseCapture) else { throw CaptureError("pause_capture was refused") }
-        let soon = ProcessInfo.processInfo.systemUptime + 0.4
-        guard controller.paused, !controller.shouldAutoResume(now: soon),
+        guard let host = AddonHostClient(dataRoot: scratch.path, appVersion: "0.2.1", primary: true) else {
+            throw CaptureError("AddonHostClient failed to start")
+        }
+        controller.attach(addonHost: host)
+        defer { host.shutdownAndFree(); controller.addonHost = nil }
+        let command = AddonControlCommand(command: "pause_capture", from_seconds_ago: nil, to_seconds_ago: nil,
+            start_frame: nil, end_frame: nil, lane: nil, first: nil, last: nil, seconds: nil, folder: nil, source: nil)
+        controller.executeSingleControlCall(host: host, call: AddonControlCall(addon_id: "verify.pause", addon_name: "Verify",
+                                                                           run: 1, request_id: "p", command: command))
+        // Timer ticks for 0.4 s, as the window's 15 per second do.
+        let end = ProcessInfo.processInfo.systemUptime + 0.4
+        while ProcessInfo.processInfo.systemUptime < end {
+            controller.tick(Timer())
+            Thread.sleep(forTimeInterval: 1.0 / 15.0)
+        }
+        let soon = ProcessInfo.processInfo.systemUptime
+        guard controller.paused, host.verifyEvents.contains("control_reply p ok"),
               controller.shouldAutoResume(now: soon + 5) else {
-            throw CaptureError("An add-on's pause resumes on its own after 0.4 s (paused \(controller.paused))")
+            throw CaptureError("An add-on's pause resumed on its own within 0.4 s (paused \(controller.paused), replies \(host.verifyEvents))")
         }
     }
 
@@ -2768,6 +2805,26 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         controller.syncAddonSnapshotUI()
         guard whileTyping == 0, controller.verifyAddonsTabReloads == 1, !controller.pendingAddonsTabReload else {
             throw CaptureError("Add-ons page reloaded \(whileTyping) times while typing and \(controller.verifyAddonsTabReloads) after")
+        }
+
+        // A look repainting its colours (same offer, same gradient) rebuilds neither the look
+        // controls nor the Add-ons page.
+        controller.selectedLookAddonID = "verify.page"
+        controller.verifyLookControlRebuilds = 0
+        controller.verifyAddonsTabReloads = 0
+        let stops = [AddonSpectrumStop(color: "#ff8800", position: 0), AddonSpectrumStop(color: "#2c68ec", position: 1)]
+        for colour in ["#88ccff", "#99ddff", "#aaeeff"] {
+            generation += 1
+            let addon = AddonRecord(id: "verify.page", manifest: nil, enabled: false, state: "stopped", reason: nil,
+                pid: nil, message: nil, sources: [], settings: [], actions: [], control_allowed: false, control_asked: false)
+            host.verifyReceive(AddonSnapshot(schema: 1, generation: generation, ready: true, error: nil, addons: [addon],
+                appearances: ["verify.page": AddonAppearance(colors: ["waveform": colour], numbers: [:], rows: [:], spectrum: stops)],
+                completed: []))
+            controller.syncAddonSnapshotUI()
+        }
+        // The first one is a new offer and rebuilds once; the repaints after it do not.
+        guard controller.verifyLookControlRebuilds == 1, controller.verifyAddonsTabReloads == 0 else {
+            throw CaptureError("Repainting a look rebuilt its controls \(controller.verifyLookControlRebuilds) times and the Add-ons page \(controller.verifyAddonsTabReloads)")
         }
 
         // An Options list (a popover) is open: neither the Add-ons nor the Sources page is rebuilt
@@ -3005,10 +3062,37 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     /// An add-on source without audio shows Windows' short capture status, not the Sources page's sentence.
     static func verifyAddonCaptureStatus() throws {
-        let status = SystemAudioTap.addonCaptureStatus
-        let missing = status(nil, "main")
-        guard missing == "Add-on is not installed" else {
-            throw CaptureError("A missing add-on's capture status is \(missing)")
+        func addon(_ state: String, reason: String? = nil, sources: [AddonSource] = [], message: AddonNotice? = nil) -> AddonRecord {
+            AddonRecord(id: "verify.status", manifest: nil, enabled: true, state: state, reason: reason, pid: nil,
+                        message: message, sources: sources, settings: [], actions: [], control_allowed: false, control_asked: false)
+        }
+        let main = AddonSource(id: "main", name: "Main", sender: "s", formats: [], format: "", groups: nil, transport: nil)
+        let cases: [(AddonRecord?, String)] = [
+            (nil, "Add-on is not installed"),
+            (addon("starting"), "Add-on is starting"),
+            (addon("stopping"), "Add-on is stopping"),
+            (addon("stopped"), "Add-on is stopped"),
+            (addon("not_responding"), "Add-on is not responding"),
+            (addon("failed", reason: "it crashed"), "Add-on unavailable: it crashed"),
+            (addon("running"), "Add-on source is not available"),
+            (addon("running", sources: [main]), "Waiting for add-on audio"),
+        ]
+        let wrong = cases.filter { SystemAudioTap.addonCaptureStatus($0.0, sourceID: "main") != $0.1 }.map(\.1)
+        // The Sources page adds what can be done about an add-on's error.
+        let controller = BacktrackingController()
+        let saved = currentAddonSnapshot
+        defer { currentAddonSnapshot = saved }
+        let failing = addon("running", sources: [main], message: try JSONDecoder().decode(AddonNotice.self,
+            from: Data(#"{"level":"error","text":"The file could not be read"}"#.utf8)))
+        currentAddonSnapshot = AddonSnapshot(schema: 1, generation: 1, ready: true, error: nil, addons: [failing], appearances: [:], completed: [])
+        controller.captureLanes = [CaptureLane(source: .addon(addonID: "verify.status", sourceID: "main"), route: .merged)]
+        func texts(_ view: NSView) -> [String] {
+            ((view as? NSTextField).map { [$0.stringValue] } ?? []) + view.subviews.flatMap(texts)
+        }
+        let page = controller.makeAddonSourceLaneRows(laneIndex: 0, addonID: "verify.status", sourceID: "main").views.flatMap(texts)
+        let hint = "Try another file or format, or restart the add-on on the Add-ons page."
+        guard wrong.isEmpty, page.contains(hint) else {
+            throw CaptureError("Capture status wrong for \(wrong); Sources page shows \(page)")
         }
     }
 
@@ -8997,6 +9081,13 @@ extension WaveformView {
     var verifyWholeLanes: Set<Int> { wholeLanes }
     var verifyLaneBoxes: [LaneLayoutBox] { laneBoxes }
     func verifyStopEdgeScroll() { stopEdgeAutoScroll() }
+    /// The tooltips the view registers for the chips its own layout makes.
+    func verifyLaidOutChipToolTips() -> [String] {
+        verifyChips = nil
+        syncChipsForDisplay()
+        return chipToolTips.map(\.text)
+    }
+
     /// Puts one group chip and one transport chip on the plot and lets the view register them.
     func verifyShowChips() -> [(NSPoint, String)] {
         let group = OverlayChip(rect: NSRect(x: 40, y: 3, width: 50, height: 14), text: "Objects", current: false,
