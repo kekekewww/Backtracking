@@ -2009,6 +2009,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         get { pendingOptionsPages.contains("Sources") }
         set { if newValue { pendingOptionsPages.insert("Sources") } else { pendingOptionsPages.remove("Sources") } }
     }
+    /// Set while the app quits; no Options page is built then.
+    private var quitting = false
     #if BACKTRACKING_CAPTURE_VERIFY
     /// Stand-ins for the Options window, which a verification does not open.
     private var verifyOptionsPage: String?
@@ -4333,6 +4335,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        quitting = true
         if !independentWindow && !testCopy { panel?.saveFrame(usingName: frameAutosaveName) }
         timer?.invalidate()
         timer = nil
@@ -5229,7 +5232,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     /// to be built again; the poll, a category switch or reopening Options does it later. Every
     /// request for one page in the meantime comes to one rebuild, from the state then.
     private func rebuildOptionsPage(_ label: String) {
-        guard let tabs = optionTabs,
+        guard !quitting, let tabs = optionTabs,
               tabs.tabViewItems.contains(where: { $0.label == label }) else { return }
         if let window = tabs.window, let previous = tabs.tabViewItems.first(where: { $0.label == label }),
            Self.responder(window.firstResponder, isInside: previous.view) {
@@ -5241,7 +5244,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             let ended = window.makeFirstResponder(nil)
             endingEditingForOptionsRebuild = false
             if !ended || Self.responder(window.firstResponder, isInside: previous.view) {
-                DispatchQueue.main.async { [weak self] in self?.rebuildOptionsPage(label) }
+                pendingOptionsPages.insert(label)
                 return
             }
         }
