@@ -175,6 +175,12 @@ func verifyMacControlSaveReply() throws {
 }
 
 @MainActor
+func verifyMacOptionsRebuild(step: String) throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyOptionsRebuildWhileTyping(step: step)
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -3393,6 +3399,81 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
+    /// N1: the Add-ons page holds a Text setting being typed into; the page is rebuilt, then the
+    /// user picks another category. The Options window is made but never put on screen. Run in a
+    /// child process that exits with status 11 on a crash instead of leaving a crash report.
+    static func verifyOptionsRebuildWhileTyping(step: String) throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-n1-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        guard let host = AddonHostClient(dataRoot: scratch.path, appVersion: "0.2.1", primary: true) else {
+            throw CaptureError("AddonHostClient failed to start")
+        }
+        controller.attach(addonHost: host)
+        defer { host.shutdownAndFree(); controller.addonHost = nil }
+        let ready = ProcessInfo.processInfo.systemUptime + 3
+        while !host.snapshot.ready && ProcessInfo.processInfo.systemUptime < ready {
+            host.pollSnapshot(); Thread.sleep(forTimeInterval: 0.01)
+        }
+        let folder = AddonSettingEntry(declaration: AddonSettingDeclaration(key: "folder", label: "Save to folder", help: nil,
+            kind: "text", defaultValue: .string(""), options: nil, min: nil, max: nil, step: nil), value: .string("/tmp"))
+        func receive(_ generation: UInt64, value: String) {
+            let entry = AddonSettingEntry(declaration: folder.declaration, value: .string(value))
+            let addon = AddonRecord(id: "verify.n1", manifest: nil, enabled: true, state: "running", reason: nil, pid: 1,
+                message: nil, sources: [], settings: [entry], actions: [], control_allowed: false, control_asked: false)
+            host.verifyReceive(AddonSnapshot(schema: 1, generation: generation, ready: true, error: nil,
+                                             addons: [addon], appearances: [:], completed: []))
+        }
+        receive(5_000, value: "/tmp")
+        controller.syncAddonSnapshotUI()
+        let window = controller.makeOptionsPanel()
+        controller.optionsPanel = window
+        defer { controller.optionsPanel = nil; window.close() }
+        func category(_ label: String) -> NSButton? { controller.optionCategoryButtons.first { $0.title == label } }
+        guard let addons = category("Add-ons"), let export = category("Export") else { throw CaptureError("No Options categories") }
+        controller.selectOptionCategory(addons)
+        func editable(_ view: NSView) -> [NSTextField] {
+            ((view as? NSTextField).flatMap { $0.isEditable ? [$0] : nil } ?? []) + view.subviews.flatMap(editable)
+        }
+        weak var typedInto: NSTextField?
+        autoreleasepool {
+            guard let page = controller.optionTabs?.selectedTabViewItem?.view, let field = editable(page).first else { return }
+            typedInto = field
+            _ = window.makeFirstResponder(field)
+        }
+        guard typedInto != nil, window.firstResponder is NSTextView else { throw CaptureError("The Text setting could not be typed into") }
+        // The page is rebuilt while the field is being typed into, by whichever path does it.
+        autoreleasepool {
+            switch step {
+            case "close-reopen":
+                window.close()
+                receive(5_001, value: "/var")
+                controller.syncAddonSnapshotUI()
+                controller.reloadAddonsTab()
+            case "end-editing":
+                // Closing the window ends the edit; the field sends its value, which rebuilds the page.
+                (window.firstResponder as? NSTextView)?.string = "/new"
+                window.close()
+                _ = window.makeFirstResponder(nil)
+                if controller.addonSettingDrafts["verify.n1:folder"] == nil {
+                    fputs("note: ending the edit did not send the field\n", stderr)
+                }
+            default:
+                controller.reloadAddonsTab()
+            }
+        }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let stale = typedInto == nil && window.firstResponder is NSTextView
+        controller.selectOptionCategory(export)
+        controller.selectOptionCategory(addons)
+        controller.selectOptionCategory(export)
+        guard !stale else {
+            throw CaptureError("After the Add-ons page was rebuilt (\(step)) the window still edits the freed field")
+        }
+    }
+
     /// A test copy opens only test-copy windows and never offers or asks for Input Monitoring.
     static func verifyTestCopyIsolation() throws {
         let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-copy-\(UUID().uuidString)", isDirectory: true)
@@ -4722,10 +4803,39 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         replaceOptionsTab(with: makeHotkeysTab())
     }
 
+    /// Whether `responder` is `view` or inside it; a field editor counts as the field it edits.
+    private static func responder(_ responder: NSResponder?, isInside view: NSView?) -> Bool {
+        guard let view, var node = responder as? NSView else { return false }
+        if let editor = node as? NSTextView, editor.isFieldEditor, let edited = editor.delegate as? NSView { node = edited }
+        return node === view || node.isDescendant(of: view)
+    }
+
+    private var endingEditingForOptionsRebuild = false
+
+    /// Puts `page` in place of the page with its label. AppKit keeps unretained pointers to the
+    /// view being edited (the field editor's client, the tab item's remembered first responder),
+    /// so a page is never taken away while one of its fields is the first responder: editing
+    /// ends first, or, inside that field's own end-of-editing, the swap waits a turn (N1).
     private func replaceOptionsTab(with page: NSTabViewItem) {
         guard let tabs = optionTabs,
               let index = tabs.tabViewItems.firstIndex(where: { $0.label == page.label }) else { return }
         let previous = tabs.tabViewItem(at: index)
+        if let window = tabs.window, Self.responder(window.firstResponder, isInside: previous.view) {
+            if endingEditingForOptionsRebuild {
+                DispatchQueue.main.async { [weak self] in self?.replaceOptionsTab(with: page) }
+                return
+            }
+            endingEditingForOptionsRebuild = true
+            let ended = window.makeFirstResponder(nil)
+            endingEditingForOptionsRebuild = false
+            if !ended || Self.responder(window.firstResponder, isInside: previous.view) {
+                DispatchQueue.main.async { [weak self] in self?.replaceOptionsTab(with: page) }
+                return
+            }
+            // Ending the edit may itself have rebuilt this page.
+            guard tabs.tabViewItems.contains(where: { $0 === previous }) else { return }
+        }
+        previous.initialFirstResponder = nil
         let selected = tabs.selectedTabViewItem === previous
         let offset = (previous.view as? NSScrollView)?.contentView.bounds.origin ?? .zero
         tabs.insertTabViewItem(page, at: index)
@@ -5449,6 +5559,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     /// Package 9 & 20 / TL-41..43: Frequency colors editor matching Windows spectrum.rs (user > look > default).
     private func refreshFrequencyGradientControls() {
         guard let controls = frequencyGradientControls else { return }
+        // As with whole pages (replaceOptionsTab), nothing being edited is taken away under AppKit.
+        if let window = controls.window, Self.responder(window.firstResponder, isInside: controls) {
+            _ = window.makeFirstResponder(nil)
+        }
         for view in controls.arrangedSubviews {
             controls.removeArrangedSubview(view)
             view.removeFromSuperview()

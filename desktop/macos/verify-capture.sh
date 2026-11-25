@@ -26,6 +26,17 @@ import Foundation
 enum Verify {
     @MainActor
     static func main() {
+        // A child run of one check that may crash: a crash exits with status 11, without a report.
+        if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--options-rebuild" {
+            exitOnCrash()
+            do {
+                try verifyMacOptionsRebuild(step: CommandLine.arguments[2])
+                exit(0)
+            } catch {
+                fputs("Verification failed: \(error)\n", stderr)
+                exit(1)
+            }
+        }
         // A failed check exits with status 1 and its message, never a crash report.
         do {
             try checks()
@@ -285,6 +296,26 @@ enum Verify {
         client.shutdownAndFree()
     }
 
+    /// Takes this process's crash exceptions itself and exits with status 11, so a crash in a
+    /// child check leaves no crash report behind.
+    static func exitOnCrash() {
+        var port = mach_port_t()
+        guard mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &port) == KERN_SUCCESS,
+              mach_port_insert_right(mach_task_self_, port, port, mach_msg_type_name_t(MACH_MSG_TYPE_MAKE_SEND)) == KERN_SUCCESS else { return }
+        let mask = exception_mask_t(EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION | EXC_MASK_ARITHMETIC | EXC_MASK_BREAKPOINT | EXC_MASK_SOFTWARE)
+        _ = task_set_exception_ports(mach_task_self_, mask, port, EXCEPTION_DEFAULT, THREAD_STATE_NONE)
+        Thread.detachNewThread {
+            let size = 4_096
+            let buffer = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 8)
+            let header = buffer.assumingMemoryBound(to: mach_msg_header_t.self)
+            header.pointee.msgh_size = mach_msg_size_t(size)
+            header.pointee.msgh_local_port = port
+            _ = mach_msg(header, MACH_RCV_MSG, 0, mach_msg_size_t(size), port, MACH_MSG_TIMEOUT_NONE, mach_port_t(MACH_PORT_NULL))
+            fputs("Verification crashed\n", stderr)
+            _exit(11)
+        }
+    }
+
     struct VerificationError: Error {
         let message: String
         init(_ message: String) { self.message = message }
@@ -301,4 +332,15 @@ xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library -D BACKTRACKING_CAP
   -framework AppKit -framework AudioToolbox -framework CoreAudio -framework AVFoundation \
   -framework ServiceManagement -framework Carbon -framework CoreGraphics -o "$scratch/verify"
 "$scratch/verify"
+# N1: rebuilding an Options page under a field being typed into, then changing category, in a
+# child that exits 11 on a crash instead of leaving a crash report.
+for step in rebuild close-reopen end-editing; do
+  status=0
+  "$scratch/verify" --options-rebuild "$step" || status=$?
+  if [[ $status -ne 0 ]]; then
+    printf 'Options rebuild check (%s) ended with status %s\n' "$step" "$status" >&2
+    exit 1
+  fi
+done
+printf 'Options rebuild checks passed.\n'
 bash "$source_dir/tests/make-test-copy-tests.sh"
