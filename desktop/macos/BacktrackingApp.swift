@@ -2405,6 +2405,21 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
               child.language == .zhHant else {
             throw CaptureError("A test copy's new capture window would not be the same test copy: \(launch)")
         }
+        // A data folder inside the user's real settings or recordings is refused like the folders themselves.
+        let fakeHome = scratch.appendingPathComponent("home", isDirectory: true)
+        let inside = ["Library/Preferences/copy", "Library/Application Support/Backtracking/copy",
+                      "Backtracking/copy", "Backtracking/output/copy"]
+        let allowed = ["work/copy", "Library/Application Support/Other/copy"]
+        for path in inside + allowed {
+            try FileManager.default.createDirectory(at: fakeHome.appendingPathComponent(path), withIntermediateDirectories: true)
+        }
+        let accepted = (inside + allowed).filter {
+            if case .success = TestCopyConfig.validateDataDirectory(fakeHome.appendingPathComponent($0).path, realHome: fakeHome) { return true }
+            return false
+        }
+        guard accepted == allowed else {
+            throw CaptureError("Test-copy data folders accepted \(accepted), expected only \(allowed)")
+        }
         // A window whose test variables went missing must refuse rather than open the real data.
         let lost = TestCopyConfig(environment: [:], arguments: ["Backtracking"] + launch.arguments)
         guard TestCopyConfig.refusesUnisolatedLaunch(arguments: launch.arguments, isTestCopy: lost.isTestCopy),

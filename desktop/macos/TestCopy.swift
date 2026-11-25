@@ -140,6 +140,15 @@ final class TestCopyConfig: @unchecked Sendable {
                 return .failure(refusal)
             }
         }
+        // Nor a folder inside the places that hold the user's real settings and recordings.
+        let realData = [
+            home.appendingPathComponent("Library/Preferences", isDirectory: true),
+            home.appendingPathComponent("Library/Application Support/Backtracking", isDirectory: true),
+            home.appendingPathComponent("Backtracking", isDirectory: true),
+        ].map { $0.resolvingSymlinksInPath().standardizedFileURL.path }
+        if realData.contains(where: { resolvedPath.hasPrefix($0.hasSuffix("/") ? $0 : $0 + "/") }) {
+            return .failure(refusal)
+        }
         // Reject ancestor folders of the user's home (e.g. "/" or "/Users").
         if home.path == resolvedPath || home.path.hasPrefix(resolvedPath.hasSuffix("/") ? resolvedPath : resolvedPath + "/") {
             return .failure(refusal)
