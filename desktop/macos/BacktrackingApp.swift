@@ -333,6 +333,7 @@ private final class OptionsPopUpButton: NSPopUpButton, NSTableViewDataSource, NS
 private final class CapturePanel: KeyPanel {
     var onClick: (() -> Void)?
     var onMenu: ((NSEvent) -> Void)?
+    var onManualResize: (() -> Void)?
     /// Runs one of the recorder's own keys. False lets the key go on to the focused control.
     var onCommand: ((RecorderAction) -> Bool)?
     var actionForShortcut: ((RecorderShortcut) -> RecorderAction?)?
@@ -555,7 +556,10 @@ private final class CapturePanel: KeyPanel {
         let bottom = edges.contains(.bottom) ? min(start.minY + dy, start.maxY - minimum.height) : start.minY
         let top = edges.contains(.top) ? max(start.maxY + dy, start.minY + minimum.height) : start.maxY
         let proposed = NSRect(x: left, y: bottom, width: right - left, height: top - bottom)
-        if frame != proposed { setFrame(proposed, display: true) }
+        if frame != proposed {
+            setFrame(proposed, display: true)
+            onManualResize?()
+        }
     }
 
     private func updateChromeCursor() {
@@ -613,29 +617,65 @@ private struct WaveformTrace: Sendable {
 }
 
 private struct WaveformRow: Equatable, Sendable {
+    let identity: RowIdentity
     let lane: Int
     let view: UInt32
     let title: String?
-    var isPair: Bool { view == 67 || view == 68 }
+    let shortLabel: String?
+    let fullLabel: String
+    let laneChannelCount: Int
+    let channelNumber: Int?
+    var isPair: Bool { identity.isPair }
 
-    static func layout(widths: [UInt32], labels: [[String]], stereo: Bool) -> [WaveformRow] {
+    var spec: WaveformRowSpec {
+        WaveformRowSpec(
+            identity: identity, lane: lane, view: view, shortLabel: shortLabel,
+            fullLabel: fullLabel, laneChannelCount: laneChannelCount, channelNumberOneBased: channelNumber
+        )
+    }
+
+    static func layout(
+        widths: [UInt32], labels: [[String]], stereo: Bool,
+        activeMasks: [UInt64?] = []
+    ) -> [WaveformRow] {
         widths.enumerated().flatMap { lane, width -> [WaveformRow] in
             let name = widths.count > 1 ? captureLaneLetter(lane) : nil
+            let count = Int(width)
             if width > 2 {
-                let pair = [(UInt32(67), "L"), (UInt32(68), "R")].map { view, label in
-                    WaveformRow(lane: lane, view: view, title: name.map { "\($0) · \(label)" } ?? label)
+                let laneLabels = labels.indices.contains(lane) ? labels[lane] : []
+                let pair = [(0, UInt32(67), "L"), (1, UInt32(68), "R")].map { side, view, label in
+                    WaveformRow(
+                        identity: .pair(lane: lane, side: side), lane: lane, view: view,
+                        title: name.map { "\($0) · \(label)" } ?? label,
+                        shortLabel: label, fullLabel: label, laneChannelCount: count, channelNumber: nil
+                    )
                 }
-                return pair + (0..<Int(width)).map { channel in
-                    let label = labels.indices.contains(lane) && labels[lane].indices.contains(channel)
-                        ? labels[lane][channel] : "Channel \(channel + 1)"
-                    let title = name.map { "\($0) · \(label)" } ?? label
-                    return WaveformRow(lane: lane, view: UInt32(channel + 3), title: title)
+                let mask: UInt64? = activeMasks.indices.contains(lane) ? activeMasks[lane] : nil
+                let shown = ChannelActivityTracker.shownChannels(width: count, labels: laneLabels, activeMask: mask)
+                return pair + shown.map { channel in
+                    let full = laneLabels.indices.contains(channel) ? laneLabels[channel] : "Channel \(channel + 1)"
+                    let short = RowStackLayout.shortLabel(full)
+                    let title = name.map { "\($0) · \(full)" } ?? full
+                    return WaveformRow(
+                        identity: .channel(lane: lane, index: channel), lane: lane, view: UInt32(channel + 3),
+                        title: title, shortLabel: short, fullLabel: full,
+                        laneChannelCount: count, channelNumber: channel + 1
+                    )
                 }
             }
             if width == 2, stereo, widths.count == 1 {
-                return [WaveformRow(lane: lane, view: 1, title: "L"), WaveformRow(lane: lane, view: 2, title: "R")]
+                return [
+                    WaveformRow(identity: .stereoSide(lane: lane, side: 0), lane: lane, view: 1,
+                                title: "L", shortLabel: "L", fullLabel: "L", laneChannelCount: 2, channelNumber: 1),
+                    WaveformRow(identity: .stereoSide(lane: lane, side: 1), lane: lane, view: 2,
+                                title: "R", shortLabel: "R", fullLabel: "R", laneChannelCount: 2, channelNumber: 2)
+                ]
             }
-            return [WaveformRow(lane: lane, view: 0, title: name)]
+            return [WaveformRow(
+                identity: .whole(lane: lane), lane: lane, view: 0,
+                title: name, shortLabel: name, fullLabel: name ?? "A",
+                laneChannelCount: count, channelNumber: nil
+            )]
         }
     }
 }
@@ -703,9 +743,11 @@ private final class WAVExport: @unchecked Sendable {
     let span: Range<UInt64>
     let sampleRate: UInt32
     let revision: UInt64
+    let widths: [UInt32]
     private let channelNames: [[String]]
     private let bars: [UInt64]
     private let cacheLock = NSLock()
+    private var cachedActivity: [Int: UInt64] = [:]
     private struct PeakKey: Equatable {
         let visible: Range<UInt64>
         let bins: Int
@@ -723,6 +765,7 @@ private final class WAVExport: @unchecked Sendable {
         sampleRate = bt_tracks_sample_rate(core)
         revision = bt_tracks_revision(core)
         self.routes = routes.map(\.wavRouteCode)
+        self.widths = routes.indices.map { bt_tracks_channels(core, UInt32($0)) }
         self.channelNames = channelNames
         let markerCount = bt_tracks_copy_bar_markers(core, capturedSpan.lowerBound, capturedSpan.upperBound, nil, 0)
         var markers = Array<UInt64>(repeating: 0, count: markerCount)
@@ -784,53 +827,150 @@ private final class WAVExport: @unchecked Sendable {
         channelNames[row.lane].joined(separator: "\t").withCString { read($0) }
     }
 
-    private func laneRange(_ lane: Int?) -> Range<Int>? {
-        guard let lane else { return routes.indices }
-        return routes.indices.contains(lane) ? lane..<(lane + 1) : nil
+    func activeChannels(for lane: Int) -> UInt64 {
+        cacheLock.lock()
+        if let value = cachedActivity[lane] {
+            cacheLock.unlock()
+            return value
+        }
+        cacheLock.unlock()
+        let mask = bt_frozen_active_channels(frozen, UInt32(lane))
+        cacheLock.lock()
+        cachedActivity[lane] = mask
+        cacheLock.unlock()
+        return mask
+    }
+
+    private func buildSelectionLanes(
+        names: [String],
+        selectedRows: [RowIdentity]?,
+        hideSilentLanes: Set<Int>
+    ) -> (lanes: [BtFrozenSelectionLane], sources: [UnsafeMutablePointer<CChar>?], labels: [UnsafeMutablePointer<CChar>?]) {
+        var lanes: [BtFrozenSelectionLane] = []
+        var sources: [UnsafeMutablePointer<CChar>?] = []
+        var labels: [UnsafeMutablePointer<CChar>?] = []
+
+        for index in routes.indices {
+            let width = widths.indices.contains(index) ? Int(widths[index]) : 0
+            let laneLabels = channelNames.indices.contains(index) ? channelNames[index] : []
+            var maskValid: UInt32 = 0
+            var mask: UInt64 = 0
+            var includePair: UInt32 = width > 2 ? 1 : 0
+
+            if let selectedRows, !selectedRows.isEmpty {
+                let forLane = selectedRows.filter { $0.lane == index }
+                if forLane.isEmpty { continue }
+                if width > 2 {
+                    let hasPair = forLane.contains(where: \.isPair)
+                    var channelMask: UInt64 = 0
+                    for row in forLane {
+                        if case .channel(_, let ch) = row, ch < 64 {
+                            channelMask |= (1 << UInt64(ch))
+                        }
+                    }
+                    includePair = hasPair ? 1 : 0
+                    maskValid = 1
+                    mask = channelMask
+                } else if width == 2 {
+                    var sideMask: UInt64 = 0
+                    var whole = false
+                    for row in forLane {
+                        switch row {
+                        case .whole: whole = true
+                        case .stereoSide(_, let side): sideMask |= (1 << UInt64(side))
+                        default: break
+                        }
+                    }
+                    if !whole && sideMask != 0 && sideMask != 0b11 {
+                        maskValid = 1
+                        mask = sideMask
+                    }
+                }
+            } else if width > 2, hideSilentLanes.contains(index) {
+                // Whole-lane export with hide-silent: export only active channels in this frozen copy + L/R pair.
+                let activeMask = activeChannels(for: index)
+                let shown = ChannelActivityTracker.shownChannels(width: width, labels: laneLabels, activeMask: activeMask)
+                var channelMask: UInt64 = 0
+                for ch in shown where ch < 64 { channelMask |= (1 << UInt64(ch)) }
+                maskValid = 1
+                mask = channelMask
+                includePair = 1
+            }
+
+            let src = names.indices.contains(index) ? strdup(names[index]) : nil
+            let lbl = !laneLabels.isEmpty ? strdup(laneLabels.joined(separator: "\t")) : nil
+            sources.append(src)
+            labels.append(lbl)
+            lanes.append(BtFrozenSelectionLane(
+                index: UInt32(index),
+                route: routes[index],
+                source_name: UnsafePointer(src),
+                channel_labels: UnsafePointer(lbl),
+                channel_mask: mask,
+                channel_mask_valid: maskValid,
+                include_pair: includePair
+            ))
+        }
+        return (lanes, sources, labels)
     }
 
     func play(in slot: OpaquePointer, range: Range<UInt64>, forceMono: Bool, fades: BtFades,
-              row: WaveformRow?, pairBinaural: Bool) -> Bool {
-        guard let chosen = laneRange(row?.lane) else { return false }
-        let labels = chosen.map { channelNames.indices.contains($0) ? strdup(channelNames[$0].joined(separator: "\t")) : nil }
-        defer { for label in labels { free(label) } }
-        let lanes = zip(chosen, labels).map { index, label in
-            BtFrozenLane(index: UInt32(index), route: routes[index], source_name: nil,
-                channel_labels: UnsafePointer(label), view: row?.view ?? 0)
+              selectedRows: [RowIdentity]?, hideSilentLanes: Set<Int>, pairBinaural: Bool) -> String? {
+        let built = buildSelectionLanes(names: [], selectedRows: selectedRows, hideSilentLanes: hideSilentLanes)
+        defer {
+            for s in built.sources { free(s) }
+            for l in built.labels { free(l) }
         }
-        return lanes.withUnsafeBufferPointer {
-            bt_frozen_play(frozen, slot, $0.baseAddress, $0.count, range.lowerBound,
-                range.upperBound, forceMono ? 1 : 0, pairBinaural ? 1 : 0, fades) == 1
+        guard !built.lanes.isEmpty else { return "The selected audio is unavailable." }
+        var errorPtr: UnsafeMutablePointer<CChar>?
+        let ok = built.lanes.withUnsafeBufferPointer {
+            bt_frozen_play_selection(
+                frozen, slot, $0.baseAddress, $0.count, range.lowerBound,
+                range.upperBound, forceMono ? 1 : 0, pairBinaural ? 1 : 0, fades, &errorPtr
+            ) == 1
         }
+        if let errorPtr {
+            let msg = String(cString: errorPtr)
+            bt_string_free(errorPtr)
+            return ok ? nil : msg
+        }
+        return ok ? nil : "The selected audio is unavailable."
     }
 
     func write(
         range: Range<UInt64>, directory: String, sampleRate: UInt32, bitsPerSample: UInt32, forceMono: Bool,
-        fades: BtFades, names: [String], row: WaveformRow?, wideMode: WideExportMode, pairBinaural: Bool
-    ) -> [URL] {
-        guard let chosen = laneRange(row?.lane) else { return [] }
-        let sources = chosen.map { names.indices.contains($0) ? strdup(names[$0]) : nil }
-        let labels = chosen.map { channelNames.indices.contains($0) ? strdup(channelNames[$0].joined(separator: "\t")) : nil }
+        fades: BtFades, names: [String], selectedRows: [RowIdentity]?, hideSilentLanes: Set<Int>,
+        wideMode: WideExportMode, pairBinaural: Bool
+    ) -> (urls: [URL], error: String?) {
+        let built = buildSelectionLanes(names: names, selectedRows: selectedRows, hideSilentLanes: hideSilentLanes)
         defer {
-            for source in sources { free(source) }
-            for label in labels { free(label) }
+            for s in built.sources { free(s) }
+            for l in built.labels { free(l) }
         }
-        let lanes = chosen.enumerated().map { offset, index in
-            BtFrozenLane(index: UInt32(index), route: routes[index], source_name: UnsafePointer(sources[offset]),
-                channel_labels: UnsafePointer(labels[offset]), view: row?.view ?? 0)
-        }
+        guard !built.lanes.isEmpty else { return ([], "Invalid capture lanes") }
+        var errorPtr: UnsafeMutablePointer<CChar>?
         let paths = directory.withCString { destination in
-            lanes.withUnsafeBufferPointer {
-                bt_frozen_export(frozen, $0.baseAddress, $0.count, range.lowerBound, range.upperBound,
+            built.lanes.withUnsafeBufferPointer {
+                bt_frozen_export_selection(
+                    frozen, $0.baseAddress, $0.count, range.lowerBound, range.upperBound,
                     destination, sampleRate, bitsPerSample, forceMono ? 1 : 0, wideMode.rawValue,
-                    pairBinaural ? 1 : 0, fades)
+                    pairBinaural ? 1 : 0, fades, &errorPtr
+                )
             }
         }
-        guard let paths else { return [] }
+        let errorMessage: String?
+        if let errorPtr {
+            errorMessage = String(cString: errorPtr)
+            bt_string_free(errorPtr)
+        } else {
+            errorMessage = nil
+        }
+        guard let paths else { return ([], errorMessage) }
         defer { bt_export_paths_free(paths) }
-        return (0..<bt_export_paths_count(paths)).compactMap { index in
+        let urls = (0..<bt_export_paths_count(paths)).compactMap { index in
             bt_export_path(paths, index).map { URL(fileURLWithPath: String(cString: $0)) }
         }
+        return (urls, nil)
     }
 }
 
@@ -854,6 +994,10 @@ private final class PreviewPlayer {
     private(set) var range: Range<UInt64>?
     /// Runs on the main thread when the playhead moves or the preview ends.
     var onChange: (() -> Void)?
+    /// Runs on the main thread if playback stops due to an output device problem.
+    var onProblem: ((String) -> Void)?
+    private var lastRenderedFrame: UInt64?
+    private var lastFrameProgressAt: TimeInterval = 0
 
     init?() {
         guard let slot = bt_preview_slot_new() else { return nil }
@@ -870,11 +1014,13 @@ private final class PreviewPlayer {
     /// Plays `range` of `material`, or of its `lane` alone, from its start. Returns a problem to
     /// show, or nil.
     func play(_ material: WAVExport, range: Range<UInt64>, forceMono: Bool, fades: BtFades,
-              row: WaveformRow?, pairBinaural: Bool) -> String? {
+              selectedRows: [RowIdentity]?, hideSilentLanes: Set<Int>, pairBinaural: Bool) -> String? {
         do {
             try startEngine(rate: material.sampleRate)
+        } catch let error as CaptureError {
+            return error.localizedDescription
         } catch {
-            return "Could not play the selection: \(error.localizedDescription)"
+            return "Could not open the playback device (\(error.localizedDescription))"
         }
         // Started before playing, so that an engine left with nothing to play is stopped too.
         if timer == nil {
@@ -882,13 +1028,16 @@ private final class PreviewPlayer {
             RunLoop.main.add(timer, forMode: .common)
             self.timer = timer
         }
-        guard material.play(in: slot, range: range, forceMono: forceMono, fades: fades, row: row, pairBinaural: pairBinaural) else {
-            return "The selected audio is unavailable."
+        if let err = material.play(in: slot, range: range, forceMono: forceMono, fades: fades,
+                                   selectedRows: selectedRows, hideSilentLanes: hideSilentLanes, pairBinaural: pairBinaural) {
+            return err
         }
         // Any earlier preview has been let go, and its material with it.
         self.material = material
         self.range = range
         idleSince = nil
+        lastRenderedFrame = nil
+        lastFrameProgressAt = ProcessInfo.processInfo.systemUptime
         onChange?()
         return nil
     }
@@ -897,6 +1046,7 @@ private final class PreviewPlayer {
     func stop() {
         guard range != nil else { return }
         range = nil
+        lastRenderedFrame = nil
         bt_preview_slot_stop(slot)
         onChange?()
     }
@@ -920,8 +1070,12 @@ private final class PreviewPlayer {
         engine = nil
         // A new engine each time follows the output device the user has chosen since.
         let engine = AVAudioEngine()
+        let outFormat = engine.outputNode.outputFormat(forBus: 0)
+        if outFormat.channelCount == 0 || outFormat.sampleRate <= 0 {
+            throw CaptureError("No playback device to preview on (no active output device)")
+        }
         guard let format = AVAudioFormat(standardFormatWithSampleRate: Double(rate), channels: 2) else {
-            throw CaptureError("The selection's sample rate cannot be played")
+            throw CaptureError("Could not open the playback device (unsupported sample rate \(rate) Hz)")
         }
         let slot = self.slot
         let source = AVAudioSourceNode(format: format) { _, _, frames, buffers -> OSStatus in
@@ -946,14 +1100,40 @@ private final class PreviewPlayer {
     }
 
     private func tick() {
+        let now = ProcessInfo.processInfo.systemUptime
         // The engine stops by itself when the output device changes; the preview ends with it.
-        if engine?.isRunning != true { bt_preview_slot_clear(slot) }
-        if range != nil, bt_preview_slot_position(slot, nil) != 1 { range = nil }
+        if engine?.isRunning != true {
+            let wasPlaying = range != nil
+            bt_preview_slot_clear(slot)
+            range = nil
+            lastRenderedFrame = nil
+            if wasPlaying {
+                onProblem?("Preview playback stopped (the playback device stopped)")
+            }
+        } else if range != nil {
+            var frame: UInt64 = 0
+            if bt_preview_slot_position(slot, &frame) == 1 {
+                if lastRenderedFrame != frame {
+                    lastRenderedFrame = frame
+                    lastFrameProgressAt = now
+                } else if now - lastFrameProgressAt >= 3.0 {
+                    // Package 13 / PRE-09: 3 s with no audio taken by output device.
+                    bt_preview_slot_clear(slot)
+                    range = nil
+                    lastRenderedFrame = nil
+                    engine?.stop()
+                    engine = nil
+                    onProblem?("Preview playback stopped (the playback device stopped taking audio)")
+                }
+            } else {
+                range = nil
+                lastRenderedFrame = nil
+            }
+        }
         if bt_preview_slot_reap(slot) != 0 {
             idleSince = nil
         } else {
             material = nil
-            let now = ProcessInfo.processInfo.systemUptime
             // The device still holds the last few milliseconds; stopping it at once cuts them off.
             if let idleSince, now - idleSince >= 0.25 || engine?.isRunning != true {
                 timer?.invalidate()
@@ -1163,6 +1343,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var harness: TestHarness? = TestHarness()
     private var harnessTimer: Timer?
     private var activeSnapshotSaves = 0
+    private struct PendingSnapshotSave {
+        let range: Range<UInt64>?
+        let fades: BtFades
+        let rows: [RowIdentity]?
+        let directory: String
+        let ticket: UInt64?
+    }
+    private var pendingSnapshots: [PendingSnapshotSave] = []
+    private var lastManualResize: TimeInterval = 0
+    private var autoGrownBaseHeight: CGFloat?
+    private var autoGrownTargetHeight: CGFloat?
     private var lastHarnessDragFiles: [URL] = []
     private var lastHarnessDragStatus: String = ""
     private lazy var snapshotShortcut = SnapshotShortcut { [weak self] in self?.dispatchSnapshotShortcut() }
@@ -1274,6 +1465,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var wideExportMode: WideExportMode = .binauralFiles
     private(set) var forceMonoExport = false
     private(set) var pairBinaural = false
+    private(set) var hideSilentChannels = true
+    private var optionsHideSilentButton: NSButton?
     private var alwaysOnTop = true
     private var waveformOnly = false
     private var paused = true
@@ -1341,6 +1534,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         forceMonoExport = defaults.bool(forKey: "forceMonoExport")
         pairBinaural = defaults.bool(forKey: "pairBinaural")
+        // Default on: only explicit false (0) turns Hide silent channels off.
+        hideSilentChannels = (defaults.object(forKey: "hideSilentChannels") as? Bool) ?? true
         if let raw = unsignedSetting("wideExportMode"), let mode = WideExportMode(rawValue: raw) { wideExportMode = mode }
         alwaysOnTop = (defaults.object(forKey: "alwaysOnTop") as? Bool) ?? true
         waveformOnly = (defaults.object(forKey: "waveformOnly") as? Bool) ?? false
@@ -1504,6 +1699,38 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             bt_cleanup_free(cleanup)
             self.cleanup = nil
         }
+        if !pendingSnapshots.isEmpty, let tap {
+            let queued = pendingSnapshots
+            pendingSnapshots.removeAll()
+            let routes = tap.captureRoutes
+            let labels = tap.captureChannelNames
+            let sem = DispatchSemaphore(value: 0)
+            var frozen: WAVExport?
+            tap.readCapture({ WAVExport(core: $0, routes: routes, channelNames: labels) }) { mat in
+                frozen = mat
+                sem.signal()
+            }
+            _ = sem.wait(timeout: .now() + 2.0)
+            if let frozen {
+                for req in queued {
+                    let range = req.range ?? frozen.span
+                    if range.lowerBound >= frozen.span.lowerBound, range.upperBound <= frozen.span.upperBound, !range.isEmpty {
+                        let sampleRate = exportSampleRate
+                        let bits = exportBitsPerSample
+                        let mono = forceMonoExport
+                        let wide = wideExportMode
+                        let binaural = pairBinaural
+                        let names = laneFileNames
+                        let hide = hideSilentLaneIndices
+                        worker.async {
+                            _ = frozen.write(range: range, directory: req.directory, sampleRate: sampleRate,
+                                             bitsPerSample: bits, forceMono: mono, fades: req.fades, names: names,
+                                             selectedRows: req.rows, hideSilentLanes: hide, wideMode: wide, pairBinaural: binaural)
+                        }
+                    }
+                }
+            }
+        }
         waveform?.endPreview()
         tap = nil
         waveform?.discardPreparedFile()
@@ -1621,6 +1848,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .fullScreenDisallowsTiling]
         window.onClick = { [weak self] in self?.registerClick() }
         window.onMenu = { [weak self] event in self?.showContextMenu(with: event) }
+        window.onManualResize = { [weak self] in
+            self?.lastManualResize = ProcessInfo.processInfo.systemUptime
+            self?.autoGrownBaseHeight = nil
+            self?.autoGrownTargetHeight = nil
+        }
         window.onCommand = { [weak self] command in self?.run(command) ?? false }
         window.actionForShortcut = { [weak self] shortcut in self?.hotkeys.windowAction(for: shortcut) }
 
@@ -1628,6 +1860,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         waveform.controller = self
         waveform.accentRGB = accentRGB
         waveform.stereo = stereoWaveform
+        waveform.hideSilentChannels = hideSilentChannels
         waveform.frequencyGradient = frequencyColoring ? frequencyGradient : nil
         let minimumWaveformHeight = waveform.heightAnchor.constraint(greaterThanOrEqualToConstant: fullWaveformMinimumHeight)
         minimumWaveformHeight.isActive = true
@@ -2122,6 +2355,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             checkboxWithTitle: "Keep quiet sections", target: self, action: #selector(retainSilenceChanged(_:))
         )
         quietSections.state = retainSilence ? .on : .off
+        let hideSilent = NSButton(
+            checkboxWithTitle: "Hide silent channels", target: self, action: #selector(hideSilentChannelsChanged(_:))
+        )
+        hideSilent.state = hideSilentChannels ? .on : .off
+        optionsHideSilentButton = hideSilent
+        let hideSilentNote = optionNote(
+            "System, application and microphone sources show below L and R only the channels that have sound. Add-on sources show every channel."
+        )
         return optionsTab("Capture", groups: [
             optionGroup(nil, rows: [
                 optionChoice(
@@ -2130,14 +2371,30 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 ) { $0 > 60 ? "\($0 / 60) minutes" : "\($0) seconds" },
                 capacity,
                 quietSections,
-                optionChoice("L/R of multichannel sources", choices: [0, 1], selected: pairBinaural ? 1 : 0,
-                    action: #selector(pairBinauralChanged(_:))) { $0 == 0 ? "Stereo" : "Binaural" },
                 optionChoice(
                     "Auto-resume delay", choices: autoResumeChoices, selected: idleSeconds,
                     action: #selector(idleChanged(_:))
                 ) { $0 == 0 ? "Off" : "\($0) seconds" }
+            ]),
+            optionGroup("Multichannel sources", rows: [
+                hideSilent,
+                hideSilentNote,
+                optionChoice("L/R of multichannel sources", choices: [0, 1], selected: pairBinaural ? 1 : 0,
+                    action: #selector(pairBinauralChanged(_:))) { $0 == 0 ? "Stereo" : "Binaural" }
             ])
         ])
+    }
+
+    @objc private func hideSilentChannelsChanged(_ sender: NSButton) {
+        let enabled = sender.state == .on
+        guard enabled != hideSilentChannels else { return }
+        hideSilentChannels = enabled
+        defaults.set(enabled, forKey: "hideSilentChannels")
+        waveform?.hideSilentChannels = enabled
+        waveform?.discardPreparedFile()
+        refreshWaveform()
+        updateStatus()
+        registerClick()
     }
 
     private func makeExportTab() -> NSTabViewItem {
@@ -2516,12 +2773,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func reconnectConfiguredSources() {
+        let hadPending = !pendingSnapshots.isEmpty
+        if hadPending {
+            failPendingSnapshots("The capture source changed before this selection was ready.")
+        }
         let wasRunning = !paused
         if wasRunning { pauseCapture() }
         editing = false
         tap = nil
         waveform?.resetTimeline()
-        notice = nil
+        if !hadPending { notice = nil }
         captureError = nil
         registerClick()
         if wasRunning {
@@ -3069,13 +3330,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     @objc private func toggleSeparateLanes() {
         guard !editing else { return }
         guard multipleRows else {
-            setNotice("Editing separately needs at least two waveform rows.")
+            setNotice("Editing separately needs more than one row.")
             return
         }
         separateLanes.toggle()
         waveform?.separateLanes = separateLanes
         registerClick()
-        setNotice(separateLanes ? "Editing rows separately" : "Editing rows together")
+        setNotice(separateLanes ? "Editing rows separately" : "Editing all rows together")
     }
 
     private func loginItem() -> NSMenuItem {
@@ -3782,6 +4043,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             stateText = "Paused · resumes in \(remaining) s"
         }
         let problem = captureError ?? tap?.sourceMessage
+        if let waveform {
+            var laneProbs: [Int: String] = [:]
+            if let tap {
+                for idx in 0..<tap.laneCount {
+                    if let p = tap.sourceProblem(for: idx) { laneProbs[idx] = p }
+                }
+            }
+            waveform.laneProblems = laneProbs
+            waveform.laneSourceLabels = captureLanes.map { $0.source.label }
+        }
         let markShown = statusMark.shows(state, problem: problem != nil)
         // With Never the lamp gives up its place; otherwise it keeps it while it is dark.
         if captureLamp.isHidden != (statusMark == .never) { captureLamp.isHidden = statusMark == .never }
@@ -3799,8 +4070,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         } else if waveform?.isPreparingMaterial == true {
             line = "Preparing selection…"
         } else if waveform?.hasSelection == true && notice == nil {
-            // A selection of one row names it.
-            let selection = waveform?.selectedRow?.title.map { "Selection · \($0)" } ?? "Selection"
+            let rowLabel = waveform?.selectedRowsLabel ?? ""
+            let selection = rowLabel.isEmpty ? "Selection" : "Selection · \(rowLabel)"
             line = paused ? "\(selection) / Paused" : selection
         } else {
             line = [state == .paused ? stateText : nil, message.isEmpty ? nil : message]
@@ -3849,49 +4120,31 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         worker.async { withExtendedLifetime(material) {} }
     }
 
+    var hideSilentLaneIndices: Set<Int> {
+        guard hideSilentChannels, let tap else { return [] }
+        return Set((0..<tap.laneCount).filter { tap.canHideSilentChannels(for: $0) })
+    }
+
+    var currentChannelLabels: [[String]] {
+        tap?.captureChannelNames ?? []
+    }
+
     @objc private func saveCurrentSnapshot() {
-        guard !editing else { return }
-        guard waveform?.isPreparingMaterial != true else { setNotice("Preparing selection…"); return }
-        let selected = waveform?.selectionForSaving()
-        // Read before the selection, and its fades and lane with it, is cleared below. Without a
-        // selection all lanes are saved.
-        let fades = waveform?.fadesForSaving() ?? noFades
-        let row = selected == nil ? nil : waveform?.selectedRow
-        let save: (WAVExport?) -> Void = { [weak self] job in
-            guard let self else { return }
-            guard let job else { self.setNotice("No audio captured yet."); return }
-            let range = selected ?? job.span
-            guard range.lowerBound >= job.span.lowerBound, range.upperBound <= job.span.upperBound, !range.isEmpty else {
-                self.setNotice("The selected audio is unavailable.")
-                return
-            }
-            let ticket = self.waveform?.reserveMarker()
-            if selected != nil { self.waveform?.clearSelection() }
-            self.writeExport(job, range: range, fades: fades, row: row, directory: self.directory(for: .saved),
-                             provisional: false) { [weak self] urls in
-                if !urls.isEmpty, let ticket { self?.waveform?.commitMarker(range, row: row, ticket: ticket) }
-                return true
-            }
-        }
-        if let material = waveform?.materialForExport(range: selected) {
-            save(material)
-        } else {
-            requestEditingMaterial(save)
-        }
+        saveSnapshot(into: directory(for: .saved))
     }
 
     func prepareDrag(
-        _ job: WAVExport, range: Range<UInt64>, fades: BtFades, row: WaveformRow?,
+        _ job: WAVExport, range: Range<UInt64>, fades: BtFades, rows: [RowIdentity]?,
         completion: @escaping ([URL]) -> Bool
     ) -> DispatchWorkItem {
-        writeExport(job, range: range, fades: fades, row: row, directory: directory(for: .output),
+        writeExport(job, range: range, fades: fades, rows: rows, directory: directory(for: .output),
                     provisional: true, completion: completion)
     }
 
     /// Writes the selected audio on the export worker.
     @discardableResult
     private func writeExport(
-        _ job: WAVExport, range: Range<UInt64>, fades: BtFades, row: WaveformRow?, directory: String,
+        _ job: WAVExport, range: Range<UInt64>, fades: BtFades, rows: [RowIdentity]?, directory: String,
         provisional: Bool, completion: @escaping ([URL]) -> Bool
     ) -> DispatchWorkItem {
         let sampleRate = exportSampleRate
@@ -3900,13 +4153,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let wideMode = wideExportMode
         let pairBinaural = self.pairBinaural
         let names = laneFileNames
+        let hideLanes = hideSilentLaneIndices
         if !provisional { activeSnapshotSaves += 1 }
         setNotice(provisional ? "Preparing WAV…" : "Saving snapshot…")
         let write = DispatchWorkItem { @Sendable [weak self, worker, pendingProvisionalWAVs] in
-            let urls = job.write(
+            let written = job.write(
                 range: range, directory: directory, sampleRate: sampleRate, bitsPerSample: bitsPerSample,
-                forceMono: forceMono, fades: fades, names: names, row: row, wideMode: wideMode, pairBinaural: pairBinaural
+                forceMono: forceMono, fades: fades, names: names, selectedRows: rows, hideSilentLanes: hideLanes,
+                wideMode: wideMode, pairBinaural: pairBinaural
             )
+            let urls = written.urls
             if provisional { pendingProvisionalWAVs.urls.formUnion(urls) }
             DispatchQueue.main.async {
                 if !provisional, let self { self.activeSnapshotSaves = max(0, self.activeSnapshotSaves - 1) }
@@ -3920,10 +4176,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                     return
                 }
                 if urls.isEmpty {
-                    self?.setNotice(
-                        (provisional ? "Could not prepare WAV." : "Could not save snapshot.")
-                            + " Check that there is audio and that the folder can be written to."
-                    )
+                    let detail = written.error ?? "Check that there is audio and that the folder can be written to."
+                    self?.setNotice((provisional ? "Could not prepare WAV: " : "Could not save snapshot: ") + detail)
                 } else {
                     if !provisional { self?.harness?.noteSaved(urls) }
                     self?.setNotice(provisional ? nil : "Saved snapshot \(exportDescription(urls))")
@@ -4054,7 +4308,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             return .success(())
         case .group:
             return .failure("channel groups require add-on sources (not available in A stage)")
-        case .hideSilent:
+        case .hideSilent(let on):
+            hideSilentChannels = on
+            optionsHideSilentButton?.state = on ? .on : .off
+            waveform?.hideSilentChannels = on
+            waveform?.discardPreparedFile()
+            refreshWaveform()
             return .success(())
         case .pair(let binaural):
             pairBinaural = binaural
@@ -4242,14 +4501,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             guard let waveform else { return .failure(TestActionRefusal(code: "failed", message: "no waveform")) }
             let selected = waveform.selectionForSaving()
             let fades = waveform.fadesForSaving()
-            let row = selected == nil ? nil : waveform.selectedRow
+            let rows = selected == nil ? nil : waveform.selectedRowsForExport
             let runPrepare: (WAVExport?) -> Void = { [weak self] job in
                 guard let self, let job else {
                     self?.lastHarnessDragFiles = []
                     return
                 }
                 let range = selected ?? job.span
-                _ = self.writeExport(job, range: range, fades: fades, row: row, directory: self.directory(for: .output),
+                _ = self.writeExport(job, range: range, fades: fades, rows: rows, directory: self.directory(for: .output),
                                      provisional: true) { [weak self] urls in
                     self?.lastHarnessDragFiles = urls
                     self?.lastHarnessDragStatus = urls.isEmpty ? "" : "Saved \(exportDescription(urls))"
@@ -4302,31 +4561,95 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         return desc
     }
 
+    /// Package 4 / WIN-12: auto-grow full window for stacked channels or >2 sources (20px/row, capped at min(560, 85% screen)).
+    func maybeAutoGrowWindow() {
+        guard let panel, let waveform, !waveformOnly, !editing,
+              TestCopyConfig.current.windowSizeOverride == nil else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastManualResize < 1.0 { return }
+        let currentContent = panel.contentRect(forFrameRect: panel.frame).size
+        let currentAudioH = max(1, waveform.bounds.height)
+        let chromeHeight = max(0, currentContent.height - currentAudioH)
+        let screenMax = (panel.screen?.visibleFrame.height ?? 900) * 0.85
+        let cap = min(560, screenMax)
+
+        if let desiredAudio = waveform.desiredComfortableAudioHeight {
+            let desiredTotal = min(cap, desiredAudio + chromeHeight)
+            if desiredTotal > currentContent.height + 1 {
+                if autoGrownBaseHeight == nil {
+                    autoGrownBaseHeight = currentContent.height
+                }
+                if let prevTarget = autoGrownTargetHeight, desiredTotal <= prevTarget + 1 {
+                    return
+                }
+                autoGrownTargetHeight = desiredTotal
+                resizePanel(to: NSSize(width: currentContent.width, height: desiredTotal))
+            }
+        } else if let base = autoGrownBaseHeight {
+            // Shrink back to pre-grow height once no stacked lane and <=2 sources, unless user manually resized.
+            autoGrownBaseHeight = nil
+            autoGrownTargetHeight = nil
+            resizePanel(to: NSSize(width: currentContent.width, height: base))
+        }
+    }
+
+    func onEditMaterialReady(_ material: WAVExport) {
+        guard !pendingSnapshots.isEmpty else { return }
+        let queued = pendingSnapshots
+        pendingSnapshots.removeAll()
+        for req in queued {
+            executeSnapshotSave(material, request: req)
+        }
+    }
+
+    func onEditMaterialUnavailable() {
+        failPendingSnapshots("No audio available for this selection.")
+    }
+
+    private func failPendingSnapshots(_ reason: String) {
+        guard !pendingSnapshots.isEmpty else { return }
+        pendingSnapshots.removeAll()
+        setNotice(reason)
+    }
+
+    private func executeSnapshotSave(_ job: WAVExport, request: PendingSnapshotSave) {
+        let range = request.range ?? job.span
+        guard range.lowerBound >= job.span.lowerBound, range.upperBound <= job.span.upperBound, !range.isEmpty else {
+            setNotice("The selected audio is unavailable.")
+            return
+        }
+        writeExport(job, range: range, fades: request.fades, rows: request.rows, directory: request.directory,
+                    provisional: false) { [weak self] urls in
+            if !urls.isEmpty, let ticket = request.ticket {
+                self?.waveform?.commitMarker(range, rows: request.rows, ticket: ticket)
+            }
+            return true
+        }
+    }
+
     private func saveSnapshot(into directoryPath: String) {
         guard !editing else { return }
-        guard waveform?.isPreparingMaterial != true else { setNotice("Preparing selection…"); return }
         let selected = waveform?.selectionForSaving()
         let fades = waveform?.fadesForSaving() ?? noFades
-        let row = selected == nil ? nil : waveform?.selectedRow
+        let rows = selected == nil ? nil : waveform?.selectedRowsForExport
+        let ticket = waveform?.reserveMarker()
+        let req = PendingSnapshotSave(range: selected, fades: fades, rows: rows, directory: directoryPath, ticket: ticket)
+        if waveform?.isPreparingMaterial == true {
+            pendingSnapshots.append(req)
+            if selected != nil { waveform?.clearSelection() }
+            setNotice("Preparing snapshot…")
+            return
+        }
         let save: (WAVExport?) -> Void = { [weak self] job in
             guard let self else { return }
             guard let job else { self.setNotice("No audio captured yet."); return }
-            let range = selected ?? job.span
-            guard range.lowerBound >= job.span.lowerBound, range.upperBound <= job.span.upperBound, !range.isEmpty else {
-                self.setNotice("The selected audio is unavailable.")
-                return
-            }
-            let ticket = self.waveform?.reserveMarker()
             if selected != nil { self.waveform?.clearSelection() }
-            self.writeExport(job, range: range, fades: fades, row: row, directory: directoryPath,
-                             provisional: false) { [weak self] urls in
-                if !urls.isEmpty, let ticket { self?.waveform?.commitMarker(range, row: row, ticket: ticket) }
-                return true
-            }
+            self.executeSnapshotSave(job, request: req)
         }
         if let material = waveform?.materialForExport(range: selected) {
             save(material)
         } else {
+            setNotice("Preparing snapshot…")
             requestEditingMaterial(save)
         }
     }
@@ -4356,10 +4679,17 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         }
     }
     var secondsInterval: UInt32? { didSet { needsDisplay = true } }
-    var accentRGB = defaultAccentRGB { didSet { needsDisplay = true } }
+    var accentRGB = WaveformTheme.defaultAccentRGB { didSet { needsDisplay = true } }
     var stereo = false {
         didSet { if stereo != oldValue { revision = nil } }
     }
+    var hideSilentChannels = true {
+        didSet { if hideSilentChannels != oldValue { revision = nil; needsDisplay = true } }
+    }
+    var laneProblems: [Int: String] = [:] {
+        didSet { if laneProblems != oldValue { needsDisplay = true } }
+    }
+    var laneSourceLabels: [String] = []
 
     var frequencyGradient: FrequencyGradient? {
         didSet {
@@ -4388,9 +4718,19 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     private var traces: [WaveformTrace] = []
     private var requestedRows: [WaveformRow] = []
     private var displayedRows: [WaveformRow] = []
-    private var rowOffset: CGFloat = 0
-    private var rowHeight: CGFloat { max(16, bounds.height / CGFloat(max(1, displayedRows.count))) }
-    private var maxRowOffset: CGFloat { max(0, CGFloat(displayedRows.count) * rowHeight - bounds.height) }
+    private var displayedLaneCount: Int = 1
+    private var displayedLaneWidths: [UInt32] = []
+    private var laneFirstRows: [Int] = []
+    private var columnFirstRow: Int = 0
+    private var laneBoxes: [LaneLayoutBox] = []
+    private var columnBox: LaneLayoutBox?
+    private var gutterToolTip: NSView.ToolTipTag?
+    private struct ScrollDrag {
+        let laneIndex: Int? // nil = column scroll (>2 lanes)
+        let grabOffset: CGFloat
+    }
+    private var scrollDrag: ScrollDrag?
+    private var edgeScrollTimer: Timer?
     private var retainedFrames: Range<UInt64> = 0..<0
     private var visibleFrames: Range<UInt64> = 0..<0
     private var renderedFrames: Range<UInt64> = 0..<0
@@ -4402,12 +4742,13 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     private var bars: [UInt64] = []
     private var selection: Range<UInt64>?
     private var marker: Range<UInt64>?
-    /// The row the marker was left on. Nil marks the whole clip.
-    private var markerRow: WaveformRow?
+    private var markerRows: [RowIdentity] = []
     private var markerRevision: UInt64 = 0
     private var committedMarkerRevision: UInt64 = 0
-    private var pendingDragMarker: (range: Range<UInt64>, row: WaveformRow?, ticket: UInt64)?
+    private var pendingDragMarker: (range: Range<UInt64>, rows: [RowIdentity]?, ticket: UInt64)?
     private var anchor: UInt64?
+    private var selectionPressX: CGFloat?
+    private var selectionMoved = false
     private var pointer: NSPoint?
     private var pointerModifiers: NSEvent.ModifierFlags = []
     private var selectionModifierDown: Bool { selectsWaveform(pointerModifiers) }
@@ -4442,35 +4783,145 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     var separateLanes = false {
         didSet {
             guard separateLanes != oldValue else { return }
-            // The selection stays, but what it plays and carries changes with the mode.
             player?.stop()
             if !dragging { discardPreparedFile() }
             needsDisplay = true
         }
     }
-    private var selectionReference: WaveformRow?
-    private var dragRow: WaveformRow?
-    var selectedRow: WaveformRow? { separateLanes && hasSelection ? selectionReference : nil }
+    private var selectionAnchorRow: RowIdentity?
+    private var selectionCursorRow: RowIdentity?
+    private var rememberedRows: [RowIdentity] = []
+    private var dragRow: RowIdentity?
+    private var waveformCursorActive = false
 
-    private func row(at y: CGFloat) -> WaveformRow? {
+    private var hasStackedLane: Bool {
+        displayedLaneWidths.contains { $0 > 2 }
+    }
+
+    private var gutterWidth: CGFloat {
+        guard showsOverlay else { return 0 }
+        return RowStackLayout.labelGutterWidth(laneCount: displayedLaneCount, hasStacked: hasStackedLane)
+    }
+
+    private var audioRect: NSRect {
+        let left = bounds.minX + gutterWidth
+        return NSRect(x: left, y: bounds.minY, width: max(1, bounds.maxX - left), height: max(1, bounds.height))
+    }
+
+    private var isPointerGestureActive: Bool {
+        anchor != nil || mouseDownEvent != nil || dragging || fadeGesture != nil || scrollDrag != nil
+    }
+
+    private func laneInputsForDisplay() -> [LaneLayoutInput] {
+        (0..<max(1, displayedLaneCount)).map { lane in
+            let count = displayedRows.filter { $0.lane == lane }.count
+            let stacked = displayedLaneWidths.indices.contains(lane) && displayedLaneWidths[lane] > 2
+            return LaneLayoutInput(rows: count, stacked: stacked)
+        }
+    }
+
+    var desiredComfortableAudioHeight: CGFloat? {
+        RowStackLayout.comfortableAudioHeight(lanes: laneInputsForDisplay())
+    }
+
+    private func recomputeRowLayout() {
+        let inputs = laneInputsForDisplay()
+        if laneFirstRows.count != inputs.count {
+            laneFirstRows = Array(repeating: 0, count: inputs.count)
+        }
+        if inputs.count > 2 {
+            let (boxes, col) = RowStackLayout.layOutColumn(height: audioRect.height, lanes: inputs, first: columnFirstRow)
+            laneBoxes = boxes
+            columnBox = col
+            columnFirstRow = col.first
+        } else {
+            let boxes = RowStackLayout.layOut(height: audioRect.height, lanes: inputs, first: laneFirstRows)
+            laneBoxes = boxes
+            columnBox = nil
+            for i in boxes.indices { laneFirstRows[i] = boxes[i].first }
+        }
+        updateGutterToolTip()
+    }
+
+    private func rowRect(for index: Int) -> NSRect? {
+        guard displayedRows.indices.contains(index) else { return nil }
+        let row = displayedRows[index]
+        guard laneBoxes.indices.contains(row.lane) else { return nil }
+        let box = laneBoxes[row.lane]
+        let laneStart = displayedRows.firstIndex { $0.lane == row.lane } ?? index
+        let rel = index - laneStart
+        guard let topFromPlotTop = box.rowTop(rel) else { return nil }
+        let y = audioRect.maxY - topFromPlotTop - box.rowHeight
+        return NSRect(x: audioRect.minX, y: y, width: audioRect.width, height: box.rowHeight)
+    }
+
+    private func rowIdentity(at point: NSPoint, clampedToVisible: Bool = true) -> RowIdentity? {
         guard !displayedRows.isEmpty else { return nil }
-        let index = Int(max(0, (bounds.maxY + rowOffset - y) / rowHeight))
-        return displayedRows[min(displayedRows.count - 1, index)]
+        let yFromTop = audioRect.maxY - point.y
+        let hit = clampedToVisible
+            ? RowStackLayout.nearestVisibleRow(boxes: laneBoxes, yFromTop: yFromTop)
+            : RowStackLayout.rowAt(boxes: laneBoxes, yFromTop: yFromTop)
+        guard let (lane, relRow) = hit else { return nil }
+        let laneRows = displayedRows.filter { $0.lane == lane }
+        guard laneRows.indices.contains(relRow) else { return nil }
+        return laneRows[relRow].identity
     }
 
-    private func rowRect(_ row: Int) -> NSRect {
-        NSRect(x: bounds.minX, y: bounds.maxY + rowOffset - CGFloat(row + 1) * rowHeight,
-            width: bounds.width, height: rowHeight)
+    private func currentSpecs() -> [WaveformRowSpec] { displayedRows.map(\.spec) }
+
+    /// Rows currently selected when Edit separately is on. Empty means all rows.
+    private var activeSelectedRows: [RowIdentity] {
+        guard separateLanes, hasSelection, !rememberedRows.isEmpty else { return [] }
+        let visibleSet = Set(displayedRows.map(\.identity))
+        let filtered = rememberedRows.filter { visibleSet.contains($0) }
+        guard !filtered.isEmpty, filtered.count < displayedRows.count else { return [] }
+        return filtered
     }
 
-    private func matches(_ row: WaveformRow, _ selected: WaveformRow) -> Bool {
-        row.lane == selected.lane && (row.view == selected.view || (row.isPair && selected.isPair))
+    var selectedRowsForExport: [RowIdentity]? {
+        let rows = activeSelectedRows
+        return rows.isEmpty ? nil : rows
     }
 
-    private func targetRect(_ row: WaveformRow) -> NSRect {
-        guard let first = displayedRows.firstIndex(where: { matches($0, row) }),
-              let last = displayedRows.lastIndex(where: { matches($0, row) }) else { return .zero }
-        return rowRect(first).union(rowRect(last))
+    var selectedRowsLabel: String {
+        let rows = activeSelectedRows
+        guard !rows.isEmpty else { return "" }
+        return RowStackLayout.rowsLabel(rows, dual: displayedLaneCount > 1,
+                                        channelLabels: controller?.currentChannelLabels ?? [])
+    }
+
+    private func isRowSelected(_ id: RowIdentity) -> Bool {
+        let rows = activeSelectedRows
+        if rows.isEmpty { return true }
+        return rows.contains(id)
+    }
+
+    private func rectForRows(_ ids: [RowIdentity]) -> NSRect? {
+        var combined: NSRect?
+        for (index, row) in displayedRows.enumerated() where ids.contains(row.identity) {
+            guard let rect = rowRect(for: index) else { continue }
+            combined = combined.map { $0.union(rect) } ?? rect
+        }
+        return combined
+    }
+
+    private func selectedRowsRect() -> NSRect? {
+        let rows = activeSelectedRows
+        if rows.isEmpty { return audioRect }
+        return rectForRows(rows)
+    }
+
+    private func flagTopY() -> CGFloat? {
+        if selection != nil {
+            return selectedRowsRect()?.maxY
+        }
+        if marker != nil {
+            if !markerRows.isEmpty {
+                return rectForRows(markerRows)?.maxY
+            }
+            return audioRect.maxY
+        }
+        return nil
     }
 
     var hasEditingMaterial: Bool { editMaterial != nil || materialPending }
@@ -4491,24 +4942,35 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     }
 
     func scrollToRow(lane: Int, row: Int) {
-        if let idx = displayedRows.firstIndex(where: { $0.lane == lane }) {
-            let target = min(displayedRows.count - 1, idx + row)
-            rowOffset = min(maxRowOffset, max(0, CGFloat(target) * rowHeight))
-            needsDisplay = true
+        if displayedLaneCount > 2 {
+            let laneStart = displayedRows.firstIndex { $0.lane == lane } ?? 0
+            columnFirstRow = max(0, laneStart + row)
+        } else if laneFirstRows.indices.contains(lane) {
+            laneFirstRows[lane] = max(0, row)
         }
+        recomputeRowLayout()
+        needsDisplay = true
     }
 
     func selectProgrammaticLane(_ lane: Int) -> Bool {
-        guard let row = displayedRows.first(where: { $0.lane == lane }) else { return false }
-        selectionReference = row
+        let laneRows = displayedRows.filter { $0.lane == lane }
+        guard let first = laneRows.first?.identity, let last = laneRows.last?.identity else { return false }
+        selectionAnchorRow = first
+        selectionCursorRow = last
+        rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: first, cursor: last)
         needsDisplay = true
         return true
     }
 
     func selectProgrammaticRows(firstLane: Int, firstRow: Int, lastLane: Int, lastRow: Int) -> Bool {
-        let laneRows = displayedRows.filter { $0.lane == firstLane }
-        guard laneRows.indices.contains(firstRow) else { return false }
-        selectionReference = laneRows[firstRow]
+        let aRows = displayedRows.filter { $0.lane == firstLane }
+        let bRows = displayedRows.filter { $0.lane == lastLane }
+        guard aRows.indices.contains(firstRow), bRows.indices.contains(lastRow) else { return false }
+        let a = aRows[firstRow].identity
+        let b = bRows[lastRow].identity
+        selectionAnchorRow = a
+        selectionCursorRow = b
+        rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: a, cursor: b)
         needsDisplay = true
         return true
     }
@@ -4519,7 +4981,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
-        rowOffset = min(rowOffset, maxRowOffset)
+        recomputeRowLayout()
         needsDisplay = true
         updateStatusToolTip()
         controller?.refreshWaveform()
@@ -4559,28 +5021,70 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         statusToolTip = addToolTip(hover.intersection(bounds), owner: self, userData: nil)
     }
 
+    private func updateGutterToolTip() {
+        if let gutterToolTip { removeToolTip(gutterToolTip) }
+        gutterToolTip = nil
+        guard showsOverlay, gutterWidth > 0 else { return }
+        let rect = NSRect(x: bounds.minX, y: bounds.minY, width: gutterWidth, height: bounds.height)
+        gutterToolTip = addToolTip(rect, owner: self, userData: UnsafeMutableRawPointer(bitPattern: 1))
+    }
+
     func view(
         _ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?
     ) -> String {
-        compactStatus?.detail ?? ""
+        if data == UnsafeMutableRawPointer(bitPattern: 1) {
+            return gutterToolTipText(at: point)
+        }
+        return compactStatus?.detail ?? ""
+    }
+
+    private func gutterToolTipText(at point: NSPoint) -> String {
+        guard let id = rowIdentity(at: point, clampedToVisible: false),
+              let row = displayedRows.first(where: { $0.identity == id }) else { return "" }
+        var lines: [String] = []
+        if displayedLaneCount > 2 {
+            let letter = captureLaneLetter(row.lane)
+            let src = laneSourceLabels.indices.contains(row.lane) ? laneSourceLabels[row.lane] : "Source \(letter)"
+            lines.append("Source \(letter): \(src)")
+            if let problem = laneProblems[row.lane] { lines.append(problem) }
+        }
+        switch id {
+        case .pair(_, let side):
+            lines.append(side == 0
+                ? "L: the left side of all channels mixed to stereo"
+                : "R: the right side of all channels mixed to stereo")
+        case .channel(_, let ch):
+            lines.append("Channel \(ch + 1) of \(row.laneChannelCount): \(row.fullLabel)")
+        case .stereoSide(_, let side):
+            lines.append(side == 0 ? "L" : "R")
+        case .whole:
+            if displayedLaneCount <= 2, let problem = laneProblems[row.lane] { lines.append(problem) }
+        }
+        let scrollsColumn = columnBox?.scrolls == true
+        let scrollsLane = laneBoxes.indices.contains(row.lane) && laneBoxes[row.lane].scrolls
+        if scrollsColumn {
+            lines.append("Scroll here or drag the bar on the right to see the other sources.")
+        } else if scrollsLane {
+            lines.append("Scroll here or drag the bar on the right to see the other channels.")
+        }
+        return lines.joined(separator: "\n")
     }
 
     private func drawCompactStatus() {
         guard let status = compactStatus else { return }
         let center = statusMarkCenter
-        // The backing keeps the mark readable over a loud waveform or a transparent window.
         let backing = NSColor.black.withAlphaComponent(0.66)
         backing.setFill()
         NSBezierPath(ovalIn: NSRect(x: center.x - 6.5, y: center.y - 6.5, width: 13, height: 13)).fill()
         let color: NSColor
         if status.problem != nil {
-            color = problemColor
+            color = WaveformTheme.statusUnavailable
         } else {
             switch status.state {
-            case .unavailable: color = problemColor
-            case .paused: color = NSColor(white: 214 / 255, alpha: 1)
-            case .waiting: color = NSColor(white: 132 / 255, alpha: 1)
-            case .recording: color = NSColor.systemRed.withAlphaComponent(status.lit ? 1 : 0.27)
+            case .unavailable: color = WaveformTheme.statusUnavailable
+            case .paused: color = WaveformTheme.compactPaused
+            case .waiting: color = WaveformTheme.compactWaiting
+            case .recording: color = status.lit ? WaveformTheme.statusRecordingBright : WaveformTheme.statusRecordingDim
             }
         }
         color.setFill()
@@ -4601,8 +5105,6 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         }
     }
 
-    /// Says why the plot is empty. It is dimmed in waveform-only mode, and left out there when
-    /// a source problem is already written on the plot.
     private func drawEmptyHint() {
         guard visibleFrames.isEmpty, showsOverlay || compactStatus?.problem == nil else { return }
         let text = NSAttributedString(string: "No captured audio", attributes: [
@@ -4610,8 +5112,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             .foregroundColor: showsOverlay ? NSColor.gray : NSColor(white: 104 / 255, alpha: 1)
         ])
         let size = text.size()
-        guard size.width < bounds.width, size.height < bounds.height else { return }
-        text.draw(at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2))
+        guard size.width < audioRect.width, size.height < audioRect.height else { return }
+        text.draw(at: NSPoint(x: audioRect.midX - size.width / 2, y: audioRect.midY - size.height / 2))
     }
 
     override func updateTrackingAreas() {
@@ -4628,9 +5130,9 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
     private func readRequest() -> WaveformReadRequest {
         WaveformReadRequest(view: requestedView ?? (zoomed || editMaterial != nil ? visibleFrames : nil),
-            width: Float(bounds.width), height: Float(bounds.height), rows: requestedRows,
+            width: Float(audioRect.width), height: Float(audioRect.height), rows: requestedRows,
             interactive: anchor != nil || mouseDownEvent != nil || dragging || panStart != nil
-                || fadeGesture != nil)
+                || fadeGesture != nil || scrollDrag != nil)
     }
 
     private func refreshFrequency(tap: SystemAudioTap) {
@@ -4676,14 +5178,23 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     func refresh(tap: SystemAudioTap, worker: DispatchQueue) {
         guard !materialPending else { return }
         let widths = (0..<tap.laneCount).map { tap.channelCount(for: $0) ?? 0 }
-        requestedRows = WaveformRow.layout(widths: widths, labels: tap.captureChannelNames, stereo: stereo)
+        let material = editMaterial
+        if !isPointerGestureActive || requestedRows.isEmpty {
+            let activeMasks: [UInt64?] = (0..<tap.laneCount).map { lane in
+                guard hideSilentChannels, tap.canHideSilentChannels(for: lane) else { return nil }
+                if let material { return material.activeChannels(for: lane) }
+                return tap.liveActiveMask(for: lane, hideSilent: true)
+            }
+            requestedRows = WaveformRow.layout(widths: widths, labels: tap.captureChannelNames,
+                                               stereo: stereo, activeMasks: activeMasks)
+        }
         refreshFrequency(tap: tap)
         let request = readRequest()
-        let material = editMaterial
         if material != nil && revision != nil && request == lastRenderedRequest { return }
         guard renderGate.request() else { return }
         let unchangedRevision = request == lastRenderedRequest ? revision : nil
         let version = materialVersion
+        let laneCount = tap.laneCount
         let receive: (WaveformFrame?) -> Void = { [weak self] frame in
             guard let self else { return }
             let stale = self.materialVersion != version || self.materialPending
@@ -4693,6 +5204,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 if retry && !self.materialPending { self.controller?.refreshWaveform() }
             }
             guard !stale, let frame else { return }
+            let rowsChanged = self.displayedRows != request.rows || self.displayedLaneWidths != widths
             self.revision = frame.revision
             self.sampleRate = frame.sampleRate
             self.retainedFrames = frame.retained
@@ -4701,12 +5213,15 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             self.requestedView = nil
             self.zoomed = frame.visible != frame.retained
             self.displayedRows = request.rows
-            self.rowOffset = min(self.rowOffset, self.maxRowOffset)
+            self.displayedLaneCount = laneCount
+            self.displayedLaneWidths = widths
             self.traces = frame.traces
             self.bars = frame.bars
+            self.recomputeRowLayout()
             self.lastRenderedRequest = self.readRequest()
             self.updateDisplayPolicy()
             self.refreshFrequency(tap: tap)
+            if rowsChanged { self.controller?.maybeAutoGrowWindow() }
             self.needsDisplay = true
         }
         if let material {
@@ -4742,11 +5257,15 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         controller?.requestEditingMaterial { [weak self] material in
             guard let self else { return }
             guard self.materialVersion == version else {
+                if let material {
+                    self.controller?.onEditMaterialReady(material)
+                }
                 self.controller?.retireEditingMaterial(material)
                 return
             }
             self.materialPending = false
             guard let material else {
+                self.controller?.onEditMaterialUnavailable()
                 self.controller?.setNotice("No audio available for this selection.")
                 return
             }
@@ -4769,6 +5288,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             self.zoomed = self.visibleFrames != self.retainedFrames
             self.revision = nil
             self.controller?.refreshWaveform()
+            self.controller?.onEditMaterialReady(material)
             if self.dragRequested && !self.dragging { self.prepareDrag() }
         }
     }
@@ -4796,40 +5316,96 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         controller?.refreshWaveform()
     }
 
+    private func scrollBoxAt(point: NSPoint) -> (laneIndex: Int?, box: LaneLayoutBox)? {
+        if let col = columnBox, col.scrolls {
+            return (nil, col)
+        }
+        let yFromTop = audioRect.maxY - point.y
+        for (i, box) in laneBoxes.enumerated() where box.scrolls {
+            if yFromTop >= box.top && yFromTop <= box.top + box.height {
+                return (i, box)
+            }
+        }
+        return nil
+    }
+
+    private func isOverScrollbar(point: NSPoint) -> Bool {
+        guard point.x >= bounds.maxX - RowStackLayout.scrollbarHitWidth else { return false }
+        return scrollBoxAt(point: point) != nil
+    }
+
+    private func scrollRows(by steps: Int, at point: NSPoint) -> Bool {
+        guard steps != 0, let target = scrollBoxAt(point: point) else { return false }
+        if let lane = target.laneIndex {
+            let maxFirst = max(0, target.box.rows - target.box.shown)
+            let next = min(maxFirst, max(0, target.box.first + steps))
+            guard next != laneFirstRows[lane] else { return true }
+            laneFirstRows[lane] = next
+        } else {
+            let maxFirst = max(0, target.box.rows - target.box.shown)
+            let next = min(maxFirst, max(0, target.box.first + steps))
+            guard next != columnFirstRow else { return true }
+            columnFirstRow = next
+        }
+        recomputeRowLayout()
+        needsDisplay = true
+        return true
+    }
+
     override func scrollWheel(with event: NSEvent) {
-        let x = convert(event.locationInWindow, from: nil).x
-        if maxRowOffset > 0, x < bounds.minX + 24 || x > bounds.maxX - 24 {
-            rowOffset = min(maxRowOffset, max(0, rowOffset - event.scrollingDeltaY))
-            needsDisplay = true
-            return
+        let loc = convert(event.locationInWindow, from: nil)
+        let inGutter = gutterWidth > 0 && loc.x < audioRect.minX
+        let inScrollEdge = loc.x >= bounds.maxX - RowStackLayout.scrollbarHitWidth
+        if (inGutter || inScrollEdge), event.scrollingDeltaY != 0 {
+            let raw = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY / 16.0 : event.scrollingDeltaY
+            let mag = max(1, Int(abs(raw).rounded(.up)))
+            // Up (positive deltaY on macOS) scrolls to earlier rows (-steps).
+            let steps = raw > 0 ? -mag : mag
+            if scrollRows(by: steps, at: loc) { return }
         }
         guard !dragging, !visibleFrames.isEmpty, event.scrollingDeltaY != 0 else { return }
-        let fraction = Double(fraction(at: convert(event.locationInWindow, from: nil).x))
-        let delta = Double(event.scrollingDeltaY) * (event.hasPreciseScrollingDeltas ? 0.014 : 0.12)
+        let fraction = Double(fraction(at: loc.x))
+        let delta: Double
+        if event.hasPreciseScrollingDeltas {
+            delta = Double(event.scrollingDeltaY) * 0.014
+        } else {
+            // Windows: x1.22 per notch, clamped to +-12 notches per frame.
+            let notches = max(-12.0, min(12.0, Double(event.scrollingDeltaY)))
+            delta = notches * log(1.22)
+        }
         changeView(to: zoomedWaveformRange(requestedView ?? visibleFrames, in: retainedFrames,
-                                          width: Double(bounds.width), cursorFraction: fraction, delta: delta))
+                                          width: Double(audioRect.width), cursorFraction: fraction, delta: delta))
     }
 
     override func otherMouseDown(with event: NSEvent) {
         guard event.buttonNumber == 2, zoomed, !dragging else { return }
         panStart = (convert(event.locationInWindow, from: nil).x, requestedView ?? visibleFrames)
+        updateWaveformCursor()
     }
 
     override func otherMouseDragged(with event: NSEvent) {
         guard event.buttonNumber == 2, let panStart else { return }
-        let delta = Double((convert(event.locationInWindow, from: nil).x - panStart.x) / max(1, bounds.width))
+        let delta = Double((convert(event.locationInWindow, from: nil).x - panStart.x) / max(1, audioRect.width))
         let span = panStart.range.upperBound - panStart.range.lowerBound
         changeView(to: fittedRange(start: Double(panStart.range.lowerBound) - delta * Double(span), span: span))
     }
 
     override func otherMouseUp(with event: NSEvent) {
-        if event.buttonNumber == 2 { panStart = nil }
+        if event.buttonNumber == 2 {
+            panStart = nil
+            updateWaveformCursor()
+        }
     }
 
     func clearSelection() {
-        // The preview plays the selection, so it ends with it.
+        stopEdgeAutoScroll()
         player?.stop()
         selection = nil
+        selectionPressX = nil
+        selectionMoved = false
+        selectionAnchorRow = nil
+        selectionCursorRow = nil
+        rememberedRows = []
         fades = noFades
         fadeGesture = nil
         requestedView = nil
@@ -4847,6 +5423,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         clearSelection()
         anchor = nil
         mouseDownEvent = nil
+        scrollDrag = nil
         retainedFrames = 0..<0
         visibleFrames = 0..<0
         renderedFrames = 0..<0
@@ -4858,11 +5435,15 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         nextFrequencyRead = 0
         requestedRows = []
         displayedRows = []
+        displayedLaneWidths = []
+        laneFirstRows = []
+        columnFirstRow = 0
+        laneBoxes = []
+        columnBox = nil
         traces = []
-        rowOffset = 0
         bars.removeAll()
         marker = nil
-        markerRow = nil
+        markerRows = []
         committedMarkerRevision = reserveMarker()
     }
 
@@ -4871,12 +5452,12 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         return markerRevision
     }
 
-    /// Leaves the marker on the exported range and row.
-    func commitMarker(_ range: Range<UInt64>, row: WaveformRow?, ticket: UInt64) {
+    /// Leaves the marker on the exported range and rows.
+    func commitMarker(_ range: Range<UInt64>, rows: [RowIdentity]?, ticket: UInt64) {
         guard ticket > committedMarkerRevision, !range.isEmpty else { return }
         committedMarkerRevision = ticket
         marker = range
-        markerRow = row
+        markerRows = rows ?? []
         needsDisplay = true
     }
 
@@ -4885,7 +5466,6 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         return selection
     }
 
-    /// The fades a saved or dragged selection gets: none without a selection.
     func fadesForSaving() -> BtFades {
         guard let selection = selectionForSaving() else { return noFades }
         return bt_fades_fitted(fades, selection.upperBound - selection.lowerBound)
@@ -4893,11 +5473,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
     var hasSelection: Bool { selectionForSaving() != nil }
 
-    /// Space with a selection plays it from its start flag, or stops it. Returns false without a
-    /// selection, so that Space keeps pausing and resuming capture.
     func togglePreview() -> Bool {
         guard let selection = selectionForSaving() else { return false }
-        // A gesture in progress keeps the key to itself.
         guard anchor == nil, fadeGesture == nil, mouseDownEvent == nil, !dragging else { return true }
         if TestCopyConfig.current.isTestCopy {
             controller?.setNotice("a test copy of Backtracking does not play audio")
@@ -4914,25 +5491,28 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         if player == nil {
             player = PreviewPlayer()
             player?.onChange = { [weak self] in self?.needsDisplay = true }
+            player?.onProblem = { [weak self] msg in self?.controller?.setNotice(msg) }
         }
         guard let player else {
-            controller?.setNotice("Could not play the selection.")
+            controller?.setNotice("Could not open the playback device (unavailable)")
             return true
         }
-        let problem = player.play(editMaterial, range: selection,
-                                  forceMono: controller?.forceMonoExport ?? false, fades: fadesForSaving(),
-                                  row: selectedRow, pairBinaural: controller?.pairBinaural ?? false)
+        let problem = player.play(
+            editMaterial, range: selection,
+            forceMono: controller?.forceMonoExport ?? false, fades: fadesForSaving(),
+            selectedRows: selectedRowsForExport,
+            hideSilentLanes: controller?.hideSilentLaneIndices ?? [],
+            pairBinaural: controller?.pairBinaural ?? false
+        )
         if let problem { controller?.setNotice(problem) }
         return true
     }
 
-    /// Silences the preview at once, for quitting.
     func endPreview() {
         player = nil
         needsDisplay = true
     }
 
-    /// Stops the preview over a few milliseconds, for when nothing would show it any longer.
     func stopPreview() {
         player?.stop()
     }
@@ -4952,6 +5532,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
     func cancelSelection() -> Bool {
         guard canCancelSelection else { return false }
+        stopEdgeAutoScroll()
         anchor = nil
         mouseDownEvent = nil
         clearSelection()
@@ -4968,6 +5549,16 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         return true
     }
 
+    func abortGestures() {
+        stopEdgeAutoScroll()
+        scrollDrag = nil
+        fadeGesture = nil
+        panStart = nil
+        anchor = nil
+        mouseDownEvent = nil
+        if !dragging && dragRequested { discardPreparedFile() }
+    }
+
     func discardPreparedFile() {
         pendingDragWrite?.cancel()
         pendingDragWrite = nil
@@ -4982,7 +5573,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     private func x(for frame: UInt64) -> CGFloat {
         let fraction = Double(frame - visibleFrames.lowerBound)
             / Double(max(1, visibleFrames.upperBound - visibleFrames.lowerBound))
-        return bounds.minX + bounds.width * CGFloat(fraction)
+        return audioRect.minX + audioRect.width * CGFloat(fraction)
     }
 
     private func isVisible(_ frame: UInt64) -> Bool {
@@ -4990,15 +5581,22 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     }
 
     private func flagPosition(for frame: UInt64) -> CGFloat {
-        min(bounds.maxX - 1.5, max(bounds.minX + 1.5, x(for: frame)))
+        min(audioRect.maxX - 1.5, max(audioRect.minX + 1.5, x(for: frame)))
     }
 
+    /// Picks a visible flag within 8 px horizontally and [top-13, top+2] vertically.
+    /// Nearer flag wins; equal distance picks the start flag.
     private func draggableFlag(at position: NSPoint) -> UInt64? {
-        guard let flags = selection ?? marker, position.y >= bounds.maxY - 17 else { return nil }
-        return [flags.lowerBound, flags.upperBound].filter(isVisible)
-            .map { (frame: $0, distance: abs(flagPosition(for: $0) - position.x)) }
-            .filter { $0.distance <= 8 }
-            .min { $0.distance < $1.distance }?.frame
+        guard let flags = selection ?? marker, let top = flagTopY() else { return nil }
+        guard position.y >= top - 13 && position.y <= top + 2 else { return nil }
+        let candidates: [(frame: UInt64, distance: CGFloat, isStart: Bool)] = [
+            (flags.lowerBound, abs(flagPosition(for: flags.lowerBound) - position.x), true),
+            (flags.upperBound, abs(flagPosition(for: flags.upperBound) - position.x), false)
+        ].filter { isVisible($0.frame) && $0.distance <= 8 }
+        return candidates.min { a, b in
+            if abs(a.distance - b.distance) < 0.001 { return a.isStart && !b.isStart }
+            return a.distance < b.distance
+        }?.frame
     }
 
     func hasDraggableFlag(at windowPoint: NSPoint) -> Bool {
@@ -5018,7 +5616,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 guideSeconds.withUnsafeBufferPointer { seconds in
                     bt_waveform_snap_visible(pointerFraction, visibleFrames.lowerBound, visibleFrames.upperBound,
                         flags.baseAddress, flags.count, bars.baseAddress, bars.count,
-                        seconds.baseAddress, seconds.count, 8 / Double(max(1, bounds.width)))
+                        seconds.baseAddress, seconds.count, 8 / Double(max(1, audioRect.width)))
                 }
             }
         }
@@ -5028,7 +5626,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     }
 
     private func fraction(at x: CGFloat) -> CGFloat {
-        min(1, max(0, (x - bounds.minX) / max(1, bounds.width)))
+        min(1, max(0, (x - audioRect.minX) / max(1, audioRect.width)))
     }
 
     private func frame(at event: NSEvent) -> UInt64 {
@@ -5043,6 +5641,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         let current = NSEvent.modifierFlags.intersection([.option, .control, .command, .shift])
         guard current != pointerModifiers else { return }
         pointerModifiers = current
+        updateWaveformCursor()
         needsDisplay = true
     }
 
@@ -5050,6 +5649,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         let position = convert(event.locationInWindow, from: nil)
         pointer = bounds.contains(position) ? position : nil
         pointerModifiers = event.modifierFlags.intersection([.option, .control, .command, .shift])
+        updateWaveformCursor()
         needsDisplay = true
     }
 
@@ -5060,26 +5660,115 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         needsDisplay = true
     }
 
+    private func updateWaveformCursor() {
+        guard let pointer else {
+            if waveformCursorActive {
+                NSCursor.arrow.set()
+                waveformCursorActive = false
+            }
+            return
+        }
+        if fadeGesture != nil || (selectionForSaving() != nil && dragsFade(pointerModifiers) && draggableFlag(at: pointer) != nil) {
+            NSCursor.resizeLeftRight.set()
+            waveformCursorActive = true
+        } else if isOverScrollbar(point: pointer) || scrollDrag != nil {
+            NSCursor.pointingHand.set()
+            waveformCursorActive = true
+        } else if anchor != nil || dragging || panStart != nil || mouseDownEvent != nil {
+            NSCursor.closedHand.set()
+            waveformCursorActive = true
+        } else if audioRect.contains(pointer) {
+            NSCursor.openHand.set()
+            waveformCursorActive = true
+        } else if waveformCursorActive {
+            NSCursor.arrow.set()
+            waveformCursorActive = false
+        }
+    }
+
     override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
 
     override func mouseMoved(with event: NSEvent) { trackPointer(event) }
 
     func clearPointerFeedback() {
         pointer = nil
+        updateWaveformCursor()
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) { clearPointerFeedback() }
 
-    /// Option on a selection flag drags its fade instead of moving it.
     private func dragsFade(_ modifiers: NSEvent.ModifierFlags) -> Bool {
         modifiers.contains(.option) && modifiers.intersection([.command, .control]).isEmpty
     }
 
-    /// The frame under `x`, without snapping.
+    private func hasNoSelectionModifiers(_ modifiers: NSEvent.ModifierFlags) -> Bool {
+        modifiers.intersection([.command, .option, .control, .shift]).isEmpty
+    }
+
     private func freeFrame(at x: CGFloat) -> UInt64 {
         let count = visibleFrames.upperBound - visibleFrames.lowerBound
         return visibleFrames.lowerBound + UInt64((Double(fraction(at: x)) * Double(count)).rounded())
+    }
+
+    private func startEdgeAutoScrollIfNeeded(at point: NSPoint) {
+        guard anchor != nil else { stopEdgeAutoScroll(); return }
+        let above = point.y > audioRect.maxY
+        let below = point.y < audioRect.minY
+        if above || below {
+            if edgeScrollTimer == nil {
+                let t = Timer(timeInterval: 0.09, repeats: true) { [weak self] _ in
+                    self?.edgeAutoScrollTick()
+                }
+                RunLoop.main.add(t, forMode: .common)
+                edgeScrollTimer = t
+            }
+        } else {
+            stopEdgeAutoScroll()
+        }
+    }
+
+    private func stopEdgeAutoScroll() {
+        edgeScrollTimer?.invalidate()
+        edgeScrollTimer = nil
+    }
+
+    private func edgeAutoScrollTick() {
+        guard anchor != nil, let window else { stopEdgeAutoScroll(); return }
+        let screenPoint = NSEvent.mouseLocation
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        let local = convert(windowPoint, from: nil)
+        let direction: Int
+        if local.y > audioRect.maxY { direction = -1 }
+        else if local.y < audioRect.minY { direction = 1 }
+        else { stopEdgeAutoScroll(); return }
+
+        var scrolled = false
+        if let col = columnBox, col.scrolls {
+            let maxFirst = max(0, col.rows - col.shown)
+            let next = min(maxFirst, max(0, columnFirstRow + direction))
+            if next != columnFirstRow {
+                columnFirstRow = next
+                scrolled = true
+            }
+        } else if let anchorLane = selectionAnchorRow?.lane, laneBoxes.indices.contains(anchorLane), laneBoxes[anchorLane].scrolls {
+            let box = laneBoxes[anchorLane]
+            let maxFirst = max(0, box.rows - box.shown)
+            let next = min(maxFirst, max(0, laneFirstRows[anchorLane] + direction))
+            if next != laneFirstRows[anchorLane] {
+                laneFirstRows[anchorLane] = next
+                scrolled = true
+            }
+        }
+        if scrolled {
+            recomputeRowLayout()
+            if let anchorRow = selectionAnchorRow, let nextRow = rowIdentity(at: local, clampedToVisible: true) {
+                selectionCursorRow = nextRow
+                rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: anchorRow, cursor: nextRow)
+            }
+            controller?.refreshWaveform()
+            needsDisplay = true
+        }
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -5090,6 +5779,33 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         }
         trackPointer(event)
         let position = convert(event.locationInWindow, from: nil)
+
+        // Package 4 / SEL-23: pressing on the row scrollbar scrolls rows, never starts selection/drag.
+        if isOverScrollbar(point: position), let target = scrollBoxAt(point: position) {
+            let yFromTop = audioRect.maxY - position.y
+            let thumb = target.box.thumb()
+            let grabOffset: CGFloat
+            if thumb.contains(yFromTop) {
+                grabOffset = yFromTop - thumb.lowerBound
+            } else {
+                // Click on track centers thumb at click position and begins dragging.
+                let thumbLen = thumb.upperBound - thumb.lowerBound
+                let centeredTop = yFromTop - thumbLen / 2
+                let nextFirst = target.box.firstForThumb(centeredTop)
+                if let lane = target.laneIndex { laneFirstRows[lane] = nextFirst }
+                else { columnFirstRow = nextFirst }
+                recomputeRowLayout()
+                grabOffset = thumbLen / 2
+            }
+            scrollDrag = ScrollDrag(laneIndex: target.laneIndex, grabOffset: grabOffset)
+            updateWaveformCursor()
+            needsDisplay = true
+            return
+        }
+
+        // Pressing in left label gutter does not start selection or drag.
+        if gutterWidth > 0 && position.x < audioRect.minX { return }
+
         let flag = draggableFlag(at: position)
         if let flag, let selection = selectionForSaving(), dragsFade(event.modifierFlags) {
             controller.beginEditing()
@@ -5097,9 +5813,10 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             window?.makeFirstResponder(self)
             fadeGesture = FadeGesture(end: flag == selection.lowerBound ? 0 : 1, press: freeFrame(at: position.x),
                                       originX: position.x, initial: fadesForSaving())
+            updateWaveformCursor()
             needsDisplay = true
-        } else if let flag, let flags = selection ?? marker {
-            // A resized selection replaces the one that was playing.
+        } else if let flag, let flags = selection ?? marker, hasNoSelectionModifiers(event.modifierFlags) {
+            // Package 5: flag pickup requires no modifiers; 2px move required to keep.
             player?.stop()
             controller.beginEditing()
             window?.makeKey()
@@ -5107,10 +5824,22 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             let edge = min(max(flag, retainedFrames.lowerBound), retainedFrames.upperBound)
             let other = flag == flags.lowerBound ? flags.upperBound : flags.lowerBound
             let opposite = min(max(other, retainedFrames.lowerBound), retainedFrames.upperBound)
-            // A selection taken back from a marker restores its row.
-            if selection == nil { selectionReference = markerRow ?? row(at: position.y) }
+            if selection == nil {
+                if !markerRows.isEmpty {
+                    rememberedRows = markerRows
+                    selectionAnchorRow = markerRows.first
+                    selectionCursorRow = markerRows.last
+                } else if let r = rowIdentity(at: position) {
+                    selectionAnchorRow = r
+                    selectionCursorRow = r
+                    rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: r, cursor: r)
+                }
+            }
             anchor = opposite
+            selectionPressX = position.x
+            selectionMoved = false
             selection = min(edge, opposite)..<max(edge, opposite)
+            updateWaveformCursor()
             needsDisplay = true
         } else if selectionModifierDown {
             clearSelection()
@@ -5119,13 +5848,20 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             window?.makeFirstResponder(self)
             controller.refreshWaveform()
             anchor = frame(at: event)
+            selectionPressX = position.x
+            selectionMoved = false
             selection = anchor.map { $0..<$0 }
-            // The row is saved so that toggling separate editing can narrow the selection.
-            selectionReference = row(at: position.y)
+            if let r = rowIdentity(at: position) {
+                selectionAnchorRow = r
+                selectionCursorRow = r
+                rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: r, cursor: r)
+            }
+            updateWaveformCursor()
             needsDisplay = true
         } else {
             mouseDownEvent = event
-            dragRow = row(at: position.y)
+            dragRow = rowIdentity(at: position)
+            updateWaveformCursor()
         }
     }
 
@@ -5135,21 +5871,44 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
     override func mouseDragged(with event: NSEvent) {
         trackPointer(event)
+        let local = convert(event.locationInWindow, from: nil)
+        if let scrollDrag {
+            let yFromTop = audioRect.maxY - local.y
+            let box: LaneLayoutBox?
+            if let lane = scrollDrag.laneIndex, laneBoxes.indices.contains(lane) { box = laneBoxes[lane] }
+            else { box = columnBox }
+            if let box {
+                let nextFirst = box.firstForThumb(yFromTop - scrollDrag.grabOffset)
+                if let lane = scrollDrag.laneIndex { laneFirstRows[lane] = nextFirst }
+                else { columnFirstRow = nextFirst }
+                recomputeRowLayout()
+                needsDisplay = true
+            }
+            return
+        }
         if var gesture = fadeGesture {
             guard let selection = selectionForSaving() else { return }
-            let x = convert(event.locationInWindow, from: nil).x
-            gesture.moved = gesture.moved || abs(x - gesture.originX) >= 2
+            gesture.moved = gesture.moved || abs(local.x - gesture.originX) >= 2
             if gesture.moved {
                 fades = bt_fades_dragged(gesture.end, selection.lowerBound, selection.upperBound,
-                                         gesture.initial, gesture.press, freeFrame(at: x))
-                // A playing preview takes the new ramps from its next block.
+                                         gesture.initial, gesture.press, freeFrame(at: local.x))
                 player?.setFades(fades)
             }
             fadeGesture = gesture
             needsDisplay = true
         } else if let anchor {
-            let position = frame(at: event)
-            selection = min(anchor, position)..<max(anchor, position)
+            if let pressX = selectionPressX, abs(local.x - pressX) >= 2 {
+                selectionMoved = true
+            }
+            if selectionMoved {
+                let position = frame(at: event)
+                selection = min(anchor, position)..<max(anchor, position)
+            }
+            if let anchorRow = selectionAnchorRow, let nextRow = rowIdentity(at: local, clampedToVisible: true) {
+                selectionCursorRow = nextRow
+                rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: anchorRow, cursor: nextRow)
+            }
+            startEdgeAutoScrollIfNeeded(at: local)
             needsDisplay = true
         } else if !dragging, let window, let mouseDownEvent {
             let start = mouseDownEvent.locationInWindow
@@ -5174,10 +5933,18 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
     override func mouseUp(with event: NSEvent) {
         trackPointer(event)
+        stopEdgeAutoScroll()
+        if scrollDrag != nil {
+            scrollDrag = nil
+            updateWaveformCursor()
+            needsDisplay = true
+            return
+        }
         if fadeGesture != nil {
             mouseDragged(with: event)
             fadeGesture = nil
             controller?.endEditing(allowImmediateResume: false)
+            updateWaveformCursor()
             needsDisplay = true
             return
         }
@@ -5186,9 +5953,10 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         if anchor != nil {
             mouseDragged(with: event)
             anchor = nil
-            keepSelection = hasSelection
-            // A resized selection keeps the ramps at its flags, shortened to fit it.
-            if let selection = selectionForSaving() {
+            // Package 5: require at least 2px horizontal movement and non-empty span to keep selection.
+            keepSelection = selectionMoved && hasSelection
+            selectionPressX = nil
+            if keepSelection, let selection = selectionForSaving() {
                 fades = bt_fades_fitted(fades, selection.upperBound - selection.lowerBound)
             }
         } else if !dragging && dragRequested {
@@ -5196,6 +5964,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             controller?.setNotice(nil)
         }
         mouseDownEvent = nil
+        updateWaveformCursor()
         if !dragging { endGesture(keepingSelection: keepSelection) }
     }
 
@@ -5221,9 +5990,15 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             return
         }
         let ticket = reserveMarker()
-        let row = selectionForSaving() != nil ? selectedRow : (separateLanes ? dragRow : nil)
-        // DAWs can keep the file URLs after the external drop. Treat the paths as one take.
-        pendingDragWrite = controller.prepareDrag(job, range: range, fades: fadesForSaving(), row: row) {
+        let rows: [RowIdentity]?
+        if selectionForSaving() != nil {
+            rows = selectedRowsForExport
+        } else if separateLanes, let dragRow {
+            rows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: dragRow, cursor: dragRow)
+        } else {
+            rows = nil
+        }
+        pendingDragWrite = controller.prepareDrag(job, range: range, fades: fadesForSaving(), rows: rows) {
             [weak self] urls in
             guard let self, self.exportVersion == version else { return false }
             self.pendingDragWrite = nil
@@ -5234,7 +6009,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 return false
             }
             if !urls.isEmpty {
-                self.pendingDragMarker = (range, row, ticket)
+                self.pendingDragMarker = (range, rows, ticket)
                 self.beginFileDrag(urls, event: event)
             }
             return true
@@ -5274,12 +6049,11 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         mouseDownEvent = nil
         trackDragPointer()
         let accepted = operation.contains(.copy)
-        // The files stay where the other program found them.
         let saved = accepted ? exportDescription(readyFiles) : nil
         if accepted {
             readyFiles.removeAll()
             if let pendingDragMarker {
-                commitMarker(pendingDragMarker.range, row: pendingDragMarker.row, ticket: pendingDragMarker.ticket)
+                commitMarker(pendingDragMarker.range, rows: pendingDragMarker.rows, ticket: pendingDragMarker.ticket)
             }
             pendingDragMarker = nil
         } else { discardPreparedFile() }
@@ -5294,36 +6068,39 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             clearSelection()
             controller?.resumeAfterSelectionCancellation()
         }
+        controller?.refreshWaveform()
     }
 
     private func waveformRect(for range: Range<UInt64>) -> NSRect? {
         let first = max(range.lowerBound, visibleFrames.lowerBound)
         let end = min(range.upperBound, visibleFrames.upperBound)
         guard first < end else { return nil }
-        return NSRect(x: x(for: first), y: bounds.minY, width: x(for: end) - x(for: first), height: bounds.height)
+        return NSRect(x: x(for: first), y: audioRect.minY, width: x(for: end) - x(for: first), height: audioRect.height)
     }
 
-    private func drawFlag(_ frame: UInt64, pointsRight: Bool) {
-        guard isVisible(frame) else { return }
+    private func drawFlag(_ frame: UInt64, pointsRight: Bool, top: CGFloat) -> NSRect? {
+        guard isVisible(frame) else { return nil }
         let lineX = flagPosition(for: frame)
-        let top = bounds.maxY - 3
+        let poleHeight = min(11, max(4, audioRect.height - 4))
         let flagWidth: CGFloat = pointsRight ? 6 : -6
         let shape = NSBezierPath()
-        shape.move(to: NSPoint(x: lineX, y: top - 11))
+        shape.move(to: NSPoint(x: lineX, y: top - poleHeight))
         shape.line(to: NSPoint(x: lineX, y: top))
-        shape.lineWidth = 1.5
+        shape.lineWidth = 1.0
         let snapped = pointerModifiers.contains(.shift) && pointer.flatMap { snapTarget(near: $0.x) } == frame
-        let color = snapped ? NSColor.systemYellow : NSColor.white.withAlphaComponent(0.9)
+        let color = snapped ? NSColor.systemYellow : WaveformTheme.flagAndFade
         color.setStroke()
         shape.stroke()
 
         let flag = NSBezierPath()
         flag.move(to: NSPoint(x: lineX, y: top))
-        flag.line(to: NSPoint(x: lineX + flagWidth, y: top - 2.5))
-        flag.line(to: NSPoint(x: lineX, y: top - 5))
+        flag.line(to: NSPoint(x: lineX + flagWidth, y: top - 3))
+        flag.line(to: NSPoint(x: lineX, y: top - 6))
         flag.close()
         color.setFill()
         flag.fill()
+        let minX = min(lineX, lineX + flagWidth)
+        return NSRect(x: minX - 2, y: top - poleHeight - 2, width: abs(flagWidth) + 4, height: poleHeight + 4)
     }
 
     private func tracePaths() -> (fill: NSBezierPath, outline: NSBezierPath, coverage: NSBezierPath) {
@@ -5337,32 +6114,37 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         guard rows > 0 else { return (fill, outline, coverage) }
         let fitted = fadesForSaving()
         let faded = fitted.fade_in > 0 || fitted.fade_out > 0 ? selectionForSaving() : nil
-        for row in 0..<rows where bounds.intersects(rowRect(row)) {
-            let middle = rowRect(row).midY
+        for row in 0..<rows {
+            guard let rect = rowRect(for: row) else { continue }
+            let middle = rect.midY
             if showsOverlay {
-                NSColor.white.withAlphaComponent(0.17).setStroke()
-                NSBezierPath.strokeLine(
-                    from: NSPoint(x: bounds.minX, y: middle), to: NSPoint(x: bounds.maxX, y: middle)
-                )
+                if displayedRows[row].isPair {
+                    WaveformTheme.pairBacking.setFill()
+                    NSBezierPath.fill(rect)
+                }
+                WaveformTheme.centerLine.setStroke()
+                let centerLine = NSBezierPath()
+                centerLine.lineWidth = 1
+                centerLine.move(to: NSPoint(x: rect.minX, y: middle))
+                centerLine.line(to: NSPoint(x: rect.maxX, y: middle))
+                centerLine.stroke()
             }
             if renderedFrames.isEmpty { continue }
             var bins = traces[row]
-            // Separate lanes taper only the selected one.
-            if let faded, selectedRow.map({ matches(displayedRows[row], $0) }) ?? true {
-                // The waveform tapers the way the exported clip does.
+            if let faded, isRowSelected(displayedRows[row].identity) {
                 bins.read { minimum, maximum, count in
                     bt_waveform_fade_bins(minimum, maximum, count, renderedFrames.lowerBound,
                         renderedFrames.upperBound, faded.lowerBound, faded.upperBound, fitted)
                 }
             }
             func point(_ x: Double, _ value: Float) -> NSPoint {
-                NSPoint(x: bounds.minX + CGFloat(x) * bounds.width,
-                        y: middle + CGFloat(value) * rowHeight * 0.46)
+                NSPoint(x: rect.minX + CGFloat(x) * rect.width,
+                        y: middle + CGFloat(value) * rect.height * WaveformTheme.envelopeAmplitudeScale)
             }
             func cover(_ first: Double, _ end: Double) {
                 coverage.append(NSBezierPath(rect: NSRect(
-                    x: bounds.minX + CGFloat(first) * bounds.width, y: middle - rowHeight / 2,
-                    width: CGFloat(max(0, end - first)) * bounds.width, height: rowHeight
+                    x: rect.minX + CGFloat(first) * rect.width, y: rect.minY,
+                    width: CGFloat(max(0, end - first)) * rect.width, height: rect.height
                 )))
             }
             switch waveformDisplayGeometry(minimum: bins.low, maximum: bins.high, visibleFrames: renderedFrames) {
@@ -5413,11 +6195,11 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         paths.coverage.addClip()
         if let gradient = frequencyGradient, let context = NSGraphicsContext.current?.cgContext {
             let live = editMaterial == nil ? UInt64(sampleRate) / 4 : 0
+            let effective = gradient.readableForDrawing()
             let images = traces.enumerated().compactMap { row, trace -> (CGImage, NSRect)? in
-                let rect = rowRect(row)
-                guard bounds.intersects(rect) else { return nil }
+                guard let rect = rowRect(for: row) else { return nil }
                 let colors = frequencyWaveform?.colors(for: row, in: renderedFrames, bins: trace.low.count,
-                    gradient: gradient, liveFrames: live) ?? []
+                    gradient: effective, liveFrames: live) ?? []
                 return FrequencyWaveform.stripeImage(colors.isEmpty ? [nil] : colors,
                     fallback: accentRGB, dimmed: dimFrequency).map { ($0, rect) }
             }
@@ -5425,7 +6207,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             context.interpolationQuality = .none
             context.addPath(paths.fill.cgPath)
             context.clip()
-            context.setAlpha(0.72)
+            context.setAlpha(WaveformTheme.envelopeFillAlpha)
             for (image, rect) in images { context.draw(image, in: rect) }
             context.restoreGState()
 
@@ -5440,7 +6222,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             for (image, rect) in images { context.draw(image, in: rect) }
             context.restoreGState()
         } else {
-            color.withAlphaComponent(0.72).setFill()
+            color.withAlphaComponent(WaveformTheme.envelopeFillAlpha).setFill()
             paths.fill.fill()
             color.setStroke()
             paths.outline.stroke()
@@ -5448,26 +6230,22 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         NSGraphicsContext.restoreGraphicsState()
     }
 
-    /// Where `frame` falls across the plot, extended past either edge.
     private func unclampedX(for frame: UInt64) -> CGFloat {
         let fraction = (Double(frame) - Double(visibleFrames.lowerBound))
             / Double(max(1, visibleFrames.upperBound - visibleFrames.lowerBound))
-        return bounds.minX + bounds.width * CGFloat(fraction)
+        return audioRect.minX + audioRect.width * CGFloat(fraction)
     }
 
-    /// Draws the selection's fades on each row: a wedge from silence at the flag to full level
-    /// where the ramp ends, with the cut-away level shaded.
     private func drawFades(_ selection: Range<UInt64>) {
         let fitted = fadesForSaving()
         let rows = min(displayedRows.count, traces.count)
         guard fitted.fade_in > 0 || fitted.fade_out > 0, rows > 0, !visibleFrames.isEmpty else { return }
         let ramps = [(selection.lowerBound, selection.lowerBound + fitted.fade_in),
                      (selection.upperBound, selection.upperBound - fitted.fade_out)]
-        for row in 0..<rows where bounds.intersects(rowRect(row))
-            && (selectedRow.map({ matches(displayedRows[row], $0) }) ?? true) {
-            let middle = rowRect(row).midY
-            // Full scale is drawn at the height tracePaths uses.
-            let extent = rowHeight * 0.46
+        for row in 0..<rows where isRowSelected(displayedRows[row].identity) {
+            guard let rect = rowRect(for: row) else { continue }
+            let middle = rect.midY
+            let extent = rect.height * WaveformTheme.envelopeAmplitudeScale
             for (edge, full) in ramps where edge != full {
                 let edgeX = unclampedX(for: edge)
                 let fullX = unclampedX(for: full)
@@ -5488,46 +6266,203 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 wedge.move(to: top)
                 wedge.line(to: silent)
                 wedge.line(to: bottom)
-                NSColor.white.withAlphaComponent(0.9).setStroke()
+                WaveformTheme.flagAndFade.setStroke()
                 wedge.stroke()
             }
         }
     }
 
-    /// Draws the preview's playhead, while it plays and its frame is on screen.
     private func drawPlayhead() {
         guard let frame = player?.playhead, isVisible(frame) else { return }
-        let x = min(bounds.maxX, max(bounds.minX, x(for: frame)))
-        let color = NSColor(white: 245 / 255, alpha: 1)
+        let x = min(audioRect.maxX, max(audioRect.minX, x(for: frame)))
+        let color = WaveformTheme.playhead
         let line = NSBezierPath()
         line.lineWidth = 1.5
-        line.move(to: NSPoint(x: x, y: bounds.minY))
-        line.line(to: NSPoint(x: x, y: bounds.maxY))
+        line.move(to: NSPoint(x: x, y: audioRect.minY))
+        line.line(to: NSPoint(x: x, y: audioRect.maxY))
         color.setStroke()
         line.stroke()
-        let size = min(10, max(4, bounds.height)) * 0.5
+        let size = min(10, max(4, audioRect.height)) * 0.5
         let head = NSBezierPath()
-        head.move(to: NSPoint(x: x - size, y: bounds.maxY))
-        head.line(to: NSPoint(x: x + size, y: bounds.maxY))
-        head.line(to: NSPoint(x: x, y: bounds.maxY - size))
+        head.move(to: NSPoint(x: x - size, y: audioRect.maxY))
+        head.line(to: NSPoint(x: x + size, y: audioRect.maxY))
+        head.line(to: NSPoint(x: x, y: audioRect.maxY - size))
         head.close()
         color.setFill()
         head.fill()
     }
 
-    /// Names the ramp being dragged and its length, in the plot's top-right corner.
-    private func drawFadeLabel() {
-        guard showsOverlay, let fadeGesture, sampleRate > 0 else { return }
-        let fitted = fadesForSaving()
-        let frames = fadeGesture.end == 0 ? fitted.fade_in : fitted.fade_out
-        let text = NSAttributedString(
-            string: String(format: "%@ %.2f s", fadeGesture.end == 0 ? "Fade in" : "Fade out",
-                           Double(frames) / Double(sampleRate)),
-            attributes: [.font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
-                         .foregroundColor: NSColor.white]
-        )
-        let size = text.size()
-        text.draw(at: NSPoint(x: bounds.maxX - 8 - size.width, y: bounds.maxY - size.height))
+    /// Package 6: length / fade label in top-right (8px inset), avoiding drawn flags.
+    private func drawLengthLabel(flagRects: [NSRect], hoverRows: [RowIdentity]?) {
+        guard showsOverlay, sampleRate > 0 else { return }
+        let fullText: String
+        let shortText: String
+        if let fadeGesture {
+            let fitted = fadesForSaving()
+            let frames = fadeGesture.end == 0 ? fitted.fade_in : fitted.fade_out
+            let s = String(format: "%@ %.2f s", fadeGesture.end == 0 ? "Fade in" : "Fade out",
+                           Double(frames) / Double(sampleRate))
+            fullText = s
+            shortText = s
+        } else if let sel = selection, !sel.isEmpty {
+            let sec = String(format: "%.2f s", Double(sel.upperBound - sel.lowerBound) / Double(sampleRate))
+            let rowsName = selectedRowsLabel
+            fullText = rowsName.isEmpty ? sec : "\(rowsName) · \(sec)"
+            shortText = sec
+        } else if selection == nil, !retainedFrames.isEmpty, pointer != nil || mouseDownEvent != nil || dragging {
+            let sec = String(format: "%.2f s", Double(retainedFrames.upperBound - retainedFrames.lowerBound) / Double(sampleRate))
+            let rowsName = hoverRows.map {
+                RowStackLayout.rowsLabel($0, dual: displayedLaneCount > 1, channelLabels: controller?.currentChannelLabels ?? [])
+            } ?? ""
+            fullText = rowsName.isEmpty ? sec : "\(rowsName) · \(sec)"
+            shortText = sec
+        } else {
+            return
+        }
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.white
+        ]
+        func attributed(_ s: String) -> (NSAttributedString, NSSize) {
+            let a = NSAttributedString(string: s, attributes: attrs)
+            return (a, a.size())
+        }
+        func collides(_ rect: NSRect) -> Bool {
+            flagRects.contains { $0.intersects(rect) }
+        }
+        let topY = audioRect.maxY - 2
+        let (fullAttr, fullSize) = attributed(fullText)
+        let rightRect = NSRect(x: audioRect.maxX - 8 - fullSize.width, y: topY - fullSize.height, width: fullSize.width, height: fullSize.height)
+        if !collides(rightRect) {
+            fullAttr.draw(at: rightRect.origin)
+            return
+        }
+        let (shortAttr, shortSize) = attributed(shortText)
+        let shortRightRect = NSRect(x: audioRect.maxX - 8 - shortSize.width, y: topY - shortSize.height, width: shortSize.width, height: shortSize.height)
+        if !collides(shortRightRect) {
+            shortAttr.draw(at: shortRightRect.origin)
+            return
+        }
+        let leftRect = NSRect(x: audioRect.minX + 8, y: topY - shortSize.height, width: shortSize.width, height: shortSize.height)
+        if !collides(leftRect) {
+            shortAttr.draw(at: leftRect.origin)
+            return
+        }
+        let belowY = max(audioRect.minY + 2, topY - 15 - shortSize.height)
+        shortAttr.draw(at: NSPoint(x: audioRect.maxX - 8 - shortSize.width, y: belowY))
+    }
+
+    private func drawRowDecorations(separate: Bool) {
+        guard showsOverlay else { return }
+        let rows = displayedRows.count
+        guard rows > 1 else { return }
+        // Pair bottom divider (below second row of L/R pair in wide sources).
+        for row in 0..<(rows - 1) {
+            if displayedRows[row].isPair, !displayedRows[row + 1].isPair,
+               displayedRows[row].lane == displayedRows[row + 1].lane,
+               let rect = rowRect(for: row) {
+                WaveformTheme.pairDivider.setStroke()
+                let line = NSBezierPath()
+                line.lineWidth = 1
+                line.move(to: NSPoint(x: audioRect.minX, y: rect.minY))
+                line.line(to: NSPoint(x: audioRect.maxX, y: rect.minY))
+                line.stroke()
+            }
+        }
+        // Stacked lane divider (1 px white alpha 36 between lanes when stacked).
+        if hasStackedLane && displayedLaneCount > 1 {
+            WaveformTheme.laneDivider.setStroke()
+            for row in 0..<(rows - 1) where displayedRows[row].lane != displayedRows[row + 1].lane {
+                guard let rect = rowRect(for: row) else { continue }
+                let line = NSBezierPath()
+                line.lineWidth = 1
+                line.move(to: NSPoint(x: bounds.minX, y: rect.minY))
+                line.line(to: NSPoint(x: bounds.maxX, y: rect.minY))
+                line.stroke()
+            }
+        }
+        // Package 1: when exactly two sources are edited separately, draw a 1 px accent x0.7 line between A and B.
+        if separate && displayedLaneCount == 2 {
+            if let splitIndex = (0..<(rows - 1)).first(where: { displayedRows[$0].lane != displayedRows[$0 + 1].lane }),
+               let rect = rowRect(for: splitIndex) {
+                accentColor(accentRGB).withAlphaComponent(0.7).setStroke()
+                let line = NSBezierPath()
+                line.lineWidth = 1
+                line.move(to: NSPoint(x: audioRect.minX, y: rect.minY))
+                line.line(to: NSPoint(x: audioRect.maxX, y: rect.minY))
+                line.stroke()
+            }
+        }
+    }
+
+    private func drawRowLabels() {
+        guard showsOverlay else { return }
+        let rowH = laneBoxes.first?.rowHeight ?? 0
+        guard rowH >= RowStackLayout.labelledRowHeight else { return }
+        let font = NSFont.monospacedSystemFont(ofSize: 8, weight: .regular)
+        var drawnLaneLetters = Set<Int>()
+        for (index, row) in displayedRows.enumerated() {
+            guard let rect = rowRect(for: index) else { continue }
+            let hasProblem = laneProblems[row.lane] != nil
+            let letterColor = hasProblem ? WaveformTheme.statusUnavailable : WaveformTheme.rowLabel
+            if gutterWidth > 0 {
+                if displayedLaneCount > 2 {
+                    if !drawnLaneLetters.contains(row.lane) {
+                        drawnLaneLetters.insert(row.lane)
+                        let letter = NSAttributedString(string: captureLaneLetter(row.lane),
+                                                        attributes: [.font: font, .foregroundColor: letterColor])
+                        let sz = letter.size()
+                        letter.draw(at: NSPoint(x: bounds.minX + 2, y: rect.midY - sz.height / 2))
+                    }
+                    if hasStackedLane, let ch = row.shortLabel, !row.identity.isWhole {
+                        let chAttr = NSAttributedString(string: ch, attributes: [.font: font, .foregroundColor: WaveformTheme.rowLabel])
+                        let sz = chAttr.size()
+                        chAttr.draw(at: NSPoint(x: bounds.minX + 14, y: rect.midY - sz.height / 2))
+                    }
+                } else if let ch = row.shortLabel {
+                    let color = row.identity.isWhole ? letterColor : WaveformTheme.rowLabel
+                    let chAttr = NSAttributedString(string: ch, attributes: [.font: font, .foregroundColor: color])
+                    let sz = chAttr.size()
+                    chAttr.draw(at: NSPoint(x: bounds.minX + 2, y: rect.midY - sz.height / 2))
+                }
+            } else if let short = row.shortLabel {
+                // 1-2 non-stacked sources (2 lanes A/B, or single stereo L/R): draw subtle 8pt mono left-aligned.
+                let color = hasProblem ? WaveformTheme.statusUnavailable : WaveformTheme.rowLabel
+                let attr = NSAttributedString(string: short, attributes: [.font: font, .foregroundColor: color])
+                let sz = attr.size()
+                attr.draw(at: NSPoint(x: rect.minX + 4, y: rect.midY - sz.height / 2))
+            }
+        }
+    }
+
+    private func drawScrollbars() {
+        guard showsOverlay else { return }
+        func drawBar(box: LaneLayoutBox, laneIndex: Int?) {
+            guard box.scrolls else { return }
+            let barX = bounds.maxX - 5
+            let trackRect = NSRect(
+                x: barX, y: audioRect.maxY - box.top - box.height,
+                width: RowStackLayout.scrollbarVisualWidth, height: box.height
+            )
+            WaveformTheme.scrollbarTrack.setFill()
+            NSBezierPath(roundedRect: trackRect, xRadius: 1.5, yRadius: 1.5).fill()
+            let thumb = box.thumb()
+            let thumbH = thumb.upperBound - thumb.lowerBound
+            let thumbRect = NSRect(
+                x: barX, y: audioRect.maxY - thumb.upperBound,
+                width: RowStackLayout.scrollbarVisualWidth, height: thumbH
+            )
+            let isActive = (scrollDrag != nil && scrollDrag?.laneIndex == laneIndex)
+                || (pointer.map { isOverScrollbar(point: $0) } ?? false)
+            (isActive ? WaveformTheme.scrollbarThumbActive : WaveformTheme.scrollbarThumb).setFill()
+            NSBezierPath(roundedRect: thumbRect, xRadius: 1.5, yRadius: 1.5).fill()
+        }
+        if let col = columnBox {
+            drawBar(box: col, laneIndex: nil)
+        } else {
+            for (i, box) in laneBoxes.enumerated() { drawBar(box: box, laneIndex: i) }
+        }
     }
 
     private func updateDisplayPolicy() {
@@ -5561,39 +6496,49 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             path.lineWidth = CGFloat(width)
             for frame in positions where isVisible(frame) {
                 let x = x(for: frame)
-                path.move(to: NSPoint(x: x, y: bounds.minY))
-                path.line(to: NSPoint(x: x, y: bounds.maxY))
+                path.move(to: NSPoint(x: x, y: audioRect.minY))
+                path.line(to: NSPoint(x: x, y: audioRect.maxY))
             }
             NSColor.white.withAlphaComponent(alpha * gridOpacity).setStroke()
             path.stroke()
         }
-        draw(guideSeconds, alpha: 0.16, width: displayPolicy.seconds_stroke)
-        draw(guideBars, alpha: 0.30, width: displayPolicy.bar_stroke)
+        draw(guideSeconds, alpha: WaveformTheme.secondsGuideAlpha, width: displayPolicy.seconds_stroke)
+        draw(guideBars, alpha: WaveformTheme.barGuideAlpha, width: displayPolicy.bar_stroke)
     }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        recomputeRowLayout()
         updateDisplayPolicy()
-        let panel = NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6)
+        let cornerRadius: CGFloat = showsOverlay ? WaveformTheme.cornerRadius : 0
+        let panel = NSBezierPath(roundedRect: bounds, xRadius: cornerRadius, yRadius: cornerRadius)
         NSGraphicsContext.saveGraphicsState()
         panel.addClip()
         let rows = min(displayedRows.count, traces.count)
         let separate = separateLanes && rows > 1
+        var hoverRows: [RowIdentity]?
         if showsOverlay, selection == nil, !visibleFrames.isEmpty,
            pointer != nil || mouseDownEvent != nil || dragging {
-            // Separate editing uses the row a drag starts in.
-            let hover = !separate ? nil
-                : (mouseDownEvent != nil || dragging ? dragRow : pointer.flatMap { row(at: $0.y) })
-            accentColor(accentRGB).withAlphaComponent(0.23).setFill()
-            NSBezierPath.fill(hover.map(targetRect) ?? bounds)
+            let hoveredID = !separate ? nil
+                : (mouseDownEvent != nil || dragging ? dragRow : pointer.flatMap { rowIdentity(at: $0, clampedToVisible: false) })
+            if let hoveredID {
+                let unit = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: hoveredID, cursor: hoveredID)
+                hoverRows = unit
+                if let rect = rectForRows(unit) {
+                    accentColor(accentRGB).withAlphaComponent(1.0 / 3.0).setFill()
+                    NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).fill()
+                }
+            } else {
+                accentColor(accentRGB).withAlphaComponent(1.0 / 3.0).setFill()
+                NSBezierPath(roundedRect: audioRect, xRadius: 4, yRadius: 4).fill()
+            }
         }
 
         drawTimeGrid()
         let trace = tracePaths()
-        // A selection of one lane is drawn on that lane alone.
         let selectedArea = selection.flatMap(waveformRect(for:)).flatMap { rect -> NSRect? in
-            guard let row = selectedRow else { return rect }
-            let area = rect.intersection(targetRect(row))
+            guard let rowBounds = selectedRowsRect() else { return nil }
+            let area = rect.intersection(rowBounds)
             return area.isEmpty ? nil : area
         }
         if let selectedRect = selectedArea {
@@ -5607,41 +6552,30 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
             NSGraphicsContext.saveGraphicsState()
             NSBezierPath(rect: selectedRect).addClip()
-            paintTrace(trace, color: accentColor(accentRGB ^ 0xFFFFFF))
+            paintTrace(trace, color: accentColor(WaveformTheme.selectionRGB(for: accentRGB)))
             NSGraphicsContext.restoreGraphicsState()
         } else {
             paintTrace(trace, color: accentColor(accentRGB))
         }
         if let selection = selectionForSaving() { drawFades(selection) }
-        if separate {
-            // The pair is one editing target even though it draws two rows.
-            accentColor(accentRGB).withAlphaComponent(0.7).setStroke()
-            for row in 0..<(rows - 1) where !matches(displayedRows[row], displayedRows[row + 1]) {
-                let y = rowRect(row).minY
-                NSBezierPath.strokeLine(from: NSPoint(x: bounds.minX, y: y), to: NSPoint(x: bounds.maxX, y: y))
+        drawRowDecorations(separate: separate)
+        drawRowLabels()
+        drawScrollbars()
+
+        var drawnFlagRects: [NSRect] = []
+        if let marker, marker != selection {
+            let mTop = (!markerRows.isEmpty ? rectForRows(markerRows)?.maxY : audioRect.maxY)
+            if let mTop {
+                if let r = drawFlag(marker.lowerBound, pointsRight: true, top: mTop - 2) { drawnFlagRects.append(r) }
+                if let r = drawFlag(marker.upperBound, pointsRight: false, top: mTop - 2) { drawnFlagRects.append(r) }
             }
         }
-        for (row, info) in displayedRows.enumerated() {
-            let rect = rowRect(row)
-            guard let title = info.title, bounds.intersects(rect) else { continue }
-            let label = NSAttributedString(string: title, attributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .medium),
-                .foregroundColor: NSColor.white.withAlphaComponent(0.84),
-                .backgroundColor: NSColor.black.withAlphaComponent(0.45)
-            ])
-            let offset: CGFloat = compactStatus != nil && row == 0 ? 25 : 5
-            label.draw(at: NSPoint(x: rect.minX + offset, y: rect.midY - label.size().height / 2))
-        }
-        if let marker, marker != selection {
-            drawFlag(marker.lowerBound, pointsRight: true)
-            drawFlag(marker.upperBound, pointsRight: false)
-        }
-        if let selection, !selection.isEmpty {
-            drawFlag(selection.lowerBound, pointsRight: true)
-            drawFlag(selection.upperBound, pointsRight: false)
+        if let selection, !selection.isEmpty, let sTop = selectedRowsRect()?.maxY {
+            if let r = drawFlag(selection.lowerBound, pointsRight: true, top: sTop - 2) { drawnFlagRects.append(r) }
+            if let r = drawFlag(selection.upperBound, pointsRight: false, top: sTop - 2) { drawnFlagRects.append(r) }
         }
         drawPlayhead()
-        drawFadeLabel()
+        drawLengthLabel(flagRects: drawnFlagRects, hoverRows: hoverRows)
         drawEmptyHint()
         drawCompactStatus()
         NSGraphicsContext.restoreGraphicsState()

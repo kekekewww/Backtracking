@@ -92,6 +92,23 @@ struct FrequencyGradient: Equatable, Sendable {
         (0...96).map { Self.rgb(color(at: Double($0) / 96)) }
     }
 
+    func rgbAt(position: Double) -> UInt32 {
+        Self.rgb(color(at: position))
+    }
+
+    var hasUnreadableStops: Bool {
+        stops.contains { !WaveformTheme.isReadableGradientStop($0.rgb) }
+    }
+
+    func readableForDrawing() -> FrequencyGradient {
+        guard hasUnreadableStops else { return self }
+        let adjusted = stops.map { stop -> Stop in
+            if WaveformTheme.isReadableGradientStop(stop.rgb) { return stop }
+            return Stop(position: stop.position, rgb: Self.standard.rgbAt(position: stop.position))
+        }
+        return FrequencyGradient(stops: adjusted)
+    }
+
     static func dim(_ rgb: UInt32) -> UInt32 {
         let red = (rgb >> 16) & 255
         let green = (rgb >> 8) & 255

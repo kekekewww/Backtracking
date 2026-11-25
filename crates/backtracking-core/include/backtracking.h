@@ -238,6 +238,44 @@ size_t bt_export_paths_count(const BtExportPaths *paths);
 const char *bt_export_path(const BtExportPaths *paths, size_t index);
 void bt_export_paths_free(BtExportPaths *paths);
 
+// Bitmask of channels (bit i = native channel i) that have non-silent audio (> -90 dBFS)
+// in the retained history or frozen capture. Returns 0 for narrow (<= 2ch) or unknown lanes.
+uint64_t bt_tracks_active_channels(const BtTracks *core, uint32_t lane);
+uint64_t bt_frozen_active_channels(const BtFrozenCapture *frozen, uint32_t lane);
+
+// Multi-row / channel-subset selection for preview and export.
+// When channel_mask_valid == 0, every channel of the lane is selected.
+// When channel_mask_valid != 0, bit i of channel_mask selects native channel i;
+// channel_mask == 0 with include_pair != 0 selects only the wide L/R pair.
+typedef struct BtFrozenSelectionLane {
+    uint32_t index;
+    uint32_t route;
+    const char *source_name;
+    const char *channel_labels; // Tab-separated, in channel order. NULL means numbered labels.
+    uint64_t channel_mask;
+    uint32_t channel_mask_valid;
+    uint32_t include_pair; // For wide lanes: nonzero includes the L/R pair WAV.
+} BtFrozenSelectionLane;
+
+// Like bt_frozen_play, supporting arbitrary channel subsets per lane and returning a UTF-8
+// error message via error_out on failure (free with bt_string_free).
+int32_t bt_frozen_play_selection(const BtFrozenCapture *frozen, const BtPreviewSlot *slot,
+                                 const BtFrozenSelectionLane *lanes, size_t count,
+                                 uint64_t first, uint64_t end,
+                                 uint32_t force_mono, uint32_t pair_binaural, BtFades fades,
+                                 char **error_out);
+
+// Like bt_frozen_export, supporting arbitrary channel subsets per lane (cross-row selection
+// and hide-silent-channels export) and returning a UTF-8 error message via error_out on failure
+// (free with bt_string_free).
+BtExportPaths *bt_frozen_export_selection(const BtFrozenCapture *frozen,
+                                          const BtFrozenSelectionLane *lanes, size_t count,
+                                          uint64_t first, uint64_t end, const char *directory,
+                                          uint32_t sample_rate, uint32_t bits_per_sample,
+                                          uint32_t force_mono, uint32_t wide_mode,
+                                          uint32_t pair_binaural, BtFades fades,
+                                          char **error_out);
+
 BtSnapshot *bt_tracks_snapshot(const BtTracks *core, uint32_t lane);
 BtSnapshot *bt_tracks_snapshot_range(const BtTracks *core, uint32_t lane, uint64_t first, uint64_t end);
 
