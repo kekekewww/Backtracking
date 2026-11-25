@@ -42,8 +42,7 @@ fn private_dir(path: &Path) -> std::io::Result<()> {
 }
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RESTART_WINDOW: Duration = Duration::from_secs(60);
 const STATE_FILE: &str = "addon-host-v1.json";
@@ -340,7 +339,7 @@ impl AddonHandle {
     }
 
     /// Take the control requests waiting to be carried out, oldest first. Answer each one
-    /// with [`AddonHandle::control_reply`]. Empty in a secondary capture window.
+    /// with [`AddonHandle::answer_control`]. Empty in a secondary capture window.
     pub(crate) fn take_control_calls(&self) -> Vec<ControlCall> {
         self.shared
             .control_calls
@@ -351,35 +350,24 @@ impl AddonHandle {
     }
 
     /// Answer a control request. A reply after the request timed out is dropped.
-    #[cfg(test)]
-    pub(crate) fn control_reply(
-        &self,
-        call: &ControlCall,
-        outcome: Result<ControlResult, ControlError>,
-    ) {
-        self.answer_control(
-            call.addon_id.clone(),
-            call.run,
-            call.request_id.clone(),
-            outcome,
-        )
-    }
     pub(crate) fn answer_control(
         &self,
         addon_id: String,
         run: u64,
         request_id: String,
         outcome: Result<ControlResult, ControlError>,
-    ) {
+    ) -> Result<(), String> {
         let reply = match outcome {
             Ok(result) => ControlReply::success(request_id, &result),
             Err(error) => ControlReply::failure(Some(request_id), error),
         };
-        let _ = self.commands.send(Command::ControlReply {
-            addon_id,
-            run,
-            reply,
-        });
+        self.commands
+            .send(Command::ControlReply {
+                addon_id,
+                run,
+                reply,
+            })
+            .map_err(|_| "The add-on manager has stopped".to_owned())
     }
 
     /// Switch "Let this add-on control Backtracking" for one add-on, and save it.
@@ -549,23 +537,38 @@ impl AddonManager {
     pub(crate) fn handle(&self) -> AddonHandle {
         self.handle.clone()
     }
+
+    pub(super) fn close(&mut self, deadline: Instant) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        let primary = self.bridge.is_some();
+        // Stop children while the bridge is closing. Both share the caller's deadline.
+        let (files_only, cleanup) = mpsc::channel();
+        let _ = self.handle.commands.send(Command::Shutdown {
+            deadline,
+            files_only,
+        });
+        self.bridge.take();
+        if primary {
+            // Disconnection means the process worker exited. An explicit message
+            // means all process groups are gone but a package transaction is
+            // still using the primary lease and must finish consistently.
+            if cleanup.recv().is_err() {
+                let _ = worker.join();
+            }
+        } else if matches!(
+            cleanup.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ) {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl Drop for AddonManager {
     fn drop(&mut self) {
-        self.bridge.take();
-        let _ = self.handle.commands.send(Command::Shutdown);
-        if let Some(worker) = self.worker.take() {
-            let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
-            while !worker.is_finished() && Instant::now() < deadline {
-                thread::sleep(POLL_INTERVAL);
-            }
-            if worker.is_finished() {
-                let _ = worker.join();
-            }
-            // A stuck worker keeps its resources until it returns, but cannot
-            // prevent the UI process from exiting.
-        }
+        self.close(Instant::now() + QUIT_TIMEOUT);
     }
 }
 
@@ -585,7 +588,10 @@ enum Command {
         run: u64,
         reply: ControlReply,
     },
-    Shutdown,
+    Shutdown {
+        deadline: Instant,
+        files_only: mpsc::Sender<()>,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -751,6 +757,7 @@ struct Worker {
     inspections: Vec<PendingInspection>,
     operations: Vec<Operation>,
     shutting_down: bool,
+    closing: Option<(Instant, mpsc::Sender<()>)>,
     runs: u64,
 }
 
@@ -791,6 +798,7 @@ impl Worker {
             inspections: Vec::new(),
             operations: Vec::new(),
             shutting_down: false,
+            closing: None,
             runs: 0,
         })
     }
@@ -809,7 +817,11 @@ impl Worker {
         loop {
             match commands.recv_timeout(POLL_INTERVAL) {
                 Ok(command) => self.command(command),
-                Err(mpsc::RecvTimeoutError::Disconnected) => self.shutdown(),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.shutdown(Instant::now() + QUIT_TIMEOUT);
+                    // An outstanding file transaction may still own the primary lease.
+                    thread::sleep(POLL_INTERVAL);
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             for _ in 0..64 {
@@ -821,12 +833,19 @@ impl Worker {
             self.poll();
             self.advance_operations();
             self.publish();
-            if self.shutting_down
-                && self.entries.values().all(|entry| entry.runtime.is_none())
-                && self.operations.is_empty()
-                && self.inspections.is_empty()
-            {
-                break;
+            if self.shutting_down && self.entries.values().all(|entry| entry.runtime.is_none()) {
+                if self.operations.is_empty() && self.inspections.is_empty() {
+                    break;
+                }
+                if self
+                    .closing
+                    .as_ref()
+                    .is_some_and(|(deadline, _)| Instant::now() >= *deadline)
+                {
+                    if let Some((_, files_only)) = self.closing.take() {
+                        let _ = files_only.send(());
+                    }
+                }
             }
         }
     }
@@ -846,7 +865,7 @@ impl Worker {
     }
 
     fn command(&mut self, command: Command) {
-        if self.shutting_down && !matches!(command, Command::Shutdown) {
+        if self.shutting_down && !matches!(command, Command::Shutdown { .. }) {
             reject_command(command, "The add-on manager is shutting down");
             return;
         }
@@ -1007,7 +1026,13 @@ impl Worker {
                     }
                 }
             }
-            Command::Shutdown => self.shutdown(),
+            Command::Shutdown {
+                deadline,
+                files_only,
+            } => {
+                self.shutdown(deadline);
+                self.closing = Some((deadline, files_only));
+            }
         }
     }
 
@@ -1273,7 +1298,7 @@ impl Worker {
         }
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self, deadline: Instant) {
         if self.shutting_down {
             return;
         }
@@ -1281,6 +1306,14 @@ impl Worker {
         let ids: Vec<_> = self.entries.keys().cloned().collect();
         for id in ids {
             self.stop(&id, AddonState::Stopped);
+            if let Some((stop_at, _)) = self
+                .entries
+                .get_mut(&id)
+                .and_then(|e| e.runtime.as_mut())
+                .and_then(|r| r.stop.as_mut())
+            {
+                *stop_at = (*stop_at).min(deadline);
+            }
         }
     }
 
@@ -1924,7 +1957,7 @@ fn reject_command(command: Command, reason: &str) {
         | Command::ControlAllowed(_, _, reply) => {
             let _ = reply.send(Err(reason.into()));
         }
-        Command::ControlReply { .. } | Command::Shutdown => {}
+        Command::ControlReply { .. } | Command::Shutdown { .. } => {}
     }
 }
 
@@ -3175,6 +3208,47 @@ mod tests {
         package::install(&path, dir.0.join("addons")).unwrap();
         let manager = AddonManager::new(dir.0.clone(), "test").unwrap();
         wait_for(&manager, Some(false));
+    }
+
+    #[test]
+    fn close_releases_caller_while_unfinished_file_work_keeps_the_lease() {
+        let dir = TestDir::new();
+        let mut actor = worker(&dir.0);
+        let (commands, rx) = mpsc::channel();
+        let handle = AddonHandle {
+            commands,
+            shared: actor.shared.clone(),
+        };
+        let bridge = bridge::Bridge::start(&dir.0, handle.clone()).unwrap();
+        let (finish, result) = mpsc::channel();
+        let (reply, completed) = mpsc::channel();
+        actor.inspections.push(PendingInspection { result, reply });
+        let mut manager = AddonManager {
+            handle,
+            worker: Some(thread::spawn(move || actor.run(rx))),
+            bridge: Some(bridge),
+        };
+        let (closed, when_closed) = mpsc::channel();
+        let closer = thread::spawn(move || {
+            manager.close(Instant::now() + Duration::from_millis(20));
+            let _ = closed.send(());
+        });
+        when_closed.recv_timeout(Duration::from_secs(1)).unwrap();
+        closer.join().unwrap();
+        assert!(startup::PrimaryLease::acquire(&dir.0).is_err());
+        finish.send(Err("cancelled".to_owned())).unwrap();
+        assert_eq!(
+            completed
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err(),
+            "cancelled"
+        );
+        let until = Instant::now() + Duration::from_secs(1);
+        while startup::PrimaryLease::acquire(&dir.0).is_err() {
+            assert!(Instant::now() < until);
+            thread::sleep(POLL_INTERVAL);
+        }
     }
 
     #[test]

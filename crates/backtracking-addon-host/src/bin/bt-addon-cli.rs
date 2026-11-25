@@ -1,6 +1,7 @@
 //! Line-oriented C ABI test driver. Pass an absolute root and optional "secondary".
 //! Read one JSON document per line. Commands wait for completion; {"op":"snapshot"}
-//! reads the current publication. EOF releases the handle.
+//! reads the current publication. EOF releases the handle. {"op":"close"} explicitly
+//! frees the handle and reports the elapsed milliseconds without exiting the driver.
 #[cfg(unix)]
 mod unix {
     use backtracking_addon_host::*;
@@ -26,7 +27,7 @@ mod unix {
         let root =
             CString::new(std::env::args().nth(1).expect("Pass an absolute data root")).unwrap();
         let role = u32::from(std::env::args().nth(2).as_deref() == Some("secondary"));
-        let host = unsafe { bt_addon_host_new(root.as_ptr(), c"0.2.1".as_ptr(), role) };
+        let mut host = unsafe { bt_addon_host_new(root.as_ptr(), c"0.2.1".as_ptr(), role) };
         assert!(!host.is_null(), "Invalid data root");
         for line in io::stdin().lock().lines().map_while(Result::ok) {
             let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
@@ -38,7 +39,12 @@ mod unix {
                 continue;
             }
             value["schema"] = 1.into();
-            let mut result = if value["op"] == "snapshot" {
+            let mut result = if value["op"] == "close" && !host.is_null() {
+                let started = Instant::now();
+                unsafe { bt_addon_host_free(host) };
+                host = std::ptr::null_mut();
+                json!({"schema":1,"ok":true,"value":{"elapsed_ms":started.elapsed().as_secs_f64()*1000.0}})
+            } else if value["op"] == "snapshot" {
                 decode(unsafe { bt_addon_host_snapshot(host) })
             } else {
                 command(host, &value)

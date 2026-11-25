@@ -7,13 +7,15 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
-    time::Duration,
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 struct Shared {
+    closing: OnceLock<Instant>,
     generation: AtomicU64,
     manager: Mutex<Result<Option<AddonHandle>, String>>,
     tickets: Mutex<BTreeMap<u64, Option<Value>>>,
@@ -21,6 +23,7 @@ struct Shared {
 pub struct BtAddonHost {
     shared: Arc<Shared>,
     tx: mpsc::SyncSender<(u64, Request)>,
+    worker: JoinHandle<()>,
     next: AtomicU64,
 }
 pub(crate) fn failure(code: &str, message: &str) -> Value {
@@ -32,21 +35,25 @@ fn success(v: Value) -> Value {
 impl BtAddonHost {
     pub(crate) fn new(root: PathBuf, version: String, role: u32) -> Option<Self> {
         let shared = Arc::new(Shared {
+            closing: OnceLock::new(),
             generation: AtomicU64::new(0),
             manager: Mutex::new(Ok(None)),
             tickets: Mutex::new(BTreeMap::new()),
         });
         let (tx, rx) = mpsc::sync_channel(128);
         let state = shared.clone();
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("addon API".into())
             .spawn(move || {
+                if state.closing.get().is_some() {
+                    return;
+                }
                 let result = if role == 0 {
                     AddonManager::new(root, &version)
                 } else {
                     AddonManager::connect_existing(root)
                 };
-                let manager = match result {
+                let mut manager = match result {
                     Ok(manager) => manager,
                     Err(e) => {
                         *state.manager.lock().unwrap() = Err(e);
@@ -67,7 +74,7 @@ impl BtAddonHost {
                 *state.manager.lock().unwrap() = Ok(Some(handle.clone()));
                 state.generation.fetch_add(1, Ordering::Release);
                 let mut pending: Vec<(u64, Pending)> = Vec::new();
-                loop {
+                while state.closing.get().is_none() {
                     match rx.recv_timeout(Duration::from_millis(5)) {
                         Ok((id, request)) => match dispatch(&handle, request) {
                             Ok(job) => pending.push((id, job)),
@@ -84,14 +91,27 @@ impl BtAddonHost {
                         }
                     });
                 }
+                if let Some(&deadline) = state.closing.get() {
+                    manager.close(deadline);
+                }
             })
             .ok()?;
         Some(Self {
             shared,
             tx,
+            worker,
             next: AtomicU64::new(1),
         })
     }
+    pub(crate) fn close(self) {
+        // Reserve the last 50 ms of the two-second budget for reaping groups
+        // and joining the worker after the last cooperative quit.
+        let force_at = Instant::now() + crate::addons::QUIT_TIMEOUT - Duration::from_millis(50);
+        let _ = self.shared.closing.set(force_at);
+        drop(self.tx);
+        let _ = self.worker.join();
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.shared.generation.load(Ordering::Acquire)
     }
@@ -182,8 +202,10 @@ impl BtAddonHost {
                     (None, Some(e)) => Err(e),
                     _ => return failure("invalid_request", "Expected one control result or error"),
                 };
-                h.answer_control(addon_id, run, request_id, outcome);
-                return success(Value::Null);
+                return match h.answer_control(addon_id, run, request_id, outcome) {
+                    Ok(()) => success(Value::Null),
+                    Err(e) => failure("failed", &e),
+                };
             }
             _ => {}
         }

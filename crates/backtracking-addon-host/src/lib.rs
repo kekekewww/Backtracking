@@ -68,7 +68,7 @@ pub unsafe extern "C" fn bt_addon_string_free(p: *mut c_char) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bt_addon_host_free(h: *mut BtAddonHost) {
     if !h.is_null() {
-        drop(unsafe { Box::from_raw(h) });
+        unsafe { Box::from_raw(h) }.close();
     }
 }
 

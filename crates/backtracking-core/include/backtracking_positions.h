@@ -14,8 +14,12 @@ uint64_t bt_capture_clock_ns(void);
 BtPositionTrack *bt_positions_new(void);
 void bt_positions_free(BtPositionTrack *);
 bool bt_positions_insert(BtPositionTrack *, uint32_t channel, BtPositionKey key);
+/* Report a capture frame-clock eviction before retaining or freezing this lane.
+   The floor only advances until clear. Frozen keys below it are omitted. */
+void bt_positions_clock_evicted_before(BtPositionTrack *, uint64_t first);
 void bt_positions_retain(BtPositionTrack *, uint64_t first, uint64_t end);
 void bt_positions_clear(BtPositionTrack *);
+/* Reports a key-budget or clock eviction once per history (reset by clear). */
 bool bt_positions_take_overflowed(BtPositionTrack *);
 BtFrozenPositions *bt_positions_freeze(const BtPositionTrack *);
 void bt_frozen_positions_free(BtFrozenPositions *);

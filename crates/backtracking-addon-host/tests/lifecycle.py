@@ -227,6 +227,38 @@ def crash_checks(host, root, work):
     print(f"10 s hello timeout, three crashes, {elapsed:.3f} s stop, SIGKILL cleanup {(time.monotonic()-start)*1000:.1f} ms")
 
 
+def close_active_host(work, env, agent):
+    root = work / "closing"
+    with process([BIN / "bt-addon-cli", root], env) as proc:
+        host = Host(proc)
+        eventually(lambda: host.call("snapshot")["ready"])
+        endpoint = None
+        if agent:
+            addon = host.install(agent.resolve())
+            host.call("start", id=addon)
+            host.running(addon)
+            endpoint = root / "addon-data" / addon / "endpoint.json"
+            eventually(endpoint.is_file)
+        # Two uncooperative groups must share a grace period.
+        pids = []
+        for name in ["slow-a", "slow-b"]:
+            addon = host.install(fixture(work, "control", work / "no-hello",
+                                         {"id": f"com.example.{name}"}))
+            host.call("start", id=addon)
+            pidfile = root / "addon-data" / addon / "child.pid"
+            pids.append(eventually(lambda: host.addon(addon)["pid"]))
+            pids.append(eventually(lambda: int(pidfile.read_text()) if pidfile.exists() and pidfile.stat().st_size else None))
+        elapsed = host.call("close")["elapsed_ms"] / 1000
+        assert 1.8 <= elapsed <= 2.0, elapsed
+        assert proc.poll() is None, "check cleanup while the host process is still alive"
+        assert all(dead(pid) for pid in pids)
+        assert not (root / "addon-host-endpoint-v1.json").exists()
+        if endpoint:
+            assert not endpoint.exists()
+        print(f"Synchronous free: two groups reaped in {elapsed:.3f} s, host endpoint removed"
+              + (", Agent endpoint removed" if endpoint else ""))
+
+
 if __name__=="__main__":
     parser=argparse.ArgumentParser()
     parser.add_argument("--agent", type=Path)
@@ -242,3 +274,4 @@ if __name__=="__main__":
             if opts.agent:
                 agent_flow(host,root,opts.agent.resolve(),env)
             crash_checks(host,root,work)
+        close_active_host(work, env, opts.agent)

@@ -10,9 +10,12 @@ Each handle owns an independent worker. Primary owns the data root, secondary pr
 the primary. Supply the absolute root and app version at creation. Compare generations
 for inequality, then read the snapshot. The generation embedded in the snapshot is
 the one to remember. Poll control and positions independently of snapshot changes.
-Free releases the handle and signals shutdown. The worker sends quit, waits up to
-two seconds and terminates remaining groups. Callers must synchronize final release
-with all calls on that handle. Release each returned JSON string using bt_addon_string_free.
+Free is synchronous. It closes the command channel and joins the host API worker.
+The primary sends quit to all add-ons with one shared two-second grace period and
+terminates remaining process groups before returning. The secondary releases its proxy.
+The host reserves the final 50 ms of the two-second budget for reaping and joining.
+An existing filesystem transaction can retain the primary lease until it has finished.
+Callers must synchronize final release with all calls on that handle. Release each returned JSON string using bt_addon_string_free.
 
 ## Snapshot
 All top-level JSON documents have integer schema 1. The snapshot has generation (u64),
@@ -31,6 +34,9 @@ Pass an object with schema=1, op and the fields below. Successful asynchronous a
 returns {"schema":1,"ok":true,"ticket":1}. On completion retrieve exactly once with
 take_result. Successful completion returns {"schema":1,"ok":true,"value":null}
 or a value described below. Failure returns {"schema":1,"ok":false,"code":"failed","message":"…"}.
+The four synchronous operations are take_control, positions_since, control_reply and
+take_result. All other operations in the table return tickets. Consuming a completed
+ticket with take_result updates the completed list and generation.
 take_control, positions_since and control_reply return the value envelope immediately
 and do not allocate a ticket or advance generation. control_reply acknowledges admission
 to the worker; the worker drops a stale run or expired request. A ticket is scoped to its handle. Before readiness callers may receive busy.
@@ -54,14 +60,20 @@ to the worker; the worker drops a stale run or expired request. A ticket is scop
 |positions_since|cursor (u64, initially zero); returns {cursor,positions:[{sequence,addon_id,source_id,time,channels}]} with Sender clock nanoseconds|
 |take_result|ticket (u64); immediate, returns busy if pending, not_found if unknown|
 
-On a first install the host records the package as stopped. Request set_enabled=true
-to enable and launch it. Updates preserve the saved enabled and control switches.
-Only broken_package has a null manifest. For each source, sender matches the id from
-bt_senders_string(...,name=0) on a bt_senders_new list. Optional transport contains state
-(playing, paused or stopped), position (seconds), and optional duration (seconds).
-clip_exported broadcasts completed file paths, frame count and sample rate to add-ons
-declaring clips. Reply separately to a save control request with its ControlResult,
-including state and SavedFile records, or with an error.
+A fresh install is disabled. If its id was absent from snapshot.addons before
+installation, the app calls set_enabled(id, true) after install succeeds to enable
+and launch it. Updates preserve enabled, control, settings and selected formats.
+
+Only state == "broken_package" has manifest: null. Every other state, including
+disabled, stopped and failed add-ons, retains the full manifest with its declared
+open_files and capabilities. source.sender is the Sender instance ID returned by
+bt_senders_string(...,name=0) on a bt_senders_new list. Optional source.transport
+uses protocol::Transport with state ("playing", "paused" or "stopped"), position
+(f64 seconds) and optional duration (f64 seconds). The protocol has no "seeking" state.
+
+clip_exported takes only files, sample_rate and frames as its payload. The host
+notifies add-ons declaring clips. A save requested through control receives its own
+ControlResult (including state and SavedFile records) or error via control_reply.
 
 The protocol's six ordinary capabilities are filtered by the worker. Control requires
 explicit per-id consent, retained on update and cleared on removal. After draining
@@ -72,16 +84,21 @@ request_too_large, unknown_command, too_many_requests, duplicate_id, busy, not_f
 no_audio, no_selection, failed, timeout.
 
 ## Position tracks
-BtFrozenPositions is the opaque C name for backtracking_core::FrozenPositionTrack.
-bt_capture_clock_ns uses the same monotonic clock as positions_since. Align against
-received packet timestamps and retained frames, accounting for pauses and dropped audio.
-One mutable core track per lane receives frame-indexed keys. Trim to the retained frame
-range, freeze with the corresponding audio, then read immutable per-channel keys.
-The archive exports the positions header. The frozen-audio consumer needs an additive
-entry point to attach a cloned FrozenPositionTrack per lane before preview/export.
+BtFrozenPositions points directly to a backtracking_core::FrozenPositionTrack from
+the same crate; track_ffi.rs can borrow it as &FrozenPositionTrack for preview/export.
+Clone that value when its lifetime must extend beyond the caller's handle.
+bt_capture_clock_ns uses the Sender clock. Map timestamps via
+SynchronizedCapture::retained_frame_at. Forward take_frame_clock_eviction values to
+bt_positions_clock_evicted_before before retaining or freezing. Each live lane has a
+6 MiB key budget. Retention starts at max(first, clock_floor); ordinary retention
+keeps an interpolation predecessor. A freeze excludes every key below the eviction
+floor. Memory and clock eviction share a once-per-history warning. Clear resets
+the warning and floor. A frozen track remains valid until bt_frozen_positions_free.
 
-Build the private process-group supervisor binary `bt-addon-guard` from the same
-package and copy it beside the application executable (Contents/MacOS) before signing.
+## Guard packaging
+The host resolves bt-addon-guard beside current_exe(). In build.sh copy
+`$target_dir/$rust_target/release/bt-addon-guard` from the same cargo build to
+`Contents/MacOS/bt-addon-guard`. Sign the guard before signing the enclosing .app.
 Each running add-on has its own guard. Closing the host's pipe, including on SIGKILL,
 wakes the guard to terminate its group. The launched add-on inherits only null stdio.
 
