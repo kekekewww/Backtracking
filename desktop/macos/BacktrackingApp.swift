@@ -2626,6 +2626,42 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             || live.selectedRowsForExport != [.whole(lane: 0)] {
             problems.append("lane A held whole: whole \(live.verifyWholeLanes), rows \(live.verifyRememberedRows), export \(live.selectedRowsForExport ?? [])")
         }
+        // Flags of those rows stay: with Bed on show the selection's flags stand on top of the plot
+        // and can be moved, keeping Object 1.
+        controller.waveform = view
+        func mouse(_ type: NSEvent.EventType, _ point: NSPoint) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0, windowNumber: 0,
+                               context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        }
+        if let flag = view.verifyFlagPoint {
+            view.mouseDown(with: mouse(.leftMouseDown, flag))
+            view.mouseDragged(with: mouse(.leftMouseDragged, NSPoint(x: flag.x + 30, y: flag.y)))
+            view.mouseUp(with: mouse(.leftMouseUp, NSPoint(x: flag.x + 30, y: flag.y)))
+            if view.selectionForSaving()?.lowerBound == 12_000 || view.selectedRowsForExport != [.channel(lane: 0, index: 3)] {
+                problems.append("the flag of Object 1 with Bed on show did not move it (\(String(describing: view.selectionForSaving())), \(view.selectedRowsForExport ?? []))")
+            }
+        } else {
+            problems.append("no flag for Object 1 while Bed is on show")
+        }
+        // A save of lane A held whole leaves flags on lane A; taking them back chooses lane A whole.
+        let held = WaveformView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
+        held.controller = controller
+        controller.waveform = held
+        held.verifyShow(rows: quiet, laneWidths: [6, 2], frames: 0..<48_000)
+        held.verifyShowRows(quiet, groups: [nil, nil])
+        held.separateLanes = true
+        held.commitMarker(12_000..<36_000, rows: [.whole(lane: 0)], ticket: held.reserveMarker())
+        if let flag = held.verifyMarkerFlagPoint {
+            held.mouseDown(with: mouse(.leftMouseDown, flag))
+            held.mouseDragged(with: mouse(.leftMouseDragged, NSPoint(x: flag.x + 30, y: flag.y)))
+            held.mouseUp(with: mouse(.leftMouseUp, NSPoint(x: flag.x + 30, y: flag.y)))
+            if !held.hasSelection || held.selectedRowsForExport != [.whole(lane: 0)] {
+                problems.append("taking back lane A's flags chose \(held.selectedRowsForExport ?? []) (selection \(held.hasSelection))")
+            }
+        } else {
+            problems.append("no flags for a save of lane A held whole")
+        }
+        controller.waveform = nil
         guard problems.isEmpty else { throw CaptureError("Rows across groups: " + problems.joined(separator: "; ")) }
     }
 
@@ -9085,6 +9121,10 @@ extension WaveformView {
     }
 
     var verifyRememberedRows: [RowIdentity] { rememberedRows }
+    var verifyMarkerFlagPoint: NSPoint? {
+        guard let marker, let top = flagTopY() else { return nil }
+        return NSPoint(x: flagPosition(for: marker.lowerBound), y: top - 5)
+    }
     var verifyChipToolTipTags: [NSView.ToolTipTag] { chipToolTipTags }
     var verifyLaneFirstRows: [Int] { laneFirstRows }
     func verifyShowRows(_ rows: [WaveformRow], groups: [String?]) { showRows(rows, groups: groups) }
@@ -9458,9 +9498,11 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         return rows.contains(id)
     }
 
+    /// The visible rows of `ids` drawn now; `.whole(lane:)` stands for every row of that lane.
     private func rectForRows(_ ids: [RowIdentity]) -> NSRect? {
         var combined: NSRect?
-        for (index, row) in displayedRows.enumerated() where ids.contains(row.identity) {
+        let wholeLanes = Set(ids.compactMap { id -> Int? in if case .whole(let lane) = id { return lane } else { return nil } })
+        for (index, row) in displayedRows.enumerated() where ids.contains(row.identity) || wholeLanes.contains(row.lane) {
             guard let rect = rowRect(for: index) else { continue }
             combined = combined.map { $0.union(rect) } ?? rect
         }
@@ -9473,17 +9515,21 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         return rectForRows(rows)
     }
 
+    /// Where flags stand: on top of their rows, or on top of the plot when none of them is drawn
+    /// (scrolled away, or of another group), as Windows `flag_area` does.
     private func flagTopY() -> CGFloat? {
         if selection != nil {
-            return selectedRowsRect()?.maxY
+            return selectedRowsRect()?.maxY ?? audioRect.maxY
         }
         if marker != nil {
-            if !markerRows.isEmpty {
-                return rectForRows(markerRows)?.maxY
-            }
-            return audioRect.maxY
+            return markerRows.isEmpty ? audioRect.maxY : (rectForRows(markerRows)?.maxY ?? audioRect.maxY)
         }
         return nil
+    }
+
+    private func flagTopY(forMarker: Bool) -> CGFloat? {
+        guard forMarker, marker != nil else { return flagTopY() }
+        return markerRows.isEmpty ? audioRect.maxY : (rectForRows(markerRows)?.maxY ?? audioRect.maxY)
     }
 
     var hasEditingMaterial: Bool { editMaterial != nil || materialPending }
@@ -11431,13 +11477,12 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
         var drawnFlagRects: [NSRect] = []
         if let marker, marker != selection {
-            let mTop = (!markerRows.isEmpty ? rectForRows(markerRows)?.maxY : audioRect.maxY)
-            if let mTop {
+            if let mTop = flagTopY(forMarker: true) {
                 if let r = drawFlag(marker.lowerBound, pointsRight: true, top: mTop - 2) { drawnFlagRects.append(r) }
                 if let r = drawFlag(marker.upperBound, pointsRight: false, top: mTop - 2) { drawnFlagRects.append(r) }
             }
         }
-        if let selection, !selection.isEmpty, let sTop = selectedRowsRect()?.maxY {
+        if let selection, !selection.isEmpty, let sTop = flagTopY() {
             if let r = drawFlag(selection.lowerBound, pointsRight: true, top: sTop - 2) { drawnFlagRects.append(r) }
             if let r = drawFlag(selection.upperBound, pointsRight: false, top: sTop - 2) { drawnFlagRects.append(r) }
         }
