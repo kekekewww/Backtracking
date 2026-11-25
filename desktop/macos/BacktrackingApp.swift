@@ -419,6 +419,10 @@ private final class OptionsPopUpButton: NSPopUpButton, NSTableViewDataSource, NS
 
     var isChoicePopoverShown: Bool { choicePopover?.isShown == true }
 
+    /// Every list that has opened, so a window can ask whether any is open now, whichever it is.
+    private static let opened = NSHashTable<OptionsPopUpButton>.weakObjects()
+    static var anyChoicePopoverShown: Bool { opened.allObjects.contains(where: \.isChoicePopoverShown) }
+
     func reloadChoicesIfOpen() {
         guard choicePopover?.isShown == true, let table = choiceTable else { return }
         choiceItems = itemArray
@@ -498,6 +502,7 @@ private final class OptionsPopUpButton: NSPopUpButton, NSTableViewDataSource, NS
         popover.behavior = .transient
         popover.animates = false
         choicePopover = popover
+        Self.opened.add(self)
         choiceTable = table
         popover.show(relativeTo: bounds, of: self, preferredEdge: .minY)
         let selected = indexOfSelectedItem
@@ -3443,15 +3448,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         return window
     }
 
+    /// Whether any Options list is open, so Escape closes it before the window.
     private func hasOpenOptionsPopover() -> Bool {
-        if sourcePopups.contains(where: \.isChoicePopoverShown) { return true }
-        if addSourcePopup?.isChoicePopoverShown == true { return true }
-        if (snapshotTargetPopup as? OptionsPopUpButton)?.isChoicePopoverShown == true { return true }
-        if routePopups.contains(where: { ($0 as? OptionsPopUpButton)?.isChoicePopoverShown == true }) { return true }
-        if (waveformModePopup as? OptionsPopUpButton)?.isChoicePopoverShown == true { return true }
-        if (secondsIntervalPopup as? OptionsPopUpButton)?.isChoicePopoverShown == true { return true }
-        if optionsMeterPopups.contains(where: { ($0 as? OptionsPopUpButton)?.isChoicePopoverShown == true }) { return true }
-        return false
+        OptionsPopUpButton.anyChoicePopoverShown
     }
 
     @objc private func selectOptionCategory(_ sender: NSButton) {
