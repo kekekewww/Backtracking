@@ -2902,6 +2902,28 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
               controller.verifySourcesTabRebuilds == 1, controller.verifyLookControlRebuilds == 1 else {
             throw CaptureError("Under an open list: Add-ons \(reloadsUnderList) (pending \(addonsPending)), Sources \(sourcesUnderList), look \(lookUnderList), pending \(pending); after: Sources \(controller.verifySourcesTabRebuilds), look \(controller.verifyLookControlRebuilds)")
         }
+
+        // Typing a File name on the Sources page holds its rebuild too. When the typing ends in
+        // the same pass a new snapshot arrives, each page is rebuilt once.
+        controller.verifySourcesTabRebuilds = 0
+        controller.verifyLookControlRebuilds = 0
+        controller.verifyEditingText = true
+        receiveSource("a")
+        let whileNaming = controller.verifySourcesTabRebuilds
+        controller.verifyEditingText = false
+        receiveSource("b")
+        guard whileNaming == 0, controller.verifySourcesTabRebuilds == 1, controller.verifyLookControlRebuilds <= 2 else {
+            throw CaptureError("Sources page rebuilt \(whileNaming) times while a name was typed and \(controller.verifySourcesTabRebuilds) in the pass that ended it")
+        }
+        // Same for the look controls: one deferred, one new, in one pass.
+        OptionsPopUpButton.verifyShown = true
+        controller.verifyLookControlRebuilds = 0
+        receiveSource("a")
+        OptionsPopUpButton.verifyShown = false
+        receiveSource("b")
+        guard controller.verifyLookControlRebuilds == 1 else {
+            throw CaptureError("The look controls were rebuilt \(controller.verifyLookControlRebuilds) times in the pass the list closed")
+        }
     }
 
     /// A look that repaints its colours every 250 ms neither rebuilds the Appearance page's look
@@ -7491,14 +7513,23 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let snap = host.snapshot
         currentAddonSnapshot = snap
         // Rebuilds put off while the user held a menu or a control are done once they let go.
+        // Each page is rebuilt at most once in a pass: a rebuild already shows this snapshot.
+        var lookRebuilt = false, sourcesRebuilt = false, addonsRebuilt = false
         if !userIsHandlingControls {
             if pendingLookControlsRebuild {
                 pendingLookControlsRebuild = false
                 recomputeLook(refreshAppearanceTab: true)
+                lookRebuilt = true
             }
-            if pendingSourcesTabRebuild {
+        }
+        if pendingSourcesTabRebuild {
+            // The Sources page's File name fields wait for typing to end too.
+            if !optionsPageShown("Sources") {
                 pendingSourcesTabRebuild = false
-                if optionsPageShown("Sources") { rebuildSourcesTab() }
+            } else if !userIsHandlingControls && !editingOptionsText {
+                pendingSourcesTabRebuild = false
+                rebuildSourcesTab()
+                sourcesRebuilt = true
             }
         }
         if pendingAddonsTabReload {
@@ -7509,6 +7540,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             } else if !userIsHandlingControls && !editingOptionsText {
                 pendingAddonsTabReload = false
                 reloadAddonsTab()
+                addonsRebuilt = true
             }
         }
         guard snap.generation != lastAddonSnapshotForUI.generation else { return }
@@ -7520,7 +7552,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 pendingLookControlsRebuild = true
                 recomputeLook(refreshAppearanceTab: false)
             } else {
-                recomputeLook(refreshAppearanceTab: rebuild)
+                recomputeLook(refreshAppearanceTab: rebuild && !lookRebuilt)
             }
         }
         // Refresh cached source choices if any running add-on sources changed.
@@ -7536,7 +7568,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         if optionsPageShown("Add-ons") || optionsPageShown("Sources") {
             if optionsPageShown("Add-ons") {
-                if Self.addonsPageChanged(from: prev, to: snap) {
+                if Self.addonsPageChanged(from: prev, to: snap), !addonsRebuilt {
                     if userIsHandlingControls || editingOptionsText {
                         pendingAddonsTabReload = true
                     } else {
@@ -7550,8 +7582,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                             && s1.sender == s2.sender && s1.groups == s2.groups
                     }
                 }
-                if sourcesStructureChanged {
-                    if userIsHandlingControls {
+                if sourcesStructureChanged, !sourcesRebuilt {
+                    if userIsHandlingControls || editingOptionsText {
                         pendingSourcesTabRebuild = true
                     } else {
                         rebuildSourcesTab()
