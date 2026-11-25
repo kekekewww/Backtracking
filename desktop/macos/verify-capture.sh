@@ -17,7 +17,7 @@ esac
 
 target_dir="${CARGO_TARGET_DIR:-$repo_dir/target}"
 CARGO_TARGET_DIR="$target_dir" cargo build --locked --release --target "$rust_target" -p backtracking-addon-host
-scratch="$(mktemp -d)"
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/bt-verify.XXXXXX")"
 trap 'rm -rf -- "$scratch"' EXIT
 cat > "$scratch/Verify.swift" <<'SWIFT'
 import Foundation
