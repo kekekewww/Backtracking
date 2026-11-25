@@ -1570,6 +1570,21 @@ final class SystemAudioTap {
         return false
     }
 
+    /// The short capture status of an add-on source that is not delivering audio, in Windows'
+    /// words (`controller.rs`); the Sources page explains it at length.
+    nonisolated static func addonCaptureStatus(_ addon: AddonRecord?, sourceID: String) -> String {
+        guard let addon else { return "Add-on is not installed" }
+        switch addon.state {
+        case "running":
+            return addon.sources.contains(where: { $0.id == sourceID }) ? "Waiting for add-on audio" : "Add-on source is not available"
+        case "starting": return "Add-on is starting"
+        case "stopping": return "Add-on is stopping"
+        case "stopped": return "Add-on is stopped"
+        case "not_responding": return "Add-on is not responding"
+        default: return "Add-on unavailable: \(addon.reason ?? addon.state)"
+        }
+    }
+
     func sourceProblem(for lane: Int) -> String? {
         guard lanes.indices.contains(lane) else { return nil }
         if let capError = laneCapErrors[lane] {
@@ -1579,17 +1594,7 @@ final class SystemAudioTap {
         if let error = slot.error { return localizedBilingual(error) }
         if slot.input == nil {
             if case .addon(let addonID, let sourceID) = slot.source {
-                let fallbackName = defaultFileName(for: slot.source)
-                guard let addon = currentAddonSnapshot.addon(addonID) else {
-                    return "The add-on that provides \"\(fallbackName)\" is not installed."
-                }
-                if !addon.isRunning {
-                    return "\(addon.displayName) is not available. \(addon.statusPresentation.text)"
-                }
-                if addon.sources.first(where: { $0.id == sourceID }) == nil {
-                    return "\(addon.displayName) no longer offers \"\(fallbackName)\"."
-                }
-                return "Waiting for \(addon.displayName)..."
+                return Self.addonCaptureStatus(currentAddonSnapshot.addon(addonID), sourceID: sourceID)
             }
             if slot.source.isSender {
                 return "Sender audio is unavailable"

@@ -133,6 +133,12 @@ func verifyMacSelectWaitsForFreeze() throws {
 }
 
 @MainActor
+func verifyMacAddonCaptureStatus() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyAddonCaptureStatus()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -2555,6 +2561,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let replies = host.verifyEvents.filter { $0.hasPrefix("control_reply") }
         guard early.isEmpty, replies == ["control_reply sel ok"], view.hasEditingMaterial, !view.isPreparingMaterial else {
             throw CaptureError("select answered \(early) before its freeze and \(replies) after")
+        }
+    }
+
+    /// An add-on source without audio shows Windows' short capture status, not the Sources page's sentence.
+    static func verifyAddonCaptureStatus() throws {
+        let status = SystemAudioTap.addonCaptureStatus
+        let missing = status(nil, "main")
+        guard missing == "Add-on is not installed" else {
+            throw CaptureError("A missing add-on's capture status is \(missing)")
         }
     }
 
@@ -7862,6 +7877,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             let mLbl = optionNote(AddonFormatting.addonMessageText(msg))
             if msg.level == "error" { mLbl.textColor = WaveformTheme.statusUnavailable }
             views.append(mLbl)
+            // An error also says what can be done about it (Windows `addon_error_hint`).
+            if msg.level == "error" {
+                views.append(optionNote("Try another file or format, or restart the add-on on the Add-ons page."))
+            }
         }
         if let prob = addonSourceProblems[addonID] {
             let pLbl = optionNote(prob)
