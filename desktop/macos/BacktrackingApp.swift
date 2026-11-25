@@ -177,7 +177,7 @@ func verifyMacControlSaveReply() throws {
 @MainActor
 func verifyMacOptionsRebuild(step: String) throws {
     _ = NSApplication.shared
-    if ["typed-values", "deferred", "sources-name", "open-list", "key-loop", "switch-while-typing", "switch-unchanged"].contains(step) {
+    if ["typed-values", "deferred", "sources-name", "open-list", "key-loop", "switch-while-typing", "switch-unchanged", "not-a-number"].contains(step) {
         try BacktrackingController.verifyOptionsRebuildKeepsTyping(step: step)
         return
     }
@@ -3743,11 +3743,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         // The Sources page, hidden: a play position that moves marks nothing; a new format does,
         // and the page is rebuilt once when it is shown.
-        func receiveSource(position: Double, format: String) {
+        func receiveSource(position: Double?, format: String, name: String = "Main", state: String = "running", reason: String? = nil) {
             generation += 1
-            let source = AddonSource(id: "main", name: "Main", sender: "s", formats: [], format: format, groups: nil,
-                                     transport: AddonTransport(state: "playing", position: position, duration: 10))
-            let addon = AddonRecord(id: "verify.hidden", manifest: nil, enabled: true, state: "running", reason: nil,
+            let source = AddonSource(id: "main", name: name, sender: "s", formats: [], format: format, groups: nil,
+                                     transport: position.map { AddonTransport(state: "playing", position: $0, duration: 10) })
+            let addon = AddonRecord(id: "verify.hidden", manifest: nil, enabled: true, state: state, reason: reason,
                 pid: nil, message: nil, sources: [source], settings: [], actions: [], control_allowed: false, control_asked: false)
             host.verifyReceive(AddonSnapshot(schema: 1, generation: generation, ready: true, error: nil,
                                              addons: [addon], appearances: [:], completed: []))
@@ -3766,6 +3766,23 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let sourcesShown = controller.verifySourcesTabRebuilds - sourcesBefore
         guard !afterPlaying, afterFormat, sourcesShown == 1 else {
             throw CaptureError("Hidden Sources page: marked \(afterPlaying) by play positions, \(afterFormat) by a new format, rebuilt \(sourcesShown) times when shown")
+        }
+        // Playback controls that go or come, another name and another reason for having stopped
+        // are shown on the page too, so each marks it.
+        func marks(_ change: () -> Void) -> Bool {
+            controller.pendingSourcesTabRebuild = false
+            change()
+            return controller.pendingSourcesTabRebuild
+        }
+        controller.selectOptionCategory(export)
+        let noPlayback = marks { receiveSource(position: nil, format: "b") }
+        let playback = marks { receiveSource(position: 5, format: "b") }
+        let moved = marks { receiveSource(position: 6, format: "b") }
+        let renamed = marks { receiveSource(position: 6, format: "b", name: "Other") }
+        receiveSource(position: 6, format: "b", name: "Other", state: "failed", reason: "one")
+        let reason = marks { receiveSource(position: 6, format: "b", name: "Other", state: "failed", reason: "two") }
+        guard noPlayback, playback, !moved, renamed, reason else {
+            throw CaptureError("Hidden Sources page: marked \(noPlayback) by playback controls going, \(playback) by them coming, \(moved) by a play position, \(renamed) by a name, \(reason) by a reason")
         }
     }
 
@@ -3935,6 +3952,36 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             guard controller.optionTabs?.selectedTabViewItem?.label == "Export",
                   controller.addonSettingDrafts.isEmpty else {
                 throw CaptureError("Switching after focus without typing sent drafts \(controller.addonSettingDrafts) or landed on \(controller.optionTabs?.selectedTabViewItem?.label ?? "-")")
+            }
+        case "not-a-number":
+            // Text that is not a number in a Number setting sends nothing, and the field shows the
+            // setting's value again; + then steps from that value, not from the lowest one.
+            guard let addons = category("Add-ons"), let export = category("Export") else { throw CaptureError("No categories") }
+            for value in ["abc", "", "nan", "inf"] {
+                controller.selectOptionCategory(addons)
+                try autoreleasepool {
+                    guard let view = page("Add-ons") else { throw CaptureError("No Add-ons page") }
+                    let fields = editable(view)
+                    guard fields.count == 2 else { throw CaptureError("The Add-ons page has \(fields.count) fields") }
+                    try type(value, into: fields[1])
+                }
+                controller.selectOptionCategory(export)
+                let shown = autoreleasepool { page("Add-ons").map(editable)?.last?.stringValue }
+                guard controller.addonSettingDrafts.isEmpty, shown == "0.5" else {
+                    throw CaptureError("\"\(value)\" in a Number setting sent \(controller.addonSettingDrafts) and left the field showing \(shown ?? "-")")
+                }
+            }
+            controller.selectOptionCategory(addons)
+            try autoreleasepool {
+                guard let view = page("Add-ons"), let field = editable(view).last,
+                      let plus = controller.addonNumberSteps.first(where: { $0.value.0 === field && $0.value.1 })?.key else {
+                    throw CaptureError("No + button for the Number setting")
+                }
+                try type("abc", into: field)
+                controller.addonSettingNumberStep(plus)
+            }
+            guard controller.addonSettingDrafts["verify.typing:gain"] == .double(0.6) else {
+                throw CaptureError("+ on a Number setting holding \"abc\" sent \(String(describing: controller.addonSettingDrafts["verify.typing:gain"]))")
             }
         case "open-list":
             // A Choice setting's list is open when an add-on's answer rebuilds the page.
@@ -8629,11 +8676,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if !optionsPageShown("Add-ons"), Self.addonsPageChanged(from: prev, to: snap), optionTabs != nil {
             pendingAddonsTabReload = true
         }
-        // What the Sources page shows of a source: not its play position, which its chip refreshes.
+        // What the Sources page shows of a source, its name, why it stopped and whether it has
+        // playback controls included: not its play position, which its chip refreshes.
         let sourcesStructureChanged = !prev.addons.elementsEqual(snap.addons) { a, b in
-            a.id == b.id && a.state == b.state && a.sources.elementsEqual(b.sources) { s1, s2 in
-                s1.id == s2.id && s1.format == s2.format && s1.formats == s2.formats
+            a.id == b.id && a.state == b.state && a.reason == b.reason && a.sources.elementsEqual(b.sources) { s1, s2 in
+                s1.id == s2.id && s1.name == s2.name && s1.format == s2.format && s1.formats == s2.formats
                     && s1.sender == s2.sender && s1.groups == s2.groups
+                    && (s1.transport == nil) == (s2.transport == nil)
             }
         }
         if !optionsPageShown("Sources"), sourcesStructureChanged, optionTabs != nil {
@@ -8648,7 +8697,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                         reloadAddonsTab()
                     }
                 }
-            } else if sourcesChanged {
+            } else if sourcesChanged || sourcesStructureChanged {
                 if sourcesStructureChanged, !sourcesRebuilt {
                     if userIsHandlingControls || editingOptionsText {
                         pendingSourcesTabRebuild = true
@@ -9463,18 +9512,31 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         submitAddonSetting(host: host, id: parts[0], key: parts[1], label: parts[2], value: .string(val))
     }
 
+    /// The value an Add-ons Number setting has now, as the add-on holds it.
+    private func addonNumberSettingValue(addonID: String, key: String) -> Double? {
+        guard let entry = currentAddonSnapshot.addon(addonID)?.settings.first(where: { $0.declaration.key == key }) else { return nil }
+        return entry.value.doubleValue ?? entry.declaration.defaultValue.doubleValue
+    }
+
     @objc private func addonSettingNumberChanged(_ sender: NSTextField) {
         guard let info = addonSettingNumberFields[sender], let host = addonHost else { return }
-        let parsed = Double(sender.stringValue.trimmingCharacters(in: .whitespaces)) ?? info.min
-        let snapped = AddonJSONValue.snapNumber(parsed, min: info.min, max: info.max, step: info.step)
+        let current = addonNumberSettingValue(addonID: info.addonID, key: info.key)
+        func show(_ value: Double) {
+            let decimals = AddonJSONValue.stepDecimals(info.step)
+            sender.stringValue = decimals == 0 ? String(format: "%.0f", value) : String(format: "%.\(decimals)f", value)
+        }
+        // Text that is not a number changes nothing: the field shows the setting's value again,
+        // as on Windows, instead of sending the lowest value.
+        guard let typed = Double(sender.stringValue.trimmingCharacters(in: .whitespaces)), typed.isFinite else {
+            show(AddonJSONValue.snapNumber(current ?? info.min, min: info.min, max: info.max, step: info.step))
+            return
+        }
+        let snapped = AddonJSONValue.snapNumber(typed, min: info.min, max: info.max, step: info.step)
         let json = AddonJSONValue.snappedNumber(snapped, min: info.min, max: info.max, step: info.step)
         let slot = "\(info.addonID):\(info.key)"
-        if addonSettingDrafts[slot] == nil, addonProblems[slot] == nil,
-           let entry = currentAddonSnapshot.addon(info.addonID)?.settings.first(where: { $0.declaration.key == info.key }),
-           let currentVal = entry.value.doubleValue ?? entry.declaration.defaultValue.doubleValue,
-           AddonJSONValue.snappedNumber(currentVal, min: info.min, max: info.max, step: info.step) == json {
-            let decimals = AddonJSONValue.stepDecimals(info.step)
-            sender.stringValue = decimals == 0 ? String(format: "%.0f", snapped) : String(format: "%.\(decimals)f", snapped)
+        if addonSettingDrafts[slot] == nil, addonProblems[slot] == nil, let current,
+           AddonJSONValue.snappedNumber(current, min: info.min, max: info.max, step: info.step) == json {
+            show(snapped)
             return
         }
         submitAddonSetting(host: host, id: info.addonID, key: info.key, label: info.label, value: json)
@@ -9483,7 +9545,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     @objc private func addonSettingNumberStep(_ sender: NSButton) {
         guard let (field, up) = addonNumberSteps[sender], let info = addonSettingNumberFields[field],
               let host = addonHost else { return }
-        let shown = Double(field.stringValue.trimmingCharacters(in: .whitespaces)) ?? info.min
+        // A field that holds no number steps from the setting's value, not from the lowest one.
+        let typed = Double(field.stringValue.trimmingCharacters(in: .whitespaces)).flatMap { $0.isFinite ? $0 : nil }
+        let shown = typed ?? addonNumberSettingValue(addonID: info.addonID, key: info.key) ?? info.min
         let json = AddonJSONValue.snappedNumber(shown + (up ? info.step : -info.step), min: info.min, max: info.max, step: info.step)
         submitAddonSetting(host: host, id: info.addonID, key: info.key, label: info.label, value: json)
     }
