@@ -2944,19 +2944,28 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         view.verifyShow(rows: WaveformRow.layout(widths: [2], labels: [[]], stereo: false), laneWidths: [2], frames: first..<end)
         // Something else holds the capture queue, so the freeze is still running when select returns.
         tap.readCapture(poll: false, { _ in Thread.sleep(forTimeInterval: 0.3); return 0 }) { _ in }
-        let command = AddonControlCommand(command: "select", from_seconds_ago: 0.5, to_seconds_ago: 0.1,
-            start_frame: nil, end_frame: nil, lane: nil, first: nil, last: nil, seconds: nil, folder: nil, source: nil)
-        let call = AddonControlCall(addon_id: "verify.select", addon_name: "Verify", run: 1, request_id: "sel", command: command)
-        controller.executeSingleControlCall(host: host, call: call)
-        let early = host.verifyEvents.filter { $0.hasPrefix("control_reply") }
-        let deadline = ProcessInfo.processInfo.systemUptime + 5
-        while !host.verifyEvents.contains(where: { $0.hasPrefix("control_reply") }) && ProcessInfo.processInfo.systemUptime < deadline {
-            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
-            controller.answerSelectFreezeWaits()
+        view.verifySilentPreview = true
+        func call(_ name: String, _ id: String) -> AddonControlCall {
+            let command = AddonControlCommand(command: name, from_seconds_ago: name == "select" ? 0.5 : nil,
+                to_seconds_ago: name == "select" ? 0.1 : nil, start_frame: nil, end_frame: nil, lane: nil,
+                first: nil, last: nil, seconds: nil, folder: nil, source: nil)
+            return AddonControlCall(addon_id: "verify.select", addon_name: "Verify", run: 1, request_id: id, command: command)
         }
+        // One batch: select, then play_preview while the freeze is still running.
+        controller.executeSingleControlCall(host: host, call: call("select", "sel"))
+        controller.executeSingleControlCall(host: host, call: call("play_preview", "early"))
+        let early = host.verifyEvents.filter { $0.hasPrefix("control_reply") }
+        // Only the main queue runs now, no poll: the freeze's own completion must answer select.
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        while !host.verifyEvents.contains("control_reply sel ok") && ProcessInfo.processInfo.systemUptime < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        controller.executeSingleControlCall(host: host, call: call("play_preview", "late"))
         let replies = host.verifyEvents.filter { $0.hasPrefix("control_reply") }
-        guard early.isEmpty, replies == ["control_reply sel ok"], view.hasEditingMaterial, !view.isPreparingMaterial else {
-            throw CaptureError("select answered \(early) before its freeze and \(replies) after")
+        guard early == ["control_reply early failed"],
+              replies == ["control_reply early failed", "control_reply sel ok", "control_reply late ok"],
+              controller.buildControlState().preview_playing, view.hasEditingMaterial, !view.isPreparingMaterial else {
+            throw CaptureError("select and play_preview answered \(early) before the freeze and \(replies) in all (playing \(controller.buildControlState().preview_playing))")
         }
     }
 
@@ -7015,7 +7024,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             if testCopy {
                 return .failure(TestActionRefusal(code: "failed", message: "a test copy of Backtracking does not play audio"))
             }
-            _ = waveform?.togglePreview()
+            // A preview already playing goes on; otherwise one that did not start says why
+            // (Windows `ui/commands.rs:279-286`).
+            if waveform?.isPreviewPlaying != true {
+                _ = waveform?.togglePreview()
+                if waveform?.isPreviewPlaying != true {
+                    return .failure(TestActionRefusal(code: "failed", message: notice ?? "The selected audio is unavailable."))
+                }
+            }
             return .success(nil)
         case .stopPreview:
             waveform?.stopPreview()
@@ -7082,6 +7098,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     func onEditMaterialReady(_ material: WAVExport) {
+        // An add-on's select waiting for this freeze is answered now, not at the next poll.
+        answerSelectFreezeWaits()
         guard !pendingSnapshots.isEmpty else { return }
         let queued = pendingSnapshots
         pendingSnapshots.removeAll()
@@ -7091,6 +7109,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     func onEditMaterialUnavailable() {
+        answerSelectFreezeWaits()
         failPendingSnapshots("No audio available for this selection.")
     }
 
@@ -9283,7 +9302,17 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     var currentRetainedFrames: Range<UInt64> { retainedFrames }
     var currentVisibleFrames: Range<UInt64> { visibleFrames }
     var isPointerGestureCurrentlyActive: Bool { isPointerGestureActive }
-    var isPreviewPlaying: Bool { player?.range != nil }
+    var isPreviewPlaying: Bool {
+        #if BACKTRACKING_CAPTURE_VERIFY
+        if verifySilentPreview { return verifyPreviewRange != nil }
+        #endif
+        return player?.range != nil
+    }
+    #if BACKTRACKING_CAPTURE_VERIFY
+    /// A verification starts no audio: a preview that would play is only noted.
+    var verifySilentPreview = false
+    var verifyPreviewRange: Range<UInt64>?
+    #endif
 
     func chosenRowsForControlState() -> [AddonRowState] {
         let rows = activeSelectedRows
@@ -9884,6 +9913,9 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             controller?.setNotice(materialPending ? "Preparing selection…" : "The selected audio is unavailable.")
             return true
         }
+        #if BACKTRACKING_CAPTURE_VERIFY
+        if verifySilentPreview { verifyPreviewRange = selection; return true }
+        #endif
         if player == nil {
             player = PreviewPlayer()
             player?.onChange = { [weak self] in self?.needsDisplay = true }
