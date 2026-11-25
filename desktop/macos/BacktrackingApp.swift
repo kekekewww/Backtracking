@@ -3686,6 +3686,32 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard hidden == 0, shown == 1, again == 1, closed == 1, reopened == 2, !controller.pendingAddonsTabReload, !sourcesLeft else {
             throw CaptureError("Hidden Add-ons page reloads: hidden \(hidden), shown \(shown), again \(again), closed \(closed), reopened \(reopened)")
         }
+        // The Sources page, hidden: a play position that moves marks nothing; a new format does,
+        // and the page is rebuilt once when it is shown.
+        func receiveSource(position: Double, format: String) {
+            generation += 1
+            let source = AddonSource(id: "main", name: "Main", sender: "s", formats: [], format: format, groups: nil,
+                                     transport: AddonTransport(state: "playing", position: position, duration: 10))
+            let addon = AddonRecord(id: "verify.hidden", manifest: nil, enabled: true, state: "running", reason: nil,
+                pid: nil, message: nil, sources: [source], settings: [], actions: [], control_allowed: false, control_asked: false)
+            host.verifyReceive(AddonSnapshot(schema: 1, generation: generation, ready: true, error: nil,
+                                             addons: [addon], appearances: [:], completed: []))
+            controller.syncAddonSnapshotUI()
+        }
+        controller.selectOptionCategory(export)
+        receiveSource(position: 1, format: "a")
+        controller.pendingSourcesTabRebuild = false
+        receiveSource(position: 2, format: "a")
+        receiveSource(position: 3, format: "a")
+        let afterPlaying = controller.pendingSourcesTabRebuild
+        receiveSource(position: 4, format: "b")
+        let afterFormat = controller.pendingSourcesTabRebuild
+        let sourcesBefore = controller.verifySourcesTabRebuilds
+        if let sources = category("Sources") { controller.selectOptionCategory(sources) }
+        let sourcesShown = controller.verifySourcesTabRebuilds - sourcesBefore
+        guard !afterPlaying, afterFormat, sourcesShown == 1 else {
+            throw CaptureError("Hidden Sources page: marked \(afterPlaying) by play positions, \(afterFormat) by a new format, rebuilt \(sourcesShown) times when shown")
+        }
     }
 
     /// V10-M1/M2: a page rebuilt while one of its fields is being typed into sends what was typed
@@ -8440,7 +8466,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if !optionsPageShown("Add-ons"), Self.addonsPageChanged(from: prev, to: snap), optionTabs != nil {
             pendingAddonsTabReload = true
         }
-        if !optionsPageShown("Sources"), sourcesChanged, optionTabs != nil {
+        // What the Sources page shows of a source: not its play position, which its chip refreshes.
+        let sourcesStructureChanged = !prev.addons.elementsEqual(snap.addons) { a, b in
+            a.id == b.id && a.state == b.state && a.sources.elementsEqual(b.sources) { s1, s2 in
+                s1.id == s2.id && s1.format == s2.format && s1.formats == s2.formats
+                    && s1.sender == s2.sender && s1.groups == s2.groups
+            }
+        }
+        if !optionsPageShown("Sources"), sourcesStructureChanged, optionTabs != nil {
             pendingSourcesTabRebuild = true
         }
         if optionsPageShown("Add-ons") || optionsPageShown("Sources") {
@@ -8453,12 +8486,6 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                     }
                 }
             } else if sourcesChanged {
-                let sourcesStructureChanged = !prev.addons.elementsEqual(snap.addons) { a, b in
-                    a.id == b.id && a.state == b.state && a.sources.elementsEqual(b.sources) { s1, s2 in
-                        s1.id == s2.id && s1.format == s2.format && s1.formats == s2.formats
-                            && s1.sender == s2.sender && s1.groups == s2.groups
-                    }
-                }
                 if sourcesStructureChanged, !sourcesRebuilt {
                     if userIsHandlingControls || editingOptionsText {
                         pendingSourcesTabRebuild = true
