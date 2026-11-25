@@ -1995,6 +1995,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var verifyAddonsTabReloads = 0
     private var verifySourcesTabRebuilds = 0
     private var verifyLookControlRebuilds = 0
+    private var verifyLookRecomputes = 0
     #endif
     /// The window's editing freezes still in flight, oldest first; `pendingSnapshots` wait for them.
     private var editingFreezeReads: [EditingMaterialRead] = []
@@ -3126,9 +3127,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         controller.verifyLookControlRebuilds = 0
         receiveSource("a")
         OptionsPopUpButton.verifyShown = false
+        controller.verifyLookRecomputes = 0
         receiveSource("b")
-        guard controller.verifyLookControlRebuilds == 1 else {
-            throw CaptureError("The look controls were rebuilt \(controller.verifyLookControlRebuilds) times in the pass the list closed")
+        guard controller.verifyLookControlRebuilds == 1, controller.verifyLookRecomputes == 1 else {
+            throw CaptureError("The look controls were rebuilt \(controller.verifyLookControlRebuilds) times and the look worked out \(controller.verifyLookRecomputes) times in the pass the list closed")
         }
     }
 
@@ -3479,7 +3481,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let closed = controller.verifyAddonsTabReloads
         controller.catchUpOptionsPage()
         let reopened = controller.verifyAddonsTabReloads
-        guard hidden == 0, shown == 1, again == 1, closed == 1, reopened == 2, !controller.pendingAddonsTabReload else {
+        // A page rebuilt by another path (adding a source rebuilds Sources) leaves nothing to do later.
+        controller.pendingSourcesTabRebuild = true
+        controller.replaceOptionsTab(with: controller.makeSourceTab())
+        let sourcesLeft = controller.pendingSourcesTabRebuild
+        guard hidden == 0, shown == 1, again == 1, closed == 1, reopened == 2, !controller.pendingAddonsTabReload, !sourcesLeft else {
             throw CaptureError("Hidden Add-ons page reloads: hidden \(hidden), shown \(shown), again \(again), closed \(closed), reopened \(reopened)")
         }
     }
@@ -4945,6 +4951,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             guard tabs.tabViewItems.contains(where: { $0 === previous }) else { return }
         }
         previous.initialFirstResponder = nil
+        // A page rebuilt by any path shows the latest state; a rebuild put off for it is done.
+        if page.label == "Sources" { pendingSourcesTabRebuild = false }
+        if page.label == "Add-ons" { pendingAddonsTabReload = false }
         let selected = tabs.selectedTabViewItem === previous
         let offset = (previous.view as? NSScrollView)?.contentView.bounds.origin ?? .zero
         tabs.insertTabViewItem(page, at: index)
@@ -8028,11 +8037,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         lastAddonSnapshotForUI = snap
         if prev.appearances != snap.appearances || prev.addons.map(\.id) != snap.addons.map(\.id) {
             let rebuild = Self.lookControlsChanged(from: prev, to: snap, chosen: selectedLookAddonID)
-            if rebuild && userIsHandlingControls {
+            if lookRebuilt {
+                // The rebuild above already applied this snapshot's look.
+            } else if rebuild && userIsHandlingControls {
                 pendingLookControlsRebuild = true
                 recomputeLook(refreshAppearanceTab: false)
             } else {
-                recomputeLook(refreshAppearanceTab: rebuild && !lookRebuilt)
+                recomputeLook(refreshAppearanceTab: rebuild)
             }
         }
         // Refresh cached source choices if any running add-on sources changed.
@@ -8206,6 +8217,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func recomputeLook(refreshAppearanceTab: Bool) {
+        #if BACKTRACKING_CAPTURE_VERIFY
+        verifyLookRecomputes += 1
+        #endif
         let nextLook: ResolvedLook
         if let id = selectedLookAddonID, let appearance = currentAddonSnapshot.appearances[id] {
             nextLook = ResolvedLook.from(appearance: appearance, accentRGB: accentRGB)
