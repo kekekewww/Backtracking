@@ -85,6 +85,12 @@ func verifyMacClipExportedAtExportRate() throws {
 }
 
 @MainActor
+func verifyMacCrossSourceEdgeScroll() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyCrossSourceEdgeScroll()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -2205,6 +2211,47 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard let crossed = view.selectedRowsForExport ?? (view.hasSelection ? view.verifyRememberedRows : nil),
               crossed.count == 6 else {
             throw CaptureError("A new selection across rows took \(view.selectedRowsForExport ?? []) rows")
+        }
+    }
+
+    /// A selection dragged from source A into stacked source B and past the plot's bottom scrolls
+    /// B, the lane the drag is in now, and takes the row that comes into view (Windows `row_drag`).
+    static func verifyCrossSourceEdgeScroll() throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-edge-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        let view = WaveformView(frame: NSRect(x: 0, y: 0, width: 600, height: 120))
+        view.controller = controller
+        controller.waveform = view
+        defer { controller.waveform = nil }
+        let widths: [UInt32] = [2, 8]
+        let labels = ["FL", "FR", "FC", "LFE", "Ls", "Rs", "Lb", "Rb"]
+        view.verifyShow(rows: WaveformRow.layout(widths: widths, labels: [[], labels], stereo: false),
+                        laneWidths: widths, frames: 0..<48_000)
+        view.separateLanes = true
+        let boxes = view.verifyLaneBoxes
+        guard boxes.count == 2, !boxes[0].scrolls, boxes[1].scrolls else {
+            throw CaptureError("Edge scroll setup: lanes \(boxes)")
+        }
+        func mouse(_ type: NSEvent.EventType, _ point: NSPoint) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: point, modifierFlags: [.option], timestamp: 0, windowNumber: 0,
+                               context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        }
+        let aY = 120 - (boxes[0].top + boxes[0].height / 2)
+        let bY = 120 - (boxes[1].top + boxes[1].height / 2)
+        view.mouseDown(with: mouse(.leftMouseDown, NSPoint(x: 200, y: aY)))
+        view.mouseDragged(with: mouse(.leftMouseDragged, NSPoint(x: 260, y: bY)))
+        view.mouseDragged(with: mouse(.leftMouseDragged, NSPoint(x: 280, y: -10)))
+        let first = view.verifyLaneFirstRows
+        let rows = view.verifyRememberedRows
+        view.verifyStopEdgeScroll()
+        view.mouseUp(with: mouse(.leftMouseUp, NSPoint(x: 280, y: 60)))
+        let lastShown = first.count == 2 ? first[1] + boxes[1].shown - 1 : -1
+        let entered = lastShown >= 2 ? RowIdentity.channel(lane: 1, index: lastShown - 2) : nil
+        guard first.count == 2, first[1] == 1, let entered, rows.last == entered, rows.first == .whole(lane: 0) else {
+            throw CaptureError("Dragging past B's bottom scrolled lanes to \(first) and chose \(rows)")
         }
     }
 
@@ -7970,6 +8017,9 @@ extension WaveformView {
 
     var verifyRememberedRows: [RowIdentity] { rememberedRows }
     var verifyChipToolTipTags: [NSView.ToolTipTag] { chipToolTipTags }
+    var verifyLaneFirstRows: [Int] { laneFirstRows }
+    var verifyLaneBoxes: [LaneLayoutBox] { laneBoxes }
+    func verifyStopEdgeScroll() { stopEdgeAutoScroll() }
     /// Puts one group chip and one transport chip on the plot and lets the view register them.
     func verifyShowChips() -> [(NSPoint, String)] {
         let group = OverlayChip(rect: NSRect(x: 40, y: 3, width: 50, height: 14), text: "Objects", current: false,
@@ -8076,6 +8126,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     }
     private var scrollDrag: ScrollDrag?
     private var edgeScrollTimer: Timer?
+    private var edgeScrollPoint: NSPoint?
     private var retainedFrames: Range<UInt64> = 0..<0
     private var visibleFrames: Range<UInt64> = 0..<0
     private var renderedFrames: Range<UInt64> = 0..<0
@@ -9103,17 +9154,37 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         return visibleFrames.lowerBound + UInt64((Double(fraction(at: x)) * Double(count)).rounded())
     }
 
+    /// With one or two sources, the scrolling lane the drag's row is in scrolls while the pointer
+    /// is past that lane's top or bottom and it has rows that way (Windows `row_drag`).
+    private func laneEdgeScroll(at point: NSPoint) -> (lane: Int, direction: Int)? {
+        guard columnBox == nil, let lane = selectionCursorRow?.lane, laneBoxes.indices.contains(lane),
+              laneFirstRows.indices.contains(lane) else { return nil }
+        let box = laneBoxes[lane]
+        guard box.scrolls else { return nil }
+        let yFromTop = audioRect.maxY - point.y
+        if yFromTop < box.top && laneFirstRows[lane] > 0 { return (lane, -1) }
+        if yFromTop >= box.top + box.height && laneFirstRows[lane] + box.shown < box.rows { return (lane, 1) }
+        return nil
+    }
+
     private func startEdgeAutoScrollIfNeeded(at point: NSPoint) {
         guard anchor != nil, selectionUpdatesRows else { stopEdgeAutoScroll(); return }
-        let above = point.y > audioRect.maxY
-        let below = point.y < audioRect.minY
-        if above || below {
+        edgeScrollPoint = point
+        let past: Bool
+        if columnBox != nil {
+            past = point.y > audioRect.maxY || point.y < audioRect.minY
+        } else {
+            past = laneEdgeScroll(at: point) != nil
+        }
+        if past {
             if edgeScrollTimer == nil {
                 let t = Timer(timeInterval: 0.09, repeats: true) { [weak self] _ in
                     self?.edgeAutoScrollTick()
                 }
                 RunLoop.main.add(t, forMode: .common)
                 edgeScrollTimer = t
+                // The first row scrolls in at once, then one every 90 ms (Windows `EDGE_SCROLL_STEP`).
+                edgeAutoScrollTick()
             }
         } else {
             stopEdgeAutoScroll()
@@ -9123,44 +9194,41 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     private func stopEdgeAutoScroll() {
         edgeScrollTimer?.invalidate()
         edgeScrollTimer = nil
+        edgeScrollPoint = nil
     }
 
     private func edgeAutoScrollTick() {
-        guard anchor != nil, selectionUpdatesRows, let window else { stopEdgeAutoScroll(); return }
-        let screenPoint = NSEvent.mouseLocation
-        let windowPoint = window.convertPoint(fromScreen: screenPoint)
-        let local = convert(windowPoint, from: nil)
-        let direction: Int
-        if local.y > audioRect.maxY { direction = -1 }
-        else if local.y < audioRect.minY { direction = 1 }
-        else { stopEdgeAutoScroll(); return }
-
-        var scrolled = false
-        if let col = columnBox, col.scrolls {
+        // The pointer held still keeps scrolling; it is where the last drag event left it.
+        guard anchor != nil, selectionUpdatesRows, let local = edgeScrollPoint else { stopEdgeAutoScroll(); return }
+        var cursor: RowIdentity?
+        if let col = columnBox {
+            let direction: Int
+            if local.y > audioRect.maxY { direction = -1 }
+            else if local.y < audioRect.minY { direction = 1 }
+            else { stopEdgeAutoScroll(); return }
+            guard col.scrolls else { return }
             let maxFirst = max(0, col.rows - col.shown)
             let next = min(maxFirst, max(0, columnFirstRow + direction))
-            if next != columnFirstRow {
-                columnFirstRow = next
-                scrolled = true
-            }
-        } else if let anchorLane = selectionAnchorRow?.lane, laneBoxes.indices.contains(anchorLane), laneBoxes[anchorLane].scrolls {
-            let box = laneBoxes[anchorLane]
-            let maxFirst = max(0, box.rows - box.shown)
-            let next = min(maxFirst, max(0, laneFirstRows[anchorLane] + direction))
-            if next != laneFirstRows[anchorLane] {
-                laneFirstRows[anchorLane] = next
-                scrolled = true
-            }
-        }
-        if scrolled {
+            guard next != columnFirstRow else { return }
+            columnFirstRow = next
             recomputeRowLayout()
-            if let anchorRow = selectionAnchorRow, let nextRow = rowIdentity(at: local, clampedToVisible: true) {
-                selectionCursorRow = nextRow
-                rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: anchorRow, cursor: nextRow)
-            }
-            controller?.refreshWaveform()
-            needsDisplay = true
+            cursor = rowIdentity(at: local, clampedToVisible: true)
+        } else {
+            guard let (lane, direction) = laneEdgeScroll(at: local) else { stopEdgeAutoScroll(); return }
+            laneFirstRows[lane] += direction
+            recomputeRowLayout()
+            // The drag takes the row that came into view at that edge.
+            let laneRows = displayedRows.filter { $0.lane == lane }
+            let box = laneBoxes[lane]
+            let index = direction > 0 ? box.first + box.shown - 1 : box.first
+            cursor = laneRows.indices.contains(index) ? laneRows[index].identity : nil
         }
+        if let anchorRow = selectionAnchorRow, let cursor {
+            selectionCursorRow = cursor
+            rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: anchorRow, cursor: cursor)
+        }
+        controller?.refreshWaveform()
+        needsDisplay = true
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -9306,7 +9374,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 let position = frame(at: event)
                 selection = min(anchor, position)..<max(anchor, position)
             }
-            if selectionUpdatesRows, let anchorRow = selectionAnchorRow,
+            // Past the edge of the scrolling lane the drag is in, that lane scrolls instead.
+            if selectionUpdatesRows, laneEdgeScroll(at: local) == nil, let anchorRow = selectionAnchorRow,
                let nextRow = rowIdentity(at: local, clampedToVisible: true) {
                 selectionCursorRow = nextRow
                 rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: anchorRow, cursor: nextRow)
