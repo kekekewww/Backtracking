@@ -27,8 +27,10 @@ if [[ "${1:-}" == --clean ]]; then
   id="$2"
   [[ "$id" == "$prefix"* && "$id" =~ ^[A-Za-z0-9.-]+$ && "${#id}" -gt "${#prefix}" ]] \
     || fail "Only test copy identifiers starting with $prefix can be cleaned."
-  # A domain that was never written is not an error.
+  # A domain that was never written is not an error. defaults leaves an empty file behind, so
+  # the file goes too, once cfprefsd has let go of the domain.
   defaults delete "$id" >/dev/null 2>&1 || true
+  rm -f -- "$real_home/Library/Preferences/$id.plist"
   rm -rf -- "$real_home/Library/Saved Application State/$id.savedState"
   printf 'Cleaned %s\n' "$id"
   exit 0

@@ -74,4 +74,5 @@ for id in com.backtracking.audio.capture com.backtracking.audio.capture.testcopy
   if "$script" --clean "$id" >/dev/null 2>&1; then fail "--clean accepted $id"; fi
 done
 "$script" --clean "com.backtracking.audio.capture.testcopy.never-made-$$" >/dev/null || fail "--clean of an unused test id failed"
+[[ ! -e "$real_home/Library/Preferences/com.backtracking.audio.capture.testcopy.never-made-$$.plist" ]] || fail "--clean left a preferences file"
 printf 'make-test-copy: copy, identifier, signature, refused folders and clean checks passed.\n'
