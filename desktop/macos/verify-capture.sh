@@ -50,6 +50,7 @@ enum Verify {
         try verifyMacLookGradient()
         try verifyMacControlPauseHolds()
         try verifyMacLookUpdatesKeepControls()
+        try verifyMacFrequencyRows()
         try verifyMacTerminationSaves()
         try verifyFrequencyColors()
         try verifyRecorderHotkeys()
@@ -60,7 +61,7 @@ enum Verify {
         try AddonHostClient.verifyControlGate()
         try verifyMacControlBatchSnapshotSync()
         try verifyMacClipExportedAtExportRate()
-        print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options, test-copy isolation, flag drags keeping rows, chip tooltips, cross-source edge scroll, 64-channel limit, look gradients, add-on pauses holding, look updates keeping controls, exit saves, hotkeys, row layout, silent channel tracking, theme, add-on host, ticket completions, control grant checks, control batch window sync, clip_exported rates, look readability and positions passed.")
+        print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options, test-copy isolation, flag drags keeping rows, chip tooltips, cross-source edge scroll, 64-channel limit, look gradients, add-on pauses holding, look updates keeping controls, frequency rows by identity, exit saves, hotkeys, row layout, silent channel tracking, theme, add-on host, ticket completions, control grant checks, control batch window sync, clip_exported rates, look readability and positions passed.")
     }
 
     static func verifyFrequencyColors() throws {

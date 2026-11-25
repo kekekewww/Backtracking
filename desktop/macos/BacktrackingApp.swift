@@ -115,6 +115,12 @@ func verifyMacLookUpdatesKeepControls() throws {
 }
 
 @MainActor
+func verifyMacFrequencyRows() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyFrequencyRowsFollowIdentity()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -2440,6 +2446,19 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard !repaint, lookControlsChanged(from: b, to: c, chosen: "theme"), lookControlsChanged(from: c, to: d, chosen: "theme"),
               !lookControlsChanged(from: a, to: b, chosen: nil) else {
             throw CaptureError("A look's colour update rebuilds controls (\(repaint)) or a new gradient or offer does not")
+        }
+    }
+
+    /// A frequency read made just before a silent channel's row went away still colours the rows
+    /// that remain, each with its own colours.
+    static func verifyFrequencyRowsFollowIdentity() throws {
+        let labels = ["FL", "FR", "FC", "LFE", "Ls", "Rs"]
+        let before = WaveformRow.layout(widths: [6, 2], labels: [labels, []], stereo: false, activeMasks: [0b11_0111, nil])
+        let after = WaveformRow.layout(widths: [6, 2], labels: [labels, []], stereo: false, activeMasks: [0b11_0011, nil])
+        let mapped = after.indices.map { WaveformView.frequencyRowIndex(of: $0, displayed: after, read: before) }
+        let expected = after.map { row in before.firstIndex(of: row) }
+        guard before != after, mapped == expected, !mapped.contains(where: { $0 == nil }) else {
+            throw CaptureError("Rows after a silent channel hid map to \(mapped), expected \(expected)")
         }
     }
 
@@ -8295,6 +8314,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     private let frequencyQueue = DispatchQueue(label: "Backtracking.waveform-frequency", qos: .utility)
     private let wideWaveformQueue = DispatchQueue(label: "Backtracking.multichannel-waveform", qos: .userInitiated)
     private var frequencyWaveform: FrequencyWaveform?
+    /// The rows `frequencyWaveform` was read for, in its order.
+    private var frequencyRows: [WaveformRow] = []
     private var frequencyReading = false
     private var nextFrequencyRead = 0.0
     private struct FrequencyRequest: Equatable {
@@ -8798,9 +8819,11 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                     guard let self else { return }
                     self.frequencyReading = false
                     self.nextFrequencyRead = ProcessInfo.processInfo.systemUptime + elapsed * 2
-                    guard self.frequencyGradient != nil, self.materialVersion == request.materialVersion,
-                          self.displayedRows == request.rows else { return }
+                    // Rows that come and go while recording (a channel turning silent or sounding
+                    // again) no longer throw the read away; each row drawn finds its own colours.
+                    guard self.frequencyGradient != nil, self.materialVersion == request.materialVersion else { return }
                     self.frequencyWaveform = spectrum
+                    self.frequencyRows = request.rows
                     self.lastFrequencyRequest = request
                     self.needsDisplay = true
                 }
@@ -9885,6 +9908,13 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         return result
     }
 
+    /// Where the row drawn at `index` is in a frequency read made for `read`.
+    static func frequencyRowIndex(of index: Int, displayed: [WaveformRow], read: [WaveformRow]) -> Int? {
+        guard displayed.indices.contains(index) else { return nil }
+        if read.indices.contains(index), read[index] == displayed[index] { return index }
+        return read.firstIndex(of: displayed[index])
+    }
+
     private func paintTraces(
         _ rowPaths: [RowTracePath],
         selected: Bool,
@@ -9898,10 +9928,13 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             let fallbackRGB = look.effectiveWaveform(accent: accent).rgbUInt32
             for item in rowPaths where !item.coverage.isEmpty {
                 guard let rect = rowRect(for: item.rowIndex), traces.indices.contains(item.rowIndex) else { continue }
-                let colors = frequencyWaveform?.colors(
-                    for: item.rowIndex, in: renderedFrames, bins: traces[item.rowIndex].low.count,
-                    gradient: effective, liveFrames: live
-                ) ?? []
+                let colors = Self.frequencyRowIndex(of: item.rowIndex, displayed: displayedRows, read: frequencyRows)
+                    .flatMap { row in
+                        frequencyWaveform?.colors(
+                            for: row, in: renderedFrames, bins: traces[item.rowIndex].low.count,
+                            gradient: effective, liveFrames: live
+                        )
+                    } ?? []
                 guard let image = FrequencyWaveform.stripeImage(
                     colors.isEmpty ? [nil] : colors, fallback: fallbackRGB, dimmed: dimFrequency
                 ) else { continue }
