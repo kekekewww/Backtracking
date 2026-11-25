@@ -17,11 +17,13 @@ case "$(uname -m)" in
 esac
 
 target_dir="${CARGO_TARGET_DIR:-$repo_dir/target}"
-CARGO_TARGET_DIR="$target_dir" cargo build --locked --release --target "$rust_target" -p backtracking-core
+CARGO_TARGET_DIR="$target_dir" cargo build --locked --release --target "$rust_target" -p backtracking-addon-host
 app_dir="$target_dir/bundled/Backtracking.app"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
 cp "$source_dir/Info.plist" "$app_dir/Contents/Info.plist"
 cp "$repo_dir/assets/Backtracking.icns" "$app_dir/Contents/Resources/Backtracking.icns"
+cp "$target_dir/$rust_target/release/bt-addon-guard" "$app_dir/Contents/MacOS/bt-addon-guard"
+chmod 755 "$app_dir/Contents/MacOS/bt-addon-guard"
 if [[ -n "${BACKTRACKING_UPDATE_PUBLIC_KEY:-}" ]]; then
   if [[ ! "$BACKTRACKING_UPDATE_PUBLIC_KEY" =~ ^[a-f0-9]{64}$ ]]; then
     printf '%s\n' 'BACKTRACKING_UPDATE_PUBLIC_KEY must be 64 lowercase hexadecimal characters.' >&2
@@ -31,17 +33,20 @@ if [[ -n "${BACKTRACKING_UPDATE_PUBLIC_KEY:-}" ]]; then
 fi
 xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library -O \
   -target "$swift_target" -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
-  -import-objc-header "$repo_dir/crates/backtracking-core/include/backtracking.h" \
+  -import-objc-header "$source_dir/BacktrackingBridging.h" \
   "$source_dir/BacktrackingApp.swift" "$source_dir/SystemAudioTap.swift" "$source_dir/StartupUpdater.swift" \
   "$source_dir/FrequencyWaveform.swift" "$source_dir/RecorderHotkeys.swift" "$source_dir/TestCopy.swift" \
-  "$source_dir/WaveformLayout.swift" \
-  "$target_dir/$rust_target/release/libbacktracking_core.a" \
+  "$source_dir/WaveformLayout.swift" "$source_dir/AddonHost.swift" \
+  "$target_dir/$rust_target/release/libbacktracking_addon_host.a" \
   -framework AppKit -framework CoreAudio -framework AudioToolbox -framework AVFoundation -framework ServiceManagement -framework Carbon -framework CoreGraphics \
   -o "$app_dir/Contents/MacOS/Backtracking"
 identity="${BACKTRACKING_MAC_CODESIGN_IDENTITY:--}"
 if [[ "$identity" == - ]]; then
+  codesign --force --sign - "$app_dir/Contents/MacOS/bt-addon-guard"
   codesign --force --sign - "$app_dir"
 else
+  codesign --force --options runtime --timestamp --sign "$identity" \
+    "$app_dir/Contents/MacOS/bt-addon-guard"
   codesign --force --options runtime --timestamp --sign "$identity" \
     --entitlements "$source_dir/Backtracking.entitlements" "$app_dir"
 fi

@@ -16,10 +16,12 @@ case "$(uname -m)" in
 esac
 
 target_dir="${CARGO_TARGET_DIR:-$repo_dir/target}"
-CARGO_TARGET_DIR="$target_dir" cargo build --locked --release --target "$rust_target" -p backtracking-core
+CARGO_TARGET_DIR="$target_dir" cargo build --locked --release --target "$rust_target" -p backtracking-addon-host
 scratch="$(mktemp -d)"
 trap 'rm -rf -- "$scratch"' EXIT
 cat > "$scratch/Verify.swift" <<'SWIFT'
+import Foundation
+
 @main
 enum Verify {
     @MainActor
@@ -30,7 +32,8 @@ enum Verify {
         try verifyRecorderHotkeys()
         try verifyRowStackAndActivity()
         try verifyThemeAndReadability()
-        print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options, hotkeys, row layout, silent channel tracking and theme passed.")
+        try verifyStageBAddonsAndLook()
+        print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options, hotkeys, row layout, silent channel tracking, theme, add-on host, look readability and positions passed.")
     }
 
     static func verifyFrequencyColors() throws {
@@ -170,6 +173,81 @@ enum Verify {
         }
     }
 
+    static func verifyStageBAddonsAndLook() throws {
+        // Pkg 20: ResolvedLook readability rejects illegible dark waveform on dark plot and clamps numbers.
+        let badOffer = AddonAppearance(
+            colors: ["waveform": "#161a1d", "flag": "#ffaa44"],
+            numbers: ["border_width": 12.0, "corner_radius": 24.0, "waveform_stroke_scale": 0.1, "waveform_fill_opacity": 2.0],
+            rows: ["LFE": "#ff4444", "BadDark": "#161a1d"],
+            spectrum: [
+                AddonSpectrumStop(color: "#161a1d", position: 0.0),
+                AddonSpectrumStop(color: "#00ff88", position: 1.0),
+            ]
+        )
+        let resolved = ResolvedLook.from(appearance: badOffer, accentRGB: WaveformTheme.defaultAccentRGB)
+        guard resolved.waveform == nil,
+              resolved.flag == RGBA8(0xff, 0xaa, 0x44),
+              resolved.borderWidth == 8.0,
+              resolved.cornerRadius == 16.0,
+              resolved.waveformStrokeScale == 0.5,
+              resolved.waveformFillOpacity == 1.0,
+              resolved.rowColors["LFE"] == RGBA8(0xff, 0x44, 0x44),
+              resolved.rowColors["BadDark"] == nil else {
+            throw VerificationError("ResolvedLook readability or clamping failed")
+        }
+        guard let lookSpectrum = ResolvedLook.spectrum(from: badOffer) else {
+            throw VerificationError("ResolvedLook.spectrum failed to parse valid stops")
+        }
+        let legibleSpec = resolved.legibleSpectrum(for: lookSpectrum)
+        guard legibleSpec.replacedAny,
+              legibleSpec.gradient.stops[0].rgb == FrequencyGradient.standard.rgbAt(position: 0),
+              legibleSpec.gradient.stops[1].rgb == 0x00ff88 else {
+            throw VerificationError("ResolvedLook.legibleSpectrum did not replace unreadable stop")
+        }
+
+        // Pkg 16: AddonJSONValue snapping & link guard.
+        guard AddonJSONValue.snapNumber(0.30000000000000004, min: 0.0, max: 1.0, step: 0.1) == 0.3,
+              AddonFormatting.linkIsOpenable("https://example.com/addon"),
+              !AddonFormatting.linkIsOpenable("http://insecure.example.com"),
+              !AddonFormatting.linkIsOpenable("https://bad.com/a b"),
+              CaptureSource(key: "addon:test.addon:main") == .addon(addonID: "test.addon", sourceID: "main") else {
+            throw VerificationError("Add-on helper validation failed")
+        }
+
+        // Pkg 19: LanePositionBuffer freeze & overflow tracking.
+        let posBuf = LanePositionBuffer()
+        posBuf.enqueue(timeNs: 1_000_000_000, channels: [
+            AddonChannelPosition(channel: 3, x: 0.25, y: 0.5, z: 0.0, size: 0.1, gain: 1.0)
+        ])
+        posBuf.drain(evictedBefore: nil, retainedRange: 0..<1000) { _ in (1, 100) }
+        guard let frozen = posBuf.freeze() else {
+            throw VerificationError("LanePositionBuffer.freeze returned nil")
+        }
+        var outKey = BtPositionKey(frame: 0, x: 0, y: 0, z: 0, size: 0, gain: 0)
+        let count = bt_frozen_positions_read(frozen.pointer, 3, 0, 1000, &outKey, 1)
+        guard count == 1, outKey.frame == 100, abs(outKey.x - 0.25) < 1e-6 else {
+            throw VerificationError("Frozen positions readback mismatch")
+        }
+
+        // Pkg 16: AddonHostClient isolated root startup & clean shutdown.
+        let tmpRoot = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-addon-host-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmpRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpRoot) }
+        guard let client = AddonHostClient(dataRoot: tmpRoot.path, appVersion: "0.2.1", primary: true) else {
+            throw VerificationError("AddonHostClient failed to start")
+        }
+        let deadline = ProcessInfo.processInfo.systemUptime + 3.0
+        while !client.snapshot.ready && ProcessInfo.processInfo.systemUptime < deadline {
+            _ = client.pollSnapshot()
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        guard client.snapshot.ready, client.snapshot.error == nil, client.snapshot.addons.isEmpty else {
+            client.shutdownAndFree()
+            throw VerificationError("AddonHostClient did not reach ready state: \(client.snapshot.error ?? "not ready")")
+        }
+        client.shutdownAndFree()
+    }
+
     struct VerificationError: Error {
         let message: String
         init(_ message: String) { self.message = message }
@@ -178,11 +256,11 @@ enum Verify {
 SWIFT
 xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library -D BACKTRACKING_CAPTURE_VERIFY \
   -target "$swift_target" -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
-  -import-objc-header "$repo_dir/crates/backtracking-core/include/backtracking.h" \
+  -import-objc-header "$source_dir/BacktrackingBridging.h" \
   "$source_dir/BacktrackingApp.swift" "$source_dir/SystemAudioTap.swift" "$source_dir/StartupUpdater.swift" \
   "$source_dir/FrequencyWaveform.swift" "$source_dir/RecorderHotkeys.swift" "$source_dir/TestCopy.swift" \
-  "$source_dir/WaveformLayout.swift" \
-  "$scratch/Verify.swift" "$target_dir/$rust_target/release/libbacktracking_core.a" \
+  "$source_dir/WaveformLayout.swift" "$source_dir/AddonHost.swift" \
+  "$scratch/Verify.swift" "$target_dir/$rust_target/release/libbacktracking_addon_host.a" \
   -framework AppKit -framework AudioToolbox -framework CoreAudio -framework AVFoundation \
   -framework ServiceManagement -framework Carbon -framework CoreGraphics -o "$scratch/verify"
 "$scratch/verify"

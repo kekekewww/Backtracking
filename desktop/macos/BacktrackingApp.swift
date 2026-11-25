@@ -3,6 +3,7 @@ import AVFoundation
 import Carbon
 import CoreGraphics
 import ServiceManagement
+import UniformTypeIdentifiers
 
 private let timeChoices: [UInt32] = [10, 20, 30, 60, 180, 300, 600]
 private let autoResumeChoices: [UInt32] = [0, 5, 10]
@@ -203,8 +204,98 @@ private let offSourceKey = "off"
 /// A snapshot or a drag as the status line names it.
 private func exportDescription(_ files: [URL]) -> String {
     guard let first = files.first else { return "" }
+    let positions = files.filter { $0.lastPathComponent.hasSuffix("-Positions.json") }.count
+    let wavs = files.count - positions
+    let folder = first.deletingLastPathComponent().path
     if files.count == 1 { return first.path }
-    return "\(files.count) WAV files in \(first.deletingLastPathComponent().path)"
+    let wavText = wavs == 1 ? "1 WAV file" : "\(wavs) WAV files"
+    switch positions {
+    case 0: return "\(wavText) in \(folder)"
+    case 1: return "\(wavText) and a positions file in \(folder)"
+    default: return "\(wavText) and \(positions) positions files in \(folder)"
+    }
+}
+
+private func extractFileDropURLs(from info: NSDraggingInfo) -> [URL] {
+    let pb = info.draggingPasteboard
+    let classes: [AnyClass] = [NSURL.self]
+    let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+    return (pb.readObjects(forClasses: classes, options: options) as? [URL]) ?? []
+}
+
+private func drawPackageDropHint(in bounds: NSRect, accentColor: NSColor) {
+    let rect = bounds.insetBy(dx: 3, dy: 3)
+    guard rect.width > 40, rect.height > 20 else { return }
+    let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+    NSColor.black.withAlphaComponent(200.0 / 255.0).setFill()
+    path.fill()
+    accentColor.setStroke()
+    path.lineWidth = 2
+    path.stroke()
+    let fontSize: CGFloat = rect.height < 120 ? 13 : 17
+    let style = NSMutableParagraphStyle()
+    style.alignment = .center
+    let text = NSAttributedString(
+        string: "Drop to review this add-on before it is installed",
+        attributes: [
+            .font: NSFont.systemFont(ofSize: fontSize, weight: .medium),
+            .foregroundColor: NSColor(white: 235.0 / 255.0, alpha: 1),
+            .paragraphStyle: style,
+        ]
+    )
+    let box = text.boundingRect(with: NSSize(width: max(40, rect.width - 24), height: rect.height - 12), options: [.usesLineFragmentOrigin])
+    let drawRect = NSRect(
+        x: rect.minX + 12,
+        y: rect.midY - box.height / 2,
+        width: max(40, rect.width - 24),
+        height: box.height
+    )
+    text.draw(in: drawRect)
+}
+
+private final class OptionsDropContainerView: NSView {
+    var onDropFiles: (([URL]) -> Bool)?
+    var accentColorProvider: (() -> NSColor)?
+    private var packageHovered = false { didSet { if packageHovered != oldValue { needsDisplay = true } } }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        registerForDraggedTypes([.fileURL])
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        registerForDraggedTypes([.fileURL])
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let urls = extractFileDropURLs(from: sender)
+        guard !urls.isEmpty else { return [] }
+        packageHovered = urls.contains(where: AddonFormatting.isPackageURL)
+        return .copy
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        packageHovered = false
+    }
+
+    override func draggingEnded(_ sender: NSDraggingInfo) {
+        packageHovered = false
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        packageHovered = false
+        let urls = extractFileDropURLs(from: sender)
+        guard !urls.isEmpty else { return false }
+        return onDropFiles?(urls) ?? false
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        if packageHovered {
+            drawPackageDropHint(in: bounds, accentColor: accentColorProvider?() ?? accentColor(defaultAccentRGB))
+        }
+    }
 }
 
 private final class OptionsChoiceTable: NSTableView {
@@ -684,22 +775,30 @@ private struct WaveformRow: Equatable, Sendable {
 
     static func layout(
         widths: [UInt32], labels: [[String]], stereo: Bool,
-        activeMasks: [UInt64?] = []
+        activeMasks: [UInt64?] = [],
+        shownGroups: [(group: AddonChannelGroup, range: Range<Int>, hasBed: Bool)?] = []
     ) -> [WaveformRow] {
         widths.enumerated().flatMap { lane, width -> [WaveformRow] in
             let name = widths.count > 1 ? captureLaneLetter(lane) : nil
             let count = Int(width)
             if width > 2 {
                 let laneLabels = labels.indices.contains(lane) ? labels[lane] : []
-                let pair = [(0, UInt32(67), "L"), (1, UInt32(68), "R")].map { side, view, label in
+                let groupSpec = shownGroups.indices.contains(lane) ? shownGroups[lane] : nil
+                let includePair = groupSpec?.hasBed ?? true
+                let pair: [WaveformRow] = includePair ? [(0, UInt32(67), "L"), (1, UInt32(68), "R")].map { side, view, label in
                     WaveformRow(
                         identity: .pair(lane: lane, side: side), lane: lane, view: view,
                         title: name.map { "\($0) · \(label)" } ?? label,
                         shortLabel: label, fullLabel: label, laneChannelCount: count, channelNumber: nil
                     )
+                } : []
+                let shown: [Int]
+                if let groupSpec {
+                    shown = Array(groupSpec.range.lowerBound..<min(count, groupSpec.range.upperBound))
+                } else {
+                    let mask: UInt64? = activeMasks.indices.contains(lane) ? activeMasks[lane] : nil
+                    shown = ChannelActivityTracker.shownChannels(width: count, labels: laneLabels, activeMask: mask)
                 }
-                let mask: UInt64? = activeMasks.indices.contains(lane) ? activeMasks[lane] : nil
-                let shown = ChannelActivityTracker.shownChannels(width: count, labels: laneLabels, activeMask: mask)
                 return pair + shown.map { channel in
                     let full = laneLabels.indices.contains(channel) ? laneLabels[channel] : "Channel \(channel + 1)"
                     let short = RowStackLayout.shortLabel(full)
@@ -793,6 +892,8 @@ private final class WAVExport: @unchecked Sendable {
     let revision: UInt64
     let widths: [UInt32]
     private let channelNames: [[String]]
+    let channelGroups: [[AddonChannelGroup]]
+    private let positions: [Int: FrozenPositionsHandle]
     private let bars: [UInt64]
     private let cacheLock = NSLock()
     private var cachedActivity: [Int: UInt64] = [:]
@@ -803,7 +904,14 @@ private final class WAVExport: @unchecked Sendable {
     }
     private var cachedPeaks: (PeakKey, WaveformFrame)?
 
-    init?(core: OpaquePointer, routes: [CaptureRoute], channelNames: [[String]] = [], range: Range<UInt64>? = nil) {
+    init?(
+        core: OpaquePointer,
+        routes: [CaptureRoute],
+        channelNames: [[String]] = [],
+        channelGroups: [[AddonChannelGroup]] = [],
+        positions: [Int: FrozenPositionsHandle] = [:],
+        range: Range<UInt64>? = nil
+    ) {
         let first = bt_tracks_first_frame(core)
         let capturedSpan = range ?? first..<max(first, bt_tracks_end_frame(core))
         guard !capturedSpan.isEmpty,
@@ -815,6 +923,8 @@ private final class WAVExport: @unchecked Sendable {
         self.routes = routes.map(\.wavRouteCode)
         self.widths = routes.indices.map { bt_tracks_channels(core, UInt32($0)) }
         self.channelNames = channelNames
+        self.channelGroups = channelGroups
+        self.positions = positions
         let markerCount = bt_tracks_copy_bar_markers(core, capturedSpan.lowerBound, capturedSpan.upperBound, nil, 0)
         var markers = Array<UInt64>(repeating: 0, count: markerCount)
         let actual = markers.withUnsafeMutableBufferPointer {
@@ -829,6 +939,22 @@ private final class WAVExport: @unchecked Sendable {
         Self.releaseQueue.async { bt_frozen_free(OpaquePointer(bitPattern: address)) }
     }
 
+    private func bedInfo(for lane: Int) -> (start: UInt32, count: UInt32, labels: [String]) {
+        let width = widths.indices.contains(lane) ? Int(widths[lane]) : 0
+        if channelGroups.indices.contains(lane), !channelGroups[lane].isEmpty {
+            var offset = 0
+            for group in channelGroups[lane] {
+                let end = offset + group.channels.count
+                if !group.positioned && end <= width {
+                    return (UInt32(offset), UInt32(group.channels.count), group.channels)
+                }
+                offset = end
+            }
+        }
+        let all = channelNames.indices.contains(lane) ? channelNames[lane] : []
+        return (0, UInt32(width), all)
+    }
+
     func render(_ request: WaveformReadRequest) -> WaveformFrame {
         let visible = fittedWaveformRange(request.view, in: span)
         let bins = Int(request.policy(frames: visible, rate: sampleRate).bins)
@@ -840,9 +966,11 @@ private final class WAVExport: @unchecked Sendable {
         let traces = request.rows.map { row -> WaveformTrace in
             var trace = WaveformTrace(bins: bins)
             trace.read { minimum, maximum, count in
-                withChannelNames(row) { names in
-                    bt_frozen_waveform(frozen, UInt32(row.lane), row.view, visible.lowerBound,
-                        visible.upperBound, minimum, maximum, count, names)
+                withBedNames(row) { bedStart, bedCount, names in
+                    bt_frozen_waveform_bed(
+                        frozen, UInt32(row.lane), row.view, bedStart, bedCount,
+                        visible.lowerBound, visible.upperBound, minimum, maximum, count, names
+                    )
                 }
             }
             return trace
@@ -860,9 +988,11 @@ private final class WAVExport: @unchecked Sendable {
             var energy = [Float](repeating: 0, count: bins * FrequencyGradient.bandCount)
             energy.withUnsafeMutableBufferPointer {
                 let pointer = $0.baseAddress
-                withChannelNames(row) { names in
-                    bt_frozen_spectrum(frozen, UInt32(row.lane), row.view, range.lowerBound,
-                        range.upperBound, pointer, UInt32(bins), names)
+                withBedNames(row) { bedStart, bedCount, names in
+                    bt_frozen_spectrum_bed(
+                        frozen, UInt32(row.lane), row.view, bedStart, bedCount,
+                        range.lowerBound, range.upperBound, pointer, UInt32(bins), names
+                    )
                 }
             }
             return energy
@@ -870,9 +1000,14 @@ private final class WAVExport: @unchecked Sendable {
         return FrequencyWaveform(range: range, rows: energies)
     }
 
-    private func withChannelNames(_ row: WaveformRow, _ read: (UnsafePointer<CChar>?) -> Void) {
-        guard row.isPair, channelNames.indices.contains(row.lane) else { read(nil); return }
-        channelNames[row.lane].joined(separator: "\t").withCString { read($0) }
+    private func withBedNames(_ row: WaveformRow, _ read: (UInt32, UInt32, UnsafePointer<CChar>?) -> Void) {
+        guard row.isPair else { read(0, 0, nil); return }
+        let bed = bedInfo(for: row.lane)
+        if bed.labels.isEmpty {
+            read(bed.start, bed.count, nil)
+        } else {
+            bed.labels.joined(separator: "\t").withCString { read(bed.start, bed.count, $0) }
+        }
     }
 
     func activeChannels(for lane: Int) -> UInt64 {
@@ -889,21 +1024,55 @@ private final class WAVExport: @unchecked Sendable {
         return mask
     }
 
-    private func buildSelectionLanes(
+    private func resolvedGroupBounds(
+        for lane: Int, width: Int, preferredID: String?
+    ) -> (shownStart: UInt32, shownCount: UInt32, shownPositioned: UInt32, bedStart: UInt32, bedCount: UInt32) {
+        guard width > 2, channelGroups.indices.contains(lane), !channelGroups[lane].isEmpty else {
+            return (0, 0, 0, 0, 0)
+        }
+        let groups = channelGroups[lane]
+        var offset = 0
+        var shown: (Int, Int, Bool)?
+        var bed: (Int, Int)?
+        for g in groups {
+            let end = offset + g.channels.count
+            if end <= width {
+                if !g.positioned && bed == nil {
+                    bed = (offset, g.channels.count)
+                }
+                if let preferredID, g.id == preferredID {
+                    shown = (offset, g.channels.count, g.positioned)
+                }
+            }
+            offset = end
+        }
+        if shown == nil, let first = groups.first, first.channels.count <= width {
+            shown = (0, first.channels.count, first.positioned)
+        }
+        let s = shown ?? (0, width, false)
+        let b = bed ?? (0, 0)
+        return (UInt32(s.0), UInt32(s.1), s.2 ? 1 : 0, UInt32(b.0), UInt32(b.1))
+    }
+
+    private func buildGroupSelectionLanes(
         names: [String],
         selectedRows: [RowIdentity]?,
-        hideSilentLanes: Set<Int>
-    ) -> (lanes: [BtFrozenSelectionLane], sources: [UnsafeMutablePointer<CChar>?], labels: [UnsafeMutablePointer<CChar>?]) {
-        var lanes: [BtFrozenSelectionLane] = []
+        hideSilentLanes: Set<Int>,
+        shownGroupIDs: [String?]
+    ) -> (lanes: [BtFrozenGroupSelectionLane], sources: [UnsafeMutablePointer<CChar>?], labels: [UnsafeMutablePointer<CChar>?]) {
+        var lanes: [BtFrozenGroupSelectionLane] = []
         var sources: [UnsafeMutablePointer<CChar>?] = []
         var labels: [UnsafeMutablePointer<CChar>?] = []
 
         for index in routes.indices {
             let width = widths.indices.contains(index) ? Int(widths[index]) : 0
             let laneLabels = channelNames.indices.contains(index) ? channelNames[index] : []
+            let preferredID = shownGroupIDs.indices.contains(index) ? shownGroupIDs[index] : nil
+            let gb = resolvedGroupBounds(for: index, width: width, preferredID: preferredID)
+            let hasBed = (gb.shownCount == 0 && width > 2) || gb.bedCount > 0
             var maskValid: UInt32 = 0
             var mask: UInt64 = 0
-            var includePair: UInt32 = width > 2 ? 1 : 0
+            var includePair: UInt32 = (width > 2 && hasBed) ? 1 : 0
 
             if let selectedRows, !selectedRows.isEmpty {
                 let forLane = selectedRows.filter { $0.lane == index }
@@ -916,7 +1085,7 @@ private final class WAVExport: @unchecked Sendable {
                             channelMask |= (1 << UInt64(ch))
                         }
                     }
-                    includePair = hasPair ? 1 : 0
+                    includePair = (hasPair && hasBed) ? 1 : 0
                     maskValid = 1
                     mask = channelMask
                 } else if width == 2 {
@@ -934,7 +1103,7 @@ private final class WAVExport: @unchecked Sendable {
                         mask = sideMask
                     }
                 }
-            } else if width > 2, hideSilentLanes.contains(index) {
+            } else if width > 2, hideSilentLanes.contains(index), gb.shownCount == 0 {
                 // Whole-lane export with hide-silent: export only active channels in this frozen copy + L/R pair.
                 let activeMask = activeChannels(for: index)
                 let shown = ChannelActivityTracker.shownChannels(width: width, labels: laneLabels, activeMask: activeMask)
@@ -949,22 +1118,31 @@ private final class WAVExport: @unchecked Sendable {
             let lbl = !laneLabels.isEmpty ? strdup(laneLabels.joined(separator: "\t")) : nil
             sources.append(src)
             labels.append(lbl)
-            lanes.append(BtFrozenSelectionLane(
+            lanes.append(BtFrozenGroupSelectionLane(
                 index: UInt32(index),
                 route: routes[index],
                 source_name: UnsafePointer(src),
                 channel_labels: UnsafePointer(lbl),
                 channel_mask: mask,
                 channel_mask_valid: maskValid,
-                include_pair: includePair
+                include_pair: includePair,
+                shown_start: gb.shownStart,
+                shown_count: gb.shownCount,
+                shown_positioned: gb.shownPositioned,
+                bed_start: gb.bedStart,
+                bed_count: gb.bedCount,
+                positions: positions[index]?.pointer
             ))
         }
         return (lanes, sources, labels)
     }
 
     func play(in slot: OpaquePointer, range: Range<UInt64>, forceMono: Bool, fades: BtFades,
-              selectedRows: [RowIdentity]?, hideSilentLanes: Set<Int>, pairBinaural: Bool) -> String? {
-        let built = buildSelectionLanes(names: [], selectedRows: selectedRows, hideSilentLanes: hideSilentLanes)
+              selectedRows: [RowIdentity]?, hideSilentLanes: Set<Int>, pairBinaural: Bool,
+              shownGroupIDs: [String?] = []) -> String? {
+        let built = buildGroupSelectionLanes(
+            names: [], selectedRows: selectedRows, hideSilentLanes: hideSilentLanes, shownGroupIDs: shownGroupIDs
+        )
         defer {
             for s in built.sources { free(s) }
             for l in built.labels { free(l) }
@@ -972,7 +1150,7 @@ private final class WAVExport: @unchecked Sendable {
         guard !built.lanes.isEmpty else { return "The selected audio is unavailable." }
         var errorPtr: UnsafeMutablePointer<CChar>?
         let ok = built.lanes.withUnsafeBufferPointer {
-            bt_frozen_play_selection(
+            bt_frozen_play_group_selection(
                 frozen, slot, $0.baseAddress, $0.count, range.lowerBound,
                 range.upperBound, forceMono ? 1 : 0, pairBinaural ? 1 : 0, fades, &errorPtr
             ) == 1
@@ -988,21 +1166,24 @@ private final class WAVExport: @unchecked Sendable {
     func write(
         range: Range<UInt64>, directory: String, sampleRate: UInt32, bitsPerSample: UInt32, forceMono: Bool,
         fades: BtFades, names: [String], selectedRows: [RowIdentity]?, hideSilentLanes: Set<Int>,
-        wideMode: WideExportMode, pairBinaural: Bool
-    ) -> (urls: [URL], error: String?) {
-        let built = buildSelectionLanes(names: names, selectedRows: selectedRows, hideSilentLanes: hideSilentLanes)
+        wideMode: WideExportMode, pairBinaural: Bool, shownGroupIDs: [String?] = []
+    ) -> (urls: [URL], objectsInMono: Bool, error: String?) {
+        let built = buildGroupSelectionLanes(
+            names: names, selectedRows: selectedRows, hideSilentLanes: hideSilentLanes, shownGroupIDs: shownGroupIDs
+        )
         defer {
             for s in built.sources { free(s) }
             for l in built.labels { free(l) }
         }
-        guard !built.lanes.isEmpty else { return ([], "Invalid capture lanes") }
+        guard !built.lanes.isEmpty else { return ([], false, "Invalid capture lanes") }
+        var objectsInMonoRaw: UInt32 = 0
         var errorPtr: UnsafeMutablePointer<CChar>?
         let paths = directory.withCString { destination in
             built.lanes.withUnsafeBufferPointer {
-                bt_frozen_export_selection(
+                bt_frozen_export_group_selection(
                     frozen, $0.baseAddress, $0.count, range.lowerBound, range.upperBound,
                     destination, sampleRate, bitsPerSample, forceMono ? 1 : 0, wideMode.rawValue,
-                    pairBinaural ? 1 : 0, fades, &errorPtr
+                    pairBinaural ? 1 : 0, fades, &objectsInMonoRaw, &errorPtr
                 )
             }
         }
@@ -1013,12 +1194,12 @@ private final class WAVExport: @unchecked Sendable {
         } else {
             errorMessage = nil
         }
-        guard let paths else { return ([], errorMessage) }
+        guard let paths else { return ([], false, errorMessage) }
         defer { bt_export_paths_free(paths) }
         let urls = (0..<bt_export_paths_count(paths)).compactMap { index in
             bt_export_path(paths, index).map { URL(fileURLWithPath: String(cString: $0)) }
         }
-        return (urls, nil)
+        return (urls, objectsInMonoRaw != 0, nil)
     }
 }
 
@@ -1062,7 +1243,8 @@ private final class PreviewPlayer {
     /// Plays `range` of `material`, or of its `lane` alone, from its start. Returns a problem to
     /// show, or nil.
     func play(_ material: WAVExport, range: Range<UInt64>, forceMono: Bool, fades: BtFades,
-              selectedRows: [RowIdentity]?, hideSilentLanes: Set<Int>, pairBinaural: Bool) -> String? {
+              selectedRows: [RowIdentity]?, hideSilentLanes: Set<Int>, pairBinaural: Bool,
+              shownGroupIDs: [String?] = []) -> String? {
         do {
             try startEngine(rate: material.sampleRate)
         } catch let error as CaptureError {
@@ -1077,7 +1259,8 @@ private final class PreviewPlayer {
             self.timer = timer
         }
         if let err = material.play(in: slot, range: range, forceMono: forceMono, fades: fades,
-                                   selectedRows: selectedRows, hideSilentLanes: hideSilentLanes, pairBinaural: pairBinaural) {
+                                   selectedRows: selectedRows, hideSilentLanes: hideSilentLanes,
+                                   pairBinaural: pairBinaural, shownGroupIDs: shownGroupIDs) {
             return err
         }
         // Any earlier preview has been let go, and its material with it.
@@ -1294,6 +1477,42 @@ private final class CaptureBackground: NSView {
     var outlineWidth: CGFloat = 1 { didSet { needsDisplay = true } }
     var outlineColor = NSColor.white { didSet { needsDisplay = true } }
     var outlineFollowsOpacity = true { didSet { needsDisplay = true } }
+    var look: ResolvedLook = .default { didSet { if look != oldValue { needsDisplay = true } } }
+    var onDropFiles: (([URL]) -> Bool)?
+    var dropAccentColor: NSColor = accentColor(defaultAccentRGB)
+    private var packageHovered = false { didSet { if packageHovered != oldValue { needsDisplay = true } } }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        registerForDraggedTypes([.fileURL])
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        registerForDraggedTypes([.fileURL])
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let urls = extractFileDropURLs(from: sender)
+        guard !urls.isEmpty else { return [] }
+        packageHovered = urls.contains(where: AddonFormatting.isPackageURL)
+        return .copy
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        packageHovered = false
+    }
+
+    override func draggingEnded(_ sender: NSDraggingInfo) {
+        packageHovered = false
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        packageHovered = false
+        let urls = extractFileDropURLs(from: sender)
+        guard !urls.isEmpty else { return false }
+        return onDropFiles?(urls) ?? false
+    }
 
     override func layout() {
         super.layout()
@@ -1303,7 +1522,7 @@ private final class CaptureBackground: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         NSGraphicsContext.current?.cgContext.clear(dirtyRect)
-        let radius: CGFloat = waveformOnly ? 0 : WaveformTheme.cornerRadius
+        let radius: CGFloat = waveformOnly ? 0 : look.cornerRadius
         let waveRect = waveform.map { convert($0.bounds, from: $0) }
         let waveShape = waveRect.map { NSBezierPath(roundedRect: $0, xRadius: radius, yRadius: radius) }
         if backgroundOpacity > 0 {
@@ -1312,10 +1531,11 @@ private final class CaptureBackground: NSView {
                 fill.append(waveShape)
                 fill.windingRule = .evenOdd
             }
-            WaveformTheme.panelBackground.withAlphaComponent(backgroundOpacity).setFill()
+            let panelBg = look.panelBackground?.nsColor ?? WaveformTheme.panelBackground
+            panelBg.withAlphaComponent(backgroundOpacity).setFill()
             fill.fill()
             if let waveShape {
-                WaveformTheme.plotBackground.withAlphaComponent(backgroundOpacity).setFill()
+                look.plotBackground.nsColor.withAlphaComponent(backgroundOpacity).setFill()
                 waveShape.fill()
             }
         }
@@ -1331,6 +1551,9 @@ private final class CaptureBackground: NSView {
             }
             outlineColor.withAlphaComponent(outlineFollowsOpacity ? backgroundOpacity : 1).setFill()
             outline.fill()
+        }
+        if packageHovered {
+            drawPackageDropHint(in: bounds, accentColor: dropAccentColor)
         }
     }
 }
@@ -1402,8 +1625,44 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let rows: [RowIdentity]?
         let directory: String
         let ticket: UInt64?
+        let controlCall: AddonControlCall?
     }
     private var pendingSnapshots: [PendingSnapshotSave] = []
+    private var addonHost: AddonHostClient?
+    private var addonPositionsCursor: UInt64 = 0
+    private var lastAddonSnapshotForUI: AddonSnapshot = .empty
+    private var shownChannelGroups: [String: String] = [:] // source.key -> group.id
+    private var selectedLookAddonID: String?
+    private var currentLook: ResolvedLook = .default
+    private var lookAddonPopup: OptionsPopUpButton?
+    private var lookAddonNote: NSTextField?
+    private var lookBorderWidthNote: NSTextField?
+    private var selectionByAddon: String?
+
+    private enum AddonReviewStage {
+        case reading(URL, note: String?)
+        case refused(URL, reason: String, note: String?)
+        case ready(URL, inspect: AddonInspectResult, installedVersion: String?, brokenInstalled: Bool, note: String?)
+        case installing(URL, inspect: AddonInspectResult, installedVersion: String?, brokenInstalled: Bool, note: String?)
+        case failed(URL, inspect: AddonInspectResult, installedVersion: String?, brokenInstalled: Bool, reason: String, note: String?)
+    }
+    private var addonReview: AddonReviewStage?
+    private var addonRemoval: (id: String, name: String, deleteData: Bool, busy: Bool, error: String?)?
+    private var addonPageNotice: String?
+    private var addonProblems: [String: String] = [:]
+    private var addonPendingDropChoice: (url: URL, openers: [(id: String, name: String)])?
+    private var addonSeekingTargets: [String: (target: Double, at: TimeInterval)] = [:]
+    private var addonPendingFormats: [String: (format: String, at: TimeInterval)] = [:]
+    private var addonSourceProblems: [String: String] = [:]
+    private var addonBusyRequests: Int = 0
+    private var addonSettingDrafts: [String: AddonJSONValue] = [:]
+    private var addonSettingTextFields: [NSTextField: (addonID: String, key: String, label: String)] = [:]
+    private var addonSettingNumberFields: [NSTextField: (addonID: String, key: String, label: String, min: Double, max: Double, step: Double)] = [:]
+    private var addonTransportTimeLabels: [Int: NSTextField] = [:]
+    private var addonTransportPlayButtons: [Int: NSButton] = [:]
+    private var addonTransportSliders: [Int: NSSlider] = [:]
+    private var addonTransportSeekNotes: [Int: NSTextField] = [:]
+    private var lastAddonTransportUIRefresh: TimeInterval = 0
     private var lastManualResize: TimeInterval = 0
     private var autoGrownBaseHeight: CGFloat?
     private var autoGrownTargetHeight: CGFloat?
@@ -1613,6 +1872,21 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if let raw = unsignedSetting("wideExportMode"), let mode = WideExportMode(rawValue: raw) { wideExportMode = mode }
         alwaysOnTop = (defaults.object(forKey: "alwaysOnTop") as? Bool) ?? true
         waveformOnly = (defaults.object(forKey: "waveformOnly") as? Bool) ?? false
+        if let savedGroups = defaults.dictionary(forKey: "shownChannelGroups") as? [String: String] {
+            shownChannelGroups = savedGroups
+        }
+        if let savedLook = defaults.string(forKey: "selectedLookAddon"), !savedLook.isEmpty {
+            selectedLookAddonID = savedLook
+        }
+        let appVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.2.1"
+        let addonRoot = TestCopyConfig.current.addonDataRoot.path
+        try? FileManager.default.createDirectory(atPath: addonRoot, withIntermediateDirectories: true)
+        addonHost = AddonHostClient(dataRoot: addonRoot, appVersion: appVersion, primary: !independentWindow)
+        if let snap = addonHost?.snapshot {
+            currentAddonSnapshot = snap
+            lastAddonSnapshotForUI = snap
+        }
+        recomputeLook(refreshAppearanceTab: false)
         if independentWindow || testCopy { beginCaptureAfterUpdate() }
         else { startupUpdater.checkAtLaunch { [weak self] in self?.beginCaptureAfterUpdate() } }
     }
@@ -1783,9 +2057,12 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             pendingSnapshots.removeAll()
             let routes = tap.captureRoutes
             let labels = tap.captureChannelNames
+            let groups = (0..<tap.laneCount).map { tap.channelGroups(for: $0) }
+            let frozenPos = tap.freezePositions()
+            let shownIDs = currentShownGroupIDs()
             let sem = DispatchSemaphore(value: 0)
             var frozen: WAVExport?
-            tap.readCapture({ WAVExport(core: $0, routes: routes, channelNames: labels) }) { mat in
+            tap.readCapture({ WAVExport(core: $0, routes: routes, channelNames: labels, channelGroups: groups, positions: frozenPos) }) { mat in
                 frozen = mat
                 sem.signal()
             }
@@ -1804,12 +2081,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                         worker.async {
                             _ = frozen.write(range: range, directory: req.directory, sampleRate: sampleRate,
                                              bitsPerSample: bits, forceMono: mono, fades: req.fades, names: names,
-                                             selectedRows: req.rows, hideSilentLanes: hide, wideMode: wide, pairBinaural: binaural)
+                                             selectedRows: req.rows, hideSilentLanes: hide, wideMode: wide,
+                                             pairBinaural: binaural, shownGroupIDs: shownIDs)
                         }
                     }
                 }
             }
         }
+        addonHost?.shutdownAndFree(timeoutMs: 2500)
+        addonHost = nil
         waveform?.endPreview()
         tap = nil
         waveform?.discardPreparedFile()
@@ -2017,6 +2297,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         statusLabel.isHidden = false
         let content = CaptureBackground(frame: window.contentView?.bounds ?? .zero)
         content.waveform = waveform
+        content.look = currentLook
+        content.dropAccentColor = accentColor(accentRGB)
+        content.onDropFiles = { [weak self] urls in
+            self?.handleDroppedFiles(urls) ?? false
+        }
         window.contentView = content
         background = content
         window.trackChrome(in: content)
@@ -2149,6 +2434,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             if NSColorPanel.shared.isVisible { return false }
             if self.optionsPanel?.firstResponder is NSTextView { return false }
             if self.hasOpenOptionsPopover() { return false }
+            if self.cancelAddonPromptOnEscape() { return false }
             return true
         }
         window.contentMinSize = NSSize(width: 680, height: 460)
@@ -2157,11 +2443,20 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         window.level = alwaysOnTop ? .floating : .normal
         window.hidesOnDeactivate = false
 
-        let content = NSView(frame: .zero)
+        let content = OptionsDropContainerView(frame: .zero)
+        content.onDropFiles = { [weak self] urls in
+            self?.handleDroppedFiles(urls) ?? false
+        }
+        content.accentColorProvider = { [weak self] in
+            accentColor(self?.accentRGB ?? defaultAccentRGB)
+        }
         let tabs = NSTabView(frame: .zero)
         tabs.tabViewType = .noTabsNoBorder
-        // Package 11 & 12 / OPT-03: exact order Actions, Hotkeys, Capture, Sources, Appearance, Export, (Updates).
-        var pages = [makeActionTab(), makeHotkeysTab(), makeCaptureTab(), makeSourceTab(), makeAppearanceTab(), makeExportTab()]
+        // Exact Windows order: Actions, Hotkeys, Capture, Sources, Appearance, Export, Add-ons, (Updates).
+        var pages = [
+            makeActionTab(), makeHotkeysTab(), makeCaptureTab(), makeSourceTab(),
+            makeAppearanceTab(), makeExportTab(), makeAddonsTab()
+        ]
         if !independentWindow { pages.append(makeUpdateTab()) }
         for page in pages { tabs.addTabViewItem(page) }
         optionTabs = tabs
@@ -2717,8 +3012,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         sourceScanQueued = false
         let excluded = tap?.privatePlaybackDevices ?? []
         let apps = snapshotRunningApps()
+        let addonSnap = currentAddonSnapshot
         sourceScanQueue.async { [weak self] in
-            let choices = scanCaptureSources(excluding: excluded, runningApps: apps)
+            let choices = scanCaptureSources(excluding: excluded, runningApps: apps, addonSnapshot: addonSnap)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.sourceScanInFlight = false
@@ -2751,7 +3047,23 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         fileNameNotes.removeAll()
         fileNameSourceKeys.removeAll()
         sourceProblemNotes.removeAll()
+        addonTransportTimeLabels.removeAll()
+        addonTransportPlayButtons.removeAll()
+        addonTransportSliders.removeAll()
+        addonTransportSeekNotes.removeAll()
         var groups: [NSView] = []
+        if let choice = addonPendingDropChoice {
+            let fileName = choice.url.lastPathComponent
+            let prompt = optionNote("Which add-on should open \(fileName)?")
+            prompt.textColor = .labelColor
+            var buttons: [NSButton] = choice.openers.enumerated().map { idx, opener in
+                let b = NSButton(title: opener.name, target: self, action: #selector(pickAddonDropOpener(_:)))
+                b.tag = idx
+                return b
+            }
+            buttons.append(NSButton(title: "Cancel", target: self, action: #selector(cancelAddonDropOpener)))
+            groups.append(optionGroup(nil, rows: [prompt, buttonRow(buttons)]))
+        }
         for (index, configuration) in captureLanes.enumerated() {
             let label = captureLaneLetter(index)
             let source = OptionsPopUpButton(frame: .zero, pullsDown: false)
@@ -2788,7 +3100,24 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             source.setAccessibilityLabel("Source \(label) audio source")
             route.setAccessibilityLabel("Source \(label) channel route")
             name.setAccessibilityLabel("Source \(label) file name")
-            var rows: [NSView] = [sourceField, routeField, nameField, problemNote]
+            var rows: [NSView] = [sourceField]
+            let isWideAddon: Bool
+            if case .addon(let addonID, let sourceID) = configuration.source {
+                let addonRows = makeAddonSourceLaneRows(laneIndex: index, addonID: addonID, sourceID: sourceID)
+                isWideAddon = addonRows.hideRoute
+                if !isWideAddon { rows.append(routeField) }
+                rows.append(contentsOf: addonRows.views)
+            } else {
+                isWideAddon = false
+                rows.append(routeField)
+            }
+            rows.append(nameField)
+            if !configuration.source.isAddon || currentAddonSnapshot.source(
+                addonID: { if case .addon(let a, _) = configuration.source { return a }; return "" }(),
+                sourceID: { if case .addon(_, let s) = configuration.source { return s }; return "" }()
+            ) != nil {
+                rows.append(problemNote)
+            }
             if dualSource {
                 let remove = NSButton(title: "Remove", target: self, action: #selector(removeSource(_:)))
                 remove.tag = index
@@ -2880,7 +3209,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         for (index, lane) in captureLanes.enumerated() {
             refreshSourcePopup(sourcePopups[index], choices: choices, scanning: false)
             let route = routePopups[index]
-            let wideSender = lane.source.isSender && (tap?.channelCount(for: index) ?? 0) > 2
+            let wideSender = lane.source.isSenderBacked && (tap?.channelCount(for: index) ?? 0) > 2
             route.isEnabled = !editing && !wideSender
             route.selectItem(withTag: Int((wideSender ? CaptureRoute.merged : lane.route).rawValue))
             for item in route.itemArray {
@@ -3122,6 +3451,16 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let accent = NSButton(title: "Choose…", target: self, action: #selector(chooseAccentColor))
         let resetAccent = NSButton(title: "Reset", target: self, action: #selector(resetAccentColor))
 
+        let lookPopup = OptionsPopUpButton(frame: .zero, pullsDown: false)
+        lookPopup.target = self
+        lookPopup.action = #selector(lookAddonChanged(_:))
+        lookPopup.autoenablesItems = false
+        prepareOptionPopup(lookPopup)
+        lookAddonPopup = lookPopup
+        let lookNote = optionNote("")
+        lookAddonNote = lookNote
+        refreshLookAddonPopup()
+
         let marks = StatusMark.allCases
         let mark = choiceControl(
             marks.indices.map { UInt32($0) }, selected: UInt32(marks.firstIndex(of: statusMark) ?? 0),
@@ -3136,6 +3475,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let width = choiceControl(
             borderWidthChoices, selected: outlineWidth, action: #selector(outlineWidthChanged(_:))
         ) { "\($0) px" }
+        let borderLookNote = optionNote("The chosen look sets its own width, which is used while that look is on.")
+        borderLookNote.isHidden = currentLook.borderWidth == nil
+        lookBorderWidthNote = borderLookNote
         let theme = checkbox("Use theme color", !customOutline, #selector(outlineThemeChanged(_:)))
         let outlineColor = NSButton(title: "Choose…", target: self, action: #selector(chooseOutlineColor))
         outlineColorButton = outlineColor
@@ -3166,7 +3508,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let frequencyControls = optionsStack([], spacing: 8)
         frequencyGradientControls = frequencyControls
         refreshFrequencyGradientControls()
-        // Package 8 / OPT-16: Window group includes Waveform color & Frequency colors; Display holds Single-source & Meter.
+        // Package 8 & 20 / OPT-16: Window group includes Look from add-on, Waveform color & Frequency colors.
         let tab = optionsTab("Appearance", groups: [
             optionGroup("Window", rows: [
                 waveform,
@@ -3176,6 +3518,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                     action: #selector(transparencyChanged(_:))
                 ) { "\($0)%" },
                 optionField("Theme color", buttonRow([accent, resetAccent])),
+                optionField("Look from add-on", lookPopup, below: [lookNote]),
                 optionField("Waveform color", coloring),
                 frequencyControls
             ]),
@@ -3191,7 +3534,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             ]),
             optionGroup("Waveform border", rows: [
                 checkbox("Show a border", showsOutline, #selector(outlineChanged(_:))),
-                optionField("Border width", width),
+                optionField("Border width", width, below: [borderLookNote]),
                 theme,
                 optionField("Custom border color", outlineColor),
                 follows
@@ -3204,7 +3547,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         return tab
     }
 
-    /// Package 9 / TL-41..43: Frequency colors editor matching Windows spectrum.rs.
+    /// Package 9 & 20 / TL-41..43: Frequency colors editor matching Windows spectrum.rs (user > look > default).
     private func refreshFrequencyGradientControls() {
         guard let controls = frequencyGradientControls else { return }
         for view in controls.arrangedSubviews {
@@ -3216,8 +3559,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         controls.isHidden = !frequencyColoring
         guard frequencyColoring else { return }
 
+        let activeGradient = effectiveFrequencyGradient()
+        let lookOfferer = lookSpectrumOffererName()
         let preview = FrequencyGradientPreview(frame: .zero)
-        preview.gradient = frequencyGradient
+        preview.gradient = activeGradient
         preview.heightAnchor.constraint(equalToConstant: 16).isActive = true
         preview.setAccessibilityElement(true)
         preview.setAccessibilityLabel("Waveform gradient from low to high frequency")
@@ -3233,7 +3578,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         endsRow.alignment = .centerY
 
         var editorRows: [NSView] = [preview, endsRow]
-        let stops = frequencyGradient.stops
+        let stops = activeGradient.stops
         let count = stops.count
         for (index, stop) in stops.enumerated() {
             let color = NSColorWell(frame: .zero)
@@ -3283,9 +3628,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         reset.isEnabled = hasCustomFrequencyGradient
         editorRows.append(buttonRow([add, reset]))
         editorRows.append(optionNote("Each moment of the waveform mixes these colors by how much of its sound is low or high."))
+        if let lookOfferer {
+            if hasCustomFrequencyGradient {
+                editorRows.append(optionNote("Your own colors are used instead of the ones from the look of \(lookOfferer). Reset uses the look's colors again."))
+            } else {
+                editorRows.append(optionNote("These colors come from the look of \(lookOfferer). Changing one makes them your own."))
+            }
+        }
+        let (_, replacedAny) = currentLook.legibleSpectrum(for: activeGradient)
         let illegible = optionNote("A color too hard to see on the waveform's background is drawn in the default color instead.")
         illegible.textColor = WaveformTheme.statusUnavailable
-        illegible.isHidden = !frequencyGradient.hasUnreadableStops
+        illegible.isHidden = !replacedAny
         frequencyIllegibleNote = illegible
         editorRows.append(illegible)
 
@@ -3298,7 +3651,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     @objc private func frequencyColoringChanged(_ sender: NSPopUpButton) {
         frequencyColoring = selectedValue(sender) == 1
         defaults.set(frequencyColoring, forKey: "waveformColorByFrequency")
-        waveform?.frequencyGradient = frequencyColoring ? frequencyGradient : nil
+        waveform?.frequencyGradient = frequencyColoring ? effectiveFrequencyGradient() : nil
         refreshFrequencyGradientControls()
         refreshWaveform()
     }
@@ -3312,13 +3665,18 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 defaults.removeObject(forKey: "waveformFrequencyGradient")
             }
         }
-        frequencyGradientPreview?.gradient = frequencyGradient
-        frequencyIllegibleNote?.isHidden = !frequencyGradient.hasUnreadableStops
-        waveform?.frequencyGradient = frequencyColoring ? frequencyGradient : nil
+        let active = effectiveFrequencyGradient()
+        frequencyGradientPreview?.gradient = active
+        let (_, replaced) = currentLook.legibleSpectrum(for: active)
+        frequencyIllegibleNote?.isHidden = !replaced
+        waveform?.frequencyGradient = frequencyColoring ? active : nil
         if refreshControls { refreshFrequencyGradientControls() }
     }
 
     @objc private func frequencyStopColorChanged(_ sender: NSColorWell) {
+        if !hasCustomFrequencyGradient {
+            frequencyGradient = effectiveFrequencyGradient()
+        }
         guard frequencyGradient.stops.indices.contains(sender.tag),
               let color = sender.color.usingColorSpace(.sRGB) else { return }
         func component(_ value: CGFloat) -> UInt32 {
@@ -3332,6 +3690,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     @objc private func frequencyStopPositionChanged(_ sender: NSSlider) {
+        if !hasCustomFrequencyGradient {
+            frequencyGradient = effectiveFrequencyGradient()
+        }
         let index = sender.tag
         let stops = frequencyGradient.stops
         guard index > 0 && index < stops.count - 1 else { return }
@@ -3350,6 +3711,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     @objc private func removeFrequencyStop(_ sender: NSButton) {
+        if !hasCustomFrequencyGradient {
+            frequencyGradient = effectiveFrequencyGradient()
+        }
         let index = sender.tag
         guard frequencyGradient.stops.count > 2, index > 0 && index < frequencyGradient.stops.count - 1 else { return }
         frequencyGradient.stops.remove(at: index)
@@ -3357,6 +3721,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     @objc private func addFrequencyStop() {
+        if !hasCustomFrequencyGradient {
+            frequencyGradient = effectiveFrequencyGradient()
+        }
         var added = frequencyGradient.addingStop()
         added.stops.sort { $0.position < $1.position }
         frequencyGradient = added
@@ -3803,6 +4170,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         accentRGB = rgb
         defaults.set(Int(rgb), forKey: "accentRGB")
         waveform?.accentRGB = rgb
+        background?.dropAccentColor = accentColor(rgb)
+        recomputeLook(refreshAppearanceTab: false)
         updateBackground()
     }
 
@@ -3974,12 +4343,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         panel?.hasShadow = !waveformOnly && opacity > 0
         background?.backgroundOpacity = opacity
         background?.waveformOnly = waveformOnly
+        background?.look = currentLook
         background?.showsOutline = false
-        let borderColor = accentColor(customOutline ? outlineRGB : accentRGB)
-            .withAlphaComponent(outlineFollowsOpacity ? opacity : 1)
+        let effectiveBorderColor = currentLook.effectiveBorderColor(
+            accent: RGBA8(rgb: accentRGB),
+            userBorderRGB: customOutline ? outlineRGB : nil
+        ).nsColor
+        let effectiveBorderWidth = currentLook.effectiveBorderWidth(userWidth: Int(outlineWidth))
+        waveform?.look = currentLook
         waveform?.showsOutline = showsOutline
-        waveform?.outlineWidth = CGFloat(outlineWidth)
-        waveform?.outlineColor = borderColor
+        waveform?.outlineWidth = effectiveBorderWidth
+        waveform?.outlineColor = effectiveBorderColor.withAlphaComponent(outlineFollowsOpacity ? opacity : 1)
         waveform?.gridOpacity = opacity
         waveform?.showsBars = showsBars
         waveform?.secondsInterval = showsSeconds ? secondsInterval : nil
@@ -4472,6 +4846,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard !editing, let core = tap?.core else { return }
         registerClick()
         bt_tracks_clear(core)
+        tap?.clearPositionTracks()
+        selectionByAddon = nil
         waveform?.resetTimeline()
         refreshWaveform()
         notice = nil
@@ -4532,6 +4908,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     @objc private func tick(_: Timer) {
         let tickStart = ProcessInfo.processInfo.systemUptime
+        pollAddonHost()
         // Package 12 / WIN-23: hidden or minimized main window skips waveform/meter drawing.
         let panelVisible = panel?.isVisible == true && panel?.isMiniaturized != true
         let optionsVisible = optionsPanel?.isVisible == true && optionsPanel?.isMiniaturized != true
@@ -4558,6 +4935,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 refreshWaveform()
                 tap.pollCapture()
             } else if optionsVisible {
+                tap.pollCapture()
+            } else if addonHost != nil {
                 tap.pollCapture()
             }
         }
@@ -4642,7 +5021,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             optionsNotice.stringValue = message
             optionsNotice.toolTip = message.isEmpty ? nil : message
         }
-        // Package 6 / WIN-06: status strip below waveform (26px, empty when no text, hidden in waveform-only).
+        // Package 6 & 17 / WIN-06, ADD-W27: status strip below waveform (26px, empty when no text, hidden in waveform-only).
         let line: String
         if let captureError {
             line = captureError
@@ -4650,7 +5029,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             line = "Preparing selection…"
         } else if waveform?.hasSelection == true && notice == nil {
             let rowLabel = waveform?.selectedRowsLabel ?? ""
-            let selection = rowLabel.isEmpty ? "Selection" : "Selection · \(rowLabel)"
+            var selection = rowLabel.isEmpty ? "Selection" : "Selection · \(rowLabel)"
+            if let by = selectionByAddon {
+                selection += " · by \(by)"
+            }
             line = paused ? "\(selection) / Paused" : selection
         } else {
             line = [state == .paused ? stateText : nil, message.isEmpty ? nil : message]
@@ -4687,7 +5069,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard let tap else { completion(nil); return }
         let routes = tap.captureRoutes
         let labels = tap.captureChannelNames
-        tap.readCapture({ WAVExport(core: $0, routes: routes, channelNames: labels) }) { [weak self, weak tap] material in
+        let groups = (0..<tap.laneCount).map { tap.channelGroups(for: $0) }
+        let frozenPos = tap.freezePositions()
+        tap.readCapture({ WAVExport(core: $0, routes: routes, channelNames: labels, channelGroups: groups, positions: frozenPos) }) { [weak self, weak tap] material in
             guard let self, let tap, self.tap === tap else { completion(nil); return }
             completion(material)
         }
@@ -4723,7 +5107,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     @discardableResult
     private func writeExport(
         _ job: WAVExport, range: Range<UInt64>, fades: BtFades, rows: [RowIdentity]?, directory: String,
-        provisional: Bool, completion: @escaping ([URL]) -> Bool
+        provisional: Bool, controlCall: AddonControlCall? = nil, completion: @escaping ([URL]) -> Bool
     ) -> DispatchWorkItem {
         let sampleRate = exportSampleRate
         let bitsPerSample = exportBitsPerSample
@@ -4732,13 +5116,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let pairBinaural = self.pairBinaural
         let names = laneFileNames
         let hideLanes = hideSilentLaneIndices
+        let shownIDs = currentShownGroupIDs()
+        let frameCount = range.upperBound > range.lowerBound ? (range.upperBound - range.lowerBound) : 0
         if !provisional { activeSnapshotSaves += 1 }
         setNotice(provisional ? "Preparing WAV…" : "Saving snapshot…")
         let write = DispatchWorkItem { @Sendable [weak self, worker, pendingProvisionalWAVs] in
             let written = job.write(
                 range: range, directory: directory, sampleRate: sampleRate, bitsPerSample: bitsPerSample,
                 forceMono: forceMono, fades: fades, names: names, selectedRows: rows, hideSilentLanes: hideLanes,
-                wideMode: wideMode, pairBinaural: pairBinaural
+                wideMode: wideMode, pairBinaural: pairBinaural, shownGroupIDs: shownIDs
             )
             let urls = written.urls
             if provisional { pendingProvisionalWAVs.urls.formUnion(urls) }
@@ -4756,9 +5142,30 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 if urls.isEmpty {
                     let detail = written.error ?? "Check that there is audio and that the folder can be written to."
                     self?.setNotice((provisional ? "Could not prepare WAV: " : "Could not save snapshot: ") + detail)
+                    if let controlCall {
+                        self?.addonHost?.controlReply(
+                            call: controlCall,
+                            error: AddonControlError(code: "failed", message: detail)
+                        )
+                    }
                 } else {
-                    if !provisional { self?.harness?.noteSaved(urls) }
-                    self?.setNotice(provisional ? nil : "Saved snapshot \(exportDescription(urls))")
+                    if !provisional {
+                        self?.harness?.noteSaved(urls)
+                        self?.notifyClipExported(urls: urls, sampleRate: sampleRate, frames: frameCount)
+                    }
+                    if provisional {
+                        self?.setNotice(written.objectsInMono ? "Objects without positions were written in mono." : nil)
+                    } else {
+                        var status = "Saved snapshot \(exportDescription(urls))"
+                        if written.objectsInMono {
+                            status = "Objects without positions were written in mono. \(status)"
+                        }
+                        if let controlCall {
+                            status += " · by \(controlCall.addon_name)"
+                            self?.replyControlSave(call: controlCall, folder: directory, urls: urls)
+                        }
+                        self?.setNotice(status)
+                    }
                 }
             }
         }
@@ -4884,8 +5291,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         case .scroll(let lane, let row):
             waveform?.scrollToRow(lane: lane, row: row)
             return .success(())
-        case .group:
-            return .failure("channel groups require add-on sources (not available in A stage)")
+        case .group(let lane, let groupID):
+            guard selectChannelGroup(lane: lane, groupID: groupID) else {
+                return .failure("lane \(lane) has no channel group '\(groupID)'")
+            }
+            return .success(())
         case .hideSilent(let on):
             hideSilentChannels = on
             optionsHideSilentButton?.state = on ? .on : .off
@@ -4937,12 +5347,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         case .wait(let ms):
             harness?.holdSeconds = Double(ms) / 1000.0
             return .success(())
-        case .look:
-            return .failure("add-on looks are not available in A stage")
+        case .look(let addonID):
+            chooseLookAddon(addonID)
+            return .success(())
         case .waveformColor(let byFrequency):
             frequencyColoring = byFrequency
             defaults.set(frequencyColoring, forKey: "waveformColorByFrequency")
-            waveform?.frequencyGradient = frequencyColoring ? frequencyGradient : nil
+            waveform?.frequencyGradient = frequencyColoring ? effectiveFrequencyGradient() : nil
             refreshFrequencyGradientControls()
             refreshWaveform()
             return .success(())
@@ -4958,12 +5369,54 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             let wanted = name.trimmingCharacters(in: .whitespaces).lowercased()
             let found = choices.first { $0.title.lowercased() == wanted }
                 ?? choices.first { $0.title.lowercased().contains(wanted) }
+                ?? choices.first { $0.source.key.lowercased() == wanted }
             guard let source = found?.source else { return .failure("no source is called \(name)") }
             return runWindowAction(.addSource(source)).map { _ in () }.mapError { MessageError($0.message) }
         case .removeSource(let lane):
             return runWindowAction(.removeSource(lane)).map { _ in () }.mapError { MessageError($0.message) }
+        case .dropPackage(let url):
+            _ = handleDroppedFiles([url])
+            return .success(())
+        case .dropFile(let url):
+            _ = handleDroppedFiles([url])
+            return .success(())
+        case .installConfirm:
+            confirmAddonInstall()
+            return .success(())
+        case .allowControl(let addonID, let allowed):
+            addonHost?.setControlAllowed(id: addonID, allowed: allowed) { _ in }
+            return .success(())
+        case .setAddonSetting(let addonID, let key, let raw):
+            let jsonVal: AddonJSONValue
+            if raw == "true" { jsonVal = .bool(true) }
+            else if raw == "false" { jsonVal = .bool(false) }
+            else if let i = Int64(raw) { jsonVal = .int(i) }
+            else if let d = Double(raw) { jsonVal = .double(d) }
+            else { jsonVal = .string(raw) }
+            addonHost?.setSetting(id: addonID, key: key, value: jsonVal) { _ in }
+            return .success(())
+        case .runAddonAction(let addonID, let actionID):
+            addonHost?.runAction(id: addonID, action: actionID) { _ in }
+            return .success(())
+        case .selectAddonFormat(let lane, let fmt):
+            guard captureLanes.indices.contains(lane),
+                  case .addon(let addonID, let sourceID) = captureLanes[lane].source else {
+                return .failure("lane \(lane) is not an add-on source")
+            }
+            addonHost?.selectFormat(id: addonID, source: sourceID, format: fmt) { _ in }
+            return .success(())
+        case .addonTransport(let lane, let cmd, let pos):
+            guard captureLanes.indices.contains(lane),
+                  case .addon(let addonID, let sourceID) = captureLanes[lane].source else {
+                return .failure("lane \(lane) is not an add-on source")
+            }
+            addonHost?.transport(id: addonID, source: sourceID, command: cmd, position: pos) { _ in }
+            return .success(())
+        case .removeAddon(let id, let deleteData):
+            addonHost?.remove(id: id, deleteData: deleteData) { _ in }
+            return .success(())
         case .unsupportedAddon(let step):
-            return .failure("add-on step '\(step)' is not available in A stage")
+            return .failure("step '\(step)' is not supported")
         }
     }
 
@@ -5186,18 +5639,28 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     private func failPendingSnapshots(_ reason: String) {
         guard !pendingSnapshots.isEmpty else { return }
+        let failed = pendingSnapshots
         pendingSnapshots.removeAll()
+        for req in failed {
+            if let call = req.controlCall {
+                addonHost?.controlReply(call: call, error: AddonControlError(code: "failed", message: reason))
+            }
+        }
         setNotice(reason)
     }
 
     private func executeSnapshotSave(_ job: WAVExport, request: PendingSnapshotSave) {
         let range = request.range ?? job.span
         guard range.lowerBound >= job.span.lowerBound, range.upperBound <= job.span.upperBound, !range.isEmpty else {
-            setNotice("The selected audio is unavailable.")
+            let msg = "The selected audio is unavailable."
+            setNotice(msg)
+            if let call = request.controlCall {
+                addonHost?.controlReply(call: call, error: AddonControlError(code: "no_audio", message: msg))
+            }
             return
         }
         writeExport(job, range: range, fades: request.fades, rows: request.rows, directory: request.directory,
-                    provisional: false) { [weak self] urls in
+                    provisional: false, controlCall: request.controlCall) { [weak self] urls in
             if !urls.isEmpty, let ticket = request.ticket {
                 self?.waveform?.commitMarker(range, rows: request.rows, ticket: ticket)
             }
@@ -5205,13 +5668,21 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
-    private func saveSnapshot(into directoryPath: String) {
-        guard !editing else { return }
+    private func saveSnapshot(into directoryPath: String, controlCall: AddonControlCall? = nil) {
+        guard !editing else {
+            if let call = controlCall {
+                addonHost?.controlReply(call: call, error: AddonControlError(code: "busy", message: "Backtracking is busy editing; try again shortly"))
+            }
+            return
+        }
         let selected = waveform?.selectionForSaving()
         let fades = waveform?.fadesForSaving() ?? noFades
         let rows = selected == nil ? nil : waveform?.selectedRowsForExport
         let ticket = waveform?.reserveMarker()
-        let req = PendingSnapshotSave(range: selected, fades: fades, rows: rows, directory: directoryPath, ticket: ticket)
+        let req = PendingSnapshotSave(
+            range: selected, fades: fades, rows: rows, directory: directoryPath,
+            ticket: ticket, controlCall: controlCall
+        )
         if waveform?.isPreparingMaterial == true {
             pendingSnapshots.append(req)
             if selected != nil { waveform?.clearSelection() }
@@ -5220,7 +5691,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         let save: (WAVExport?) -> Void = { [weak self] job in
             guard let self else { return }
-            guard let job else { self.setNotice("No audio captured yet."); return }
+            guard let job else {
+                let msg = "No audio captured yet."
+                self.setNotice(msg)
+                if let call = controlCall {
+                    self.addonHost?.controlReply(call: call, error: AddonControlError(code: "no_audio", message: msg))
+                }
+                return
+            }
             if selected != nil { self.waveform?.clearSelection() }
             self.executeSnapshotSave(job, request: req)
         }
@@ -5229,6 +5707,1483 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         } else {
             setNotice("Preparing snapshot…")
             requestEditingMaterial(save)
+        }
+    }
+
+    // MARK: - Stage B: Add-on Host Polling, Channel Groups (Pkg 3), Add-ons Page (Pkg 16/21),
+    // Add-on Sources (Pkg 18), Positions & Clip Exported (Pkg 19), Look (Pkg 20), Control (Pkg 17)
+
+    private func pollAddonHost() {
+        guard let host = addonHost else { return }
+        let changed = host.pollSnapshot()
+        if changed {
+            let snap = host.snapshot
+            currentAddonSnapshot = snap
+            let prev = lastAddonSnapshotForUI
+            lastAddonSnapshotForUI = snap
+            if prev.appearances != snap.appearances || prev.addons.map(\.id) != snap.addons.map(\.id) {
+                recomputeLook(refreshAppearanceTab: true)
+            }
+            // Refresh cached source choices if any running add-on sources changed.
+            let sourcesChanged = !prev.addons.elementsEqual(snap.addons) { a, b in
+                a.id == b.id && a.state == b.state && a.sources == b.sources
+            }
+            if sourcesChanged {
+                cachedSourceChoices = nil
+                if !paused, captureLanes.contains(where: { $0.source.isAddon }) {
+                    if tap?.refreshSources() == true { reconnectConfiguredSources() }
+                }
+                refreshWaveform()
+            }
+            let optionsVisible = optionsPanel?.isVisible == true
+            if optionsVisible, let tabs = optionTabs {
+                let selectedLabel = tabs.selectedTabViewItem?.label
+                if selectedLabel == "Add-ons" && !(optionsPanel?.firstResponder is NSTextView) {
+                    reloadAddonsTab()
+                } else if selectedLabel == "Sources" && sourcesChanged {
+                    let sourcesStructureChanged = !prev.addons.elementsEqual(snap.addons) { a, b in
+                        a.id == b.id && a.state == b.state && a.sources.elementsEqual(b.sources) { s1, s2 in
+                            s1.id == s2.id && s1.format == s2.format && s1.formats == s2.formats
+                                && s1.sender == s2.sender && s1.groups == s2.groups
+                        }
+                    }
+                    if sourcesStructureChanged {
+                        replaceOptionsTab(with: makeSourceTab())
+                        refreshSourceOptions()
+                    } else {
+                        refreshAddonTransportControls()
+                    }
+                }
+            }
+            waveform?.needsDisplay = true
+        }
+        // Lightweight transport position refresh on Sources tab & main window chip.
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastAddonTransportUIRefresh >= 0.2 {
+            lastAddonTransportUIRefresh = now
+            refreshAddonTransportControls()
+        }
+        // Poll positions independently of snapshot generation (Pkg 19).
+        if let batch = host.positionsSince(cursor: addonPositionsCursor) {
+            addonPositionsCursor = batch.cursor
+            if !batch.positions.isEmpty || tap != nil {
+                if tap?.ingestAddonPositions(batch.positions) == true {
+                    setNotice("Position history was trimmed to its memory limit.")
+                }
+            }
+        }
+        // Poll control commands on primary window only (Pkg 17).
+        if !independentWindow {
+            let calls = host.takeControl()
+            if !calls.isEmpty {
+                executeControlCalls(calls)
+            }
+        }
+    }
+
+    func notifyClipExported(urls: [URL], sampleRate: UInt32, frames: UInt64) {
+        guard !urls.isEmpty, frames > 0, sampleRate > 0 else { return }
+        addonHost?.clipExported(files: urls.map(\.path), sampleRate: sampleRate, frames: frames)
+    }
+
+    // MARK: Pkg 3 — Channel Groups
+
+    func currentShownGroupIDs() -> [String?] {
+        captureLanes.map { shownChannelGroups[$0.source.key] }
+    }
+
+    func channelGroups(for lane: Int) -> [AddonChannelGroup] {
+        tap?.channelGroups(for: lane) ?? []
+    }
+
+    func resolvedShownGroup(for lane: Int) -> (group: AddonChannelGroup, range: Range<Int>, hasBed: Bool)? {
+        let groups = channelGroups(for: lane)
+        guard !groups.isEmpty, captureLanes.indices.contains(lane) else { return nil }
+        let preferred = shownChannelGroups[captureLanes[lane].source.key]
+        var offset = 0
+        var chosen: (AddonChannelGroup, Range<Int>)?
+        var hasBed = false
+        for g in groups {
+            let end = offset + g.channels.count
+            if !g.positioned { hasBed = true }
+            if let preferred, g.id == preferred {
+                chosen = (g, offset..<end)
+            }
+            offset = end
+        }
+        let pair = chosen ?? (groups[0], 0..<groups[0].channels.count)
+        return (pair.0, pair.1, hasBed)
+    }
+
+    @discardableResult
+    func selectChannelGroup(lane: Int, groupID: String) -> Bool {
+        guard captureLanes.indices.contains(lane) else { return false }
+        let groups = channelGroups(for: lane)
+        guard groups.contains(where: { $0.id == groupID }) else { return false }
+        let key = captureLanes[lane].source.key
+        guard shownChannelGroups[key] != groupID else { return true }
+        shownChannelGroups[key] = groupID
+        defaults.set(shownChannelGroups, forKey: "shownChannelGroups")
+        waveform?.onChannelGroupSwitched(lane: lane)
+        refreshWaveform()
+        updateStatus()
+        return true
+    }
+
+    func cycleChannelGroup(lane: Int) {
+        let groups = channelGroups(for: lane)
+        guard groups.count >= 2, captureLanes.indices.contains(lane) else { return }
+        let currentID = resolvedShownGroup(for: lane)?.group.id ?? groups[0].id
+        let idx = groups.firstIndex(where: { $0.id == currentID }) ?? 0
+        let next = groups[(idx + 1) % groups.count]
+        _ = selectChannelGroup(lane: lane, groupID: next.id)
+    }
+
+    // MARK: Pkg 20 — Look from add-on
+
+    private func offeredLookSpectrum() -> FrequencyGradient? {
+        guard let id = selectedLookAddonID, let appearance = currentAddonSnapshot.appearances[id] else {
+            return nil
+        }
+        return ResolvedLook.spectrum(from: appearance)
+    }
+
+    private func lookSpectrumOffererName() -> String? {
+        guard let id = selectedLookAddonID, offeredLookSpectrum() != nil else { return nil }
+        return currentAddonSnapshot.addonName(for: id)
+    }
+
+    func effectiveFrequencyGradient() -> FrequencyGradient {
+        if hasCustomFrequencyGradient { return frequencyGradient }
+        if let fromLook = offeredLookSpectrum() { return fromLook }
+        return .standard
+    }
+
+    private func recomputeLook(refreshAppearanceTab: Bool) {
+        let nextLook: ResolvedLook
+        if let id = selectedLookAddonID, let appearance = currentAddonSnapshot.appearances[id] {
+            nextLook = ResolvedLook.from(appearance: appearance, accentRGB: accentRGB)
+        } else {
+            nextLook = .default
+        }
+        currentLook = nextLook
+        background?.look = nextLook
+        waveform?.look = nextLook
+        waveform?.frequencyGradient = frequencyColoring ? effectiveFrequencyGradient() : nil
+        lookBorderWidthNote?.isHidden = nextLook.borderWidth == nil
+        updateBackground()
+        if refreshAppearanceTab {
+            refreshLookAddonPopup()
+            refreshFrequencyGradientControls()
+        }
+    }
+
+    private func chooseLookAddon(_ addonID: String?) {
+        selectedLookAddonID = addonID
+        if let addonID {
+            defaults.set(addonID, forKey: "selectedLookAddon")
+        } else {
+            defaults.removeObject(forKey: "selectedLookAddon")
+        }
+        recomputeLook(refreshAppearanceTab: true)
+        refreshWaveform()
+    }
+
+    private func refreshLookAddonPopup() {
+        guard let popup = lookAddonPopup else { return }
+        let offering: [(id: String, name: String)] = currentAddonSnapshot.appearances.keys.sorted().map {
+            ($0, currentAddonSnapshot.addonName(for: $0))
+        }
+        popup.removeAllItems()
+        popup.addItem(withTitle: "None")
+        popup.lastItem?.representedObject = ""
+        var selectedIndex = 0
+        for item in offering {
+            popup.addItem(withTitle: item.name)
+            popup.lastItem?.representedObject = item.id
+            if selectedLookAddonID == item.id { selectedIndex = popup.numberOfItems - 1 }
+        }
+        var missingChosenName: String?
+        if let chosen = selectedLookAddonID, !offering.contains(where: { $0.id == chosen }) {
+            let name = currentAddonSnapshot.addonName(for: chosen)
+            missingChosenName = name
+            popup.addItem(withTitle: name)
+            popup.lastItem?.representedObject = chosen
+            selectedIndex = popup.numberOfItems - 1
+        }
+        popup.selectItem(at: selectedIndex)
+        if let note = lookAddonNote {
+            if let missing = missingChosenName {
+                note.stringValue = "\(missing) is not offering a look right now. Backtracking shows its own look until it does."
+                note.isHidden = false
+            } else if offering.isEmpty {
+                note.stringValue = "No running add-on offers a look."
+                note.isHidden = false
+            } else {
+                note.stringValue = ""
+                note.isHidden = true
+            }
+        }
+        lookBorderWidthNote?.isHidden = currentLook.borderWidth == nil
+    }
+
+    @objc private func lookAddonChanged(_ sender: NSPopUpButton) {
+        let raw = (sender.selectedItem?.representedObject as? String) ?? ""
+        chooseLookAddon(raw.isEmpty ? nil : raw)
+        registerClick()
+    }
+
+    // MARK: Pkg 16 & 21 — Add-ons Page, Install Review, Settings, Actions, Remove
+
+    private func reloadAddonsTab() {
+        guard optionTabs != nil else { return }
+        replaceOptionsTab(with: makeAddonsTab())
+    }
+
+    private func openAddonsOptionsTab() {
+        if optionsPanel == nil || optionsPanel?.isVisible != true { showOptions() }
+        if let idx = optionCategoryButtons.firstIndex(where: { $0.title == "Add-ons" }) {
+            selectOptionCategory(optionCategoryButtons[idx])
+        }
+    }
+
+    private func openSourcesOptionsTab() {
+        if optionsPanel == nil || optionsPanel?.isVisible != true { showOptions() }
+        if let idx = optionCategoryButtons.firstIndex(where: { $0.title == "Sources" }) {
+            selectOptionCategory(optionCategoryButtons[idx])
+        }
+    }
+
+    private func cancelAddonPromptOnEscape() -> Bool {
+        if let review = addonReview {
+            if case .installing = review { return true }
+            addonReview = nil
+            reloadAddonsTab()
+            return true
+        }
+        if let removal = addonRemoval {
+            if !removal.busy {
+                addonRemoval = nil
+                reloadAddonsTab()
+            }
+            return true
+        }
+        return false
+    }
+
+    func handleDroppedFiles(_ urls: [URL]) -> Bool {
+        let packages = urls.filter(AddonFormatting.isPackageURL)
+        if let firstPkg = packages.first {
+            openAddonsOptionsTab()
+            beginAddonReview(url: firstPkg, others: packages.count - 1)
+            return true
+        }
+        // Non-package file drop (ADD-W33).
+        let snap = currentAddonSnapshot
+        for url in urls where !AddonFormatting.isPackageURL(url) {
+            let runningOpeners: [(id: String, name: String)] = snap.addons.compactMap { addon in
+                guard addon.isRunning, let spec = addon.openFilesSpec, spec.accepts(url: url) else { return nil }
+                return (addon.id, addon.displayName)
+            }
+            if runningOpeners.count == 1 {
+                openFileWithAddon(id: runningOpeners[0].id, url: url)
+                return true
+            } else if runningOpeners.count > 1 {
+                addonPendingDropChoice = (url, runningOpeners)
+                openSourcesOptionsTab()
+                replaceOptionsTab(with: makeSourceTab())
+                refreshSourceOptions()
+                return true
+            } else {
+                if let idle = snap.addons.first(where: { !$0.isRunning && ($0.openFilesSpec?.accepts(url: url) == true) }) {
+                    setNotice("\(idle.displayName) opens this kind of file but is not running. Turn it on in Options, Add-ons.")
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    private func beginAddonReview(url: URL, others: Int) {
+        if case .installing = addonReview {
+            addonPageNotice = "Wait for the current installation to finish."
+            reloadAddonsTab()
+            return
+        }
+        guard let host = addonHost else {
+            addonPageNotice = "Add-ons are not available in this window."
+            reloadAddonsTab()
+            return
+        }
+        let extraNote: String? = others > 0
+            ? (others == 1
+                ? "Only the first add-on is shown; the other add-on file was not opened."
+                : "Only the first add-on is shown; the other \(others) add-on files were not opened.")
+            : nil
+        addonPageNotice = nil
+        addonReview = .reading(url, note: extraNote)
+        reloadAddonsTab()
+        host.inspect(path: url.path) { [weak self] result in
+            guard let self else { return }
+            guard case .reading(let currentURL, let note) = self.addonReview, currentURL == url else { return }
+            switch result {
+            case .success(let inspected):
+                let existing = currentAddonSnapshot.addon(inspected.manifest.id)
+                let installedVer = existing?.manifest?.version
+                let broken = existing != nil && existing?.manifest == nil
+                self.addonReview = .ready(url, inspect: inspected, installedVersion: installedVer, brokenInstalled: broken, note: note)
+            case .failure(let reason):
+                self.addonReview = .refused(url, reason: reason.message, note: note)
+            }
+            self.reloadAddonsTab()
+        }
+    }
+
+    private func makeAddonsTab() -> NSTabViewItem {
+        addonSettingTextFields.removeAll()
+        addonSettingNumberFields.removeAll()
+        guard addonHost != nil else {
+            return optionsTab("Add-ons", groups: [
+                optionGroup(nil, rows: [optionNote("Add-ons are not available in this window.")])
+            ])
+        }
+        if let review = addonReview {
+            return optionsTab("Add-ons", groups: [makeAddonReviewGroup(review)])
+        }
+
+        let snap = currentAddonSnapshot
+        var groups: [NSView] = []
+        var topRows: [NSView] = []
+        if let notice = addonPageNotice, !notice.isEmpty {
+            let lbl = optionNote(notice)
+            lbl.textColor = .labelColor
+            topRows.append(lbl)
+        }
+        if let err = snap.error, !err.isEmpty {
+            let errLbl = optionNote("Add-ons are unavailable: \(err)")
+            errLbl.textColor = WaveformTheme.statusUnavailable
+            topRows.append(errLbl)
+        }
+        if snap.addons.isEmpty {
+            let emptyHead = optionNote("No add-ons are installed.")
+            emptyHead.textColor = .labelColor
+            topRows.append(emptyHead)
+            topRows.append(optionNote("An add-on is a separate program that adds features to Backtracking or changes how it works, for example a new audio source with its own settings and buttons."))
+            topRows.append(optionNote("To add one, choose Install from file, or drop a .btaddon file on a Backtracking window."))
+        }
+        if !topRows.isEmpty {
+            groups.append(optionGroup(nil, rows: topRows))
+        }
+        for addon in snap.addons {
+            groups.append(makeAddonCardGroup(addon))
+        }
+        let installBtn = NSButton(title: "Install from file…", target: self, action: #selector(installAddonFromFile))
+        var footerRows: [NSView] = [buttonRow([installBtn])]
+        if !snap.addons.isEmpty {
+            footerRows.append(optionNote("You can also drop a .btaddon file on a Backtracking window."))
+        }
+        groups.append(optionGroup(nil, rows: footerRows))
+        return optionsTab("Add-ons", groups: groups)
+    }
+
+    private func makeAddonReviewGroup(_ review: AddonReviewStage) -> NSStackView {
+        var rows: [NSView] = []
+        switch review {
+        case .reading(let url, let note):
+            if let note { rows.append(optionNote(note)) }
+            rows.append(optionNote("Reading \(url.lastPathComponent)…"))
+            rows.append(buttonRow([NSButton(title: "Cancel", target: self, action: #selector(cancelAddonReview))]))
+            return optionGroup("Install this add-on?", rows: rows)
+
+        case .refused(let url, let reason, let note):
+            if let note { rows.append(optionNote(note)) }
+            let heading = optionNote("This file cannot be installed.")
+            heading.textColor = WaveformTheme.statusUnavailable
+            rows.append(heading)
+            rows.append(optionNote(reason))
+            rows.append(optionField("Package file", optionNote(url.path)))
+            rows.append(buttonRow([NSButton(title: "Close", target: self, action: #selector(cancelAddonReview))]))
+            return optionGroup("Install this add-on?", rows: rows)
+
+        case .ready(let url, let info, let installedVer, let broken, let note),
+             .installing(let url, let info, let installedVer, let broken, let note),
+             .failed(let url, let info, let installedVer, let broken, _, let note):
+            if let note { rows.append(optionNote(note)) }
+            let m = info.manifest
+            let title = NSTextField(labelWithString: m.name)
+            title.font = .systemFont(ofSize: 16, weight: .bold)
+            rows.append(title)
+            rows.append(optionNote("Version \(m.version) · by \(m.author)"))
+            if !m.description.isEmpty {
+                let desc = optionNote(m.description)
+                desc.textColor = .labelColor
+                rows.append(desc)
+            }
+            if let homepage = m.homepage, AddonFormatting.linkIsOpenable(homepage) {
+                let linkBtn = NSButton(title: homepage, target: self, action: #selector(openAddonHomepage(_:)))
+                linkBtn.isBordered = false
+                linkBtn.contentTintColor = .linkColor
+                linkBtn.alignment = .left
+                linkBtn.toolTip = homepage
+                rows.append(optionField("Homepage", linkBtn))
+            }
+            if let license = m.license, !license.isEmpty {
+                rows.append(optionField("License", optionNote(license)))
+            }
+            rows.append(optionField("Program it runs", optionNote(info.program)))
+            rows.append(optionField("Unpacked size", optionNote(AddonFormatting.sizeInFiles(bytes: info.unpacked_size, files: info.file_count))))
+            rows.append(optionField("Package file", optionNote(url.path)))
+
+            let capsHeading = NSTextField(labelWithString: "What it asks for")
+            capsHeading.font = .systemFont(ofSize: 14, weight: .semibold)
+            rows.append(capsHeading)
+            for capLine in AddonFormatting.capabilityLines(for: m) {
+                let l = optionNote("• \(capLine)")
+                l.textColor = .labelColor
+                rows.append(l)
+            }
+            let trust = optionNote("An add-on is a program that runs with your own permissions. It is not sandboxed: it can do anything you can do on this computer, whatever the list above says. Install only add-ons you trust.")
+            trust.textColor = NSColor(srgbRed: 246 / 255, green: 196 / 255, blue: 118 / 255, alpha: 1)
+            rows.append(trust)
+
+            if let installedVer {
+                rows.append(optionNote("This replaces version \(installedVer) with version \(m.version). Its settings and saved data are kept."))
+            } else if broken {
+                rows.append(optionNote("This replaces a broken installation of the same add-on."))
+            } else {
+                rows.append(optionNote("Once installed, it starts at once and each time Backtracking starts. You can turn it off on the Add-ons page."))
+            }
+
+            if case .installing = review {
+                rows.append(optionNote("Installing…"))
+            } else if case .failed(_, _, _, _, let reason, _) = review {
+                let err = optionNote("Could not install it: \(reason)")
+                err.textColor = WaveformTheme.statusUnavailable
+                rows.append(err)
+                if let installedVer {
+                    rows.append(optionNote("The previous version, \(installedVer), is still installed."))
+                } else if broken {
+                    rows.append(optionNote("The broken installation was left as it was."))
+                } else {
+                    rows.append(optionNote("Nothing was installed."))
+                }
+                rows.append(buttonRow([NSButton(title: "Close", target: self, action: #selector(cancelAddonReview))]))
+            } else {
+                let installBtn = NSButton(title: "Install", target: self, action: #selector(confirmAddonInstall))
+                let cancelBtn = NSButton(title: "Cancel", target: self, action: #selector(cancelAddonReview))
+                rows.append(buttonRow([installBtn, cancelBtn]))
+            }
+            return optionGroup("Install this add-on?", rows: rows)
+        }
+    }
+
+    private func makeAddonCardGroup(_ addon: AddonRecord) -> NSStackView {
+        var rows: [NSView] = []
+        if let m = addon.manifest {
+            rows.append(optionNote("Version \(m.version) · by \(m.author)"))
+            if !m.description.isEmpty {
+                rows.append(optionNote(m.description))
+            }
+        }
+        let status = addon.statusPresentation
+        let statusLbl = optionNote(status.text)
+        switch status.tone {
+        case .running: statusLbl.textColor = accentColor(accentRGB)
+        case .busy: statusLbl.textColor = NSColor(white: 170 / 255, alpha: 1)
+        case .off: statusLbl.textColor = NSColor(white: 140 / 255, alpha: 1)
+        case .problem: statusLbl.textColor = NSColor(srgbRed: 246 / 255, green: 196 / 255, blue: 118 / 255, alpha: 1)
+        }
+        rows.append(statusLbl)
+        if addon.isBroken {
+            rows.append(optionNote("Remove it, or install the package again."))
+        }
+        if let msg = addon.message {
+            let msgLbl = optionNote(AddonFormatting.addonMessageText(msg))
+            switch msg.level {
+            case "error": msgLbl.textColor = WaveformTheme.statusUnavailable
+            case "warning": msgLbl.textColor = NSColor(srgbRed: 246 / 255, green: 196 / 255, blue: 118 / 255, alpha: 1)
+            default: msgLbl.textColor = .labelColor
+            }
+            rows.append(msgLbl)
+        }
+
+        let enabledCheck = NSButton(checkboxWithTitle: "Enabled", target: self, action: #selector(addonEnabledChanged(_:)))
+        enabledCheck.state = addon.enabled ? .on : .off
+        enabledCheck.isEnabled = !addon.isBroken
+        enabledCheck.identifier = NSUserInterfaceItemIdentifier("addon-enabled:\(addon.id)")
+        var headerButtons: [NSButton] = [enabledCheck]
+        if addon.canStartAgain {
+            let restartBtn = NSButton(title: "Start again", target: self, action: #selector(addonStartAgain(_:)))
+            restartBtn.identifier = NSUserInterfaceItemIdentifier("addon-start:\(addon.id)")
+            headerButtons.append(restartBtn)
+        }
+        rows.append(buttonRow(headerButtons))
+
+        if let problem = addonProblems["\(addon.id):"] {
+            let pLbl = optionNote(problem)
+            pLbl.textColor = WaveformTheme.statusUnavailable
+            rows.append(pLbl)
+        }
+
+        // Control consent switch (Pkg 17).
+        if addon.declaresControl {
+            let controlCheck = NSButton(
+                checkboxWithTitle: "Let this add-on control Backtracking (start and pause recording, select, save files, change sources)",
+                target: self, action: #selector(addonControlAllowedChanged(_:))
+            )
+            controlCheck.state = addon.control_allowed ? .on : .off
+            controlCheck.identifier = NSUserInterfaceItemIdentifier("addon-control:\(addon.id)")
+            rows.append(controlCheck)
+            if addon.control_asked && !addon.control_allowed {
+                let refused = optionNote("It asked to control Backtracking and was refused")
+                refused.textColor = NSColor(srgbRed: 246 / 255, green: 196 / 255, blue: 118 / 255, alpha: 1)
+                rows.append(refused)
+            }
+            if let cp = addonProblems["\(addon.id):control:"] {
+                let pLbl = optionNote(cp)
+                pLbl.textColor = WaveformTheme.statusUnavailable
+                rows.append(pLbl)
+            }
+        }
+
+        // Settings & Actions while running.
+        if addon.isRunning {
+            if !addon.settings.isEmpty {
+                let heading = NSTextField(labelWithString: "Settings")
+                heading.font = .systemFont(ofSize: 14, weight: .semibold)
+                rows.append(heading)
+                for entry in addon.settings {
+                    rows.append(makeAddonSettingView(addonID: addon.id, entry: entry))
+                }
+            }
+            if !addon.actions.isEmpty {
+                let heading = NSTextField(labelWithString: "Actions")
+                heading.font = .systemFont(ofSize: 14, weight: .semibold)
+                rows.append(heading)
+                let buttons = addon.actions.map { act -> NSButton in
+                    let b = NSButton(title: act.label, target: self, action: #selector(addonRunAction(_:)))
+                    b.identifier = NSUserInterfaceItemIdentifier("addon-action:\(addon.id):\(act.id):\(act.label)")
+                    return b
+                }
+                for start in stride(from: 0, to: buttons.count, by: 2) {
+                    let end = min(start + 2, buttons.count)
+                    rows.append(buttonRow(Array(buttons[start..<end])))
+                }
+                for act in addon.actions {
+                    if let prob = addonProblems["\(addon.id):action:\(act.id)"] {
+                        let pLbl = optionNote(prob)
+                        pLbl.textColor = WaveformTheme.statusUnavailable
+                        rows.append(pLbl)
+                    }
+                }
+            }
+        } else if !addon.isBroken && (addon.manifest?.hasCapability("settings") == true || addon.manifest?.hasCapability("actions") == true) {
+            rows.append(optionNote("Its settings and buttons appear here while it is running."))
+        }
+
+        // Remove inline confirmation or Remove… button.
+        if let rem = addonRemoval, rem.id == addon.id {
+            let q = optionNote("Remove \(rem.name)?")
+            q.textColor = .labelColor
+            rows.append(q)
+            rows.append(optionNote("Its program is deleted, and its sources leave the source list."))
+            let delCheck = NSButton(checkboxWithTitle: "Also delete its saved data", target: self, action: #selector(addonRemoveDeleteDataChanged(_:)))
+            delCheck.state = rem.deleteData ? .on : .off
+            delCheck.isEnabled = !rem.busy
+            rows.append(delCheck)
+            rows.append(optionNote("Unless you delete it, its saved data stays for a later install."))
+            if let err = rem.error {
+                let eLbl = optionNote(err)
+                eLbl.textColor = WaveformTheme.statusUnavailable
+                rows.append(eLbl)
+            }
+            if rem.busy {
+                rows.append(optionNote("Removing…"))
+            } else {
+                let confirmBtn = NSButton(title: "Remove", target: self, action: #selector(addonConfirmRemove))
+                let cancelBtn = NSButton(title: "Cancel", target: self, action: #selector(addonCancelRemove))
+                rows.append(buttonRow([confirmBtn, cancelBtn]))
+            }
+        } else {
+            let removeBtn = NSButton(title: "Remove…", target: self, action: #selector(addonAskRemove(_:)))
+            removeBtn.identifier = NSUserInterfaceItemIdentifier("addon-remove:\(addon.id)")
+            rows.append(buttonRow([removeBtn]))
+        }
+
+        return optionGroup(addon.displayName, rows: rows)
+    }
+
+    private func makeAddonSettingView(addonID: String, entry: AddonSettingEntry) -> NSView {
+        let decl = entry.declaration
+        let draftKey = "\(addonID):\(decl.key)"
+        let current = addonSettingDrafts[draftKey] ?? entry.value
+        var below: [NSView] = []
+        if let help = decl.help, !help.isEmpty {
+            below.append(optionNote(help))
+        }
+        if let prob = addonProblems[draftKey] {
+            let pLbl = optionNote(prob)
+            pLbl.textColor = WaveformTheme.statusUnavailable
+            below.append(pLbl)
+        }
+        switch decl.kind {
+        case "toggle":
+            let check = NSButton(checkboxWithTitle: decl.label, target: self, action: #selector(addonSettingToggleChanged(_:)))
+            let on = current.boolValue ?? decl.defaultValue.boolValue ?? false
+            check.state = on ? .on : .off
+            check.identifier = NSUserInterfaceItemIdentifier("addon-toggle:\(addonID):\(decl.key):\(decl.label)")
+            if below.isEmpty { return check }
+            return optionsStack([check] + below, spacing: 4)
+
+        case "choice":
+            let opts = decl.options ?? []
+            let popup = OptionsPopUpButton(frame: .zero, pullsDown: false)
+            popup.target = self
+            popup.action = #selector(addonSettingChoiceChanged(_:))
+            popup.autoenablesItems = false
+            prepareOptionPopup(popup)
+            popup.identifier = NSUserInterfaceItemIdentifier("addon-choice:\(addonID):\(decl.key):\(decl.label)")
+            let wanted = current.stringValue ?? decl.defaultValue.stringValue ?? ""
+            var selectedIdx = 0
+            for (idx, opt) in opts.enumerated() {
+                popup.addItem(withTitle: opt.label)
+                popup.lastItem?.representedObject = opt.value
+                if opt.value == wanted { selectedIdx = idx }
+            }
+            if !opts.isEmpty { popup.selectItem(at: selectedIdx) }
+            return optionField(decl.label, popup, below: below)
+
+        case "number":
+            let minV = decl.min ?? 0
+            let maxV = decl.max ?? 65535
+            let stepV = decl.step ?? 1
+            let val = AddonJSONValue.snapNumber(
+                current.doubleValue ?? decl.defaultValue.doubleValue ?? minV,
+                min: minV, max: maxV, step: stepV
+            )
+            let decimals = AddonJSONValue.stepDecimals(stepV)
+            let formatted = decimals == 0 ? String(format: "%.0f", val) : String(format: "%.\(decimals)f", val)
+            let field = NSTextField(string: formatted)
+            field.target = self
+            field.action = #selector(addonSettingNumberChanged(_:))
+            addonSettingNumberFields[field] = (addonID, decl.key, decl.label, minV, maxV, stepV)
+            return optionField(decl.label, field, below: below)
+
+        default: // "text"
+            let val = current.stringValue ?? decl.defaultValue.stringValue ?? ""
+            let field = NSTextField(string: val)
+            field.target = self
+            field.action = #selector(addonSettingTextChanged(_:))
+            addonSettingTextFields[field] = (addonID, decl.key, decl.label)
+            return optionField(decl.label, field, below: below)
+        }
+    }
+
+    @objc private func installAddonFromFile() {
+        let dialog = NSOpenPanel()
+        dialog.title = "Install an add-on"
+        dialog.canChooseFiles = true
+        dialog.canChooseDirectories = false
+        dialog.allowsMultipleSelection = false
+        if let btaddonType = UTType(filenameExtension: "btaddon") {
+            dialog.allowedContentTypes = [btaddonType]
+        }
+        let response = dialog.runModal()
+        guard response == .OK, let url = dialog.url else { return }
+        beginAddonReview(url: url, others: 0)
+    }
+
+    @objc private func confirmAddonInstall() {
+        guard let host = addonHost,
+              case .ready(let url, let inspect, let installedVer, let broken, let note) = addonReview else { return }
+        let wasInstalled = installedVer != nil || broken
+        addonReview = .installing(url, inspect: inspect, installedVersion: installedVer, brokenInstalled: broken, note: note)
+        reloadAddonsTab()
+        host.install(path: url.path, reviewID: inspect.review_id) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let summary):
+                self.addonReview = nil
+                self.addonPageNotice = "Installed \(summary.manifest.name) \(summary.manifest.version)."
+                if !wasInstalled {
+                    host.setEnabled(id: summary.manifest.id, enabled: true) { [weak self] enRes in
+                        if case .failure(let err) = enRes {
+                            self?.addonProblems["\(summary.manifest.id):"] = "Could not turn it on: \(err)"
+                            self?.reloadAddonsTab()
+                        }
+                    }
+                }
+            case .failure(let reason):
+                self.addonReview = .failed(
+                    url, inspect: inspect, installedVersion: installedVer,
+                    brokenInstalled: broken, reason: reason.message, note: note
+                )
+            }
+            self.reloadAddonsTab()
+        }
+    }
+
+    @objc private func cancelAddonReview() {
+        addonReview = nil
+        reloadAddonsTab()
+    }
+
+    @objc private func openAddonHomepage(_ sender: NSButton) {
+        let link = sender.title
+        guard AddonFormatting.linkIsOpenable(link), let url = URL(string: link) else { return }
+        if !NSWorkspace.shared.open(url) {
+            addonPageNotice = "Could not open the link: \(link)"
+            reloadAddonsTab()
+        }
+    }
+
+    @objc private func addonEnabledChanged(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue, raw.hasPrefix("addon-enabled:"), let host = addonHost else { return }
+        let id = String(raw.dropFirst("addon-enabled:".count))
+        let on = sender.state == .on
+        addonProblems.removeValue(forKey: "\(id):")
+        host.setEnabled(id: id, enabled: on) { [weak self] result in
+            if case .failure(let reason) = result {
+                self?.addonProblems["\(id):"] = on ? "Could not turn it on: \(reason)" : "Could not turn it off: \(reason)"
+                self?.reloadAddonsTab()
+            }
+        }
+    }
+
+    @objc private func addonControlAllowedChanged(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue, raw.hasPrefix("addon-control:"), let host = addonHost else { return }
+        let id = String(raw.dropFirst("addon-control:".count))
+        let on = sender.state == .on
+        addonProblems.removeValue(forKey: "\(id):control:")
+        host.setControlAllowed(id: id, allowed: on) { [weak self] result in
+            if case .failure(let reason) = result {
+                self?.addonProblems["\(id):control:"] = on ? "Could not turn it on: \(reason)" : "Could not turn it off: \(reason)"
+                self?.reloadAddonsTab()
+            }
+        }
+    }
+
+    @objc private func addonStartAgain(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue, raw.hasPrefix("addon-start:"), let host = addonHost else { return }
+        let id = String(raw.dropFirst("addon-start:".count))
+        addonProblems.removeValue(forKey: "\(id):")
+        host.start(id: id) { [weak self] result in
+            if case .failure(let reason) = result {
+                self?.addonProblems["\(id):"] = "Could not start it: \(reason)"
+                self?.reloadAddonsTab()
+            }
+        }
+    }
+
+    @objc private func addonSettingToggleChanged(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue, raw.hasPrefix("addon-toggle:"), let host = addonHost else { return }
+        let parts = raw.dropFirst("addon-toggle:".count).split(separator: ":", maxSplits: 2).map(String.init)
+        guard parts.count == 3 else { return }
+        let (id, key, label) = (parts[0], parts[1], parts[2])
+        let value = AddonJSONValue.bool(sender.state == .on)
+        submitAddonSetting(host: host, id: id, key: key, label: label, value: value)
+    }
+
+    @objc private func addonSettingChoiceChanged(_ sender: NSPopUpButton) {
+        guard let raw = sender.identifier?.rawValue, raw.hasPrefix("addon-choice:"),
+              let val = sender.selectedItem?.representedObject as? String, let host = addonHost else { return }
+        let parts = raw.dropFirst("addon-choice:".count).split(separator: ":", maxSplits: 2).map(String.init)
+        guard parts.count == 3 else { return }
+        submitAddonSetting(host: host, id: parts[0], key: parts[1], label: parts[2], value: .string(val))
+    }
+
+    @objc private func addonSettingNumberChanged(_ sender: NSTextField) {
+        guard let info = addonSettingNumberFields[sender], let host = addonHost else { return }
+        let parsed = Double(sender.stringValue.trimmingCharacters(in: .whitespaces)) ?? info.min
+        let json = AddonJSONValue.snappedNumber(parsed, min: info.min, max: info.max, step: info.step)
+        submitAddonSetting(host: host, id: info.addonID, key: info.key, label: info.label, value: json)
+    }
+
+    @objc private func addonSettingTextChanged(_ sender: NSTextField) {
+        guard let info = addonSettingTextFields[sender], let host = addonHost else { return }
+        let clipped = String(sender.stringValue.prefix(200))
+        submitAddonSetting(host: host, id: info.addonID, key: info.key, label: info.label, value: .string(clipped))
+    }
+
+    private func submitAddonSetting(host: AddonHostClient, id: String, key: String, label: String, value: AddonJSONValue) {
+        let slot = "\(id):\(key)"
+        addonProblems.removeValue(forKey: slot)
+        addonSettingDrafts[slot] = value
+        host.setSetting(id: id, key: key, value: value) { [weak self] result in
+            guard let self else { return }
+            self.addonSettingDrafts.removeValue(forKey: slot)
+            if case .failure(let reason) = result {
+                self.addonProblems[slot] = "Could not change \(label): \(reason)"
+            }
+            self.reloadAddonsTab()
+        }
+    }
+
+    @objc private func addonRunAction(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue, raw.hasPrefix("addon-action:"), let host = addonHost else { return }
+        let parts = raw.dropFirst("addon-action:".count).split(separator: ":", maxSplits: 2).map(String.init)
+        guard parts.count == 3 else { return }
+        let (id, actionID, label) = (parts[0], parts[1], parts[2])
+        let slot = "\(id):action:\(actionID)"
+        addonProblems.removeValue(forKey: slot)
+        host.runAction(id: id, action: actionID) { [weak self] result in
+            if case .failure(let reason) = result {
+                self?.addonProblems[slot] = "Could not run \(label): \(reason)"
+                self?.reloadAddonsTab()
+            }
+        }
+    }
+
+    @objc private func addonAskRemove(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue, raw.hasPrefix("addon-remove:") else { return }
+        let id = String(raw.dropFirst("addon-remove:".count))
+        let name = currentAddonSnapshot.addonName(for: id)
+        addonRemoval = (id: id, name: name, deleteData: false, busy: false, error: nil)
+        reloadAddonsTab()
+    }
+
+    @objc private func addonRemoveDeleteDataChanged(_ sender: NSButton) {
+        guard var rem = addonRemoval else { return }
+        rem.deleteData = sender.state == .on
+        addonRemoval = rem
+    }
+
+    @objc private func addonConfirmRemove() {
+        guard var rem = addonRemoval, !rem.busy, let host = addonHost else { return }
+        rem.busy = true
+        rem.error = nil
+        addonRemoval = rem
+        reloadAddonsTab()
+        let removeID = rem.id
+        let removeName = rem.name
+        host.remove(id: removeID, deleteData: rem.deleteData) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                self.addonRemoval = nil
+                self.addonPageNotice = "Removed \(removeName)."
+                self.addonProblems = self.addonProblems.filter { !$0.key.hasPrefix("\(removeID):") }
+                self.addonSettingDrafts = self.addonSettingDrafts.filter { !$0.key.hasPrefix("\(removeID):") }
+            case .failure(let reason):
+                if var cur = self.addonRemoval, cur.id == removeID {
+                    cur.busy = false
+                    cur.error = "Could not remove it: \(reason)"
+                    self.addonRemoval = cur
+                }
+            }
+            self.reloadAddonsTab()
+        }
+    }
+
+    @objc private func addonCancelRemove() {
+        addonRemoval = nil
+        reloadAddonsTab()
+    }
+
+    // MARK: Pkg 18 — Add-on Sources on Sources Page & Main Window Transport Chip
+
+    private func makeAddonSourceLaneRows(laneIndex: Int, addonID: String, sourceID: String) -> (views: [NSView], hideRoute: Bool) {
+        var views: [NSView] = []
+        let snap = currentAddonSnapshot
+        let fallbackName = defaultFileName(for: .addon(addonID: addonID, sourceID: sourceID))
+
+        guard let addon = snap.addon(addonID) else {
+            let msg = optionNote("The add-on that provides \"\(fallbackName)\" is not installed.")
+            msg.textColor = WaveformTheme.statusUnavailable
+            views.append(msg)
+            views.append(optionNote("Install it on the Add-ons page, or choose another source."))
+            views.append(buttonRow([NSButton(title: "Open the Add-ons page", target: self, action: #selector(openAddonsFromSources))]))
+            return (views, true)
+        }
+        guard addon.isRunning else {
+            let msg = optionNote("\(addon.displayName) is not available. \(addon.statusPresentation.text)")
+            msg.textColor = WaveformTheme.statusUnavailable
+            views.append(msg)
+            views.append(optionNote("Turn it on or start it again on the Add-ons page, or choose another source."))
+            views.append(buttonRow([NSButton(title: "Open the Add-ons page", target: self, action: #selector(openAddonsFromSources))]))
+            return (views, true)
+        }
+        guard let source = addon.sources.first(where: { $0.id == sourceID }) else {
+            let msg = optionNote("\(addon.displayName) no longer offers \"\(fallbackName)\".")
+            msg.textColor = WaveformTheme.statusUnavailable
+            views.append(msg)
+            views.append(optionNote("Choose another source. If you expected it, restart the add-on on the Add-ons page."))
+            views.append(buttonRow([NSButton(title: "Open the Add-ons page", target: self, action: #selector(openAddonsFromSources))]))
+            return (views, true)
+        }
+
+        let channels = tap?.channelCount(for: laneIndex) ?? UInt32(source.allChannelLabels.count)
+        let isWide = channels > 2
+
+        // Format picker.
+        if !source.formats.isEmpty {
+            let slotKey = "\(addonID):\(sourceID)"
+            let now = ProcessInfo.processInfo.systemUptime
+            let activeFormat: String
+            if let pending = addonPendingFormats[slotKey], now - pending.at < 5.0, source.format != pending.format {
+                activeFormat = pending.format
+            } else {
+                activeFormat = source.format
+            }
+            let fmtPopup = OptionsPopUpButton(frame: .zero, pullsDown: false)
+            fmtPopup.target = self
+            fmtPopup.action = #selector(addonFormatChanged(_:))
+            fmtPopup.autoenablesItems = false
+            fmtPopup.tag = laneIndex
+            prepareOptionPopup(fmtPopup)
+            var selectedIdx = 0
+            var found = false
+            for (i, fmt) in source.formats.enumerated() {
+                fmtPopup.addItem(withTitle: fmt.label)
+                fmtPopup.lastItem?.representedObject = fmt.id
+                if fmt.id == activeFormat {
+                    selectedIdx = i
+                    found = true
+                }
+            }
+            var below: [NSView] = []
+            if !found && !activeFormat.isEmpty {
+                fmtPopup.addItem(withTitle: activeFormat)
+                fmtPopup.lastItem?.isEnabled = false
+                selectedIdx = fmtPopup.numberOfItems - 1
+                let warn = optionNote("The add-on reports the format \"\(activeFormat)\", which it does not list.")
+                warn.textColor = WaveformTheme.statusUnavailable
+                below.append(warn)
+            }
+            fmtPopup.selectItem(at: selectedIdx)
+            if channels > 0 {
+                below.append(optionNote(channels == 1 ? "1 channel" : "\(channels) channels"))
+            }
+            if isWide {
+                below.append(optionNote("Each channel of a wide format has its own row, so there is no route to choose."))
+            }
+            views.append(optionField("Format", fmtPopup, below: below))
+        }
+
+        // Open file…
+        if let spec = addon.openFilesSpec {
+            let openBtn = NSButton(title: "Open file…", target: self, action: #selector(addonOpenFileButton(_:)))
+            openBtn.identifier = NSUserInterfaceItemIdentifier("addon-open:\(addonID)")
+            let help = optionNote("Opens \(spec.description) (\(spec.formattedExtensions)). You can also drop the file on a window.")
+            views.append(optionField("File", buttonRow([openBtn]), below: [help]))
+        }
+
+        // Playback transport.
+        if let tr = source.transport {
+            let playBtn = NSButton(title: tr.isPlaying ? "Pause" : "Play", target: self, action: #selector(addonTransportToggle(_:)))
+            playBtn.tag = laneIndex
+            addonTransportPlayButtons[laneIndex] = playBtn
+            let stopBtn = NSButton(title: "Stop", target: self, action: #selector(addonTransportStop(_:)))
+            stopBtn.tag = laneIndex
+            let pos = shownTransportPosition(addonID: addonID, sourceID: sourceID, transport: tr)
+            let timeText = tr.duration.map { "\(AddonFormatting.clock(pos.position)) / \(AddonFormatting.clock($0))" }
+                ?? AddonFormatting.clock(pos.position)
+            let timeLbl = NSTextField(labelWithString: timeText)
+            timeLbl.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+            addonTransportTimeLabels[laneIndex] = timeLbl
+            var transportRows: [NSView] = [buttonRow([playBtn, stopBtn]), timeLbl]
+            if let dur = tr.duration, dur.isFinite, dur > 0 {
+                let slider = NSSlider(value: min(dur, max(0, pos.position)), minValue: 0, maxValue: dur,
+                                      target: self, action: #selector(addonTransportSliderChanged(_:)))
+                slider.tag = laneIndex
+                slider.isContinuous = false
+                addonTransportSliders[laneIndex] = slider
+                transportRows.append(slider)
+            }
+            let seekNote = optionNote(pos.seeking ? "Moving to \(AddonFormatting.clock(pos.position)). The sound returns in a moment." : "")
+            seekNote.isHidden = !pos.seeking
+            addonTransportSeekNotes[laneIndex] = seekNote
+            transportRows.append(seekNote)
+            views.append(optionField("Playback", optionsStack(transportRows, spacing: 6)))
+        }
+
+        if let msg = addon.message {
+            let mLbl = optionNote(AddonFormatting.addonMessageText(msg))
+            if msg.level == "error" { mLbl.textColor = WaveformTheme.statusUnavailable }
+            views.append(mLbl)
+        }
+        if let prob = addonSourceProblems[addonID] {
+            let pLbl = optionNote(prob)
+            pLbl.textColor = WaveformTheme.statusUnavailable
+            views.append(pLbl)
+        }
+        return (views, isWide)
+    }
+
+    private func shownTransportPosition(addonID: String, sourceID: String, transport: AddonTransport) -> (position: Double, seeking: Bool) {
+        let key = "\(addonID):\(sourceID)"
+        let now = ProcessInfo.processInfo.systemUptime
+        if let seek = addonSeekingTargets[key], now - seek.at < 3.0, abs(transport.position - seek.target) > 1.0 {
+            return (seek.target, true)
+        }
+        addonSeekingTargets.removeValue(forKey: key)
+        return (transport.position, false)
+    }
+
+    private func refreshAddonTransportControls() {
+        for (laneIndex, lane) in captureLanes.enumerated() {
+            guard case .addon(let addonID, let sourceID) = lane.source,
+                  let (_, source) = currentAddonSnapshot.source(addonID: addonID, sourceID: sourceID),
+                  let tr = source.transport else { continue }
+            let pos = shownTransportPosition(addonID: addonID, sourceID: sourceID, transport: tr)
+            let timeText = tr.duration.map { "\(AddonFormatting.clock(pos.position)) / \(AddonFormatting.clock($0))" }
+                ?? AddonFormatting.clock(pos.position)
+            addonTransportPlayButtons[laneIndex]?.title = tr.isPlaying ? "Pause" : "Play"
+            addonTransportTimeLabels[laneIndex]?.stringValue = timeText
+            if let slider = addonTransportSliders[laneIndex], let dur = tr.duration, dur > 0 {
+                slider.maxValue = dur
+                if NSApp.currentEvent?.type != .leftMouseDragged {
+                    slider.doubleValue = min(dur, max(0, pos.position))
+                }
+            }
+            if let note = addonTransportSeekNotes[laneIndex] {
+                note.stringValue = pos.seeking ? "Moving to \(AddonFormatting.clock(pos.position)). The sound returns in a moment." : ""
+                note.isHidden = !pos.seeking
+            }
+        }
+    }
+
+    func compactTransportChip(for lane: Int) -> (playing: Bool, text: String, sourceName: String)? {
+        guard captureLanes.indices.contains(lane),
+              case .addon(let addonID, let sourceID) = captureLanes[lane].source,
+              let (_, source) = currentAddonSnapshot.source(addonID: addonID, sourceID: sourceID),
+              let tr = source.transport else { return nil }
+        let pos = shownTransportPosition(addonID: addonID, sourceID: sourceID, transport: tr)
+        let text = tr.duration.map { "\(AddonFormatting.clock(pos.position)) / \(AddonFormatting.clock($0))" }
+            ?? AddonFormatting.clock(pos.position)
+        return (tr.isPlaying, text, source.name)
+    }
+
+    func toggleAddonTransport(lane: Int) {
+        guard captureLanes.indices.contains(lane),
+              case .addon(let addonID, let sourceID) = captureLanes[lane].source,
+              let (_, source) = currentAddonSnapshot.source(addonID: addonID, sourceID: sourceID),
+              let tr = source.transport, let host = addonHost else { return }
+        let cmd = tr.isPlaying ? "pause" : "play"
+        addonSourceProblems.removeValue(forKey: addonID)
+        host.transport(id: addonID, source: sourceID, command: cmd) { [weak self] result in
+            if case .failure(let reason) = result {
+                self?.addonSourceProblems[addonID] = reason.message
+                self?.setNotice(reason.message)
+            }
+        }
+    }
+
+    @objc private func openAddonsFromSources() { openAddonsOptionsTab() }
+
+    @objc private func addonFormatChanged(_ sender: NSPopUpButton) {
+        let laneIndex = sender.tag
+        guard captureLanes.indices.contains(laneIndex),
+              case .addon(let addonID, let sourceID) = captureLanes[laneIndex].source,
+              let fmtID = sender.selectedItem?.representedObject as? String,
+              let host = addonHost else { return }
+        let label = sender.titleOfSelectedItem ?? fmtID
+        let slotKey = "\(addonID):\(sourceID)"
+        addonSourceProblems.removeValue(forKey: addonID)
+        addonPendingFormats[slotKey] = (fmtID, ProcessInfo.processInfo.systemUptime)
+        host.selectFormat(id: addonID, source: sourceID, format: fmtID) { [weak self] result in
+            guard let self else { return }
+            if case .failure(let reason) = result {
+                self.addonPendingFormats.removeValue(forKey: slotKey)
+                self.addonSourceProblems[addonID] = "Could not choose \(label): \(reason)"
+                self.replaceOptionsTab(with: self.makeSourceTab())
+                self.refreshSourceOptions()
+            }
+        }
+    }
+
+    @objc private func addonOpenFileButton(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue, raw.hasPrefix("addon-open:") else { return }
+        let addonID = String(raw.dropFirst("addon-open:".count))
+        guard let addon = currentAddonSnapshot.addon(addonID), let spec = addon.openFilesSpec else { return }
+        let dialog = NSOpenPanel()
+        dialog.title = "Open a file with \(addon.displayName)"
+        dialog.canChooseFiles = true
+        dialog.canChooseDirectories = false
+        dialog.allowsMultipleSelection = false
+        let types = spec.extensions.compactMap { UTType(filenameExtension: $0.trimmingCharacters(in: CharacterSet(charactersIn: "."))) }
+        if !types.isEmpty {
+            dialog.allowedContentTypes = types
+        }
+        guard dialog.runModal() == .OK, let url = dialog.url else { return }
+        openFileWithAddon(id: addonID, url: url)
+    }
+
+    private func openFileWithAddon(id: String, url: URL) {
+        guard let host = addonHost else { return }
+        let addonName = currentAddonSnapshot.addonName(for: id)
+        let fileName = url.lastPathComponent
+        addonSourceProblems.removeValue(forKey: id)
+        host.openFile(id: id, path: url.path) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                var msg = "Sent \(fileName) to \(addonName)."
+                let inUse = self.captureLanes.contains {
+                    if case .addon(let a, _) = $0.source { return a == id }
+                    return false
+                }
+                if !inUse, let firstSource = currentAddonSnapshot.addon(id)?.sources.first {
+                    msg += " Choose \"\(firstSource.name)\" as an audio source in Options, Sources, to see it."
+                }
+                self.setNotice(msg)
+            case .failure(let reason):
+                let msg = "Could not open \(fileName): \(reason)"
+                self.addonSourceProblems[id] = msg
+                self.setNotice(msg)
+            }
+        }
+    }
+
+    @objc private func pickAddonDropOpener(_ sender: NSButton) {
+        guard let choice = addonPendingDropChoice, choice.openers.indices.contains(sender.tag) else { return }
+        let opener = choice.openers[sender.tag]
+        let url = choice.url
+        addonPendingDropChoice = nil
+        replaceOptionsTab(with: makeSourceTab())
+        refreshSourceOptions()
+        openFileWithAddon(id: opener.id, url: url)
+    }
+
+    @objc private func cancelAddonDropOpener() {
+        addonPendingDropChoice = nil
+        replaceOptionsTab(with: makeSourceTab())
+        refreshSourceOptions()
+    }
+
+    @objc private func addonTransportToggle(_ sender: NSButton) {
+        toggleAddonTransport(lane: sender.tag)
+    }
+
+    @objc private func addonTransportStop(_ sender: NSButton) {
+        let laneIndex = sender.tag
+        guard captureLanes.indices.contains(laneIndex),
+              case .addon(let addonID, let sourceID) = captureLanes[laneIndex].source,
+              let host = addonHost else { return }
+        addonSeekingTargets.removeValue(forKey: "\(addonID):\(sourceID)")
+        host.transport(id: addonID, source: sourceID, command: "stop") { [weak self] result in
+            if case .failure(let reason) = result {
+                self?.addonSourceProblems[addonID] = reason.message
+                self?.setNotice(reason.message)
+            }
+        }
+    }
+
+    @objc private func addonTransportSliderChanged(_ sender: NSSlider) {
+        let laneIndex = sender.tag
+        guard captureLanes.indices.contains(laneIndex),
+              case .addon(let addonID, let sourceID) = captureLanes[laneIndex].source,
+              let host = addonHost else { return }
+        let target = sender.doubleValue
+        addonSeekingTargets["\(addonID):\(sourceID)"] = (target, ProcessInfo.processInfo.systemUptime)
+        refreshAddonTransportControls()
+        host.transport(id: addonID, source: sourceID, command: "seek", position: target) { [weak self] result in
+            if case .failure(let reason) = result {
+                self?.addonSourceProblems[addonID] = reason.message
+                self?.setNotice(reason.message)
+            }
+        }
+    }
+
+    // MARK: Pkg 17 — Control Command Executor
+
+    private func controlBusyReason() -> String? {
+        if editing || waveform?.isPointerGestureCurrentlyActive == true { return "a gesture" }
+        if activeSnapshotSaves > 0 || waveform?.hasPendingDragWrite == true { return "saving audio" }
+        return nil
+    }
+
+    private func parseControlLane(_ letter: String) -> Int? {
+        let upper = letter.trimmingCharacters(in: .whitespaces).uppercased()
+        for i in captureLanes.indices where captureLaneLetter(i) == upper {
+            return i
+        }
+        return nil
+    }
+
+    private func buildControlState() -> AddonControlState {
+        let rate = waveform?.currentSampleRate ?? UInt32(SystemAudioTap.timelineRate)
+        let rateD = Double(max(1, rate))
+        let historyRange = waveform?.currentRetainedFrames ?? (0..<0)
+        let viewRange = waveform?.currentVisibleFrames ?? historyRange
+        let historySpan = AddonFrameSpan(
+            start_frame: historyRange.lowerBound,
+            end_frame: historyRange.upperBound,
+            seconds: Double(historyRange.upperBound - historyRange.lowerBound) / rateD
+        )
+        let viewSpan = AddonFrameSpan(
+            start_frame: viewRange.lowerBound,
+            end_frame: viewRange.upperBound,
+            seconds: Double(viewRange.upperBound - viewRange.lowerBound) / rateD
+        )
+        let selectionState: AddonSelectionState? = waveform?.selectionForSaving().map { sel in
+            AddonSelectionState(
+                start_frame: sel.lowerBound,
+                end_frame: sel.upperBound,
+                seconds: Double(sel.upperBound - sel.lowerBound) / rateD,
+                from_seconds_ago: Double(historyRange.upperBound >= sel.lowerBound ? (historyRange.upperBound - sel.lowerBound) : 0) / rateD,
+                to_seconds_ago: Double(historyRange.upperBound >= sel.upperBound ? (historyRange.upperBound - sel.upperBound) : 0) / rateD
+            )
+        }
+        let laneStates: [AddonLaneState] = captureLanes.enumerated().map { idx, lane in
+            let srcName = defaultFileName(for: lane.source)
+            let info = AddonSourceInfo(id: lane.source.key, kind: lane.source.controlKind, name: srcName)
+            let effectiveRoute = tap?.captureRoutes.indices.contains(idx) == true ? tap!.captureRoutes[idx] : lane.route
+            return AddonLaneState(
+                lane: captureLaneLetter(idx),
+                source: info,
+                channels: tap?.channelCount(for: idx),
+                route: effectiveRoute.controlName,
+                problem: tap?.sourceProblem(for: idx)
+            )
+        }
+        let chosenRows = waveform?.chosenRowsForControlState() ?? []
+        return AddonControlState(
+            capturing: !paused,
+            recording: !paused && tap?.cachedState == 1,
+            problem: captureError,
+            sample_rate: rate,
+            lanes: laneStates,
+            history: historySpan,
+            selection: selectionState,
+            view: viewSpan,
+            separate_rows: separateLanes,
+            chosen_rows: chosenRows,
+            preview_playing: waveform?.isPreviewPlaying == true,
+            save_folder: directory(for: .saved),
+            drag_folder: directory(for: .output),
+            busy: controlBusyReason()
+        )
+    }
+
+    private func replyControlSave(call: AddonControlCall, folder: String, urls: [URL]) {
+        let savedFiles: [AddonSavedFile] = urls.map { url in
+            if url.lastPathComponent.hasSuffix("-Positions.json") {
+                return AddonSavedFile(path: url.path, kind: "positions", lane: nil, channels: nil, sample_rate: nil, frames: nil)
+            }
+            if let data = try? Data(contentsOf: url), let hdr = WavHeaderInfo.parse(data) {
+                return AddonSavedFile(
+                    path: url.path, kind: "wav", lane: nil,
+                    channels: UInt32(hdr.channels), sample_rate: hdr.sampleRate, frames: hdr.frames
+                )
+            }
+            return AddonSavedFile(path: url.path, kind: "wav", lane: nil, channels: nil, sample_rate: nil, frames: nil)
+        }
+        let res = AddonControlResult(
+            state: buildControlState(),
+            sources: nil,
+            folder: folder,
+            files: savedFiles,
+            history_restarted: false
+        )
+        addonHost?.controlReply(call: call, result: res)
+    }
+
+    private func executeControlCalls(_ calls: [AddonControlCall]) {
+        guard let host = addonHost else { return }
+        // I6 step 5: re-check current snapshot's control_allowed immediately before executing each request.
+        _ = host.pollSnapshot(force: true)
+        currentAddonSnapshot = host.snapshot
+        for call in calls {
+            let allowed = currentAddonSnapshot.addon(call.addon_id)?.control_allowed ?? false
+            if !allowed {
+                host.controlReply(
+                    call: call,
+                    error: AddonControlError(code: "not_allowed", message: "The user has not let this add-on control Backtracking")
+                )
+                continue
+            }
+            if !call.command.isQuiet, let busy = controlBusyReason() {
+                host.controlReply(
+                    call: call,
+                    error: AddonControlError(code: "busy", message: "Backtracking is busy with \(busy); try again shortly")
+                )
+                continue
+            }
+            executeSingleControlCall(host: host, call: call)
+        }
+    }
+
+    private func executeSingleControlCall(host: AddonHostClient, call: AddonControlCall) {
+        let cmd = call.command
+        let by = call.addon_name
+        switch cmd.command {
+        case "get_state":
+            host.controlReply(call: call, result: AddonControlResult(state: buildControlState()))
+
+        case "list_sources":
+            let choices = availableCaptureSources(excluding: tap?.privatePlaybackDevices ?? [])
+            let sources = choices.map { AddonSourceInfo(id: $0.source.key, kind: $0.source.controlKind, name: $0.title) }
+            host.controlReply(call: call, result: AddonControlResult(state: buildControlState(), sources: sources))
+
+        case "start_capture":
+            switch runWindowAction(.startCapture) {
+            case .success:
+                setNotice("Capture started · by \(by)")
+                host.controlReply(call: call, result: AddonControlResult(state: buildControlState()))
+            case .failure(let ref):
+                host.controlReply(call: call, error: AddonControlError(code: ref.code, message: ref.message))
+            }
+
+        case "pause_capture":
+            switch runWindowAction(.pauseCapture) {
+            case .success:
+                setNotice("by \(by)")
+                host.controlReply(call: call, result: AddonControlResult(state: buildControlState()))
+            case .failure(let ref):
+                host.controlReply(call: call, error: AddonControlError(code: ref.code, message: ref.message))
+            }
+
+        case "clear_history":
+            switch runWindowAction(.clearHistory) {
+            case .success:
+                setNotice("Cleared · by \(by)")
+                host.controlReply(call: call, result: AddonControlResult(state: buildControlState()))
+            case .failure(let ref):
+                host.controlReply(call: call, error: AddonControlError(code: ref.code, message: ref.message))
+            }
+
+        case "select":
+            let action: TestWindowAction
+            if let from = cmd.from_seconds_ago {
+                action = .selectBack(from: from, to: cmd.to_seconds_ago ?? 0.0)
+            } else if let s = cmd.start_frame, let e = cmd.end_frame {
+                action = .selectFrames(s..<e)
+            } else {
+                host.controlReply(call: call, error: AddonControlError(code: "invalid_request", message: "select needs from_seconds_ago or start_frame/end_frame"))
+                return
+            }
+            switch runWindowAction(action) {
+            case .success:
+                selectionByAddon = by
+                updateStatus()
+                host.controlReply(call: call, result: AddonControlResult(state: buildControlState()))
+            case .failure(let ref):
+                host.controlReply(call: call, error: AddonControlError(code: ref.code, message: ref.message))
+            }
+
+        case "clear_selection":
+            selectionByAddon = nil
+            _ = runWindowAction(.clearSelection)
+            host.controlReply(call: call, result: AddonControlResult(state: buildControlState()))
+
+        case "choose_rows":
+            let result: Result<String?, TestActionRefusal>
+            if let laneStr = cmd.lane {
+                guard let idx = parseControlLane(laneStr) else {
+                    host.controlReply(call: call, error: AddonControlError(code: "not_found", message: "the window does not show lane \(laneStr)"))
+                    return
+                }
+                if !separateLanes, case .failure(let r) = runWindowAction(.separate(true)) {
+                    host.controlReply(call: call, error: AddonControlError(code: r.code, message: r.message))
+                    return
+                }
+                result = runWindowAction(.chooseLane(idx))
+            } else if let first = cmd.first, let last = cmd.last {
+                guard let fl = parseControlLane(first.lane), let ll = parseControlLane(last.lane) else {
+                    host.controlReply(call: call, error: AddonControlError(code: "not_found", message: "unknown lane"))
+                    return
+                }
+                if !separateLanes, case .failure(let r) = runWindowAction(.separate(true)) {
+                    host.controlReply(call: call, error: AddonControlError(code: r.code, message: r.message))
+                    return
+                }
+                result = runWindowAction(.chooseRows(
+                    firstLane: fl, firstRow: Int(max(1, first.row)) - 1,
+                    lastLane: ll, lastRow: Int(max(1, last.row)) - 1
+                ))
+            } else {
+                result = separateLanes ? runWindowAction(.separate(false)) : .success(nil)
+            }
+            switch result {
+            case .success:
+                host.controlReply(call: call, result: AddonControlResult(state: buildControlState()))
+            case .failure(let ref):
+                host.controlReply(call: call, error: AddonControlError(code: ref.code, message: ref.message))
+            }
+
+        case "set_view":
+            let action: TestWindowAction
+            if let secs = cmd.seconds {
+                action = .zoomNewest(secs)
+            } else if let s = cmd.start_frame, let e = cmd.end_frame {
+                action = .view(s..<e)
+            } else {
+                action = .viewAll
+            }
+            switch runWindowAction(action) {
+            case .success:
+                host.controlReply(call: call, result: AddonControlResult(state: buildControlState()))
+            case .failure(let ref):
+                host.controlReply(call: call, error: AddonControlError(code: ref.code, message: ref.message))
+            }
+
+        case "save":
+            let targetFolder = cmd.folder ?? directory(for: .saved)
+            do {
+                try FileManager.default.createDirectory(atPath: targetFolder, withIntermediateDirectories: true)
+            } catch {
+                host.controlReply(call: call, error: AddonControlError(code: "failed", message: "\(targetFolder): \(error.localizedDescription)"))
+                return
+            }
+            saveSnapshot(into: targetFolder, controlCall: call)
+
+        case "play_preview":
+            if waveform?.hasSelection != true {
+                host.controlReply(call: call, error: AddonControlError(code: "no_selection", message: "there is no selection to play"))
+                return
+            }
+            switch runWindowAction(.playPreview) {
+            case .success:
+                host.controlReply(call: call, result: AddonControlResult(state: buildControlState()))
+            case .failure(let ref):
+                host.controlReply(call: call, error: AddonControlError(code: ref.code, message: ref.message))
+            }
+
+        case "stop_preview":
+            _ = runWindowAction(.stopPreview)
+            host.controlReply(call: call, result: AddonControlResult(state: buildControlState()))
+
+        case "add_source":
+            guard let sourceID = cmd.source else {
+                host.controlReply(call: call, error: AddonControlError(code: "invalid_request", message: "missing source id"))
+                return
+            }
+            let choices = availableCaptureSources(excluding: tap?.privatePlaybackDevices ?? [])
+            guard let found = choices.first(where: { $0.source.key == sourceID }) else {
+                host.controlReply(call: call, error: AddonControlError(
+                    code: "not_found",
+                    message: "no source with this id can be added now; list_sources gives the ids"
+                ))
+                return
+            }
+            switch runWindowAction(.addSource(found.source)) {
+            case .success:
+                setNotice("Sources changed, recording started over · by \(by)")
+                host.controlReply(call: call, result: AddonControlResult(state: buildControlState(), history_restarted: true))
+            case .failure(let ref):
+                host.controlReply(call: call, error: AddonControlError(code: ref.code, message: ref.message))
+            }
+
+        case "remove_source":
+            guard let laneStr = cmd.lane, let idx = parseControlLane(laneStr) else {
+                host.controlReply(call: call, error: AddonControlError(code: "not_found", message: "unknown lane"))
+                return
+            }
+            if captureLanes.count < 2 {
+                host.controlReply(call: call, error: AddonControlError(code: "failed", message: "the only lane cannot be removed; add another first"))
+                return
+            }
+            switch runWindowAction(.removeSource(idx)) {
+            case .success:
+                setNotice("Sources changed, recording started over · by \(by)")
+                host.controlReply(call: call, result: AddonControlResult(state: buildControlState(), history_restarted: true))
+            case .failure(let ref):
+                host.controlReply(call: call, error: AddonControlError(code: ref.code, message: ref.message))
+            }
+
+        default:
+            host.controlReply(call: call, error: AddonControlError(code: "unknown_command", message: "Unknown command \(cmd.command)"))
         }
     }
 
@@ -5261,6 +7216,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     }
     var secondsInterval: UInt32? { didSet { needsDisplay = true } }
     var accentRGB = WaveformTheme.defaultAccentRGB { didSet { needsDisplay = true } }
+    var look: ResolvedLook = .default { didSet { if look != oldValue { needsDisplay = true } } }
     var stereo = false {
         didSet { if stereo != oldValue { revision = nil } }
     }
@@ -5511,6 +7467,39 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     var hasPendingDragWrite: Bool { pendingDragWrite != nil }
     var currentSampleRate: UInt32 { sampleRate }
     var currentRetainedFrames: Range<UInt64> { retainedFrames }
+    var currentVisibleFrames: Range<UInt64> { visibleFrames }
+    var isPointerGestureCurrentlyActive: Bool { isPointerGestureActive }
+    var isPreviewPlaying: Bool { player?.range != nil }
+
+    func chosenRowsForControlState() -> [AddonRowState] {
+        let rows = activeSelectedRows
+        guard !rows.isEmpty else { return [] }
+        var out: [AddonRowState] = []
+        var perLaneCount: [Int: UInt32] = [:]
+        for row in displayedRows {
+            let num = (perLaneCount[row.lane] ?? 0) + 1
+            perLaneCount[row.lane] = num
+            if rows.contains(row.identity) {
+                out.append(AddonRowState(lane: captureLaneLetter(row.lane), row: num, label: row.fullLabel))
+            }
+        }
+        return out
+    }
+
+    func onChannelGroupSwitched(lane: Int) {
+        if laneFirstRows.indices.contains(lane) {
+            laneFirstRows[lane] = 0
+        }
+        columnFirstRow = 0
+        player?.stop()
+        if !dragging { discardPreparedFile() }
+        // Move any per-lane channel selection onto the newly visible rows of this lane.
+        if separateLanes && !rememberedRows.isEmpty {
+            rememberedRows.removeAll { $0.lane == lane && !$0.isPair }
+        }
+        revision = nil
+        needsDisplay = true
+    }
 
     func applyProgrammaticView(_ range: Range<UInt64>) {
         changeView(to: range)
@@ -5751,8 +7740,9 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         } else {
             let routes = tap.captureRoutes
             let labels = tap.captureChannelNames
+            let groups = (0..<tap.laneCount).map { tap.channelGroups(for: $0) }
             tap.readCapture(poll: false, { WAVExport(core: $0, routes: routes, channelNames: labels,
-                range: request.range) }, completion: read)
+                channelGroups: groups, range: request.range) }, completion: read)
         }
     }
 
@@ -5766,8 +7756,12 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 if let material { return material.activeChannels(for: lane) }
                 return tap.liveActiveMask(for: lane, hideSilent: true)
             }
+            let shownGroups: [(group: AddonChannelGroup, range: Range<Int>, hasBed: Bool)?] = (0..<tap.laneCount).map { lane in
+                controller?.resolvedShownGroup(for: lane)
+            }
             requestedRows = WaveformRow.layout(widths: widths, labels: tap.captureChannelNames,
-                                               stereo: stereo, activeMasks: activeMasks)
+                                               stereo: stereo, activeMasks: activeMasks,
+                                               shownGroups: shownGroups)
         }
         refreshFrequency(tap: tap)
         let request = readRequest()
@@ -5813,9 +7807,10 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         } else if request.rows.contains(where: \.isPair) {
             let routes = tap.captureRoutes
             let labels = tap.captureChannelNames
+            let groups = (0..<tap.laneCount).map { tap.channelGroups(for: $0) }
             tap.readCapture(poll: false, { core -> WAVExport? in
                 guard bt_tracks_revision(core) != unchangedRevision else { return nil }
-                return WAVExport(core: core, routes: routes, channelNames: labels)
+                return WAVExport(core: core, routes: routes, channelNames: labels, channelGroups: groups)
             }) { [weak self] material in
                 guard let self, let material else { receive(nil); return }
                 self.wideWaveformQueue.async {
@@ -6083,7 +8078,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             forceMono: controller?.forceMonoExport ?? false, fades: fadesForSaving(),
             selectedRows: selectedRowsForExport,
             hideSilentLanes: controller?.hideSilentLaneIndices ?? [],
-            pairBinaural: controller?.pairBinaural ?? false
+            pairBinaural: controller?.pairBinaural ?? false,
+            shownGroupIDs: controller?.currentShownGroupIDs() ?? []
         )
         if let problem { controller?.setNotice(problem) }
         return true
@@ -6252,7 +8248,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         if fadeGesture != nil || (selectionForSaving() != nil && dragsFade(pointerModifiers) && draggableFlag(at: pointer) != nil) {
             NSCursor.resizeLeftRight.set()
             waveformCursorActive = true
-        } else if isOverScrollbar(point: pointer) || scrollDrag != nil {
+        } else if isOverOverlayChip(at: pointer) || isOverScrollbar(point: pointer) || scrollDrag != nil {
             NSCursor.pointingHand.set()
             waveformCursorActive = true
         } else if anchor != nil || dragging || panStart != nil || mouseDownEvent != nil {
@@ -6360,6 +8356,11 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         }
         trackPointer(event)
         let position = convert(event.locationInWindow, from: nil)
+
+        // Package 3 & 18: clicking a channel-group switcher chip or compact transport chip never starts selection/drag.
+        if handleOverlayChipClick(at: position) {
+            return
+        }
 
         // Package 4 / SEL-23: pressing on the row scrollbar scrolls rows, never starts selection/drag.
         if isOverScrollbar(point: position), let target = scrollBoxAt(point: position) {
@@ -6630,8 +8631,14 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         mouseDownEvent = nil
         trackDragPointer()
         let accepted = operation.contains(.copy)
-        let saved = accepted ? exportDescription(readyFiles) : nil
+        let exportedURLs = accepted ? readyFiles : []
+        let saved = accepted ? exportDescription(exportedURLs) : nil
         if accepted {
+            let frames = pendingDragMarker.map { $0.range.upperBound - $0.range.lowerBound }
+                ?? (retainedFrames.upperBound - retainedFrames.lowerBound)
+            if !exportedURLs.isEmpty {
+                controller?.notifyClipExported(urls: exportedURLs, sampleRate: sampleRate, frames: frames)
+            }
             readyFiles.removeAll()
             if let pendingDragMarker {
                 commitMarker(pendingDragMarker.range, rows: pendingDragMarker.rows, ticket: pendingDragMarker.ticket)
@@ -6669,7 +8676,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         shape.line(to: NSPoint(x: lineX, y: top))
         shape.lineWidth = 1.0
         let snapped = pointerModifiers.contains(.shift) && pointer.flatMap { snapTarget(near: $0.x) } == frame
-        let color = snapped ? NSColor.systemYellow : WaveformTheme.flagAndFade
+        let color = snapped ? NSColor.systemYellow : look.flag.nsColor
         color.setStroke()
         shape.stroke()
 
@@ -6684,17 +8691,22 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         return NSRect(x: minX - 2, y: top - poleHeight - 2, width: abs(flagWidth) + 4, height: poleHeight + 4)
     }
 
-    private func tracePaths() -> (fill: NSBezierPath, outline: NSBezierPath, coverage: NSBezierPath) {
-        let fill = NSBezierPath()
-        let outline = NSBezierPath()
-        let coverage = NSBezierPath()
-        outline.lineWidth = CGFloat(displayPolicy.waveform_stroke)
-        outline.lineCapStyle = .round
-        outline.lineJoinStyle = .round
+    private struct RowTracePath {
+        let rowIndex: Int
+        let rowLabel: String?
+        let fill: NSBezierPath
+        let outline: NSBezierPath
+        let coverage: NSBezierPath
+    }
+
+    private func tracePaths() -> [RowTracePath] {
+        let strokeWidth = CGFloat(displayPolicy.waveform_stroke) * look.waveformStrokeScale
         let rows = min(displayedRows.count, traces.count)
-        guard rows > 0 else { return (fill, outline, coverage) }
+        guard rows > 0 else { return [] }
         let fitted = fadesForSaving()
         let faded = fitted.fade_in > 0 || fitted.fade_out > 0 ? selectionForSaving() : nil
+        var result: [RowTracePath] = []
+        result.reserveCapacity(rows)
         for row in 0..<rows {
             guard let rect = rowRect(for: row) else { continue }
             let middle = rect.midY
@@ -6703,7 +8715,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                     WaveformTheme.pairBacking.setFill()
                     NSBezierPath.fill(rect)
                 }
-                WaveformTheme.centerLine.setStroke()
+                look.centerLine.nsColor.setStroke()
                 let centerLine = NSBezierPath()
                 centerLine.lineWidth = 1
                 centerLine.move(to: NSPoint(x: rect.minX, y: middle))
@@ -6711,6 +8723,12 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 centerLine.stroke()
             }
             if renderedFrames.isEmpty { continue }
+            let fill = NSBezierPath()
+            let outline = NSBezierPath()
+            let coverage = NSBezierPath()
+            outline.lineWidth = strokeWidth
+            outline.lineCapStyle = .round
+            outline.lineJoinStyle = .round
             var bins = traces[row]
             if let faded, isRowSelected(displayedRows[row].identity) {
                 bins.read { minimum, maximum, count in
@@ -6763,52 +8781,72 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                     }
                 }
             }
+            let rowLabel: String? = displayedRows[row].identity.isPair || displayedRows[row].identity.isWhole
+                ? nil : displayedRows[row].fullLabel
+            result.append(RowTracePath(rowIndex: row, rowLabel: rowLabel, fill: fill, outline: outline, coverage: coverage))
         }
-        return (fill, outline, coverage)
+        return result
     }
 
-    private func paintTrace(
-        _ paths: (fill: NSBezierPath, outline: NSBezierPath, coverage: NSBezierPath),
-        color: NSColor, dimFrequency: Bool = false
+    private func paintTraces(
+        _ rowPaths: [RowTracePath],
+        selected: Bool,
+        dimFrequency: Bool = false
     ) {
-        guard !paths.coverage.isEmpty else { return }
-        NSGraphicsContext.saveGraphicsState()
-        paths.coverage.addClip()
+        let accent = RGBA8(rgb: accentRGB)
+        let fillOpacity = look.waveformFillOpacity
         if let gradient = frequencyGradient, let context = NSGraphicsContext.current?.cgContext {
             let live = editMaterial == nil ? UInt64(sampleRate) / 4 : 0
-            let effective = gradient.readableForDrawing()
-            let images = traces.enumerated().compactMap { row, trace -> (CGImage, NSRect)? in
-                guard let rect = rowRect(for: row) else { return nil }
-                let colors = frequencyWaveform?.colors(for: row, in: renderedFrames, bins: trace.low.count,
-                    gradient: effective, liveFrames: live) ?? []
-                return FrequencyWaveform.stripeImage(colors.isEmpty ? [nil] : colors,
-                    fallback: accentRGB, dimmed: dimFrequency).map { ($0, rect) }
-            }
-            context.saveGState()
-            context.interpolationQuality = .none
-            context.addPath(paths.fill.cgPath)
-            context.clip()
-            context.setAlpha(WaveformTheme.envelopeFillAlpha)
-            for (image, rect) in images { context.draw(image, in: rect) }
-            context.restoreGState()
+            let effective = look.legibleSpectrum(for: gradient).gradient
+            let fallbackRGB = look.effectiveWaveform(accent: accent).rgbUInt32
+            for item in rowPaths where !item.coverage.isEmpty {
+                guard let rect = rowRect(for: item.rowIndex), traces.indices.contains(item.rowIndex) else { continue }
+                let colors = frequencyWaveform?.colors(
+                    for: item.rowIndex, in: renderedFrames, bins: traces[item.rowIndex].low.count,
+                    gradient: effective, liveFrames: live
+                ) ?? []
+                guard let image = FrequencyWaveform.stripeImage(
+                    colors.isEmpty ? [nil] : colors, fallback: fallbackRGB, dimmed: dimFrequency
+                ) else { continue }
+                NSGraphicsContext.saveGraphicsState()
+                item.coverage.addClip()
 
-            context.saveGState()
-            context.interpolationQuality = .none
-            context.addPath(paths.outline.cgPath)
-            context.setLineWidth(paths.outline.lineWidth)
-            context.setLineCap(.round)
-            context.setLineJoin(.round)
-            context.replacePathWithStrokedPath()
-            context.clip()
-            for (image, rect) in images { context.draw(image, in: rect) }
-            context.restoreGState()
+                context.saveGState()
+                context.interpolationQuality = .none
+                context.addPath(item.fill.cgPath)
+                context.clip()
+                context.setAlpha(fillOpacity)
+                context.draw(image, in: rect)
+                context.restoreGState()
+
+                context.saveGState()
+                context.interpolationQuality = .none
+                context.addPath(item.outline.cgPath)
+                context.setLineWidth(item.outline.lineWidth)
+                context.setLineCap(.round)
+                context.setLineJoin(.round)
+                context.replacePathWithStrokedPath()
+                context.clip()
+                context.draw(image, in: rect)
+                context.restoreGState()
+
+                NSGraphicsContext.restoreGraphicsState()
+            }
         } else {
-            color.withAlphaComponent(WaveformTheme.envelopeFillAlpha).setFill()
-            paths.fill.fill()
-            color.setStroke()
-            paths.outline.stroke()
+            let selectedColor = look.effectiveWaveformSelected(accent: accent).nsColor
+            for item in rowPaths where !item.coverage.isEmpty {
+                let rowColor = selected
+                    ? selectedColor
+                    : look.effectiveRowWaveform(label: item.rowLabel, accent: accent).nsColor
+                NSGraphicsContext.saveGraphicsState()
+                item.coverage.addClip()
+                rowColor.withAlphaComponent(rowColor.alphaComponent * fillOpacity).setFill()
+                item.fill.fill()
+                rowColor.setStroke()
+                item.outline.stroke()
+                NSGraphicsContext.restoreGraphicsState()
+            }
         }
-        NSGraphicsContext.restoreGraphicsState()
     }
 
     private func unclampedX(for frame: UInt64) -> CGFloat {
@@ -6847,7 +8885,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 wedge.move(to: top)
                 wedge.line(to: silent)
                 wedge.line(to: bottom)
-                WaveformTheme.flagAndFade.setStroke()
+                look.flag.nsColor.setStroke()
                 wedge.stroke()
             }
         }
@@ -6856,7 +8894,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     private func drawPlayhead() {
         guard let frame = player?.playhead, isVisible(frame) else { return }
         let x = min(audioRect.maxX, max(audioRect.minX, x(for: frame)))
-        let color = WaveformTheme.playhead
+        let color = look.playhead.nsColor
         let line = NSBezierPath()
         line.lineWidth = 1.5
         line.move(to: NSPoint(x: x, y: audioRect.minY))
@@ -6871,6 +8909,121 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         head.close()
         color.setFill()
         head.fill()
+    }
+
+    // MARK: Pkg 3 & 18 — Bottom-left Group Switcher Chips & Compact Transport Chips
+
+    private struct OverlayChip {
+        enum Action {
+            case selectGroup(lane: Int, groupID: String)
+            case cycleGroup(lane: Int)
+            case toggleTransport(lane: Int)
+        }
+        let rect: NSRect
+        let text: String
+        let current: Bool
+        let toolTip: String
+        let action: Action
+    }
+
+    private func overlayChips() -> [OverlayChip] {
+        guard showsOverlay, let controller else { return [] }
+        let font = NSFont.systemFont(ofSize: 10, weight: .medium)
+        let chipH: CGFloat = 14
+        let padX: CGFloat = 5
+        let gap: CGFloat = 2
+        var chips: [OverlayChip] = []
+
+        for (lane, box) in laneBoxes.enumerated() {
+            guard box.height >= 18 else { continue }
+            let laneBottomY = audioRect.maxY - box.top - box.height + 3
+            var cursorX = audioRect.minX + 4
+
+            // Group switcher chips (Pkg 3 / TL-06, TL-07).
+            let groups = controller.channelGroups(for: lane)
+            if groups.count >= 2 {
+                let currentGroupID = controller.resolvedShownGroup(for: lane)?.group.id ?? groups[0].id
+                let widths: [CGFloat] = groups.map { g in
+                    ceil((g.label as NSString).size(withAttributes: [.font: font]).width) + padX * 2
+                }
+                let totalW = widths.reduce(0, +) + CGFloat(max(0, groups.count - 1)) * gap
+                if totalW <= audioRect.width * 0.6 {
+                    for (i, g) in groups.enumerated() {
+                        let w = widths[i]
+                        let isCurrent = g.id == currentGroupID
+                        let r = NSRect(x: cursorX, y: laneBottomY, width: w, height: chipH)
+                        let tip = isCurrent ? "\(g.label) is on show and is what you drag out" : "Show \(g.label)"
+                        chips.append(OverlayChip(
+                            rect: r, text: g.label, current: isCurrent, toolTip: tip,
+                            action: .selectGroup(lane: lane, groupID: g.id)
+                        ))
+                        cursorX += w + gap
+                    }
+                } else if let cur = groups.first(where: { $0.id == currentGroupID }) ?? groups.first {
+                    let w = min(audioRect.width * 0.55, ceil((cur.label as NSString).size(withAttributes: [.font: font]).width) + padX * 2)
+                    let r = NSRect(x: cursorX, y: laneBottomY, width: w, height: chipH)
+                    chips.append(OverlayChip(
+                        rect: r, text: cur.label, current: true,
+                        toolTip: "\(cur.label) is on show and is what you drag out",
+                        action: .cycleGroup(lane: lane)
+                    ))
+                    cursorX += w + gap
+                }
+                cursorX += 4
+            }
+
+            // Compact add-on transport chip (Pkg 18 / ADD-W35).
+            if let tr = controller.compactTransportChip(for: lane) {
+                let symbol = tr.playing ? "⏸" : "▶"
+                let label = "\(symbol) \(tr.text)"
+                let w = ceil((label as NSString).size(withAttributes: [.font: font]).width) + padX * 2
+                if cursorX + w <= audioRect.maxX - 8 {
+                    let r = NSRect(x: cursorX, y: laneBottomY, width: w, height: chipH)
+                    let tip = tr.playing ? "Pause \(tr.sourceName)" : "Play \(tr.sourceName)"
+                    chips.append(OverlayChip(
+                        rect: r, text: label, current: false, toolTip: tip,
+                        action: .toggleTransport(lane: lane)
+                    ))
+                }
+            }
+        }
+        return chips
+    }
+
+    private func isOverOverlayChip(at point: NSPoint) -> Bool {
+        overlayChips().contains { $0.rect.contains(point) }
+    }
+
+    private func handleOverlayChipClick(at point: NSPoint) -> Bool {
+        guard let controller, let chip = overlayChips().first(where: { $0.rect.contains(point) }) else { return false }
+        switch chip.action {
+        case .selectGroup(let lane, let groupID):
+            _ = controller.selectChannelGroup(lane: lane, groupID: groupID)
+        case .cycleGroup(let lane):
+            controller.cycleChannelGroup(lane: lane)
+        case .toggleTransport(let lane):
+            controller.toggleAddonTransport(lane: lane)
+        }
+        return true
+    }
+
+    private func drawOverlayChips() {
+        let chips = overlayChips()
+        guard !chips.isEmpty else { return }
+        let accent = RGBA8(rgb: accentRGB)
+        let font = NSFont.systemFont(ofSize: 10, weight: .medium)
+        let bgColor = look.chipBackground.nsColor
+        let currentBg = look.effectiveChipCurrent(accent: accent).nsColor
+        let textColor = look.chipText.nsColor
+        for chip in chips {
+            let hovered = pointer.map { chip.rect.contains($0) } ?? false
+            (chip.current ? currentBg : bgColor).setFill()
+            NSBezierPath(roundedRect: chip.rect, xRadius: 3, yRadius: 3).fill()
+            let fg = (chip.current || hovered) ? NSColor.white : textColor
+            let attr = NSAttributedString(string: chip.text, attributes: [.font: font, .foregroundColor: fg])
+            let sz = attr.size()
+            attr.draw(at: NSPoint(x: chip.rect.midX - sz.width / 2, y: chip.rect.midY - sz.height / 2))
+        }
     }
 
     /// Package 6: length / fade label in top-right (8px inset), avoiding drawn flags.
@@ -6963,11 +9116,11 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 line.stroke()
             }
         }
-        // Package 1: when exactly two sources are edited separately, draw a 1 px accent x0.7 line between A and B.
+        // Package 1 & 20: when exactly two sources are edited separately, draw lane divider using look.
         if separate && displayedLaneCount == 2 {
             if let splitIndex = (0..<(rows - 1)).first(where: { displayedRows[$0].lane != displayedRows[$0 + 1].lane }),
                let rect = rowRect(for: splitIndex) {
-                accentColor(accentRGB).withAlphaComponent(0.7).setStroke()
+                look.effectiveLaneDivider(accent: RGBA8(rgb: accentRGB)).nsColor.setStroke()
                 let line = NSBezierPath()
                 line.lineWidth = 1
                 line.move(to: NSPoint(x: audioRect.minX, y: rect.minY))
@@ -6982,11 +9135,12 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         let rowH = laneBoxes.first?.rowHeight ?? 0
         guard rowH >= RowStackLayout.labelledRowHeight else { return }
         let font = NSFont.monospacedSystemFont(ofSize: 8, weight: .regular)
+        let labelColor = look.rowLabel.nsColor
         var drawnLaneLetters = Set<Int>()
         for (index, row) in displayedRows.enumerated() {
             guard let rect = rowRect(for: index) else { continue }
             let hasProblem = laneProblems[row.lane] != nil
-            let letterColor = hasProblem ? WaveformTheme.statusUnavailable : WaveformTheme.rowLabel
+            let letterColor = hasProblem ? WaveformTheme.statusUnavailable : labelColor
             if gutterWidth > 0 {
                 if displayedLaneCount > 2 {
                     if !drawnLaneLetters.contains(row.lane) {
@@ -6997,19 +9151,19 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                         letter.draw(at: NSPoint(x: bounds.minX + 2, y: rect.midY - sz.height / 2))
                     }
                     if hasStackedLane, let ch = row.shortLabel, !row.identity.isWhole {
-                        let chAttr = NSAttributedString(string: ch, attributes: [.font: font, .foregroundColor: WaveformTheme.rowLabel])
+                        let chAttr = NSAttributedString(string: ch, attributes: [.font: font, .foregroundColor: labelColor])
                         let sz = chAttr.size()
                         chAttr.draw(at: NSPoint(x: bounds.minX + 14, y: rect.midY - sz.height / 2))
                     }
                 } else if let ch = row.shortLabel {
-                    let color = row.identity.isWhole ? letterColor : WaveformTheme.rowLabel
+                    let color = row.identity.isWhole ? letterColor : labelColor
                     let chAttr = NSAttributedString(string: ch, attributes: [.font: font, .foregroundColor: color])
                     let sz = chAttr.size()
                     chAttr.draw(at: NSPoint(x: bounds.minX + 2, y: rect.midY - sz.height / 2))
                 }
             } else if let short = row.shortLabel {
                 // 1-2 non-stacked sources (2 lanes A/B, or single stereo L/R): draw subtle 8pt mono left-aligned.
-                let color = hasProblem ? WaveformTheme.statusUnavailable : WaveformTheme.rowLabel
+                let color = hasProblem ? WaveformTheme.statusUnavailable : labelColor
                 let attr = NSAttributedString(string: short, attributes: [.font: font, .foregroundColor: color])
                 let sz = attr.size()
                 attr.draw(at: NSPoint(x: rect.minX + 4, y: rect.midY - sz.height / 2))
@@ -7036,7 +9190,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             )
             let isActive = (scrollDrag != nil && scrollDrag?.laneIndex == laneIndex)
                 || (pointer.map { isOverScrollbar(point: $0) } ?? false)
-            (isActive ? WaveformTheme.scrollbarThumbActive : WaveformTheme.scrollbarThumb).setFill()
+            look.effectiveScrollThumb(active: isActive).nsColor.setFill()
             NSBezierPath(roundedRect: thumbRect, xRadius: 1.5, yRadius: 1.5).fill()
         }
         if let col = columnBox {
@@ -7071,7 +9225,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
     private func drawTimeGrid() {
         guard gridOpacity > 0, !visibleFrames.isEmpty else { return }
-        func draw(_ positions: [UInt64], alpha: CGFloat, width: Float) {
+        func draw(_ positions: [UInt64], color: RGBA8, width: Float) {
             guard !positions.isEmpty else { return }
             let path = NSBezierPath()
             path.lineWidth = CGFloat(width)
@@ -7080,18 +9234,18 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 path.move(to: NSPoint(x: x, y: audioRect.minY))
                 path.line(to: NSPoint(x: x, y: audioRect.maxY))
             }
-            NSColor.white.withAlphaComponent(alpha * gridOpacity).setStroke()
+            color.nsColor(alphaMultiplier: gridOpacity).setStroke()
             path.stroke()
         }
-        draw(guideSeconds, alpha: WaveformTheme.secondsGuideAlpha, width: displayPolicy.seconds_stroke)
-        draw(guideBars, alpha: WaveformTheme.barGuideAlpha, width: displayPolicy.bar_stroke)
+        draw(guideSeconds, color: look.secondLine, width: displayPolicy.seconds_stroke)
+        draw(guideBars, color: look.barLine, width: displayPolicy.bar_stroke)
     }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         recomputeRowLayout()
         updateDisplayPolicy()
-        let cornerRadius: CGFloat = showsOverlay ? WaveformTheme.cornerRadius : 0
+        let cornerRadius: CGFloat = showsOverlay ? look.cornerRadius : 0
         let panel = NSBezierPath(roundedRect: bounds, xRadius: cornerRadius, yRadius: cornerRadius)
         NSGraphicsContext.saveGraphicsState()
         panel.addClip()
@@ -7102,21 +9256,22 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
            pointer != nil || mouseDownEvent != nil || dragging {
             let hoveredID = !separate ? nil
                 : (mouseDownEvent != nil || dragging ? dragRow : pointer.flatMap { rowIdentity(at: $0, clampedToVisible: false) })
+            let hlColor = look.effectivePreviewHighlight(accent: RGBA8(rgb: accentRGB)).nsColor
             if let hoveredID {
                 let unit = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: hoveredID, cursor: hoveredID)
                 hoverRows = unit
                 if let rect = rectForRows(unit) {
-                    accentColor(accentRGB).withAlphaComponent(1.0 / 3.0).setFill()
+                    hlColor.setFill()
                     NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).fill()
                 }
             } else {
-                accentColor(accentRGB).withAlphaComponent(1.0 / 3.0).setFill()
+                hlColor.setFill()
                 NSBezierPath(roundedRect: audioRect, xRadius: 4, yRadius: 4).fill()
             }
         }
 
         drawTimeGrid()
-        let trace = tracePaths()
+        let rowPaths = tracePaths()
         let selectedArea = selection.flatMap(waveformRect(for:)).flatMap { rect -> NSRect? in
             guard let rowBounds = selectedRowsRect() else { return nil }
             let area = rect.intersection(rowBounds)
@@ -7128,20 +9283,21 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             outside.windingRule = .evenOdd
             NSGraphicsContext.saveGraphicsState()
             outside.addClip()
-            paintTrace(trace, color: accentColor(accentRGB), dimFrequency: true)
+            paintTraces(rowPaths, selected: false, dimFrequency: true)
             NSGraphicsContext.restoreGraphicsState()
 
             NSGraphicsContext.saveGraphicsState()
             NSBezierPath(rect: selectedRect).addClip()
-            paintTrace(trace, color: accentColor(WaveformTheme.selectionRGB(for: accentRGB)))
+            paintTraces(rowPaths, selected: true)
             NSGraphicsContext.restoreGraphicsState()
         } else {
-            paintTrace(trace, color: accentColor(accentRGB))
+            paintTraces(rowPaths, selected: false)
         }
         if let selection = selectionForSaving() { drawFades(selection) }
         drawRowDecorations(separate: separate)
         drawRowLabels()
         drawScrollbars()
+        drawOverlayChips()
 
         var drawnFlagRects: [NSRect] = []
         if let marker, marker != selection {

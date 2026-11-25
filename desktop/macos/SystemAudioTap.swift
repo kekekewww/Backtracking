@@ -31,18 +31,29 @@ private func checkAudio(_ status: OSStatus, _ operation: String) throws {
 /// Comes before a plug-in Sender's name in the source list.
 let senderMark = "【Sender】"
 
+/// Latest snapshot published by AddonHostClient, read on the main actor by capture source helpers.
+@MainActor var currentAddonSnapshot: AddonSnapshot = .empty
+
 enum CaptureSource: Hashable {
     case system
     case microphone(String)
     case application(String)
     case sender(String)
+    case addon(addonID: String, sourceID: String)
 
     init?(key: String) {
         if key == "system" { self = .system }
         else if key.hasPrefix("mic:") { self = .microphone(String(key.dropFirst(4))) }
         else if key.hasPrefix("app:"), key.count > 4 { self = .application(String(key.dropFirst(4))) }
         else if key.hasPrefix("sender:"), key.count > 7 { self = .sender(String(key.dropFirst(7))) }
-        else { return nil }
+        else if key.hasPrefix("addon:") {
+            let rest = key.dropFirst(6)
+            guard let colon = rest.firstIndex(of: ":") else { return nil }
+            let addonID = String(rest[..<colon])
+            let sourceID = String(rest[rest.index(after: colon)...])
+            guard !addonID.isEmpty, !sourceID.isEmpty else { return nil }
+            self = .addon(addonID: addonID, sourceID: sourceID)
+        } else { return nil }
     }
 
     var key: String {
@@ -51,6 +62,17 @@ enum CaptureSource: Hashable {
         case .microphone(let uid): "mic:\(uid)"
         case .application(let identifier): "app:\(identifier)"
         case .sender(let id): "sender:\(id)"
+        case .addon(let addonID, let sourceID): "addon:\(addonID):\(sourceID)"
+        }
+    }
+
+    var controlKind: String {
+        switch self {
+        case .system: "system"
+        case .microphone(let uid): uid.isEmpty ? "default-microphone" : "microphone"
+        case .application: "application"
+        case .sender: "sender"
+        case .addon: "addon"
         }
     }
 
@@ -61,12 +83,22 @@ enum CaptureSource: Hashable {
             if uid.isEmpty { "Default microphone" } else { "Microphone · \(uid)" }
         case .application(let identifier): "Application · \(identifier)"
         case .sender: senderMark
+        case .addon(_, let sourceID): sourceID
         }
     }
 
     var isSender: Bool {
         if case .sender = self { return true }
         return false
+    }
+
+    var isAddon: Bool {
+        if case .addon = self { return true }
+        return false
+    }
+
+    var isSenderBacked: Bool {
+        isSender || isAddon
     }
 
     var isMicrophone: Bool {
@@ -100,6 +132,18 @@ enum CaptureRoute: UInt32, CaseIterable, Sendable {
         case .center: "Center"
         case .mid: "Mid"
         case .side: "Side"
+        }
+    }
+
+    var controlName: String {
+        switch self {
+        case .merged: "merged"
+        case .allChannels: "all"
+        case .left: "left"
+        case .right: "right"
+        case .center: "center"
+        case .mid: "mid"
+        case .side: "side"
         }
     }
 }
@@ -285,12 +329,17 @@ func snapshotRunningApps() -> [RunningAppSnapshot] {
 
 @MainActor
 func availableCaptureSources(excluding privateDevices: Set<AudioObjectID>) -> [(source: CaptureSource, title: String)] {
-    scanCaptureSources(excluding: privateDevices, runningApps: snapshotRunningApps())
+    scanCaptureSources(
+        excluding: privateDevices,
+        runningApps: snapshotRunningApps(),
+        addonSnapshot: currentAddonSnapshot
+    )
 }
 
 func scanCaptureSources(
     excluding privateDevices: Set<AudioObjectID>,
-    runningApps apps: [RunningAppSnapshot]
+    runningApps apps: [RunningAppSnapshot],
+    addonSnapshot: AddonSnapshot = .empty
 ) -> [(source: CaptureSource, title: String)] {
     var choices: [(CaptureSource, String)] = []
     if TestCopyConfig.current.syntheticSystemFormat != nil
@@ -305,8 +354,8 @@ func scanCaptureSources(
     if let device = defaultDevice(kAudioHardwarePropertyDefaultInputDevice), inputDevices.contains(device) {
         choices.append((.microphone(""), CaptureSource.microphone("").label))
     }
-    // Plug-in senders come right after the two fixed entries, as on Windows, so they are not
-    // lost below a long list of devices and apps.
+    // Add-on sources and plug-in senders come right after the two fixed entries, as on Windows,
+    // so they are not lost below a long list of devices and apps.
     let fixedChoices = choices.count
     for device in inputDevices {
         guard let uid = audioString(device, kAudioDevicePropertyDeviceUID), !uid.isEmpty,
@@ -339,9 +388,28 @@ func scanCaptureSources(
         return order == .orderedSame ? $0.key < $1.key : order == .orderedAscending
     }
     choices += sortedApps.map { (.application($0.key), $0.value) }
-    choices.insert(
-        contentsOf: availableSenders().map { (.sender($0.id), "\(senderMark)\($0.name)") }, at: fixedChoices
-    )
+
+    // ADD-W30: Hide raw Sender entries claimed by running add-on sources, and list add-on sources first.
+    let claimedSenders = addonSnapshot.claimedSenderIDs
+    var addonEntries: [(CaptureSource, String)] = []
+    var seenNames: [String: Int] = [:]
+    for addon in addonSnapshot.addons where addon.isRunning {
+        for source in addon.sources {
+            seenNames[source.name, default: 0] += 1
+        }
+    }
+    for addon in addonSnapshot.addons where addon.isRunning {
+        for source in addon.sources {
+            let title = (seenNames[source.name] ?? 0) > 1
+                ? "\(source.name) (\(addon.displayName))"
+                : source.name
+            addonEntries.append((.addon(addonID: addon.id, sourceID: source.id), title))
+        }
+    }
+    let rawSenderEntries: [(CaptureSource, String)] = availableSenders()
+        .filter { !claimedSenders.contains($0.id) }
+        .map { (.sender($0.id), "\(senderMark)\($0.name)") }
+    choices.insert(contentsOf: addonEntries + rawSenderEntries, at: fixedChoices)
     return choices
 }
 
@@ -370,6 +438,8 @@ func defaultFileName(for source: CaptureSource) -> String {
             .deletingPathExtension().lastPathComponent ?? identifier
     case .sender:
         return "Sender"
+    case .addon(_, let sourceID):
+        return sourceID
     }
 }
 
@@ -389,6 +459,8 @@ private func presentFileName(for source: CaptureSource) -> String? {
         return NSRunningApplication.runningApplications(withBundleIdentifier: identifier).first?.localizedName
     case .sender(let id):
         return availableSenders().first { $0.id == id }?.name
+    case .addon(let addonID, let sourceID):
+        return currentAddonSnapshot.source(addonID: addonID, sourceID: sourceID)?.source.name
     }
 }
 
@@ -553,7 +625,7 @@ private enum InputIdentity: Equatable {
     case syntheticSystem(String)
     case microphone(AudioObjectID, Double)
     case application([AudioObjectID], AudioObjectID, Double)
-    case sender(String, UInt32, UInt32)
+    case sender(String, UInt32, UInt32, [String]?)
 }
 
 @MainActor
@@ -561,7 +633,17 @@ private func identity(for source: CaptureSource) -> InputIdentity? {
     switch source {
     case .sender(let id):
         return senderDescriptors(audioOnly: true).first { $0.id == id }
-            .map { .sender(id, $0.sampleRate, $0.channels) }
+            .map { .sender(id, $0.sampleRate, $0.channels, nil) }
+    case .addon(let addonID, let sourceID):
+        guard let (_, addonSource) = currentAddonSnapshot.source(addonID: addonID, sourceID: sourceID) else {
+            return nil
+        }
+        let groupLabels = addonSource.allChannelLabels
+        return senderDescriptors(audioOnly: true).first { $0.id == addonSource.sender }
+            .map {
+                let labels = groupLabels.count == Int($0.channels) ? groupLabels : nil
+                return .sender(addonSource.sender, $0.sampleRate, $0.channels, labels)
+            }
     case .system:
         if let spec = TestCopyConfig.current.syntheticSystemFormat {
             return .syntheticSystem(spec)
@@ -658,7 +740,7 @@ private struct InputFormat {
         }
     }
 
-    init(senderID: String, senderChannels: UInt32, sampleRate: UInt32) {
+    init(senderID: String, senderChannels: UInt32, sampleRate: UInt32, overrideLabels: [String]? = nil) {
         channels = Int(senderChannels)
         self.sampleRate = Double(sampleRate)
         planar = false
@@ -667,6 +749,10 @@ private struct InputFormat {
         center = nil
         mix = []
         mixScale = 1.0
+        if let overrideLabels, overrideLabels.count == channels {
+            channelNames = overrideLabels
+            return
+        }
         let names: [String]
         if let labels = senderID.withCString({ bt_sender_channel_labels($0) }) {
             names = String(cString: labels).components(separatedBy: "\t")
@@ -1012,9 +1098,9 @@ private final class SenderInput: NativeInput {
     private let id: String
     private var producers: [LaneProducer] = []
 
-    init(id: String, rate: UInt32, channels: UInt32) {
+    init(id: String, rate: UInt32, channels: UInt32, overrideLabels: [String]? = nil) {
         self.id = id
-        format = InputFormat(senderID: id, senderChannels: channels, sampleRate: rate)
+        format = InputFormat(senderID: id, senderChannels: channels, sampleRate: rate, overrideLabels: overrideLabels)
     }
 
     func bind(_ producers: [LaneProducer]) throws { self.producers = producers }
@@ -1207,6 +1293,7 @@ final class SystemAudioTap {
     private var telemetryVersion: UInt64 = 0
     private var lastActivityPoll = 0.0
     private var activeTrackers: [ChannelActivityTracker]
+    private var positionBuffers: [LanePositionBuffer?]
     private(set) var cachedState: UInt32 = 0
     private static let silentMeter = BtMeterReadings(
         peak_dbfs: -Float.infinity, vu: -Float.infinity, momentary_lufs: -Float.infinity)
@@ -1219,9 +1306,79 @@ final class SystemAudioTap {
     var captureChannelNames: [[String]] {
         lanes.indices.map { index in
             guard widths[index] > 2 else { return [] }
+            if case .addon(let addonID, let sourceID) = lanes[index].source,
+               let (_, src) = currentAddonSnapshot.source(addonID: addonID, sourceID: sourceID) {
+                let labels = src.allChannelLabels
+                if labels.count == Int(widths[index]) {
+                    return labels
+                }
+            }
             return slots.first(where: { $0.indexes.contains(index) })?.input?.format.channelNames
                 ?? (1...Int(widths[index])).map { "Channel \($0)" }
         }
+    }
+
+    func channelGroups(for lane: Int) -> [AddonChannelGroup] {
+        guard lanes.indices.contains(lane), widths.indices.contains(lane), widths[lane] > 2 else { return [] }
+        guard case .addon(let addonID, let sourceID) = lanes[lane].source,
+              let (_, src) = currentAddonSnapshot.source(addonID: addonID, sourceID: sourceID),
+              let groups = src.groups, !groups.isEmpty else {
+            return []
+        }
+        let total = groups.reduce(0) { $0 + $1.channels.count }
+        guard total == Int(widths[lane]) else { return [] }
+        return groups
+    }
+
+    func ingestAddonPositions(_ events: [AddonPositionEvent]) -> Bool {
+        guard positionBuffers.contains(where: { $0 != nil }) else { return false }
+        for event in events {
+            for (index, lane) in lanes.enumerated() {
+                guard case .addon(let addonID, let sourceID) = lane.source,
+                      addonID == event.addon_id, sourceID == event.source_id,
+                      let buf = positionBuffers[index] else { continue }
+                buf.enqueue(timeNs: event.time, channels: event.channels)
+            }
+        }
+        var overflowed = false
+        let timeline = self.timeline
+        captureQueue.sync {
+            let first = bt_tracks_first_frame(timeline.core)
+            let end = bt_tracks_end_frame(timeline.core)
+            let retained: Range<UInt64>? = first < end ? first..<end : nil
+            for (index, buf) in positionBuffers.enumerated() {
+                guard let buf else { continue }
+                var evictedFirst: UInt64 = 0
+                let evicted: UInt64? = bt_tracks_take_frame_clock_eviction(
+                    timeline.core, UInt32(index), &evictedFirst
+                ) != 0 ? evictedFirst : nil
+                buf.drain(evictedBefore: evicted, retainedRange: retained) { timeNs in
+                    var frame: UInt64 = 0
+                    let status = bt_tracks_retained_frame_at(timeline.core, UInt32(index), timeNs, &frame)
+                    return (status, frame)
+                }
+                if buf.takeOverflowed() {
+                    overflowed = true
+                }
+            }
+        }
+        return overflowed
+    }
+
+    func clearPositionTracks() {
+        for buf in positionBuffers {
+            buf?.clear()
+        }
+    }
+
+    func freezePositions() -> [Int: FrozenPositionsHandle] {
+        var result: [Int: FrozenPositionsHandle] = [:]
+        for (index, buf) in positionBuffers.enumerated() {
+            if let frozen = buf?.freeze() {
+                result[index] = frozen
+            }
+        }
+        return result
     }
 
     func channelCount(for lane: Int) -> UInt32? {
@@ -1229,15 +1386,15 @@ final class SystemAudioTap {
     }
 
     /// Only wide (>2 ch) system, microphone, and application sources hide silent channels.
-    /// Sender (and add-on) sources always show every channel.
+    /// Sender and add-on sources always show every channel.
     func canHideSilentChannels(for lane: Int) -> Bool {
         guard lanes.indices.contains(lane), widths.indices.contains(lane) else { return false }
-        return widths[lane] > 2 && !lanes[lane].source.isSender
+        return widths[lane] > 2 && !lanes[lane].source.isSenderBacked
     }
 
     func isWideSender(lane: Int) -> Bool {
         guard lanes.indices.contains(lane), widths.indices.contains(lane) else { return false }
-        return lanes[lane].source.isSender && widths[lane] > 2
+        return lanes[lane].source.isSenderBacked && widths[lane] > 2
     }
 
     func liveActiveMask(for lane: Int, hideSilent: Bool) -> UInt64? {
@@ -1255,6 +1412,7 @@ final class SystemAudioTap {
         }
         cachedMeters = Array(repeating: Self.silentMeter, count: lanes.count)
         activeTrackers = Array(repeating: ChannelActivityTracker(), count: lanes.count)
+        positionBuffers = Array(repeating: nil, count: lanes.count)
         self.lanes = lanes
         var slots: [Slot] = []
         for (index, lane) in lanes.enumerated() {
@@ -1280,8 +1438,8 @@ final class SystemAudioTap {
             slots.first(where: { $0.indexes.contains(index) })?.input?.format
         }
         let routes = lanes.enumerated().map { index, lane -> CaptureRoute in
-            // CAP-10: A wide Sender (>2 channels) always captures all native channels.
-            if lane.source.isSender, let format = formats[index], format.channels > 2 {
+            // CAP-10: A wide Sender or add-on source (>2 channels) always captures all native channels.
+            if lane.source.isSenderBacked, let format = formats[index], format.channels > 2 {
                 return .allChannels
             }
             return lane.route == .allChannels && formats[index]?.supports(.allChannels) == false ? .merged : lane.route
@@ -1315,6 +1473,12 @@ final class SystemAudioTap {
         self.laneCapErrors = capErrors
         self.timeline = try TimelineHandle(history: history, widths: acceptedWidths, retainSilence: retainSilence)
         self.slots = slots
+        // Enable frame clock & position tracking for wide add-on lanes (Pkg 19).
+        for (index, lane) in lanes.enumerated() where lane.source.isAddon && acceptedWidths[index] > 2 {
+            if bt_tracks_enable_frame_clock(timeline.core, UInt32(index)) != 0 {
+                self.positionBuffers[index] = LanePositionBuffer()
+            }
+        }
         // A selection preview from any Backtracking is heard in System playback. Those lanes
         // record silence while it plays, so the preview never enters the history.
         // A test copy neither plays previews nor joins the shared preview gate.
@@ -1340,13 +1504,13 @@ final class SystemAudioTap {
         switch identity(for: lane.source) {
         case .syntheticSystem(let spec):
             channels = SyntheticSystemInput.parse(spec)?.labels.count ?? 2
-        case .sender(_, _, let count): channels = Int(count)
+        case .sender(_, _, let count, _): channels = Int(count)
         case .microphone(let device, _): channels = inputChannels(device)
         case .system(let device, _), .application(_, let device, _):
             channels = max(2, deviceChannelCount(device, scope: kAudioDevicePropertyScopeOutput))
         case nil: channels = lane.source.isMicrophone ? 1 : 2
         }
-        if (lane.route == .allChannels || lane.source.isSender), channels > 2 { return UInt32(channels) }
+        if (lane.route == .allChannels || lane.source.isSenderBacked), channels > 2 { return UInt32(channels) }
         return UInt32(max(1, min(2, channels)))
     }
 
@@ -1357,7 +1521,8 @@ final class SystemAudioTap {
         case .application(let processes, let device, _):
             try PlaybackTap(processes: processes, device: device, preferNativeLayout: preferNative)
         case .microphone(let device, _): try MicrophoneInput(device: device)
-        case .sender(let id, let rate, let channels): SenderInput(id: id, rate: rate, channels: channels)
+        case .sender(let id, let rate, let channels, let labels):
+            SenderInput(id: id, rate: rate, channels: channels, overrideLabels: labels)
         case nil: nil
         }
     }
@@ -1401,6 +1566,19 @@ final class SystemAudioTap {
         guard let slot = slots.first(where: { $0.indexes.contains(lane) }) else { return nil }
         if let error = slot.error { return localizedBilingual(error) }
         if slot.input == nil {
+            if case .addon(let addonID, let sourceID) = slot.source {
+                let fallbackName = defaultFileName(for: slot.source)
+                guard let addon = currentAddonSnapshot.addon(addonID) else {
+                    return "The add-on that provides \"\(fallbackName)\" is not installed."
+                }
+                if !addon.isRunning {
+                    return "\(addon.displayName) is not available. \(addon.statusPresentation.text)"
+                }
+                if addon.sources.first(where: { $0.id == sourceID }) == nil {
+                    return "\(addon.displayName) no longer offers \"\(fallbackName)\"."
+                }
+                return "Waiting for \(addon.displayName)..."
+            }
             if slot.source.isSender {
                 return "Sender audio is unavailable"
             }
@@ -1412,7 +1590,7 @@ final class SystemAudioTap {
             }
             return "waiting for the source"
         }
-        if let input = slot.input, !lanes[lane].source.isSender, !input.format.supports(lanes[lane].route) {
+        if let input = slot.input, !lanes[lane].source.isSenderBacked, !input.format.supports(lanes[lane].route) {
             if lanes[lane].route == .allChannels, routes[lane] == .merged {
                 return "capturing in Merged because this source has fewer than three channels"
             }
@@ -1579,7 +1757,7 @@ final class SystemAudioTap {
                 if let input, slots[index].indexes.contains(where: {
                     let wanted = lanes[$0].route
                     let route: CaptureRoute
-                    if lanes[$0].source.isSender, input.format.channels > 2 {
+                    if lanes[$0].source.isSenderBacked, input.format.channels > 2 {
                         route = .allChannels
                     } else {
                         route = wanted == .allChannels && !input.format.supports(wanted) ? .merged : wanted

@@ -438,12 +438,23 @@ enum TestStep: Equatable {
     case colorWait(Bool)
     case addSource(String)
     case removeSource(Int)
+    case dropPackage(URL)
+    case dropFile(URL)
+    case installConfirm
+    case allowControl(String, Bool)
+    case setAddonSetting(String, String, String)
+    case runAddonAction(String, String)
+    case selectAddonFormat(Int, String)
+    case addonTransport(Int, String, Double?)
+    case removeAddon(String, Bool)
     case unsupportedAddon(String)
 
     var waits: Bool {
         switch self {
         case .save, .dragPrepare, .exportMode, .wait, .previewPlan,
-             .rows, .selectLane, .key, .addSource, .removeSource, .optionsScroll:
+             .rows, .selectLane, .key, .addSource, .removeSource, .optionsScroll,
+             .dropPackage, .dropFile, .installConfirm, .allowControl,
+             .setAddonSetting, .runAddonAction, .selectAddonFormat, .addonTransport, .removeAddon:
             return true
         default:
             return false
@@ -770,7 +781,7 @@ final class TestHarness {
         for raw in text.split(separator: ";") {
             let step = raw.trimmingCharacters(in: .whitespaces)
             if step.isEmpty { continue }
-            if step == "install" { result.append(.unsupportedAddon(step)); continue }
+            if step == "install" { result.append(.installConfirm); continue }
             if step == "preview-plan" { result.append(.previewPlan); continue }
             if step == "open-export-mode" { result.append(.openExportMode); continue }
             if step == "meters=open" { result.append(.openMeters); continue }
@@ -950,7 +961,44 @@ final class TestHarness {
             case "remove-source":
                 guard let lane = parseLane(value) else { return .failure("\(value) is not a lane") }
                 result.append(.removeSource(lane))
-            case "drop", "drop-options", "remove", "set", "format", "open-format", "open", "transport":
+            case "drop", "drop-options":
+                let url = URL(fileURLWithPath: value)
+                if AddonFormatting.isPackageURL(url) {
+                    result.append(.dropPackage(url))
+                } else {
+                    result.append(.dropFile(url))
+                }
+            case "allow-control":
+                guard case .success(let (id, flag)) = splitPair(value) else {
+                    return .failure("\(step) needs <addon-id>:<on|off>")
+                }
+                result.append(.allowControl(id.trimmingCharacters(in: .whitespaces), flag == "on" || flag == "true"))
+            case "set":
+                let parts = value.split(separator: ":", maxSplits: 2).map(String.init)
+                guard parts.count == 3 else { return .failure("\(step) needs <addon-id>:<key>:<value>") }
+                result.append(.setAddonSetting(parts[0], parts[1], parts[2]))
+            case "action":
+                guard case .success(let (id, actionID)) = splitPair(value) else {
+                    return .failure("\(step) needs <addon-id>:<action>")
+                }
+                result.append(.runAddonAction(id.trimmingCharacters(in: .whitespaces), actionID.trimmingCharacters(in: .whitespaces)))
+            case "format":
+                guard case .success(let (laneText, fmt)) = splitPair(value), let lane = parseLane(laneText) else {
+                    return .failure("\(step) needs <lane>:<format-id>")
+                }
+                result.append(.selectAddonFormat(lane, fmt.trimmingCharacters(in: .whitespaces)))
+            case "transport":
+                let parts = value.split(separator: ":", maxSplits: 2).map(String.init)
+                guard parts.count >= 2, let lane = parseLane(parts[0]) else {
+                    return .failure("\(step) needs <lane>:<command>[:<pos>]")
+                }
+                let pos = parts.count == 3 ? Double(parts[2]) : nil
+                result.append(.addonTransport(lane, parts[1], pos))
+            case "remove":
+                let parts = value.split(separator: ":", maxSplits: 1).map(String.init)
+                let deleteData = parts.count == 2 && (parts[1] == "delete" || parts[1] == "true")
+                result.append(.removeAddon(parts[0], deleteData))
+            case "open-format", "open":
                 result.append(.unsupportedAddon(step))
             default:
                 return .failure("unknown step \(name)")

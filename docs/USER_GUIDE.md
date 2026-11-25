@@ -130,9 +130,11 @@ Windows 桌面版可以同時擷取 A、B 以外的更多來源，最多 64 個�
 
 目前原始碼的 macOS 版在 Options → **Sources** 提供 **Add source** 和 **Remove**，最多 64 個來源，合計最多 64 個聲道。來源從 A 編到 BL。使用 **All channels** 可保留多聲道來源，波形顯示立體聲 L/R 混合列及個別聲道。波形列放不下時，在左右邊緣捲動可瀏覽其他列。**Edit separately** 可選單一列，L/R 混合列視為一組。
 
-Options → **Capture** 可選多聲道來源的 L/R 聲音為立體聲或雙耳音訊。Options → **Export** 可選每聲道一個雙耳或單聲道檔、單一多聲道 WAV，或單一雙耳混音。Options → **Appearance** 的 **Waveform color** 可切換頻率著色並調整漸層。
+Options → **Capture** 可選多聲道來源的 L/R 聲音為立體聲或雙耳音訊，並提供 **Hide silent channels**。Options → **Export** 可選每聲道一個雙耳或單聲道檔、單一多聲道 WAV，或單一雙耳混音；含位置資料的物件群組會同時寫出 `-Positions.json`。Options → **Appearance** 的 **Waveform color** 可切換頻率著色並調整漸層，亦可由 **Look from add-on** 套用附加元件外觀。
 
 Options → **Hotkeys** 可為每個動作設定兩組快捷鍵。全域快照預設用 Fn／Globe 加數字 1 左側的實體鍵，需要「輸入監控」權限。分開編輯預設輕按右側 Command，可用 **Reset** 還原。
+
+Options → **Add-ons** 支援安裝、管理、停用與移除 `.btaddon` 附加元件（檔案存放於 `~/Library/Application Support/Backtracking/addons` 與 `~/Library/Application Support/Backtracking/addon-data`），並支援附加元件音訊來源、格式切換、檔案開啟／拖放、播放控制、聲道群組切換、控制權限核准及 **Backtracking Agent**（MCP）。
 
 ### 即時音量表
 
@@ -241,13 +243,13 @@ Options 的 **Hotkeys／快速鍵** 頁列出所有鍵盤快速鍵，都可以�
 
 **檔名**。桌面版以來源名稱為 WAV 命名。同時擷取 A 和 B 時為 `Backtracking_<名稱>_A_<日期>_<時間>_<長度>s.wav` 與 `Backtracking_<名稱>_B_…`；只有一個來源時不加 A／B，例如 `Backtracking_Spotify_2026-11-17_09-05-00_12.4s.wav`。分開編輯 A 和 B 時單獨匯出的一軌仍標示 A 或 B。名稱預設為來源清單中的裝置或 App 名稱，不含 `.exe` 等副檔名；系統播放為 `System audio`，Sender 為音軌名稱。要改名時，在 Options → Sources 該來源下方的 **File name** 欄位輸入，欄位下方會顯示檔名的開頭；清空欄位即恢復預設。名稱屬於裝置而不是 A／B：把系統播放命名為 `Loop` 後，不論它在 A 還是 B 擷取，檔名都使用 `Loop`。檔名不能使用的字元（`\ / : * ? " < > |`）會改成空格，名稱最多保留 48 個字元。VST3／CLAP 的檔名不含來源名稱，為 `Backtracking_<日期>_<時間>_<長度>s.wav`，DAW 提供速度時在長度後加上 BPM，例如 `_120bpm`；擷取 A 和 B 時，兩個檔案分別以 `-A`、`-B` 結尾。**Delete old drag-and-drop files** 也認得舊版的檔名。
 
-### 附加元件（Windows 桌面版）
+### 附加元件（桌面版）
 
-附加元件（add-on）是獨立的程式，Backtracking 會啟動它並擷取它送出的音訊。附加元件可以提供新的音訊來源、開啟檔案、有自己的設定與按鈕。附加元件檔案的副檔名是 `.btaddon`。目前只有 Windows 桌面版支援，macOS 桌面版與插件尚未支援。
+附加元件（add-on）是獨立的程式，Backtracking 會啟動它並擷取它送出的音訊。附加元件可以提供新的音訊來源、開啟檔案、提供外觀或控制，並有自己的設定與按鈕。附加元件檔案的副檔名是 `.btaddon`。Windows 與 macOS 桌面版支援附加元件，VST3／CLAP 插件尚未支援。
 
 **安裝。** 把 `.btaddon` 檔拖到 Backtracking 視窗，或在 Options 的 **Add-ons** 頁按 **Install from file…**。Backtracking 先顯示確認畫面：名稱、版本、作者、它會執行的程式、解壓後的大小，以及它要求的功能。按 **Install** 之前不會寫入任何東西。附加元件是以你的權限執行的程式，沒有沙箱，請只安裝你信任的附加元件。裝好後它會立刻啟動，之後每次開啟 Backtracking 也會啟動。
 
-**管理。** **Add-ons** 頁列出每個附加元件的狀態、最新訊息、設定與按鈕。取消勾選 **Enabled** 可停用。**Remove…** 會移除程式，並可選擇一併刪除它保存的資料。附加元件裝在 `%LOCALAPPDATA%\Backtracking\addons`，它的資料在 `%LOCALAPPDATA%\Backtracking\addon-data`。
+**管理。** **Add-ons** 頁列出每個附加元件的狀態、最新訊息、設定與按鈕。取消勾選 **Enabled** 可停用。**Remove…** 會移除程式，並可選擇一併刪除它保存的資料。Windows 裝在 `%LOCALAPPDATA%\Backtracking\addons`（資料在 `%LOCALAPPDATA%\Backtracking\addon-data`）；macOS 裝在 `~/Library/Application Support/Backtracking/addons`（資料在 `~/Library/Application Support/Backtracking/addon-data`）。
 
 **使用附加元件的來源。** 附加元件提供的來源會出現在 Options 的 **Sources** 頁的 **Audio source** 清單。選了這種來源後：
 
@@ -259,7 +261,7 @@ Options 的 **Hotkeys／快速鍵** 頁列出所有鍵盤快速鍵，都可以�
 
 想自己寫附加元件，請看 [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md)。
 
-### 讓附加元件控制 Backtracking（Windows 桌面版）
+### 讓附加元件控制 Backtracking（桌面版）
 
 具有 `control` 功能的附加元件可以像坐在視窗前的人一樣操作 Backtracking，例如讓 AI 助理或腳本替你暫停、選取並存檔。
 
@@ -272,7 +274,7 @@ Options 的 **Hotkeys／快速鍵** 頁列出所有鍵盤快速鍵，都可以�
 - 它不能切換自己或其他附加元件的這個勾選框，不能安裝、移除、啟用或停用附加元件，不能更改其他設定、開啟檔案、結束 Backtracking 或更新。
 - 隨時取消勾選即可收回；還在等待的要求會被拒絕。這個選擇依附加元件分別保存，重新開啟 Backtracking 後仍有效；移除附加元件後就會忘記，重新安裝時又是不允許。
 
-### 讓 AI 助理使用 Backtracking（Windows 桌面版）
+### 讓 AI 助理使用 Backtracking（桌面版）
 
 **Backtracking Agent** 附加元件讓 Claude Code、Claude Desktop 或其他 MCP 用戶端透過上述的控制使用 Backtracking：讀取 Backtracking 保留的內容、暫停與開始錄音、框選一段、存成 WAV 檔、試聽，以及新增或移除來源。安裝檔請從 [`addons/backtracking-agent`](../addons/backtracking-agent/README.md) 建置。
 
@@ -580,13 +582,13 @@ Enable **Export every file as mono** to export each WAV in mono. Stereo Merged a
 
 **File names**. The desktop apps name each WAV after its source. With A and B recording, the files are `Backtracking_<name>_A_<date>_<time>_<length>s.wav` and `Backtracking_<name>_B_…`. With one source the letter is left out, as in `Backtracking_Spotify_2026-11-17_09-05-00_12.4s.wav`. A lane exported on its own while editing A and B separately keeps its letter. The name defaults to the device or app name in the source list, without an extension such as `.exe`: `System audio` for system playback, and the track name for a Sender. To change it, type in the **File name** field under the source in Options → Sources. The note under the field shows how the files will begin. Clear the field to go back to the default. A name belongs to the device, not to A or B: name system playback `Loop` and its files say `Loop` whether it records on A or on B. Characters that file names cannot hold (`\ / : * ? " < > |`) become spaces, and a name keeps at most 48 characters. VST3 and CLAP files carry no source name: `Backtracking_<date>_<time>_<length>s.wav`, with the tempo after the length, as in `_120bpm`, when the DAW reports one. With A and B recording, the two files end in `-A` and `-B`. **Delete old drag-and-drop files** also recognizes the names that earlier versions used.
 
-### Add-ons (Windows desktop)
+### Add-ons (desktop)
 
-An add-on is a separate program that Backtracking starts and captures audio from. An add-on can provide new audio sources, open files, and have its own settings and buttons. Add-on files end in `.btaddon`. Only the Windows desktop app hosts add-ons today; the macOS app and the plug-ins do not.
+An add-on is a separate program that Backtracking starts and captures audio from. An add-on can provide new audio sources, open files, offer a look or control, and have its own settings and buttons. Add-on files end in `.btaddon`. Both the Windows and macOS desktop apps host add-ons; the VST3/CLAP plug-ins do not.
 
 **Install.** Drop a `.btaddon` file on a Backtracking window, or press **Install from file…** on the **Add-ons** page of Options. Backtracking first shows a confirmation: the name, version, author, the program it will run, its unpacked size, and what it asks for. Nothing is written before you press **Install**. An add-on is a program that runs with your own permissions and is not sandboxed, so install only add-ons you trust. Once installed it starts at once, and again each time Backtracking starts.
 
-**Manage.** The **Add-ons** page lists each add-on with its state, its latest message, its settings, and its buttons. Clear **Enabled** to turn one off. **Remove…** removes the program and offers to delete the data it saved as well. Add-ons are installed in `%LOCALAPPDATA%\Backtracking\addons`; their data is in `%LOCALAPPDATA%\Backtracking\addon-data`.
+**Manage.** The **Add-ons** page lists each add-on with its state, its latest message, its settings, and its buttons. Clear **Enabled** to turn one off. **Remove…** removes the program and offers to delete the data it saved as well. On Windows add-ons live in `%LOCALAPPDATA%\Backtracking\addons` and their data in `%LOCALAPPDATA%\Backtracking\addon-data`; on macOS they live in `~/Library/Application Support/Backtracking/addons` and `~/Library/Application Support/Backtracking/addon-data`.
 
 **Use an add-on's source.** Sources that add-ons provide appear in the **Audio source** list on the **Sources** page of Options. With such a source selected:
 
@@ -598,7 +600,7 @@ An add-on is a separate program that Backtracking starts and captures audio from
 
 To write an add-on, see [`ADDON_CONTRACT.md`](ADDON_CONTRACT.md).
 
-### Let an add-on control Backtracking (Windows desktop)
+### Let an add-on control Backtracking (desktop)
 
 An add-on with the `control` capability can work Backtracking the way a person at the window does, so that an AI assistant or a script can, for example, pause, select and save for you.
 
@@ -611,7 +613,7 @@ An add-on with the `control` capability can work Backtracking the way a person a
 - It cannot change its own check box or another add-on's, install, remove, enable or disable add-ons, change other options, open files, quit Backtracking, or update it.
 - Clear the box at any time to take control back; requests still waiting are refused. The choice is kept for each add-on when Backtracking restarts, and forgotten when the add-on is removed: installed again, it starts off.
 
-### Let an AI agent use Backtracking (Windows desktop)
+### Let an AI agent use Backtracking (desktop)
 
 The **Backtracking Agent** add-on lets Claude Code, Claude Desktop or another MCP client use Backtracking through the control described above. The client can read what Backtracking holds, pause and start recording, select a stretch, save it as WAV files, play it, and add or remove sources. Build the package from [`addons/backtracking-agent`](../addons/backtracking-agent/README.md).
 
