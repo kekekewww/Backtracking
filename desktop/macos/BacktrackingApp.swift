@@ -103,6 +103,12 @@ func verifyMacLookGradient() throws {
 }
 
 @MainActor
+func verifyMacControlPauseHolds() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyControlPauseHolds()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -2383,6 +2389,28 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let sent = host.verifyEvents.filter { $0.hasPrefix("clip_exported ") && $0 != "clip_exported answered" }
         guard file.fileFormat.sampleRate == 44_100, sent == [expected] else {
             throw CaptureError("A \(file.fileFormat.sampleRate) Hz WAV of \(file.length) frames was announced as \(sent), expected [\(expected)]")
+        }
+    }
+
+    /// An add-on's pause_capture holds for the auto-resume delay, as a pause by hand does.
+    static func verifyControlPauseHolds() throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-pause-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        let lanes = [CaptureLane(source: .addon(addonID: "verify.pause", sourceID: "a"), route: .merged)]
+        controller.captureLanes = lanes
+        controller.tap = try SystemAudioTap(history: 10, lanes: lanes)
+        defer { controller.tap = nil }
+        controller.paused = false
+        controller.idleSeconds = 5
+        controller.lastClick = ProcessInfo.processInfo.systemUptime - 60 // nobody has touched the window for a minute
+        guard case .success = controller.runWindowAction(.pauseCapture) else { throw CaptureError("pause_capture was refused") }
+        let soon = ProcessInfo.processInfo.systemUptime + 0.4
+        guard controller.paused, !controller.shouldAutoResume(now: soon),
+              controller.shouldAutoResume(now: soon + 5) else {
+            throw CaptureError("An add-on's pause resumes on its own after 0.4 s (paused \(controller.paused))")
         }
     }
 
@@ -5679,7 +5707,15 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         _ = waveform?.cancelSelection()
     }
 
+    /// Whether a pause has gone untouched for the auto-resume delay.
+    private func shouldAutoResume(now: TimeInterval) -> Bool {
+        paused && !editing && waveform?.hasSelection != true && tap != nil && idleSeconds > 0
+            && now - lastClick >= Double(idleSeconds)
+    }
+
     private func pauseCapture() {
+        // A pause, whoever asks for it, starts the auto-resume delay again (Windows `Recorder::freeze`).
+        registerClick()
         if !paused {
             do {
                 try tap?.pause()
@@ -5761,8 +5797,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 tap.pollCapture()
             }
         }
-        if paused && !editing && waveform?.hasSelection != true && tap != nil && idleSeconds > 0 &&
-            ProcessInfo.processInfo.systemUptime - lastClick >= Double(idleSeconds) {
+        if shouldAutoResume(now: ProcessInfo.processInfo.systemUptime) {
             registerClick()
             resume()
         }
