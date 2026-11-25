@@ -73,6 +73,12 @@ func verifyMacFlagDragKeepsRows() throws {
 }
 
 @MainActor
+func verifyMacChipToolTips() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyChipToolTipsAndTransportLimits()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -2180,6 +2186,22 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard let crossed = view.selectedRowsForExport ?? (view.hasSelection ? view.verifyRememberedRows : nil),
               crossed.count == 6 else {
             throw CaptureError("A new selection across rows took \(view.selectedRowsForExport ?? []) rows")
+        }
+    }
+
+    /// Hovering a group or transport chip shows what it does, and the compact transport keeps
+    /// Windows' plot-width and lane-height limits.
+    static func verifyChipToolTipsAndTransportLimits() throws {
+        let view = WaveformView(frame: NSRect(x: 0, y: 0, width: 600, height: 300))
+        let expected = view.verifyShowChips()
+        let shown = expected.map { view.verifyChipToolTip(at: $0.0) }
+        guard view.verifyChipToolTipTags.count == expected.count, shown == expected.map(\.1) else {
+            throw CaptureError("Chip tooltips: \(view.verifyChipToolTipTags.count) registered, hover shows \(shown)")
+        }
+        let fits = WaveformView.transportChipFits
+        guard fits(240, 22, 300, 304), !fits(239, 22, 100, 304), !fits(400, 21.5, 100, 404),
+              !fits(400, 40, 301, 304), fits(400, 40, 300, 304) else {
+            throw CaptureError("The compact transport ignores Windows' 240 px plot / 22 px lane / 4 px edge limits")
         }
     }
 
@@ -7866,6 +7888,21 @@ extension WaveformView {
     }
 
     var verifyRememberedRows: [RowIdentity] { rememberedRows }
+    var verifyChipToolTipTags: [NSView.ToolTipTag] { chipToolTipTags }
+    /// Puts one group chip and one transport chip on the plot and lets the view register them.
+    func verifyShowChips() -> [(NSPoint, String)] {
+        let group = OverlayChip(rect: NSRect(x: 40, y: 3, width: 50, height: 14), text: "Objects", current: false,
+                                toolTip: "Show Bed", action: .cycleGroup(lane: 0))
+        let transport = OverlayChip(rect: NSRect(x: 94, y: 3, width: 80, height: 14), text: "▶ 0:01", current: false,
+                                    toolTip: "Play Tone", action: .toggleTransport(lane: 0))
+        verifyChips = [group, transport]
+        syncChipsForDisplay()
+        return [(NSPoint(x: 60, y: 10), "Show Bed"), (NSPoint(x: 120, y: 10), "Play Tone")]
+    }
+    func verifyChipToolTip(at point: NSPoint) -> String? {
+        guard let tag = chipToolTipTags.first else { return nil }
+        return view(self, stringForToolTip: tag, point: point, userData: Self.chipToolTipData)
+    }
 }
 #endif
 
@@ -7942,6 +7979,16 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     private var laneBoxes: [LaneLayoutBox] = []
     private var columnBox: LaneLayoutBox?
     private var gutterToolTip: NSView.ToolTipTag?
+    struct ChipToolTip: Equatable {
+        let rect: NSRect
+        let text: String
+    }
+    private static let chipToolTipData = UnsafeMutableRawPointer(bitPattern: 2)
+    private var chipToolTips: [ChipToolTip] = []
+    private var chipToolTipTags: [NSView.ToolTipTag] = []
+    #if BACKTRACKING_CAPTURE_VERIFY
+    private var verifyChips: [OverlayChip]?
+    #endif
     private struct ScrollDrag {
         let laneIndex: Int? // nil = column scroll (>2 lanes)
         let grabOffset: CGFloat
@@ -8287,6 +8334,9 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     ) -> String {
         if data == UnsafeMutableRawPointer(bitPattern: 1) {
             return gutterToolTipText(at: point)
+        }
+        if data == Self.chipToolTipData {
+            return chipToolTips.first { $0.rect.contains(point) }?.text ?? ""
         }
         return compactStatus?.detail ?? ""
     }
@@ -9617,12 +9667,27 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         let action: Action
     }
 
+    /// The least plot width, and lane height, that take the compact transport (Windows
+    /// `TRANSPORT_MIN_WIDTH`, `TRANSPORT_MIN_LANE_HEIGHT`).
+    static let transportMinWidth: CGFloat = 240
+    static let transportMinLaneHeight: CGFloat = 22
+
+    /// Whether a lane's compact transport is drawn at `right`: left out of a plot too narrow, a
+    /// lane too short, or where it would reach past 4 px before the plot's right edge.
+    static func transportChipFits(plotWidth: CGFloat, laneHeight: CGFloat, right: CGFloat, plotRight: CGFloat) -> Bool {
+        plotWidth >= transportMinWidth && laneHeight >= transportMinLaneHeight && right <= plotRight - 4
+    }
+
     private func overlayChips() -> [OverlayChip] {
+        #if BACKTRACKING_CAPTURE_VERIFY
+        if let verifyChips { return verifyChips }
+        #endif
         guard showsOverlay, let controller else { return [] }
         let font = NSFont.systemFont(ofSize: 10, weight: .medium)
         let chipH: CGFloat = 14
         let padX: CGFloat = 5
-        let gap: CGFloat = 2
+        // Windows lays group buttons side by side with no gap.
+        let gap: CGFloat = 0
         var chips: [OverlayChip] = []
 
         for (lane, box) in laneBoxes.enumerated() {
@@ -9650,12 +9715,15 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                         ))
                         cursorX += w + gap
                     }
-                } else if let cur = groups.first(where: { $0.id == currentGroupID }) ?? groups.first {
-                    let w = min(audioRect.width * 0.55, ceil((cur.label as NSString).size(withAttributes: [.font: font]).width) + padX * 2)
+                } else if let index = groups.firstIndex(where: { $0.id == currentGroupID }) ?? (groups.isEmpty ? nil : 0) {
+                    // One button names the group on show and moves to the next (Windows `group_chips`).
+                    let cur = groups[index]
+                    let next = groups[(index + 1) % groups.count]
+                    let w = min(audioRect.width * 0.6, ceil((cur.label as NSString).size(withAttributes: [.font: font]).width) + padX * 2)
                     let r = NSRect(x: cursorX, y: laneBottomY, width: w, height: chipH)
                     chips.append(OverlayChip(
-                        rect: r, text: cur.label, current: true,
-                        toolTip: "\(cur.label) is on show and is what you drag out",
+                        rect: r, text: cur.label, current: false,
+                        toolTip: "Show \(next.label)",
                         action: .cycleGroup(lane: lane)
                     ))
                     cursorX += w + gap
@@ -9668,7 +9736,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 let symbol = tr.playing ? "⏸" : "▶"
                 let label = "\(symbol) \(tr.text)"
                 let w = ceil((label as NSString).size(withAttributes: [.font: font]).width) + padX * 2
-                if cursorX + w <= audioRect.maxX - 8 {
+                if Self.transportChipFits(plotWidth: audioRect.width, laneHeight: box.height,
+                                          right: cursorX + w, plotRight: audioRect.maxX) {
                     let r = NSRect(x: cursorX, y: laneBottomY, width: w, height: chipH)
                     let tip = tr.playing ? "Pause \(tr.sourceName)" : "Play \(tr.sourceName)"
                     chips.append(OverlayChip(
@@ -9698,8 +9767,25 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         return true
     }
 
-    private func drawOverlayChips() {
+    /// Registers a tooltip over each chip, so hovering one says what it does.
+    private func syncChipToolTips(_ chips: [OverlayChip]) {
+        let shown = chips.map { ChipToolTip(rect: $0.rect, text: $0.toolTip) }
+        guard shown != chipToolTips else { return }
+        for tag in chipToolTipTags { removeToolTip(tag) }
+        chipToolTips = shown
+        chipToolTipTags = shown.map { addToolTip($0.rect, owner: self, userData: Self.chipToolTipData) }
+    }
+
+    /// The chips drawing will show, with their tooltips registered.
+    @discardableResult
+    private func syncChipsForDisplay() -> [OverlayChip] {
         let chips = overlayChips()
+        syncChipToolTips(chips)
+        return chips
+    }
+
+    private func drawOverlayChips() {
+        let chips = syncChipsForDisplay()
         guard !chips.isEmpty else { return }
         let accent = RGBA8(rgb: accentRGB)
         let font = NSFont.systemFont(ofSize: 10, weight: .medium)
