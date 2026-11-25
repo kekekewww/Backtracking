@@ -169,6 +169,12 @@ func verifyMacPreviewPlan() throws {
 }
 
 @MainActor
+func verifyMacControlSaveReply() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyControlSaveReply()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -2655,6 +2661,48 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard problems.isEmpty else { throw CaptureError("Preview plan: " + problems.joined(separator: "; ")) }
     }
 
+    /// An add-on's `save` of two sources answers with each file and the lane it came from.
+    /// It spins the main queue for the freeze and the write.
+    static func verifyControlSaveReply() throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-save-reply-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        guard let host = AddonHostClient(dataRoot: scratch.path, appVersion: "0.2.1", primary: true) else {
+            throw CaptureError("AddonHostClient failed to start")
+        }
+        controller.attach(addonHost: host)
+        defer { host.shutdownAndFree(); controller.addonHost = nil }
+        let lanes = [
+            CaptureLane(source: .addon(addonID: "verify.reply", sourceID: "a"), route: .merged),
+            CaptureLane(source: .addon(addonID: "verify.reply", sourceID: "b"), route: .merged)
+        ]
+        let tap = try SystemAudioTap(history: 10, lanes: lanes)
+        controller.captureLanes = lanes
+        controller.tap = tap
+        defer { controller.tap = nil }
+        let samples = [Float](repeating: 0.25, count: 4_800 * 2)
+        for lane in 0..<2 {
+            _ = tap.withCaptureRead { core in
+                samples.withUnsafeBufferPointer { bt_tracks_push_interleaved(core, UInt32(lane), $0.baseAddress, 4_800, 1_000_000_000, SystemAudioTap.timelineRate) }
+            }
+        }
+        let folder = scratch.appendingPathComponent("saved", isDirectory: true)
+        let command = AddonControlCommand(command: "save", from_seconds_ago: nil, to_seconds_ago: nil, start_frame: nil,
+            end_frame: nil, lane: nil, first: nil, last: nil, seconds: nil, folder: folder.path, source: nil)
+        controller.executeSingleControlCall(host: host, call: AddonControlCall(addon_id: "verify.reply", addon_name: "Verify",
+                                                                           run: 1, request_id: "save", command: command))
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        while !host.verifyEvents.contains(where: { $0.hasPrefix("saved save ") }) && ProcessInfo.processInfo.systemUptime < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        let saved = host.verifyEvents.first { $0.hasPrefix("saved save ") }
+        guard let saved, Set(saved.dropFirst("saved save ".count).split(separator: ",").map(String.init)) == ["wav:A", "wav:B"] else {
+            throw CaptureError("The save answered \(host.verifyEvents)")
+        }
+    }
+
     /// Rows chosen in one channel group keep their identity when another group is shown, and are
     /// still what is written, named by their own group; a lane held whole takes a row that starts
     /// sounding later, and is written whole (Windows `carry_rows`, `lanes_chosen_whole`, `lane_write`).
@@ -3156,6 +3204,50 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             }
         }
         if steps != ["−", "+"] { problems.append("Number steps \(steps)") }
+        // Enter in a Number or Text field sends it, and holds the field until the answer.
+        for kind in ["number", "text"] {
+            let key = "enter-\(kind)"
+            let entry = kind == "number" ? declaration("number", key)
+                : AddonSettingEntry(declaration: AddonSettingDeclaration(key: key, label: "Name", help: nil, kind: "text",
+                    defaultValue: .string(""), options: nil, min: nil, max: nil, step: nil), value: .string(""))
+            let page = controls(controller.makeAddonSettingView(addonID: "verify.settings", entry: entry))
+            guard let field = page.compactMap({ $0 as? NSTextField }).first(where: \.isEditable) else {
+                problems.append("\(kind) has no field"); continue
+            }
+            field.stringValue = kind == "number" ? "0.8" : "Verify"
+            if kind == "number" { controller.addonSettingNumberChanged(field) } else { controller.addonSettingTextChanged(field) }
+            let sent = controller.addonSettingDrafts["verify.settings:\(key)"]
+            let waiting = controls(controller.makeAddonSettingView(addonID: "verify.settings", entry: entry))
+            let deadline = ProcessInfo.processInfo.systemUptime + 3
+            while controller.addonSettingDrafts["verify.settings:\(key)"] != nil && ProcessInfo.processInfo.systemUptime < deadline {
+                host.pollSnapshot()
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            let answered = controls(controller.makeAddonSettingView(addonID: "verify.settings", entry: entry))
+            let expected: AddonJSONValue = kind == "number" ? .double(0.8) : .string("Verify")
+            if sent != expected || field.isEnabled || waiting.contains(where: \.isEnabled) || !answered.allSatisfy(\.isEnabled) {
+                problems.append("Enter in \(kind): sent \(String(describing: sent)), field \(field.isEnabled), waiting \(waiting.map(\.isEnabled)), answered \(answered.map(\.isEnabled))")
+            }
+        }
+        // The Enabled switch holds the value asked for until the manager answers.
+        let switchable = AddonRecord(id: "verify.switch", manifest: nil, enabled: false, state: "stopped", reason: nil,
+            pid: nil, message: nil, sources: [], settings: [], actions: [], control_allowed: false, control_asked: false)
+        if let enabled = controls(controller.makeAddonCardGroup(switchable)).compactMap({ $0 as? NSButton }).first(where: { $0.title == "Enabled" }) {
+            enabled.state = .on
+            controller.addonEnabledChanged(enabled)
+            let held = controls(controller.makeAddonCardGroup(switchable)).compactMap { $0 as? NSButton }.first { $0.title == "Enabled" }
+            let deadline = ProcessInfo.processInfo.systemUptime + 3
+            while controller.addonEnabledChanging["verify.switch"] != nil && ProcessInfo.processInfo.systemUptime < deadline {
+                host.pollSnapshot()
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            let after = controls(controller.makeAddonCardGroup(switchable)).compactMap { $0 as? NSButton }.first { $0.title == "Enabled" }
+            if enabled.isEnabled || held?.isEnabled != false || held?.state != .on || after?.isEnabled != true {
+                problems.append("Enabled switch: live \(enabled.isEnabled), waiting \(String(describing: held?.isEnabled)) \(String(describing: held?.state)), answered \(String(describing: after?.isEnabled))")
+            }
+        } else {
+            problems.append("no Enabled switch")
+        }
         let link = AddonFormatting.linkIsOpenable
         if link("https://example.com/\u{7}a") || link("https://example.com/a\u{85}") || !link("https://example.com/it's") {
             problems.append("link checks")
@@ -3237,6 +3329,31 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
               replies == ["control_reply early failed", "control_reply sel ok", "control_reply late ok"],
               controller.buildControlState().preview_playing, view.hasEditingMaterial, !view.isPreparingMaterial else {
             throw CaptureError("select and play_preview answered \(early) before the freeze and \(replies) in all (playing \(controller.buildControlState().preview_playing))")
+        }
+        func waitForReply(_ id: String) -> String? {
+            let until = ProcessInfo.processInfo.systemUptime + 5
+            while ProcessInfo.processInfo.systemUptime < until {
+                if let reply = host.verifyEvents.first(where: { $0.hasPrefix("control_reply \(id) ") }) { return reply }
+                RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+            }
+            return nil
+        }
+        // A select whose freeze takes past its 8 s answers no_audio (the deadline is moved, not waited for).
+        _ = view.cancelSelection()
+        tap.readCapture(poll: false, { _ in Thread.sleep(forTimeInterval: 0.3); return 0 }) { _ in }
+        controller.executeSingleControlCall(host: host, call: call("select", "slow"))
+        controller.selectFreezeWaits = controller.selectFreezeWaits.map { ($0.0, 0) }
+        controller.answerSelectFreezeWaits()
+        let slow = host.verifyEvents.first { $0.hasPrefix("control_reply slow ") }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5)) // the slow freeze lands
+        // A select whose selection is cleared before its freeze lands answers no_audio too.
+        _ = view.cancelSelection()
+        tap.readCapture(poll: false, { _ in Thread.sleep(forTimeInterval: 0.3); return 0 }) { _ in }
+        controller.executeSingleControlCall(host: host, call: call("select", "dropped"))
+        controller.executeSingleControlCall(host: host, call: call("clear_selection", "clear"))
+        let dropped = waitForReply("dropped")
+        guard slow == "control_reply slow no_audio", dropped == "control_reply dropped no_audio" else {
+            throw CaptureError("A select past its time answered \(slow ?? "nothing"); one cleared before its freeze \(dropped ?? "nothing")")
         }
     }
 

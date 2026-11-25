@@ -2986,6 +2986,24 @@ mod display_tests {
             assert!(out_names.iter().any(|p| p.contains("Object 2.wav")), "{out_names:?}");
             bt_export_paths_free(paths);
 
+            // The lanes variant names lane 0 for every file, the positions sidecar too.
+            let _ = std::fs::remove_dir_all(&directory);
+            let mut lanes_out: *mut Vec<u32> = ptr::null_mut();
+            let paths = bt_frozen_export_group_selection_lanes(
+                frozen, group_lane.as_ptr(), 1, first, end, folder.as_ptr(),
+                48_000, 32, 0, 0, 0, Fades::NONE, ptr::null_mut(), &mut err, &mut lanes_out,
+            );
+            assert!(err.is_null() && !paths.is_null() && !lanes_out.is_null());
+            let count = bt_export_paths_count(paths);
+            assert_eq!(bt_export_lanes_count(lanes_out), count);
+            let positions = (0..count)
+                .position(|i| CStr::from_ptr(bt_export_path(paths, i)).to_str().unwrap().ends_with("-Positions.json"))
+                .expect("a positions sidecar");
+            assert_eq!(bt_export_lane(lanes_out, positions), 0);
+            assert!((0..count).all(|i| bt_export_lane(lanes_out, i) == 0));
+            bt_export_lanes_free(lanes_out);
+            bt_export_paths_free(paths);
+
             // Preview positioned group + bed pair succeeds.
             let slot = PreviewSlot::new();
             assert_eq!(

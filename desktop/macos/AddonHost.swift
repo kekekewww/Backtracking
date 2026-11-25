@@ -947,6 +947,9 @@ final class AddonHostClient {
     func controlReply(call: AddonControlCall, result: AddonControlResult) {
         #if BACKTRACKING_CAPTURE_VERIFY
         verifyEvents.append("control_reply \(call.request_id) ok")
+        if let files = result.files {
+            verifyEvents.append("saved \(call.request_id) " + files.map { "\($0.kind):\($0.lane ?? "-")" }.joined(separator: ","))
+        }
         #endif
         let payload = ControlReplyPayload(
             addon_id: call.addon_id,
