@@ -29,6 +29,7 @@ enum Verify {
         try verifyMacCaptureRouting()
         try verifyMacOptions()
         try verifyMacTestCopyIsolation()
+        try verifyMacFlagDragKeepsRows()
         try verifyMacTerminationSaves()
         try verifyFrequencyColors()
         try verifyRecorderHotkeys()
@@ -38,7 +39,7 @@ enum Verify {
         try AddonHostClient.verifyTicketCompletions()
         try AddonHostClient.verifyControlGate()
         try verifyMacControlBatchSnapshotSync()
-        print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options, test-copy isolation, exit saves, hotkeys, row layout, silent channel tracking, theme, add-on host, ticket completions, control grant checks, control batch window sync, look readability and positions passed.")
+        print("macOS geometry, routes, quiet retention, aligned multi-source WAVs, frequency colors, Options, test-copy isolation, flag drags keeping rows, exit saves, hotkeys, row layout, silent channel tracking, theme, add-on host, ticket completions, control grant checks, control batch window sync, look readability and positions passed.")
     }
 
     static func verifyFrequencyColors() throws {

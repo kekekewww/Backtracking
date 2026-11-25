@@ -67,6 +67,12 @@ func verifyMacOptions() throws {
 }
 
 @MainActor
+func verifyMacFlagDragKeepsRows() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyFlagDragKeepsRows()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -2107,6 +2113,55 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         guard problems.isEmpty else {
             throw CaptureError("Control batch left the window behind the add-on host: " + problems.joined(separator: "; "))
+        }
+    }
+
+    /// Edit separately with three of six rows selected: moving the start flag sideways keeps those
+    /// rows (Windows starts row tracking only for a new selection).
+    static func verifyFlagDragKeepsRows() throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-flag-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        let view = WaveformView(frame: NSRect(x: 0, y: 0, width: 600, height: 300))
+        view.controller = controller
+        controller.waveform = view
+        defer { controller.waveform = nil }
+        let widths: [UInt32] = [2, 3]
+        view.verifyShow(rows: WaveformRow.layout(widths: widths, labels: [[], ["FL", "FR", "FC"]], stereo: false),
+                        laneWidths: widths, frames: 0..<48_000)
+        view.separateLanes = true
+        guard view.selectProgrammaticRows(firstLane: 0, firstRow: 0, lastLane: 1, lastRow: 1) else {
+            throw CaptureError("Flag verification could not choose rows")
+        }
+        view.applyProgrammaticSelection(12_000..<36_000)
+        let chosen = view.selectedRowsForExport
+        guard let chosen, chosen.count == 3, let press = view.verifyFlagPoint else {
+            throw CaptureError("Flag verification setup chose \(view.selectedRowsForExport ?? []) rows")
+        }
+        func mouse(_ type: NSEvent.EventType, _ point: NSPoint, _ modifiers: NSEvent.ModifierFlags = []) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: point, modifierFlags: modifiers, timestamp: 0, windowNumber: 0,
+                               context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        }
+        view.mouseDown(with: mouse(.leftMouseDown, press))
+        // Sideways and down into a channel row of lane B, as a hand does while moving a flag.
+        let moved = NSPoint(x: press.x + 40, y: 20)
+        view.mouseDragged(with: mouse(.leftMouseDragged, NSPoint(x: press.x + 20, y: press.y)))
+        let sideways = view.selectedRowsForExport
+        view.mouseDragged(with: mouse(.leftMouseDragged, moved))
+        view.mouseUp(with: mouse(.leftMouseUp, moved))
+        guard sideways == chosen, view.selectedRowsForExport == chosen, view.selectionForSaving()?.lowerBound != 12_000 else {
+            throw CaptureError("Moving the start flag changed the rows from \(chosen) to \(view.selectedRowsForExport ?? view.verifyRememberedRows) (selection \(String(describing: view.selectionForSaving())))")
+        }
+        // A new selection (Option-drag) still takes the rows it crosses.
+        let start = NSPoint(x: 300, y: 295)
+        view.mouseDown(with: mouse(.leftMouseDown, start, .option))
+        view.mouseDragged(with: mouse(.leftMouseDragged, NSPoint(x: 360, y: 20), .option))
+        view.mouseUp(with: mouse(.leftMouseUp, NSPoint(x: 360, y: 20), .option))
+        guard let crossed = view.selectedRowsForExport ?? (view.hasSelection ? view.verifyRememberedRows : nil),
+              crossed.count == 6 else {
+            throw CaptureError("A new selection across rows took \(view.selectedRowsForExport ?? []) rows")
         }
     }
 
@@ -7766,6 +7821,29 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
 }
 
+#if BACKTRACKING_CAPTURE_VERIFY
+extension WaveformView {
+    /// Shows `rows` over `frames` as if a read had just arrived.
+    func verifyShow(rows: [WaveformRow], laneWidths: [UInt32], frames: Range<UInt64>) {
+        requestedRows = rows
+        displayedRows = rows
+        displayedLaneCount = laneWidths.count
+        displayedLaneWidths = laneWidths
+        retainedFrames = frames
+        visibleFrames = frames
+        sampleRate = UInt32(SystemAudioTap.timelineRate)
+        recomputeRowLayout()
+    }
+
+    var verifyFlagPoint: NSPoint? {
+        guard let selection, let top = flagTopY() else { return nil }
+        return NSPoint(x: flagPosition(for: selection.lowerBound), y: top - 5)
+    }
+
+    var verifyRememberedRows: [RowIdentity] { rememberedRows }
+}
+#endif
+
 private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     weak var controller: BacktrackingController?
     var showsOverlay = true { didSet { needsDisplay = true } }
@@ -7905,6 +7983,9 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     private var selectionAnchorRow: RowIdentity?
     private var selectionCursorRow: RowIdentity?
     private var rememberedRows: [RowIdentity] = []
+    /// Only a new selection follows the pointer across rows; moving a flag keeps the rows it has
+    /// (Windows `Gesture::Select.rows` is `Some` only for a new selection).
+    private var selectionUpdatesRows = false
     private var dragRow: RowIdentity?
     private var waveformCursorActive = false
 
@@ -8866,7 +8947,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     }
 
     private func startEdgeAutoScrollIfNeeded(at point: NSPoint) {
-        guard anchor != nil else { stopEdgeAutoScroll(); return }
+        guard anchor != nil, selectionUpdatesRows else { stopEdgeAutoScroll(); return }
         let above = point.y > audioRect.maxY
         let below = point.y < audioRect.minY
         if above || below {
@@ -8888,7 +8969,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     }
 
     private func edgeAutoScrollTick() {
-        guard anchor != nil, let window else { stopEdgeAutoScroll(); return }
+        guard anchor != nil, selectionUpdatesRows, let window else { stopEdgeAutoScroll(); return }
         let screenPoint = NSEvent.mouseLocation
         let windowPoint = window.convertPoint(fromScreen: screenPoint)
         let local = convert(windowPoint, from: nil)
@@ -8983,6 +9064,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             let edge = min(max(flag, retainedFrames.lowerBound), retainedFrames.upperBound)
             let other = flag == flags.lowerBound ? flags.upperBound : flags.lowerBound
             let opposite = min(max(other, retainedFrames.lowerBound), retainedFrames.upperBound)
+            selectionUpdatesRows = false
             if selection == nil {
                 if !markerRows.isEmpty {
                     rememberedRows = markerRows
@@ -9010,10 +9092,12 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             selectionPressX = position.x
             selectionMoved = false
             selection = anchor.map { $0..<$0 }
+            selectionUpdatesRows = false
             if let r = rowIdentity(at: position) {
                 selectionAnchorRow = r
                 selectionCursorRow = r
                 rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: r, cursor: r)
+                selectionUpdatesRows = true
             }
             updateWaveformCursor()
             needsDisplay = true
@@ -9063,7 +9147,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 let position = frame(at: event)
                 selection = min(anchor, position)..<max(anchor, position)
             }
-            if let anchorRow = selectionAnchorRow, let nextRow = rowIdentity(at: local, clampedToVisible: true) {
+            if selectionUpdatesRows, let anchorRow = selectionAnchorRow,
+               let nextRow = rowIdentity(at: local, clampedToVisible: true) {
                 selectionCursorRow = nextRow
                 rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: anchorRow, cursor: nextRow)
             }
@@ -9112,6 +9197,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         if anchor != nil {
             mouseDragged(with: event)
             anchor = nil
+            selectionUpdatesRows = false
             // Package 5: require at least 2px horizontal movement and non-empty span to keep selection.
             keepSelection = selectionMoved && hasSelection
             selectionPressX = nil
