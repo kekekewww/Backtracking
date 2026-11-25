@@ -66,9 +66,14 @@ pub unsafe extern "C" fn bt_addon_string_free(p: *mut c_char) {
     }
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn bt_addon_host_shutdown(h: *mut BtAddonHost, timeout_ms: u32) -> bool {
+    unsafe { h.as_ref() }
+        .is_some_and(|host| host.shutdown(std::time::Duration::from_millis(u64::from(timeout_ms))))
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bt_addon_host_free(h: *mut BtAddonHost) {
     if !h.is_null() {
-        unsafe { Box::from_raw(h) }.close();
+        drop(unsafe { Box::from_raw(h) });
     }
 }
 

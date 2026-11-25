@@ -1,6 +1,6 @@
 //! Line-oriented C ABI test driver. Pass an absolute root and optional "secondary".
 //! Read one JSON document per line. Commands wait for completion; {"op":"snapshot"}
-//! reads the current publication. EOF releases the handle. {"op":"close"} explicitly
+//! reads the current publication. EOF waits up to 2500 ms for shutdown, then releases the handle. {"op":"close"} explicitly
 //! frees the handle and reports the elapsed milliseconds without exiting the driver.
 #[cfg(unix)]
 mod unix {
@@ -44,6 +44,20 @@ mod unix {
                 unsafe { bt_addon_host_free(host) };
                 host = std::ptr::null_mut();
                 json!({"schema":1,"ok":true,"value":{"elapsed_ms":started.elapsed().as_secs_f64()*1000.0}})
+            } else if value["op"] == "shutdown" {
+                let Some(ms) = value["timeout_ms"]
+                    .as_u64()
+                    .and_then(|ms| u32::try_from(ms).ok())
+                else {
+                    println!(
+                        "{}",
+                        json!({"schema":1,"ok":false,"code":"invalid_request","message":"Expected uint32 timeout_ms"})
+                    );
+                    continue;
+                };
+                let started = Instant::now();
+                let done = unsafe { bt_addon_host_shutdown(host, ms) };
+                json!({"schema":1,"ok":true,"value":{"done":done,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0}})
             } else if value["op"] == "snapshot" {
                 decode(unsafe { bt_addon_host_snapshot(host) })
             } else {
@@ -64,7 +78,10 @@ mod unix {
             }
             println!("{result}");
         }
-        unsafe { bt_addon_host_free(host) }
+        unsafe {
+            bt_addon_host_shutdown(host, 2500);
+            bt_addon_host_free(host);
+        }
     }
 }
 #[cfg(unix)]

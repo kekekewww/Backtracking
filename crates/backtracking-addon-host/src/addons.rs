@@ -516,16 +516,19 @@ impl AddonManager {
         let (commands, receive) = mpsc::channel();
         let shared = Arc::new(Shared::default());
         let worker_state = Worker::new(data_root.clone(), host, shared.clone())?;
+        let handle = AddonHandle { commands, shared };
+        // Publish the bridge before launching any enabled add-on. If startup
+        // fails, there is no running process to outlive the failed host.
+        let bridge = bridge::Bridge::start(&data_root, handle.clone())?;
         let worker = thread::Builder::new()
             .name("add-on host".into())
             .spawn(move || worker_state.run(receive))
             .map_err(|e| e.to_string())?;
-        let mut manager = Self {
-            handle: AddonHandle { commands, shared },
+        let manager = Self {
+            handle,
             worker: Some(worker),
-            bridge: None,
+            bridge: Some(bridge),
         };
-        manager.bridge = Some(bridge::Bridge::start(&data_root, manager.handle())?);
         Ok(manager)
     }
 
@@ -538,30 +541,23 @@ impl AddonManager {
         self.handle.clone()
     }
 
-    pub(super) fn close(&mut self, deadline: Instant) {
-        let Some(worker) = self.worker.take() else {
-            return;
-        };
-        let primary = self.bridge.is_some();
-        // Stop children while the bridge is closing. Both share the caller's deadline.
-        let (files_only, cleanup) = mpsc::channel();
-        let _ = self.handle.commands.send(Command::Shutdown {
-            deadline,
-            files_only,
-        });
+    pub(super) fn stop_worker(&mut self, deadline: Instant) -> Option<JoinHandle<()>> {
+        let worker = self.worker.take()?;
+        let _ = self.handle.commands.send(Command::Shutdown(deadline));
         self.bridge.take();
-        if primary {
-            // Disconnection means the process worker exited. An explicit message
-            // means all process groups are gone but a package transaction is
-            // still using the primary lease and must finish consistently.
-            if cleanup.recv().is_err() {
+        Some(worker)
+    }
+
+    fn close(&mut self, deadline: Instant) {
+        if let Some(worker) = self.stop_worker(deadline) {
+            // Internal fallback (including partially constructed managers).
+            // File tasks retain their lease until they finish.
+            while !worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(POLL_INTERVAL);
+            }
+            if worker.is_finished() {
                 let _ = worker.join();
             }
-        } else if matches!(
-            cleanup.recv_timeout(deadline.saturating_duration_since(Instant::now())),
-            Err(mpsc::RecvTimeoutError::Disconnected)
-        ) {
-            let _ = worker.join();
         }
     }
 }
@@ -588,10 +584,7 @@ enum Command {
         run: u64,
         reply: ControlReply,
     },
-    Shutdown {
-        deadline: Instant,
-        files_only: mpsc::Sender<()>,
-    },
+    Shutdown(Instant),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -757,7 +750,6 @@ struct Worker {
     inspections: Vec<PendingInspection>,
     operations: Vec<Operation>,
     shutting_down: bool,
-    closing: Option<(Instant, mpsc::Sender<()>)>,
     runs: u64,
 }
 
@@ -798,7 +790,6 @@ impl Worker {
             inspections: Vec::new(),
             operations: Vec::new(),
             shutting_down: false,
-            closing: None,
             runs: 0,
         })
     }
@@ -833,19 +824,12 @@ impl Worker {
             self.poll();
             self.advance_operations();
             self.publish();
-            if self.shutting_down && self.entries.values().all(|entry| entry.runtime.is_none()) {
-                if self.operations.is_empty() && self.inspections.is_empty() {
-                    break;
-                }
-                if self
-                    .closing
-                    .as_ref()
-                    .is_some_and(|(deadline, _)| Instant::now() >= *deadline)
-                {
-                    if let Some((_, files_only)) = self.closing.take() {
-                        let _ = files_only.send(());
-                    }
-                }
+            if self.shutting_down
+                && self.entries.values().all(|entry| entry.runtime.is_none())
+                && self.operations.is_empty()
+                && self.inspections.is_empty()
+            {
+                break;
             }
         }
     }
@@ -865,7 +849,7 @@ impl Worker {
     }
 
     fn command(&mut self, command: Command) {
-        if self.shutting_down && !matches!(command, Command::Shutdown { .. }) {
+        if self.shutting_down && !matches!(command, Command::Shutdown(_)) {
             reject_command(command, "The add-on manager is shutting down");
             return;
         }
@@ -1026,13 +1010,7 @@ impl Worker {
                     }
                 }
             }
-            Command::Shutdown {
-                deadline,
-                files_only,
-            } => {
-                self.shutdown(deadline);
-                self.closing = Some((deadline, files_only));
-            }
+            Command::Shutdown(deadline) => self.shutdown(deadline),
         }
     }
 
@@ -1957,7 +1935,7 @@ fn reject_command(command: Command, reason: &str) {
         | Command::ControlAllowed(_, _, reply) => {
             let _ = reply.send(Err(reason.into()));
         }
-        Command::ControlReply { .. } | Command::Shutdown { .. } => {}
+        Command::ControlReply { .. } | Command::Shutdown(_) => {}
     }
 }
 

@@ -10,12 +10,23 @@ Each handle owns an independent worker. Primary owns the data root, secondary pr
 the primary. Supply the absolute root and app version at creation. Compare generations
 for inequality, then read the snapshot. The generation embedded in the snapshot is
 the one to remember. Poll control and positions independently of snapshot changes.
-Free is synchronous. It closes the command channel and joins the host API worker.
-The primary sends quit to all add-ons with one shared two-second grace period and
-terminates remaining process groups before returning. The secondary releases its proxy.
-The host reserves the final 50 ms of the two-second budget for reaping and joining.
-An existing filesystem transaction can retain the primary lease until it has finished.
-Callers must synchronize final release with all calls on that handle. Release each returned JSON string using bt_addon_string_free.
+The first shutdown request starts background cleanup. A primary sends quit to
+all its add-ons and terminates remaining groups after a shared two-second grace
+period. A secondary closes its own proxy. A package transaction in progress
+can retain its primary lease while it finishes.
+
+`bt_addon_host_shutdown(host, timeout_ms)` waits up to the caller's time budget.
+It returns true when the host worker has finished cleanup, or false on timeout
+or a null handle. Zero initiates shutdown and checks completion immediately.
+Concurrent and repeated shutdown calls share the same cleanup, each with its
+own wait budget. Timing out leaves cleanup running. Stop submitting commands
+when shutdown begins. New commands then return the failed envelope.
+
+`bt_addon_host_free(host)` releases the handle and starts shutdown if needed.
+It returns without waiting for cleanup. Release each handle once after concurrent
+calls have returned. At application termination, call
+`bt_addon_host_shutdown(host, 2500)` followed by `bt_addon_host_free(host)`
+regardless of the result. Release each returned JSON string with bt_addon_string_free.
 
 ## Snapshot
 All top-level JSON documents have integer schema 1. The snapshot has generation (u64),
@@ -119,7 +130,10 @@ bt-addon-cli takes an absolute data root followed by optional secondary. It acce
 one command object per line, fills schema=1, and polls tickets to completion. Send
 {"op":"snapshot"} to read current state. Inspect and install require a package path.
 Use the review_id returned by inspect in install. A fresh install needs set_enabled
-or start. The lifecycle test demonstrates the complete sequence.
+or start. Send {"op":"shutdown","timeout_ms":2500} to measure a timed wait, or
+{"op":"close"} to measure free while the driver process stays alive. EOF requests a
+2500 ms shutdown before releasing a live handle. The lifecycle test demonstrates
+the complete sequence.
 
 bt-seed-profile takes a new absolute root under an existing test folder. The backend
 seed uses BACKTRACKING_TEST_ADDONS (tone, tone-opens, quits, broken, atmos, theme,

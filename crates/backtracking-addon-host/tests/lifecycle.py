@@ -227,8 +227,8 @@ def crash_checks(host, root, work):
     print(f"10 s hello timeout, three crashes, {elapsed:.3f} s stop, SIGKILL cleanup {(time.monotonic()-start)*1000:.1f} ms")
 
 
-def close_active_host(work, env, agent):
-    root = work / "closing"
+def close_active_host(work, env, agent, wait):
+    root = work / ("shutdown" if wait else "free")
     with process([BIN / "bt-addon-cli", root], env) as proc:
         host = Host(proc)
         eventually(lambda: host.call("snapshot")["ready"])
@@ -248,15 +248,37 @@ def close_active_host(work, env, agent):
             pidfile = root / "addon-data" / addon / "child.pid"
             pids.append(eventually(lambda: host.addon(addon)["pid"]))
             pids.append(eventually(lambda: int(pidfile.read_text()) if pidfile.exists() and pidfile.stat().st_size else None))
-        elapsed = host.call("close")["elapsed_ms"] / 1000
-        assert 1.8 <= elapsed <= 2.0, elapsed
+        if wait:
+            with process([BIN / "bt-addon-cli", root, "secondary"], env) as secondary:
+                proxy = Host(secondary)
+                eventually(lambda: proxy.call("snapshot")["ready"])
+                assert proxy.call("shutdown", timeout_ms=2500)["done"]
+            assert all(not dead(pid) for pid in pids)
+            poll = host.call("shutdown", timeout_ms=0)
+            assert not poll["done"] and poll["elapsed_ms"] < 100, poll
+            short = host.call("shutdown", timeout_ms=40)
+            assert not short["done"] and 35 <= short["elapsed_ms"] < 150, short
+            assert all(not dead(pid) for pid in pids)
+            send(proc, {"op": "take_control"})
+            assert receive(proc)["code"] == "failed"
+            full = host.call("shutdown", timeout_ms=2500)
+            assert full["done"] and 1750 < full["elapsed_ms"] < 2500, full
+            assert all(dead(pid) for pid in pids)
+            assert host.call("shutdown", timeout_ms=0)["done"]
+            print(f"Shutdown calls: zero {poll['elapsed_ms']:.2f} ms, "
+                  f"timeout {short['elapsed_ms']:.2f} ms, completed {full['elapsed_ms']:.2f} ms")
+        free_ms = host.call("close")["elapsed_ms"]
+        assert free_ms < 100, free_ms
         assert proc.poll() is None, "check cleanup while the host process is still alive"
-        assert all(dead(pid) for pid in pids)
+        if not wait:
+            assert all(not dead(pid) for pid in pids), "free unexpectedly waited for cleanup"
+            eventually(lambda: all(dead(pid) for pid in pids), timeout=3)
         assert not (root / "addon-host-endpoint-v1.json").exists()
         if endpoint:
             assert not endpoint.exists()
-        print(f"Synchronous free: two groups reaped in {elapsed:.3f} s, host endpoint removed"
-              + (", Agent endpoint removed" if endpoint else ""))
+        print(f"Free after {'shutdown' if wait else 'no prior shutdown'}: {free_ms:.3f} ms; "
+              "two groups gone, host endpoint removed" + (", Agent endpoint removed" if endpoint else ""))
+
 
 
 if __name__=="__main__":
@@ -274,4 +296,5 @@ if __name__=="__main__":
             if opts.agent:
                 agent_flow(host,root,opts.agent.resolve(),env)
             crash_checks(host,root,work)
-        close_active_host(work, env, opts.agent)
+        close_active_host(work, env, opts.agent, wait=True)
+        close_active_host(work, env, opts.agent, wait=False)

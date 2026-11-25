@@ -361,7 +361,7 @@ fn proxy(root: PathBuf, receiver: mpsc::Receiver<Command>, shared: Arc<Shared>) 
             wait = wait.min(Duration::from_millis(10));
         }
         match receiver.recv_timeout(wait) {
-            Ok(Command::Shutdown { .. }) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(Command::Shutdown(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(command) => {
                 if pending.len() + queued.len() >= MAX_PROXY_COMMANDS {
                     reject(command, "Too many add-on commands are pending".into());
@@ -508,7 +508,7 @@ fn forward(root: &Path, command: Command, stopping: &AtomicBool) {
             ));
         }
         // Control requests are carried out by the primary window, which answers them itself.
-        Command::ControlReply { .. } | Command::Shutdown { .. } => {}
+        Command::ControlReply { .. } | Command::Shutdown(_) => {}
     }
 }
 
@@ -530,7 +530,7 @@ fn reject(command: Command, error: String) {
         | Command::ControlAllowed(_, _, reply) => {
             let _ = reply.send(Err(error));
         }
-        Command::ControlReply { .. } | Command::Shutdown { .. } => {}
+        Command::ControlReply { .. } | Command::Shutdown(_) => {}
     }
 }
 

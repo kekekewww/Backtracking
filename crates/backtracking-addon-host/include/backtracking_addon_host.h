@@ -1,6 +1,7 @@
 #ifndef BACKTRACKING_ADDON_HOST_H
 #define BACKTRACKING_ADDON_HOST_H
 #include <stdint.h>
+#include <stdbool.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -14,9 +15,12 @@ char *bt_addon_host_snapshot(const BtAddonHost *host);
 char *bt_addon_host_command(const BtAddonHost *host, const char *command_json);
 /* Pass each non-null returned string exactly once. */
 void bt_addon_string_free(char *value);
-/* Finish all concurrent calls before free. Synchronously joins the API worker.
-   Primary sends quit, grants all children a shared two seconds, and terminates
-   remaining process groups. Secondary releases only its own proxy. */
+/* Start shutdown once. Wait up to timeout_ms, or poll with zero. True when
+   cleanup has finished, false on timeout or NULL. Safe to call again.
+   Shutdown leaves the handle allocated. */
+bool bt_addon_host_shutdown(BtAddonHost *host, uint32_t timeout_ms);
+/* Release once, after all concurrent calls have returned. Starts background
+   shutdown if needed and returns without waiting. NULL is accepted. */
 void bt_addon_host_free(BtAddonHost *host);
 #ifdef __cplusplus
 }
