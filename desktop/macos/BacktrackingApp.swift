@@ -467,7 +467,16 @@ private final class OptionsPopUpButton: NSPopUpButton, NSTableViewDataSource, NS
 
     /// Every list that has opened, so a window can ask whether any is open now, whichever it is.
     private static let opened = NSHashTable<OptionsPopUpButton>.weakObjects()
-    static var anyChoicePopoverShown: Bool { opened.allObjects.contains(where: \.isChoicePopoverShown) }
+    static var anyChoicePopoverShown: Bool {
+        #if BACKTRACKING_CAPTURE_VERIFY
+        if let verifyShown { return verifyShown }
+        #endif
+        return opened.allObjects.contains(where: \.isChoicePopoverShown)
+    }
+    #if BACKTRACKING_CAPTURE_VERIFY
+    /// Stands in for a list a verification cannot open.
+    static var verifyShown: Bool?
+    #endif
 
     func reloadChoicesIfOpen() {
         guard choicePopover?.isShown == true, let table = choiceTable else { return }
@@ -1912,11 +1921,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var pendingLookControlsRebuild = false
     private var selectFreezeWaits: [(AddonControlCall, TimeInterval)] = []
     private var pendingAddonsTabReload = false
+    private var pendingSourcesTabRebuild = false
     #if BACKTRACKING_CAPTURE_VERIFY
     /// Stand-ins for the Options window, which a verification does not open.
     private var verifyOptionsPage: String?
     private var verifyEditingText: Bool?
     private var verifyAddonsTabReloads = 0
+    private var verifySourcesTabRebuilds = 0
+    private var verifyLookControlRebuilds = 0
     #endif
     /// The window's editing freezes still in flight, oldest first; `pendingSnapshots` wait for them.
     private var editingFreezeReads: [EditingMaterialRead] = []
@@ -2720,6 +2732,41 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         controller.syncAddonSnapshotUI()
         guard whileTyping == 0, controller.verifyAddonsTabReloads == 1, !controller.pendingAddonsTabReload else {
             throw CaptureError("Add-ons page reloaded \(whileTyping) times while typing and \(controller.verifyAddonsTabReloads) after")
+        }
+
+        // An Options list (a popover) is open: neither the Add-ons nor the Sources page is rebuilt
+        // under it, nor the look controls; once it closes, the next pass rebuilds each once.
+        OptionsPopUpButton.verifyShown = true
+        defer { OptionsPopUpButton.verifyShown = nil }
+        controller.verifyAddonsTabReloads = 0
+        receive(enabled: true)
+        let reloadsUnderList = controller.verifyAddonsTabReloads
+        let addonsPending = controller.pendingAddonsTabReload
+        controller.verifyOptionsPage = "Sources"
+        func receiveSource(_ format: String) {
+            generation += 1
+            let source = AddonSource(id: "main", name: "Main", sender: "s", formats: [], format: format, groups: nil, transport: nil)
+            let addon = AddonRecord(id: "verify.page", manifest: nil, enabled: true, state: "running", reason: nil,
+                pid: nil, message: nil, sources: [source], settings: [], actions: [], control_allowed: false, control_asked: false)
+            let look = AddonAppearance(colors: [:], numbers: [:], rows: [:], spectrum: [
+                AddonSpectrumStop(color: "#ff8800", position: 0), AddonSpectrumStop(color: format == "a" ? "#2c68ec" : "#22cc66", position: 1)])
+            host.verifyReceive(AddonSnapshot(schema: 1, generation: generation, ready: true, error: nil,
+                                             addons: [addon], appearances: ["verify.page": look], completed: []))
+            controller.syncAddonSnapshotUI()
+        }
+        controller.selectedLookAddonID = "verify.page"
+        controller.verifyLookControlRebuilds = 0
+        receiveSource("a")
+        receiveSource("b")
+        let sourcesUnderList = controller.verifySourcesTabRebuilds
+        let lookUnderList = controller.verifyLookControlRebuilds
+        let pending = (controller.pendingSourcesTabRebuild, controller.pendingLookControlsRebuild)
+        OptionsPopUpButton.verifyShown = false
+        controller.syncAddonSnapshotUI()
+        controller.syncAddonSnapshotUI()
+        guard reloadsUnderList == 0, addonsPending, sourcesUnderList == 0, lookUnderList == 0, pending == (true, true),
+              controller.verifySourcesTabRebuilds == 1, controller.verifyLookControlRebuilds == 1 else {
+            throw CaptureError("Under an open list: Add-ons \(reloadsUnderList) (pending \(addonsPending)), Sources \(sourcesUnderList), look \(lookUnderList), pending \(pending); after: Sources \(controller.verifySourcesTabRebuilds), look \(controller.verifyLookControlRebuilds)")
         }
     }
 
@@ -7092,8 +7139,19 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     /// A menu is open or a mouse button is down in this app; controls are not swapped under it.
+    /// A menu or an Options list is open, or a mouse button is down; controls are not swapped then.
+    /// An Options list is a popover, which leaves the run loop in its default mode once the button is up.
     private var userIsHandlingControls: Bool {
         RunLoop.current.currentMode == .eventTracking || NSEvent.pressedMouseButtons != 0
+            || OptionsPopUpButton.anyChoicePopoverShown
+    }
+
+    private func rebuildSourcesTab() {
+        #if BACKTRACKING_CAPTURE_VERIFY
+        verifySourcesTabRebuilds += 1
+        #endif
+        replaceOptionsTab(with: makeSourceTab())
+        refreshSourceOptions()
     }
 
     /// Whether the Options window is on show at page `label`.
@@ -7121,6 +7179,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             if pendingLookControlsRebuild {
                 pendingLookControlsRebuild = false
                 recomputeLook(refreshAppearanceTab: true)
+            }
+            if pendingSourcesTabRebuild {
+                pendingSourcesTabRebuild = false
+                if optionsPageShown("Sources") { rebuildSourcesTab() }
             }
         }
         if pendingAddonsTabReload {
@@ -7173,8 +7235,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                     }
                 }
                 if sourcesStructureChanged {
-                    replaceOptionsTab(with: makeSourceTab())
-                    refreshSourceOptions()
+                    if userIsHandlingControls {
+                        pendingSourcesTabRebuild = true
+                    } else {
+                        rebuildSourcesTab()
+                    }
                 } else {
                     refreshAddonTransportControls()
                 }
@@ -7318,6 +7383,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         lookBorderWidthNote?.isHidden = nextLook.borderWidth == nil
         updateBackground()
         if refreshAppearanceTab {
+            #if BACKTRACKING_CAPTURE_VERIFY
+            verifyLookControlRebuilds += 1
+            #endif
             refreshLookAddonPopup()
             refreshFrequencyGradientControls()
         }
