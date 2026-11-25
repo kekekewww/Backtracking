@@ -1303,6 +1303,26 @@ final class SystemAudioTap {
     /// The channels of the lanes that start; a lane past the limit holds none (Windows `track_channels`).
     var totalChannelCount: UInt32 { Self.channelsInUse(widths: widths, capErrors: laneCapErrors) }
 
+    /// Channels the capture core holds for sources that cannot start: one each (Windows holds none).
+    var channelsKeptForRefusedLanes: UInt32 { UInt32(laneCapErrors.filter { $0 != nil }.count) }
+
+    /// The Sources page's count, in English and Traditional Chinese: the channels in use, and the
+    /// ones kept for sources that cannot start, which count toward the 64 too.
+    nonisolated static func channelsInUseNote(used: UInt32, kept: UInt32) -> String {
+        guard kept > 0 else { return "\(used) of 64 channels in use / 已使用 \(used) 個聲道，上限 64 個" }
+        return "\(used) of 64 channels in use, and \(kept) kept for sources that cannot start / 已使用 \(used) 個聲道，另有 \(kept) 個保留給無法開始的來源，上限 64 個"
+    }
+
+    /// Why source `lane` cannot be added or changed: the sources would hold `total` channels,
+    /// `kept` of them one for each source that cannot start.
+    nonisolated static func addRefusal(lane: Int, total: UInt32, kept: UInt32) -> String {
+        let letter = captureLaneLetter(lane)
+        guard kept > 0 else {
+            return "Source \(letter) would bring the total to \(total) channels. The limit is 64. / 來源 \(letter) 會使總數變成 \(total) 個聲道，上限為 64。"
+        }
+        return "Source \(letter) would bring the total to \(total) channels, with one channel kept for each source that cannot start. The limit is 64. / 來源 \(letter) 會使總數變成 \(total) 個聲道（每個無法開始的來源保留 1 個），上限為 64。"
+    }
+
     nonisolated static func channelsInUse(widths: [UInt32], capErrors: [String?]) -> UInt32 {
         zip(widths, capErrors).reduce(0) { $0 + ($1.1 == nil ? $1.0 : 0) }
     }

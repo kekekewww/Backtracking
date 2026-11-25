@@ -187,6 +187,12 @@ func verifyMacHiddenPagesCatchUp() throws {
 }
 
 @MainActor
+func verifyMacChannelCountsAgree() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyChannelCountsAgree()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -2479,6 +2485,29 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let entered = lastShown >= 2 ? RowIdentity.channel(lane: 1, index: lastShown - 2) : nil
         guard first.count == 2, first[1] == 1, let entered, rows.last == entered, rows.first == .whole(lane: 0) else {
             throw CaptureError("Dragging past B's bottom scrolled lanes to \(first) and chose \(rows)")
+        }
+    }
+
+    /// N5: the count on the Sources page, the check before adding a source, and its message agree,
+    /// a source that cannot start counting the one channel kept for it.
+    static func verifyChannelCountsAgree() throws {
+        let note = SystemAudioTap.channelsInUseNote(used: 62, kept: 1)
+        let refusal = SystemAudioTap.addRefusal(lane: 7, total: 65, kept: 1)
+        // The real check: 31 stereo sources hold 62; an eight-channel lane would bring 70.
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-counts-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        let lanes = (0..<32).map { CaptureLane(source: .addon(addonID: "verify.counts", sourceID: "s\($0)"), route: .merged) }
+        controller.captureLanes = lanes
+        controller.tap = try SystemAudioTap(history: 10, lanes: lanes)
+        defer { controller.tap = nil }
+        let refused = !controller.canConfigure(CaptureLane(source: .addon(addonID: "verify.counts", sourceID: "more"), route: .merged), at: 32)
+        guard note.hasPrefix("62 of 64 channels in use, and 1 kept for sources that cannot start / "),
+              refusal.hasPrefix("Source H would bring the total to 65 channels, with one channel kept for each source that cannot start. The limit is 64. / "),
+              refused, controller.notice == "Source AG would bring the total to 66 channels. The limit is 64." else {
+            throw CaptureError("Channel counts: note \(note), refusal \(refusal), refused \(refused), notice \(controller.notice ?? "-")")
         }
     }
 
@@ -5340,8 +5369,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let channels = tap.totalChannelCount
         let shortNote = kept < history ? "With \(channels) channels, memory holds the latest \(kept) seconds." : nil
         sourcesCapacityNote?.isHidden = false
-        sourcesCapacityNote?.stringValue = ["\(channels) of 64 channels in use", shortNote].compactMap { $0 }.joined(separator: ". ")
-        sourcesChannelsFullNote?.isHidden = !(channels >= 64 && captureLanes.count < maximumCaptureLanes)
+        let keptChannels = tap.channelsKeptForRefusedLanes
+        sourcesCapacityNote?.stringValue = [localizedBilingual(SystemAudioTap.channelsInUseNote(used: channels, kept: keptChannels)), shortNote]
+            .compactMap { $0 }.joined(separator: ". ")
+        sourcesChannelsFullNote?.isHidden = !(channels + keptChannels >= 64 && captureLanes.count < maximumCaptureLanes)
         captureCapacityNote?.isHidden = shortNote == nil
         captureCapacityNote?.stringValue = shortNote ?? ""
     }
@@ -5449,8 +5480,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         if widths.indices.contains(index) { widths[index] = width }
         else { widths.append(width) }
         let count = widths.reduce(0, +)
+        // A source that cannot start keeps one channel (its width here is 1), so the count and the
+        // Sources page's note agree.
+        let kept = (0..<captureLanes.count).filter { $0 != index && tap?.sourceProblem(for: $0)?.contains("cannot start") == true }.count
         guard count <= 64 else {
-            setNotice("Source \(captureLaneLetter(index)) would bring the total to \(count) channels. The limit is 64.")
+            setNotice(localizedBilingual(SystemAudioTap.addRefusal(lane: index, total: count, kept: UInt32(kept))))
             refreshSourceOptions()
             return false
         }

@@ -58,6 +58,7 @@ enum Verify {
         try verifyMacChipToolTips()
         try verifyMacCrossSourceEdgeScroll()
         try verifyMacChannelLimit()
+        try verifyMacChannelCountsAgree()
         try verifyMacChannelLimitCaptureOpens()
         try verifyMacLookGradient()
         try verifyMacControlPauseHolds()
