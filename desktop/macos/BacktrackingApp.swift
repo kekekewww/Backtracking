@@ -151,6 +151,12 @@ func verifyMacSavedFileLanes() throws {
 }
 
 @MainActor
+func verifyMacRowsAcrossGroups() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyRowsAcrossGroupsAndActivity()
+}
+
+@MainActor
 func verifyMacTestCopyIsolation() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTestCopyIsolation()
@@ -1253,11 +1259,39 @@ private final class WAVExport: @unchecked Sendable {
         return (UInt32(s.0), UInt32(s.1), s.2 ? 1 : 0, UInt32(b.0), UInt32(b.1))
     }
 
+    /// Where each of lane `lane`'s groups lies, in order.
+    private func groupSpans(for lane: Int, width: Int) -> [(range: Range<Int>, positioned: Bool)] {
+        guard channelGroups.indices.contains(lane) else { return [] }
+        var offset = 0
+        return channelGroups[lane].compactMap { group in
+            let range = offset..<(offset + group.channels.count)
+            offset = range.upperBound
+            return range.upperBound <= width && !range.isEmpty ? (range, group.positioned) : nil
+        }
+    }
+
+    /// The group chosen channel rows are written or played with, whatever group is on show now
+    /// (Windows `lane_write`, `preview_plan`). Export names them by the objects when any row is an
+    /// object, else by the group that holds them; preview plays the group that holds every one.
+    /// nil when no group fits (preview then plays the pair).
+    private func groupHolding(_ channels: [Int], lane: Int, width: Int, forPreview: Bool) -> (range: Range<Int>, positioned: Bool)? {
+        let spans = groupSpans(for: lane, width: width)
+        guard !spans.isEmpty, !channels.isEmpty else { return nil }
+        if forPreview {
+            return spans.first { span in channels.allSatisfy { span.range.contains($0) } }
+        }
+        let holding = { (objects: Bool) in
+            spans.first { $0.positioned == objects && channels.contains(where: $0.range.contains) }
+        }
+        return holding(true) ?? holding(false)
+    }
+
     private func buildGroupSelectionLanes(
         names: [String],
         selectedRows: [RowIdentity]?,
         hideSilentLanes: Set<Int>,
-        shownGroupIDs: [String?]
+        shownGroupIDs: [String?],
+        forPreview: Bool = false
     ) -> (lanes: [BtFrozenGroupSelectionLane], sources: [UnsafeMutablePointer<CChar>?], labels: [UnsafeMutablePointer<CChar>?]) {
         var lanes: [BtFrozenGroupSelectionLane] = []
         var sources: [UnsafeMutablePointer<CChar>?] = []
@@ -1267,26 +1301,39 @@ private final class WAVExport: @unchecked Sendable {
             let width = widths.indices.contains(index) ? Int(widths[index]) : 0
             let laneLabels = channelNames.indices.contains(index) ? channelNames[index] : []
             let preferredID = shownGroupIDs.indices.contains(index) ? shownGroupIDs[index] : nil
-            let gb = resolvedGroupBounds(for: index, width: width, preferredID: preferredID)
+            var gb = resolvedGroupBounds(for: index, width: width, preferredID: preferredID)
             let hasBed = (gb.shownCount == 0 && width > 2) || gb.bedCount > 0
             var maskValid: UInt32 = 0
             var mask: UInt64 = 0
             var includePair: UInt32 = (width > 2 && hasBed) ? 1 : 0
+            let forLane = selectedRows?.filter { $0.lane == index } ?? []
+            // A wide lane chosen whole is written as it is shown, with rows that came or went since.
+            let laneWhole = selectedRows?.isEmpty != false || (width > 2 && forLane.contains(.whole(lane: index)))
 
-            if let selectedRows, !selectedRows.isEmpty {
-                let forLane = selectedRows.filter { $0.lane == index }
+            if !laneWhole {
                 if forLane.isEmpty { continue }
                 if width > 2 {
                     let hasPair = forLane.contains(where: \.isPair)
-                    var channelMask: UInt64 = 0
+                    var channels: [Int] = []
                     for row in forLane {
-                        if case .channel(_, let ch) = row, ch < 64 {
-                            channelMask |= (1 << UInt64(ch))
-                        }
+                        if case .channel(_, let ch) = row, ch < 64, ch < width { channels.append(ch) }
                     }
+                    var channelMask: UInt64 = 0
+                    for ch in channels { channelMask |= (1 << UInt64(ch)) }
                     includePair = (hasPair && hasBed) ? 1 : 0
                     maskValid = 1
                     mask = channelMask
+                    if !channels.isEmpty {
+                        if let holding = groupHolding(channels, lane: index, width: width, forPreview: forPreview) {
+                            gb.shownStart = UInt32(holding.range.lowerBound)
+                            gb.shownCount = UInt32(holding.range.count)
+                            gb.shownPositioned = holding.positioned ? 1 : 0
+                        } else if forPreview, hasBed {
+                            // Rows of two groups at once play the pair.
+                            mask = 0
+                            includePair = 1
+                        }
+                    }
                 } else if width == 2 {
                     var sideMask: UInt64 = 0
                     var whole = false
@@ -1303,6 +1350,7 @@ private final class WAVExport: @unchecked Sendable {
                     }
                 }
             } else if width > 2, hideSilentLanes.contains(index), gb.shownCount == 0 {
+                // Whole lane (no rows chosen, or the lane chosen whole).
                 // Whole-lane export with hide-silent: export only active channels in this frozen copy + L/R pair.
                 let activeMask = activeChannels(for: index)
                 let shown = ChannelActivityTracker.shownChannels(width: width, labels: laneLabels, activeMask: activeMask)
@@ -1340,7 +1388,8 @@ private final class WAVExport: @unchecked Sendable {
               selectedRows: [RowIdentity]?, hideSilentLanes: Set<Int>, pairBinaural: Bool,
               shownGroupIDs: [String?] = []) -> String? {
         let built = buildGroupSelectionLanes(
-            names: [], selectedRows: selectedRows, hideSilentLanes: hideSilentLanes, shownGroupIDs: shownGroupIDs
+            names: [], selectedRows: selectedRows, hideSilentLanes: hideSilentLanes, shownGroupIDs: shownGroupIDs,
+            forPreview: true
         )
         defer {
             for s in built.sources { free(s) }
@@ -2433,6 +2482,97 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard files.count == 2, Set(files.compactMap(\.lane)) == ["A", "B"], !named.contains(false) else {
             throw CaptureError("Saved files carry lanes \(files.map { "\($0.lane ?? "-") \(URL(fileURLWithPath: $0.path).lastPathComponent)" })")
         }
+    }
+
+    /// Rows chosen in one channel group keep their identity when another group is shown, and are
+    /// still what is written, named by their own group; a lane held whole takes a row that starts
+    /// sounding later, and is written whole (Windows `carry_rows`, `lanes_chosen_whole`, `lane_write`).
+    static func verifyRowsAcrossGroupsAndActivity() throws {
+        let controller = BacktrackingController()
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-groups-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        let bed = AddonChannelGroup(id: "bed", label: "Bed", channels: ["FL", "FR", "FC"], positioned: false)
+        let objects = AddonChannelGroup(id: "objects", label: "Objects", channels: ["Object 1", "Object 2"], positioned: true)
+        let labels = ["FL", "FR", "FC", "Object 1", "Object 2"]
+        func rows(_ shown: AddonChannelGroup, _ range: Range<Int>) -> [WaveformRow] {
+            WaveformRow.layout(widths: [5, 2], labels: [labels, []], stereo: false,
+                               shownGroups: [(group: shown, range: range, hasBed: true), nil])
+        }
+        let view = WaveformView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
+        view.controller = controller
+        controller.waveform = view
+        defer { controller.waveform = nil }
+        view.verifyShow(rows: rows(objects, 3..<5), laneWidths: [5, 2], frames: 0..<48_000)
+        view.verifyShowRows(rows(objects, 3..<5), groups: ["objects", nil])
+        view.separateLanes = true
+        // Object 1 alone, chosen while Objects is on show.
+        guard view.selectProgrammaticRows(firstLane: 0, firstRow: 2, lastLane: 0, lastRow: 2) else {
+            throw CaptureError("Group verification could not choose Object 1")
+        }
+        view.applyProgrammaticSelection(12_000..<36_000)
+        let chosen = view.selectedRowsForExport
+        view.onChannelGroupSwitched(lane: 0)
+        view.verifyShowRows(rows(bed, 0..<3), groups: ["bed", nil])
+        let afterSwitch = view.selectedRowsForExport
+        var problems: [String] = []
+        if chosen != [.channel(lane: 0, index: 3)] || afterSwitch != chosen {
+            problems.append("chosen \(chosen ?? []), after showing Bed \(afterSwitch ?? [])")
+        }
+
+        // The export of those rows, with Bed on show, writes Object 1 named by its own group.
+        let widths: [UInt32] = [5, 2]
+        guard let core = widths.withUnsafeBufferPointer({
+            bt_tracks_new_lanes(SystemAudioTap.timelineRate, $0.baseAddress, $0.count, 10, ProcessInfo.processInfo.physicalMemory)
+        }) else { throw CaptureError("Group verification could not make a capture") }
+        defer { bt_tracks_free(core) }
+        bt_tracks_set_retain_silence(core, 1)
+        let wide = [Float](repeating: 0.25, count: 4_800 * 5)
+        let stereo = [Float](repeating: 0.2, count: 4_800 * 2)
+        _ = wide.withUnsafeBufferPointer { bt_tracks_push_interleaved(core, 0, $0.baseAddress, 4_800, 1_000_000_000, SystemAudioTap.timelineRate) }
+        _ = stereo.withUnsafeBufferPointer { bt_tracks_push_interleaved(core, 1, $0.baseAddress, 4_800, 1_000_000_000, SystemAudioTap.timelineRate) }
+        bt_tracks_pause(core)
+        guard let frozen = WAVExport(core: core, routes: [.allChannels, .merged], channelNames: [labels, []],
+                                     channelGroups: [[bed, objects], []]) else {
+            throw CaptureError("Group verification could not freeze")
+        }
+        let folder = scratch.appendingPathComponent("rows", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let written = frozen.write(range: frozen.span, directory: folder.path, sampleRate: 48_000, bitsPerSample: 32,
+            forceMono: false, fades: noFades, names: ["Groups", "Other"], selectedRows: afterSwitch, hideSilentLanes: [],
+            wideMode: .monoFiles, pairBinaural: false, shownGroupIDs: ["bed", nil])
+        let names = written.urls.map(\.lastPathComponent)
+        if written.error != nil || names.filter({ $0.hasSuffix(".wav") }).count != 1 || !names.contains(where: { $0.contains("Object 1") }) {
+            problems.append("export of Object 1 with Bed on show wrote \(names) \(written.error ?? "")")
+        }
+        let slot = bt_preview_slot_new()
+        defer { if let slot { bt_preview_slot_clear(slot); bt_preview_slot_free(slot) } }
+        if let slot, let failure = frozen.play(in: slot, range: frozen.span, forceMono: false, fades: noFades,
+                                               selectedRows: afterSwitch, hideSilentLanes: [], pairBinaural: false,
+                                               shownGroupIDs: ["bed", nil]) {
+            problems.append("preview of Object 1 with Bed on show failed: \(failure)")
+        }
+
+        // Lane B held whole, then lane A held whole as a channel starts sounding.
+        controller.waveform = nil
+        let quiet = WaveformRow.layout(widths: [6, 2], labels: [["FL", "FR", "FC", "LFE", "Ls", "Rs"], []], stereo: false,
+                                       activeMasks: [0b0000_0111, nil])
+        let louder = WaveformRow.layout(widths: [6, 2], labels: [["FL", "FR", "FC", "LFE", "Ls", "Rs"], []], stereo: false,
+                                        activeMasks: [0b0001_0111, nil])
+        let live = WaveformView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
+        live.verifyShow(rows: quiet, laneWidths: [6, 2], frames: 0..<48_000)
+        live.verifyShowRows(quiet, groups: [nil, nil])
+        live.separateLanes = true
+        guard live.selectProgrammaticLane(0) else { throw CaptureError("Could not choose lane A") }
+        live.applyProgrammaticSelection(12_000..<36_000)
+        live.verifyShowRows(louder, groups: [nil, nil])
+        let sounding = RowIdentity.channel(lane: 0, index: 4)
+        if live.verifyWholeLanes != [0] || !live.verifyRememberedRows.contains(sounding)
+            || live.selectedRowsForExport != [.whole(lane: 0)] {
+            problems.append("lane A held whole: whole \(live.verifyWholeLanes), rows \(live.verifyRememberedRows), export \(live.selectedRowsForExport ?? [])")
+        }
+        guard problems.isEmpty else { throw CaptureError("Rows across groups: " + problems.joined(separator: "; ")) }
     }
 
     /// Hovering a group or transport chip shows what it does, and the compact transport keeps
@@ -8496,6 +8636,8 @@ extension WaveformView {
     var verifyRememberedRows: [RowIdentity] { rememberedRows }
     var verifyChipToolTipTags: [NSView.ToolTipTag] { chipToolTipTags }
     var verifyLaneFirstRows: [Int] { laneFirstRows }
+    func verifyShowRows(_ rows: [WaveformRow], groups: [String?]) { showRows(rows, groups: groups) }
+    var verifyWholeLanes: Set<Int> { wholeLanes }
     var verifyLaneBoxes: [LaneLayoutBox] { laneBoxes }
     func verifyStopEdgeScroll() { stopEdgeAutoScroll() }
     /// Puts one group chip and one transport chip on the plot and lets the view register them.
@@ -8667,6 +8809,12 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     private var selectionAnchorRow: RowIdentity?
     private var selectionCursorRow: RowIdentity?
     private var rememberedRows: [RowIdentity] = []
+    /// Lanes the chosen rows held whole (Windows `selection_whole`): such a lane stays whole as
+    /// its rows come and go, until it shows another group.
+    private var wholeLanes: Set<Int> = []
+    /// The group each lane drew its rows with, for `displayedRows`, and for `requestedRows`.
+    private var displayedGroupIDs: [String?] = []
+    private var requestedGroupIDs: [String?] = []
     /// Only a new selection follows the pointer across rows; moving a flag keeps the rows it has
     /// (Windows `Gesture::Select.rows` is `Some` only for a new selection).
     private var selectionUpdatesRows = false
@@ -8748,18 +8896,93 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
     private func currentSpecs() -> [WaveformRowSpec] { displayedRows.map(\.spec) }
 
-    /// Rows currently selected when Edit separately is on. Empty means all rows.
+    /// Rows currently selected when Edit separately is on. Empty means all rows. Rows keep their
+    /// identity while scrolled away or while another group is on show (Windows `selected_rows`).
     private var activeSelectedRows: [RowIdentity] {
         guard separateLanes, hasSelection, !rememberedRows.isEmpty else { return [] }
-        let visibleSet = Set(displayedRows.map(\.identity))
-        let filtered = rememberedRows.filter { visibleSet.contains($0) }
-        guard !filtered.isEmpty, filtered.count < displayedRows.count else { return [] }
-        return filtered
+        let chosen = Set(rememberedRows)
+        let shown = Set(displayedRows.map(\.identity))
+        // Every row drawn, and no other, is the whole capture.
+        if chosen == shown { return [] }
+        return rememberedRows
     }
 
     var selectedRowsForExport: [RowIdentity]? {
         let rows = activeSelectedRows
-        return rows.isEmpty ? nil : rows
+        guard !rows.isEmpty else { return nil }
+        return Self.exportRows(rows, wholeLanes: wholeLanes)
+    }
+
+    /// The rows an export or preview takes: a lane held whole is named by `.whole`, so it is
+    /// written as it is shown then, with any row that sounded since.
+    static func exportRows(_ rows: [RowIdentity], wholeLanes: Set<Int>) -> [RowIdentity] {
+        var out: [RowIdentity] = []
+        for row in rows {
+            if wholeLanes.contains(row.lane) {
+                if !out.contains(.whole(lane: row.lane)) { out.append(.whole(lane: row.lane)) }
+            } else {
+                out.append(row)
+            }
+        }
+        return out
+    }
+
+    /// By lane: whether `rows` hold every row `displayed` draws of it (Windows `lanes_chosen_whole`).
+    static func lanesChosenWhole(displayed: [WaveformRow], rows: [RowIdentity]) -> Set<Int> {
+        let chosen = Set(rows)
+        let lanes = Set(displayed.map(\.lane))
+        return lanes.filter { lane in
+            let drawn = displayed.filter { $0.lane == lane }
+            return !drawn.isEmpty && drawn.allSatisfy { chosen.contains($0.identity) }
+        }
+    }
+
+    /// Carries the chosen rows from rows drawn as `old` to rows drawn as `new` (Windows
+    /// `carry_rows`). A lane held whole covers every row it draws now while it shows the same
+    /// group; once it shows another group it keeps only the rows it held. Other rows stay.
+    static func carryRows(
+        _ rows: [RowIdentity], whole: Set<Int>, old: [WaveformRow], new: [WaveformRow],
+        oldGroups: [String?], newGroups: [String?]
+    ) -> (rows: [RowIdentity], whole: Set<Int>) {
+        let group = { (groups: [String?], lane: Int) -> String?? in groups.indices.contains(lane) ? groups[lane] : nil }
+        let stillWhole = whole.filter { lane in
+            old.contains(where: { $0.lane == lane }) && new.contains(where: { $0.lane == lane })
+                && group(oldGroups, lane) == group(newGroups, lane)
+        }
+        var carried: [RowIdentity] = []
+        var lanesDrawn: [Int] = []
+        for row in new where !lanesDrawn.contains(row.lane) { lanesDrawn.append(row.lane) }
+        for lane in lanesDrawn {
+            if stillWhole.contains(lane) {
+                carried += new.filter { $0.lane == lane }.map(\.identity)
+            } else {
+                carried += rows.filter { $0.lane == lane }
+            }
+        }
+        carried += rows.filter { !lanesDrawn.contains($0.lane) }
+        return (carried, stillWhole)
+    }
+
+    /// Draws `rows` from now on, carrying the chosen rows over to them.
+    private func showRows(_ rows: [WaveformRow], groups: [String?]) {
+        if rows != displayedRows || groups != displayedGroupIDs, !rememberedRows.isEmpty {
+            (rememberedRows, wholeLanes) = Self.carryRows(rememberedRows, whole: wholeLanes, old: displayedRows,
+                                                          new: rows, oldGroups: displayedGroupIDs, newGroups: groups)
+        }
+        displayedRows = rows
+        displayedGroupIDs = groups
+    }
+
+    /// The rows a selection now covers.
+    private func chooseRows(_ rows: [RowIdentity]) {
+        // Flags left by a save name a wide lane held whole by `.whole`; it covers the lane's rows.
+        let rows = rows.flatMap { row -> [RowIdentity] in
+            guard case .whole(let lane) = row else { return [row] }
+            let drawn = displayedRows.filter { $0.lane == lane }.map(\.identity)
+            return drawn.isEmpty || drawn == [row] ? [row] : drawn
+        }
+        rememberedRows = rows
+        wholeLanes = Self.lanesChosenWhole(displayed: displayedRows, rows: rows)
     }
 
     var selectedRowsLabel: String {
@@ -8835,10 +9058,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         columnFirstRow = 0
         player?.stop()
         if !dragging { discardPreparedFile() }
-        // Move any per-lane channel selection onto the newly visible rows of this lane.
-        if separateLanes && !rememberedRows.isEmpty {
-            rememberedRows.removeAll { $0.lane == lane && !$0.isPair }
-        }
+        // The chosen rows keep their identity across the switch (Windows `carry_rows`); they are
+        // carried when the new group's rows arrive.
         revision = nil
         needsDisplay = true
     }
@@ -8869,7 +9090,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         guard let first = laneRows.first?.identity, let last = laneRows.last?.identity else { return false }
         selectionAnchorRow = first
         selectionCursorRow = last
-        rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: first, cursor: last)
+        chooseRows(RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: first, cursor: last))
         needsDisplay = true
         return true
     }
@@ -8882,7 +9103,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         let b = bRows[lastRow].identity
         selectionAnchorRow = a
         selectionCursorRow = b
-        rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: a, cursor: b)
+        chooseRows(RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: a, cursor: b))
         needsDisplay = true
         return true
     }
@@ -9109,6 +9330,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             requestedRows = WaveformRow.layout(widths: widths, labels: tap.captureChannelNames,
                                                stereo: stereo, activeMasks: activeMasks,
                                                shownGroups: shownGroups)
+            requestedGroupIDs = shownGroups.map { $0?.group.id }
         }
         refreshFrequency(tap: tap)
         let request = readRequest()
@@ -9134,7 +9356,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             self.renderedFrames = frame.visible
             self.requestedView = nil
             self.zoomed = frame.visible != frame.retained
-            self.displayedRows = request.rows
+            self.showRows(request.rows, groups: self.requestedGroupIDs)
             self.displayedLaneCount = laneCount
             self.displayedLaneWidths = widths
             self.traces = frame.traces
@@ -9330,6 +9552,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         selectionAnchorRow = nil
         selectionCursorRow = nil
         rememberedRows = []
+        wholeLanes = []
         fades = noFades
         fadeGesture = nil
         requestedView = nil
@@ -9707,7 +9930,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         }
         if let anchorRow = selectionAnchorRow, let cursor {
             selectionCursorRow = cursor
-            rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: anchorRow, cursor: cursor)
+            chooseRows(RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: anchorRow, cursor: cursor))
         }
         controller?.refreshWaveform()
         needsDisplay = true
@@ -9776,13 +9999,13 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             controller.selectionNoLongerByAddon()
             if selection == nil {
                 if !markerRows.isEmpty {
-                    rememberedRows = markerRows
+                    chooseRows(markerRows)
                     selectionAnchorRow = markerRows.first
                     selectionCursorRow = markerRows.last
                 } else if let r = rowIdentity(at: position) {
                     selectionAnchorRow = r
                     selectionCursorRow = r
-                    rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: r, cursor: r)
+                    chooseRows(RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: r, cursor: r))
                 }
             }
             anchor = opposite
@@ -9805,7 +10028,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             if let r = rowIdentity(at: position) {
                 selectionAnchorRow = r
                 selectionCursorRow = r
-                rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: r, cursor: r)
+                chooseRows(RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: r, cursor: r))
                 selectionUpdatesRows = true
             }
             updateWaveformCursor()
@@ -9860,7 +10083,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             if selectionUpdatesRows, laneEdgeScroll(at: local) == nil, let anchorRow = selectionAnchorRow,
                let nextRow = rowIdentity(at: local, clampedToVisible: true) {
                 selectionCursorRow = nextRow
-                rememberedRows = RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: anchorRow, cursor: nextRow)
+                chooseRows(RowStackLayout.rowsBetween(allRows: currentSpecs(), anchor: anchorRow, cursor: nextRow))
             }
             startEdgeAutoScrollIfNeeded(at: local)
             needsDisplay = true
