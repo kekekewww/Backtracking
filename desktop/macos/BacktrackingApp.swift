@@ -2528,14 +2528,23 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     /// More lanes than the 64 channels can hold, as when sources turn out wider than estimated:
-    /// the capture still opens, and only the lanes that do not fit say why.
+    /// the capture does not open, and its error says the channels pass 64. Lanes that fit beside
+    /// the placeholders still open, with none refused.
     static func verifyChannelLimitCaptureOpens() throws {
-        let lanes = (0..<33).map { CaptureLane(source: .addon(addonID: "verify.limit", sourceID: "s\($0)"), route: .merged) }
-        let tap = try SystemAudioTap(history: 10, lanes: lanes)
-        let refused = lanes.indices.filter { tap.sourceProblem(for: $0)?.contains("cannot start") == true }
-        guard refused == [31, 32], tap.totalChannelCount == 62,
-              tap.sourceProblem(for: 32)?.hasPrefix("Lane AG cannot start: lanes A to AG would contain 66 channels; the limit is 64") == true else {
-            throw CaptureError("33 stereo lanes: refused \(refused), \(tap.totalChannelCount) channels in use")
+        func lanes(_ count: Int) -> [CaptureLane] {
+            (0..<count).map { CaptureLane(source: .addon(addonID: "verify.limit", sourceID: "s\($0)"), route: .merged) }
+        }
+        var message = ""
+        do {
+            _ = try SystemAudioTap(history: 10, lanes: lanes(33))
+            message = "opened"
+        } catch let error as CaptureError {
+            message = error.operation
+        }
+        let fits = try SystemAudioTap(history: 10, lanes: lanes(32))
+        guard message.hasPrefix("Capture cannot start: with one channel kept for each source that cannot start, the sources would hold 65 channels; the limit is 64."),
+              fits.totalChannelCount == 64, (0..<32).allSatisfy({ fits.sourceProblem(for: $0)?.contains("cannot start") != true }) else {
+            throw CaptureError("33 stereo sources: \(message); 32: \(fits.totalChannelCount) channels")
         }
     }
 

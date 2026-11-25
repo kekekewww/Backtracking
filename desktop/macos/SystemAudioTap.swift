@@ -1326,13 +1326,16 @@ final class SystemAudioTap {
                 widths.append(1)
             }
         }
-        var held = widths.reduce(0, +)
-        while held > 64, let last = widths.indices.last(where: { errors[$0] == nil && widths[$0] > 1 }) {
-            errors[last] = overLimitMessage(lane: last, total: held)
-            held -= widths[last] - 1
-            widths[last] = 1
-        }
         return (widths, errors)
+    }
+
+    /// Why the capture cannot open at all, or nil. A lane that does not start still holds one
+    /// channel of the capture core here (Windows leaves it out), so the lanes that start and those
+    /// placeholders can pass 64 together. Then nothing records, and the window says so.
+    nonisolated static func captureOverLimitMessage(_ held: [UInt32]) -> String? {
+        let total = held.reduce(0, +)
+        guard total > 64 else { return nil }
+        return "Capture cannot start: with one channel kept for each source that cannot start, the sources would hold \(total) channels; the limit is 64. Remove a source or choose a narrower route."
     }
 
     /// Why lane `lane` cannot start after lanes holding `total - width` channels, in English and
@@ -1494,6 +1497,7 @@ final class SystemAudioTap {
             return format.width(for: route)
         }
         let (acceptedWidths, capErrors) = Self.acceptLanes(requestedWidths)
+        if let overLimit = Self.captureOverLimitMessage(acceptedWidths) { throw CaptureError(overLimit) }
         self.routes = routes
         self.widths = acceptedWidths
         self.laneCapErrors = capErrors
