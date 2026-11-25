@@ -177,7 +177,7 @@ func verifyMacControlSaveReply() throws {
 @MainActor
 func verifyMacOptionsRebuild(step: String) throws {
     _ = NSApplication.shared
-    if ["typed-values", "deferred", "sources-name", "open-list"].contains(step) {
+    if ["typed-values", "deferred", "sources-name", "open-list", "key-loop"].contains(step) {
         try BacktrackingController.verifyOptionsRebuildKeepsTyping(step: step)
         return
     }
@@ -3831,6 +3831,31 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             guard whileHeld == 0, waiting, built == 1, shown == "/latest", addonsRegistered(), !controller.pendingAddonsTabReload else {
                 throw CaptureError("Held rebuild: built \(whileHeld) while held (pending \(waiting)), \(built) in all, shows \(shown ?? "-"), registered \(addonsRegistered())")
             }
+        case "key-loop":
+            // The window's key view loop and initial first responder lead into the page; after
+            // the page is rebuilt neither points into the old page, which is still alive.
+            guard let addons = category("Add-ons"), let export = category("Export") else { throw CaptureError("No categories") }
+            controller.selectOptionCategory(addons)
+            window.recalculateKeyViewLoop()
+            guard let oldPage = page("Add-ons"), let firstField = editable(oldPage).first else { throw CaptureError("No Add-ons fields") }
+            window.initialFirstResponder = firstField
+            weak var oldView = oldPage
+            controller.reloadAddonsTab()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            guard let old = oldView else { throw CaptureError("The old page was let go at once") }
+            var loop: [NSView] = []
+            var node: NSView? = window.contentView
+            for _ in 0..<200 {
+                guard let current = node?.nextKeyView, !loop.contains(where: { $0 === current }) else { break }
+                loop.append(current)
+                node = current
+            }
+            let intoOld = loop.contains { $0 === old || $0.isDescendant(of: old) }
+            let initialIntoOld = window.initialFirstResponder.map { $0 === old || $0.isDescendant(of: old) } ?? false
+            controller.selectOptionCategory(export)
+            guard !intoOld, !initialIntoOld else {
+                throw CaptureError("After the rebuild the key view loop leads into the old page: \(intoOld), the initial first responder: \(initialIntoOld)")
+            }
         case "open-list":
             // A Choice setting's list is open when an add-on's answer rebuilds the page.
             let choice = AddonSettingEntry(declaration: AddonSettingDeclaration(key: "mode", label: "Mode", help: nil, kind: "choice",
@@ -5324,6 +5349,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private var endingEditingForOptionsRebuild = false
+    /// Pages taken out of the Options window, kept alive for a while (see rebuildOptionsPage).
+    private var retiredOptionsPages: [NSTabViewItem] = []
 
     /// A fresh page for `label`, built from the state now.
     private func makeOptionsPage(_ label: String) -> NSTabViewItem? {
@@ -5375,11 +5402,23 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard let page = makeOptionsPage(label) else { return }
         pendingOptionsPages.remove(label)
         current.initialFirstResponder = nil
+        // Nothing of the window may keep pointing into the old page: the window's initial first
+        // responder and the key view loop are set again, and the old page stays alive for a while
+        // so a pointer AppKit kept regardless finds a live, detached view (rc-v10 still crashed
+        // in -[NSTabView selectTabViewItem:] on a real desktop after N1's first fix).
+        let window = tabs.window
+        if let oldView = current.view, let initial = window?.initialFirstResponder,
+           initial === oldView || initial.isDescendant(of: oldView) {
+            window?.initialFirstResponder = nil
+        }
+        retiredOptionsPages.append(current)
+        if retiredOptionsPages.count > 32 { retiredOptionsPages.removeFirst(retiredOptionsPages.count - 32) }
         let selected = tabs.selectedTabViewItem === current
         let offset = (current.view as? NSScrollView)?.contentView.bounds.origin ?? .zero
         tabs.insertTabViewItem(page, at: index)
         if selected { tabs.selectTabViewItem(page) }
         tabs.removeTabViewItem(current)
+        window?.recalculateKeyViewLoop()
         if selected, let scroll = page.view as? NSScrollView {
             scroll.layoutSubtreeIfNeeded()
             scroll.contentView.scroll(to: offset)

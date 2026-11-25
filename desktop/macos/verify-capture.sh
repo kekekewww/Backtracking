@@ -338,7 +338,7 @@ xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library -D BACKTRACKING_CAP
 "$scratch/verify"
 # N1: rebuilding an Options page under a field being typed into, then changing category, in a
 # child that exits 11 on a crash instead of leaving a crash report.
-for step in rebuild close-reopen end-editing typed-values deferred sources-name open-list; do
+for step in rebuild close-reopen end-editing typed-values deferred sources-name open-list key-loop; do
   status=0
   "$scratch/verify" --options-rebuild "$step" || status=$?
   if [[ $status -ne 0 ]]; then
