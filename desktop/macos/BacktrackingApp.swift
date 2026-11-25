@@ -2772,6 +2772,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard names.count == 1, names[0].hasSuffix("-Stereo.wav") else {
             throw CaptureError("The pair with an empty group ahead of the bed wrote \(names) \(written.error ?? "")")
         }
+        // The preview of the pair plays the bed too.
+        guard let slot = bt_preview_slot_new_local() else { throw CaptureError("No preview slot") }
+        defer { bt_preview_slot_clear(slot); bt_preview_slot_free(slot) }
+        let failure = frozen.play(in: slot, range: frozen.span, forceMono: false, fades: noFades,
+                                  selectedRows: [.pair(lane: 0, side: 0), .pair(lane: 0, side: 1)], hideSilentLanes: [],
+                                  pairBinaural: false, shownGroupIDs: ["objects"])
+        var left = [Float](repeating: 0, count: 2_048), right = left
+        _ = bt_preview_slot_render(slot, &left, &right, 2_048, 48_000)
+        guard failure == nil, (left.map(abs).max() ?? 0) > 0.05 else {
+            throw CaptureError("The pair preview with an empty group ahead of the bed: \(failure ?? "silent")")
+        }
     }
 
     /// Previews play one part per lane, as Windows `preview_plan` does: the pair with an object
@@ -2895,6 +2906,22 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let took = ProcessInfo.processInfo.systemUptime - started
         guard files.count == 1, files[0].frames == UInt64(dataBytes) / 8, files[0].channels == 2, took < 0.1 else {
             throw CaptureError("Describing a 1 GB WAV took \(String(format: "%.2f", took)) s: \(files)")
+        }
+        // An RF64 file over 4 GB names its data size in ds64; a file that is no WAV leaves the fields empty.
+        let rf64 = scratch.appendingPathComponent("huge.wav")
+        let bigBytes: UInt64 = 6_000_000_000
+        func le64(_ v: UInt64) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
+        var head = Data("RF64".utf8) + le32(UInt32.max) + Data("WAVE".utf8)
+        head += Data("ds64".utf8) + le32(28) + le64(bigBytes + 72) + le64(bigBytes) + le64(bigBytes / 8) + le32(0)
+        head += Data("fmt ".utf8) + le32(16) + le16(3) + le16(2) + le32(48_000) + le32(48_000 * 8) + le16(8) + le16(32)
+        head += Data("data".utf8) + le32(UInt32.max)
+        FileManager.default.createFile(atPath: rf64.path, contents: head)
+        let notWav = scratch.appendingPathComponent("note.wav")
+        FileManager.default.createFile(atPath: notWav.path, contents: Data("not a wave file at all, but long enough to read".utf8))
+        let described = BacktrackingController.savedFiles(urls: [rf64, notWav], lanes: [0, 0])
+        guard described.count == 2, described[0].frames == bigBytes / 8, described[0].sample_rate == 48_000,
+              described[1].frames == nil, described[1].channels == nil, described[1].sample_rate == nil else {
+            throw CaptureError("RF64 and unreadable files were described as \(described)")
         }
     }
 
@@ -3698,7 +3725,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         // Options closed (the window is not on screen) while the change comes; opening shows it.
         receive(false)
         let closed = controller.verifyAddonsTabReloads
-        controller.catchUpOptionsPage()
+        controller.optionsOpenedOnce = true // Options was open before, at Add-ons
+        _ = controller.prepareOptionsForShowing() // what showOptions does before the window goes on screen
         let reopened = controller.verifyAddonsTabReloads
         // A page rebuilt by another path (adding a source rebuilds Sources) leaves nothing to do later.
         controller.pendingSourcesTabRebuild = true
@@ -3957,6 +3985,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 _ = window.makeFirstResponder(nil)
                 if controller.addonSettingDrafts["verify.n1:folder"] != .string("/new") {
                     throw CaptureError("Closing the window over the Text field did not send what was typed")
+                }
+                // The send asked for a rebuild while the edit was ending; one rebuild after it took it.
+                controller.reloadAddonsTab()
+                if controller.pendingAddonsTabReload {
+                    throw CaptureError("A rebuild asked for while the edit ended was left waiting")
                 }
             default:
                 controller.reloadAddonsTab()
@@ -4881,6 +4914,22 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     @objc private func showOptions() {
         guard !editing else { return }
         registerClick()
+        let window = prepareOptionsForShowing()
+        if testCopy {
+            if let size = harness?.optionsSize {
+                window.setContentSize(size)
+            }
+            window.orderFrontRegardless()
+        } else {
+            keepPanelVisible(window)
+            NSApp.activate()
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    /// Everything opening Options does before the window goes on screen, the catch-up of pages
+    /// changed while it was closed included.
+    private func prepareOptionsForShowing() -> HotkeyOptionsPanel {
         let window = optionsPanel ?? makeOptionsPanel()
         optionsPanel = window
         if !optionsOpenedOnce {
@@ -4897,16 +4946,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         updateOptionsVisibility()
         updateLoginOption()
         updateStatus()
-        if testCopy {
-            if let size = harness?.optionsSize {
-                window.setContentSize(size)
-            }
-            window.orderFrontRegardless()
-        } else {
-            keepPanelVisible(window)
-            NSApp.activate()
-            window.makeKeyAndOrderFront(nil)
-        }
+        return window
     }
 
     private func makeOptionsPanel() -> HotkeyOptionsPanel {
