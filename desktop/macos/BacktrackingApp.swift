@@ -23,11 +23,7 @@ private let cleanupAgeChoices: [UInt32] = [0, 10, 20, 30, 60, 90]
 private let optionLabelWidth: CGFloat = 232
 private let problemColor = NSColor(srgbRed: 246 / 255, green: 196 / 255, blue: 118 / 255, alpha: 1)
 
-/// The recorder window's own keys, which the right-click menu names beside its items.
-private enum WindowCommand {
-    case toggleCapture, clear, separateLanes
-}
-/// The Right Command key, tapped on its own, separates lanes A and B.
+/// The default toggle for editing sources separately.
 private let rightCommandKeyCode: UInt16 = 54
 /// The device-dependent bits AppKit keeps in `modifierFlags` for each Command key (IOLLEvent.h).
 private let leftCommandDeviceMask: UInt = 0x08
@@ -57,6 +53,13 @@ private func selectsWaveform(_ modifiers: NSEvent.ModifierFlags) -> Bool {
     !modifiers.intersection([.option, .control, .shift]).isEmpty
 }
 
+#if BACKTRACKING_CAPTURE_VERIFY
+@MainActor
+func verifyMacOptions() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyOptions()
+}
+#else
 @main
 enum BacktrackingApp {
     @MainActor
@@ -70,18 +73,21 @@ enum BacktrackingApp {
         withExtendedLifetime(delegate) {}
     }
 }
+#endif
 
 private final class SnapshotShortcut {
     private var port: CFMachPort?
     private var source: CFRunLoopSource?
     private let action: () -> Void
+    var bindings = RecorderAction.globalSnapshot.presets
+    var recording = false
 
     init(action: @escaping () -> Void) { self.action = action }
 
     var isListening: Bool { port.map { CGEvent.tapIsEnabled(tap: $0) } ?? false }
 
     func start() {
-        guard !isListening, CGPreflightListenEventAccess() else { return }
+        guard !bindings.isEmpty, !isListening, CGPreflightListenEventAccess() else { return }
         stop()
         let keyDown = CGEventMask(1) << CGEventType.keyDown.rawValue
         guard let port = CGEvent.tapCreate(
@@ -111,14 +117,19 @@ private final class SnapshotShortcut {
             if let port { CGEvent.tapEnable(tap: port, enable: true) }
             return
         }
-        guard type == .keyDown, event.getIntegerValueField(.keyboardEventAutorepeat) == 0,
-              event.flags.intersection([.maskSecondaryFn, .maskShift, .maskCommand, .maskControl, .maskAlternate])
-                == .maskSecondaryFn else { return }
+        guard !recording, type == .keyDown,
+              event.getIntegerValueField(.keyboardEventAutorepeat) == 0 else { return }
         let keyboardType = Int16(truncatingIfNeeded: event.getIntegerValueField(.keyboardEventKeyboardType))
-        // macOS swaps the virtual key codes for the top-left and section keys on ISO keyboards.
-        let key = KBGetLayoutType(keyboardType) == UInt32(kKeyboardISO) ? kVK_ISO_Section : kVK_ANSI_Grave
-        guard event.getIntegerValueField(.keyboardEventKeycode) == Int64(key) else { return }
-        DispatchQueue.main.async { [weak self] in self?.action() }
+        let code = UInt16(truncatingIfNeeded: event.getIntegerValueField(.keyboardEventKeycode))
+        let modifiers = NSEvent.ModifierFlags(rawValue: UInt(event.flags.rawValue))
+        guard bindings.contains(where: { $0.matches(code: RecorderShortcut.normalizedCode(code, type: keyboardType),
+            modifiers: modifiers) }) else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.recording, self.bindings.contains(where: {
+                $0.matches(code: RecorderShortcut.normalizedCode(code, type: keyboardType), modifiers: modifiers)
+            }) else { return }
+            self.action()
+        }
     }
 
     deinit { stop() }
@@ -126,6 +137,26 @@ private final class SnapshotShortcut {
 
 private class KeyPanel: NSPanel {
     override var canBecomeKey: Bool { true }
+}
+
+private final class HotkeyOptionsPanel: KeyPanel {
+    var recordKey: ((NSEvent) -> Bool)?
+    var cancelRecording: (() -> Void)?
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown, recordKey?(event) == true { return }
+        super.sendEvent(event)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.type == .keyDown, recordKey?(event) == true { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func resignKey() {
+        super.resignKey()
+        cancelRecording?()
+    }
 }
 
 private final class OptionsDocumentView: NSView {
@@ -297,7 +328,8 @@ private final class CapturePanel: KeyPanel {
     var onClick: (() -> Void)?
     var onMenu: ((NSEvent) -> Void)?
     /// Runs one of the recorder's own keys. False lets the key go on to the focused control.
-    var onCommand: ((WindowCommand) -> Bool)?
+    var onCommand: ((RecorderAction) -> Bool)?
+    var actionForShortcut: ((RecorderShortcut) -> RecorderAction?)?
     weak var waveform: WaveformView?
     private var move: MoveGesture?
     private var resize: ResizeGesture?
@@ -358,7 +390,9 @@ private final class CapturePanel: KeyPanel {
             rightCommandPress = alone ? event.timestamp : nil
         } else if let press = rightCommandPress {
             rightCommandPress = nil
-            if event.timestamp - press <= tapLimit { _ = onCommand?(.separateLanes) }
+            if event.timestamp - press <= tapLimit, let action = actionForShortcut?(.rightCommand) {
+                _ = onCommand?(action)
+            }
         }
     }
 
@@ -376,23 +410,7 @@ private final class CapturePanel: KeyPanel {
         }
         switch event.type {
         case .keyDown:
-            // Hardware codes 51 and 53 are Backspace and Escape on macOS.
-            if !event.modifierFlags.contains(.command), event.keyCode == 51 || event.keyCode == 53 {
-                if waveform?.cancelSelection() == true { return }
-                if event.keyCode == 53, waveform?.cancelPendingDrag() == true { return }
-            }
-            // Space (49) pauses or resumes and Forward Delete (117, Fn+Delete on a laptop) clears,
-            // as Space and Delete do on Windows. A held key does not repeat the command, and a
-            // focused button keeps Space for itself.
-            if event.keyCode == 49 || event.keyCode == 117, !event.isARepeat,
-               event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
-               !(firstResponder is NSControl) {
-                // With a selection on screen, Delete drops the selection first and Space plays
-                // the selection or stops it.
-                if event.keyCode == 117, waveform?.cancelSelection() == true { return }
-                if event.keyCode == 49, waveform?.togglePreview() == true { return }
-                if onCommand?(event.keyCode == 49 ? .toggleCapture : .clear) == true { return }
-            }
+            if handleShortcut(event) { return }
         case .leftMouseDown:
             onClick?()
             move = nil
@@ -450,6 +468,21 @@ private final class CapturePanel: KeyPanel {
             updateChromeCursor()
         default: break
         }
+    }
+
+    private func handleShortcut(_ event: NSEvent) -> Bool {
+        guard !event.isARepeat, !(firstResponder is NSTextView) else { return false }
+        let shortcut = RecorderShortcut(event: event)
+        guard let action = actionForShortcut?(shortcut) else { return false }
+        if firstResponder is NSControl, shortcut.modifiers.isEmpty, action != .cancelSelection { return false }
+        return onCommand?(action) == true
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.type == .keyDown,
+           !event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+           handleShortcut(event) { return true }
+        return super.performKeyEquivalent(with: event)
     }
 
     func trackChrome(in content: NSView) {
@@ -573,11 +606,39 @@ private struct WaveformTrace: Sendable {
     }
 }
 
+private struct WaveformRow: Equatable, Sendable {
+    let lane: Int
+    let view: UInt32
+    let title: String?
+    var isPair: Bool { view == 67 || view == 68 }
+
+    static func layout(widths: [UInt32], labels: [[String]], stereo: Bool) -> [WaveformRow] {
+        widths.enumerated().flatMap { lane, width -> [WaveformRow] in
+            let name = widths.count > 1 ? captureLaneLetter(lane) : nil
+            if width > 2 {
+                let pair = [(UInt32(67), "L"), (UInt32(68), "R")].map { view, label in
+                    WaveformRow(lane: lane, view: view, title: name.map { "\($0) · \(label)" } ?? label)
+                }
+                return pair + (0..<Int(width)).map { channel in
+                    let label = labels.indices.contains(lane) && labels[lane].indices.contains(channel)
+                        ? labels[lane][channel] : "Channel \(channel + 1)"
+                    let title = name.map { "\($0) · \(label)" } ?? label
+                    return WaveformRow(lane: lane, view: UInt32(channel + 3), title: title)
+                }
+            }
+            if width == 2, stereo, widths.count == 1 {
+                return [WaveformRow(lane: lane, view: 1, title: "L"), WaveformRow(lane: lane, view: 2, title: "R")]
+            }
+            return [WaveformRow(lane: lane, view: 0, title: name)]
+        }
+    }
+}
+
 private struct WaveformReadRequest: Equatable, Sendable {
     var view: Range<UInt64>?
     var width: Float
     var height: Float
-    var stereo: Bool
+    var rows: [WaveformRow]
     var interactive: Bool
 
     func policy(frames: Range<UInt64>, rate: UInt32) -> BtWaveformDisplayPolicy {
@@ -601,8 +662,7 @@ private struct WaveformFrame: Sendable {
     let traces: [WaveformTrace]
     let bars: [UInt64]
 
-    static func read(core: OpaquePointer, laneCount: Int, request: WaveformReadRequest,
-                     unchangedRevision: UInt64?) -> WaveformFrame? {
+    static func read(core: OpaquePointer, request: WaveformReadRequest, unchangedRevision: UInt64?) -> WaveformFrame? {
         let revision = bt_tracks_revision(core)
         if revision == unchangedRevision { return nil }
         let rate = bt_tracks_sample_rate(core)
@@ -610,12 +670,10 @@ private struct WaveformFrame: Sendable {
         let retained = first..<max(first, bt_tracks_end_frame(core))
         let visible = fittedWaveformRange(request.view, in: retained)
         let bins = Int(request.policy(frames: visible, rate: rate).bins)
-        let layout: [(UInt32, UInt32)] = laneCount == 2 ? [(0, 0), (1, 0)]
-            : (request.stereo && bt_tracks_channels(core, 0) == 2 ? [(0, 1), (0, 2)] : [(0, 0)])
-        let traces = layout.map { lane, channel -> WaveformTrace in
+        let traces = request.rows.map { row -> WaveformTrace in
             var trace = WaveformTrace(bins: bins)
             trace.read { minimum, maximum, count in
-                _ = bt_tracks_waveform_range(core, lane, channel, visible.lowerBound, visible.upperBound,
+                _ = bt_tracks_waveform_range(core, UInt32(row.lane), row.view, visible.lowerBound, visible.upperBound,
                     minimum, maximum, count)
             }
             return trace
@@ -634,49 +692,32 @@ private struct WaveformFrame: Sendable {
 // Immutable recording material shared by the edit renderer and WAV worker.
 private final class WAVExport: @unchecked Sendable {
     private static let releaseQueue = DispatchQueue(label: "Backtracking.material-release", qos: .utility)
-    private let snapshots: [OpaquePointer]
+    private let frozen: OpaquePointer
     private let routes: [UInt32]
     let span: Range<UInt64>
     let sampleRate: UInt32
-    private let channels: [UInt32]
+    let revision: UInt64
+    private let channelNames: [[String]]
     private let bars: [UInt64]
     private let cacheLock = NSLock()
     private struct PeakKey: Equatable {
         let visible: Range<UInt64>
         let bins: Int
-        let stereo: Bool
+        let rows: [WaveformRow]
     }
     private var cachedPeaks: (PeakKey, WaveformFrame)?
 
-    init?(core: OpaquePointer, routes: [CaptureRoute], range: Range<UInt64>? = nil) {
-        guard (1...2).contains(routes.count) else { return nil }
-        func snapshot(_ lane: UInt32) -> OpaquePointer? {
-            if let range { return bt_tracks_snapshot_range(core, lane, range.lowerBound, range.upperBound) }
-            return bt_tracks_snapshot(core, lane)
-        }
-        guard let first = snapshot(0) else { return nil }
-        let count = bt_snapshot_frame_count(first)
-        guard count > 0 else {
-            bt_snapshot_free(first)
-            return nil
-        }
-        let start = bt_snapshot_first_frame(first)
-        let capturedSpan = start..<(start + count)
+    init?(core: OpaquePointer, routes: [CaptureRoute], channelNames: [[String]] = [], range: Range<UInt64>? = nil) {
+        let first = bt_tracks_first_frame(core)
+        let capturedSpan = range ?? first..<max(first, bt_tracks_end_frame(core))
+        guard !capturedSpan.isEmpty,
+              let frozen = bt_tracks_freeze(core, capturedSpan.lowerBound, capturedSpan.upperBound) else { return nil }
+        self.frozen = frozen
         span = capturedSpan
         sampleRate = bt_tracks_sample_rate(core)
+        revision = bt_tracks_revision(core)
         self.routes = routes.map(\.wavRouteCode)
-        let captured: [OpaquePointer]
-        if routes.count == 2 {
-            guard let second = snapshot(1) else {
-                bt_snapshot_free(first)
-                return nil
-            }
-            captured = [first, second]
-        } else {
-            captured = [first]
-        }
-        snapshots = captured
-        channels = captured.map { bt_snapshot_channels($0) }
+        self.channelNames = channelNames
         let markerCount = bt_tracks_copy_bar_markers(core, capturedSpan.lowerBound, capturedSpan.upperBound, nil, 0)
         var markers = Array<UInt64>(repeating: 0, count: markerCount)
         let actual = markers.withUnsafeMutableBufferPointer {
@@ -687,31 +728,29 @@ private final class WAVExport: @unchecked Sendable {
     }
 
     deinit {
-        let addresses = snapshots.map { UInt(bitPattern: $0) }
-        Self.releaseQueue.async {
-            for address in addresses { bt_snapshot_free(OpaquePointer(bitPattern: address)) }
-        }
+        let address = UInt(bitPattern: frozen)
+        Self.releaseQueue.async { bt_frozen_free(OpaquePointer(bitPattern: address)) }
     }
 
     func render(_ request: WaveformReadRequest) -> WaveformFrame {
         let visible = fittedWaveformRange(request.view, in: span)
         let bins = Int(request.policy(frames: visible, rate: sampleRate).bins)
-        let key = PeakKey(visible: visible, bins: bins, stereo: request.stereo)
+        let key = PeakKey(visible: visible, bins: bins, rows: request.rows)
         cacheLock.lock()
         let cached = cachedPeaks
         cacheLock.unlock()
         if let cached, cached.0 == key { return cached.1 }
-        let layout: [(Int, UInt32)] = snapshots.count == 2 ? [(0, 0), (1, 0)]
-            : (request.stereo && channels[0] == 2 ? [(0, 1), (0, 2)] : [(0, 0)])
-        let traces = layout.map { lane, channel -> WaveformTrace in
+        let traces = request.rows.map { row -> WaveformTrace in
             var trace = WaveformTrace(bins: bins)
             trace.read { minimum, maximum, count in
-                _ = bt_snapshot_waveform_range(snapshots[lane], channel, visible.lowerBound,
-                    visible.upperBound, minimum, maximum, count)
+                withChannelNames(row) { names in
+                    bt_frozen_waveform(frozen, UInt32(row.lane), row.view, visible.lowerBound,
+                        visible.upperBound, minimum, maximum, count, names)
+                }
             }
             return trace
         }
-        let frame = WaveformFrame(revision: 0, sampleRate: sampleRate, retained: span, visible: visible,
+        let frame = WaveformFrame(revision: revision, sampleRate: sampleRate, retained: span, visible: visible,
             traces: traces, bars: bars)
         cacheLock.lock()
         cachedPeaks = (key, frame)
@@ -719,70 +758,72 @@ private final class WAVExport: @unchecked Sendable {
         return frame
     }
 
-    /// The lanes to play or write: `lane` alone, or all of them. Nil for a lane there is not.
-    private func laneRange(_ lane: Int?) -> Range<Int>? {
-        guard let lane else { return snapshots.indices }
-        return snapshots.indices.contains(lane) ? lane..<(lane + 1) : nil
+    func spectrum(range: Range<UInt64>, bins: Int, rows: [WaveformRow]) -> FrequencyWaveform {
+        let energies = rows.map { row in
+            var energy = [Float](repeating: 0, count: bins * FrequencyGradient.bandCount)
+            energy.withUnsafeMutableBufferPointer {
+                let pointer = $0.baseAddress
+                withChannelNames(row) { names in
+                    bt_frozen_spectrum(frozen, UInt32(row.lane), row.view, range.lowerBound,
+                        range.upperBound, pointer, UInt32(bins), names)
+                }
+            }
+            return energy
+        }
+        return FrequencyWaveform(range: range, rows: energies)
     }
 
-    /// Starts a preview of `range` in `slot`, routed as the WAVs are, of one lane or all of them.
-    /// The slot reads the snapshots in place, so whoever plays it keeps this material until the
-    /// slot has let the preview go.
-    func play(in slot: OpaquePointer, range: Range<UInt64>, forceMono: Bool, fades: BtFades, lane: Int?) -> Bool {
-        guard let chosen = laneRange(lane) else { return false }
-        let played: [OpaquePointer?] = Array(snapshots[chosen])
-        let playedRoutes = Array(routes[chosen])
-        return played.withUnsafeBufferPointer { lanes in
-            playedRoutes.withUnsafeBufferPointer { routes in
-                bt_preview_slot_play(slot, lanes.baseAddress, lanes.count, routes.baseAddress,
-                    range.lowerBound, range.upperBound, forceMono ? 1 : 0, fades) == 1
-            }
+    private func withChannelNames(_ row: WaveformRow, _ read: (UnsafePointer<CChar>?) -> Void) {
+        guard row.isPair, channelNames.indices.contains(row.lane) else { read(nil); return }
+        channelNames[row.lane].joined(separator: "\t").withCString { read($0) }
+    }
+
+    private func laneRange(_ lane: Int?) -> Range<Int>? {
+        guard let lane else { return routes.indices }
+        return routes.indices.contains(lane) ? lane..<(lane + 1) : nil
+    }
+
+    func play(in slot: OpaquePointer, range: Range<UInt64>, forceMono: Bool, fades: BtFades,
+              row: WaveformRow?, pairBinaural: Bool) -> Bool {
+        guard let chosen = laneRange(row?.lane) else { return false }
+        let labels = chosen.map { channelNames.indices.contains($0) ? strdup(channelNames[$0].joined(separator: "\t")) : nil }
+        defer { for label in labels { free(label) } }
+        let lanes = zip(chosen, labels).map { index, label in
+            BtFrozenLane(index: UInt32(index), route: routes[index], source_name: nil,
+                channel_labels: UnsafePointer(label), view: row?.view ?? 0)
+        }
+        return lanes.withUnsafeBufferPointer {
+            bt_frozen_play(frozen, slot, $0.baseAddress, $0.count, range.lowerBound,
+                range.upperBound, forceMono ? 1 : 0, pairBinaural ? 1 : 0, fades) == 1
         }
     }
 
-    /// Writes `range` of one lane or all of them, each file named after its lane's source in
-    /// `names`. With two lanes recording, a file names its lane even when it is written alone.
     func write(
         range: Range<UInt64>, directory: String, sampleRate: UInt32, bitsPerSample: UInt32, forceMono: Bool,
-        fades: BtFades, names: [String], lane: Int?
+        fades: BtFades, names: [String], row: WaveformRow?, wideMode: WideExportMode, pairBinaural: Bool
     ) -> [URL] {
-        guard let chosen = laneRange(lane) else { return [] }
-        let mono: UInt32 = forceMono ? 1 : 0
-        let name = { (index: Int) in index < names.count ? names[index] : "" }
-        return directory.withCString { destination -> [URL] in
-            if chosen.count == 2 {
-                var a: UnsafeMutablePointer<CChar>?
-                var b: UnsafeMutablePointer<CChar>?
-                let written = name(0).withCString { nameA in
-                    name(1).withCString { nameB in
-                        bt_snapshots_export_pair_labelled_frames(
-                            snapshots[0], snapshots[1], range.lowerBound, range.upperBound, destination,
-                            sampleRate, bitsPerSample, routes[0], routes[1], mono, fades.fade_in, fades.fade_out,
-                            nameA, nameB, &a, &b
-                        )
-                    }
-                }
-                guard written == 1, let pathA = a, let pathB = b else { return [] }
-                defer {
-                    bt_string_free(pathA)
-                    bt_string_free(pathB)
-                }
-                return [
-                    URL(fileURLWithPath: String(cString: pathA)),
-                    URL(fileURLWithPath: String(cString: pathB))
-                ]
+        guard let chosen = laneRange(row?.lane) else { return [] }
+        let sources = chosen.map { names.indices.contains($0) ? strdup(names[$0]) : nil }
+        let labels = chosen.map { channelNames.indices.contains($0) ? strdup(channelNames[$0].joined(separator: "\t")) : nil }
+        defer {
+            for source in sources { free(source) }
+            for label in labels { free(label) }
+        }
+        let lanes = chosen.enumerated().map { offset, index in
+            BtFrozenLane(index: UInt32(index), route: routes[index], source_name: UnsafePointer(sources[offset]),
+                channel_labels: UnsafePointer(labels[offset]), view: row?.view ?? 0)
+        }
+        let paths = directory.withCString { destination in
+            lanes.withUnsafeBufferPointer {
+                bt_frozen_export(frozen, $0.baseAddress, $0.count, range.lowerBound, range.upperBound,
+                    destination, sampleRate, bitsPerSample, forceMono ? 1 : 0, wideMode.rawValue,
+                    pairBinaural ? 1 : 0, fades)
             }
-            let index = chosen.lowerBound
-            // 0 leaves the letter out; 1 and 2 are A and B.
-            let letter: UInt32 = snapshots.count == 2 ? UInt32(index + 1) : 0
-            guard let path = name(index).withCString({ source in
-                bt_snapshot_export_labelled_frames(
-                    snapshots[index], range.lowerBound, range.upperBound, destination,
-                    sampleRate, bitsPerSample, routes[index], mono, fades.fade_in, fades.fade_out, source, letter
-                )
-            }) else { return [] }
-            defer { bt_string_free(path) }
-            return [URL(fileURLWithPath: String(cString: path))]
+        }
+        guard let paths else { return [] }
+        defer { bt_export_paths_free(paths) }
+        return (0..<bt_export_paths_count(paths)).compactMap { index in
+            bt_export_path(paths, index).map { URL(fileURLWithPath: String(cString: $0)) }
         }
     }
 }
@@ -822,7 +863,8 @@ private final class PreviewPlayer {
 
     /// Plays `range` of `material`, or of its `lane` alone, from its start. Returns a problem to
     /// show, or nil.
-    func play(_ material: WAVExport, range: Range<UInt64>, forceMono: Bool, fades: BtFades, lane: Int?) -> String? {
+    func play(_ material: WAVExport, range: Range<UInt64>, forceMono: Bool, fades: BtFades,
+              row: WaveformRow?, pairBinaural: Bool) -> String? {
         do {
             try startEngine(rate: material.sampleRate)
         } catch {
@@ -834,7 +876,7 @@ private final class PreviewPlayer {
             RunLoop.main.add(timer, forMode: .common)
             self.timer = timer
         }
-        guard material.play(in: slot, range: range, forceMono: forceMono, fades: fades, lane: lane) else {
+        guard material.play(in: slot, range: range, forceMono: forceMono, fades: fades, row: row, pairBinaural: pairBinaural) else {
             return "The selected audio is unavailable."
         }
         // Any earlier preview has been let go, and its material with it.
@@ -1082,6 +1124,19 @@ private enum MeterMode: UInt32, CaseIterable {
     }
 }
 
+private enum WideExportMode: UInt32, CaseIterable {
+    case binauralFiles, monoFiles, multichannel, binauralMix
+
+    var label: String {
+        switch self {
+        case .binauralFiles: "Binaural, one file per channel"
+        case .monoFiles: "Mono, one file per channel"
+        case .multichannel: "One multichannel file"
+        case .binauralMix: "One binaural mix"
+        }
+    }
+}
+
 private enum ExportFolder: Int {
     case output
     case saved
@@ -1107,6 +1162,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var receiverPreferencesName: String?
     private let startupUpdater = StartupUpdater()
     private lazy var snapshotShortcut = SnapshotShortcut { [weak self] in self?.dispatchSnapshotShortcut() }
+    private var hotkeys = RecorderHotkeys()
+    private var recordingShortcut: (action: RecorderAction, index: Int)?
+    private var hotkeyNote: String?
+    private weak var snapshotShortcutLabel: NSTextField?
     private var lastShortcutCheck = 0.0
     private var snapshotTargetID: String?
     private weak var snapshotTargetPopup: NSPopUpButton?
@@ -1132,10 +1191,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private let meterBButton = NSButton(title: "B — dBFS", target: nil, action: nil)
     private var sourcePopups: [NSPopUpButton] = []
     private var routePopups: [NSPopUpButton] = []
-    private var routeRowB: NSView?
     private var waveformModePopup: NSPopUpButton?
-    private var meterALabel: NSTextField?
-    private var meterBRow: NSView?
+    private let moreMetersButton = NSButton(title: "", target: nil, action: nil)
+    private var addSourcePopup: NSPopUpButton?
+    private weak var sourcesCapacityNote: NSTextField?
+    private weak var captureCapacityNote: NSTextField?
     private var secondsIntervalPopup: NSPopUpButton?
     private var borderDependents: [NSControl] = []
     private var outlineColorButton: NSButton?
@@ -1149,8 +1209,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var optionsWaveformButton: NSButton?
     private var optionsLoginButton: NSButton?
     private var optionsVisibilityButton: NSButton?
-    private var optionsMeterPopup: NSPopUpButton?
-    private var optionsMeterBPopup: NSPopUpButton?
+    private var optionsMeterPopups: [NSPopUpButton] = []
     private var optionsNotice: NSTextField?
     private var outputPathLabel: NSTextField?
     private var savedPathLabel: NSTextField?
@@ -1169,6 +1228,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var idleSeconds: UInt32 = 10
     private var transparency: UInt32 = 0
     private var accentRGB = defaultAccentRGB
+    private var frequencyColoring = false
+    private var frequencyGradient = FrequencyGradient.standard
+    private var frequencyGradientControls: NSStackView?
+    private weak var frequencyGradientPreview: FrequencyGradientPreview?
     private var showsBars = false
     private var showsSeconds = false
     private var secondsInterval: UInt32 = 5
@@ -1182,11 +1245,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     private var statusMark: StatusMark = .always
     // The drag-and-drop folder's housekeeping. Extra capture windows leave it to the main one.
     private var cleanup: OpaquePointer?
-    private var meterMode: MeterMode = .dbfs
-    private var meterModeB: MeterMode = .dbfs
-    private var laneA = CaptureLane(source: .system)
-    private var laneB = CaptureLane(source: .microphone(""))
-    private var dualSource = false
+    private var meterModes: [MeterMode] = [.dbfs]
+    private var captureLanes = [CaptureLane(source: .system)]
+    private var dualSource: Bool { captureLanes.count > 1 }
+    private var multipleRows: Bool {
+        let width = tap?.channelCount(for: 0) ?? 0
+        return dualSource || width > 2 || (stereoWaveform && width == 2)
+    }
     /// The names the user gave sources for their files, by source key. A name belongs to the
     /// device, so it follows it to either lane.
     private var sourceFileNames: [String: String] = [:]
@@ -1194,18 +1259,17 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     /// The source each File name field shows the name of, so typing never names another one.
     private var fileNameSourceKeys: [String] = []
     private var fileNameNotes: [NSTextField] = []
-    private var fileNameRowB: NSView?
-    /// Lanes A and B are selected, previewed, dragged out and saved on their own. Only two
-    /// sources have lanes to separate, and the choice is not kept between launches.
+    /// Select, preview, drag and save one source at a time while multiple sources record.
     private var separateLanes = false
     private var stereoWaveform = false
     private var microphonePromptPending = false
     private var lastSourceCheck = 0.0
 
-    private var captureLanes: [CaptureLane] { dualSource ? [laneA, laneB] : [laneA] }
     private var exportSampleRate: UInt32 = 48_000
     private var exportBitsPerSample: UInt32 = 32
+    private var wideExportMode: WideExportMode = .binauralFiles
     private(set) var forceMonoExport = false
+    private(set) var pairBinaural = false
     private var alwaysOnTop = true
     private var waveformOnly = false
     private var paused = true
@@ -1219,6 +1283,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             history = saved
         }
         retainSilence = defaults.bool(forKey: "retainSilence")
+        hotkeys = RecorderHotkeys(data: defaults.data(forKey: "recorderHotkeys"))
+        snapshotShortcut.bindings = hotkeys[.globalSnapshot]
         // The old idleSeconds key stored 0 for manual mode.
         if let seconds = unsignedSetting(autoResumePreferenceKey), autoResumeChoices.contains(seconds) {
             idleSeconds = seconds
@@ -1228,6 +1294,11 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         if let saved = unsignedSetting("accentRGB"), saved <= 0xFFFFFF {
             accentRGB = saved
+        }
+        frequencyColoring = defaults.bool(forKey: "waveformColorByFrequency")
+        if let settings = defaults.array(forKey: "waveformFrequencyGradient") as? [[String: Any]],
+           let saved = FrequencyGradient(settings: settings) {
+            frequencyGradient = saved
         }
         showsBars = defaults.bool(forKey: "showsBars")
         showsSeconds = defaults.bool(forKey: "showsSeconds")
@@ -1258,9 +1329,6 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
            CGFloat(height.doubleValue) >= fullPanelMinimum.height {
             fullPanelSize = NSSize(width: CGFloat(width.doubleValue), height: CGFloat(height.doubleValue))
         }
-        if let saved = unsignedSetting("meterMode"), let mode = MeterMode(rawValue: saved) {
-            meterMode = mode
-        }
         if let saved = unsignedSetting("exportSampleRate"), exportSampleRates.contains(saved) {
             exportSampleRate = saved
         }
@@ -1268,11 +1336,56 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             exportBitsPerSample = saved
         }
         forceMonoExport = defaults.bool(forKey: "forceMonoExport")
+        pairBinaural = defaults.bool(forKey: "pairBinaural")
+        if let raw = unsignedSetting("wideExportMode"), let mode = WideExportMode(rawValue: raw) { wideExportMode = mode }
         alwaysOnTop = (defaults.object(forKey: "alwaysOnTop") as? Bool) ?? true
         waveformOnly = (defaults.object(forKey: "waveformOnly") as? Bool) ?? false
         if independentWindow { beginCaptureAfterUpdate() }
         else { startupUpdater.checkAtLaunch { [weak self] in self?.beginCaptureAfterUpdate() } }
     }
+
+    #if BACKTRACKING_CAPTURE_VERIFY
+    static func verifyOptions() throws {
+        let controller = BacktrackingController()
+        let suite = "com.backtracking.verify.\(UUID())"
+        guard let fixture = UserDefaults(suiteName: suite) else { throw CaptureError("Missing settings fixture") }
+        defer { fixture.removePersistentDomain(forName: suite) }
+        controller.defaults = fixture
+        fixture.set("system", forKey: "captureSourceA")
+        fixture.set("mic:fixture", forKey: "captureSourceB")
+        fixture.set(Int(CaptureRoute.left.rawValue), forKey: "captureRouteB")
+        fixture.set(true, forKey: "dualCaptureSource")
+        fixture.set(Int(MeterMode.vu.rawValue), forKey: "meterModeB")
+        controller.loadCapturePreferences()
+        guard controller.captureLanes == [CaptureLane(source: .system), CaptureLane(source: .microphone("fixture"), route: .left)],
+              controller.meterModes == [.dbfs, .vu] else { throw CaptureError("Legacy A/B settings were lost") }
+        fixture.set([
+            ["source": "system", "route": 0], ["source": "mic:fixture", "route": 1],
+            ["source": "sender:abc", "route": 6]
+        ], forKey: "captureLanes")
+        fixture.set([0, 1, 2], forKey: "meterModes")
+        controller.loadCapturePreferences()
+        let sources = controller.makeSourceTab()
+        let appearance = controller.makeAppearanceTab()
+        let hotkeys = controller.makeHotkeysTab()
+        let tabs = NSTabView(frame: NSRect(x: 0, y: 0, width: 600, height: 360))
+        tabs.addTabViewItem(sources)
+        tabs.addTabViewItem(appearance)
+        tabs.addTabViewItem(hotkeys)
+        tabs.selectTabViewItem(sources)
+        controller.optionTabs = tabs
+        let replacement = controller.makeSourceTab()
+        controller.replaceOptionsTab(with: replacement)
+        let rows = WaveformRow.layout(widths: [1, 2, 3], labels: [[], [], ["FL", "FR", "FC"]], stereo: false)
+        guard tabs.selectedTabViewItem === replacement, replacement.view?.superview != nil,
+              tabs.tabViewItems.map(\.label) == ["Sources", "Appearance", "Hotkeys"],
+              controller.sourcePopups.count == 3, controller.addSourcePopup != nil,
+              controller.optionsMeterPopups.count == 3, controller.meterModes == [.dbfs, .vu, .lufs],
+              rows.map(\.view) == [0, 0, 67, 68, 3, 4, 5], rows.last?.title == "C · FC" else {
+            throw CaptureError("The Options or waveform rows do not match the loaded sources")
+        }
+    }
+    #endif
 
     private func beginCaptureAfterUpdate() {
         loadCapturePreferences()
@@ -1289,16 +1402,33 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func loadCapturePreferences() {
-        if let saved = defaults.string(forKey: "captureSourceA"), let source = CaptureSource(key: saved) {
-            laneA.source = source
+        let saved = defaults.array(forKey: "captureLanes") as? [[String: Any]] ?? []
+        let loaded: [CaptureLane] = saved.prefix(maximumCaptureLanes).compactMap { item in
+            guard let key = item["source"] as? String, let source = CaptureSource(key: key),
+                  let number = item["route"] as? NSNumber, let raw = UInt32(exactly: number.doubleValue),
+                  let route = CaptureRoute(rawValue: raw) else { return nil }
+            return CaptureLane(source: source, route: route)
         }
-        if let saved = defaults.string(forKey: "captureSourceB"), let source = CaptureSource(key: saved) {
-            laneB.source = source
+        if !loaded.isEmpty, loaded.count == saved.count {
+            captureLanes = loaded
+            let modes = defaults.array(forKey: "meterModes") ?? []
+            meterModes = captureLanes.indices.map { index in
+                guard modes.indices.contains(index), let number = modes[index] as? NSNumber,
+                      let raw = UInt32(exactly: number.doubleValue) else { return .dbfs }
+                return MeterMode(rawValue: raw) ?? .dbfs
+            }
+        } else {
+            let first = defaults.string(forKey: "captureSourceA").flatMap(CaptureSource.init(key:)) ?? .system
+            let routeA = unsignedSetting("captureRouteA").flatMap(CaptureRoute.init(rawValue:)) ?? .merged
+            captureLanes = [CaptureLane(source: first, route: routeA)]
+            meterModes = [unsignedSetting("meterMode").flatMap(MeterMode.init(rawValue:)) ?? .dbfs]
+            if defaults.bool(forKey: "dualCaptureSource") {
+                let second = defaults.string(forKey: "captureSourceB").flatMap(CaptureSource.init(key:)) ?? .microphone("")
+                let routeB = unsignedSetting("captureRouteB").flatMap(CaptureRoute.init(rawValue:)) ?? .merged
+                captureLanes.append(CaptureLane(source: second, route: routeB))
+                meterModes.append(unsignedSetting("meterModeB").flatMap(MeterMode.init(rawValue:)) ?? .dbfs)
+            }
         }
-        if let raw = unsignedSetting("captureRouteA"), let route = CaptureRoute(rawValue: raw) { laneA.route = route }
-        if let raw = unsignedSetting("captureRouteB"), let route = CaptureRoute(rawValue: raw) { laneB.route = route }
-        if let raw = unsignedSetting("meterModeB"), let mode = MeterMode(rawValue: raw) { meterModeB = mode }
-        dualSource = defaults.bool(forKey: "dualCaptureSource")
         stereoWaveform = defaults.bool(forKey: "stereoWaveform")
         if let names = defaults.dictionary(forKey: sourceFileNamesKey) as? [String: String] {
             sourceFileNames = names.filter { !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -1315,7 +1445,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     /// How the core begins the names of a source's files: everything before the date.
-    /// `lane` is 0 for a single source, 1 for A and 2 for B.
+    /// `lane` is 0 for a single source, or the one-based lane index.
     private func filePrefix(_ name: String, lane: UInt32) -> String {
         guard let prefix = name.withCString({ bt_take_file_prefix($0, lane) }) else { return "" }
         defer { bt_string_free(prefix) }
@@ -1411,7 +1541,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             refreshSnapshotTargets()
             return
         }
-        if let source = sourcePopups.first(where: { $0.menu === menu }) {
+        if let source = sourcePopups.first(where: { $0.menu === menu })
+            ?? (addSourcePopup?.menu === menu ? addSourcePopup : nil) {
             refreshSourcePopup(source, choices: availableCaptureSources(excluding: tap?.privatePlaybackDevices ?? []))
             return
         }
@@ -1472,11 +1603,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         window.onClick = { [weak self] in self?.registerClick() }
         window.onMenu = { [weak self] event in self?.showContextMenu(with: event) }
         window.onCommand = { [weak self] command in self?.run(command) ?? false }
+        window.actionForShortcut = { [weak self] shortcut in self?.hotkeys.windowAction(for: shortcut) }
 
         let waveform = WaveformView(frame: .zero)
         waveform.controller = self
         waveform.accentRGB = accentRGB
         waveform.stereo = stereoWaveform
+        waveform.frequencyGradient = frequencyColoring ? frequencyGradient : nil
         let minimumWaveformHeight = waveform.heightAnchor.constraint(greaterThanOrEqualToConstant: fullWaveformMinimumHeight)
         minimumWaveformHeight.isActive = true
         waveformMinimumHeight = minimumWaveformHeight
@@ -1503,8 +1636,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             button.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
             button.widthAnchor.constraint(equalToConstant: 100).isActive = true
         }
-        meterButton.isHidden = !showsMeters
-        meterBButton.isHidden = !showsMeters || !dualSource
+        moreMetersButton.target = self
+        moreMetersButton.action = #selector(showMoreMeters(_:))
+        moreMetersButton.bezelStyle = .rounded
+        updateMeter()
 
         pinButton.target = self
         pinButton.action = #selector(pinChanged(_:))
@@ -1519,7 +1654,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         // the left, the meters and Options on the right.
         let controls = NSStackView(views: [
             titleLabel, captureButton, captureLamp, clearButton, pinButton, statusLabel, spacer,
-            meterButton, meterBButton, settingsButton
+            meterButton, meterBButton, moreMetersButton, settingsButton
         ])
         controls.orientation = .horizontal
         controls.spacing = 6
@@ -1606,11 +1741,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func makeOptionsPanel() -> KeyPanel {
-        let window = KeyPanel(
+        let window = HotkeyOptionsPanel(
             contentRect: NSRect(x: 0, y: 0, width: 760, height: 560),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false
         )
         window.title = independentWindow ? "Backtracking Capture Options" : "Backtracking Options"
+        window.recordKey = { [weak self] event in self?.recordHotkey(event) ?? false }
+        window.cancelRecording = { [weak self] in self?.cancelHotkeyRecording() }
         window.contentMinSize = NSSize(width: 680, height: 460)
         window.isReleasedWhenClosed = false
         window.isFloatingPanel = true
@@ -1620,7 +1757,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let content = NSView(frame: .zero)
         let tabs = NSTabView(frame: .zero)
         tabs.tabViewType = .noTabsNoBorder
-        var pages = [makeActionTab(), makeCaptureTab(), makeSourceTab(), makeAppearanceTab(), makeExportTab()]
+        var pages = [makeActionTab(), makeCaptureTab(), makeSourceTab(), makeAppearanceTab(), makeExportTab(), makeHotkeysTab()]
         if !independentWindow { pages.append(makeUpdateTab()) }
         for page in pages { tabs.addTabViewItem(page) }
         optionTabs = tabs
@@ -1692,6 +1829,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     @objc private func selectOptionCategory(_ sender: NSButton) {
+        cancelHotkeyRecording()
         optionCategory = sender.tag
         optionTabs?.selectTabViewItem(at: optionCategory)
         for button in optionCategoryButtons { button.state = button === sender ? .on : .off }
@@ -1731,7 +1869,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         prepareOptionPopup(target)
         snapshotTargetPopup = target
         refreshSnapshotTargets()
-        let shortcut = NSTextField(labelWithString: "Fn/Globe + the key left of 1")
+        let shortcut = NSTextField(labelWithString: globalShortcutTitle)
+        snapshotShortcutLabel = shortcut
         let permission = NSButton(title: "Allow Input Monitoring", target: self, action: #selector(requestShortcutPermission))
         shortcutPermissionButton = permission
         refreshShortcutPermission()
@@ -1787,7 +1926,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     private func refreshShortcutPermission() {
         let authorized = CGPreflightListenEventAccess()
-        shortcutPermissionButton?.isHidden = snapshotShortcut.isListening
+        shortcutPermissionButton?.isHidden = snapshotShortcut.isListening || hotkeys[.globalSnapshot].isEmpty
         shortcutPermissionButton?.title = authorized ? "Reconnect the global shortcut" : "Allow Input Monitoring"
     }
 
@@ -1797,7 +1936,145 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         refreshShortcutPermission()
     }
 
+    private var globalShortcutTitle: String {
+        let shortcuts = hotkeys[.globalSnapshot].map(\.title)
+        return shortcuts.isEmpty ? "Off" : shortcuts.joined(separator: " / ")
+    }
+
+    private func makeHotkeysTab() -> NSTabViewItem {
+        var groups: [NSView] = []
+        for (index, action) in RecorderAction.allCases.enumerated() {
+            guard action != .globalSnapshot || !independentWindow else { continue }
+            let shortcuts = hotkeys[action]
+            var buttons = shortcuts.enumerated().map { position, shortcut -> NSButton in
+                let button = NSButton(title: shortcut.title, target: self, action: #selector(startHotkeyRecording(_:)))
+                if recordingShortcut?.action == action, recordingShortcut?.index == position { button.title = "Press keys…" }
+                button.tag = index * 2 + position
+                return button
+            }
+            if shortcuts.count < 2 {
+                let title = shortcuts.isEmpty ? "Set shortcut…" : "Add another"
+                let add = NSButton(title: title, target: self, action: #selector(startHotkeyRecording(_:)))
+                if recordingShortcut?.action == action, recordingShortcut?.index == shortcuts.count { add.title = "Press keys…" }
+                add.tag = index * 2 + shortcuts.count
+                buttons.append(add)
+            }
+            let clear = NSButton(title: "Clear", target: self, action: #selector(clearHotkey(_:)))
+            clear.tag = index
+            clear.isEnabled = !shortcuts.isEmpty
+            let reset = NSButton(title: "Reset", target: self, action: #selector(resetHotkey(_:)))
+            reset.tag = index
+            reset.isEnabled = shortcuts != action.presets
+            var rows: [NSView] = [optionField(action.title, buttonRow(buttons)), buttonRow([clear, reset])]
+            if action == .globalSnapshot {
+                rows.append(optionNote("Works when another app is focused. Requires Input Monitoring."))
+            }
+            groups.append(optionGroup(nil, rows: rows))
+        }
+        let reset = NSButton(title: "Reset all", target: self, action: #selector(resetAllHotkeys))
+        groups.append(optionGroup(nil, rows: [
+            buttonRow([reset]),
+            optionNote("Option-drag selects, Shift-drag snaps, and Option-drag on a flag fades. Scroll to zoom, and middle-drag to pan.")
+        ]))
+        if let hotkeyNote { groups.insert(optionGroup(nil, rows: [optionNote(hotkeyNote)]), at: 0) }
+        return optionsTab("Hotkeys", groups: groups)
+    }
+
+    @objc private func startHotkeyRecording(_ sender: NSButton) {
+        let action = RecorderAction.allCases[sender.tag / 2]
+        recordingShortcut = (action, sender.tag % 2)
+        snapshotShortcut.recording = true
+        hotkeyNote = "Press keys for \(action.title). Escape cancels."
+        reloadHotkeysTab()
+    }
+
+    private func recordHotkey(_ event: NSEvent) -> Bool {
+        guard let editing = recordingShortcut else { return false }
+        guard !event.isARepeat else { return true }
+        if event.keyCode == UInt16(kVK_Escape) {
+            cancelHotkeyRecording()
+            return true
+        }
+        let shortcut = RecorderShortcut(event: event)
+        var modified = hotkeys[editing.action]
+        if modified.indices.contains(editing.index) { modified[editing.index] = shortcut }
+        else { modified.append(shortcut) }
+        if let reason = hotkeys.set(modified, for: editing.action) {
+            hotkeyNote = reason
+            reloadHotkeysTab()
+            return true
+        }
+        finishHotkeyEdit()
+        return true
+    }
+
+    private func cancelHotkeyRecording() {
+        guard recordingShortcut != nil else { return }
+        recordingShortcut = nil
+        snapshotShortcut.recording = false
+        hotkeyNote = nil
+        reloadHotkeysTab()
+    }
+
+    @objc private func clearHotkey(_ sender: NSButton) { changeHotkey(sender.tag, reset: false) }
+
+    @objc private func resetHotkey(_ sender: NSButton) { changeHotkey(sender.tag, reset: true) }
+
+    private func changeHotkey(_ index: Int, reset: Bool) {
+        let action = RecorderAction.allCases[index]
+        if let reason = hotkeys.set(reset ? action.presets : [], for: action) {
+            hotkeyNote = reason
+            reloadHotkeysTab()
+            return
+        }
+        finishHotkeyEdit()
+    }
+
+    @objc private func resetAllHotkeys() {
+        hotkeys = RecorderHotkeys()
+        finishHotkeyEdit()
+    }
+
+    private func finishHotkeyEdit() {
+        recordingShortcut = nil
+        hotkeyNote = nil
+        snapshotShortcut.recording = false
+        defaults.set(hotkeys.data, forKey: "recorderHotkeys")
+        snapshotShortcut.bindings = hotkeys[.globalSnapshot]
+        if !independentWindow {
+            if snapshotShortcut.bindings.isEmpty { snapshotShortcut.stop() }
+            else { snapshotShortcut.start() }
+        }
+        snapshotShortcutLabel?.stringValue = globalShortcutTitle
+        refreshShortcutPermission()
+        reloadHotkeysTab()
+    }
+
+    private func reloadHotkeysTab() {
+        guard optionTabs != nil else { return }
+        replaceOptionsTab(with: makeHotkeysTab())
+    }
+
+    private func replaceOptionsTab(with page: NSTabViewItem) {
+        guard let tabs = optionTabs,
+              let index = tabs.tabViewItems.firstIndex(where: { $0.label == page.label }) else { return }
+        let previous = tabs.tabViewItem(at: index)
+        let selected = tabs.selectedTabViewItem === previous
+        let offset = (previous.view as? NSScrollView)?.contentView.bounds.origin ?? .zero
+        tabs.insertTabViewItem(page, at: index)
+        if selected { tabs.selectTabViewItem(page) }
+        tabs.removeTabViewItem(previous)
+        if selected, let scroll = page.view as? NSScrollView {
+            scroll.layoutSubtreeIfNeeded()
+            scroll.contentView.scroll(to: offset)
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
+    }
+
     private func makeCaptureTab() -> NSTabViewItem {
+        let capacity = optionNote("")
+        captureCapacityNote = capacity
+        updateCaptureCapacity()
         let quietSections = NSButton(
             checkboxWithTitle: "Keep quiet sections", target: self, action: #selector(retainSilenceChanged(_:))
         )
@@ -1808,7 +2085,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                     "Retain the latest audio", choices: timeChoices, selected: history,
                     action: #selector(historyChanged(_:))
                 ) { $0 > 60 ? "\($0 / 60) minutes" : "\($0) seconds" },
+                capacity,
                 quietSections,
+                optionChoice("L/R of multichannel sources", choices: [0, 1], selected: pairBinaural ? 1 : 0,
+                    action: #selector(pairBinauralChanged(_:))) { $0 == 0 ? "Stereo" : "Binaural" },
                 optionChoice(
                     "Auto-resume delay", choices: autoResumeChoices, selected: idleSeconds,
                     action: #selector(idleChanged(_:))
@@ -1822,6 +2102,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             checkboxWithTitle: "Export every file as mono", target: self, action: #selector(exportMonoChanged(_:))
         )
         mono.state = forceMonoExport ? .on : .off
+        let wide = optionChoice("Multichannel sources", choices: WideExportMode.allCases.map(\.rawValue),
+            selected: wideExportMode.rawValue, action: #selector(wideExportModeChanged(_:))) {
+                WideExportMode(rawValue: $0)?.label ?? ""
+            }
         var folders: [NSView] = [folderOptions(.output)]
         // Other capture windows share the folder but leave its housekeeping to the main one.
         if !independentWindow { folders.append(cleanupOptions()) }
@@ -1836,7 +2120,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                     "WAV encoding", choices: exportBitDepths, selected: exportBitsPerSample,
                     action: #selector(exportEncodingChanged(_:))
                 ) { $0 == 32 ? "32-bit float" : "\($0)-bit PCM" },
-                mono
+                mono, wide
             ]),
             optionGroup(nil, rows: folders)
         ])
@@ -1909,9 +2193,14 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func makeSourceTab() -> NSTabViewItem {
+        sourcePopups.removeAll()
+        routePopups.removeAll()
+        fileNameFields.removeAll()
+        fileNameNotes.removeAll()
+        fileNameSourceKeys.removeAll()
         var groups: [NSView] = []
-        for (index, configuration) in [laneA, laneB].enumerated() {
-            let label = index == 0 ? "A" : "B"
+        for (index, configuration) in captureLanes.enumerated() {
+            let label = captureLaneLetter(index)
             let source = OptionsPopUpButton(frame: .zero, pullsDown: false)
             source.target = self
             source.tag = index
@@ -1942,13 +2231,30 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             source.setAccessibilityLabel("Source \(label) audio source")
             route.setAccessibilityLabel("Source \(label) channel route")
             name.setAccessibilityLabel("Source \(label) file name")
-            // Source B has no route or name while it is Off.
-            if index == 1 {
-                routeRowB = routeField
-                fileNameRowB = nameField
+            var rows: [NSView] = [sourceField, routeField, nameField]
+            if dualSource {
+                let remove = NSButton(title: "Remove", target: self, action: #selector(removeSource(_:)))
+                remove.tag = index
+                remove.setAccessibilityLabel("Remove source \(label)")
+                rows.append(buttonRow([remove]))
             }
-            groups.append(optionGroup("Source \(label)", rows: [sourceField, routeField, nameField]))
+            groups.append(optionGroup("Source \(label)", rows: rows))
         }
+        let add = OptionsPopUpButton(frame: .zero, pullsDown: false)
+        add.target = self
+        add.action = #selector(addSource(_:))
+        add.autoenablesItems = false
+        add.menu?.delegate = self
+        add.tag = -1
+        prepareOptionPopup(add)
+        addSourcePopup = add
+        let capacity = optionNote("")
+        sourcesCapacityNote = capacity
+        updateCaptureCapacity()
+        groups.append(optionGroup(nil, rows: [
+            optionField("Add source", add), capacity,
+            optionNote("Adding, removing or changing a source starts a new capture history.")
+        ]))
         return optionsTab("Sources", groups: groups)
     }
 
@@ -1973,7 +2279,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
 
     /// Shows under each File name field how that lane's files will begin.
     private func refreshFileNameNotes() {
-        for (index, lane) in [laneA, laneB].enumerated() where index < fileNameNotes.count {
+        for (index, lane) in captureLanes.enumerated() where index < fileNameNotes.count {
             let letter: UInt32 = dualSource ? UInt32(index + 1) : 0
             fileNameNotes[index].stringValue = "Files start with \(filePrefix(fileName(for: lane.source), lane: letter))"
         }
@@ -1995,22 +2301,21 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func refreshSourceOptions() {
-        guard sourcePopups.count == 2, routePopups.count == 2 else { return }
+        updateCaptureCapacity()
+        guard sourcePopups.count == captureLanes.count, routePopups.count == captureLanes.count else { return }
         let choices = availableCaptureSources(excluding: tap?.privatePlaybackDevices ?? [])
-        for (index, lane) in [laneA, laneB].enumerated() {
+        for (index, lane) in captureLanes.enumerated() {
             refreshSourcePopup(sourcePopups[index], choices: choices)
             let route = routePopups[index]
-            route.isEnabled = index == 0 || dualSource
+            route.isEnabled = !editing
             route.selectItem(withTag: Int(lane.route.rawValue))
             for item in route.itemArray {
                 guard let raw = UInt32(exactly: item.tag), let selection = CaptureRoute(rawValue: raw) else { continue }
                 item.isEnabled = selection == lane.route || tap?.supports(selection, lane: index) == true
-                    || (tap == nil && selection != .center)
+                    || (tap == nil && selection != .center && selection != .allChannels)
             }
         }
-        routeRowB?.isHidden = !dualSource
-        fileNameRowB?.isHidden = !dualSource
-        for (index, lane) in [laneA, laneB].enumerated() where index < fileNameFields.count && index < fileNameSourceKeys.count {
+        for (index, lane) in captureLanes.enumerated() where index < fileNameFields.count && index < fileNameSourceKeys.count {
             let field = fileNameFields[index]
             field.placeholderString = defaultFileName(for: lane.source)
             // A field being typed in keeps what it shows, unless its lane now records another
@@ -2023,21 +2328,43 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
         refreshFileNameNotes()
         waveformModePopup?.isEnabled = !dualSource
-        meterALabel?.stringValue = dualSource ? "Meter A" : "Meter"
-        optionsMeterPopup?.setAccessibilityLabel(dualSource ? "Meter A" : "Meter")
-        meterBRow?.isHidden = !dualSource
+        if let addSourcePopup {
+            refreshSourcePopup(addSourcePopup, choices: choices)
+            addSourcePopup.isEnabled = captureLanes.count < maximumCaptureLanes && !editing
+            addSourcePopup.toolTip = captureLanes.count >= maximumCaptureLanes
+                ? "The recorder has reached the 64-source limit." : addSourcePopup.titleOfSelectedItem
+        }
+    }
+
+    private func updateCaptureCapacity() {
+        guard let tap else {
+            sourcesCapacityNote?.isHidden = true
+            captureCapacityNote?.isHidden = true
+            return
+        }
+        let kept = Int(tap.retainedSeconds)
+        let channels = tap.totalChannelCount
+        let shortNote = kept < history ? "With \(channels) channels, memory holds the latest \(kept) seconds." : nil
+        sourcesCapacityNote?.isHidden = false
+        sourcesCapacityNote?.stringValue = ["\(channels) of 64 channels in use", shortNote].compactMap { $0 }.joined(separator: ". ")
+        captureCapacityNote?.isHidden = shortNote == nil
+        captureCapacityNote?.stringValue = shortNote ?? ""
     }
 
     private func refreshSourcePopup(_ popup: NSPopUpButton, choices: [(source: CaptureSource, title: String)]) {
-        let second = popup.tag == 1
-        let configured = second ? laneB.source : laneA.source
+        let adding = popup.tag == -1
+        let configured = captureLanes.indices.contains(popup.tag) ? captureLanes[popup.tag].source : nil
         popup.removeAllItems()
         var selectedIndex: Int?
-        if second {
+        if adding {
+            popup.addItem(withTitle: "Choose audio source…")
+            popup.lastItem?.isEnabled = false
+            selectedIndex = 0
+        } else if popup.tag > 0 {
             popup.addItem(withTitle: "Off")
             popup.lastItem?.representedObject = offSourceKey
-            if !dualSource { selectedIndex = 0 }
         }
+        if !adding { popup.isEnabled = !editing }
         var uses: [String: Int] = [:]
         for choice in choices { uses[choice.title, default: 0] += 1 }
         for choice in choices {
@@ -2060,7 +2387,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             popup.lastItem?.toolTip = detail
             if selectedIndex == nil, configured == choice.source { selectedIndex = popup.numberOfItems - 1 }
         }
-        if selectedIndex == nil {
+        if selectedIndex == nil, let configured {
             popup.addItem(withTitle: "\(configured.label) (unavailable)")
             popup.lastItem?.isEnabled = false
         }
@@ -2073,43 +2400,75 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             refreshSourceOptions()
             return
         }
-        if sender.tag == 1, key == offSourceKey {
-            guard dualSource else { return }
-            dualSource = false
-            defaults.set(false, forKey: "dualCaptureSource")
-            reconnectConfiguredSources()
+        guard captureLanes.indices.contains(sender.tag) else { return }
+        if key == offSourceKey {
+            removeLane(at: sender.tag)
             return
         }
         guard let source = CaptureSource(key: key) else { refreshSourceOptions(); return }
-        var lane = sender.tag == 0 ? laneA : laneB
-        let turningOn = sender.tag == 1 && !dualSource
-        guard turningOn || lane.source != source else { return }
-        // A different source starts on the merged route; the same one keeps its route.
-        if lane.source != source { lane.route = .merged }
-        lane.source = source
-        if turningOn {
-            dualSource = true
-            defaults.set(true, forKey: "dualCaptureSource")
-        }
-        storeLane(lane, index: sender.tag)
+        let lane = CaptureLane(source: source)
+        guard captureLanes[sender.tag].source != source, canConfigure(lane, at: sender.tag) else { return }
+        captureLanes[sender.tag] = lane
+        storeLanes()
     }
 
     @objc private func captureRouteChanged(_ sender: NSPopUpButton) {
-        guard !editing, let value = selectedValue(sender), let route = CaptureRoute(rawValue: value) else {
+        guard !editing, captureLanes.indices.contains(sender.tag),
+              let value = selectedValue(sender), let route = CaptureRoute(rawValue: value) else {
             refreshSourceOptions()
             return
         }
-        var lane = sender.tag == 0 ? laneA : laneB
-        guard route != lane.route else { return }
+        var lane = captureLanes[sender.tag]
+        guard lane.route != route else { return }
         lane.route = route
-        storeLane(lane, index: sender.tag)
+        guard canConfigure(lane, at: sender.tag) else { return }
+        captureLanes[sender.tag] = lane
+        storeLanes()
     }
 
-    private func storeLane(_ lane: CaptureLane, index: Int) {
-        let suffix = index == 0 ? "A" : "B"
-        if index == 0 { laneA = lane } else { laneB = lane }
-        defaults.set(lane.source.key, forKey: "captureSource\(suffix)")
-        defaults.set(Int(lane.route.rawValue), forKey: "captureRoute\(suffix)")
+    @objc private func addSource(_ sender: NSPopUpButton) {
+        guard !editing, captureLanes.count < maximumCaptureLanes,
+              let key = sender.selectedItem?.representedObject as? String,
+              let source = CaptureSource(key: key) else { refreshSourceOptions(); return }
+        let lane = CaptureLane(source: source)
+        guard canConfigure(lane, at: captureLanes.count) else { return }
+        captureLanes.append(lane)
+        meterModes.append(.dbfs)
+        storeLanes(rebuildOptions: true)
+    }
+
+    private func canConfigure(_ lane: CaptureLane, at index: Int) -> Bool {
+        var widths = captureLanes.enumerated().map { current, lane in
+            tap?.channelCount(for: current) ?? SystemAudioTap.estimatedWidth(for: lane)
+        }
+        let width = SystemAudioTap.estimatedWidth(for: lane)
+        if widths.indices.contains(index) { widths[index] = width }
+        else { widths.append(width) }
+        let count = widths.reduce(0, +)
+        guard count <= 64 else {
+            setNotice("Source \(captureLaneLetter(index)) would bring the total to \(count) channels. The limit is 64.")
+            refreshSourceOptions()
+            return false
+        }
+        return true
+    }
+
+    @objc private func removeSource(_ sender: NSButton) { removeLane(at: sender.tag) }
+
+    private func removeLane(at index: Int) {
+        guard !editing, dualSource, captureLanes.indices.contains(index) else { return }
+        captureLanes.remove(at: index)
+        meterModes.remove(at: index)
+        storeLanes(rebuildOptions: true)
+    }
+
+    private func storeLanes(rebuildOptions: Bool = false) {
+        defaults.set(captureLanes.map { ["source": $0.source.key, "route": Int($0.route.rawValue)] }, forKey: "captureLanes")
+        saveMeterModes()
+        if rebuildOptions, optionTabs != nil {
+            replaceOptionsTab(with: makeSourceTab())
+            replaceOptionsTab(with: makeAppearanceTab())
+        }
         reconnectConfiguredSources()
     }
 
@@ -2119,9 +2478,6 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         editing = false
         tap = nil
         waveform?.resetTimeline()
-        // One source has no lanes to separate, and the mode does not come back with a second.
-        if !dualSource { separateLanes = false }
-        waveform?.separateLanes = separateLanes && dualSource
         notice = nil
         captureError = nil
         registerClick()
@@ -2133,6 +2489,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 rememberSourceNames()
             } catch { captureError = error.localizedDescription }
         }
+        if !multipleRows { separateLanes = false }
+        waveform?.separateLanes = separateLanes
         refreshWaveform()
         refreshSourceOptions()
         updateStatus()
@@ -2143,6 +2501,10 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         stereoWaveform = value == 1
         defaults.set(stereoWaveform, forKey: "stereoWaveform")
         waveform?.stereo = stereoWaveform
+        if !multipleRows {
+            separateLanes = false
+            waveform?.separateLanes = false
+        }
         refreshWaveform()
     }
 
@@ -2185,22 +2547,20 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             [0, 1], selected: stereoWaveform ? 1 : 0, action: #selector(waveformModeChanged(_:))
         ) { $0 == 0 ? "Merged" : "Left / Right" }
         waveformModePopup = stereo
-        let meter = choiceControl(
-            MeterMode.allCases.map(\.rawValue), selected: meterMode.rawValue, action: #selector(meterChanged(_:))
-        ) { MeterMode(rawValue: $0)?.label ?? "" }
-        optionsMeterPopup = meter
-        let meterB = choiceControl(
-            MeterMode.allCases.map(\.rawValue), selected: meterModeB.rawValue, action: #selector(meterChanged(_:))
-        ) { MeterMode(rawValue: $0)?.label ?? "" }
-        meterB.tag = 1
-        optionsMeterBPopup = meterB
-        // With one source the meter needs no letter, as on Windows.
-        let meterName = NSTextField(labelWithString: dualSource ? "Meter A" : "Meter")
-        meterALabel = meterName
-        let meterBField = optionField("Meter B", meterB)
-        meterBField.isHidden = !dualSource
-        meterBRow = meterBField
-
+        optionsMeterPopups = []
+        let meterFields = meterModes.enumerated().map { lane, mode -> NSView in
+            let meter = choiceControl(
+                MeterMode.allCases.map(\.rawValue), selected: mode.rawValue, action: #selector(meterChanged(_:))
+            ) { MeterMode(rawValue: $0)?.label ?? "" }
+            meter.tag = lane
+            optionsMeterPopups.append(meter)
+            return optionField(dualSource ? "Meter \(captureLaneLetter(lane))" : "Meter", meter)
+        }
+        let coloring = choiceControl([0, 1], selected: frequencyColoring ? 1 : 0,
+            action: #selector(frequencyColoringChanged(_:))) { $0 == 0 ? "Single color" : "By frequency" }
+        let frequencyControls = optionsStack([], spacing: 8)
+        frequencyGradientControls = frequencyControls
+        refreshFrequencyGradientControls()
         let tab = optionsTab("Appearance", groups: [
             optionGroup("Window", rows: [
                 waveform,
@@ -2230,12 +2590,103 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             ]),
             optionGroup("Display", rows: [
                 optionField("Single-source waveform", stereo),
-                optionField(meterName, meter),
-                meterBField
-            ])
+                optionField("Waveform color", coloring),
+                frequencyControls
+            ] + meterFields)
         ])
         updateAppearanceDependencies()
         return tab
+    }
+
+    private func refreshFrequencyGradientControls() {
+        guard let controls = frequencyGradientControls else { return }
+        for view in controls.arrangedSubviews {
+            controls.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        controls.isHidden = !frequencyColoring
+        guard frequencyColoring else { return }
+        let preview = FrequencyGradientPreview(frame: .zero)
+        preview.gradient = frequencyGradient
+        preview.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        preview.setAccessibilityElement(true)
+        preview.setAccessibilityLabel("Waveform gradient from low to high frequency")
+        frequencyGradientPreview = preview
+        var rows: [NSView] = [optionField("Low to high frequencies", preview)]
+        for (index, stop) in frequencyGradient.stops.enumerated() {
+            let color = NSColorWell(frame: .zero)
+            color.color = accentColor(stop.rgb)
+            color.tag = index
+            color.target = self
+            color.action = #selector(frequencyStopColorChanged(_:))
+            color.setAccessibilityLabel("Frequency color \(index + 1)")
+            let position = NSSlider(value: stop.position, minValue: 0, maxValue: 1,
+                target: self, action: #selector(frequencyStopPositionChanged(_:)))
+            position.tag = index
+            position.setAccessibilityLabel("Frequency stop \(index + 1) position")
+            let remove = NSButton(title: "Remove", target: self, action: #selector(removeFrequencyStop(_:)))
+            remove.tag = index
+            remove.isEnabled = frequencyGradient.stops.count > 2
+            let row = NSStackView(views: [color, position, remove])
+            row.spacing = 8
+            rows.append(optionField("Stop \(index + 1)", row))
+        }
+        let add = NSButton(title: "Add stop", target: self, action: #selector(addFrequencyStop))
+        add.isEnabled = frequencyGradient.stops.count < 8
+        let reset = NSButton(title: "Reset gradient", target: self, action: #selector(resetFrequencyGradient))
+        rows.append(optionControlRow(buttonRow([add, reset])))
+        for row in rows {
+            controls.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: controls.widthAnchor).isActive = true
+        }
+    }
+
+    @objc private func frequencyColoringChanged(_ sender: NSPopUpButton) {
+        frequencyColoring = selectedValue(sender) == 1
+        defaults.set(frequencyColoring, forKey: "waveformColorByFrequency")
+        waveform?.frequencyGradient = frequencyColoring ? frequencyGradient : nil
+        refreshFrequencyGradientControls()
+        refreshWaveform()
+    }
+
+    private func storeFrequencyGradient(refreshControls: Bool = false) {
+        defaults.set(frequencyGradient.settings, forKey: "waveformFrequencyGradient")
+        frequencyGradientPreview?.gradient = frequencyGradient
+        waveform?.frequencyGradient = frequencyColoring ? frequencyGradient : nil
+        if refreshControls { refreshFrequencyGradientControls() }
+    }
+
+    @objc private func frequencyStopColorChanged(_ sender: NSColorWell) {
+        guard frequencyGradient.stops.indices.contains(sender.tag),
+              let color = sender.color.usingColorSpace(.sRGB) else { return }
+        func component(_ value: CGFloat) -> UInt32 {
+            UInt32((min(1, max(0, value)) * 255).rounded())
+        }
+        frequencyGradient.stops[sender.tag].rgb = (component(color.redComponent) << 16)
+            | (component(color.greenComponent) << 8) | component(color.blueComponent)
+        storeFrequencyGradient()
+    }
+
+    @objc private func frequencyStopPositionChanged(_ sender: NSSlider) {
+        guard frequencyGradient.stops.indices.contains(sender.tag) else { return }
+        frequencyGradient.stops[sender.tag].position = sender.doubleValue
+        storeFrequencyGradient()
+    }
+
+    @objc private func removeFrequencyStop(_ sender: NSButton) {
+        guard frequencyGradient.stops.count > 2, frequencyGradient.stops.indices.contains(sender.tag) else { return }
+        frequencyGradient.stops.remove(at: sender.tag)
+        storeFrequencyGradient(refreshControls: true)
+    }
+
+    @objc private func addFrequencyStop() {
+        frequencyGradient = frequencyGradient.addingStop()
+        storeFrequencyGradient(refreshControls: true)
+    }
+
+    @objc private func resetFrequencyGradient() {
+        frequencyGradient = .standard
+        storeFrequencyGradient(refreshControls: true)
     }
 
     /// Greys out the settings that do nothing while the one above them is off.
@@ -2478,7 +2929,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             item.tag = Int(mode.rawValue)
             item.target = self
             item.representedObject = lane
-            item.state = mode == (lane == 0 ? meterMode : meterModeB) ? .on : .off
+            item.state = meterModes.indices.contains(lane) && mode == meterModes[lane] ? .on : .off
             menu.addItem(item)
         }
         return menu
@@ -2517,70 +2968,71 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         let captureControls = !editing
         @discardableResult
         func add(
-            _ title: String, _ action: Selector, target: AnyObject? = nil, key: String = "",
+            _ title: String, _ action: Selector, target: AnyObject? = nil,
             enabled: Bool = true, checked: Bool = false
         ) -> NSMenuItem {
-            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
-            // The keys are the recorder window's own, without a modifier.
-            item.keyEquivalentModifierMask = []
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
             item.target = target ?? self
             item.isEnabled = enabled
             item.state = checked ? .on : .off
             menu.addItem(item)
             return item
         }
-        add(menuTransportLabel, #selector(toggleCapture(_:)), key: " ", enabled: captureControls)
-            .representedObject = paused
-        add("Clear", #selector(clearCapture), key: "\u{F728}", enabled: captureControls)
-        add("Save snapshot", #selector(saveCurrentSnapshot), enabled: captureControls)
+        func showKeys(_ action: RecorderAction, on item: NSMenuItem) {
+            let title = item.title
+            let keys = hotkeys[action].map(\.title).joined(separator: " / ")
+            guard !keys.isEmpty else { return }
+            item.title = "\(title)    \(keys)"
+            item.setAccessibilityLabel("\(title), \(keys)")
+        }
+        let transport = add(menuTransportLabel, #selector(toggleCapture(_:)), enabled: captureControls)
+        transport.representedObject = paused
+        showKeys(.toggleCapture, on: transport)
+        showKeys(.clear, on: add("Clear", #selector(clearCapture), enabled: captureControls))
+        showKeys(.saveSnapshot, on: add("Save snapshot", #selector(saveCurrentSnapshot), enabled: captureControls))
         menu.addItem(.separator())
-        let separate = add(
-            "Edit A and B separately", #selector(toggleSeparateLanes), enabled: dualSource,
-            checked: dualSource && separateLanes
-        )
-        // A menu key cannot be a modifier on its own, so the tap is named after the title, as
-        // the Windows menu names Right Ctrl.
-        let font = NSFont.menuFont(ofSize: 0)
-        let width = (separate.title as NSString).size(withAttributes: [.font: font]).width
-        let style = NSMutableParagraphStyle()
-        style.tabStops = [NSTextTab(textAlignment: .left, location: ceil(width) + 24)]
-        var attributes: [NSAttributedString.Key: Any] = [.font: font, .paragraphStyle: style]
-        // An enabled item keeps the menu's own colours, which change as it is highlighted. A
-        // styled title is not always dimmed for a disabled one.
-        if !dualSource { attributes[.foregroundColor] = NSColor.disabledControlTextColor }
-        separate.attributedTitle = NSAttributedString(string: "\(separate.title)\tRight ⌘", attributes: attributes)
-        separate.setAccessibilityLabel("Edit A and B separately, Right Command")
-        add("Show waveform only", #selector(toggleWaveformOnly), checked: waveformOnly)
-        add("Keep on top", #selector(togglePin), checked: alwaysOnTop)
+        showKeys(.separateLanes, on: add("Edit separately", #selector(toggleSeparateLanes), enabled: multipleRows,
+            checked: multipleRows && separateLanes))
+        showKeys(.waveformOnly, on: add("Show waveform only", #selector(toggleWaveformOnly), checked: waveformOnly))
+        showKeys(.keepOnTop, on: add("Keep on top", #selector(togglePin), checked: alwaysOnTop))
         menu.addItem(.separator())
-        add("Options…", #selector(showOptions))
-        add("Quit", #selector(NSApplication.terminate(_:)), target: NSApp)
+        showKeys(.openOptions, on: add("Options…", #selector(showOptions)))
+        showKeys(.quit, on: add("Quit", #selector(NSApplication.terminate(_:)), target: NSApp))
         return menu
     }
 
     /// Runs one of the recorder window's own keys through the same methods as the toolbar.
-    private func run(_ command: WindowCommand) -> Bool {
+    private func run(_ action: RecorderAction) -> Bool {
+        if action == .cancelSelection {
+            return waveform?.cancelSelection() == true || waveform?.cancelPendingDrag() == true
+        }
         guard !editing else { return true }
-        switch command {
-        case .toggleCapture: toggleCapture(nil)
-        case .clear: clearCapture()
+        switch action {
+        case .toggleCapture:
+            if waveform?.togglePreview() != true { toggleCapture(nil) }
+        case .clear:
+            if waveform?.cancelSelection() != true { clearCapture() }
         case .separateLanes: toggleSeparateLanes()
+        case .saveSnapshot: saveCurrentSnapshot()
+        case .waveformOnly: toggleWaveformOnly()
+        case .keepOnTop: togglePin()
+        case .openOptions: showOptions()
+        case .quit: NSApp.terminate(nil)
+        case .cancelSelection, .globalSnapshot: return false
         }
         return true
     }
 
-    /// Lets lanes A and B be selected, previewed, dragged out and saved on their own, or together
-    /// again. A selection stays, narrowed to the lane it began in or widened back to both.
     @objc private func toggleSeparateLanes() {
         guard !editing else { return }
-        guard dualSource else {
-            setNotice("Editing A and B separately needs two sources.")
+        guard multipleRows else {
+            setNotice("Editing separately needs at least two waveform rows.")
             return
         }
         separateLanes.toggle()
         waveform?.separateLanes = separateLanes
         registerClick()
-        setNotice(separateLanes ? "Editing A and B separately" : "Editing A and B together")
+        setNotice(separateLanes ? "Editing rows separately" : "Editing rows together")
     }
 
     private func loginItem() -> NSMenuItem {
@@ -2785,6 +3237,7 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
                 sender?.selectItem(withTag: Int(previous))
                 self.setNotice("Could not change how much audio is retained")
             }
+            self.updateCaptureCapacity()
             self.refreshWaveform()
             if self.waveform?.clampSelectionToHistory() == false {
                 self.resumeAfterSelectionCancellation()
@@ -2830,19 +3283,20 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         waveform?.secondsInterval = showsSeconds ? secondsInterval : nil
     }
 
+    private func saveMeterModes() {
+        defaults.set(meterModes.map { Int($0.rawValue) }, forKey: "meterModes")
+        if let first = meterModes.first { defaults.set(Int(first.rawValue), forKey: "meterMode") }
+        if meterModes.count > 1 { defaults.set(Int(meterModes[1].rawValue), forKey: "meterModeB") }
+    }
+
     @objc private func meterChanged(_ sender: Any) {
         let tag = (sender as? NSPopUpButton)?.selectedItem?.tag ?? (sender as? NSMenuItem)?.tag
         guard let tag, let raw = UInt32(exactly: tag), let mode = MeterMode(rawValue: raw) else { return }
         let lane = (sender as? NSPopUpButton)?.tag ?? ((sender as? NSMenuItem)?.representedObject as? Int) ?? 0
-        if lane == 0 {
-            meterMode = mode
-            defaults.set(Int(raw), forKey: "meterMode")
-            optionsMeterPopup?.selectItem(withTag: tag)
-        } else {
-            meterModeB = mode
-            defaults.set(Int(raw), forKey: "meterModeB")
-            optionsMeterBPopup?.selectItem(withTag: tag)
-        }
+        guard meterModes.indices.contains(lane) else { return }
+        meterModes[lane] = mode
+        saveMeterModes()
+        if optionsMeterPopups.indices.contains(lane) { optionsMeterPopups[lane].selectItem(withTag: tag) }
         registerClick()
         updateMeter()
     }
@@ -2861,6 +3315,22 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         invalidateExportFormat()
     }
 
+    @objc private func pairBinauralChanged(_ sender: NSPopUpButton) {
+        let enabled = selectedValue(sender) == 1
+        guard enabled != pairBinaural else { return }
+        pairBinaural = enabled
+        defaults.set(enabled, forKey: "pairBinaural")
+        waveform?.stopPreview()
+        invalidateExportFormat()
+    }
+
+    @objc private func wideExportModeChanged(_ sender: NSPopUpButton) {
+        guard let raw = selectedValue(sender), let mode = WideExportMode(rawValue: raw), mode != wideExportMode else { return }
+        wideExportMode = mode
+        defaults.set(Int(raw), forKey: "wideExportMode")
+        invalidateExportFormat()
+    }
+
     @objc private func exportMonoChanged(_ sender: NSButton) {
         let enabled = sender.state == .on
         guard enabled != forceMonoExport else { return }
@@ -2875,21 +3345,49 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         setNotice(nil)
     }
 
+    private func meterTitle(for lane: Int) -> String {
+        let mode = meterModes[lane]
+        let reading: Float
+        if let tap, tap.cachedMeters.indices.contains(lane), mode != .lufs || (tap.channelCount(for: lane) ?? 0) <= 2 {
+            reading = mode.value(from: tap.cachedMeters[lane])
+        } else {
+            reading = -.infinity
+        }
+        let value = reading.isFinite ? String(format: "%.1f", Double(reading)) : "—"
+        let prefix = dualSource ? "\(captureLaneLetter(lane)) " : ""
+        return "\(prefix)\(value) \(mode.label)"
+    }
+
     private func updateMeter() {
-        let hidden = [!showsMeters, !showsMeters || !dualSource]
-        for (lane, item) in [(meterButton, meterMode), (meterBButton, meterModeB)].enumerated() {
-            let (button, mode) = item
-            if button.isHidden != hidden[lane] { button.isHidden = hidden[lane] }
-            let reading = tap.map { mode.value(from: $0.cachedMeters[lane]) } ?? -Float.infinity
-            let value = reading.isFinite ? String(format: "%.1f", Double(reading)) : "—"
-            let prefix = dualSource ? (lane == 0 ? "A " : "B ") : ""
-            let title = "\(prefix)\(value) \(mode.label)"
+        let shown = captureLanes.count > 2 && (panel?.frame.width ?? 0) < 680 ? 1 : 2
+        for (lane, button) in [meterButton, meterBButton].enumerated() {
+            let hide = !showsMeters || lane >= shown || !meterModes.indices.contains(lane)
+            if button.isHidden != hide { button.isHidden = hide }
+            guard !hide else { continue }
+            let title = meterTitle(for: lane)
             if button.title != title {
                 button.title = title
                 button.setAccessibilityLabel(title)
             }
-            if button.toolTip != mode.detail { button.toolTip = mode.detail }
+            button.toolTip = meterModes[lane].detail
         }
+        let extra = max(0, meterModes.count - shown)
+        moreMetersButton.isHidden = !showsMeters || extra == 0
+        if extra > 0 {
+            let title = "+\(extra)"
+            if moreMetersButton.title != title { moreMetersButton.title = title }
+            moreMetersButton.setAccessibilityLabel("Show \(extra) more meters")
+        }
+    }
+
+    @objc private func showMoreMeters(_ sender: NSButton) {
+        let menu = NSMenu(title: "Level meters")
+        for lane in meterModes.indices {
+            let item = NSMenuItem(title: meterTitle(for: lane), action: nil, keyEquivalent: "")
+            item.submenu = meterMenu(lane: lane)
+            menu.addItem(item)
+        }
+        showMenu(menu, below: sender)
     }
 
     @objc private func togglePin() {
@@ -3237,8 +3735,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         } else if waveform?.isPreparingMaterial == true {
             line = "Preparing selection…"
         } else if waveform?.hasSelection == true && notice == nil {
-            // A selection of one lane names it.
-            let selection = waveform?.selectedLane.map { "Selection · \($0 == 0 ? "A" : "B")" } ?? "Selection"
+            // A selection of one row names it.
+            let selection = waveform?.selectedRow?.title.map { "Selection · \($0)" } ?? "Selection"
             line = paused ? "\(selection) / Paused" : selection
         } else {
             line = [state == .paused ? stateText : nil, message.isEmpty ? nil : message]
@@ -3275,7 +3773,8 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     func requestEditingMaterial(_ completion: @escaping (WAVExport?) -> Void) {
         guard let tap else { completion(nil); return }
         let routes = tap.captureRoutes
-        tap.readCapture({ WAVExport(core: $0, routes: routes) }) { [weak self, weak tap] material in
+        let labels = tap.captureChannelNames
+        tap.readCapture({ WAVExport(core: $0, routes: routes, channelNames: labels) }) { [weak self, weak tap] material in
             guard let self, let tap, self.tap === tap else { completion(nil); return }
             completion(material)
         }
@@ -3291,11 +3790,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard waveform?.isPreparingMaterial != true else { setNotice("Preparing selection…"); return }
         let selected = waveform?.selectionForSaving()
         // Read before the selection, and its fades and lane with it, is cleared below. Without a
-        // selection both lanes are saved.
+        // selection all lanes are saved.
         let fades = waveform?.fadesForSaving() ?? noFades
-        let lane = selected == nil ? nil : waveform?.selectedLane
-        // The marker the save leaves keeps the selection's lane; a whole save marks both.
-        let markerLane = selected == nil ? nil : waveform?.selectionLane
+        let row = selected == nil ? nil : waveform?.selectedRow
         let save: (WAVExport?) -> Void = { [weak self] job in
             guard let self else { return }
             guard let job else { self.setNotice("No audio captured yet."); return }
@@ -3306,9 +3803,9 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
             }
             let ticket = self.waveform?.reserveMarker()
             if selected != nil { self.waveform?.clearSelection() }
-            self.writeExport(job, range: range, fades: fades, lane: lane, directory: self.directory(for: .saved),
+            self.writeExport(job, range: range, fades: fades, row: row, directory: self.directory(for: .saved),
                              provisional: false) { [weak self] urls in
-                if !urls.isEmpty, let ticket { self?.waveform?.commitMarker(range, lane: markerLane, ticket: ticket) }
+                if !urls.isEmpty, let ticket { self?.waveform?.commitMarker(range, row: row, ticket: ticket) }
                 return true
             }
         }
@@ -3320,28 +3817,30 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     func prepareDrag(
-        _ job: WAVExport, range: Range<UInt64>, fades: BtFades, lane: Int?,
+        _ job: WAVExport, range: Range<UInt64>, fades: BtFades, row: WaveformRow?,
         completion: @escaping ([URL]) -> Bool
     ) -> DispatchWorkItem {
-        writeExport(job, range: range, fades: fades, lane: lane, directory: directory(for: .output),
+        writeExport(job, range: range, fades: fades, row: row, directory: directory(for: .output),
                     provisional: true, completion: completion)
     }
 
-    /// Writes `range` of every lane, or of `lane` alone, on the worker.
+    /// Writes the selected audio on the export worker.
     @discardableResult
     private func writeExport(
-        _ job: WAVExport, range: Range<UInt64>, fades: BtFades, lane: Int?, directory: String,
+        _ job: WAVExport, range: Range<UInt64>, fades: BtFades, row: WaveformRow?, directory: String,
         provisional: Bool, completion: @escaping ([URL]) -> Bool
     ) -> DispatchWorkItem {
         let sampleRate = exportSampleRate
         let bitsPerSample = exportBitsPerSample
         let forceMono = forceMonoExport
+        let wideMode = wideExportMode
+        let pairBinaural = self.pairBinaural
         let names = laneFileNames
         setNotice(provisional ? "Preparing WAV…" : "Saving snapshot…")
         let write = DispatchWorkItem { @Sendable [weak self, worker, pendingProvisionalWAVs] in
             let urls = job.write(
                 range: range, directory: directory, sampleRate: sampleRate, bitsPerSample: bitsPerSample,
-                forceMono: forceMono, fades: fades, names: names, lane: lane
+                forceMono: forceMono, fades: fades, names: names, row: row, wideMode: wideMode, pairBinaural: pairBinaural
             )
             if provisional { pendingProvisionalWAVs.urls.formUnion(urls) }
             DispatchQueue.main.async {
@@ -3398,8 +3897,36 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         didSet { if stereo != oldValue { revision = nil } }
     }
 
-    private var traces = [WaveformTrace(), WaveformTrace()]
-    private var traceCount = 1
+    var frequencyGradient: FrequencyGradient? {
+        didSet {
+            if frequencyGradient == nil {
+                frequencyWaveform = nil
+                lastFrequencyRequest = nil
+            }
+            needsDisplay = true
+        }
+    }
+
+    private let frequencyQueue = DispatchQueue(label: "Backtracking.waveform-frequency", qos: .utility)
+    private let wideWaveformQueue = DispatchQueue(label: "Backtracking.multichannel-waveform", qos: .userInitiated)
+    private var frequencyWaveform: FrequencyWaveform?
+    private var frequencyReading = false
+    private var nextFrequencyRead = 0.0
+    private struct FrequencyRequest: Equatable {
+        let revision: UInt64
+        let materialVersion: UInt64
+        let range: Range<UInt64>
+        let bins: Int
+        let rows: [WaveformRow]
+    }
+    private var lastFrequencyRequest: FrequencyRequest?
+
+    private var traces: [WaveformTrace] = []
+    private var requestedRows: [WaveformRow] = []
+    private var displayedRows: [WaveformRow] = []
+    private var rowOffset: CGFloat = 0
+    private var rowHeight: CGFloat { max(16, bounds.height / CGFloat(max(1, displayedRows.count))) }
+    private var maxRowOffset: CGFloat { max(0, CGFloat(displayedRows.count) * rowHeight - bounds.height) }
     private var retainedFrames: Range<UInt64> = 0..<0
     private var visibleFrames: Range<UInt64> = 0..<0
     private var renderedFrames: Range<UInt64> = 0..<0
@@ -3411,12 +3938,11 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     private var bars: [UInt64] = []
     private var selection: Range<UInt64>?
     private var marker: Range<UInt64>?
-    /// The lane the marker was left on, which a selection taken back from it covers while
-    /// lanes are separate. nil marks both lanes.
-    private var markerLane: Int?
+    /// The row the marker was left on. Nil marks the whole clip.
+    private var markerRow: WaveformRow?
     private var markerRevision: UInt64 = 0
     private var committedMarkerRevision: UInt64 = 0
-    private var pendingDragMarker: (range: Range<UInt64>, lane: Int?, ticket: UInt64)?
+    private var pendingDragMarker: (range: Range<UInt64>, row: WaveformRow?, ticket: UInt64)?
     private var anchor: UInt64?
     private var pointer: NSPoint?
     private var pointerModifiers: NSEvent.ModifierFlags = []
@@ -3448,8 +3974,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     }
     private var fadeGesture: FadeGesture?
     private var player: PreviewPlayer?
-    /// Lanes A and B are selected, previewed and dragged out on their own. The controller sets
-    /// it only while two sources record.
+    /// The controller enables this when multiple waveform rows are available.
     var separateLanes = false {
         didSet {
             guard separateLanes != oldValue else { return }
@@ -3459,23 +3984,29 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             needsDisplay = true
         }
     }
-    /// The lane the selection began in: 0 is A, at the top, and 1 is B. It is all the selection
-    /// covers while lanes are separate.
-    private(set) var selectionLane = 0
-    /// The lane a drag out began in, while lanes are separate.
-    private var dragLane: Int?
-    /// The lane a selection covers alone, or nil when it covers every lane or there is none.
-    var selectedLane: Int? { separateLanes && hasSelection ? selectionLane : nil }
-    /// The row a selection, or one being made, is drawn on alone.
-    private var selectionRow: Int? { separateLanes && min(traceCount, traces.count) == 2 ? selectionLane : nil }
+    private var selectionReference: WaveformRow?
+    private var dragRow: WaveformRow?
+    var selectedRow: WaveformRow? { separateLanes && hasSelection ? selectionReference : nil }
 
-    /// The lane drawn at height `y` when two lanes share the plot.
-    private func lane(at y: CGFloat) -> Int { y >= bounds.midY ? 0 : 1 }
+    private func row(at y: CGFloat) -> WaveformRow? {
+        guard !displayedRows.isEmpty else { return nil }
+        let index = Int(max(0, (bounds.maxY + rowOffset - y) / rowHeight))
+        return displayedRows[min(displayedRows.count - 1, index)]
+    }
 
-    /// Where `lane` is drawn when two lanes share the plot.
-    private func laneRect(_ lane: Int) -> NSRect {
-        let height = bounds.height / 2
-        return NSRect(x: bounds.minX, y: lane == 0 ? bounds.midY : bounds.minY, width: bounds.width, height: height)
+    private func rowRect(_ row: Int) -> NSRect {
+        NSRect(x: bounds.minX, y: bounds.maxY + rowOffset - CGFloat(row + 1) * rowHeight,
+            width: bounds.width, height: rowHeight)
+    }
+
+    private func matches(_ row: WaveformRow, _ selected: WaveformRow) -> Bool {
+        row.lane == selected.lane && (row.view == selected.view || (row.isPair && selected.isPair))
+    }
+
+    private func targetRect(_ row: WaveformRow) -> NSRect {
+        guard let first = displayedRows.firstIndex(where: { matches($0, row) }),
+              let last = displayedRows.lastIndex(where: { matches($0, row) }) else { return .zero }
+        return rowRect(first).union(rowRect(last))
     }
 
     var hasEditingMaterial: Bool { editMaterial != nil || materialPending }
@@ -3487,6 +4018,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
+        rowOffset = min(rowOffset, maxRowOffset)
         needsDisplay = true
         updateStatusToolTip()
         controller?.refreshWaveform()
@@ -3595,13 +4127,56 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
 
     private func readRequest() -> WaveformReadRequest {
         WaveformReadRequest(view: requestedView ?? (zoomed || editMaterial != nil ? visibleFrames : nil),
-            width: Float(bounds.width), height: Float(bounds.height), stereo: stereo,
+            width: Float(bounds.width), height: Float(bounds.height), rows: requestedRows,
             interactive: anchor != nil || mouseDownEvent != nil || dragging || panStart != nil
                 || fadeGesture != nil)
     }
 
+    private func refreshFrequency(tap: SystemAudioTap) {
+        guard frequencyGradient != nil, !frequencyReading, !materialPending, !renderedFrames.isEmpty,
+              let revision, let bins = traces.first?.low.count, bins > 0,
+              ProcessInfo.processInfo.systemUptime >= nextFrequencyRead else { return }
+        let request = FrequencyRequest(revision: revision, materialVersion: materialVersion,
+            range: renderedFrames, bins: bins, rows: displayedRows)
+        guard request != lastFrequencyRequest else { return }
+        frequencyReading = true
+        let read: (WAVExport?) -> Void = { [weak self] audio in
+            guard let self else { return }
+            guard let audio, self.materialVersion == request.materialVersion else {
+                self.frequencyReading = false
+                return
+            }
+            self.frequencyQueue.async { [weak self] in
+                let start = ProcessInfo.processInfo.systemUptime
+                let spectrum = audio.spectrum(range: request.range, bins: request.bins, rows: request.rows)
+                let elapsed = ProcessInfo.processInfo.systemUptime - start
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.frequencyReading = false
+                    self.nextFrequencyRead = ProcessInfo.processInfo.systemUptime + elapsed * 2
+                    guard self.frequencyGradient != nil, self.materialVersion == request.materialVersion,
+                          self.displayedRows == request.rows else { return }
+                    self.frequencyWaveform = spectrum
+                    self.lastFrequencyRequest = request
+                    self.needsDisplay = true
+                }
+            }
+        }
+        if let editMaterial {
+            read(editMaterial)
+        } else {
+            let routes = tap.captureRoutes
+            let labels = tap.captureChannelNames
+            tap.readCapture(poll: false, { WAVExport(core: $0, routes: routes, channelNames: labels,
+                range: request.range) }, completion: read)
+        }
+    }
+
     func refresh(tap: SystemAudioTap, worker: DispatchQueue) {
         guard !materialPending else { return }
+        let widths = (0..<tap.laneCount).map { tap.channelCount(for: $0) ?? 0 }
+        requestedRows = WaveformRow.layout(widths: widths, labels: tap.captureChannelNames, stereo: stereo)
+        refreshFrequency(tap: tap)
         let request = readRequest()
         let material = editMaterial
         if material != nil && revision != nil && request == lastRenderedRequest { return }
@@ -3624,11 +4199,13 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             self.renderedFrames = frame.visible
             self.requestedView = nil
             self.zoomed = frame.visible != frame.retained
-            self.traceCount = frame.traces.count
-            self.traces = frame.traces + Array(repeating: WaveformTrace(), count: max(0, 2 - frame.traces.count))
+            self.displayedRows = request.rows
+            self.rowOffset = min(self.rowOffset, self.maxRowOffset)
+            self.traces = frame.traces
             self.bars = frame.bars
             self.lastRenderedRequest = self.readRequest()
             self.updateDisplayPolicy()
+            self.refreshFrequency(tap: tap)
             self.needsDisplay = true
         }
         if let material {
@@ -3636,10 +4213,22 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 let frame = material.render(request)
                 DispatchQueue.main.async { receive(frame) }
             }
+        } else if request.rows.contains(where: \.isPair) {
+            let routes = tap.captureRoutes
+            let labels = tap.captureChannelNames
+            tap.readCapture(poll: false, { core -> WAVExport? in
+                guard bt_tracks_revision(core) != unchangedRevision else { return nil }
+                return WAVExport(core: core, routes: routes, channelNames: labels)
+            }) { [weak self] material in
+                guard let self, let material else { receive(nil); return }
+                self.wideWaveformQueue.async {
+                    let frame = material.render(request)
+                    DispatchQueue.main.async { receive(frame) }
+                }
+            }
         } else {
-            let laneCount = tap.laneCount
             tap.readCapture(poll: false, {
-                WaveformFrame.read(core: $0, laneCount: laneCount, request: request, unchangedRevision: unchangedRevision)
+                WaveformFrame.read(core: $0, request: request, unchangedRevision: unchangedRevision)
             }, completion: receive)
         }
     }
@@ -3707,6 +4296,12 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     }
 
     override func scrollWheel(with event: NSEvent) {
+        let x = convert(event.locationInWindow, from: nil).x
+        if maxRowOffset > 0, x < bounds.minX + 24 || x > bounds.maxX - 24 {
+            rowOffset = min(maxRowOffset, max(0, rowOffset - event.scrollingDeltaY))
+            needsDisplay = true
+            return
+        }
         guard !dragging, !visibleFrames.isEmpty, event.scrollingDeltaY != 0 else { return }
         let fraction = Double(fraction(at: convert(event.locationInWindow, from: nil).x))
         let delta = Double(event.scrollingDeltaY) * (event.hasPreciseScrollingDeltas ? 0.014 : 0.12)
@@ -3757,9 +4352,16 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         zoomed = false
         panStart = nil
         revision = nil
+        frequencyWaveform = nil
+        lastFrequencyRequest = nil
+        nextFrequencyRead = 0
+        requestedRows = []
+        displayedRows = []
+        traces = []
+        rowOffset = 0
         bars.removeAll()
         marker = nil
-        markerLane = nil
+        markerRow = nil
         committedMarkerRevision = reserveMarker()
     }
 
@@ -3768,13 +4370,12 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         return markerRevision
     }
 
-    /// Leaves the marker on `range` after an export. `lane` is the lane it was taken from, or
-    /// nil for both.
-    func commitMarker(_ range: Range<UInt64>, lane: Int?, ticket: UInt64) {
+    /// Leaves the marker on the exported range and row.
+    func commitMarker(_ range: Range<UInt64>, row: WaveformRow?, ticket: UInt64) {
         guard ticket > committedMarkerRevision, !range.isEmpty else { return }
         committedMarkerRevision = ticket
         marker = range
-        markerLane = lane
+        markerRow = row
         needsDisplay = true
     }
 
@@ -3815,7 +4416,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         }
         let problem = player.play(editMaterial, range: selection,
                                   forceMono: controller?.forceMonoExport ?? false, fades: fadesForSaving(),
-                                  lane: selectedLane)
+                                  row: selectedRow, pairBinaural: controller?.pairBinaural ?? false)
         if let problem { controller?.setNotice(problem) }
         return true
     }
@@ -4001,8 +4602,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             let edge = min(max(flag, retainedFrames.lowerBound), retainedFrames.upperBound)
             let other = flag == flags.lowerBound ? flags.upperBound : flags.lowerBound
             let opposite = min(max(other, retainedFrames.lowerBound), retainedFrames.upperBound)
-            // A selection taken back from the marker covers the lane the marker was left on.
-            if selection == nil { selectionLane = markerLane ?? lane(at: position.y) }
+            // A selection taken back from a marker restores its row.
+            if selection == nil { selectionReference = markerRow ?? row(at: position.y) }
             anchor = opposite
             selection = min(edge, opposite)..<max(edge, opposite)
             needsDisplay = true
@@ -4014,13 +4615,12 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             controller.refreshWaveform()
             anchor = frame(at: event)
             selection = anchor.map { $0..<$0 }
-            // Kept whether or not lanes are separate, so that separating them later narrows the
-            // selection to the lane it began in.
-            selectionLane = lane(at: position.y)
+            // The row is saved so that toggling separate editing can narrow the selection.
+            selectionReference = row(at: position.y)
             needsDisplay = true
         } else {
             mouseDownEvent = event
-            dragLane = separateLanes ? lane(at: position.y) : nil
+            dragRow = row(at: position.y)
         }
     }
 
@@ -4116,13 +4716,9 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             return
         }
         let ticket = reserveMarker()
-        // While lanes are separate, a selection carries its own lane and a drag without one the
-        // lane it began in.
-        let lane = selectionForSaving() != nil ? selectedLane : (separateLanes ? dragLane : nil)
-        // The marker left by the drop keeps the selection's lane, or the lane dragged out.
-        let markerLane: Int? = selectionForSaving() != nil ? selectionLane : lane
-        // DAWs can keep the file URLs after the external drop. Treat both paths as one take.
-        pendingDragWrite = controller.prepareDrag(job, range: range, fades: fadesForSaving(), lane: lane) {
+        let row = selectionForSaving() != nil ? selectedRow : (separateLanes ? dragRow : nil)
+        // DAWs can keep the file URLs after the external drop. Treat the paths as one take.
+        pendingDragWrite = controller.prepareDrag(job, range: range, fades: fadesForSaving(), row: row) {
             [weak self] urls in
             guard let self, self.exportVersion == version else { return false }
             self.pendingDragWrite = nil
@@ -4133,7 +4729,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 return false
             }
             if !urls.isEmpty {
-                self.pendingDragMarker = (range, markerLane, ticket)
+                self.pendingDragMarker = (range, row, ticket)
                 self.beginFileDrag(urls, event: event)
             }
             return true
@@ -4178,7 +4774,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         if accepted {
             readyFiles.removeAll()
             if let pendingDragMarker {
-                commitMarker(pendingDragMarker.range, lane: pendingDragMarker.lane, ticket: pendingDragMarker.ticket)
+                commitMarker(pendingDragMarker.range, row: pendingDragMarker.row, ticket: pendingDragMarker.ticket)
             }
             pendingDragMarker = nil
         } else { discardPreparedFile() }
@@ -4232,14 +4828,12 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         outline.lineWidth = CGFloat(displayPolicy.waveform_stroke)
         outline.lineCapStyle = .round
         outline.lineJoinStyle = .round
-        let rows = min(traceCount, traces.count)
+        let rows = min(displayedRows.count, traces.count)
         guard rows > 0 else { return (fill, outline, coverage) }
-        let totalHeight = bounds.height
-        let rowHeight = totalHeight / CGFloat(rows)
         let fitted = fadesForSaving()
         let faded = fitted.fade_in > 0 || fitted.fade_out > 0 ? selectionForSaving() : nil
-        for lane in 0..<rows {
-            let middle = bounds.midY + totalHeight / 2 - (CGFloat(lane) + 0.5) * rowHeight
+        for row in 0..<rows where bounds.intersects(rowRect(row)) {
+            let middle = rowRect(row).midY
             if showsOverlay {
                 NSColor.white.withAlphaComponent(0.17).setStroke()
                 NSBezierPath.strokeLine(
@@ -4247,9 +4841,9 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
                 )
             }
             if renderedFrames.isEmpty { continue }
-            var bins = traces[lane]
+            var bins = traces[row]
             // Separate lanes taper only the selected one.
-            if let faded, selectionRow == nil || selectionRow == lane {
+            if let faded, selectedRow.map({ matches(displayedRows[row], $0) }) ?? true {
                 // The waveform tapers the way the exported clip does.
                 bins.read { minimum, maximum, count in
                     bt_waveform_fade_bins(minimum, maximum, count, renderedFrames.lowerBound,
@@ -4306,15 +4900,46 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     }
 
     private func paintTrace(
-        _ paths: (fill: NSBezierPath, outline: NSBezierPath, coverage: NSBezierPath), color: NSColor
+        _ paths: (fill: NSBezierPath, outline: NSBezierPath, coverage: NSBezierPath),
+        color: NSColor, dimFrequency: Bool = false
     ) {
         guard !paths.coverage.isEmpty else { return }
         NSGraphicsContext.saveGraphicsState()
         paths.coverage.addClip()
-        color.withAlphaComponent(0.72).setFill()
-        paths.fill.fill()
-        color.setStroke()
-        paths.outline.stroke()
+        if let gradient = frequencyGradient, let context = NSGraphicsContext.current?.cgContext {
+            let live = editMaterial == nil ? UInt64(sampleRate) / 4 : 0
+            let images = traces.enumerated().compactMap { row, trace -> (CGImage, NSRect)? in
+                let rect = rowRect(row)
+                guard bounds.intersects(rect) else { return nil }
+                let colors = frequencyWaveform?.colors(for: row, in: renderedFrames, bins: trace.low.count,
+                    gradient: gradient, liveFrames: live) ?? []
+                return FrequencyWaveform.stripeImage(colors.isEmpty ? [nil] : colors,
+                    fallback: accentRGB, dimmed: dimFrequency).map { ($0, rect) }
+            }
+            context.saveGState()
+            context.interpolationQuality = .none
+            context.addPath(paths.fill.cgPath)
+            context.clip()
+            context.setAlpha(0.72)
+            for (image, rect) in images { context.draw(image, in: rect) }
+            context.restoreGState()
+
+            context.saveGState()
+            context.interpolationQuality = .none
+            context.addPath(paths.outline.cgPath)
+            context.setLineWidth(paths.outline.lineWidth)
+            context.setLineCap(.round)
+            context.setLineJoin(.round)
+            context.replacePathWithStrokedPath()
+            context.clip()
+            for (image, rect) in images { context.draw(image, in: rect) }
+            context.restoreGState()
+        } else {
+            color.withAlphaComponent(0.72).setFill()
+            paths.fill.fill()
+            color.setStroke()
+            paths.outline.stroke()
+        }
         NSGraphicsContext.restoreGraphicsState()
     }
 
@@ -4329,13 +4954,13 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     /// where the ramp ends, with the cut-away level shaded.
     private func drawFades(_ selection: Range<UInt64>) {
         let fitted = fadesForSaving()
-        let rows = min(traceCount, traces.count)
+        let rows = min(displayedRows.count, traces.count)
         guard fitted.fade_in > 0 || fitted.fade_out > 0, rows > 0, !visibleFrames.isEmpty else { return }
-        let rowHeight = bounds.height / CGFloat(rows)
         let ramps = [(selection.lowerBound, selection.lowerBound + fitted.fade_in),
                      (selection.upperBound, selection.upperBound - fitted.fade_out)]
-        for lane in 0..<rows where selectionRow == nil || selectionRow == lane {
-            let middle = bounds.midY + bounds.height / 2 - (CGFloat(lane) + 0.5) * rowHeight
+        for row in 0..<rows where bounds.intersects(rowRect(row))
+            && (selectedRow.map({ matches(displayedRows[row], $0) }) ?? true) {
+            let middle = rowRect(row).midY
             // Full scale is drawn at the height tracePaths uses.
             let extent = rowHeight * 0.46
             for (edge, full) in ramps where edge != full {
@@ -4447,23 +5072,23 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         let panel = NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6)
         NSGraphicsContext.saveGraphicsState()
         panel.addClip()
-        let rows = min(traceCount, traces.count)
-        let separate = separateLanes && rows == 2
+        let rows = min(displayedRows.count, traces.count)
+        let separate = separateLanes && rows > 1
         if showsOverlay, selection == nil, !visibleFrames.isEmpty,
            pointer != nil || mouseDownEvent != nil || dragging {
-            // While lanes are separate, a drag takes only the lane it starts in.
-            let hoverLane = !separate ? nil
-                : (mouseDownEvent != nil || dragging ? dragLane : pointer.map { lane(at: $0.y) })
+            // Separate editing uses the row a drag starts in.
+            let hover = !separate ? nil
+                : (mouseDownEvent != nil || dragging ? dragRow : pointer.flatMap { row(at: $0.y) })
             accentColor(accentRGB).withAlphaComponent(0.23).setFill()
-            NSBezierPath.fill(hoverLane.map(laneRect) ?? bounds)
+            NSBezierPath.fill(hover.map(targetRect) ?? bounds)
         }
 
         drawTimeGrid()
         let trace = tracePaths()
         // A selection of one lane is drawn on that lane alone.
         let selectedArea = selection.flatMap(waveformRect(for:)).flatMap { rect -> NSRect? in
-            guard let row = selectionRow else { return rect }
-            let area = rect.intersection(laneRect(row))
+            guard let row = selectedRow else { return rect }
+            let area = rect.intersection(targetRect(row))
             return area.isEmpty ? nil : area
         }
         if let selectedRect = selectedArea {
@@ -4472,7 +5097,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             outside.windingRule = .evenOdd
             NSGraphicsContext.saveGraphicsState()
             outside.addClip()
-            paintTrace(trace, color: accentColor(accentRGB))
+            paintTrace(trace, color: accentColor(accentRGB), dimFrequency: true)
             NSGraphicsContext.restoreGraphicsState()
 
             NSGraphicsContext.saveGraphicsState()
@@ -4484,11 +5109,23 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
         }
         if let selection = selectionForSaving() { drawFades(selection) }
         if separate {
-            // The lanes are apart: a line runs between them for as long as they are.
+            // The pair is one editing target even though it draws two rows.
             accentColor(accentRGB).withAlphaComponent(0.7).setStroke()
-            NSBezierPath.strokeLine(
-                from: NSPoint(x: bounds.minX, y: bounds.midY), to: NSPoint(x: bounds.maxX, y: bounds.midY)
-            )
+            for row in 0..<(rows - 1) where !matches(displayedRows[row], displayedRows[row + 1]) {
+                let y = rowRect(row).minY
+                NSBezierPath.strokeLine(from: NSPoint(x: bounds.minX, y: y), to: NSPoint(x: bounds.maxX, y: y))
+            }
+        }
+        for (row, info) in displayedRows.enumerated() {
+            let rect = rowRect(row)
+            guard let title = info.title, bounds.intersects(rect) else { continue }
+            let label = NSAttributedString(string: title, attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .medium),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.84),
+                .backgroundColor: NSColor.black.withAlphaComponent(0.45)
+            ])
+            let offset: CGFloat = compactStatus != nil && row == 0 ? 25 : 5
+            label.draw(at: NSPoint(x: rect.minX + offset, y: rect.midY - label.size().height / 2))
         }
         if let marker, marker != selection {
             drawFlag(marker.lowerBound, pointsRight: true)

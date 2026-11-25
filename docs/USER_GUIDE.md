@@ -20,7 +20,7 @@ Windows 上請把要取樣的程式輸出到預設播放裝置。若 DAW 使用 
 
 ### 開啟設定
 
-點擊工具列的齒輪可開啟 **Options**。在插件視窗內按滑鼠右鍵也會開啟 Options；Windows／macOS 桌面版的右鍵則開啟選單，依序為 **Pause／Resume／Retry capture**、**Clear**、**Save snapshot**、**Edit separately／分開編輯**（macOS 為 **Edit A and B separately**）、**Show waveform only**、**Keep on top**、**Options…** 與 **Quit**。桌面版視窗有焦點時，按 `Space` 可暫停或恢復擷取，按 `Delete`（Mac 鍵盤為 `Fn` + `Delete`）清除目前錄音；有選區時，`Space` 改為試聽選區，`Delete` 則先取消選區。波形有一列以上時（macOS 為擷取兩個來源時），單獨輕按右側 `Ctrl`（Mac 為右側 `Command`）可切換[分開編輯](#分開編輯)。這些是預設按鍵，Windows 桌面版可在 Options 的 **Hotkeys／快速鍵** 頁變更，見[快速鍵](#快速鍵windows-桌面版)。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
+點擊工具列的齒輪可開啟 **Options**。在插件視窗內按滑鼠右鍵也會開啟 Options；Windows／macOS 桌面版的右鍵則開啟選單，依序為 **Pause／Resume／Retry capture**、**Clear**、**Save snapshot**、**Edit separately／分開編輯**、**Show waveform only**、**Keep on top**、**Options…** 與 **Quit**。桌面版視窗有焦點時，按 `Space` 可暫停或恢復擷取，按 `Delete`（Mac 鍵盤為 `Fn` + `Delete`）清除目前錄音；有選區時，`Space` 改為試聽選區，`Delete` 則先取消選區。波形有一列以上時，單獨輕按右側 `Ctrl`（Mac 為右側 `Command`）可切換[分開編輯](#分開編輯)。這些是預設按鍵，Windows 桌面版可在 Options 的 **Hotkeys／快速鍵** 頁變更，見[快速鍵](#快速鍵windows-桌面版)。桌面版會開啟獨立的設定視窗，VST3／CLAP 則在 DAW 的插件編輯器內開啟設定。可按分類找到錄音控制、主題色、保留時間、自動續錄、背景透明度、WAV 格式及資料夾。桌面版也可直接從工具列切換 **置頂／Keep on top**。
 
 Options 左側是分類，右側以一列一項的直向清單顯示設定。頁標題使用較大粗體，分組與欄位有明確層級，主要文字至少 15。保留時間、自動續錄、透明度和 WAV 格式使用下拉選單；少於 10 項時依實際項目數決定高度，最多顯示 10 列，超過則在選單內捲動。右側內容較長時向下捲動。桌面設定視窗可調整大小，底部關閉按鈕維持可見。插件會向 DAW 要求放大設定視窗，關閉後恢復原尺寸。
 
@@ -109,7 +109,7 @@ macOS 桌面版可從選單列顯示或隱藏視窗、暫停或恢復擷取、�
 
 附加元件的外觀（見「附加元件」）也可以提供這組顏色。只有在開啟依頻率、而且你沒有自己的顏色時才會使用，顏色下方會註明來自哪個附加元件。更改其中任何一個顏色，它們就以外觀的顏色為起點成為你自己的；之後按 **重設／Reset** 會改回外觀的顏色。附加元件無法替你開啟依頻率上色。
 
-目前只有 Windows 桌面版提供，macOS 桌面版尚未支援。
+從目前原始碼建置的 macOS 版也可設定頻率著色與漸層，詳見下方的 macOS 桌面版說明。
 
 ### 多個來源（Windows 桌面版）
 
@@ -124,7 +124,15 @@ Windows 桌面版可以同時擷取 A、B 以外的更多來源，最多 64 個�
 - 列數多到在視窗內每列放不下 14 像素時，整個波形區會一起上下捲動：在波形左右邊緣或右側捲軸上捲動滑鼠滾輪，或拖曳捲軸。在波形中間捲動仍是縮放。框選、旗標、拖出與[分開編輯](#分開編輯)在捲動後的列上照常使用；分開編輯時拖到波形上下緣會自動捲動。視窗會先長高，最多到 560 像素，放不下時才捲動。
 - 工具列只顯示放得下的音量表，其餘收在 **+N** 按鈕；按下它會列出每個來源的音量表，按其他地方或 `Esc` 關閉。
 - 匯出、拖出與快照為每個來源各寫一個 WAV 檔，檔名含該來源的字母，例如 `Backtracking_Spotify_C_….wav`。
-- 一或兩個來源時，畫面與以往相同。macOS 桌面版與 VST3／CLAP 插件仍維持原本的來源數量。
+- VST3／CLAP 插件維持原有的來源數量。
+
+### macOS 桌面版（從原始碼建置）
+
+目前原始碼的 macOS 版在 Options → **Sources** 提供 **Add source** 和 **Remove**，最多 64 個來源，合計最多 64 個聲道。來源從 A 編到 BL。使用 **All channels** 可保留多聲道來源，波形顯示立體聲 L/R 混合列及個別聲道。波形列放不下時，在左右邊緣捲動可瀏覽其他列。**Edit separately** 可選單一列，L/R 混合列視為一組。
+
+Options → **Capture** 可選多聲道來源的 L/R 聲音為立體聲或雙耳音訊。Options → **Export** 可選每聲道一個雙耳或單聲道檔、單一多聲道 WAV，或單一雙耳混音。Options → **Appearance** 的 **Waveform color** 可切換頻率著色並調整漸層。
+
+Options → **Hotkeys** 可為每個動作設定兩組快捷鍵。全域快照預設用 Fn／Globe 加數字 1 左側的實體鍵，需要「輸入監控」權限。分開編輯預設輕按右側 Command，可用 **Reset** 還原。
 
 ### 即時音量表
 
@@ -162,7 +170,7 @@ Backtracking 視窗有焦點時，按 `Esc` 或 `Backspace` 可取消編輯並�
 
 ### 分開編輯
 
-可以只框選、試聽、淡化、拖出或保存部分波形列：A、B 其中一軌，立體聲來源分成 L／R 兩列時的其中一側，或多聲道來源的部分聲道。在波形上按右鍵選擇 **Edit separately／分開編輯**（macOS 為 **Edit A and B separately**），或在 Backtracking 視窗有焦點時單獨輕按一下右側 `Ctrl`（Mac 為右側 `Command`）；再選一次或再輕按一次，就回到全部一起編輯。這個模式預設關閉，結束程式後不保留。Windows 版需要畫面上有一列以上的波形，macOS 版需要擷取兩個來源。按住超過半秒，或同時按下其他按鍵或滑鼠按鈕，都不算輕按。
+可以只框選、試聽、淡化、拖出或保存部分波形列：A、B 其中一軌，立體聲來源分成 L／R 兩列時的其中一側，或多聲道來源的部分聲道。在波形上按右鍵選擇 **Edit separately／分開編輯**，或在 Backtracking 視窗有焦點時單獨輕按一下右側 `Ctrl`（Mac 為右側 `Command`）；再選一次或再輕按一次，就回到全部一起編輯。這個模式預設關閉，結束程式後不保留。此功能需要畫面上有兩列以上的波形。按住超過半秒，或同時按下其他按鍵或滑鼠按鈕，都不算輕按。
 
 Windows 版開啟這個模式後，選區涵蓋從開始拖曳的那一列到游標所在的那一列：往上或往下拖可納入更多列，拖回來就再放掉。拖過可捲動軌道的上緣或下緣時，軌道會跟著捲動。多聲道軌道最上方的 L 與 R 兩列一律一起選取。macOS 版的選區則屬於開始拖曳的那一軌。
 
@@ -351,7 +359,7 @@ On Windows, route the source to the default playback device. If a DAW uses ASIO,
 
 ### Open settings
 
-Click the gear in the toolbar to open **Options**. Right-clicking inside the plug-in also opens Options. In the Windows and macOS desktop apps, right-clicking opens a menu instead: **Pause / Resume / Retry capture**, **Clear**, **Save snapshot**, **Edit separately** (**Edit A and B separately** in the macOS app), **Show waveform only**, **Keep on top**, **Options…**, and **Quit**. With the desktop window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` previews the selection instead and `Delete` cancels the selection first. With more than one waveform row (two sources in the macOS app), tapping the right `Ctrl` key on its own (the right `Command` key on a Mac) switches [Edit separately](#edit-separately) on or off. These are the default keys; in the Windows desktop app you can change them on the **Hotkeys** page of Options (see [Hotkeys](#hotkeys-windows-desktop)). The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
+Click the gear in the toolbar to open **Options**. Right-clicking inside the plug-in also opens Options. In the Windows and macOS desktop apps, right-clicking opens a menu instead: **Pause / Resume / Retry capture**, **Clear**, **Save snapshot**, **Edit separately**, **Show waveform only**, **Keep on top**, **Options…**, and **Quit**. With the desktop window focused, `Space` pauses or resumes capture and `Delete` (`Fn` + `Delete` on a Mac keyboard) clears the current recording. With a selection, `Space` previews the selection instead and `Delete` cancels the selection first. With more than one waveform row, tapping the right `Ctrl` key on its own (the right `Command` key on a Mac) switches [Edit separately](#edit-separately) on or off. These are the default keys; in the Windows desktop app you can change them on the **Hotkeys** page of Options (see [Hotkeys](#hotkeys-windows-desktop)). The desktop app opens a separate window. VST3 and CLAP open Options inside the DAW's plug-in editor. The controls are grouped by category, including capture, theme accent, history length, auto-resume, transparency, WAV format, and folders. On desktop, you can also toggle **Keep on top** from the toolbar.
 
 Choose a category on the left, then use the vertical settings list on the right. Larger bold titles, group headings, and body/control text of at least 15 distinguish hierarchy. History, auto-resume, transparency, and WAV format use dropdowns sized to their item count, up to ten rows before scrolling. Scroll the details pane for longer content. Desktop Options can be resized and keeps Close visible. The plug-in requests a larger editor and restores its prior size when closed.
 
@@ -440,7 +448,7 @@ While there is a selection, the selected part keeps its colors and the rest of t
 
 A look from an add-on (see Add-ons) can supply these colors. They are used only while By frequency is on and you have no colors of your own, and a note under the colors names the add-on. Changing any of them makes them your own, starting from the look's; **Reset** then goes back to the look's colors. An add-on cannot turn By frequency on for you.
 
-Only the Windows desktop app has this for now; the macOS app does not yet.
+The macOS app built from the current source also has frequency coloring and editable gradient stops. See the macOS desktop section below.
 
 ### More than two sources (Windows desktop)
 
@@ -455,7 +463,15 @@ The Windows desktop app can capture more sources than A and B at once, up to 64.
 - When there are more rows than fit at 14 pixels each, the whole waveform scrolls up and down as one: turn the wheel over its left margin or the scroll bar on the right, or drag the bar. The wheel over the waveform itself still zooms. Selecting, flags, dragging out and [Edit separately](#edit-separately) work on scrolled rows; while editing separately, a drag past the top or bottom edge scrolls. The window first grows taller, up to 560 pixels, and scrolls only past that.
 - The toolbar shows the meters that fit and gathers the rest behind a **+N** button. Click it to see every source's meter; click elsewhere or press `Esc` to close the list.
 - Exports, drags and snapshots write a WAV file for each source, named with its letter, for example `Backtracking_Spotify_C_….wav`.
-- With one or two sources the window looks as before. The macOS app and the VST3 and CLAP plug-ins keep the sources they had.
+- The VST3 and CLAP plug-ins keep their original source counts.
+
+### macOS desktop from source
+
+The macOS app built from the current source has **Add source** and **Remove** in Options → **Sources**. It accepts up to 64 sources and 64 channels in total, with lanes lettered A through BL. **All channels** preserves a multichannel source. Its waveform has a stereo L/R pair and one row per channel. Scroll over either edge to see rows that do not fit. **Edit separately** selects an individual row and treats the L/R pair as one target.
+
+Options → **Capture** sets whether the wide L/R pair sounds stereo or binaural. Options → **Export** offers one binaural or mono file per channel, one multichannel WAV, or one binaural mix. In Options → **Appearance**, choose **By frequency** under **Waveform color** to enable and edit the gradient.
+
+Options → **Hotkeys** lets you set up to two shortcuts per action. The default system-wide snapshot shortcut uses Fn/Globe and the physical key left of 1 and requires Input Monitoring permission. **Reset** restores the Right Command tap for **Edit separately**.
 
 ### Live audio meter
 
@@ -493,17 +509,17 @@ Hold `Alt` (`Option` on a Mac) and drag the selection's start flag to fade it in
 
 ### Edit separately
 
-You can select, preview, fade, drag out or save some waveform rows on their own: one of the lanes A and B, one side of a stereo source shown as L and R rows, or some channels of a multichannel source. Right-click the waveform and choose **Edit separately** (**Edit A and B separately** in the macOS app), or, with the Backtracking window focused, tap the right `Ctrl` key on its own (the right `Command` key on a Mac). Choose it or tap again to edit everything together. The mode is off by default and is not kept when you quit. On Windows it needs more than one waveform row on screen; the macOS app needs two sources. Holding the key for more than half a second, or pressing another key or a mouse button with it, is not a tap.
+You can select, preview, fade, drag out or save some waveform rows on their own: one of the lanes A and B, one side of a stereo source shown as L and R rows, or some channels of a multichannel source. Right-click the waveform and choose **Edit separately**, or, with the Backtracking window focused, tap the right `Ctrl` key on its own (the right `Command` key on a Mac). Choose it or tap again to edit everything together. The mode is off by default and is not kept when you quit. It needs more than one waveform row on screen. Holding the key for more than half a second, or pressing another key or a mouse button with it, is not a tap.
 
-On Windows, while the mode is on, a selection covers the rows from the one you start dragging in to the one under the pointer: drag up or down to take in more rows, and back to let them go again. Drag past the top or bottom of a lane that scrolls to scroll it. The L and R rows on top of a multichannel lane are always taken together. In the macOS app a selection belongs to the lane you start dragging in.
+On Windows, while the mode is on, a selection covers the rows from the one you start dragging in to the one under the pointer: drag up or down to take in more rows, and back to let them go again. Drag past the top or bottom of a lane that scrolls to scroll it. The L and R rows on top of a multichannel lane are always taken together. In the macOS app a selection covers the row you start dragging in or the L/R pair.
 
 | Action | Together (default) | Separately |
 | --- | --- | --- |
-| Select | The selection covers every row | The selection covers the rows you drag across (macOS: the lane you start in), and only those rows are highlighted |
+| Select | The selection covers every row | The selection covers the rows you drag across (macOS: the starting row or L/R pair), and only those rows are highlighted |
 | Preview (`Space`) | Plays everything as it exports | Plays the selected rows only |
 | Fade in and out | Applies to everything | Applies to the selected rows only |
 | Drag out a selection | Exports every lane | Exports the selected rows only |
-| Drag out without a selection | Exports all of A and B | Exports all of the row under the pointer (macOS: the lane) |
+| Drag out without a selection | Exports all of A and B | Exports all of the row under the pointer (macOS: the starting row or L/R pair) |
 | **Save snapshot** / global snapshot shortcut | Saves A and B | Saves the selected rows; without a selection it still saves A and B |
 
 There is one selection at a time, and its rows share the flags, which stand on top of the selected rows. The status line and the length label of the full interface name the rows, for example "Selection · C–Ls", and the L and R rows of a multichannel lane as "L/R". Switching keeps the selection: turning the mode off widens it to every row, and turning it on again narrows it back to the rows you dragged across (macOS: the lane it began in). Switching does nothing while you are selecting, dragging out or fading.

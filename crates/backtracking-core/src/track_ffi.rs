@@ -7,36 +7,59 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::export::export_routed_track_refs;
+use crate::export::{export_routed_track_refs, TrackAudio};
+use crate::preview::PreviewLane;
+use crate::waveform::{PairGroup, PairSide, SpectrumRow, SPECTRUM_BANDS};
+use crate::wide_export::{export_wide_track, WideExportGroup, WideExportMode, WideRowExport};
 use crate::{
     cleanup, discover_senders, discover_snapshot_targets, request_sender_snapshot, ChannelRoute,
-    DurationChoice, Fades, Lane, MeterReadings, PreviewGate, SenderInfo, SenderReceiver, Snapshot,
+    DurationChoice, Fades, FrozenCapture, Lane, MeterReadings, Preview, PreviewGate, PreviewSlot,
+    SenderInfo, SenderReceiver, Snapshot,
     SynchronizedCapture, TakeLabel, TimedAudioQueue, WavExportProfile, WavSampleFormat,
-    WaveformView,
+    WaveformView, DEFAULT_MAX_BUFFER_SAMPLES, MAX_LANES,
 };
 
 struct TrackSender {
     id: String,
     receiver: Option<SenderReceiver>,
     route: ChannelRoute,
+    weights: Vec<[f32; 2]>,
     retry_at: Instant,
 }
 
 impl TrackSender {
-    fn receiver(&mut self, channels: usize) -> Option<&mut SenderReceiver> {
-        if self.receiver.is_none() && Instant::now() >= self.retry_at {
-            self.retry_at = Instant::now() + Duration::from_secs(2);
-            self.receiver = SenderReceiver::connect(&self.id).ok().filter(|receiver| {
-                self.route.output_channels(receiver.info.channels, None) == Some(channels)
-            });
+    fn connect(&mut self, channels: usize) {
+        if self.receiver.is_some() || Instant::now() < self.retry_at {
+            return;
         }
-        self.receiver.as_mut()
+        self.retry_at = Instant::now() + Duration::from_secs(2);
+        if let Ok(receiver) = SenderReceiver::connect(&self.id) {
+            self.bind(receiver, channels);
+        }
     }
+
+    fn bind(&mut self, receiver: SenderReceiver, channels: usize) -> bool {
+        let width = receiver.info.channels;
+        if self.route.output_channels(width, None) != Some(channels) {
+            return false;
+        }
+        self.weights = if self.route == ChannelRoute::Merged && width > 2 {
+            let labels = receiver.labels().map_or_else(|| vec![""; width], |labels| {
+                labels.iter().map(String::as_str).collect()
+            });
+            crate::spatial::stereo_weights(&labels)
+        } else {
+            Vec::new()
+        };
+        self.receiver = Some(receiver);
+        true
+    }
+
 }
 
 struct TrackReader {
     rate: u32,
-    senders: [Option<TrackSender>; 2],
+    senders: Vec<Option<TrackSender>>,
     sender_audio: Vec<f32>,
     sender_bars: Vec<usize>,
     synchronized: SynchronizedCapture,
@@ -44,18 +67,18 @@ struct TrackReader {
 }
 
 struct BtTracks {
-    queues: [Option<Arc<TimedAudioQueue>>; 2],
+    queues: Vec<Arc<TimedAudioQueue>>,
     reader: Mutex<TrackReader>,
     enabled: AtomicBool,
     /// Lanes that record System playback, where audio captured while a Backtracking preview may
     /// have been heard is silenced, so the preview never enters the history.
-    preview_silence: [AtomicBool; 2],
+    preview_silence: Vec<AtomicBool>,
     gate: &'static PreviewGate,
 }
 
 impl BtTracks {
     fn queue(&self, lane: u32) -> Option<&TimedAudioQueue> {
-        self.queues.get(lane as usize)?.as_deref()
+        self.queues.get(lane as usize).map(Arc::as_ref)
     }
 
     fn drain(&self, reader: &mut TrackReader, ingest: bool, flush: bool) {
@@ -65,19 +88,23 @@ impl BtTracks {
             let mut progressed = false;
             for (lane, queue) in self.queues.iter().enumerate() {
                 if let Some(sender) = &mut senders[lane] {
-                    let route = sender.route;
-                    let Some(receiver) = queue.as_ref().and_then(|queue| sender.receiver(queue.channels())) else {
-                        continue;
-                    };
+                    sender.connect(queue.channels());
+                    let Some(receiver) = &mut sender.receiver else { continue };
                     match receiver.packet(sender_audio, sender_bars) {
                         Ok(Some(packet)) => {
                             progressed = true;
-                            if ingest && route.route_interleaved(
-                                sender_audio, receiver.info.channels, None, scratch,
-                            ).is_ok() {
-                                let _ = synchronized.push_with_markers(
-                                    lane, packet.timestamp_ns, packet.sample_rate, scratch, false, sender_bars,
-                                );
+                            if ingest {
+                                let routed = if sender.weights.is_empty() {
+                                    sender.route.route_interleaved(sender_audio, receiver.info.channels, None, scratch).is_ok()
+                                } else {
+                                    scratch.resize(packet.frames * 2, 0.0);
+                                    crate::spatial::fold_down(sender_audio, &sender.weights, scratch).is_ok()
+                                };
+                                if routed {
+                                    let _ = synchronized.push_with_markers(
+                                        lane, packet.timestamp_ns, packet.sample_rate, scratch, false, sender_bars,
+                                    );
+                                }
                             }
                         }
                         Ok(None) => {}
@@ -86,9 +113,7 @@ impl BtTracks {
                             sender.retry_at = Instant::now() + Duration::from_secs(2);
                         }
                     }
-                } else if let Some((queue, packet)) =
-                    queue.as_deref().and_then(|queue| Some((queue, queue.pop(scratch)?)))
-                {
+                } else if let Some(packet) = queue.pop(scratch) {
                     progressed = true;
                     if ingest {
                         if self.preview_silence[lane].load(Ordering::Relaxed) {
@@ -123,32 +148,49 @@ extern "C" fn bt_tracks_new(
     b_channels: u32,
     history_secs: u32,
 ) -> *mut BtTracks {
+    let widths = [a_channels, b_channels];
+    new_tracks(rate, &widths[..if b_channels == 0 { 1 } else { 2 }], history_secs,
+        DEFAULT_MAX_BUFFER_SAMPLES)
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_tracks_new_lanes(
+    rate: f64, widths: *const u32, count: usize, history_secs: u32, physical_memory: u64,
+) -> *mut BtTracks {
+    if widths.is_null() || !(1..=MAX_LANES).contains(&count) {
+        return ptr::null_mut();
+    }
+    let budget = (physical_memory / 8 / size_of::<f32>() as u64)
+        .clamp(DEFAULT_MAX_BUFFER_SAMPLES as u64, 512 * 1024 * 1024) as usize;
+    new_tracks(rate, slice::from_raw_parts(widths, count), history_secs, budget)
+}
+
+fn new_tracks(rate: f64, widths: &[u32], history_secs: u32, budget: usize) -> *mut BtTracks {
     let (Some(rate), Some(history)) = (
         sample_rate(rate),
         DurationChoice::from_seconds(history_secs),
     ) else {
         return ptr::null_mut();
     };
-    let b_channels = (b_channels != 0).then_some(b_channels as usize);
-    let Ok(synchronized) = SynchronizedCapture::new(rate, a_channels as usize, b_channels, history)
+    let widths: Vec<_> = widths.iter().map(|&width| width as usize).collect();
+    let Ok(synchronized) = SynchronizedCapture::new_lanes_with_budget(rate, &widths, history, budget)
     else {
         return ptr::null_mut();
     };
     // Keep enough capacity to tolerate a delayed UI poll at high source rates.
     let capacity = 96_000.max(rate as usize / 4);
-    let queue = |channels| TimedAudioQueue::new(capacity, 512, channels);
     Box::into_raw(Box::new(BtTracks {
-        queues: [Some(queue(a_channels as usize)), b_channels.map(queue)],
+        queues: widths.iter().map(|&width| TimedAudioQueue::new(capacity, 512, width)).collect(),
         reader: Mutex::new(TrackReader {
             rate,
             synchronized,
-            senders: [None, None],
+            senders: widths.iter().map(|_| None).collect(),
             sender_audio: Vec::new(),
             sender_bars: Vec::new(),
             scratch: Vec::new(),
         }),
         enabled: AtomicBool::new(true),
-        preview_silence: [AtomicBool::new(false), AtomicBool::new(false)],
+        preview_silence: widths.iter().map(|_| AtomicBool::new(false)).collect(),
         gate: PreviewGate::shared(),
     }))
 }
@@ -293,6 +335,13 @@ unsafe extern "C" fn bt_tracks_set_history(core: *const BtTracks, seconds: u32) 
 }
 
 #[no_mangle]
+unsafe extern "C" fn bt_tracks_retention_frames(core: *const BtTracks) -> u64 {
+    core.as_ref()
+        .and_then(|core| core.reader.lock().ok())
+        .map_or(0, |reader| reader.synchronized.capture().effective_retention_frames() as u64)
+}
+
+#[no_mangle]
 unsafe extern "C" fn bt_tracks_set_retain_silence(core: *const BtTracks, enabled: u32) {
     let Some(core) = core.as_ref() else { return };
     let Ok(mut reader) = core.reader.lock() else { return };
@@ -351,12 +400,18 @@ unsafe extern "C" fn bt_tracks_waveform_range(
     core: *const BtTracks, lane: u32, view: u32, first: u64, end: u64,
     minimum: *mut f32, maximum: *mut f32, bins: u32,
 ) -> u64 {
-    let (Some(core), Some(view)) = (core.as_ref(), WaveformView::from_code(view)) else { return 0 };
-    if minimum.is_null() || maximum.is_null() { return 0; }
-    let Ok(reader) = core.reader.lock() else { return 0 };
+    let Some(core) = core.as_ref() else { return 0; };
+    if minimum.is_null() || maximum.is_null() || first >= end { return 0; }
+    let Ok(reader) = core.reader.lock() else { return 0; };
     let minimum = slice::from_raw_parts_mut(minimum, bins as usize);
     let maximum = slice::from_raw_parts_mut(maximum, bins as usize);
-    reader.synchronized.capture().track_waveform_range(lane as usize, view, first..end, minimum, maximum) as u64
+    let capture = reader.synchronized.capture();
+    (match WaveformView::from_code(view) {
+        Some(view) => capture.track_waveform_range(lane as usize, view, first..end, minimum, maximum),
+        None => capture.track_channel_waveform_range(
+            lane as usize, (view - 3) as usize, first..end, minimum, maximum,
+        ),
+    }) as u64
 }
 
 #[no_mangle]
@@ -381,14 +436,16 @@ unsafe extern "C" fn bt_tracks_attach_sender(
     let Ok(id) = CStr::from_ptr(id).to_str() else { return 0 };
     let Some(queue) = core.queue(lane) else { return 0 };
     let Ok(receiver) = SenderReceiver::connect(id) else { return 0 };
-    if route.output_channels(receiver.info.channels, None) != Some(queue.channels()) { return 0; }
-    let Ok(mut reader) = core.reader.lock() else { return 0 };
-    reader.senders[lane as usize] = Some(TrackSender {
+    let mut sender = TrackSender {
         id: id.to_owned(),
-        receiver: Some(receiver),
+        receiver: None,
         route,
+        weights: Vec::new(),
         retry_at: Instant::now(),
-    });
+    };
+    if !sender.bind(receiver, queue.channels()) { return 0; }
+    let Ok(mut reader) = core.reader.lock() else { return 0 };
+    reader.senders[lane as usize] = Some(sender);
     1
 }
 
@@ -433,6 +490,15 @@ unsafe extern "C" fn bt_senders_format(senders: *const Vec<SenderInfo>, index: u
 unsafe extern "C" fn bt_sender_request_snapshot(id: *const c_char) -> i32 {
     if id.is_null() { return 0; }
     i32::from(CStr::from_ptr(id).to_str().is_ok_and(|id| request_sender_snapshot(id).is_ok()))
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_sender_channel_labels(id: *const c_char) -> *mut c_char {
+    if id.is_null() { return ptr::null_mut(); }
+    let Ok(id) = CStr::from_ptr(id).to_str() else { return ptr::null_mut(); };
+    crate::sender::sender_channel_labels(id)
+        .and_then(|labels| CString::new(labels.join("\t")).ok())
+        .map_or(ptr::null_mut(), CString::into_raw)
 }
 
 /// The housekeeping schedule for the drag-and-drop folder. `days` is 0 for Off; a number the
@@ -723,13 +789,12 @@ unsafe fn source_name_arg(name: *const c_char) -> Option<String> {
     CStr::from_ptr(name).to_str().ok().map(str::to_owned)
 }
 
-/// A lane passed in from C: 0 is none, 1 is A and 2 is B. Anything else is refused.
+/// A lane passed in from C: 0 is none, 1 is A, through 64 for BL.
 fn lane_arg(lane: u32) -> Option<Option<Lane>> {
-    match lane {
-        0 => Some(None),
-        1 => Some(Some(Lane::A)),
-        2 => Some(Some(Lane::B)),
-        _ => None,
+    if lane == 0 {
+        Some(None)
+    } else {
+        Lane::from_index(lane as usize - 1).map(Some)
     }
 }
 
@@ -951,8 +1016,8 @@ unsafe fn export_pair(
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn export_snapshots(
-    snapshots: &[&Snapshot],
+unsafe fn export_snapshots<T: TrackAudio>(
+    snapshots: &[&T],
     frames: Range<usize>,
     directory: *const c_char,
     sample_rate: u32,
@@ -962,20 +1027,14 @@ unsafe fn export_snapshots(
     fades: Fades,
     labels: &[TakeLabel],
 ) -> Option<Vec<CString>> {
-    if directory.is_null() {
-        return None;
-    }
-    let directory = CStr::from_ptr(directory).to_str().ok()?;
-    if directory.is_empty() {
-        return None;
-    }
+    let directory = export_directory(directory)?;
     let sample_format = WavSampleFormat::from_bits_per_sample(bits_per_sample)?;
     let profile = WavExportProfile {
         sample_rate,
         sample_format,
     };
     let paths = export_routed_track_refs(
-        Path::new(directory),
+        directory,
         snapshots,
         frames,
         profile,
@@ -987,16 +1046,308 @@ unsafe fn export_snapshots(
         labels,
     )
     .ok()?;
+    encode_export_paths(paths)
+}
+
+unsafe fn export_directory<'a>(directory: *const c_char) -> Option<&'a Path> {
+    if directory.is_null() {
+        return None;
+    }
+    let directory = CStr::from_ptr(directory).to_str().ok()?;
+    (!directory.is_empty()).then(|| Path::new(directory))
+}
+
+fn remove_export_paths(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn encode_export_paths(paths: Vec<PathBuf>) -> Option<Vec<CString>> {
     let result: Option<Vec<CString>> = paths
         .iter()
         .map(|path| CString::new(path.to_str()?).ok())
         .collect();
     if result.is_none() {
-        for path in paths {
-            let _ = std::fs::remove_file(path);
-        }
+        remove_export_paths(&paths);
     }
     result
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_tracks_freeze(
+    core: *const BtTracks, first: u64, end: u64,
+) -> *mut FrozenCapture {
+    let frozen = core.as_ref()
+        .and_then(|core| core.reader.lock().ok())
+        .and_then(|reader| reader.synchronized.capture().freeze_range(first..end));
+    frozen.map_or(ptr::null_mut(), |value| Box::into_raw(Box::new(value)))
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_frozen_free(frozen: *mut FrozenCapture) {
+    if !frozen.is_null() {
+        drop(Box::from_raw(frozen));
+    }
+}
+
+const PAIR_LEFT: u32 = 67;
+const PAIR_RIGHT: u32 = 68;
+
+fn pair_side(view: u32) -> Option<PairSide> {
+    match view {
+        PAIR_LEFT => Some(PairSide::Left),
+        PAIR_RIGHT => Some(PairSide::Right),
+        _ => None,
+    }
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_frozen_waveform(
+    frozen: *const FrozenCapture, lane: u32, view: u32, first: u64, end: u64,
+    minimum: *mut f32, maximum: *mut f32, bins: u32, labels: *const c_char,
+) {
+    let Some(track) = frozen.as_ref().and_then(|frozen| frozen.track(lane as usize)) else {
+        return;
+    };
+    if minimum.is_null() || maximum.is_null() || first >= end { return; }
+    let minimum = slice::from_raw_parts_mut(minimum, bins as usize);
+    let maximum = slice::from_raw_parts_mut(maximum, bins as usize);
+    if let Some(view) = WaveformView::from_code(view) {
+        track.waveform(view, first..end, minimum, maximum);
+    } else if let Some(side) = pair_side(view) {
+        if let Some(group) = PairGroup::new(0, &channel_names(labels, track.channels())) {
+            track.pair_waveform(&group, side, first..end, minimum, maximum);
+        }
+    } else {
+        track.channel_waveform((view - 3) as usize, first..end, minimum, maximum);
+    }
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_frozen_spectrum(
+    frozen: *const FrozenCapture, lane: u32, view: u32, first: u64, end: u64,
+    energies: *mut [f32; SPECTRUM_BANDS], bins: u32, labels: *const c_char,
+) {
+    let Some(track) = frozen.as_ref().and_then(|frozen| frozen.track(lane as usize)) else {
+        return;
+    };
+    if energies.is_null() || first >= end { return; }
+    let group;
+    let row = if let Some(view) = WaveformView::from_code(view) {
+        SpectrumRow::View(view)
+    } else if let Some(side) = pair_side(view) {
+        let Some(pair) = PairGroup::new(0, &channel_names(labels, track.channels())) else {
+            return;
+        };
+        group = pair;
+        SpectrumRow::Pair(&group, side)
+    } else {
+        SpectrumRow::Channel((view - 3) as usize)
+    };
+    let mut results = vec![None; bins as usize];
+    track.spectrum(row, first..end, &mut results);
+    for (out, bin) in slice::from_raw_parts_mut(energies, bins as usize).iter_mut().zip(results) {
+        *out = bin.unwrap_or_default();
+    }
+}
+
+#[repr(C)]
+struct BtFrozenLane {
+    index: u32,
+    route: u32,
+    source_name: *const c_char,
+    channel_labels: *const c_char,
+    view: u32,
+}
+
+unsafe fn frozen_lanes<'a>(
+    frozen: *const FrozenCapture, lanes: *const BtFrozenLane, count: usize,
+    first: u64, end: u64,
+) -> Option<(&'a FrozenCapture, &'a [BtFrozenLane])> {
+    let frozen = frozen.as_ref()?;
+    let held = frozen.frame_range();
+    if lanes.is_null() || !(1..=frozen.track_count()).contains(&count)
+        || first < held.start || end > held.end || first >= end
+    {
+        return None;
+    }
+    Some((frozen, slice::from_raw_parts(lanes, count)))
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_frozen_play(
+    frozen: *const FrozenCapture, slot: *const PreviewSlot, lanes: *const BtFrozenLane,
+    count: usize, first: u64, end: u64, force_mono: u32, pair_binaural: u32, fades: Fades,
+) -> i32 {
+    let (Some(slot), Some((frozen, lanes))) = (slot.as_ref(), frozen_lanes(frozen, lanes, count, first, end))
+    else {
+        return 0;
+    };
+    let Some(tracks) = lanes.iter().map(|lane| frozen.track(lane.index as usize)).collect::<Option<Vec<_>>>()
+    else { return 0 };
+    let Some(routes) = lanes.iter().map(|lane| ChannelRoute::from_code(lane.route)).collect::<Option<Vec<_>>>()
+    else { return 0 };
+    let groups: Vec<_> = tracks.iter().zip(lanes).map(|(track, lane)| {
+        (track.channels() > 2)
+            .then(|| PairGroup::new(0, &channel_names(lane.channel_labels, track.channels())))
+            .flatten()
+    }).collect();
+    if tracks.iter().zip(lanes).any(|(track, lane)| !valid_row(lane.view, track.channels())) {
+        return 0;
+    }
+    let selected: Vec<_> = tracks.iter().zip(lanes).map(|(track, lane)| {
+        selection_channel(lane.view, track.channels()).map(|channel| [channel])
+    }).collect();
+    let playback: Vec<_> = tracks.iter().zip(routes).zip(groups.iter().zip(&selected))
+        .map(|((track, route), (group, selected))| PreviewLane {
+            track, route, group: group.as_ref(), selected: selected.as_ref().map(<[_; 1]>::as_slice),
+        }).collect();
+    let model = if pair_binaural != 0 && groups.iter().any(Option::is_some) {
+        let Ok(model) = crate::spatial::HeadModel::new(frozen.sample_rate()) else { return 0; };
+        Some(Arc::new(model))
+    } else {
+        None
+    };
+    let Some(preview) = Preview::with_channels(&playback, first..end, model, force_mono != 0, fades)
+    else { return 0 };
+    slot.play(preview);
+    1
+}
+
+fn valid_row(view: u32, width: usize) -> bool {
+    view == 0 || (width > 2 && pair_side(view).is_some())
+        || selection_channel(view, width).is_some_and(|channel| channel < width)
+}
+
+fn selection_channel(view: u32, width: usize) -> Option<usize> {
+    match view {
+        1..=2 if width == 2 => Some((view - 1) as usize),
+        3..=66 if width > 2 => Some((view - 3) as usize),
+        _ => None,
+    }
+}
+
+unsafe fn channel_names(labels: *const c_char, channels: usize) -> Vec<String> {
+    let labels = source_name_arg(labels).unwrap_or_default();
+    let labels: Vec<_> = labels.split('\t').map(str::to_owned).collect();
+    if labels.len() == channels {
+        labels
+    } else {
+        (1..=channels).map(|channel| format!("Channel {channel}")).collect()
+    }
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_frozen_export(
+    frozen: *const FrozenCapture, lanes: *const BtFrozenLane, count: usize,
+    first: u64, end: u64, directory: *const c_char, sample_rate: u32, bits_per_sample: u32,
+    force_mono: u32, wide_mode: u32, pair_binaural: u32, fades: Fades,
+) -> *mut Vec<CString> {
+    let Some((frozen, lanes)) = frozen_lanes(frozen, lanes, count, first, end) else {
+        return ptr::null_mut();
+    };
+    let (Some(directory), Some(sample_format)) = (
+        export_directory(directory), WavSampleFormat::from_bits_per_sample(bits_per_sample),
+    ) else {
+        return ptr::null_mut();
+    };
+    let mode = match wide_mode {
+        0 => WideExportMode::BinauralFiles,
+        1 => WideExportMode::MonoFiles,
+        2 => WideExportMode::Multichannel,
+        3 => WideExportMode::BinauralMix,
+        _ => return ptr::null_mut(),
+    };
+    let mut tracks = Vec::with_capacity(count);
+    let mut routes = Vec::with_capacity(count);
+    let mut labels = Vec::with_capacity(count);
+    for lane in lanes {
+        let (Some(track), Some(route), Some(name)) = (
+            frozen.track(lane.index as usize),
+            ChannelRoute::from_code(lane.route),
+            source_name_arg(lane.source_name),
+        ) else {
+            return ptr::null_mut();
+        };
+        if !valid_row(lane.view, track.channels()) {
+            return ptr::null_mut();
+        }
+        tracks.push(track);
+        routes.push(route);
+        let letter = if frozen.track_count() > 1 { Lane::from_index(lane.index as usize) } else { None };
+        labels.push(TakeLabel::new(name, letter));
+    }
+    let start = frozen.frame_range().start;
+    let frames = (first - start) as usize..(end - start) as usize;
+    let profile = WavExportProfile { sample_rate, sample_format };
+    let mut paths = Vec::new();
+    let result: std::io::Result<()> = (|| {
+        if tracks.iter().zip(lanes).all(|(track, lane)| track.channels() <= 2 && lane.view == 0) {
+            let references: Vec<_> = tracks.iter().collect();
+            paths = export_routed_track_refs(
+                directory, &references, frames, profile, &routes, force_mono != 0, None, fades, &labels,
+            )?;
+        } else {
+            for (index, track) in tracks.iter().enumerate() {
+                let view = lanes[index].view;
+                let channel = selection_channel(view, track.channels());
+                let selected = channel.map(|channel| [channel]);
+                let written = if track.channels() > 2 {
+                    let names = channel_names(lanes[index].channel_labels, track.channels());
+                    let group = WideExportGroup { channels: 0..track.channels(), labels: &names, positioned: false };
+                    let pair_only = pair_side(view).is_some();
+                    let channels = if pair_only { Some(&[][..]) } else { selected.as_ref().map(<[_; 1]>::as_slice) };
+                    export_wide_track(
+                        directory, track, frames.clone(), fades, profile, &labels[index], Some(&group), mode,
+                        &WideRowExport { channels, pair: channel.is_none(), pair_binaural: pair_binaural != 0,
+                            ..WideRowExport::default() },
+                    )?.paths
+                } else if let Some(channel) = channel {
+                    crate::export_channel_range_with_profile(
+                        directory, track, frames.clone(), channel..channel + 1, &[], profile,
+                        crate::ChannelExportMode::Multichannel, fades, &labels[index],
+                    )?
+                } else {
+                    export_routed_track_refs(
+                        directory, &[track], frames.clone(), profile, &routes[index..=index], force_mono != 0,
+                        None, fades, &labels[index..=index],
+                    )?
+                };
+                paths.extend(written);
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        remove_export_paths(&paths);
+        return ptr::null_mut();
+    }
+    encode_export_paths(paths).map_or(ptr::null_mut(), |paths| Box::into_raw(Box::new(paths)))
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_export_paths_count(paths: *const Vec<CString>) -> usize {
+    paths.as_ref().map_or(0, Vec::len)
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_export_path(paths: *const Vec<CString>, index: usize) -> *const c_char {
+    paths.as_ref().and_then(|paths| paths.get(index)).map_or(ptr::null(), |path| path.as_ptr())
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_export_paths_free(paths: *mut Vec<CString>) {
+    if !paths.is_null() {
+        drop(Box::from_raw(paths));
+    }
+}
+
+#[no_mangle]
+extern "C" fn bt_lane_letter(index: u32) -> *mut c_char {
+    Lane::from_index(index as usize)
+        .and_then(|lane| CString::new(lane.letter()).ok())
+        .map_or(ptr::null_mut(), CString::into_raw)
 }
 
 #[cfg(test)]
@@ -1042,7 +1393,7 @@ mod display_tests {
 
             // An unknown lane and a name that is not UTF-8 write nothing.
             let bad = [0xffu8, 0x00];
-            for (source, lane_code) in [(spotify.as_ptr(), 3), (bad.as_ptr().cast(), 1)] {
+            for (source, lane_code) in [(spotify.as_ptr(), 65), (bad.as_ptr().cast(), 1)] {
                 assert!(bt_snapshot_export_labelled_frames(
                     &lane, 100, 4_900, folder.as_ptr(), 48_000, 32, 5, 0, 0, 0, source, lane_code,
                 )
@@ -1062,7 +1413,8 @@ mod display_tests {
         assert_eq!(prefix(spotify.as_ptr(), 0).as_deref(), Some("Backtracking_Spotify_"));
         // Without a source name the lane follows the take, so the beginning is the same.
         assert_eq!(prefix(ptr::null(), 1).as_deref(), Some("Backtracking_"));
-        assert_eq!(prefix(spotify.as_ptr(), 3), None);
+        assert_eq!(prefix(spotify.as_ptr(), 64).as_deref(), Some("Backtracking_Spotify_BL_"));
+        assert_eq!(prefix(spotify.as_ptr(), 65), None);
     }
 
     #[test]

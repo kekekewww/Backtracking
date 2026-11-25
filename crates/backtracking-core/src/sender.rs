@@ -538,6 +538,10 @@ impl SenderReceiver {
     }
 }
 
+pub(crate) fn sender_channel_labels(id: &str) -> Option<Vec<String>> {
+    read_registration(id).and_then(|registration| read_labels(&registration))
+}
+
 pub fn discover_senders() -> Vec<SenderInfo> {
     discover(true)
 }
