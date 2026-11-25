@@ -2154,6 +2154,24 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         guard sideways == chosen, view.selectedRowsForExport == chosen, view.selectionForSaving()?.lowerBound != 12_000 else {
             throw CaptureError("Moving the start flag changed the rows from \(chosen) to \(view.selectedRowsForExport ?? view.verifyRememberedRows) (selection \(String(describing: view.selectionForSaving())))")
         }
+        // Selections the user makes, moves or drops are no longer the add-on's.
+        controller.selectionByAddon = "Verify"
+        let flag = view.verifyFlagPoint ?? press
+        view.mouseDown(with: mouse(.leftMouseDown, flag))
+        view.mouseDragged(with: mouse(.leftMouseDragged, NSPoint(x: flag.x + 20, y: flag.y)))
+        view.mouseUp(with: mouse(.leftMouseUp, NSPoint(x: flag.x + 20, y: flag.y)))
+        let afterFlag = controller.selectionByAddon
+        guard view.hasSelection else { throw CaptureError("The flag drag dropped the selection") }
+        controller.selectionByAddon = "Verify"
+        view.clearSelection()
+        let afterClear = controller.selectionByAddon
+        controller.selectionByAddon = "Verify"
+        view.mouseDown(with: mouse(.leftMouseDown, NSPoint(x: 300, y: 295), .option))
+        view.mouseUp(with: mouse(.leftMouseUp, NSPoint(x: 300, y: 295), .option))
+        guard afterFlag == nil, afterClear == nil, controller.selectionByAddon == nil else {
+            throw CaptureError("The status still names the add-on after a flag drag (\(afterFlag ?? "-")), a cleared selection (\(afterClear ?? "-")) or a new selection (\(controller.selectionByAddon ?? "-"))")
+        }
+        view.applyProgrammaticSelection(12_000..<36_000)
         // A new selection (Option-drag) still takes the rows it crosses.
         let start = NSPoint(x: 300, y: 295)
         view.mouseDown(with: mouse(.leftMouseDown, start, .option))
@@ -5639,6 +5657,13 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
+    /// The user moved or dropped the selection, so the status line stops naming the add-on.
+    func selectionNoLongerByAddon() {
+        guard selectionByAddon != nil else { return }
+        selectionByAddon = nil
+        updateStatus()
+    }
+
     fileprivate func setNotice(_ message: String?) {
         notice = message
         updateStatus()
@@ -8634,6 +8659,7 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
     func clearSelection() {
         stopEdgeAutoScroll()
         player?.stop()
+        controller?.selectionNoLongerByAddon()
         selection = nil
         selectionPressX = nil
         selectionMoved = false
@@ -9065,6 +9091,8 @@ private final class WaveformView: NSView, NSDraggingSource, NSViewToolTipOwner {
             let other = flag == flags.lowerBound ? flags.upperBound : flags.lowerBound
             let opposite = min(max(other, retainedFrames.lowerBound), retainedFrames.upperBound)
             selectionUpdatesRows = false
+            // The user's own drag: the selection is no longer the add-on's (Windows ui.rs:6768).
+            controller.selectionNoLongerByAddon()
             if selection == nil {
                 if !markerRows.isEmpty {
                     rememberedRows = markerRows
