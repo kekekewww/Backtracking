@@ -1679,6 +1679,596 @@ unsafe extern "C" fn bt_frozen_export_selection(
 }
 
 #[no_mangle]
+unsafe extern "C" fn bt_tracks_enable_frame_clock(core: *const BtTracks, lane: u32) -> i32 {
+    let Some(core) = core.as_ref() else { return 0 };
+    let Ok(mut reader) = core.reader.lock() else { return 0 };
+    i32::from(reader.synchronized.enable_frame_clock(lane as usize).is_ok())
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_tracks_take_frame_clock_eviction(
+    core: *const BtTracks,
+    lane: u32,
+    first_out: *mut u64,
+) -> i32 {
+    let Some(core) = core.as_ref() else { return 0 };
+    let Ok(mut reader) = core.reader.lock() else { return 0 };
+    if let Some(first) = reader.synchronized.take_frame_clock_eviction(lane as usize) {
+        if let Some(out) = first_out.as_mut() {
+            *out = first;
+        }
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+unsafe extern "C" fn bt_tracks_retained_frame_at(
+    core: *const BtTracks,
+    lane: u32,
+    time_ns: u64,
+    frame_out: *mut u64,
+) -> i32 {
+    let Some(core) = core.as_ref() else { return 0 };
+    let Ok(reader) = core.reader.lock() else { return 0 };
+    match reader.synchronized.retained_frame_at(lane as usize, time_ns) {
+        std::task::Poll::Ready(Some(frame)) => {
+            if let Some(out) = frame_out.as_mut() {
+                *out = frame;
+            }
+            1
+        }
+        std::task::Poll::Ready(None) => 0,
+        std::task::Poll::Pending => -1,
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn bt_frozen_waveform_bed(
+    frozen: *const FrozenCapture,
+    lane: u32,
+    view: u32,
+    bed_start: u32,
+    bed_count: u32,
+    first: u64,
+    end: u64,
+    minimum: *mut f32,
+    maximum: *mut f32,
+    bins: u32,
+    bed_labels: *const c_char,
+) {
+    let Some(track) = frozen.as_ref().and_then(|frozen| frozen.track(lane as usize)) else {
+        return;
+    };
+    if minimum.is_null() || maximum.is_null() || first >= end {
+        return;
+    }
+    let minimum = slice::from_raw_parts_mut(minimum, bins as usize);
+    let maximum = slice::from_raw_parts_mut(maximum, bins as usize);
+    if let Some(view) = WaveformView::from_code(view) {
+        track.waveform(view, first..end, minimum, maximum);
+    } else if let Some(side) = pair_side(view) {
+        let width = track.channels();
+        let (start, count) = if bed_count > 0 && (bed_start as usize) + (bed_count as usize) <= width {
+            (bed_start as usize, bed_count as usize)
+        } else {
+            (0, width)
+        };
+        if let Some(group) = PairGroup::new(start, &channel_names(bed_labels, count)) {
+            track.pair_waveform(&group, side, first..end, minimum, maximum);
+        }
+    } else {
+        track.channel_waveform((view - 3) as usize, first..end, minimum, maximum);
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn bt_frozen_spectrum_bed(
+    frozen: *const FrozenCapture,
+    lane: u32,
+    view: u32,
+    bed_start: u32,
+    bed_count: u32,
+    first: u64,
+    end: u64,
+    energies: *mut [f32; SPECTRUM_BANDS],
+    bins: u32,
+    bed_labels: *const c_char,
+) {
+    let Some(track) = frozen.as_ref().and_then(|frozen| frozen.track(lane as usize)) else {
+        return;
+    };
+    if energies.is_null() || first >= end {
+        return;
+    }
+    let group;
+    let row = if let Some(view) = WaveformView::from_code(view) {
+        SpectrumRow::View(view)
+    } else if let Some(side) = pair_side(view) {
+        let width = track.channels();
+        let (start, count) = if bed_count > 0 && (bed_start as usize) + (bed_count as usize) <= width {
+            (bed_start as usize, bed_count as usize)
+        } else {
+            (0, width)
+        };
+        let Some(pair) = PairGroup::new(start, &channel_names(bed_labels, count)) else {
+            return;
+        };
+        group = pair;
+        SpectrumRow::Pair(&group, side)
+    } else {
+        SpectrumRow::Channel((view - 3) as usize)
+    };
+    let mut results = vec![None; bins as usize];
+    track.spectrum(row, first..end, &mut results);
+    for (out, bin) in slice::from_raw_parts_mut(energies, bins as usize).iter_mut().zip(results) {
+        *out = bin.unwrap_or_default();
+    }
+}
+
+#[repr(C)]
+struct BtFrozenGroupSelectionLane {
+    index: u32,
+    route: u32,
+    source_name: *const c_char,
+    channel_labels: *const c_char,
+    channel_mask: u64,
+    channel_mask_valid: u32,
+    include_pair: u32,
+    shown_start: u32,
+    shown_count: u32,
+    shown_positioned: u32,
+    bed_start: u32,
+    bed_count: u32,
+    positions: *const crate::FrozenPositionTrack,
+}
+
+fn valid_group_range(start: u32, count: u32, width: usize) -> Option<Range<usize>> {
+    if count == 0 {
+        return None;
+    }
+    let s = start as usize;
+    let e = s.checked_add(count as usize)?;
+    (e <= width).then_some(s..e)
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn bt_frozen_play_group_selection(
+    frozen: *const FrozenCapture,
+    slot: *const PreviewSlot,
+    lanes: *const BtFrozenGroupSelectionLane,
+    count: usize,
+    first: u64,
+    end: u64,
+    force_mono: u32,
+    pair_binaural: u32,
+    fades: Fades,
+    error_out: *mut *mut c_char,
+) -> i32 {
+    if !error_out.is_null() {
+        *error_out = ptr::null_mut();
+    }
+    let (Some(slot), Some(frozen)) = (slot.as_ref(), frozen.as_ref()) else {
+        set_ffi_error(error_out, "Invalid capture lanes");
+        return 0;
+    };
+    let held = frozen.frame_range();
+    if lanes.is_null() || !(1..=frozen.track_count()).contains(&count) {
+        set_ffi_error(error_out, "Invalid capture lanes");
+        return 0;
+    }
+    if first < held.start || end > held.end || first >= end {
+        set_ffi_error(error_out, "The selected audio is unavailable.");
+        return 0;
+    }
+    let lanes = slice::from_raw_parts(lanes, count);
+    struct PreparedPreviewEntry<'a> {
+        track: crate::FrozenTrack,
+        route: ChannelRoute,
+        group: Option<PairGroup>,
+        selected: Option<Vec<usize>>,
+        positions: Option<&'a crate::FrozenPositionTrack>,
+    }
+    let mut entries: Vec<PreparedPreviewEntry<'_>> = Vec::with_capacity(count * 2);
+    for lane in lanes {
+        let Some(track) = frozen.track(lane.index as usize) else {
+            set_ffi_error(error_out, "Invalid capture lanes");
+            return 0;
+        };
+        let Some(route) = ChannelRoute::from_code(lane.route) else {
+            set_ffi_error(error_out, "channel route does not match the captured audio");
+            return 0;
+        };
+        let width = track.channels();
+        if width <= 2 {
+            let sel = if lane.channel_mask_valid == 0 {
+                None
+            } else {
+                let Some(indices) = mask_channels(lane.channel_mask, width) else {
+                    set_ffi_error(error_out, "The selected rows do not match this capture");
+                    return 0;
+                };
+                if width == 2 {
+                    match indices.as_slice() {
+                        [c] => Some(vec![*c]),
+                        [0, 1] => None,
+                        _ => {
+                            set_ffi_error(error_out, "The selected rows do not match this capture");
+                            return 0;
+                        }
+                    }
+                } else if indices.is_empty() {
+                    set_ffi_error(error_out, "The selected rows do not match this capture");
+                    return 0;
+                } else {
+                    None
+                }
+            };
+            entries.push(PreparedPreviewEntry {
+                track,
+                route,
+                group: None,
+                selected: sel,
+                positions: None,
+            });
+            continue;
+        }
+        let all_names = channel_names(lane.channel_labels, width);
+        let shown_range = if lane.shown_count == 0 {
+            0..width
+        } else if let Some(range) = valid_group_range(lane.shown_start, lane.shown_count, width) {
+            range
+        } else {
+            set_ffi_error(error_out, "The selected rows do not match this capture");
+            return 0;
+        };
+        let bed_range = if lane.bed_count > 0 {
+            let Some(range) = valid_group_range(lane.bed_start, lane.bed_count, width) else {
+                set_ffi_error(error_out, "The selected rows do not match this capture");
+                return 0;
+            };
+            Some(range)
+        } else if lane.shown_positioned == 0 {
+            Some(shown_range.clone())
+        } else {
+            None
+        };
+        let explicit_indices = if lane.channel_mask_valid == 0 {
+            None
+        } else {
+            let Some(indices) = mask_channels(lane.channel_mask, width) else {
+                set_ffi_error(error_out, "The selected rows do not match this capture");
+                return 0;
+            };
+            Some(indices)
+        };
+        if lane.channel_mask_valid != 0 {
+            let indices = explicit_indices.as_ref().unwrap();
+            if indices.is_empty() && lane.include_pair == 0 {
+                set_ffi_error(error_out, "The selected rows do not match this capture");
+                return 0;
+            }
+        }
+        let shown_is_bed = bed_range.as_ref().is_some_and(|b| *b == shown_range);
+        if lane.include_pair != 0 && shown_is_bed {
+            // Pair already mixes the entire speaker bed.
+            let group = PairGroup::new(shown_range.start, &all_names[shown_range.clone()]);
+            entries.push(PreparedPreviewEntry {
+                track,
+                route,
+                group,
+                selected: None,
+                positions: None,
+            });
+        } else {
+            if lane.include_pair != 0 {
+                if let Some(bed) = &bed_range {
+                    let group = PairGroup::new(bed.start, &all_names[bed.clone()]);
+                    entries.push(PreparedPreviewEntry {
+                        track: track.clone(),
+                        route,
+                        group,
+                        selected: None,
+                        positions: None,
+                    });
+                }
+            }
+            let shown_sel = match explicit_indices {
+                None => Some(None),
+                Some(indices) => {
+                    let in_shown: Vec<usize> =
+                        indices.into_iter().filter(|c| shown_range.contains(c)).collect();
+                    if in_shown.is_empty() {
+                        None
+                    } else {
+                        Some(Some(in_shown))
+                    }
+                }
+            };
+            if let Some(sel) = shown_sel {
+                let group = PairGroup::new(shown_range.start, &all_names[shown_range.clone()]);
+                let positions = if lane.shown_positioned != 0 {
+                    lane.positions.as_ref()
+                } else {
+                    None
+                };
+                entries.push(PreparedPreviewEntry {
+                    track,
+                    route,
+                    group,
+                    selected: sel,
+                    positions,
+                });
+            }
+        }
+    }
+    if entries.is_empty() || entries.len() > MAX_LANES {
+        set_ffi_error(error_out, "The selected rows do not match this capture");
+        return 0;
+    }
+    let has_wide = entries.iter().any(|e| e.group.is_some());
+    let model = if pair_binaural != 0 && has_wide {
+        let Ok(model) = crate::spatial::HeadModel::new(frozen.sample_rate()) else {
+            set_ffi_error(error_out, "Could not prepare binaural head model");
+            return 0;
+        };
+        Some(Arc::new(model))
+    } else {
+        None
+    };
+    let playback: Vec<PreviewLane<'_>> = entries
+        .iter()
+        .map(|entry| PreviewLane {
+            track: &entry.track,
+            route: entry.route,
+            group: entry.group.as_ref(),
+            selected: entry.selected.as_deref(),
+        })
+        .collect();
+    let lane_positions: Vec<Option<&crate::FrozenPositionTrack>> =
+        entries.iter().map(|entry| entry.positions).collect();
+    let Some(preview) = Preview::with_lane_positions(
+        &playback,
+        first..end,
+        model,
+        force_mono != 0,
+        fades,
+        &lane_positions,
+    ) else {
+        set_ffi_error(error_out, "The selected audio is unavailable.");
+        return 0;
+    };
+    slot.play(preview);
+    1
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn bt_frozen_export_group_selection(
+    frozen: *const FrozenCapture,
+    lanes: *const BtFrozenGroupSelectionLane,
+    count: usize,
+    first: u64,
+    end: u64,
+    directory: *const c_char,
+    sample_rate: u32,
+    bits_per_sample: u32,
+    force_mono: u32,
+    wide_mode: u32,
+    pair_binaural: u32,
+    fades: Fades,
+    objects_in_mono_out: *mut u32,
+    error_out: *mut *mut c_char,
+) -> *mut Vec<CString> {
+    if !error_out.is_null() {
+        *error_out = ptr::null_mut();
+    }
+    if !objects_in_mono_out.is_null() {
+        *objects_in_mono_out = 0;
+    }
+    let Some(frozen) = frozen.as_ref() else {
+        set_ffi_error(error_out, "Invalid capture lanes");
+        return ptr::null_mut();
+    };
+    let held = frozen.frame_range();
+    if lanes.is_null() || !(1..=frozen.track_count()).contains(&count) {
+        set_ffi_error(error_out, "Invalid capture lanes");
+        return ptr::null_mut();
+    }
+    if first < held.start || end > held.end || first >= end {
+        set_ffi_error(error_out, "expected aligned nonempty audio lanes");
+        return ptr::null_mut();
+    }
+    let Some(directory) = export_directory(directory) else {
+        set_ffi_error(error_out, "Invalid export folder");
+        return ptr::null_mut();
+    };
+    let Some(sample_format) = WavSampleFormat::from_bits_per_sample(bits_per_sample) else {
+        set_ffi_error(error_out, "Invalid WAV encoding");
+        return ptr::null_mut();
+    };
+    let mode = match wide_mode {
+        0 => WideExportMode::BinauralFiles,
+        1 => WideExportMode::MonoFiles,
+        2 => WideExportMode::Multichannel,
+        3 => WideExportMode::BinauralMix,
+        _ => {
+            set_ffi_error(error_out, "Invalid multichannel export mode");
+            return ptr::null_mut();
+        }
+    };
+    let lanes = slice::from_raw_parts(lanes, count);
+    let mut tracks = Vec::with_capacity(count);
+    let mut routes = Vec::with_capacity(count);
+    let mut labels = Vec::with_capacity(count);
+    let mut subsets: Vec<Option<Vec<usize>>> = Vec::with_capacity(count);
+    let mut narrowed_stereo: Vec<Option<usize>> = Vec::with_capacity(count);
+    for lane in lanes {
+        let Some(track) = frozen.track(lane.index as usize) else {
+            set_ffi_error(error_out, "Invalid capture lanes");
+            return ptr::null_mut();
+        };
+        let Some(route) = ChannelRoute::from_code(lane.route) else {
+            set_ffi_error(error_out, "channel route does not match the captured audio");
+            return ptr::null_mut();
+        };
+        let Some(name) = source_name_arg(lane.source_name) else {
+            set_ffi_error(error_out, "Invalid source name");
+            return ptr::null_mut();
+        };
+        let width = track.channels();
+        let mut narrow = None;
+        let subset = if lane.channel_mask_valid == 0 {
+            None
+        } else {
+            let Some(indices) = mask_channels(lane.channel_mask, width) else {
+                set_ffi_error(error_out, "The selected rows do not match this capture");
+                return ptr::null_mut();
+            };
+            if indices.is_empty() && (width <= 2 || lane.include_pair == 0) {
+                set_ffi_error(error_out, "The selected rows do not match this capture");
+                return ptr::null_mut();
+            }
+            if width == 2 && indices.len() == 1 {
+                narrow = Some(indices[0]);
+            }
+            Some(indices)
+        };
+        tracks.push(track);
+        routes.push(route);
+        let letter = if frozen.track_count() > 1 {
+            Lane::from_index(lane.index as usize)
+        } else {
+            None
+        };
+        labels.push(TakeLabel::new(name, letter));
+        subsets.push(subset);
+        narrowed_stereo.push(narrow);
+    }
+    let start = frozen.frame_range().start;
+    let frames = (first - start) as usize..(end - start) as usize;
+    let profile = WavExportProfile { sample_rate, sample_format };
+    let mut paths = Vec::new();
+    let mut any_objects_in_mono = false;
+    let result: std::io::Result<()> = (|| {
+        if tracks.iter().all(|track| track.channels() <= 2) && narrowed_stereo.iter().all(Option::is_none) {
+            let references: Vec<_> = tracks.iter().collect();
+            paths = export_routed_track_refs(
+                directory, &references, frames, profile, &routes, force_mono != 0, None, fades, &labels,
+            )?;
+        } else {
+            for (index, track) in tracks.iter().enumerate() {
+                let lane = &lanes[index];
+                let written = if track.channels() > 2 {
+                    let width = track.channels();
+                    let all_names = channel_names(lane.channel_labels, width);
+                    let shown_range = if lane.shown_count == 0 {
+                        0..width
+                    } else if let Some(range) = valid_group_range(lane.shown_start, lane.shown_count, width) {
+                        range
+                    } else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "The selected rows do not match this capture",
+                        ));
+                    };
+                    let shown_labels = all_names[shown_range.clone()].to_vec();
+                    let shown_group = WideExportGroup {
+                        channels: shown_range,
+                        labels: &shown_labels,
+                        positioned: lane.shown_positioned != 0,
+                    };
+                    let bed_range = if lane.bed_count > 0 {
+                        let Some(range) = valid_group_range(lane.bed_start, lane.bed_count, width) else {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "The selected rows do not match this capture",
+                            ));
+                        };
+                        Some(range)
+                    } else {
+                        None
+                    };
+                    let bed_labels = bed_range
+                        .as_ref()
+                        .map(|r| all_names[r.clone()].to_vec())
+                        .unwrap_or_default();
+                    let bed_group = bed_range.map(|r| WideExportGroup {
+                        channels: r,
+                        labels: &bed_labels,
+                        positioned: false,
+                    });
+                    let exported = export_wide_track(
+                        directory,
+                        track,
+                        frames.clone(),
+                        fades,
+                        profile,
+                        &labels[index],
+                        Some(&shown_group),
+                        mode,
+                        &WideRowExport {
+                            channels: subsets[index].as_deref(),
+                            pair: lane.include_pair != 0,
+                            pair_binaural: pair_binaural != 0,
+                            bed: bed_group.as_ref(),
+                            positions: lane.positions.as_ref(),
+                        },
+                    )?;
+                    any_objects_in_mono |= exported.objects_in_mono;
+                    exported.paths
+                } else if let Some(channel) = narrowed_stereo[index] {
+                    crate::export_channel_range_with_profile(
+                        directory,
+                        track,
+                        frames.clone(),
+                        channel..channel + 1,
+                        &[],
+                        profile,
+                        crate::ChannelExportMode::Multichannel,
+                        fades,
+                        &labels[index],
+                    )?
+                } else {
+                    export_routed_track_refs(
+                        directory,
+                        &[track],
+                        frames.clone(),
+                        profile,
+                        &routes[index..=index],
+                        force_mono != 0,
+                        None,
+                        fades,
+                        &labels[index..=index],
+                    )?
+                };
+                paths.extend(written);
+            }
+        }
+        Ok(())
+    })();
+    if let Err(err) = result {
+        remove_export_paths(&paths);
+        set_ffi_error(error_out, err.to_string());
+        return ptr::null_mut();
+    }
+    if !objects_in_mono_out.is_null() {
+        *objects_in_mono_out = u32::from(any_objects_in_mono);
+    }
+    match encode_export_paths(paths) {
+        Some(encoded) => Box::into_raw(Box::new(encoded)),
+        None => {
+            set_ffi_error(error_out, "Export path is not valid UTF-8");
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
 extern "C" fn bt_lane_letter(index: u32) -> *mut c_char {
     Lane::from_index(index as usize)
         .and_then(|lane| CString::new(lane.letter()).ok())
@@ -2030,6 +2620,118 @@ mod display_tests {
             assert!(!err.is_null());
             let err_str = CString::from_raw(err).into_string().unwrap();
             assert_eq!(err_str, "The selected rows do not match this capture");
+
+            bt_frozen_free(frozen);
+            bt_tracks_free(core);
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn frame_clock_bed_waveform_and_group_positions_ffi_work_end_to_end() {
+        let directory = std::env::temp_dir()
+            .join(format!("bt-group-pos-ffi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let folder = CString::new(directory.to_str().unwrap()).unwrap();
+        let all_labels = CString::new("FL\tFR\tFC\tObject 1\tObject 2").unwrap();
+        let bed_labels = CString::new("FL\tFR\tFC").unwrap();
+        let name = CString::new("Atmos").unwrap();
+        let widths = [5u32];
+        unsafe {
+            let core = bt_tracks_new_lanes(48_000.0, widths.as_ptr(), widths.len(), 10, 1 << 30);
+            assert!(!core.is_null());
+            bt_tracks_set_retain_silence(core, 1);
+            assert_eq!(bt_tracks_enable_frame_clock(core, 0), 1);
+            assert_eq!(bt_tracks_enable_frame_clock(core, 9), 0);
+
+            let mut wide = vec![0.0f32; 960 * 5];
+            for f in 0..960 {
+                wide[f * 5 + 0] = 0.2;
+                wide[f * 5 + 1] = -0.2;
+                wide[f * 5 + 3] = 0.4;
+                wide[f * 5 + 4] = -0.3;
+            }
+            assert_eq!(bt_tracks_push_interleaved(core, 0, wide.as_ptr(), 960, 1_000_000_000, 48_000.0), 960);
+            bt_tracks_pause(core);
+
+            let first = bt_tracks_first_frame(core);
+            let end = bt_tracks_end_frame(core);
+            assert_eq!(end - first, 960);
+
+            let mut mapped_frame = 0u64;
+            assert_eq!(bt_tracks_retained_frame_at(core, 0, 1_010_000_000, &mut mapped_frame), 1);
+            assert!(mapped_frame >= first && mapped_frame < end, "mapped={mapped_frame} range={first}..{end}");
+            // Future timestamp is Pending (-1).
+            assert_eq!(bt_tracks_retained_frame_at(core, 0, 2_000_000_000, &mut mapped_frame), -1);
+            let mut evicted = 0u64;
+            assert_eq!(bt_tracks_take_frame_clock_eviction(core, 0, &mut evicted), 0);
+
+            let frozen = bt_tracks_freeze(core, first, end);
+            assert!(!frozen.is_null());
+
+            // Bed-only waveform reads FL/FR/FC (0..3) and ignores objects (3..5).
+            let mut min_bins = [0.0f32; 4];
+            let mut max_bins = [0.0f32; 4];
+            bt_frozen_waveform_bed(
+                frozen, 0, 67, 0, 3, first, end,
+                min_bins.as_mut_ptr(), max_bins.as_mut_ptr(), 4, bed_labels.as_ptr(),
+            );
+            assert!(max_bins.iter().all(|&v| v > 0.05));
+
+            // Create positions only for Object 1 (channel 3), leaving Object 2 (channel 4) unpositioned.
+            let mut pos_track = crate::PositionTrack::with_memory_limit(1024 * 1024);
+            pos_track.insert(3, crate::PositionKey {
+                frame: first,
+                position: crate::Position { x: 0.5, y: 0.5, z: 0.0, size: 0.0, gain: 1.0 },
+            });
+            let frozen_pos = pos_track.freeze();
+
+            // Export shown group Objects (3..5, positioned=1) with bed (0..3), BinauralFiles (0), pair included.
+            let group_lane = [BtFrozenGroupSelectionLane {
+                index: 0,
+                route: 7,
+                source_name: name.as_ptr(),
+                channel_labels: all_labels.as_ptr(),
+                channel_mask: (1 << 3) | (1 << 4),
+                channel_mask_valid: 1,
+                include_pair: 1,
+                shown_start: 3,
+                shown_count: 2,
+                shown_positioned: 1,
+                bed_start: 0,
+                bed_count: 3,
+                positions: &frozen_pos,
+            }];
+            let mut objects_in_mono = 0u32;
+            let mut err: *mut c_char = ptr::null_mut();
+            let paths = bt_frozen_export_group_selection(
+                frozen, group_lane.as_ptr(), 1, first, end, folder.as_ptr(),
+                48_000, 32, 0, 0, 0, Fades::NONE, &mut objects_in_mono, &mut err,
+            );
+            assert!(err.is_null());
+            assert!(!paths.is_null());
+            // Object 2 had no position keys, so objects_in_mono must be 1.
+            assert_eq!(objects_in_mono, 1);
+            let mut out_names = Vec::new();
+            for i in 0..bt_export_paths_count(paths) {
+                out_names.push(CStr::from_ptr(bt_export_path(paths, i)).to_str().unwrap().to_owned());
+            }
+            assert!(out_names.iter().any(|p| p.ends_with("-Positions.json")), "{out_names:?}");
+            assert!(out_names.iter().any(|p| p.ends_with("-Stereo.wav")), "{out_names:?}");
+            assert!(out_names.iter().any(|p| p.contains("Object 1_binaural.wav")), "{out_names:?}");
+            assert!(out_names.iter().any(|p| p.contains("Object 2.wav")), "{out_names:?}");
+            bt_export_paths_free(paths);
+
+            // Preview positioned group + bed pair succeeds.
+            let slot = PreviewSlot::new();
+            assert_eq!(
+                bt_frozen_play_group_selection(
+                    frozen, &slot, group_lane.as_ptr(), 1, first, end, 0, 0, Fades::NONE, &mut err,
+                ),
+                1
+            );
+            assert!(err.is_null());
+            slot.clear();
 
             bt_frozen_free(frozen);
             bt_tracks_free(core);

@@ -276,6 +276,65 @@ BtExportPaths *bt_frozen_export_selection(const BtFrozenCapture *frozen,
                                           uint32_t pair_binaural, BtFades fades,
                                           char **error_out);
 
+// Frame clock mapping for lanes carrying positioned objects (monotonic ns -> retained frame).
+// bt_tracks_enable_frame_clock returns 1 on success, 0 on invalid lane.
+int32_t bt_tracks_enable_frame_clock(const BtTracks *core, uint32_t lane);
+// Returns 1 and writes *first_out when an older clock entry was evicted; 0 otherwise.
+int32_t bt_tracks_take_frame_clock_eviction(const BtTracks *core, uint32_t lane, uint64_t *first_out);
+// Returns 1 for Poll::Ready(Some(frame)) (writes *frame_out), 0 for Poll::Ready(None), -1 for Poll::Pending.
+int32_t bt_tracks_retained_frame_at(const BtTracks *core, uint32_t lane, uint64_t time_ns,
+                                    uint64_t *frame_out);
+
+// Bed-aware waveform and spectrum queries for wide lanes with channel groups.
+// For views 67/68 (L/R pair), folds down bed_start..bed_start+bed_count using bed_labels
+// (tab-separated, bed_count entries, or NULL). When bed_count == 0, uses the full track.
+void bt_frozen_waveform_bed(const BtFrozenCapture *frozen, uint32_t lane, uint32_t view,
+                            uint32_t bed_start, uint32_t bed_count,
+                            uint64_t first, uint64_t end, float *minimum, float *maximum,
+                            uint32_t bins, const char *bed_labels);
+void bt_frozen_spectrum_bed(const BtFrozenCapture *frozen, uint32_t lane, uint32_t view,
+                            uint32_t bed_start, uint32_t bed_count,
+                            uint64_t first, uint64_t end, float *energies, uint32_t bins,
+                            const char *bed_labels);
+
+struct BtFrozenPositions;
+
+// Group- and position-aware lane selection for preview and export.
+// shown_count == 0 selects the full track as a single unpositioned group.
+// bed_count == 0 falls back to shown (when not positioned) or full track.
+typedef struct BtFrozenGroupSelectionLane {
+    uint32_t index;
+    uint32_t route;
+    const char *source_name;
+    const char *channel_labels; // Tab-separated labels for all track channels, or NULL.
+    uint64_t channel_mask;
+    uint32_t channel_mask_valid;
+    uint32_t include_pair;
+    uint32_t shown_start;
+    uint32_t shown_count;
+    uint32_t shown_positioned;
+    uint32_t bed_start;
+    uint32_t bed_count;
+    const struct BtFrozenPositions *positions; // Optional frozen positions for this lane, or NULL.
+} BtFrozenGroupSelectionLane;
+
+int32_t bt_frozen_play_group_selection(const BtFrozenCapture *frozen, const BtPreviewSlot *slot,
+                                       const BtFrozenGroupSelectionLane *lanes, size_t count,
+                                       uint64_t first, uint64_t end,
+                                       uint32_t force_mono, uint32_t pair_binaural, BtFades fades,
+                                       char **error_out);
+
+// Writes WAVs and any *-Positions.json sidecar into directory. Sets *objects_in_mono_out to 1
+// if any positioned object lacked position keys and fell back to mono.
+BtExportPaths *bt_frozen_export_group_selection(const BtFrozenCapture *frozen,
+                                                const BtFrozenGroupSelectionLane *lanes, size_t count,
+                                                uint64_t first, uint64_t end, const char *directory,
+                                                uint32_t sample_rate, uint32_t bits_per_sample,
+                                                uint32_t force_mono, uint32_t wide_mode,
+                                                uint32_t pair_binaural, BtFades fades,
+                                                uint32_t *objects_in_mono_out,
+                                                char **error_out);
+
 BtSnapshot *bt_tracks_snapshot(const BtTracks *core, uint32_t lane);
 BtSnapshot *bt_tracks_snapshot_range(const BtTracks *core, uint32_t lane, uint64_t first, uint64_t end);
 
