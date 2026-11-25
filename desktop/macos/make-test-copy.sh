@@ -67,11 +67,33 @@ while [[ ! -d "$existing" ]]; do
   existing="$(dirname -- "$existing")"
 done
 destination="$(cd -- "$existing" && pwd -P)$rest"
-# The disk does not tell case apart, and pwd -P keeps the case it was given, so paths are
-# compared in lower case.
+# The disk does not tell case apart and stores names in one Unicode form, while pwd -P keeps the
+# spelling it was given; tr leaves non-ASCII letters alone and == does not normalize. So folders
+# that exist are compared by device and inode; only the part of a path that does not exist yet is
+# compared as text, in lower case.
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+# The device and inode of $1 and of every folder above it, from the nearest one that exists.
+ancestor_ids() {
+  local path="$1"
+  while [[ ! -e "$path" ]]; do path="$(dirname -- "$path")"; done
+  while :; do
+    stat -f '%d:%i' -- "$path"
+    [[ "$path" == / ]] && break
+    path="$(dirname -- "$path")"
+  done
+}
 # Whether $1 is $2 or lies inside it.
-within() { local a b; a="$(lower "$1")"; b="$(lower "$2")"; [[ "$a" == "$b" || "$a" == "$b/"* ]]; }
+within() {
+  if [[ -e "$2" ]]; then
+    local id
+    id="$(stat -f '%d:%i' -- "$2")"
+    ancestor_ids "$1" | grep -qx -- "$id"
+  else
+    local a b
+    a="$(lower "$1")"; b="$(lower "$2")"
+    [[ "$a" == "$b" || "$a" == "$b/"* ]]
+  fi
+}
 refuse_real() {
   for real in "$real_home/Library/Preferences" "$real_home/Library/Application Support/Backtracking" "$real_home/Backtracking"; do
     if within "$1" "$real"; then

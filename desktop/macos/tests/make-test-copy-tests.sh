@@ -74,6 +74,19 @@ if "$script" "$same_dir/backtracking-same.app" "$same_dir" same >/dev/null 2>&1;
 [[ "$(find "$same_dir/Backtracking-same.app" -type f -exec shasum {} + | sort | shasum)" == "$source_sum" ]] || fail "the source changed"
 [[ ! -e "$same_dir/Backtracking-same.app/Contents/Backtracking-inside.app" ]] || fail "a copy was made inside the source"
 
+# Folder names with letters outside ASCII, in another case or another Unicode form, are still the
+# same folder: the copy over its own source is refused, the source stays whole.
+nfc="$(printf 'Caf\xc3\xa9')"; nfd="$(printf 'Cafe\xcc\x81')"; upper="$(printf 'CAF\xc3\x89')"
+mkdir -p "$work/$nfc"
+ditto "$source_app" "$work/$nfc/Backtracking-same.app"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.backtracking.audio.capture.testcopy.same" "$work/$nfc/Backtracking-same.app/Contents/Info.plist"
+unicode_sum="$(find "$work/$nfc/Backtracking-same.app" -type f -exec shasum {} + | sort | shasum)"
+for spelled in "$nfd" "$upper"; do
+  if "$script" "$work/$spelled/Backtracking-same.app" "$work/$nfc" same >/dev/null 2>&1; then fail "a copy over its source spelled $spelled was taken"; fi
+  if "$script" "$work/$nfc/Backtracking-same.app" "$work/$spelled" same >/dev/null 2>&1; then fail "a copy over its source in $spelled was taken"; fi
+done
+[[ "$(find "$work/$nfc/Backtracking-same.app" -type f -exec shasum {} + | sort | shasum)" == "$unicode_sum" ]] || fail "the source spelled outside ASCII changed"
+
 # Something at the copy's path that is not a test copy is left alone.
 mkdir -p "$work/taken"
 ditto "$source_app" "$work/taken/Backtracking-taken.app"
