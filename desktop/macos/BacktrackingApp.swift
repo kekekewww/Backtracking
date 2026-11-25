@@ -192,9 +192,7 @@ enum BacktrackingApp {
         }
         if config.isTestCopy || config.invalidInstanceName {
             guard config.validateAndAcquireLock(primary: primary) else { return }
-            // A test copy neither restores nor keeps window state. Registered defaults live only in
-            // memory, so this writes nothing to the app's real preferences domain.
-            UserDefaults.standard.register(defaults: ["ApplePersistenceIgnoreState": true, "NSQuitAlwaysKeepsWindows": false])
+            TestCopyConfig.turnOffStateRestoration(UserDefaults.standard)
         } else {
             if StartupUpdater.runHelperIfRequested() { return }
             if StartupUpdater.otherLaunchDuringUpdate() { return }
@@ -271,6 +269,14 @@ private final class SnapshotShortcut {
 
 private class KeyPanel: NSPanel {
     override var canBecomeKey: Bool { true }
+
+    /// Every window of the app is a KeyPanel; a test copy keeps none of them for restoring.
+    override var isRestorable: Bool {
+        get { Self.restorable(testCopy: TestCopyConfig.current.isTestCopy, requested: super.isRestorable) }
+        set { super.isRestorable = newValue }
+    }
+
+    static func restorable(testCopy: Bool, requested: Bool) -> Bool { testCopy ? false : requested }
 }
 
 private final class HotkeyOptionsPanel: KeyPanel {
@@ -2809,6 +2815,20 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
               TestCopyConfig.productionBundleRefusal(bundleID: "com.backtracking.audio.capture.testcopy.verify") == nil,
               TestCopyConfig.productionBundleRefusal(bundleID: Bundle.main.bundleIdentifier) == nil else {
             throw CaptureError("A test copy would run from the installed app's bundle identifier")
+        }
+        // State restoration stays off whatever a lower domain says, and no window is restorable.
+        // Launched with `-ApplePersistenceIgnoreState NO -NSQuitAlwaysKeepsWindows YES`, as a
+        // stand-in for any domain above the registration one. Both domains live only in memory.
+        let defaults = UserDefaults.standard
+        let savedArguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+        defer { defaults.setVolatileDomain(savedArguments, forName: UserDefaults.argumentDomain) }
+        defaults.setVolatileDomain(savedArguments.merging(["ApplePersistenceIgnoreState": false, "NSQuitAlwaysKeepsWindows": true]) { $1 },
+                                   forName: UserDefaults.argumentDomain)
+        TestCopyConfig.turnOffStateRestoration(defaults)
+        // CapturePanel and HotkeyOptionsPanel, the app's only windows, are KeyPanels.
+        guard defaults.bool(forKey: "ApplePersistenceIgnoreState"), !defaults.bool(forKey: "NSQuitAlwaysKeepsWindows"),
+              !KeyPanel.restorable(testCopy: true, requested: true), KeyPanel.restorable(testCopy: false, requested: true) else {
+            throw CaptureError("A test copy could still save or restore window state")
         }
         // A data folder inside the user's real settings or recordings is refused like the folders themselves.
         let fakeHome = scratch.appendingPathComponent("home", isDirectory: true)

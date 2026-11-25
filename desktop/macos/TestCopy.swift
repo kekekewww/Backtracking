@@ -41,6 +41,16 @@ final class TestCopyConfig: @unchecked Sendable {
         environment.filter { key, _ in key.hasPrefix("BACKTRACKING_TEST_") || key == localAppDataVariable }
     }
 
+    /// A test copy neither saves nor restores window state. The argument domain outranks the
+    /// app's, the global and the registration domains, and like registration it lives only in
+    /// memory, so nothing is written for it.
+    static func turnOffStateRestoration(_ defaults: UserDefaults) {
+        var arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+        arguments["ApplePersistenceIgnoreState"] = true
+        arguments["NSQuitAlwaysKeepsWindows"] = false
+        defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+    }
+
     static let productionBundleID = "com.backtracking.audio.capture"
     static let testCopyBundlePrefix = "com.backtracking.audio.capture.testcopy."
 
