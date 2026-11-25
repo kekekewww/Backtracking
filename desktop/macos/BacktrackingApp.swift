@@ -67,6 +67,12 @@ func verifyMacOptions() throws {
 }
 
 @MainActor
+func verifyMacTestCopyIsolation() throws {
+    _ = NSApplication.shared
+    try BacktrackingController.verifyTestCopyIsolation()
+}
+
+@MainActor
 func verifyMacTerminationSaves() throws {
     _ = NSApplication.shared
     try BacktrackingController.verifyTerminationSaves()
@@ -78,6 +84,12 @@ enum BacktrackingApp {
     static func main() {
         let config = TestCopyConfig.current
         let primary = !CommandLine.arguments.contains(receiverWindowArgument)
+        // An invalid name is refused below with its own message.
+        if TestCopyConfig.refusesUnisolatedLaunch(arguments: CommandLine.arguments,
+                                                  isTestCopy: config.isTestCopy || config.invalidInstanceName) {
+            fputs("Backtracking test copy could not start: this window was opened by a test copy, but \(TestCopyConfig.instanceVariable) did not reach it.\n", stderr)
+            exit(2)
+        }
         if config.isTestCopy || config.invalidInstanceName {
             guard config.validateAndAcquireLock(primary: primary) else { return }
         } else {
@@ -1619,7 +1631,15 @@ private enum ExportFolder: Int {
 private final class BacktrackingController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate,
     NSTextFieldDelegate {
     private let independentWindow = CommandLine.arguments.contains(receiverWindowArgument)
+    #if BACKTRACKING_CAPTURE_VERIFY
+    private var testCopy = TestCopyConfig.current.isTestCopy
+    #else
     private let testCopy = TestCopyConfig.current.isTestCopy
+    #endif
+    /// Asks macOS for Input Monitoring; a verification replaces it so it never prompts.
+    private var listenAccessRequest: () -> Void = {
+        if !CGPreflightListenEventAccess() { _ = CGRequestListenEventAccess() }
+    }
     private lazy var defaults: PreferencesStore = .forCurrentProcess(independentWindow: independentWindow)
     private lazy var startupUpdater = StartupUpdater(isTestCopy: testCopy)
     private var harness: TestHarness? = TestHarness()
@@ -1937,6 +1957,53 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
               controller.optionsMeterPopups.count == 3, controller.meterModes == [.dbfs, .vu, .lufs],
               rows.map(\.view) == [0, 0, 67, 68, 3, 4, 5], rows.last?.title == "C · FC" else {
             throw CaptureError("The Options or waveform rows do not match the loaded sources")
+        }
+    }
+
+    /// A test copy opens only test-copy windows and never offers or asks for Input Monitoring.
+    static func verifyTestCopyIsolation() throws {
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("bt-verify-copy-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let parent = [
+            "BACKTRACKING_TEST_INSTANCE": "verify-copy", "BACKTRACKING_TEST_DATA_DIR": scratch.path,
+            "LOCALAPPDATA": scratch.path, "BACKTRACKING_TEST_LANGUAGE": "zh-Hant",
+            "HOME": "/Users/nobody", "PATH": "/usr/bin"
+        ]
+        let launch = receiverWindowLaunch(testCopy: true, environment: parent)
+        let child = TestCopyConfig(environment: launch.environment, arguments: ["Backtracking"] + launch.arguments)
+        guard launch.arguments.contains(receiverWindowArgument),
+              launch.arguments.contains(TestCopyConfig.testCopyLaunchArgument),
+              launch.environment["HOME"] == nil, launch.environment["PATH"] == nil,
+              child.isTestCopy, child.dataDirectory?.path == scratch.resolvingSymlinksInPath().path,
+              child.language == .zhHant else {
+            throw CaptureError("A test copy's new capture window would not be the same test copy: \(launch)")
+        }
+        // A window whose test variables went missing must refuse rather than open the real data.
+        let lost = TestCopyConfig(environment: [:], arguments: ["Backtracking"] + launch.arguments)
+        guard TestCopyConfig.refusesUnisolatedLaunch(arguments: launch.arguments, isTestCopy: lost.isTestCopy),
+              !TestCopyConfig.refusesUnisolatedLaunch(arguments: launch.arguments, isTestCopy: child.isTestCopy),
+              !TestCopyConfig.refusesUnisolatedLaunch(arguments: [receiverWindowArgument], isTestCopy: false) else {
+            throw CaptureError("A test-copy window without its test variables would still start")
+        }
+        let installed = receiverWindowLaunch(testCopy: false, environment: parent)
+        guard installed.arguments == [receiverWindowArgument], installed.environment.isEmpty else {
+            throw CaptureError("The installed app's new capture window changed")
+        }
+
+        let controller = BacktrackingController()
+        controller.defaults = PreferencesStore.file(at: scratch.appendingPathComponent("preferences.plist"))
+        controller.testCopy = true
+        var requests = 0
+        controller.listenAccessRequest = { requests += 1 }
+        controller.snapshotShortcut.bindings = []
+        _ = controller.makeActionTab()
+        guard !controller.hotkeys[.globalSnapshot].isEmpty, controller.shortcutPermissionButton?.isHidden == true else {
+            throw CaptureError("A test copy shows the Input Monitoring button")
+        }
+        controller.requestShortcutPermission()
+        guard requests == 0, !controller.snapshotShortcut.isListening else {
+            throw CaptureError("A test copy asked for Input Monitoring \(requests) times")
         }
     }
 
@@ -2731,13 +2798,19 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
     }
 
     private func refreshShortcutPermission() {
+        // A test copy has no global shortcut, so it never asks for Input Monitoring.
+        guard !testCopy else {
+            shortcutPermissionButton?.isHidden = true
+            return
+        }
         let authorized = CGPreflightListenEventAccess()
         shortcutPermissionButton?.isHidden = snapshotShortcut.isListening || hotkeys[.globalSnapshot].isEmpty
         shortcutPermissionButton?.title = authorized ? "Reconnect the global shortcut" : "Allow Input Monitoring"
     }
 
     @objc private func requestShortcutPermission() {
-        if !CGPreflightListenEventAccess() { _ = CGRequestListenEventAccess() }
+        guard !testCopy else { return }
+        listenAccessRequest()
         snapshotShortcut.start()
         refreshShortcutPermission()
     }
@@ -3276,9 +3349,21 @@ private final class BacktrackingController: NSObject, NSApplicationDelegate, NSW
         }
     }
 
+    /// How a new capture window is launched. A test copy opens another window of the same test
+    /// copy: its test variables go along, and the marker makes the window refuse to start without them.
+    static func receiverWindowLaunch(
+        testCopy: Bool, environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> (arguments: [String], environment: [String: String]) {
+        guard testCopy else { return ([receiverWindowArgument], [:]) }
+        return ([receiverWindowArgument, TestCopyConfig.testCopyLaunchArgument],
+                TestCopyConfig.inheritedTestEnvironment(environment))
+    }
+
     @objc private func openReceiverWindow() {
         let configuration = NSWorkspace.OpenConfiguration()
-        configuration.arguments = [receiverWindowArgument]
+        let launch = Self.receiverWindowLaunch(testCopy: testCopy)
+        configuration.arguments = launch.arguments
+        if !launch.environment.isEmpty { configuration.environment = launch.environment }
         configuration.createsNewApplicationInstance = true
         configuration.activates = false
         configuration.addsToRecentItems = false

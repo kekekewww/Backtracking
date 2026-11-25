@@ -29,8 +29,22 @@ final class TestCopyConfig: @unchecked Sendable {
     static let screenshotDelayVariable = "BACKTRACKING_TEST_SCREENSHOT_DELAY_MS"
     static let viewVariable = "BACKTRACKING_TEST_VIEW"
     static let showOptionsArgument = "--show-options"
+    /// Marks a window a test copy opened. Such a launch refuses to start unless it is a test copy
+    /// itself, so a lost environment can never open an instance on the user's real data.
+    static let testCopyLaunchArgument = "--backtracking-test-copy-window"
 
     static let current = TestCopyConfig()
+
+    /// The variables a window opened from this process needs to be the same test copy. On Windows
+    /// the new process inherits the whole environment; Launch Services does not, so they are passed on.
+    static func inheritedTestEnvironment(_ environment: [String: String]) -> [String: String] {
+        environment.filter { key, _ in key.hasPrefix("BACKTRACKING_TEST_") || key == localAppDataVariable }
+    }
+
+    /// Whether a launch marked as opened by a test copy has to stop because it is not one.
+    static func refusesUnisolatedLaunch(arguments: [String], isTestCopy: Bool) -> Bool {
+        arguments.contains(testCopyLaunchArgument) && !isTestCopy
+    }
 
     let instanceName: String?
     let invalidInstanceName: Bool
