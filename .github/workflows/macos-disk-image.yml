@@ -1,0 +1,141 @@
+name: macOS disk image
+
+# Builds the release disk image (app, VST3 and CLAP) on GitHub's macOS runner, so a release does not
+# need a Mac. Run it by hand with the tag or commit to build; a pull request that changes this file
+# builds one too, as a check.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/macos-disk-image.yml'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag or full commit SHA to build (empty for the branch chosen above)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-disk-image-${{ github.event.pull_request.number || github.ref }}-${{ inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  disk-image:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install Rust
+        run: rustup toolchain install 1.99.1 --profile minimal
+      - name: Build the app and the plug-ins
+        run: |
+          read -r BACKTRACKING_UPDATE_PUBLIC_KEY < desktop/update-public-key.hex
+          export BACKTRACKING_UPDATE_PUBLIC_KEY
+          RUSTUP_TOOLCHAIN=1.99.1 bash desktop/macos/build.sh
+          embedded_key=$(/usr/libexec/PlistBuddy -c 'Print :BacktrackingUpdatePublicKey' target/bundled/Backtracking.app/Contents/Info.plist)
+          test "$embedded_key" = "$BACKTRACKING_UPDATE_PUBLIC_KEY"
+          cargo +1.99.1 install cargo-nice-plug --locked
+          RUSTUP_TOOLCHAIN=1.99.1 bash plugins/backtracking-plugin/bundle-macos.sh
+          for bundle in Backtracking.app Backtracking.vst3 Backtracking.clap; do
+            codesign --verify --strict --deep "target/bundled/$bundle"
+          done
+      - name: Make the disk image
+        id: image
+        run: |
+          app=target/bundled/Backtracking.app
+          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
+          build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
+          commit=$(git rev-parse HEAD)
+          stage="$RUNNER_TEMP/dmg/Backtracking $version"
+          mkdir -p "$stage/Plug-ins"
+          ditto "$app" "$stage/Backtracking.app"
+          ditto target/bundled/Backtracking.vst3 "$stage/Plug-ins/Backtracking.vst3"
+          ditto target/bundled/Backtracking.clap "$stage/Plug-ins/Backtracking.clap"
+          ln -s /Applications "$stage/Applications"
+          cp LICENSE "$stage/LICENSE.txt"
+          cp THIRD_PARTY_NOTICES.md "$stage/THIRD_PARTY_NOTICES.md"
+          title="Backtracking $version for macOS (Apple silicon)"
+          {
+            printf '%s\n' "$title"
+            printf '%s\n' "$title" | sed 's/./=/g'
+            sed "s/@COMMIT@/$commit/g" <<'README'
+
+          Requires macOS 14.2 or later on an Apple silicon Mac.
+
+          Install the desktop app
+          -----------------------
+          1. Quit any Backtracking that is already running (menu bar item > Quit Backtracking).
+          2. Drag Backtracking.app onto the Applications shortcut in this window.
+          3. Open Backtracking from Applications.
+
+          This build is not notarized by Apple, so macOS blocks it the first time.
+          Open System Settings > Privacy & Security, scroll to the message about
+          Backtracking and choose Open Anyway. You only need to do this once.
+
+          When macOS asks, allow Backtracking to record system audio. Capturing a
+          microphone asks for the microphone permission. The global snapshot shortcut
+          (Fn/Globe + the key left of 1) needs Input Monitoring; Options > Actions has
+          a button that opens that setting.
+
+          Install the plug-ins (optional)
+          -------------------------------
+          Quit your DAW first. Copy from the Plug-ins folder in this window:
+
+            Backtracking.vst3  ->  ~/Library/Audio/Plug-Ins/VST3/
+            Backtracking.clap  ->  ~/Library/Audio/Plug-Ins/CLAP/
+
+          If your DAW refuses to load them, remove the download quarantine in Terminal
+          and rescan:
+
+            xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/VST3/Backtracking.vst3
+            xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/CLAP/Backtracking.clap
+
+          Add-ons
+          -------
+          Drop a .btaddon file on the Backtracking window, or press Install from file...
+          in Options > Add-ons. Add-ons run with your own permissions and are not
+          sandboxed, so install only add-ons you trust.
+
+          User guide: https://github.com/kekekewww/Backtracking/blob/@COMMIT@/docs/USER_GUIDE.md
+          Built from: https://github.com/kekekewww/Backtracking/commit/@COMMIT@
+          License: Apache 2.0. Third-party data notices: THIRD_PARTY_NOTICES.md
+          README
+          } > "$stage/Read Me.txt"
+          dmg="Backtracking-$version-macOS-arm64.dmg"
+          for attempt in 1 2 3; do
+            hdiutil create -volname "Backtracking $version" -srcfolder "$stage" -format UDZO -ov "$dmg" && break
+            sleep 10
+          done
+          hdiutil verify "$dmg"
+          # Open the image the way a user does and check what they will find.
+          mount="$RUNNER_TEMP/mounted"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$mount/Backtracking.app/Contents/Info.plist")" = "$version"
+          test -L "$mount/Applications"
+          for bundle in Backtracking.app Plug-ins/Backtracking.vst3 Plug-ins/Backtracking.clap; do
+            codesign --verify --strict --deep "$mount/$bundle"
+          done
+          head -n 2 "$mount/Read Me.txt"
+          hdiutil detach "$mount"
+          {
+            echo "commit $commit"
+            echo "app $version build $build"
+            sw_vers -productVersion
+            xcodebuild -version | tr '\n' ' '; echo
+            xcrun swiftc --version 2>&1 | head -n 1
+            rustc +1.99.1 --version
+            shasum -a 256 "$dmg"
+          } | tee dmg-build-info.txt
+          { echo '```'; cat dmg-build-info.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "artifact=Backtracking-$version-macOS-arm64" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.image.outputs.artifact }}
+          path: |
+            Backtracking-*-macOS-arm64.dmg
+            dmg-build-info.txt
+          if-no-files-found: error
+          compression-level: 0
